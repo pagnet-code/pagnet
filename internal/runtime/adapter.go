@@ -38,6 +38,10 @@ type TurnSpec struct {
 	WakeReason string
 	// Metadata carries runtime-agnostic extras (e.g. profile, transcript).
 	Metadata map[string]any
+	// Env is extra KEY=VALUE pairs for the spawned process (per-instance
+	// AgentNet injection: MCP bridge config, coordination contract,
+	// identity). Appended after the adapter's own environment.
+	Env []string
 }
 
 // TurnEvent is a normalized, runtime-agnostic observation of a turn.

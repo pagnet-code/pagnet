@@ -7,6 +7,7 @@ package daemon
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -41,7 +42,10 @@ func OpenState(path string) (*State, error) {
 			status        TEXT NOT NULL DEFAULT 'starting',
 			session_id    TEXT NOT NULL DEFAULT '',
 			pid           INTEGER,
-			updated_at    TEXT NOT NULL
+			updated_at    TEXT NOT NULL,
+			access        TEXT NOT NULL DEFAULT 'read_write',
+			agent_name    TEXT NOT NULL DEFAULT '',
+			network_id    TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
@@ -49,6 +53,18 @@ func OpenState(path string) (*State, error) {
 		);`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate state: %w", err)
+	}
+	// Best-effort ALTERs for state dirs created before these columns
+	// existed (a fresh CREATE TABLE already has them).
+	for _, col := range []string{
+		`ALTER TABLE instances ADD COLUMN access TEXT NOT NULL DEFAULT 'read_write'`,
+		`ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN network_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate state: %w", err)
+		}
 	}
 	return &State{db: db}, nil
 }
@@ -83,6 +99,9 @@ type InstanceRow struct {
 	SessionID    string
 	PID          *int
 	UpdatedAt    string
+	Access       string // read_write (default) | read_only (§29)
+	AgentName    string
+	NetworkID    string
 }
 
 // UpsertInstance records/updates a local instance.
@@ -91,8 +110,8 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 		r.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (instance_id) DO UPDATE SET
 			definition_id = excluded.definition_id,
 			runtime = excluded.runtime,
@@ -101,8 +120,12 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 			status = excluded.status,
 			session_id = excluded.session_id,
 			pid = excluded.pid,
-			updated_at = excluded.updated_at`,
-		r.InstanceID, r.DefinitionID, r.Runtime, r.Workspace, r.Profile, r.Status, r.SessionID, r.PID, r.UpdatedAt)
+			updated_at = excluded.updated_at,
+			access = excluded.access,
+			agent_name = excluded.agent_name,
+			network_id = excluded.network_id`,
+		r.InstanceID, r.DefinitionID, r.Runtime, r.Workspace, r.Profile, r.Status, r.SessionID, r.PID, r.UpdatedAt,
+		r.Access, r.AgentName, r.NetworkID)
 	return err
 }
 
@@ -133,12 +156,13 @@ func (s *State) SetInstanceSession(instanceID, sessionID string) error {
 func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
 	row := s.db.QueryRow(`
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
-		       COALESCE(session_id,''), pid, updated_at
+		       COALESCE(session_id,''), pid, updated_at,
+		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,'')
 		FROM instances WHERE instance_id = ?`, instanceID)
 	var r InstanceRow
 	var pid sql.NullInt64
 	err := row.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace, &r.Profile,
-		&r.Status, &r.SessionID, &pid, &r.UpdatedAt)
+		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
@@ -156,7 +180,8 @@ func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
 func (s *State) ListInstances() ([]InstanceRow, error) {
 	rows, err := s.db.Query(`
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
-		       COALESCE(session_id,''), pid, updated_at
+		       COALESCE(session_id,''), pid, updated_at,
+		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,'')
 		FROM instances ORDER BY instance_id`)
 	if err != nil {
 		return nil, err
@@ -167,7 +192,8 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 		var r InstanceRow
 		var pid sql.NullInt64
 		if err := rows.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace,
-			&r.Profile, &r.Status, &r.SessionID, &pid, &r.UpdatedAt); err != nil {
+			&r.Profile, &r.Status, &r.SessionID, &pid, &r.UpdatedAt,
+			&r.Access, &r.AgentName, &r.NetworkID); err != nil {
 			return nil, err
 		}
 		if pid.Valid {

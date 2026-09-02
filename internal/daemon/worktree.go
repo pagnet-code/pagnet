@@ -1,0 +1,154 @@
+package daemon
+
+// Git work isolation (spec §29): if two read/write agents run on the same
+// physical clone they must not blindly edit the same checkout. The first
+// RW agent keeps the current checkout; each subsequent RW agent on the
+// same repository gets an automatic worktree at
+//
+//	<checkout>/.agentnet/worktrees/<instance-id>/
+//
+// on a branch `agentnet/<agent-name>/<short-id>`. Read-only agents share
+// the checkout. If worktree creation is unsafe because of repository
+// state, fail clearly — never silently corrupt work.
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"agentnet/internal/domain"
+	"agentnet/internal/transport"
+)
+
+func gitOut(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git %s: %v: %s",
+			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func isGitRepo(path string) bool {
+	out, err := gitOut(path, "rev-parse", "--is-inside-work-tree")
+	return err == nil && out == "true"
+}
+
+// repoCommonDir is the canonical identity of the repository containing
+// path: the directory holding the shared .git data. A normal checkout and
+// all of its linked worktrees resolve to the SAME common dir, which is
+// exactly the identity "same repository" needs.
+func repoCommonDir(path string) (string, error) {
+	out, err := gitOut(path, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	dir := out
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(path, dir)
+	}
+	abs, err := filepath.Abs(filepath.Clean(dir))
+	if err != nil {
+		return "", err
+	}
+	return abs, nil
+}
+
+var branchUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// worktreeBranch is the §29 branch name: agentnet/<agent-name>/<short-id>.
+// Without an assigned task the instance id is the stable short id.
+func worktreeBranch(agentName, instanceID string) string {
+	name := strings.ToLower(branchUnsafe.ReplaceAllString(agentName, "-"))
+	name = strings.Trim(name, "-")
+	if name == "" {
+		name = "agent"
+	}
+	short := instanceID
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return fmt.Sprintf("agentnet/%s/%s", name, short)
+}
+
+// resolveWorkspace applies §29 isolation for a launching instance and
+// returns the workspace path the instance actually runs in. The first
+// RW agent (and every read-only agent) keeps the given checkout; a
+// second+ RW agent on the same repository is moved into a worktree.
+func (d *Daemon) resolveWorkspace(p transport.LaunchAgentPayload, access string) (string, error) {
+	if access == domain.AccessReadOnly || !isGitRepo(p.WorkspacePath) {
+		return p.WorkspacePath, nil
+	}
+	common, err := repoCommonDir(p.WorkspacePath)
+	if err != nil {
+		// Not a resolvable git repository (or git missing): run in the
+		// checkout as-is — there is nothing to isolate.
+		return p.WorkspacePath, nil
+	}
+	insts, err := d.state.ListInstances()
+	if err != nil {
+		return "", err
+	}
+	for _, other := range insts {
+		if other.InstanceID == p.InstanceID || other.Status == "stopped" {
+			continue
+		}
+		if other.Access != domain.AccessReadWrite {
+			continue
+		}
+		oc, err := repoCommonDir(other.Workspace)
+		if err != nil || oc != common {
+			continue
+		}
+		wt, err := d.ensureWorktree(p.WorkspacePath, common, p.InstanceID,
+			worktreeBranch(p.AgentName, p.InstanceID))
+		if err != nil {
+			return "", err
+		}
+		return wt, nil
+	}
+	return p.WorkspacePath, nil
+}
+
+// ensureWorktree creates (or reuses) the worktree for instanceID in the
+// repository containing fromRepo. It is idempotent across daemon
+// restarts and command replays.
+func (d *Daemon) ensureWorktree(fromRepo, common, instanceID, branch string) (string, error) {
+	main := filepath.Dir(common) // common is <checkout>/.git
+	if filepath.Base(common) != ".git" {
+		return "", fmt.Errorf("repository %s has no ordinary checkout (bare repository); "+
+			"worktree isolation is not possible", common)
+	}
+	wt := filepath.Join(main, ".agentnet", "worktrees", instanceID)
+
+	// Already created (daemon restart / replay)?
+	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+		if oc, err := repoCommonDir(wt); err == nil && oc == common {
+			return wt, nil
+		}
+		return "", fmt.Errorf("refusing to use %s: path exists but is not a worktree of this repository", wt)
+	}
+
+	// Create: new branch, or reuse an existing branch (worktree removed
+	// but branch kept).
+	var out string
+	var err error
+	if _, verr := gitOut(fromRepo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); verr == nil {
+		out, err = gitOut(fromRepo, "worktree", "add", wt, branch)
+	} else {
+		out, err = gitOut(fromRepo, "worktree", "add", "-b", branch, wt)
+	}
+	if err != nil {
+		// §29: fail clearly rather than silently corrupt work.
+		return "", fmt.Errorf("git worktree add failed (repository state unsafe?): %v", err)
+	}
+	d.Log.Info("created git worktree for same-repo isolation",
+		"worktree", wt, "branch", branch, "repo", main)
+	_ = out
+	return wt, nil
+}

@@ -77,7 +77,7 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = spec.Workspace
-	cmd.Env = append(os.Environ(), f.Env...)
+	cmd.Env = append(append(os.Environ(), f.Env...), spec.Env...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

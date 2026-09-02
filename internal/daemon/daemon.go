@@ -53,6 +53,13 @@ type Daemon struct {
 
 	turnMu      sync.Mutex
 	activeTurns map[string]bool
+
+	// Active attach sessions per instance (§35: no hibernation
+	// underneath an attached user). In-memory: a daemon restart drops
+	// the tracking, which is safe — worst case the instance hibernates
+	// and the next attach re-wakes it.
+	attachMu sync.Mutex
+	attaches map[string]map[string]time.Time // instanceID -> attachSessionID
 }
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
@@ -80,6 +87,7 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 			domain.RuntimeFake: fake,
 		},
 		activeTurns: map[string]bool{},
+		attaches:    map[string]map[string]time.Time{},
 	}
 	return d, nil
 }
@@ -275,6 +283,20 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		}
 		d.guarded(conn, p.CommandID, func() error { return d.doDeliver(conn, p) })
 
+	case transport.MsgAttachTerminal:
+		var p transport.TerminalAttachPayload
+		if env.DecodePayload(&p) != nil {
+			return
+		}
+		d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
+
+	case transport.MsgDetachTerminal:
+		var p transport.DetachTerminalPayload
+		if env.DecodePayload(&p) != nil {
+			return
+		}
+		d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
+
 	case transport.MsgRequestInventory:
 		d.sendInventory(conn)
 
@@ -355,20 +377,37 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if _, ok := d.adapters[rn]; !ok {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
+	access := p.Access
+	if access != domain.AccessReadOnly {
+		access = domain.AccessReadWrite
+	}
+	// §29: a second read/write agent on the same repository is isolated
+	// into an automatic git worktree (fail clearly if that is unsafe).
+	wsPath, err := d.resolveWorkspace(p, access)
+	if err != nil {
+		return err
+	}
 	// Launch registers the instance as idle: process-per-turn means no
 	// process runs until work arrives (the runtime is the turn runner).
 	if err := d.state.UpsertInstance(InstanceRow{
 		InstanceID:   p.InstanceID,
 		DefinitionID: p.DefinitionID,
 		Runtime:      string(rn),
-		Workspace:    p.WorkspacePath,
+		Workspace:    wsPath,
 		Profile:      p.Profile,
 		Status:       "idle",
+		Access:       access,
+		AgentName:    p.AgentName,
+		NetworkID:    p.NetworkID,
 	}); err != nil {
 		return err
 	}
-	d.Log.Info("agent launched (idle, process-per-turn)",
-		"instance", p.InstanceID, "runtime", rn, "workspace", p.WorkspacePath)
+	msg := "agent launched (idle, process-per-turn)"
+	if wsPath != p.WorkspacePath {
+		msg = "agent launched (git worktree isolation, process-per-turn)"
+	}
+	d.Log.Info(msg,
+		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": p.InstanceID})
 	return nil
 }
@@ -477,6 +516,7 @@ func (d *Daemon) busy(instanceID string) bool {
 }
 
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
+	contractPath, _ := d.writeContract(row)
 	return agentruntime.TurnSpec{
 		TurnID:       domain.NewID().String(),
 		InstanceID:   row.InstanceID,
@@ -487,7 +527,35 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 		Input:        input,
 		InputKind:    kind,
 		Metadata:     map[string]any{"profile": row.Profile},
+		Env: []string{
+			"AGENTNET_INSTANCE_ID=" + row.InstanceID,
+			"AGENTNET_AGENT_NAME=" + row.AgentName,
+			"AGENTNET_NETWORK_ID=" + row.NetworkID,
+			"AGENTNET_MCP_CONFIG=" + d.mcpConfig(row),
+			"AGENTNET_COORDINATION_CONTRACT=" + contractPath,
+		},
 	}
+}
+
+// mcpConfig is the MCP client config the daemon injects into every
+// managed agent: the agentnet-mcp bridge over the daemon's local Unix
+// socket (the bridge authenticates to the daemon with the instance
+// identity — the host credential never reaches the agent, §5/§17).
+func (d *Daemon) mcpConfig(row *InstanceRow) string {
+	cfg := map[string]any{
+		"mcpServers": map[string]any{
+			"agentnet": map[string]any{
+				"command": "agentnet-mcp",
+				"args":    []string{"--socket", filepath.Join(d.StateDir, "agentnetd.sock")},
+				"env": map[string]string{
+					"AGENTNET_INSTANCE_ID": row.InstanceID,
+					"AGENTNET_NETWORK_ID":  row.NetworkID,
+				},
+			},
+		},
+	}
+	b, _ := json.Marshal(cfg)
+	return string(b)
 }
 
 // runTurn executes one turn through the adapter, translating normalized
@@ -595,11 +663,110 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
 		return fmt.Errorf("turn failed: process_error: %v", turnErr)
 	default:
+		// §35: do not hibernate underneath an attached user. An active
+		// attach keeps the instance awake (idle, session active); the
+		// hibernation happens when the last attach is closed.
+		if d.attached(spec.InstanceID) {
+			_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+				"instanceId": spec.InstanceID, "status": "idle",
+			})
+			d.Log.Info("turn completed; instance kept awake (attach active)",
+				"instance", spec.InstanceID)
+			return nil
+		}
 		// Completed: hibernate with the session preserved.
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
 		})
+	}
+	return nil
+}
+
+// --- attach sessions (§35) ---------------------------------------------------
+
+func (d *Daemon) addAttach(instanceID, sessionID string) {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
+	if d.attaches[instanceID] == nil {
+		d.attaches[instanceID] = map[string]time.Time{}
+	}
+	d.attaches[instanceID][sessionID] = time.Now()
+}
+
+// removeAttach drops an attach session and reports whether it was the
+// last one for the instance.
+func (d *Daemon) removeAttach(instanceID, sessionID string) bool {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
+	sess := d.attaches[instanceID]
+	delete(sess, sessionID)
+	if len(sess) == 0 {
+		delete(d.attaches, instanceID)
+	}
+	return len(sess) == 0
+}
+
+func (d *Daemon) attached(instanceID string) bool {
+	d.attachMu.Lock()
+	defer d.attachMu.Unlock()
+	return len(d.attaches[instanceID]) > 0
+}
+
+// doAttach registers an active interactive session. A hibernated instance
+// is woken so the user has a live agent; a busy one finishes its current
+// turn first (which will then keep it awake because the attach is active).
+func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayload) error {
+	row, ok, err := d.state.GetInstance(p.InstanceID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("unknown instance %s", p.InstanceID)
+	}
+	switch row.Status {
+	case "blocked", "failed", "stopped":
+		return fmt.Errorf("instance %s is %s; attach refused", p.InstanceID, row.Status)
+	}
+	d.addAttach(p.InstanceID, p.SessionID)
+	if d.busy(p.InstanceID) {
+		d.Log.Info("attach active; instance is finishing its current turn",
+			"instance", p.InstanceID)
+		return nil
+	}
+	if row.Status == "hibernated" {
+		d.Log.Info("attach wakes hibernated instance", "instance", p.InstanceID)
+		input := "You were woken. Reason: a human attached an interactive session."
+		return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, "user_input"))
+	}
+	d.Log.Info("attach active (instance already awake)", "instance", p.InstanceID)
+	return nil
+}
+
+// doDetach closes an interactive session. When it was the last one and the
+// instance is idle with no turn running, the instance returns to normal
+// hibernation (§35: "once detached and safe, the managed runtime may
+// return to normal hibernation").
+func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayload) error {
+	last := d.removeAttach(p.InstanceID, p.SessionID)
+	if !last {
+		return nil
+	}
+	row, ok, err := d.state.GetInstance(p.InstanceID)
+	if err != nil || !ok {
+		return nil
+	}
+	if d.busy(p.InstanceID) {
+		// The finishing turn sees no active attach and will hibernate.
+		return nil
+	}
+	if row.Status == "idle" {
+		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
+			"instanceId": p.InstanceID, "sessionId": row.SessionID,
+		})
+		d.Log.Info("last attach closed; instance hibernated", "instance", p.InstanceID)
 	}
 	return nil
 }
