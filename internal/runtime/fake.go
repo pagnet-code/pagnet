@@ -189,7 +189,7 @@ func normalize(ev wireEvent) TurnEvent {
 	}
 	switch ev.Event {
 	case EventSessionStarted, EventSessionResumed, EventTurnStarted,
-		EventTurnOutput, EventTurnCompleted, EventSessionLost:
+		EventTurnOutput, EventTurnCompleted, EventTurnFailed, EventSessionLost:
 		// pass through
 	default:
 		// Unknown event names from the helper are surfaced as output so

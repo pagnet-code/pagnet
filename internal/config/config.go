@@ -73,6 +73,11 @@ type Daemon struct {
 	AllowedRoots []string
 	// HeartbeatInterval for the outbound connection.
 	HeartbeatInterval time.Duration
+	// RuntimeEnv carries extra KEY=VALUE env pairs applied to spawned
+	// runtime processes. Real deployments leave it empty; the E2E suite
+	// uses it for fake-runtime simulation knobs (e.g. AGENTNET_FAKE_
+	// RATELIMIT). Set via AGENTNET_RUNTIME_ENV (comma-separated).
+	RuntimeEnv []string
 }
 
 // LoadDaemon reads daemon config: env, then the daemon state file
@@ -89,6 +94,13 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		ServerURL:         envOr("AGENTNET_SERVER", ""),
 		HostName:          envOr("AGENTNET_HOST_NAME", defaultHostName()),
 		HeartbeatInterval: envDuration("AGENTNET_HEARTBEAT_INTERVAL", 15*time.Second),
+	}
+	if env := os.Getenv("AGENTNET_RUNTIME_ENV"); env != "" {
+		for _, kv := range strings.Split(env, ",") {
+			if kv = strings.TrimSpace(kv); kv != "" {
+				cfg.RuntimeEnv = append(cfg.RuntimeEnv, kv)
+			}
+		}
 	}
 	if file := filepath.Join(stateDir, "config.yaml"); exists(file) {
 		if err := loadDaemonYAML(file, &cfg); err == nil {

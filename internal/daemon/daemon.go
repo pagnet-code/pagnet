@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,11 @@ import (
 	agentruntime "agentnet/internal/runtime"
 	"agentnet/internal/transport"
 )
+
+// ErrDeferred means the command cannot be executed right now but must NOT
+// be acknowledged or failed: it stays queued server-side and is re-sent by
+// the host dispatcher (e.g. the instance is busy and maxConcurrentTurns=1).
+var ErrDeferred = errors.New("deferred: stays queued")
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
@@ -278,12 +284,20 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 }
 
 // guarded runs fn for a CommandID exactly once (idempotency gate) and acks.
+// A deferred outcome (ErrDeferred) is NOT acked: the command stays queued
+// server-side and the dispatcher re-sends it (§32: one active turn per
+// instance, multiple inbound items queue durably).
 func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error) {
 	if commandID != "" && d.alreadyProcessed(commandID) {
 		d.sendAck(conn, commandID, "")
 		return
 	}
-	if err := fn(); err != nil {
+	err := fn()
+	if errors.Is(err, ErrDeferred) {
+		d.Log.Debug("command deferred (stays queued)", "command", commandID)
+		return
+	}
+	if err != nil {
 		d.sendAck(conn, commandID, err.Error())
 		return
 	}
@@ -390,7 +404,12 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
 	}
-	// Cold start: the prior session is NOT resumed on restart.
+	// Cold start: the prior session is NOT resumed on restart — the local
+	// session reference is cleared so the next turn starts fresh (this is
+	// the explicit "Start fresh session" path after a lost session, §74).
+	if err := d.state.SetInstanceSession(instanceID, ""); err != nil {
+		return err
+	}
 	if err := d.state.SetInstanceStatus(instanceID, "idle", ""); err != nil {
 		return err
 	}
@@ -407,6 +426,11 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		// Not known locally yet (e.g. launched while we were offline). The
 		// server keeps the wake pending; re-evaluated on next launch.
 		return fmt.Errorf("unknown instance %s (wake deferred)", instanceID)
+	}
+	if row.Status == "blocked" || row.Status == "failed" || row.Status == "stopped" {
+		// §74/§88: a blocked/failed instance must not auto-resume or start
+		// a new session — only an explicit restart (human decision) does.
+		return fmt.Errorf("instance %s is %s; explicit restart required", instanceID, row.Status)
 	}
 	if d.busy(instanceID) {
 		d.Log.Info("instance busy; wake coalesced", "instance", instanceID)
@@ -425,11 +449,15 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	if !ok {
 		return fmt.Errorf("unknown instance %s (work stays queued server-side)", p.InstanceID)
 	}
+	if row.Status == "blocked" || row.Status == "failed" || row.Status == "stopped" {
+		// §74/§88: work stays durable server-side; no turn, no new session.
+		return fmt.Errorf("instance %s is %s; delivery refused until explicit restart", p.InstanceID, row.Status)
+	}
 	if d.busy(p.InstanceID) {
-		// maxConcurrentTurns=1: the work stays queued server-side until the
-		// current turn finishes and the instance is idle.
-		d.Log.Info("instance busy; delivery stays queued", "instance", p.InstanceID)
-		return nil
+		// maxConcurrentTurns=1: the delivery stays queued server-side
+		// (re-sent by the dispatcher) until the current turn finishes.
+		d.Log.Debug("instance busy; delivery stays queued", "instance", p.InstanceID)
+		return ErrDeferred
 	}
 	kind := p.Kind
 	if kind == "" {
@@ -506,7 +534,8 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		switch ev.Type {
 		case agentruntime.EventSessionStarted, agentruntime.EventSessionResumed:
 			sessionID = ev.SessionID
-			d.reportSession(conn, spec.InstanceID, ev.SessionID)
+			d.reportSession(conn, spec.InstanceID, ev.SessionID,
+				ev.Type == agentruntime.EventSessionResumed)
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 		case agentruntime.EventSessionLost:
 			sessionLost = true
@@ -527,24 +556,44 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	}
 	turnErr := <-turnDone
 
+	// The session this turn attempted: the live one if the runtime
+	// reported one, else the one we tried to resume (needed so the control
+	// plane can invalidate the exact stored session on session_lost,
+	// §74/§88).
+	attemptedSession := sessionID
+	if attemptedSession == "" {
+		attemptedSession = row.SessionID
+	}
+
 	switch {
 	case sessionLost:
-		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, sessionID,
+		// §74/§88: the resume failed — do NOT silently start a fresh
+		// session. Report the attempted session id so the control plane
+		// marks it invalid, drop the local reference, and block the
+		// instance until a human explicitly restarts (cold start).
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.state.SetInstanceSession(spec.InstanceID, "")
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case failedKind != "":
-		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, sessionID,
+		// The turn consumed no work: fail the command so a delivery's
+		// source message stays pending for re-delivery (§44) and a wake
+		// request is resolved as failed (never a silent no-op).
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", failedKind+":"+failedErr, failedRetry)
 		st := "failed"
 		if failedKind == "rate_limited" {
 			st = "rate_limited"
 		}
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case turnErr != nil:
 		// Adapter-level failure (spawn/IO), no turn events were produced.
-		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, sessionID,
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		return fmt.Errorf("turn failed: process_error: %v", turnErr)
 	default:
 		// Completed: hibernate with the session preserved.
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
@@ -555,12 +604,13 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	return nil
 }
 
-func (d *Daemon) reportSession(conn *websocket.Conn, instanceID, sessionID string) {
+func (d *Daemon) reportSession(conn *websocket.Conn, instanceID, sessionID string, resumed bool) {
 	_ = d.send(conn, transport.MsgRuntimeSession, map[string]any{
 		"instanceId":      instanceID,
 		"sessionId":       sessionID,
 		"resumeSupported": true,
 		"state":           "active",
+		"resumed":         resumed,
 	})
 }
 

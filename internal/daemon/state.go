@@ -120,6 +120,15 @@ func (s *State) SetInstanceStatus(instanceID, status, sessionID string) error {
 	return err
 }
 
+// SetInstanceSession explicitly sets the local session id; "" clears it
+// (cold start after a restart or a lost session).
+func (s *State) SetInstanceSession(instanceID, sessionID string) error {
+	_, err := s.db.Exec(`
+		UPDATE instances SET session_id=?, updated_at=? WHERE instance_id=?`,
+		sessionID, time.Now().UTC().Format(time.RFC3339), instanceID)
+	return err
+}
+
 // GetInstance fetches a local instance row.
 func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
 	row := s.db.QueryRow(`
