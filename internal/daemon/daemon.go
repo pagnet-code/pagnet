@@ -547,11 +547,34 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	if kind == "" {
 		kind = "notice"
 	}
-	input := p.Body
-	if p.AcceptanceCriteria != nil {
-		input += "\n\nAcceptance criteria:\n- " + strings.Join(p.AcceptanceCriteria, "\n- ")
+	// The turn input carries the context the agent needs to ACT through the
+	// network tools (reply needs the thread id, task updates need the task
+	// id) — not just the rendered text.
+	var input strings.Builder
+	switch kind {
+	case "ask", "reply":
+		fmt.Fprintf(&input, "[agentnet %s] from=%s thread=%s message=%s\n",
+			kind, dashOr(p.FromAgent), dashOr(p.ThreadID), dashOr(p.MessageID))
+	case "task":
+		fmt.Fprintf(&input, "[agentnet task] id=%s from=%s\n",
+			dashOr(p.TaskID), dashOr(p.FromAgent))
+	case "status":
+		fmt.Fprintf(&input, "[agentnet status] from=%s\n", dashOr(p.FromAgent))
+	default: // notice
+		fmt.Fprintf(&input, "[agentnet notice] from=%s\n", dashOr(p.FromAgent))
 	}
-	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, kind))
+	input.WriteString(p.Body)
+	if len(p.AcceptanceCriteria) > 0 {
+		input.WriteString("\n\nAcceptance criteria:\n- " + strings.Join(p.AcceptanceCriteria, "\n- "))
+	}
+	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input.String(), kind))
+}
+
+func dashOr(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func (d *Daemon) busy(instanceID string) bool {
