@@ -415,9 +415,6 @@ func filepathAbs(p string) (string, error) {
 // --- command implementations -------------------------------------------------
 
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
-	if !d.workspaceAllowed(p.WorkspacePath) {
-		return fmt.Errorf("workspace %q is not under an allowed root", p.WorkspacePath)
-	}
 	rn := domain.CanonicalRuntime(p.Runtime)
 	if _, ok := d.adapters[rn]; !ok {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
@@ -426,14 +423,32 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if access != domain.AccessReadOnly {
 		access = domain.AccessReadWrite
 	}
-	// §29: a second read/write agent on the same repository is isolated
-	// into an automatic git worktree (fail clearly if that is unsafe).
-	wsPath, err := d.resolveWorkspace(p, access)
-	if err != nil {
-		return err
+	var wsPath string
+	if p.WorkspacePath == "" {
+		// Representative (§37/§72): no git workspace; an AgentNet-managed
+		// stable runtime directory inside the daemon state.
+		wsPath = filepath.Join(d.StateDir, "representatives", p.InstanceID)
+		if err := os.MkdirAll(wsPath, 0o700); err != nil {
+			return err
+		}
+	} else {
+		if !d.workspaceAllowed(p.WorkspacePath) {
+			return fmt.Errorf("workspace %q is not under an allowed root", p.WorkspacePath)
+		}
+		// §29: a second read/write agent on the same repository is isolated
+		// into an automatic git worktree (fail clearly if that is unsafe).
+		var err error
+		wsPath, err = d.resolveWorkspace(p, access)
+		if err != nil {
+			return err
+		}
 	}
 	// Launch registers the instance as idle: process-per-turn means no
 	// process runs until work arrives (the runtime is the turn runner).
+	kind := p.Kind
+	if kind == "" {
+		kind = "worker"
+	}
 	if err := d.state.UpsertInstance(InstanceRow{
 		InstanceID:   p.InstanceID,
 		DefinitionID: p.DefinitionID,
@@ -444,6 +459,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		Access:       access,
 		AgentName:    p.AgentName,
 		NetworkID:    p.NetworkID,
+		Kind:         kind,
 	}); err != nil {
 		return err
 	}
@@ -558,6 +574,9 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	case "task":
 		fmt.Fprintf(&input, "[agentnet task] id=%s from=%s\n",
 			dashOr(p.TaskID), dashOr(p.FromAgent))
+	case "channel":
+		fmt.Fprintf(&input, "[agentnet channel] from=%s conversation=%s network=%s message=%s\n",
+			dashOr(p.FromAgent), dashOr(p.ConversationID), dashOr(p.NetworkID), dashOr(p.MessageID))
 	case "status":
 		fmt.Fprintf(&input, "[agentnet status] from=%s\n", dashOr(p.FromAgent))
 	default: // notice
@@ -606,14 +625,21 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 }
 
 // mcpConfig is the MCP client config the daemon injects into every
-// managed agent: the agentnet-mcp bridge over the daemon's local Unix
-// socket (the bridge authenticates to the daemon with the instance
-// identity — the host credential never reaches the agent, §5/§17).
+// managed agent: the bridge over the daemon's local Unix socket (the
+// bridge authenticates to the daemon with the instance identity — the
+// host credential never reaches the agent, §5/§17). Workers get the
+// agentnet-mcp surface (network_* tools); representatives get
+// agentnet-control (control_* tools) — the surfaces are separate
+// binaries on purpose (§9: reduces accidental privilege escalation).
 func (d *Daemon) mcpConfig(row *InstanceRow) string {
+	name, command := "agentnet", "agentnet-mcp"
+	if row.Kind == "representative" {
+		name, command = "agentnet-control", "agentnet-control"
+	}
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
-			"agentnet": map[string]any{
-				"command": "agentnet-mcp",
+			name: map[string]any{
+				"command": command,
 				"args":    []string{"--socket", filepath.Join(d.StateDir, "agentnetd.sock")},
 				"env": map[string]string{
 					"AGENTNET_INSTANCE_ID": row.InstanceID,

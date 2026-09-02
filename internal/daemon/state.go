@@ -45,7 +45,8 @@ func OpenState(path string) (*State, error) {
 			updated_at    TEXT NOT NULL,
 			access        TEXT NOT NULL DEFAULT 'read_write',
 			agent_name    TEXT NOT NULL DEFAULT '',
-			network_id    TEXT NOT NULL DEFAULT ''
+			network_id    TEXT NOT NULL DEFAULT '',
+			kind          TEXT NOT NULL DEFAULT 'worker'
 		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
@@ -60,6 +61,7 @@ func OpenState(path string) (*State, error) {
 		`ALTER TABLE instances ADD COLUMN access TEXT NOT NULL DEFAULT 'read_write'`,
 		`ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN network_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'`,
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -102,6 +104,7 @@ type InstanceRow struct {
 	Access       string // read_write (default) | read_only (§29)
 	AgentName    string
 	NetworkID    string
+	Kind         string // worker (default) | representative
 }
 
 // UpsertInstance records/updates a local instance.
@@ -110,8 +113,8 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 		r.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id, kind)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (instance_id) DO UPDATE SET
 			definition_id = excluded.definition_id,
 			runtime = excluded.runtime,
@@ -123,9 +126,10 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 			updated_at = excluded.updated_at,
 			access = excluded.access,
 			agent_name = excluded.agent_name,
-			network_id = excluded.network_id`,
+			network_id = excluded.network_id,
+			kind = excluded.kind`,
 		r.InstanceID, r.DefinitionID, r.Runtime, r.Workspace, r.Profile, r.Status, r.SessionID, r.PID, r.UpdatedAt,
-		r.Access, r.AgentName, r.NetworkID)
+		r.Access, r.AgentName, r.NetworkID, r.Kind)
 	return err
 }
 
@@ -157,12 +161,13 @@ func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
 	row := s.db.QueryRow(`
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
 		       COALESCE(session_id,''), pid, updated_at,
-		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,'')
+		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
+		       COALESCE(kind,'worker')
 		FROM instances WHERE instance_id = ?`, instanceID)
 	var r InstanceRow
 	var pid sql.NullInt64
 	err := row.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace, &r.Profile,
-		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID)
+		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID, &r.Kind)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
@@ -181,7 +186,8 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 	rows, err := s.db.Query(`
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
 		       COALESCE(session_id,''), pid, updated_at,
-		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,'')
+		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
+		       COALESCE(kind,'worker')
 		FROM instances ORDER BY instance_id`)
 	if err != nil {
 		return nil, err
@@ -193,7 +199,7 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 		var pid sql.NullInt64
 		if err := rows.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace,
 			&r.Profile, &r.Status, &r.SessionID, &pid, &r.UpdatedAt,
-			&r.Access, &r.AgentName, &r.NetworkID); err != nil {
+			&r.Access, &r.AgentName, &r.NetworkID, &r.Kind); err != nil {
 			return nil, err
 		}
 		if pid.Valid {
