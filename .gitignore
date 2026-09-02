@@ -1,0 +1,30 @@
+# Go
+/bin/
+dist/
+*.test
+*.out
+coverage.txt
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+web/.env*.local
+web/playwright-report/
+web/test-results/
+
+# Local state / daemon
+*.sqlite
+*.sqlite3
+*.db
+*.sock
+agentnet*.log
+
+# Local environment (secrets); example.env stays tracked
+deploy/.env
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
