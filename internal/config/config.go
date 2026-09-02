@@ -61,6 +61,10 @@ func LoadServer() (Server, error) {
 type Daemon struct {
 	// ServerURL is the control plane base URL (https:// or http://localhost).
 	ServerURL string
+	// Credential is the host credential (Bearer) issued at enrollment.
+	Credential string
+	// HostID is the host's registered id (set at enrollment).
+	HostID string
 	// StateDir is the daemon's local state directory (default ~/.agentnet).
 	StateDir string
 	// HostName is the host's registered name.

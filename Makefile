@@ -37,6 +37,7 @@ build:
 	$(GO) build -o $(BIN)/agentnetd ./cmd/agentnetd
 	$(GO) build -o $(BIN)/agentnet-mcp ./cmd/agentnet-mcp
 	$(GO) build -o $(BIN)/agentnet ./cmd/agentnet
+	$(GO) build -o $(BIN)/agentnet-fake-runtime ./cmd/agentnet-fake-runtime
 
 test:
 	$(GO) test ./...
