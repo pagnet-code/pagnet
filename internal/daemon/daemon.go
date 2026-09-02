@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -60,6 +61,21 @@ type Daemon struct {
 	// and the next attach re-wakes it.
 	attachMu sync.Mutex
 	attaches map[string]map[string]time.Time // instanceID -> attachSessionID
+
+	// Live host connection (for the bridge relay; nil while disconnected).
+	connMu  sync.Mutex
+	curConn *websocket.Conn
+	// websocket.Conn allows ONE concurrent writer; the heartbeat, command
+	// acks, and bridge relay all share the connection, so writes serialize.
+	writeMu sync.Mutex
+
+	// Pending agent.request -> waiting bridge-socket client.
+	pendingMu sync.Mutex
+	pending   map[string]chan transport.AgentResponsePayload
+
+	// Bridge Unix socket listener (agent MCP bridge, PROTOCOL §6).
+	bridgeMu sync.Mutex
+	bridgeL  net.Listener
 }
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
@@ -88,17 +104,27 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		},
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
+		pending:     map[string]chan transport.AgentResponsePayload{},
 	}
 	return d, nil
 }
 
-func (d *Daemon) Close() error { return d.state.Close() }
+func (d *Daemon) Close() error {
+	d.stopBridgeSocket()
+	return d.state.Close()
+}
 
 // Run connects and stays connected (reconnecting with backoff) until ctx is
 // canceled.
 func (d *Daemon) Run(ctx context.Context) error {
 	if d.Credential == "" {
 		return fmt.Errorf("no host credential; run `agentnet login` first")
+	}
+	// The agent bridge socket is local and independent of the WSS
+	// connection: it is up as soon as the daemon is, and relayed calls
+	// fail cleanly (not hang) while the host connection is down.
+	if err := d.startBridgeSocket(); err != nil {
+		return err
 	}
 	backoff := time.Second
 	for ctx.Err() == nil {
@@ -147,6 +173,14 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	d.connMu.Lock()
+	d.curConn = conn
+	d.connMu.Unlock()
+	defer func() {
+		d.connMu.Lock()
+		d.curConn = nil
+		d.connMu.Unlock()
+	}()
 	d.Log.Info("connected to control plane")
 
 	// Announce inventory on (re)connect: runtimes + workspaces, and it
@@ -189,6 +223,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			d.Log.Warn("bad envelope from server", "err", err)
 			continue
 		}
+		if env.Type == transport.MsgAgentResponse {
+			d.deliverAgentResponse(env)
+			continue
+		}
 		d.handleCommand(conn, env)
 	}
 }
@@ -203,6 +241,13 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 	if err != nil {
 		return err
 	}
+	return d.write(conn, raw)
+}
+
+// write serializes a raw write to the host connection (single-writer rule).
+func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
 	return conn.WriteMessage(websocket.TextMessage, raw)
 }
 
