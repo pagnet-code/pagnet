@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 
 	"agentnet/internal/domain"
 )
@@ -31,12 +30,11 @@ type Fake struct {
 	// processes (E2E simulation knobs, e.g. AGENTNET_FAKE_RATELIMIT).
 	Env []string
 
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
+	track procTracker
 }
 
 func NewFake(binary string) *Fake {
-	return &Fake{Binary: binary, procs: map[string]*exec.Cmd{}}
+	return &Fake{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
 }
 
 func (f *Fake) Name() domain.RuntimeName { return domain.RuntimeFake }
@@ -77,7 +75,7 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = spec.Workspace
-	cmd.Env = append(append(os.Environ(), f.Env...), spec.Env...)
+	cmd.Env = ChildEnv(f.Env, spec.Env)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -92,10 +90,8 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn fake runtime: %w", err)
 	}
-	f.mu.Lock()
-	f.procs[spec.InstanceID] = cmd
-	f.mu.Unlock()
-	defer f.release(spec.InstanceID, cmd)
+	f.track.track(spec.InstanceID, cmd)
+	defer f.track.release(spec.InstanceID, cmd)
 
 	// Send the turn spec.
 	specWire := map[string]any{
@@ -142,23 +138,9 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 }
 
 // Stop kills the running process for an instance.
-func (f *Fake) Stop(instanceID string) error {
-	f.mu.Lock()
-	cmd := f.procs[instanceID]
-	f.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
+func (f *Fake) Stop(instanceID string) error { return f.track.stop(instanceID) }
 
-func (f *Fake) release(instanceID string, cmd *exec.Cmd) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if cur, ok := f.procs[instanceID]; ok && cur == cmd {
-		delete(f.procs, instanceID)
-	}
-}
+func (f *Fake) PID(instanceID string) *int { return f.track.pid(instanceID) }
 
 // wireEvent is the fake-runtime helper's stdout event (already normalized).
 type wireEvent struct {

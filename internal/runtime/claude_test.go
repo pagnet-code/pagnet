@@ -354,10 +354,7 @@ func TestClaude_StopKillsProcess(t *testing.T) {
 	go func() { done <- c.StartTurn(context.Background(), claudeSpec(dir), events) }()
 	// Let the process spawn.
 	for i := 0; i < 200; i++ {
-		c.mu.Lock()
-		running := len(c.procs) > 0
-		c.mu.Unlock()
-		if running {
+		if c.PID("inst-1") != nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

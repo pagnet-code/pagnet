@@ -225,6 +225,32 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 	return out, rows.Err()
 }
 
+// DeleteInstance drops a local instance row (forget command: the
+// control plane deleted the instance).
+func (s *State) DeleteInstance(instanceID string) error {
+	_, err := s.db.Exec(`DELETE FROM instances WHERE instance_id = ?`, instanceID)
+	return err
+}
+
+// ReconcileRestart fixes local statuses that a dead process left behind:
+// a process-per-turn turn cannot survive a daemon restart, so 'working'
+// at startup is stale. Rows keep their session (resumable) and become
+// hibernated, or idle when they never had one. The control plane re-sends
+// the un-acked command, which re-wakes the instance and re-runs the turn.
+func (s *State) ReconcileRestart() (int64, error) {
+	res, err := s.db.Exec(`
+		UPDATE instances
+		SET status = CASE WHEN COALESCE(session_id, '') <> '' THEN 'hibernated' ELSE 'idle' END,
+		    updated_at = ?
+		WHERE status = 'working'`,
+		time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // KVGet / KVSet are a small persistent key-value store (e.g. last host id).
 func (s *State) KVGet(key string) (string, bool) {
 	var v string

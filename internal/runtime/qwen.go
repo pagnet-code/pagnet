@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"agentnet/internal/domain"
 )
@@ -53,12 +52,11 @@ type Qwen struct {
 	// Env is appended to the inherited environment for spawned processes.
 	Env []string
 
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
+	track procTracker
 }
 
 func NewQwen(binary string) *Qwen {
-	return &Qwen{Binary: binary, procs: map[string]*exec.Cmd{}}
+	return &Qwen{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
 }
 
 func (q *Qwen) Name() domain.RuntimeName { return domain.RuntimeQwenCode }
@@ -138,7 +136,7 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = append(append(os.Environ(), q.Env...), spec.Env...)
+	cmd.Env = ChildEnv(q.Env, spec.Env)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -153,8 +151,8 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn qwen: %w", err)
 	}
-	q.track(spec.InstanceID, cmd)
-	defer q.release(spec.InstanceID, cmd)
+	q.track.track(spec.InstanceID, cmd)
+	defer q.track.release(spec.InstanceID, cmd)
 
 	// The prompt goes on stdin: no ARG_MAX limit, no shell, no quoting.
 	_, _ = io.WriteString(stdin, spec.Input)
@@ -225,10 +223,13 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 			}
 			terminal = true
 			if ev.IsError {
-				// A reported failure: classify the text directly.
-				kind, retryAt := ClassifyProviderError(trunc(ev.Result), trunc(stderrBuf.String()))
+				// A reported failure: classify the text directly. (stderrBuf
+				// is owned by the copy goroutine until cmd.Wait below —
+				// reading it here would be a data race; ev.Result carries
+				// the message.)
+				kind, retryAt := ClassifyProviderError(trunc(ev.Result), trunc(lastText))
 				emit(TurnEvent{Type: EventTurnFailed, FailureKind: kind,
-					Error: trunc(firstNonEmpty(ev.Result, stderrBuf.String())), RetryAt: retryAt})
+					Error: trunc(firstNonEmpty(ev.Result, lastText)), RetryAt: retryAt})
 				break
 			}
 			// Providers can surface a 429/quota error inside a
@@ -282,29 +283,9 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 }
 
 // Stop kills the running process for an instance.
-func (q *Qwen) Stop(instanceID string) error {
-	q.mu.Lock()
-	cmd := q.procs[instanceID]
-	q.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
+func (q *Qwen) Stop(instanceID string) error { return q.track.stop(instanceID) }
 
-func (q *Qwen) track(instanceID string, cmd *exec.Cmd) {
-	q.mu.Lock()
-	q.procs[instanceID] = cmd
-	q.mu.Unlock()
-}
-
-func (q *Qwen) release(instanceID string, cmd *exec.Cmd) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if cur, ok := q.procs[instanceID]; ok && cur == cmd {
-		delete(q.procs, instanceID)
-	}
-}
+func (q *Qwen) PID(instanceID string) *int { return q.track.pid(instanceID) }
 
 // --- qwen stream-json wire shapes --------------------------------------------
 

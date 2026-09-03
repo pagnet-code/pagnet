@@ -126,22 +126,44 @@ type Daemon struct {
 	CurrentNetwork string
 }
 
-// LoadDaemon reads daemon config: env, then the daemon state file
+// LoadDaemon reads daemon config: env, then the env files (deploy/.env,
+// .env) for the daemon's own keys only, then the daemon state file
 // (stateDir/config.yaml) for persistent values (server URL, host name).
+//
+// Unlike LoadServer, the daemon NEVER os.Setenv values from the env files:
+// deploy/.env carries control-plane secrets (DATABASE_URL,
+// AGENTNET_ADMIN_TOKEN) and the daemon spawns untrusted agent processes —
+// a value set in the daemon's process environment would be inherited by
+// every runtime (spec §86.10: agent processes must not receive
+// control-plane credentials). The env files are consulted as a value
+// source only, for the keys the daemon itself needs.
 func LoadDaemon(stateDir string) (Daemon, error) {
-	LoadEnvFile("deploy/.env")
-	LoadEnvFile(".env")
+	// deploy/.env wins over ./.env, matching the LoadEnvFile order used
+	// by the server (first file seen sets the value).
+	envFiles := loadEnvFileMap(".env")
+	for k, v := range loadEnvFileMap("deploy/.env") {
+		envFiles[k] = v
+	}
+	get := func(key, def string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		if v, ok := envFiles[key]; ok && v != "" {
+			return v
+		}
+		return def
+	}
 	if stateDir == "" {
 		home, _ := os.UserHomeDir()
 		stateDir = filepath.Join(home, ".agentnet")
 	}
 	cfg := Daemon{
 		StateDir:          stateDir,
-		ServerURL:         envOr("AGENTNET_SERVER", ""),
-		HostName:          envOr("AGENTNET_HOST_NAME", defaultHostName()),
+		ServerURL:         get("AGENTNET_SERVER", ""),
+		HostName:          get("AGENTNET_HOST_NAME", defaultHostName()),
 		HeartbeatInterval: envDuration("AGENTNET_HEARTBEAT_INTERVAL", 15*time.Second),
 	}
-	if env := os.Getenv("AGENTNET_RUNTIME_ENV"); env != "" {
+	if env := get("AGENTNET_RUNTIME_ENV", ""); env != "" {
 		for _, kv := range strings.Split(env, ",") {
 			if kv = strings.TrimSpace(kv); kv != "" {
 				cfg.RuntimeEnv = append(cfg.RuntimeEnv, kv)
@@ -171,10 +193,23 @@ func exists(p string) bool {
 
 // LoadEnvFile reads KEY=VALUE lines from p and sets any variable that is not
 // already present in the environment. Missing file is not an error.
+// Restricted to LoadServer: the server process is trusted, while the daemon
+// (which spawns agent processes) must use loadEnvFileMap instead.
 func LoadEnvFile(p string) {
+	for k, v := range loadEnvFileMap(p) {
+		if _, present := os.LookupEnv(k); !present {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
+// loadEnvFileMap parses KEY=VALUE lines from p into a map without touching
+// the process environment. Missing file is not an error.
+func loadEnvFileMap(p string) map[string]string {
+	out := map[string]string{}
 	f, err := os.Open(p)
 	if err != nil {
-		return
+		return out
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -192,10 +227,9 @@ func LoadEnvFile(p string) {
 		if key == "" {
 			continue
 		}
-		if _, present := os.LookupEnv(key); !present {
-			_ = os.Setenv(key, val)
-		}
+		out[key] = val
 	}
+	return out
 }
 
 func envOr(key, def string) string {

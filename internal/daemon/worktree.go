@@ -115,6 +115,28 @@ func (d *Daemon) resolveWorkspace(p transport.LaunchAgentPayload, access string)
 	return p.WorkspacePath, nil
 }
 
+// removeWorktree removes the instance's isolated worktree when its
+// workspace is a managed one (<checkout>/.agentnet/worktrees/<id>). The
+// BRANCH is kept — the work product stays reachable as a branch; only
+// the duplicate checkout goes away. Best-effort: a dirty worktree is
+// kept and logged, never force-removed.
+func (d *Daemon) removeWorktree(row *InstanceRow) {
+	wt := row.Workspace
+	if filepath.Base(filepath.Dir(wt)) != "worktrees" ||
+		filepath.Base(filepath.Dir(filepath.Dir(wt))) != ".agentnet" {
+		return
+	}
+	checkout := filepath.Dir(filepath.Dir(filepath.Dir(wt)))
+	if !isGitRepo(checkout) {
+		return
+	}
+	if out, err := gitOut(checkout, "worktree", "remove", wt); err != nil {
+		d.Log.Warn("worktree remove failed (kept)", "worktree", wt, "err", err, "out", out)
+		return
+	}
+	d.Log.Info("removed isolated worktree (branch kept)", "worktree", wt)
+}
+
 // ensureWorktree creates (or reuses) the worktree for instanceID in the
 // repository containing fromRepo. It is idempotent across daemon
 // restarts and command replays.

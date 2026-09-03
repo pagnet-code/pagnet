@@ -91,4 +91,8 @@ type Adapter interface {
 	Stop(instanceID string) error
 	// Available reports whether this runtime is installed and usable.
 	Available() bool
+	// PID is the OS pid of the instance's currently running turn process
+	// (spec §59), or nil when no turn is running (process-per-turn: the
+	// process only exists for the duration of a turn).
+	PID(instanceID string) *int
 }

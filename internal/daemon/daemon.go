@@ -55,6 +55,21 @@ type Daemon struct {
 	turnMu      sync.Mutex
 	activeTurns map[string]bool
 
+	// turnCtx cancels when the daemon shuts down (Close): adapters kill
+	// the running turn subprocess on cancellation (spec §90: context
+	// cancellation must terminate subprocess work), so a SIGTERM never
+	// orphans a mid-turn process.
+	turnCtx    context.Context
+	turnCancel context.CancelFunc
+
+	// Per-repository lock serializing the §29 isolation decision
+	// (resolveWorkspace) and the instance registration that follows it:
+	// concurrent launches of different instances run on parallel
+	// per-instance queues, and two near-simultaneous RW launches must not
+	// both decide they are the "first RW agent" on a repository.
+	repoLockMu sync.Mutex
+	repoLocks  map[string]*sync.Mutex
+
 	// Active attach sessions per instance (§35: no hibernation
 	// underneath an attached user). In-memory: a daemon restart drops
 	// the tracking, which is safe — worst case the instance hibernates
@@ -126,6 +141,11 @@ type instQueue struct {
 	mu   sync.Mutex
 	ch   chan func()
 	live bool
+	// done is closed by finishQueue when the instance is stopped/forgotten:
+	// the worker exits instead of ranging on a never-closed channel forever
+	// (one dormant goroutine per instance id is an unbounded leak in a
+	// long-lived daemon).
+	done chan struct{}
 }
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
@@ -145,6 +165,7 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 	}
 	fake := agentruntime.NewFake("")
 	fake.Env = cfg.RuntimeEnv
+	turnCtx, turnCancel := context.WithCancel(context.Background())
 	d := &Daemon{
 		Config: cfg,
 		Log:    log,
@@ -159,11 +180,21 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		pending:     map[string]chan transport.AgentResponsePayload{},
 		instQueues:  map[string]*instQueue{},
 		seen:        map[string]time.Time{},
+		turnCtx:     turnCtx,
+		turnCancel:  turnCancel,
+		repoLocks:   map[string]*sync.Mutex{},
 	}
 	// Spec §91: start from a bounded dedup set (drops rows prunable
 	// while the daemon was down).
 	if err := st.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
 		log.Warn("prune processed_commands at startup", "err", err)
+	}
+	// §66: a process-per-turn turn cannot survive a daemon restart, so a
+	// locally 'working' row at startup is stale (its subprocess is gone).
+	// Reconcile to hibernated/idle; the server re-sends the un-acked
+	// command, which re-wakes the instance and re-runs the turn.
+	if n, err := st.ReconcileRestart(); err == nil && n > 0 {
+		log.Warn("reconciled instances left working by a previous run", "n", n)
 	}
 	return d, nil
 }
@@ -171,11 +202,17 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 // enqueueInstance queues fn for one instance: strict per-instance FIFO,
 // parallel across instances. The read loop hands the job over and keeps
 // reading — even while a long turn occupies the instance's worker.
-func (d *Daemon) enqueueInstance(instanceID string, fn func()) {
+//
+// Returns false WITHOUT enqueuing when the instance's queue is full: the
+// command was never acked, so the server's dispatcher re-sends it on the
+// next tick and it is retried then. (Blocking here would stall the WSS
+// read loop — heartbeats, other instances, the bridge relay — until the
+// busy worker drained, which for a real-runtime turn is minutes.)
+func (d *Daemon) enqueueInstance(instanceID string, fn func()) bool {
 	d.queueMu.Lock()
 	q, ok := d.instQueues[instanceID]
 	if !ok {
-		q = &instQueue{ch: make(chan func(), 64)}
+		q = &instQueue{ch: make(chan func(), 64), done: make(chan struct{})}
 		d.instQueues[instanceID] = q
 	}
 	d.queueMu.Unlock()
@@ -184,25 +221,59 @@ func (d *Daemon) enqueueInstance(instanceID string, fn func()) {
 	if !q.live {
 		q.live = true
 		go func() {
-			for job := range q.ch {
-				job()
+			for {
+				select {
+				case <-q.done:
+					return
+				case job := <-q.ch:
+					job()
+				}
 			}
 		}()
 	}
 	select {
 	case q.ch <- fn:
-	default:
-		// Pathological backlog (64 queued commands for ONE instance):
-		// apply backpressure instead of buffering unboundedly. The read
-		// loop blocks until the instance's worker has room.
 		q.mu.Unlock()
-		q.ch <- fn
-		return
+		return true
+	default:
+		q.mu.Unlock()
+		d.Log.Warn("instance command queue full; dropping (server re-send retries)",
+			"instance", instanceID)
+		return false
 	}
-	q.mu.Unlock()
 }
 
+// finishQueue removes an instance's queue and stops its worker. The
+// instance is stopped/forgotten: any still-queued jobs are un-acked, so
+// the server re-sends them (they will be refused/finalized on the fresh
+// queue) — nothing is silently lost.
+func (d *Daemon) finishQueue(instanceID string) {
+	d.queueMu.Lock()
+	q, ok := d.instQueues[instanceID]
+	if ok {
+		delete(d.instQueues, instanceID)
+	}
+	d.queueMu.Unlock()
+	if ok {
+		close(q.done)
+	}
+}
+
+// Close shuts the daemon down: cancels in-flight turns (adapters kill the
+// turn subprocess, spec §90), waits briefly for them to die, then closes
+// the bridge socket and state.
 func (d *Daemon) Close() error {
+	d.turnCancel()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		d.turnMu.Lock()
+		n := len(d.activeTurns)
+		d.turnMu.Unlock()
+		if n == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	d.stopBridgeSocket()
 	return d.state.Close()
 }
@@ -285,10 +356,17 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	defer heartbeat.Stop()
 	maint := time.NewTicker(maintenanceEvery)
 	defer maint.Stop()
+	// Exits when THIS connection ends (not only on daemon shutdown) — a
+	// goroutine that only watches ctx would survive every reconnect as a
+	// dormant leak capturing the dead conn.
+	connDone := make(chan struct{})
+	defer close(connDone)
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-connDone:
 				return
 			case <-heartbeat.C:
 				d.sendHeartbeat(conn)
@@ -328,8 +406,18 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	}
 }
 
-// send wraps a payload in a versioned envelope and writes it.
+// send wraps a payload in a versioned envelope and writes it. It prefers
+// the CURRENT host connection over the one captured when the caller was
+// queued: a turn runs for minutes, and if the connection drops and
+// reconnects mid-turn, the turn events and acks must go out on the live
+// connection — writing to the captured (dead) conn would silently lose
+// the runtime audit trail.
 func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
+	d.connMu.Lock()
+	if cur := d.curConn; cur != nil {
+		conn = cur
+	}
+	d.connMu.Unlock()
 	env, err := transport.NewEnvelope(msgType, payload)
 	if err != nil {
 		return err
@@ -342,7 +430,12 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 }
 
 // write serializes a raw write to the host connection (single-writer rule).
+// A nil conn (disconnected with no live connection yet) is a clean error —
+// the caller's command stays un-acked and the server re-sends it.
 func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
+	if conn == nil {
+		return errors.New("no host connection")
+	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	return conn.WriteMessage(websocket.TextMessage, raw)
@@ -356,8 +449,6 @@ func (d *Daemon) sendAck(conn *websocket.Conn, commandID, errMsg string) {
 }
 
 func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
 	metrics := transport.HeartbeatPayload{
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
@@ -367,18 +458,30 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 	if load, err := readLoadAvg(); err == nil {
 		metrics.Metrics.CPULoad = load
 	}
-	metrics.Metrics.MemTotalBytes = int64(mem.Sys)
-	metrics.Metrics.MemUsedBytes = int64(mem.HeapAlloc)
+	// Host memory from /proc/meminfo (NOT the daemon's Go heap — the old
+	// values reported the daemon process as the whole machine).
+	if total, used, ok := readMemInfo(); ok {
+		metrics.Metrics.MemTotalBytes = total
+		metrics.Metrics.MemUsedBytes = used
+	}
 	if diskFree, err := readDiskFree(d.StateDir); err == nil {
 		metrics.Metrics.DiskFreeBytes = diskFree
 	}
 	insts, err := d.state.ListInstances()
 	if err == nil {
 		for _, i := range insts {
-			metrics.Instances = append(metrics.Instances, transport.InstanceStatus{
+			ist := transport.InstanceStatus{
 				InstanceID: i.InstanceID,
 				Status:     i.Status,
-			})
+			}
+			// §59: the running turn's process id (process-per-turn: set
+			// only while a turn is in flight).
+			if ad, ok := d.adapters[domain.RuntimeName(i.Runtime)]; ok {
+				if p := ad.PID(i.InstanceID); p != nil {
+					ist.PID = *p
+				}
+			}
+			metrics.Instances = append(metrics.Instances, ist)
 		}
 	}
 	_ = d.send(conn, transport.MsgHeartbeat, metrics)
@@ -392,6 +495,13 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // remembered in local SQLite (marked processed on success). A daemon crash
 // mid-flight causes at most one re-execution, which every handler
 // tolerates.
+//
+// Re-send dedup happens AT ENQUEUE, not at execution: while a command is
+// un-acked the server re-dispatches it every 2 s, and per-instance FIFO
+// queues would park those re-sends behind the original until a long turn
+// finished — filling the queue and stalling the read loop. Claiming on
+// enqueue means at most ONE copy of an un-acked command ever sits in the
+// queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
 	case transport.MsgLaunchAgent:
@@ -399,7 +509,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doLaunch(conn, p) })
 		})
 
@@ -408,7 +518,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doStop(conn, p.InstanceID) })
 		})
 
@@ -417,7 +527,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doRestart(conn, p.InstanceID) })
 		})
 
@@ -426,7 +536,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil || p.WakeRequestID == "" {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.WakeRequestID, func() {
 			d.guarded(conn, p.WakeRequestID, func() error { return d.doWake(conn, p.InstanceID, p.Reason) })
 		})
 
@@ -435,7 +545,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doDeliver(conn, p) })
 		})
 
@@ -444,7 +554,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
 		})
 
@@ -453,7 +563,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
 		})
 
@@ -462,8 +572,17 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.enqueueInstance(p.InstanceID, func() {
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doTerminalInput(conn, p) })
+		})
+
+	case transport.MsgForgetInstance:
+		var p transport.ForgetInstancePayload
+		if env.DecodePayload(&p) != nil {
+			return
+		}
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doForget(conn, p.InstanceID) })
 		})
 
 	case transport.MsgRequestInventory:
@@ -476,32 +595,46 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	}
 }
 
-// guarded runs fn for a CommandID exactly once (idempotency gate) and acks.
-// A deferred outcome (ErrDeferred) is NOT acked: the command stays queued
-// server-side and the dispatcher re-sends it (§32: one active turn per
-// instance, multiple inbound items queue durably).
-//
-// Re-send dedup: while a command is un-acked the server re-dispatches it
-// every 2 s, and the per-instance FIFO queues those re-sends behind the
-// original. The claim below makes the second+ copies no-ops — a terminal
-// FAILURE keeps its claim (the failed command is never re-run; recovery is
-// a NEW command: the coordinator's schedule_retry wake, §45), while a
-// DEFERRED result releases it (nothing was handled; the re-send must run).
-func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error) {
-	if commandID != "" && d.alreadyProcessed(commandID) {
-		d.sendAck(conn, commandID, "")
-		return
-	}
+// enqueueCommand applies the re-send dedup gate and enqueues job for
+// instanceID:
+//   - already processed (persisted): acked here, not enqueued;
+//   - already claimed (queued or in flight): dropped silently — the
+//     original copy owns the outcome;
+//   - new: claimed, then enqueued. A queue-overflow drop releases the
+//     claim again: the command is un-acked, so the server's re-send must
+//     be the one that runs.
+func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID string, job func()) {
 	if commandID != "" {
+		if d.alreadyProcessed(commandID) {
+			d.sendAck(conn, commandID, "")
+			return
+		}
 		d.seenMu.Lock()
 		if _, dup := d.seen[commandID]; dup {
 			d.seenMu.Unlock()
-			d.Log.Debug("duplicate command dropped (already claimed)", "command", commandID)
+			d.Log.Debug("duplicate command dropped at enqueue", "command", commandID)
 			return
 		}
 		d.seen[commandID] = time.Now()
 		d.seenMu.Unlock()
 	}
+	if !d.enqueueInstance(instanceID, job) {
+		if commandID != "" {
+			d.seenMu.Lock()
+			delete(d.seen, commandID)
+			d.seenMu.Unlock()
+		}
+	}
+}
+
+// guarded runs an already-claimed command (claim taken in enqueueCommand)
+// and acks it. A deferred outcome (ErrDeferred) is NOT acked — and it
+// RELEASES the claim: the command stays queued server-side and the
+// dispatcher's re-send is the one that must run (§32: one active turn per
+// instance, multiple inbound items queue durably). A terminal FAILURE
+// keeps its claim (the failed command is never re-run; recovery is a NEW
+// command: the coordinator's schedule_retry wake, §45).
+func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error) {
 	err := fn()
 	if errors.Is(err, ErrDeferred) {
 		if commandID != "" {
@@ -547,18 +680,18 @@ func (d *Daemon) maintainState() {
 	}
 }
 
-// workspaceAllowed validates a path against the allowed roots (cleaned
+// workspaceAllowed validates a path against the allowed roots (resolved
 // absolute prefix match).
 func (d *Daemon) workspaceAllowed(path string) bool {
 	if path == "" {
 		return false
 	}
-	clean, err := filepathAbs(path)
+	clean, err := pathResolved(path)
 	if err != nil {
 		return false
 	}
 	for _, root := range d.AllowedRoots {
-		rc, err := filepathAbs(root)
+		rc, err := pathResolved(root)
 		if err != nil {
 			continue
 		}
@@ -567,6 +700,30 @@ func (d *Daemon) workspaceAllowed(path string) bool {
 		}
 	}
 	return false
+}
+
+// pathResolved is Abs+Clean plus symlink resolution (spec §11: an allowed
+// root must not be bypassed by a symlink pointing outside it). The
+// workspace may not exist yet, so the LONGEST EXISTING PREFIX is resolved
+// (EvalSymlinks fails on missing paths) — a symlink component anywhere in
+// an existing prefix is still resolved.
+func pathResolved(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	for cur := abs; ; {
+		if ev, err := filepath.EvalSymlinks(cur); err == nil {
+			rest, _ := filepath.Rel(cur, abs)
+			return filepath.Clean(filepath.Join(ev, rest)), nil
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		cur = parent
+	}
 }
 
 func filepathAbs(p string) (string, error) {
@@ -581,14 +738,24 @@ func filepathAbs(p string) (string, error) {
 
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
 	rn := domain.CanonicalRuntime(p.Runtime)
-	if _, ok := d.adapters[rn]; !ok {
+	ad, ok := d.adapters[rn]
+	if !ok {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
+	}
+	if !ad.Available() {
+		// Fail the launch now, not at the first turn: a host without the
+		// runtime CLI must not ack a clean launch and idle until work
+		// arrives.
+		return fmt.Errorf("runtime %q is not installed on this host", p.Runtime)
 	}
 	access := p.Access
 	if access != domain.AccessReadOnly {
 		access = domain.AccessReadWrite
 	}
-	var wsPath string
+	var (
+		wsPath string
+		lock   *sync.Mutex
+	)
 	if p.WorkspacePath == "" {
 		// Representative (§37/§72): no git workspace; an AgentNet-managed
 		// stable runtime directory inside the daemon state.
@@ -600,11 +767,21 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		if !d.workspaceAllowed(p.WorkspacePath) {
 			return fmt.Errorf("workspace %q is not under an allowed root", p.WorkspacePath)
 		}
-		// §29: a second read/write agent on the same repository is isolated
-		// into an automatic git worktree (fail clearly if that is unsafe).
+		// §29 race: the "first RW agent keeps the checkout" decision and
+		// the instance registration below must be atomic per repository —
+		// launches for different instances run on parallel per-instance
+		// queues, so without this lock two near-simultaneous RW launches
+		// could both read "no other RW agent" and both keep the main
+		// checkout.
+		lock = d.repoLock(workspaceLockKey(p.WorkspacePath))
+		lock.Lock()
+		// §29: a second read/write agent on the same repository is
+		// isolated into an automatic git worktree (fail clearly if that
+		// is unsafe).
 		var err error
 		wsPath, err = d.resolveWorkspace(p, access)
 		if err != nil {
+			lock.Unlock()
 			return err
 		}
 	}
@@ -626,7 +803,13 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		NetworkID:    p.NetworkID,
 		Kind:         kind,
 	}); err != nil {
+		if lock != nil {
+			lock.Unlock()
+		}
 		return err
+	}
+	if lock != nil {
+		lock.Unlock()
 	}
 	msg := "agent launched (idle, process-per-turn)"
 	if wsPath != p.WorkspacePath {
@@ -636,6 +819,29 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": p.InstanceID})
 	return nil
+}
+
+// repoLock returns the per-repository serialization lock (F4).
+func (d *Daemon) repoLock(key string) *sync.Mutex {
+	d.repoLockMu.Lock()
+	defer d.repoLockMu.Unlock()
+	l, ok := d.repoLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		d.repoLocks[key] = l
+	}
+	return l
+}
+
+// workspaceLockKey is the serialization identity of a workspace: the
+// repository's common dir when it is a git repo (checkout + all of its
+// worktrees share it), the absolute path otherwise.
+func workspaceLockKey(path string) string {
+	if common, err := repoCommonDir(path); err == nil {
+		return common
+	}
+	abs, _ := filepathAbs(path)
+	return abs
 }
 
 func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
@@ -655,6 +861,30 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	_ = d.send(conn, transport.MsgAgentStopped, map[string]any{
 		"instanceId": instanceID, "reason": "stopped_by_command",
 	})
+	d.finishQueue(instanceID)
+	return nil
+}
+
+// doForget finalizes a server-side instance deletion: stops any process,
+// removes the isolated worktree (the branch is kept — the work product
+// stays reachable), and drops the local row. The instance is gone for
+// good: no restart is possible, so there is nothing to preserve.
+func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
+	row, ok, err := d.state.GetInstance(instanceID)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
+			_ = ad.Stop(instanceID)
+		}
+		d.removeWorktree(row)
+	}
+	if err := d.state.DeleteInstance(instanceID); err != nil {
+		return err
+	}
+	d.finishQueue(instanceID)
+	d.Log.Info("instance forgotten", "instance", instanceID)
 	return nil
 }
 
@@ -851,7 +1081,12 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	events := make(chan agentruntime.TurnEvent, 16)
 	turnDone := make(chan error, 1)
 	go func() {
-		turnDone <- ad.StartTurn(context.Background(), spec, events)
+		// d.turnCtx is canceled on daemon shutdown: the adapter kills the
+		// turn subprocess (exec.CommandContext), so a SIGTERM mid-turn
+		// never orphans the process. Reconnects do NOT cancel it — a
+		// turn survives a dropped host connection (events re-send on the
+		// live conn, the ack replays from processed_commands).
+		turnDone <- ad.StartTurn(d.turnCtx, spec, events)
 	}()
 
 	sessionID := ""
@@ -1120,6 +1355,44 @@ func readLoadAvg() (float64, error) {
 		return 0, fmt.Errorf("empty loadavg")
 	}
 	return strconv.ParseFloat(fields[0], 64)
+}
+
+// readMemInfo reads host memory from /proc/meminfo (Linux; ok=false
+// elsewhere so the caller can fall back).
+func readMemInfo() (total, used int64, ok bool) {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, false
+	}
+	var memTotal, memAvail uint64
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, "MemTotal:"); ok {
+			memTotal = meminfoKB(rest)
+		} else if rest, ok := strings.CutPrefix(line, "MemAvailable:"); ok {
+			memAvail = meminfoKB(rest)
+		}
+	}
+	if memTotal == 0 {
+		return 0, 0, false
+	}
+	used = int64(memTotal) - int64(memAvail)
+	if used < 0 {
+		used = 0
+	}
+	return int64(memTotal), used, true
+}
+
+// meminfoKB parses the "12345 kB" value of one /proc/meminfo line.
+func meminfoKB(rest string) uint64 {
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, err := strconv.ParseUint(fields[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n * 1024
 }
 
 func readDiskFree(path string) (int64, error) {

@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"agentnet/internal/domain"
 )
@@ -56,12 +55,11 @@ type Claude struct {
 	// Env is appended to the inherited environment for spawned processes.
 	Env []string
 
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
+	track procTracker
 }
 
 func NewClaude(binary string) *Claude {
-	return &Claude{Binary: binary, procs: map[string]*exec.Cmd{}}
+	return &Claude{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
 }
 
 func (c *Claude) Name() domain.RuntimeName { return domain.RuntimeClaudeCode }
@@ -165,7 +163,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = append(append(os.Environ(), c.Env...), spec.Env...)
+	cmd.Env = ChildEnv(c.Env, spec.Env)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -180,8 +178,8 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn claude: %w", err)
 	}
-	c.track(spec.InstanceID, cmd)
-	defer c.release(spec.InstanceID, cmd)
+	c.track.track(spec.InstanceID, cmd)
+	defer c.track.release(spec.InstanceID, cmd)
 
 	// The prompt goes on stdin: no ARG_MAX limit, no shell, no quoting.
 	_, _ = io.WriteString(stdin, spec.Input)
@@ -344,29 +342,9 @@ func sessionMissingInStderr(stderr string) bool {
 }
 
 // Stop kills the running process for an instance.
-func (c *Claude) Stop(instanceID string) error {
-	c.mu.Lock()
-	cmd := c.procs[instanceID]
-	c.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
+func (c *Claude) Stop(instanceID string) error { return c.track.stop(instanceID) }
 
-func (c *Claude) track(instanceID string, cmd *exec.Cmd) {
-	c.mu.Lock()
-	c.procs[instanceID] = cmd
-	c.mu.Unlock()
-}
-
-func (c *Claude) release(instanceID string, cmd *exec.Cmd) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if cur, ok := c.procs[instanceID]; ok && cur == cmd {
-		delete(c.procs, instanceID)
-	}
-}
+func (c *Claude) PID(instanceID string) *int { return c.track.pid(instanceID) }
 
 // --- claude stream-json wire shapes -------------------------------------------
 
