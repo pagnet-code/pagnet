@@ -34,7 +34,28 @@ type Server struct {
 	OfflineThreshold time.Duration
 	// LogLevel: debug | info | warn | error
 	LogLevel string
+	// Telegram configures the Telegram channel gateway (addendum Phase G).
+	// Enabled when BotToken is set. The token is server-side only (§15).
+	Telegram Telegram
 }
+
+// Telegram is the Telegram channel gateway configuration.
+type Telegram struct {
+	// BotToken: server-side only — never passed to runtimes/MCP/logs (§15).
+	BotToken string
+	// SecretToken authenticates the public webhook (Telegram's supported
+	// secret-token mechanism). Generated at startup when empty.
+	SecretToken string
+	// WebhookURL is registered via setWebhook when set.
+	WebhookURL string
+	// AllowedUsers / AllowedChats: explicit §15 restrictions (comma-
+	// separated ids). When both are empty the pairing binding is the gate.
+	AllowedUsers []string
+	AllowedChats []string
+}
+
+// Enabled reports whether the Telegram channel should be started.
+func (t Telegram) Enabled() bool { return t.BotToken != "" }
 
 // LoadServer reads server configuration from environment (with env-file
 // fallback).
@@ -50,11 +71,32 @@ func LoadServer() (Server, error) {
 		HeartbeatInterval: envDuration("AGENTNET_HEARTBEAT_INTERVAL", 15*time.Second),
 		OfflineThreshold:  envDuration("AGENTNET_OFFLINE_THRESHOLD", 45*time.Second),
 		LogLevel:          envOr("AGENTNET_LOG_LEVEL", "info"),
+		Telegram: Telegram{
+			BotToken:    envOr("AGENTNET_TG_BOT_TOKEN", ""),
+			SecretToken: envOr("AGENTNET_TG_SECRET_TOKEN", ""),
+			WebhookURL:  envOr("AGENTNET_TG_WEBHOOK_URL", ""),
+		},
+	}
+	if v := os.Getenv("AGENTNET_TG_ALLOWED_USERS"); v != "" {
+		cfg.Telegram.AllowedUsers = splitCSV(v)
+	}
+	if v := os.Getenv("AGENTNET_TG_ALLOWED_CHATS"); v != "" {
+		cfg.Telegram.AllowedChats = splitCSV(v)
 	}
 	if cfg.DSN == "" {
 		return cfg, ErrMissingDSN
 	}
 	return cfg, nil
+}
+
+func splitCSV(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // Daemon is the host daemon configuration.
