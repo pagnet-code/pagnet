@@ -132,8 +132,9 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		Log:    log,
 		state:  st,
 		adapters: map[domain.RuntimeName]agentruntime.Adapter{
-			domain.RuntimeFake:     fake,
-			domain.RuntimeQwenCode: agentruntime.NewQwen(""),
+			domain.RuntimeFake:       fake,
+			domain.RuntimeQwenCode:   agentruntime.NewQwen(""),
+			domain.RuntimeClaudeCode: agentruntime.NewClaude(""),
 		},
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
@@ -856,8 +857,13 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", failedKind+":"+failedErr, failedRetry)
 		st := "failed"
-		if failedKind == "rate_limited" {
+		switch failedKind {
+		case "rate_limited":
 			st = "rate_limited"
+		case "auth_required":
+			// §41: availability state, not a terminal failure — the
+			// instance parks and can be woken once a human re-authenticates.
+			st = "auth_required"
 		}
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)

@@ -43,9 +43,11 @@ var (
 		"capacity error", "maximum number of requests",
 	}
 	authPatterns = []string{
-		"unauthorized", "authentication", "invalid api key", "invalid_api_key",
+		"unauthorized", "authentication", "failed to authenticate",
+		"authentication failed", "invalid api key", "invalid_api_key",
 		"api key not found", "api-key is invalid", "not logged in",
-		"access token", "invalid authentication token", "api key expired",
+		"login required", "oauth session expired", "access token",
+		"invalid authentication token", "api key expired",
 	}
 	contextLimitPatterns = []string{
 		"context length", "context window", "maximum context",

@@ -23,6 +23,8 @@ func TestClassifyProviderError_Kinds(t *testing.T) {
 		{"overloaded", "The model is overloaded; try again shortly", domain.RuntimeFailureRateLimited},
 		{"auth 401", "request failed with status 401", domain.RuntimeFailureAuthRequired},
 		{"invalid api key", "401 invalid_api_key: API key not found", domain.RuntimeFailureAuthRequired},
+		{"claude oauth expired", "Failed to authenticate: OAuth session expired and could not be refreshed", domain.RuntimeFailureAuthRequired},
+		{"authentication failed", "Authentication failed: please run /login", domain.RuntimeFailureAuthRequired},
 		{"context limit", "prompt is too long: 200000 tokens > 131072 maximum context length", domain.RuntimeFailureContextLimit},
 		{"context window", "This model's maximum context window is 128k tokens", domain.RuntimeFailureContextLimit},
 		{"network refused", "fetch failed: connect ECONNREFUSED 127.0.0.1:4000", domain.RuntimeFailureNetworkError},
