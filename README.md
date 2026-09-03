@@ -32,26 +32,43 @@ Hosts connect **outbound only** — no inbound ports, NAT-friendly.
 
 ## Quick start
 
+**1. Start the central stack** (control plane on :18080, web UI on :13000):
+
 ```bash
 cp deploy/example.env deploy/.env   # set DATABASE_URL to any Postgres you run
-
-make dev          # control plane (:18080) + web UI (:13000)
+make dev                            # control plane (:18080) + web UI (:13000)
 ```
+
+**2. Connect a host** (on the machine where the agents will run). Enroll the
+host with a one-time token, then start the daemon. In `dev` auth mode the
+enrollment call from localhost needs no admin token:
 
 ```bash
-agentnet login http://localhost:18080
-agentnet host connect
+# one-time enrollment token (plaintext is shown exactly once)
+TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
+  -d '{"name":"my-host","allowedRoots":["$HOME"],"ttlSeconds":3600}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-cd my-project
-agentnet run . --runtime qwen --role advisor
+# consume the token; stores the credential in ~/.agentnet/config.yaml (0600)
+agentnet login --server http://localhost:18080 --token "$TOKEN"
+
+# start the host daemon (outbound WSS; keep it running)
+agentnetd
 ```
 
-Then open http://localhost:13000.
+**3. Launch an agent** in a Git repository:
+
+```bash
+cd my-project
+agentnet run . --runtime fake --role coder    # fake | qwen | claude
+```
+
+Then open http://localhost:13000 — the host shows as connected, and the agent
+appears under the default network. `make demo` seeds a ready-to-watch demo
+network with three fake agents and sample tasks.
 
 For self-hosting the whole central stack (Postgres included): see
 `deploy/docker-compose.yml`. The host daemon always runs on the actual host.
-
-_(Full reproducible quick start is being finalized; see `docs/DEVELOPMENT.md`.)_
 
 ## Repository layout
 
@@ -70,13 +87,13 @@ _(Full reproducible quick start is being finalized; see `docs/DEVELOPMENT.md`.)_
 ## Development
 
 ```bash
-make dev      # Postgres (compose) + server + web
-make test     # go test -race ./...
-make build    # build all Go binaries
-make demo     # seed a demo network with fake agents and traffic
+make dev       # control plane (:18080) + web UI (:13000); Postgres is optional via `make pg-up`
+make test      # go test ./...          (or `make test-race` for -race)
+make build     # build all Go binaries into bin/
+make demo      # build + seed a demo network with fake agents and traffic
 ```
 
-See `docs/DEVELOPMENT.md` and `docs/ARCHITECTURE.md`.
+See `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, and `docs/IMPLEMENTATION_STATUS.md`.
 
 ## License
 
