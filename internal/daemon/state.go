@@ -94,6 +94,16 @@ func (s *State) MarkProcessed(commandID, msgType string) error {
 	return err
 }
 
+// PruneProcessed drops processed-command rows older than before (spec §91:
+// keep the dedup set only for a bounded period). RFC3339 UTC strings sort
+// chronologically, so a string comparison is safe.
+func (s *State) PruneProcessed(before time.Time) error {
+	_, err := s.db.Exec(
+		`DELETE FROM processed_commands WHERE processed_at < ?`,
+		before.UTC().Format(time.RFC3339))
+	return err
+}
+
 // InstanceRow is the daemon's local view of a managed instance.
 type InstanceRow struct {
 	InstanceID   string

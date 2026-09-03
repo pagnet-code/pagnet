@@ -98,10 +98,28 @@ type Daemon struct {
 	// the claim: they were not handled, and the server's re-send is the
 	// one that must run. (Crash-safe: a crash loses the claims, which is
 	// exactly when a re-send SHOULD run again; terminal successes are
-	// additionally persisted in processed_commands.)
+	// additionally persisted in processed_commands.) Claims carry a
+	// timestamp so maintainState can evict stale ones (spec §91: bounded
+	// period) — a claim only matters while the server may re-dispatch the
+	// same id, which ends once the ack lands.
 	seenMu sync.Mutex
-	seen   map[string]struct{}
+	seen   map[string]time.Time
 }
+
+// Bounded dedup retention (spec §91 "bounded period").
+const (
+	// seenTTL: in-memory claims older than this are evicted. Far beyond
+	// any re-send dedup window (server re-dispatch ticks every 2 s while a
+	// command is un-acked); command implementations are idempotent enough
+	// that a post-eviction re-run is at most one redundant turn.
+	seenTTL = 24 * time.Hour
+	// processedRetention: persistent gate lifetime. Covers daemon restarts
+	// before a lost ack is noticed; a command un-acked longer than this
+	// has stale server-side state (sweeps have already failed the flows).
+	processedRetention = 30 * 24 * time.Hour
+	// maintenanceEvery: how often stale claims are evicted + SQLite pruned.
+	maintenanceEvery = time.Hour
+)
 
 // instQueue is a single-consumer FIFO for one instance's commands.
 type instQueue struct {
@@ -140,7 +158,12 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		attaches:    map[string]map[string]time.Time{},
 		pending:     map[string]chan transport.AgentResponsePayload{},
 		instQueues:  map[string]*instQueue{},
-		seen:        map[string]struct{}{},
+		seen:        map[string]time.Time{},
+	}
+	// Spec §91: start from a bounded dedup set (drops rows prunable
+	// while the daemon was down).
+	if err := st.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
+		log.Warn("prune processed_commands at startup", "err", err)
 	}
 	return d, nil
 }
@@ -260,6 +283,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 
 	heartbeat := time.NewTicker(d.Heartbeat)
 	defer heartbeat.Stop()
+	maint := time.NewTicker(maintenanceEvery)
+	defer maint.Stop()
 	go func() {
 		for {
 			select {
@@ -267,6 +292,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				return
 			case <-heartbeat.C:
 				d.sendHeartbeat(conn)
+			case <-maint.C:
+				d.maintainState()
 			}
 		}
 	}()
@@ -472,7 +499,7 @@ func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error
 			d.Log.Debug("duplicate command dropped (already claimed)", "command", commandID)
 			return
 		}
-		d.seen[commandID] = struct{}{}
+		d.seen[commandID] = time.Now()
 		d.seenMu.Unlock()
 	}
 	err := fn()
@@ -501,6 +528,23 @@ func (d *Daemon) alreadyProcessed(commandID string) bool {
 	}
 	ok, err := d.state.IsProcessed(commandID)
 	return err == nil && ok
+}
+
+// maintainState bounds the local dedup state (spec §91 "bounded period"):
+// evict in-memory claims older than seenTTL and prune the persistent
+// processed-command set to processedRetention.
+func (d *Daemon) maintainState() {
+	d.seenMu.Lock()
+	cut := time.Now().Add(-seenTTL)
+	for id, at := range d.seen {
+		if at.Before(cut) {
+			delete(d.seen, id)
+		}
+	}
+	d.seenMu.Unlock()
+	if err := d.state.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
+		d.Log.Warn("prune processed_commands", "err", err)
+	}
 }
 
 // workspaceAllowed validates a path against the allowed roots (cleaned
