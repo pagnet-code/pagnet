@@ -430,6 +430,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
 		})
 
+	case transport.MsgTerminalInput:
+		var p transport.TerminalInputPayload
+		if env.DecodePayload(&p) != nil {
+			return
+		}
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doTerminalInput(conn, p) })
+		})
+
 	case transport.MsgRequestInventory:
 		// Read-only, but the git scan can take seconds — don't block the
 		// read loop either.
@@ -650,6 +659,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 	}
 	resume := row.SessionID != ""
 	input := "You were woken. Reason: " + reason
+	d.Log.Info("wake turn", "instance", instanceID, "reason", reason, "resume", resume)
 	return d.runTurn(conn, d.turnSpecFor(row, resume, input, "wake"))
 }
 
@@ -698,6 +708,7 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	if len(p.AcceptanceCriteria) > 0 {
 		input.WriteString("\n\nAcceptance criteria:\n- " + strings.Join(p.AcceptanceCriteria, "\n- "))
 	}
+	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
 	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input.String(), kind))
 }
 
@@ -980,6 +991,34 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 		d.Log.Info("last attach closed; instance hibernated", "instance", p.InstanceID)
 	}
 	return nil
+}
+
+// doTerminalInput executes one interactive user input from an attach
+// session as a turn (spec §54 terminal proxy: the control plane brokers
+// browser/CLI input over the host connection). A hibernated instance is
+// woken by resuming its stored session; input arriving while a turn is in
+// progress stays queued (deferred) and runs after it completes.
+func (d *Daemon) doTerminalInput(conn *websocket.Conn, p transport.TerminalInputPayload) error {
+	row, ok, err := d.state.GetInstance(p.InstanceID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("unknown instance %s", p.InstanceID)
+	}
+	switch row.Status {
+	case "blocked", "failed", "stopped":
+		return fmt.Errorf("instance %s is %s; input refused", p.InstanceID, row.Status)
+	}
+	if strings.TrimSpace(p.Data) == "" {
+		return nil
+	}
+	if d.busy(p.InstanceID) {
+		return ErrDeferred
+	}
+	d.Log.Info("terminal input turn", "instance", p.InstanceID,
+		"session", p.SessionID, "bytes", len(p.Data))
+	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", p.Data, "user_input"))
 }
 
 func (d *Daemon) reportSession(conn *websocket.Conn, instanceID, sessionID string, resumed bool) {

@@ -120,6 +120,10 @@ type Daemon struct {
 	// uses it for fake-runtime simulation knobs (e.g. AGENTNET_FAKE_
 	// RATELIMIT). Set via AGENTNET_RUNTIME_ENV (comma-separated).
 	RuntimeEnv []string
+	// CurrentNetwork is the user's selected default network (addendum:
+	// `agentnet network use <name>`). Empty means "use the only network,
+	// or ask".
+	CurrentNetwork string
 }
 
 // LoadDaemon reads daemon config: env, then the daemon state file
