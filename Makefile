@@ -6,8 +6,8 @@ COMPOSE ?= docker compose -f deploy/docker-compose.yml
 
 BIN := bin
 SERVER_ADDR ?= :18080
-WEB_PORT ?= 13000
-API_URL ?= http://localhost:18080
+# Optional: pin the web's API base (empty = follow the browser's own hostname).
+API_URL ?=
 
 # Local development reuses an existing Postgres; credentials live in
 # deploy/.env (see deploy/example.env), which the server also loads as a
@@ -22,8 +22,10 @@ dev:
 dev-server:
 	$(GO) run ./cmd/agentnet-server --addr $(SERVER_ADDR)
 
+## dev-web: Next.js UI on 13000. The API base follows the browser's own
+## hostname by default; pass API_URL=http://host:18080 to pin it.
 dev-web:
-	cd web && NEXT_PUBLIC_API_URL=$(API_URL) PORT=$(WEB_PORT) npm run dev
+	cd web && NEXT_PUBLIC_AGENTNET_API=$(API_URL) npm run dev
 
 ## pg-up: optional — start AgentNet's own Postgres via compose (only if you
 ## do NOT already run a local Postgres to point DATABASE_URL at)

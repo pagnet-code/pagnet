@@ -22,7 +22,11 @@ type State struct {
 
 // OpenState opens (and migrates) the daemon state database at path.
 func OpenState(path string) (*State, error) {
-	db, err := sql.Open("sqlite", path)
+	// _busy_timeout: a prior daemon instance (or a test) may still hold a
+	// write when this one opens; retry up to 5s instead of failing with
+	// SQLITE_BUSY (Phase 12 hardening). Applied at connection-open, before
+	// the migration below.
+	db, err := sql.Open("sqlite", path+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open state: %w", err)
 	}
