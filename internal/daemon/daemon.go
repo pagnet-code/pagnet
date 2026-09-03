@@ -76,6 +76,38 @@ type Daemon struct {
 	// Bridge Unix socket listener (agent MCP bridge, PROTOCOL §6).
 	bridgeMu sync.Mutex
 	bridgeL  net.Listener
+
+	// Per-instance command queues: commands for one instance run strictly
+	// in order (launch before deliver, wake before deliver, ...), while
+	// different instances run in parallel. The WSS read loop only
+	// ENQUEUES — it must never block on a command's execution, because a
+	// turn on a real runtime runs for minutes and would otherwise stall
+	// every other envelope on the host connection (agent responses,
+	// wakes, other agents' commands).
+	queueMu    sync.Mutex
+	instQueues map[string]*instQueue
+
+	// CommandIDs already claimed by this process: in flight or terminally
+	// handled (success OR failure). The server re-dispatches a command
+	// while it is un-acked (dispatchPending ticks every 2 s), and with
+	// per-instance FIFO queues those re-sends queue BEHIND the original —
+	// after a failed turn the instance is no longer busy, so a queued
+	// duplicate would start a second turn (a provider-hammering loop for
+	// rate-limited work). Claiming at start and keeping the claim on a
+	// terminal failure drops the duplicates. Deferred commands release
+	// the claim: they were not handled, and the server's re-send is the
+	// one that must run. (Crash-safe: a crash loses the claims, which is
+	// exactly when a re-send SHOULD run again; terminal successes are
+	// additionally persisted in processed_commands.)
+	seenMu sync.Mutex
+	seen   map[string]struct{}
+}
+
+// instQueue is a single-consumer FIFO for one instance's commands.
+type instQueue struct {
+	mu   sync.Mutex
+	ch   chan func()
+	live bool
 }
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
@@ -100,13 +132,50 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		Log:    log,
 		state:  st,
 		adapters: map[domain.RuntimeName]agentruntime.Adapter{
-			domain.RuntimeFake: fake,
+			domain.RuntimeFake:     fake,
+			domain.RuntimeQwenCode: agentruntime.NewQwen(""),
 		},
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
 		pending:     map[string]chan transport.AgentResponsePayload{},
+		instQueues:  map[string]*instQueue{},
+		seen:        map[string]struct{}{},
 	}
 	return d, nil
+}
+
+// enqueueInstance queues fn for one instance: strict per-instance FIFO,
+// parallel across instances. The read loop hands the job over and keeps
+// reading — even while a long turn occupies the instance's worker.
+func (d *Daemon) enqueueInstance(instanceID string, fn func()) {
+	d.queueMu.Lock()
+	q, ok := d.instQueues[instanceID]
+	if !ok {
+		q = &instQueue{ch: make(chan func(), 64)}
+		d.instQueues[instanceID] = q
+	}
+	d.queueMu.Unlock()
+
+	q.mu.Lock()
+	if !q.live {
+		q.live = true
+		go func() {
+			for job := range q.ch {
+				job()
+			}
+		}()
+	}
+	select {
+	case q.ch <- fn:
+	default:
+		// Pathological backlog (64 queued commands for ONE instance):
+		// apply backpressure instead of buffering unboundedly. The read
+		// loop blocks until the instance's worker has room.
+		q.mu.Unlock()
+		q.ch <- fn
+		return
+	}
+	q.mu.Unlock()
 }
 
 func (d *Daemon) Close() error {
@@ -287,10 +356,14 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 	_ = d.send(conn, transport.MsgHeartbeat, metrics)
 }
 
-// handleCommand executes one structured command from the control plane.
-// Idempotency: the CommandID is remembered in local SQLite (marked processed
-// on success). A daemon crash mid-flight causes at most one re-execution,
-// which every handler tolerates.
+// handleCommand enqueues one structured command from the control plane.
+// Execution is per-instance serialized (FIFO) on a worker goroutine, so
+// the WSS read loop is never blocked by a long turn — agent responses and
+// other instances' commands must keep flowing while an agent works (real
+// runtimes take minutes per turn). Idempotency: the CommandID is
+// remembered in local SQLite (marked processed on success). A daemon crash
+// mid-flight causes at most one re-execution, which every handler
+// tolerates.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
 	case transport.MsgLaunchAgent:
@@ -298,52 +371,68 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doLaunch(conn, p) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doLaunch(conn, p) })
+		})
 
 	case transport.MsgStopAgent:
 		var p transport.StopAgentPayload
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doStop(conn, p.InstanceID) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doStop(conn, p.InstanceID) })
+		})
 
 	case transport.MsgRestartAgent:
 		var p transport.RestartAgentPayload
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doRestart(conn, p.InstanceID) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doRestart(conn, p.InstanceID) })
+		})
 
 	case transport.MsgWakeAgent:
 		var p transport.WakeAgentPayload
 		if env.DecodePayload(&p) != nil || p.WakeRequestID == "" {
 			return
 		}
-		d.guarded(conn, p.WakeRequestID, func() error { return d.doWake(conn, p.InstanceID, p.Reason) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.WakeRequestID, func() error { return d.doWake(conn, p.InstanceID, p.Reason) })
+		})
 
 	case transport.MsgDeliverNetworkEvent:
 		var p transport.NetworkEventPayload
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doDeliver(conn, p) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doDeliver(conn, p) })
+		})
 
 	case transport.MsgAttachTerminal:
 		var p transport.TerminalAttachPayload
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
+		})
 
 	case transport.MsgDetachTerminal:
 		var p transport.DetachTerminalPayload
 		if env.DecodePayload(&p) != nil {
 			return
 		}
-		d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
+		d.enqueueInstance(p.InstanceID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
+		})
 
 	case transport.MsgRequestInventory:
-		d.sendInventory(conn)
+		// Read-only, but the git scan can take seconds — don't block the
+		// read loop either.
+		go d.sendInventory(conn)
 
 	default:
 		d.Log.Warn("unknown command type", "type", env.Type)
@@ -354,19 +443,41 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 // A deferred outcome (ErrDeferred) is NOT acked: the command stays queued
 // server-side and the dispatcher re-sends it (§32: one active turn per
 // instance, multiple inbound items queue durably).
+//
+// Re-send dedup: while a command is un-acked the server re-dispatches it
+// every 2 s, and the per-instance FIFO queues those re-sends behind the
+// original. The claim below makes the second+ copies no-ops — a terminal
+// FAILURE keeps its claim (the failed command is never re-run; recovery is
+// a NEW command: the coordinator's schedule_retry wake, §45), while a
+// DEFERRED result releases it (nothing was handled; the re-send must run).
 func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error) {
 	if commandID != "" && d.alreadyProcessed(commandID) {
 		d.sendAck(conn, commandID, "")
 		return
 	}
+	if commandID != "" {
+		d.seenMu.Lock()
+		if _, dup := d.seen[commandID]; dup {
+			d.seenMu.Unlock()
+			d.Log.Debug("duplicate command dropped (already claimed)", "command", commandID)
+			return
+		}
+		d.seen[commandID] = struct{}{}
+		d.seenMu.Unlock()
+	}
 	err := fn()
 	if errors.Is(err, ErrDeferred) {
+		if commandID != "" {
+			d.seenMu.Lock()
+			delete(d.seen, commandID)
+			d.seenMu.Unlock()
+		}
 		d.Log.Debug("command deferred (stays queued)", "command", commandID)
 		return
 	}
 	if err != nil {
 		d.sendAck(conn, commandID, err.Error())
-		return
+		return // claim kept: terminal failure, re-sends are stale
 	}
 	if commandID != "" {
 		_ = d.state.MarkProcessed(commandID, "")
