@@ -1153,6 +1153,15 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
 	}
+	// The daemon creates the workspace at launch (launchAgent); if it is
+	// gone at turn time it was deleted out from under the instance (host
+	// /tmp hygiene, test cleanup). Refuse early with a clear error instead
+	// of a spawn-time chdir failure.
+	if _, err := os.Stat(spec.Workspace); err != nil {
+		d.Log.Warn("turn refused: workspace missing",
+			"instance", spec.InstanceID, "workspace", spec.Workspace)
+		return fmt.Errorf("workspace %s not found", spec.Workspace)
+	}
 
 	d.turnMu.Lock()
 	if d.activeTurns[spec.InstanceID] {
@@ -1248,6 +1257,8 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			// instance parks and can be woken once a human re-authenticates.
 			st = "auth_required"
 		}
+		d.Log.Warn("turn failed", "instance", spec.InstanceID,
+			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case errors.Is(turnErr, context.Canceled):
@@ -1269,6 +1280,8 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		return turnErr
 	case turnErr != nil:
 		// Adapter-level failure (spawn/IO), no turn events were produced.
+		d.Log.Warn("turn failed (adapter error)",
+			"instance", spec.InstanceID, "error", turnErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
