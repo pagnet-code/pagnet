@@ -438,11 +438,19 @@ func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
 	}
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
+	// A stalled peer must not stall the command workers (or heartbeats /
+	// the bridge relay): with an unbounded write, one clogged socket can
+	// freeze a per-instance FIFO for minutes — a stop then lands past any
+	// UI/CLI deadline. A bounded write fails fast instead; the failed ack
+	// leaves the command un-acked, so the server's re-send takes over.
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return conn.WriteMessage(websocket.TextMessage, raw)
 }
 
-func (d *Daemon) sendAck(conn *websocket.Conn, commandID, errMsg string) {
-	_ = d.send(conn, transport.MsgCommandAck, map[string]any{
+// sendAck reports the command outcome. The error is the WRITE error: a
+// lost ack means the server never learns the outcome and will re-send.
+func (d *Daemon) sendAck(conn *websocket.Conn, commandID, errMsg string) error {
+	return d.send(conn, transport.MsgCommandAck, map[string]any{
 		"commandId": commandID,
 		"error":     errMsg,
 	})
@@ -506,7 +514,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
 	case transport.MsgLaunchAgent:
 		var p transport.LaunchAgentPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -515,7 +527,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgStopAgent:
 		var p transport.StopAgentPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -524,7 +540,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgRestartAgent:
 		var p transport.RestartAgentPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -533,7 +553,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgWakeAgent:
 		var p transport.WakeAgentPayload
-		if env.DecodePayload(&p) != nil || p.WakeRequestID == "" {
+		if err := env.DecodePayload(&p); err != nil || p.WakeRequestID == "" {
+			d.Log.Warn("wake command undecodable or missing wakeRequestId", "type", env.Type,
+				"err", err.Error(), "wakeRequestId", p.WakeRequestID)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.WakeRequestID, func() {
@@ -542,7 +564,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgDeliverNetworkEvent:
 		var p transport.NetworkEventPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -551,7 +577,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgAttachTerminal:
 		var p transport.TerminalAttachPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -560,7 +590,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgDetachTerminal:
 		var p transport.DetachTerminalPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -569,7 +603,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgTerminalInput:
 		var p transport.TerminalInputPayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -578,7 +616,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 
 	case transport.MsgForgetInstance:
 		var p transport.ForgetInstancePayload
-		if env.DecodePayload(&p) != nil {
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
@@ -586,9 +628,28 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		})
 
 	case transport.MsgRequestInventory:
+		var p transport.RequestInventoryPayload
+		if err := env.DecodePayload(&p); err != nil {
+			// Structurally broken: the CommandID lives inside the payload,
+			// so this copy cannot be acked and the server will re-send it.
+			// Make that visible instead of dropping it silently.
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
 		// Read-only, but the git scan can take seconds — don't block the
-		// read loop either.
-		go d.sendInventory(conn)
+		// read loop either. The command is acked AFTER the reply: an
+		// un-acked inventory request stays pending server-side, and the
+		// dispatcher re-send → reply → re-send cycle would hot-loop.
+		commandID := p.CommandID
+		go func() {
+			d.sendInventory(conn)
+			// Pre-fix inventory requests carry no commandId: there is
+			// nothing to ack (the server-side row is cleaned up, not
+			// self-healed, by design).
+			if commandID != "" {
+				d.sendAck(conn, commandID, "")
+			}
+		}()
 
 	default:
 		d.Log.Warn("unknown command type", "type", env.Type)
@@ -616,14 +677,21 @@ func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID stri
 			return
 		}
 		d.seen[commandID] = time.Now()
+		// Amortized eviction: processed commands keep their entry as a
+		// tombstone (fast re-send ack); without a sweep the map grows for
+		// the daemon's whole life.
+		if len(d.seen) > 1024 {
+			cutoff := time.Now().Add(-time.Hour)
+			for id, claimed := range d.seen {
+				if claimed.Before(cutoff) {
+					delete(d.seen, id)
+				}
+			}
+		}
 		d.seenMu.Unlock()
 	}
 	if !d.enqueueInstance(instanceID, job) {
-		if commandID != "" {
-			d.seenMu.Lock()
-			delete(d.seen, commandID)
-			d.seenMu.Unlock()
-		}
+		d.releaseClaim(commandID)
 	}
 }
 
@@ -637,22 +705,43 @@ func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID stri
 func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error) {
 	err := fn()
 	if errors.Is(err, ErrDeferred) {
-		if commandID != "" {
-			d.seenMu.Lock()
-			delete(d.seen, commandID)
-			d.seenMu.Unlock()
-		}
+		d.releaseClaim(commandID)
 		d.Log.Debug("command deferred (stays queued)", "command", commandID)
 		return
 	}
+	if errors.Is(err, context.Canceled) {
+		// Daemon shutdown interrupted the command. Do NOT ack it as a
+		// failure: the command must stay pending so the server's re-send
+		// after reconnect is the one that runs (or re-acks).
+		return
+	}
 	if err != nil {
-		d.sendAck(conn, commandID, err.Error())
+		if aerr := d.sendAck(conn, commandID, err.Error()); aerr != nil {
+			d.Log.Warn("failure ack lost; server re-send will re-fail it", "command", commandID, "err", aerr)
+		}
 		return // claim kept: terminal failure, re-sends are stale
 	}
 	if commandID != "" {
 		_ = d.state.MarkProcessed(commandID, "")
 	}
-	d.sendAck(conn, commandID, "")
+	if aerr := d.sendAck(conn, commandID, ""); aerr != nil {
+		// The outcome never reaches the server. Release the claim so the
+		// re-send is the copy that finishes the protocol: it either re-acks
+		// via alreadyProcessed (MarkProcessed succeeded) or re-runs (it
+		// did not) — both safe, every handler tolerates re-execution.
+		d.Log.Warn("ack lost; releasing claim for server re-send", "command", commandID, "err", aerr)
+		d.releaseClaim(commandID)
+	}
+}
+
+// releaseClaim drops the enqueue-time claim for commandID ("" is a no-op).
+func (d *Daemon) releaseClaim(commandID string) {
+	if commandID == "" {
+		return
+	}
+	d.seenMu.Lock()
+	delete(d.seen, commandID)
+	d.seenMu.Unlock()
 }
 
 func (d *Daemon) alreadyProcessed(commandID string) bool {
@@ -1057,6 +1146,9 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	if !ok {
 		return fmt.Errorf("unknown instance %s", spec.InstanceID)
 	}
+	// The session this turn starts from; a shutdown-interrupted turn rolls
+	// back to exactly this (see the context.Canceled branch below).
+	preTurnSession := row.SessionID
 	ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
@@ -1092,7 +1184,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	sessionID := ""
 	var failedKind, failedErr string
 	var failedRetry *string
-	var sessionLost bool
+	var sessionLost, completed bool
 
 	for ev := range events {
 		switch ev.Type {
@@ -1110,6 +1202,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 				"instanceId": spec.InstanceID, "output": ev.Output,
 			})
 		case agentruntime.EventTurnCompleted:
+			completed = true
 			d.sendTurn(conn, transport.MsgRuntimeTurnCompleted, spec, sessionID,
 				ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.Model, "", nil)
 		case agentruntime.EventTurnFailed:
@@ -1157,16 +1250,47 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		}
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
+	case errors.Is(turnErr, context.Canceled):
+		// The daemon is shutting down (Close cancels d.turnCtx, spec §90)
+		// mid-turn. That is NOT an instance failure: the turn consumed no
+		// work, the command stays un-acked, and the documented recovery is
+		// "the control plane re-sends the un-acked command" (ReconcileRestart
+		// resets the stale "working" row on startup). Marking the instance
+		// "failed" (or reporting a turn failure) would make doDeliver refuse
+		// that re-delivery until an explicit instance restart — an ordinary
+		// daemon restart mid-turn would brick the instance.
+		// Roll back the session id the turn claimed optimistically: a
+		// session is only trustworthy once the turn COMPLETED (completion
+		// is what persists it). Reverting to the pre-turn value keeps a
+		// killed resume resumable and a killed cold start cold.
+		_ = d.state.SetInstanceSession(spec.InstanceID, preTurnSession)
+		d.Log.Info("turn interrupted by daemon shutdown; no failure recorded, work stays queued",
+			"instance", spec.InstanceID)
+		return turnErr
 	case turnErr != nil:
 		// Adapter-level failure (spawn/IO), no turn events were produced.
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
 		return fmt.Errorf("turn failed: process_error: %v", turnErr)
+	case !completed:
+		// The adapter exited cleanly but the turn produced NEITHER a
+		// completion nor a failure event: the process was cut off between
+		// events. Only a shutdown cancel can cause this cleanly (the kill
+		// lands after the last event is consumed but before Wait returns,
+		// so no error surfaces). The turn consumed no work — treat it
+		// exactly like an interrupted turn: roll back the claimed session,
+		// record no failure, and return context.Canceled so guarded() does
+		// NOT ack the command; it stays pending and the server's re-send
+		// after reconnect re-runs the turn.
+		_ = d.state.SetInstanceSession(spec.InstanceID, preTurnSession)
+		d.Log.Warn("turn ended without a completion event; no failure recorded, work stays queued",
+			"instance", spec.InstanceID)
+		return context.Canceled
 	default:
-		// §35: do not hibernate underneath an attached user. An active
-		// attach keeps the instance awake (idle, session active); the
-		// hibernation happens when the last attach is closed.
+		// Completed. §35: do not hibernate underneath an attached user. An
+		// active attach keeps the instance awake (idle, session active);
+		// the hibernation happens when the last attach is closed.
 		if d.attached(spec.InstanceID) {
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
