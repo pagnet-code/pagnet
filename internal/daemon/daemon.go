@@ -153,7 +153,9 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+	// 0700: the state dir holds the host credential (config.yaml) and the
+	// agent-bridge socket — never world-traversable (SEC-102).
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
 	st, err := OpenState(filepath.Join(cfg.StateDir, "daemon.sqlite"))

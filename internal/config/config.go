@@ -8,6 +8,8 @@ package config
 import (
 	"bufio"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,14 +22,22 @@ var ErrMissingDSN = errors.New("DATABASE_URL is not set (see deploy/example.env)
 
 // Server is the control plane configuration.
 type Server struct {
-	// Addr is the listen address (e.g. ":18080").
+	// Addr is the listen address (e.g. "127.0.0.1:18080").
 	Addr string
 	// DSN is the PostgreSQL connection string.
 	DSN string
 	// AuthMode: "dev" (local development, no token on localhost) or "token".
+	// Validation is fail-closed (SEC-005): unknown modes, dev mode on a
+	// non-loopback bind, and weak token-mode credentials refuse startup.
 	AuthMode string
 	// AdminToken is the Bearer token for administrative API access.
 	AdminToken string
+	// CORSOrigins are the allowed browser origins (CORS + WebSocket origin
+	// validation). Entries are exact origins ("https://console.example.com")
+	// or the shorthand "localhost" (http(s) on loopback, any port). Empty in
+	// dev mode defaults to loopback; empty in token mode means same-origin
+	// only (hosted deployments behind one origin).
+	CORSOrigins []string
 	// HeartbeatInterval is the expected host heartbeat period.
 	HeartbeatInterval time.Duration
 	// OfflineThreshold marks hosts offline after this silence.
@@ -64,7 +74,7 @@ func LoadServer() (Server, error) {
 	LoadEnvFile(".env")
 
 	cfg := Server{
-		Addr:              envOr("AGENTNET_ADDR", ":18080"),
+		Addr:              envOr("AGENTNET_ADDR", "127.0.0.1:18080"),
 		DSN:               envOr("DATABASE_URL", ""),
 		AuthMode:          envOr("AGENTNET_AUTH_MODE", "dev"),
 		AdminToken:        envOr("AGENTNET_ADMIN_TOKEN", ""),
@@ -83,10 +93,61 @@ func LoadServer() (Server, error) {
 	if v := os.Getenv("AGENTNET_TG_ALLOWED_CHATS"); v != "" {
 		cfg.Telegram.AllowedChats = splitCSV(v)
 	}
+	if v := os.Getenv("AGENTNET_CORS_ORIGINS"); v != "" {
+		cfg.CORSOrigins = splitCSV(v)
+	}
 	if cfg.DSN == "" {
 		return cfg, ErrMissingDSN
 	}
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+// Validate enforces fail-closed auth/startup invariants (SEC-005). There is
+// deliberately no permissive fallback: a configuration that cannot be proven
+// safe refuses to start.
+func (s Server) Validate() error {
+	switch s.AuthMode {
+	case "dev":
+		// Dev mode auto-authenticates loopback callers. It must never be
+		// reachable beyond loopback, so the bind address must be loopback.
+		if !IsLoopbackAddr(s.Addr) {
+			return fmt.Errorf("config: AGENTNET_AUTH_MODE=dev requires a loopback bind address (got %q); use AUTH_MODE=token for non-loopback binds", s.Addr)
+		}
+	case "token":
+		if s.AdminToken == "" {
+			return errors.New("config: AGENTNET_AUTH_MODE=token requires AGENTNET_ADMIN_TOKEN")
+		}
+		if len(s.AdminToken) < 32 {
+			return fmt.Errorf("config: AGENTNET_ADMIN_TOKEN must be at least 32 characters (got %d)", len(s.AdminToken))
+		}
+		for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "agentnet"} {
+			if strings.EqualFold(s.AdminToken, weak) {
+				return fmt.Errorf("config: AGENTNET_ADMIN_TOKEN is a known weak value (%q); set a high-entropy token", weak)
+			}
+		}
+	default:
+		return fmt.Errorf("config: unknown AGENTNET_AUTH_MODE %q (want \"dev\" or \"token\")", s.AuthMode)
+	}
+	return nil
+}
+
+// IsLoopbackAddr reports whether a listen address binds only to loopback.
+// An empty host (":18080") binds all interfaces and is NOT loopback.
+func IsLoopbackAddr(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
 }
 
 func splitCSV(v string) []string {
