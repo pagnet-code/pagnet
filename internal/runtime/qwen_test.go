@@ -9,7 +9,7 @@ import (
 
 // TestInjectQwenMCP_MergesWithUserProjectSettings verifies the binding
 // rule "never overwrite a user's own settings": the user's project-level
-// .qwen/settings.json is preserved and only the agentnet server entry is
+// .qwen/settings.json is preserved and only the pagnet server entry is
 // upserted into mcpServers.
 func TestInjectQwenMCP_MergesWithUserProjectSettings(t *testing.T) {
 	ws := t.TempDir()
@@ -25,7 +25,7 @@ func TestInjectQwenMCP_MergesWithUserProjectSettings(t *testing.T) {
 	spec := TurnSpec{
 		Workspace: ws,
 		Env: []string{
-			`AGENTNET_MCP_CONFIG={"mcpServers":{"agentnet":{"command":"agentnet-mcp","args":["--socket","/x/agentnetd.sock"]}}}`,
+			`PAGNET_MCP_CONFIG={"mcpServers":{"pagnet":{"command":"pagnet-mcp","args":["--socket","/x/pagnetd.sock"]}}}`,
 		},
 	}
 	if err := injectQwenMCP(spec); err != nil {
@@ -44,9 +44,9 @@ func TestInjectQwenMCP_MergesWithUserProjectSettings(t *testing.T) {
 	if _, ok := servers["mine"]; !ok {
 		t.Fatalf("user MCP server lost: %v", servers)
 	}
-	ag, _ := servers["agentnet"].(map[string]any)
-	if ag == nil || ag["command"] != "agentnet-mcp" {
-		t.Fatalf("agentnet entry missing/wrong: %v", servers)
+	ag, _ := servers["pagnet"].(map[string]any)
+	if ag == nil || ag["command"] != "pagnet-mcp" {
+		t.Fatalf("pagnet entry missing/wrong: %v", servers)
 	}
 	if tools, _ := merged["tools"].(map[string]any); tools == nil || tools["approvalMode"] != "default" {
 		t.Fatalf("user top-level key lost: %v", merged)
@@ -57,7 +57,7 @@ func TestInjectQwenMCP_Idempotent(t *testing.T) {
 	ws := t.TempDir()
 	spec := TurnSpec{
 		Workspace: ws,
-		Env:       []string{`AGENTNET_MCP_CONFIG={"mcpServers":{"agentnet":{"command":"agentnet-mcp"}}}`},
+		Env:       []string{`PAGNET_MCP_CONFIG={"mcpServers":{"pagnet":{"command":"pagnet-mcp"}}}`},
 	}
 	if err := injectQwenMCP(spec); err != nil {
 		t.Fatalf("first inject: %v", err)
@@ -92,7 +92,7 @@ func TestInjectQwenMCP_InvalidUserConfigFailsLoudly(t *testing.T) {
 	}
 	spec := TurnSpec{
 		Workspace: ws,
-		Env:       []string{`AGENTNET_MCP_CONFIG={"mcpServers":{"agentnet":{"command":"agentnet-mcp"}}}`},
+		Env:       []string{`PAGNET_MCP_CONFIG={"mcpServers":{"pagnet":{"command":"pagnet-mcp"}}}`},
 	}
 	if err := injectQwenMCP(spec); err == nil {
 		t.Fatal("want error: must not silently clobber an invalid user config")
@@ -106,7 +106,7 @@ func TestInjectQwenMCP_InvalidUserConfigFailsLoudly(t *testing.T) {
 func TestInjectQwenMCP_NoEnvNoop(t *testing.T) {
 	ws := t.TempDir()
 	if err := injectQwenMCP(TurnSpec{Workspace: ws}); err != nil {
-		t.Fatalf("want no-op without AGENTNET_MCP_CONFIG, got %v", err)
+		t.Fatalf("want no-op without PAGNET_MCP_CONFIG, got %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(ws, ".qwen")); !os.IsNotExist(err) {
 		t.Fatal(".qwen dir created although there was nothing to inject")
@@ -132,7 +132,7 @@ func TestStoredSessionRoundTrip(t *testing.T) {
 }
 
 func TestQwenModelSelection(t *testing.T) {
-	t.Setenv("AGENTNET_QWEN_MODEL", "from-env")
+	t.Setenv("PAGNET_QWEN_MODEL", "from-env")
 	q := NewQwen("")
 	if q.model() != "from-env" {
 		t.Fatalf("model = %q, want from-env", q.model())
@@ -142,7 +142,7 @@ func TestQwenModelSelection(t *testing.T) {
 		t.Fatalf("model = %q, want explicit (field wins)", q.model())
 	}
 	q.Model = ""
-	t.Setenv("AGENTNET_QWEN_MODEL", "")
+	t.Setenv("PAGNET_QWEN_MODEL", "")
 	if q.model() != "" {
 		t.Fatalf("model = %q, want empty (user default applies)", q.model())
 	}

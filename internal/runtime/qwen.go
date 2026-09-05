@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 // Qwen drives the qwen-code CLI (`qwen`) as a process-per-turn runtime
@@ -35,13 +35,13 @@ import (
 // `-r <id>` and a failed resume (exit 1, "No saved session found") is
 // surfaced as EventSessionLost — never a silent fresh session (§74/§88).
 //
-// User config is never touched. MCP injection (the AGENTNET_MCP_CONFIG
+// User config is never touched. MCP injection (the PAGNET_MCP_CONFIG
 // the daemon renders per instance) is merged into the workspace's
 // project-scoped .qwen/settings.json — the official per-project MCP
 // location — preserving any user-managed keys in that file. The global
 // ~/.qwen config (auth, models, user MCP servers) is read-only input.
 //
-// Model selection: Qwen.Model (explicit) or the AGENTNET_QWEN_MODEL
+// Model selection: Qwen.Model (explicit) or the PAGNET_QWEN_MODEL
 // environment; when empty the user's own default model applies.
 type Qwen struct {
 	// Binary is the path to the qwen executable. When empty it is
@@ -89,7 +89,7 @@ func (q *Qwen) model() string {
 	if q.Model != "" {
 		return q.Model
 	}
-	return os.Getenv("AGENTNET_QWEN_MODEL")
+	return os.Getenv("PAGNET_QWEN_MODEL")
 }
 
 const qwenSessionFile = "session.json"
@@ -342,15 +342,15 @@ func writeStoredSession(path, id string) error {
 
 // --- MCP injection ---------------------------------------------------------------
 
-// injectQwenMCP merges the daemon-rendered AGENTNET_MCP_CONFIG (inline
+// injectQwenMCP merges the daemon-rendered PAGNET_MCP_CONFIG (inline
 // JSON: {"mcpServers": {...}}) into <workspace>/.qwen/settings.json —
 // qwen's project-scoped MCP config — preserving every other key the user
 // has there. The global user config (~/.qwen) is never written.
 func injectQwenMCP(spec TurnSpec) error {
 	mcpJSON := ""
 	for _, kv := range spec.Env {
-		if strings.HasPrefix(kv, "AGENTNET_MCP_CONFIG=") {
-			mcpJSON = strings.TrimPrefix(kv, "AGENTNET_MCP_CONFIG=")
+		if strings.HasPrefix(kv, "PAGNET_MCP_CONFIG=") {
+			mcpJSON = strings.TrimPrefix(kv, "PAGNET_MCP_CONFIG=")
 		}
 	}
 	if mcpJSON == "" {
@@ -360,7 +360,7 @@ func injectQwenMCP(spec TurnSpec) error {
 		MCPServers map[string]any `json:"mcpServers"`
 	}
 	if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
-		return fmt.Errorf("invalid AGENTNET_MCP_CONFIG: %w", err)
+		return fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
 	}
 	if len(cfg.MCPServers) == 0 {
 		return nil

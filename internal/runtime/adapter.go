@@ -1,4 +1,4 @@
-// Package runtime is the boundary between AgentNet's domain and a specific
+// Package runtime is the boundary between pagnet's domain and a specific
 // coding-agent runtime (claude-code, qwen-code, opencode, fake).
 //
 // Per the runtime-integration addendum: the adapter is the ONLY place that
@@ -12,7 +12,7 @@ package runtime
 import (
 	"context"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 // TurnSpec describes one turn to run. The adapter decides how to translate it
@@ -39,7 +39,7 @@ type TurnSpec struct {
 	// Metadata carries runtime-agnostic extras (e.g. profile, transcript).
 	Metadata map[string]any
 	// Env is extra KEY=VALUE pairs for the spawned process (per-instance
-	// AgentNet injection: MCP bridge config, coordination contract,
+	// pagnet injection: MCP bridge config, coordination contract,
 	// identity). Appended after the adapter's own environment.
 	Env []string
 }

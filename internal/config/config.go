@@ -74,26 +74,26 @@ func LoadServer() (Server, error) {
 	LoadEnvFile(".env")
 
 	cfg := Server{
-		Addr:              envOr("AGENTNET_ADDR", "127.0.0.1:18080"),
+		Addr:              envOr("PAGNET_ADDR", "127.0.0.1:18080"),
 		DSN:               envOr("DATABASE_URL", ""),
-		AuthMode:          envOr("AGENTNET_AUTH_MODE", "dev"),
-		AdminToken:        envOr("AGENTNET_ADMIN_TOKEN", ""),
-		HeartbeatInterval: envDuration("AGENTNET_HEARTBEAT_INTERVAL", 15*time.Second),
-		OfflineThreshold:  envDuration("AGENTNET_OFFLINE_THRESHOLD", 45*time.Second),
-		LogLevel:          envOr("AGENTNET_LOG_LEVEL", "info"),
+		AuthMode:          envOr("PAGNET_AUTH_MODE", "dev"),
+		AdminToken:        envOr("PAGNET_ADMIN_TOKEN", ""),
+		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
+		OfflineThreshold:  envDuration("PAGNET_OFFLINE_THRESHOLD", 45*time.Second),
+		LogLevel:          envOr("PAGNET_LOG_LEVEL", "info"),
 		Telegram: Telegram{
-			BotToken:    envOr("AGENTNET_TG_BOT_TOKEN", ""),
-			SecretToken: envOr("AGENTNET_TG_SECRET_TOKEN", ""),
-			WebhookURL:  envOr("AGENTNET_TG_WEBHOOK_URL", ""),
+			BotToken:    envOr("PAGNET_TG_BOT_TOKEN", ""),
+			SecretToken: envOr("PAGNET_TG_SECRET_TOKEN", ""),
+			WebhookURL:  envOr("PAGNET_TG_WEBHOOK_URL", ""),
 		},
 	}
-	if v := os.Getenv("AGENTNET_TG_ALLOWED_USERS"); v != "" {
+	if v := os.Getenv("PAGNET_TG_ALLOWED_USERS"); v != "" {
 		cfg.Telegram.AllowedUsers = splitCSV(v)
 	}
-	if v := os.Getenv("AGENTNET_TG_ALLOWED_CHATS"); v != "" {
+	if v := os.Getenv("PAGNET_TG_ALLOWED_CHATS"); v != "" {
 		cfg.Telegram.AllowedChats = splitCSV(v)
 	}
-	if v := os.Getenv("AGENTNET_CORS_ORIGINS"); v != "" {
+	if v := os.Getenv("PAGNET_CORS_ORIGINS"); v != "" {
 		cfg.CORSOrigins = splitCSV(v)
 	}
 	if cfg.DSN == "" {
@@ -114,22 +114,22 @@ func (s Server) Validate() error {
 		// Dev mode auto-authenticates loopback callers. It must never be
 		// reachable beyond loopback, so the bind address must be loopback.
 		if !IsLoopbackAddr(s.Addr) {
-			return fmt.Errorf("config: AGENTNET_AUTH_MODE=dev requires a loopback bind address (got %q); use AUTH_MODE=token for non-loopback binds", s.Addr)
+			return fmt.Errorf("config: PAGNET_AUTH_MODE=dev requires a loopback bind address (got %q); use AUTH_MODE=token for non-loopback binds", s.Addr)
 		}
 	case "token":
 		if s.AdminToken == "" {
-			return errors.New("config: AGENTNET_AUTH_MODE=token requires AGENTNET_ADMIN_TOKEN")
+			return errors.New("config: PAGNET_AUTH_MODE=token requires PAGNET_ADMIN_TOKEN")
 		}
 		if len(s.AdminToken) < 32 {
-			return fmt.Errorf("config: AGENTNET_ADMIN_TOKEN must be at least 32 characters (got %d)", len(s.AdminToken))
+			return fmt.Errorf("config: PAGNET_ADMIN_TOKEN must be at least 32 characters (got %d)", len(s.AdminToken))
 		}
-		for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "agentnet"} {
+		for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "pagnet"} {
 			if strings.EqualFold(s.AdminToken, weak) {
-				return fmt.Errorf("config: AGENTNET_ADMIN_TOKEN is a known weak value (%q); set a high-entropy token", weak)
+				return fmt.Errorf("config: PAGNET_ADMIN_TOKEN is a known weak value (%q); set a high-entropy token", weak)
 			}
 		}
 	default:
-		return fmt.Errorf("config: unknown AGENTNET_AUTH_MODE %q (want \"dev\" or \"token\")", s.AuthMode)
+		return fmt.Errorf("config: unknown PAGNET_AUTH_MODE %q (want \"dev\" or \"token\")", s.AuthMode)
 	}
 	return nil
 }
@@ -168,7 +168,7 @@ type Daemon struct {
 	Credential string
 	// HostID is the host's registered id (set at enrollment).
 	HostID string
-	// StateDir is the daemon's local state directory (default ~/.agentnet).
+	// StateDir is the daemon's local state directory (default ~/.pagnet).
 	StateDir string
 	// HostName is the host's registered name.
 	HostName string
@@ -178,11 +178,11 @@ type Daemon struct {
 	HeartbeatInterval time.Duration
 	// RuntimeEnv carries extra KEY=VALUE env pairs applied to spawned
 	// runtime processes. Real deployments leave it empty; the E2E suite
-	// uses it for fake-runtime simulation knobs (e.g. AGENTNET_FAKE_
-	// RATELIMIT). Set via AGENTNET_RUNTIME_ENV (comma-separated).
+	// uses it for fake-runtime simulation knobs (e.g. PAGNET_FAKE_
+	// RATELIMIT). Set via PAGNET_RUNTIME_ENV (comma-separated).
 	RuntimeEnv []string
 	// CurrentNetwork is the user's selected default network (addendum:
-	// `agentnet network use <name>`). Empty means "use the only network,
+	// `pagnet network use <name>`). Empty means "use the only network,
 	// or ask".
 	CurrentNetwork string
 }
@@ -193,7 +193,7 @@ type Daemon struct {
 //
 // Unlike LoadServer, the daemon NEVER os.Setenv values from the env files:
 // deploy/.env carries control-plane secrets (DATABASE_URL,
-// AGENTNET_ADMIN_TOKEN) and the daemon spawns untrusted agent processes —
+// PAGNET_ADMIN_TOKEN) and the daemon spawns untrusted agent processes —
 // a value set in the daemon's process environment would be inherited by
 // every runtime (spec §86.10: agent processes must not receive
 // control-plane credentials). The env files are consulted as a value
@@ -216,15 +216,15 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 	}
 	if stateDir == "" {
 		home, _ := os.UserHomeDir()
-		stateDir = filepath.Join(home, ".agentnet")
+		stateDir = filepath.Join(home, ".pagnet")
 	}
 	cfg := Daemon{
 		StateDir:          stateDir,
-		ServerURL:         get("AGENTNET_SERVER", ""),
-		HostName:          get("AGENTNET_HOST_NAME", defaultHostName()),
-		HeartbeatInterval: envDuration("AGENTNET_HEARTBEAT_INTERVAL", 15*time.Second),
+		ServerURL:         get("PAGNET_SERVER", ""),
+		HostName:          get("PAGNET_HOST_NAME", defaultHostName()),
+		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
 	}
-	if env := get("AGENTNET_RUNTIME_ENV", ""); env != "" {
+	if env := get("PAGNET_RUNTIME_ENV", ""); env != "" {
 		for _, kv := range strings.Split(env, ",") {
 			if kv = strings.TrimSpace(kv); kv != "" {
 				cfg.RuntimeEnv = append(cfg.RuntimeEnv, kv)
@@ -244,7 +244,7 @@ func defaultHostName() string {
 	if hostname != "" {
 		return hostname
 	}
-	return "agentnet-host"
+	return "pagnet-host"
 }
 
 func exists(p string) bool {

@@ -1,4 +1,4 @@
-# AgentNet developer Makefile
+# pagnet developer Makefile
 # Go is resolved from PATH first, then the local toolchain used on this machine.
 GO ?= $(shell command -v go 2>/dev/null || echo $(HOME)/go-toolchain/go/bin/go)
 export PATH := $(dir $(GO)):$(PATH)
@@ -20,14 +20,14 @@ dev:
 	$(MAKE) -j2 dev-server dev-web
 
 dev-server:
-	$(GO) run ./cmd/agentnet-server --addr $(SERVER_ADDR)
+	$(GO) run ./cmd/pagnet-server --addr $(SERVER_ADDR)
 
 ## dev-web: Next.js UI on 13000. The API base follows the browser's own
 ## hostname by default; pass API_URL=http://host:18080 to pin it.
 dev-web:
-	cd web && NEXT_PUBLIC_AGENTNET_API=$(API_URL) npm run dev
+	cd web && NEXT_PUBLIC_PAGNET_API=$(API_URL) npm run dev
 
-## pg-up: optional — start AgentNet's own Postgres via compose (only if you
+## pg-up: optional — start pagnet's own Postgres via compose (only if you
 ## do NOT already run a local Postgres to point DATABASE_URL at)
 pg-up:
 	$(COMPOSE) up -d postgres
@@ -35,12 +35,12 @@ pg-up:
 ## build: compile all Go binaries into bin/
 build:
 	mkdir -p $(BIN)
-	$(GO) build -o $(BIN)/agentnet-server ./cmd/agentnet-server
-	$(GO) build -o $(BIN)/agentnetd ./cmd/agentnetd
-	$(GO) build -o $(BIN)/agentnet-mcp ./cmd/agentnet-mcp
-	$(GO) build -o $(BIN)/agentnet-control ./cmd/agentnet-control
-	$(GO) build -o $(BIN)/agentnet ./cmd/agentnet
-	$(GO) build -o $(BIN)/agentnet-fake-runtime ./cmd/agentnet-fake-runtime
+	$(GO) build -o $(BIN)/pagnet-server ./cmd/pagnet-server
+	$(GO) build -o $(BIN)/pagnetd ./cmd/pagnetd
+	$(GO) build -o $(BIN)/pagnet-mcp ./cmd/pagnet-mcp
+	$(GO) build -o $(BIN)/pagnet-control ./cmd/pagnet-control
+	$(GO) build -o $(BIN)/pagnet ./cmd/pagnet
+	$(GO) build -o $(BIN)/pagnet-fake-runtime ./cmd/pagnet-fake-runtime
 
 test:
 	$(GO) test ./...
@@ -59,7 +59,7 @@ tidy:
 
 ## demo: seed demo-software network with fake agents and sample traffic
 demo: build
-	$(BIN)/agentnet demo
+	$(BIN)/pagnet demo
 
 clean:
 	rm -rf $(BIN)

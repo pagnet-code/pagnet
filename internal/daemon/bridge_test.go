@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 type bridgeClient struct {

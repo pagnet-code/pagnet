@@ -19,7 +19,7 @@ web/test-results/
 *.sqlite3
 *.db
 *.sock
-agentnet*.log
+pagnet*.log
 
 # Local environment (secrets); example.env stays tracked
 deploy/.env

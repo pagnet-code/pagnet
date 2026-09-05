@@ -10,8 +10,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"agentnet/internal/domain"
-	"agentnet/internal/transport"
+	"pagnet/internal/domain"
+	"pagnet/internal/transport"
 )
 
 // sendInventory reports detected runtimes and workspaces to the control

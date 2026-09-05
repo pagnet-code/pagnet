@@ -20,9 +20,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"agentnet/internal/domain"
-	agentruntime "agentnet/internal/runtime"
-	"agentnet/internal/transport"
+	"pagnet/internal/domain"
+	agentruntime "pagnet/internal/runtime"
+	"pagnet/internal/transport"
 )
 
 // ErrDeferred means the command cannot be executed right now but must NOT
@@ -44,7 +44,7 @@ type Config struct {
 	RuntimeEnv []string
 }
 
-// Daemon is a running agentnetd instance.
+// Daemon is a running pagnetd instance.
 type Daemon struct {
 	Config
 	Log *slog.Logger
@@ -284,7 +284,7 @@ func (d *Daemon) Close() error {
 // canceled.
 func (d *Daemon) Run(ctx context.Context) error {
 	if d.Credential == "" {
-		return fmt.Errorf("no host credential; run `agentnet login` first")
+		return fmt.Errorf("no host credential; run `pagnet login` first")
 	}
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
@@ -848,7 +848,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		lock   *sync.Mutex
 	)
 	if p.WorkspacePath == "" {
-		// Representative (§37/§72): no git workspace; an AgentNet-managed
+		// Representative (§37/§72): no git workspace; an pagnet-managed
 		// stable runtime directory inside the daemon state.
 		wsPath = filepath.Join(d.StateDir, "representatives", p.InstanceID)
 		if err := os.MkdirAll(wsPath, 0o700); err != nil {
@@ -1056,18 +1056,18 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	var input strings.Builder
 	switch kind {
 	case "ask", "reply":
-		fmt.Fprintf(&input, "[agentnet %s] from=%s thread=%s message=%s\n",
+		fmt.Fprintf(&input, "[pagnet %s] from=%s thread=%s message=%s\n",
 			kind, dashOr(p.FromAgent), dashOr(p.ThreadID), dashOr(p.MessageID))
 	case "task":
-		fmt.Fprintf(&input, "[agentnet task] id=%s from=%s\n",
+		fmt.Fprintf(&input, "[pagnet task] id=%s from=%s\n",
 			dashOr(p.TaskID), dashOr(p.FromAgent))
 	case "channel":
-		fmt.Fprintf(&input, "[agentnet channel] from=%s conversation=%s network=%s message=%s\n",
+		fmt.Fprintf(&input, "[pagnet channel] from=%s conversation=%s network=%s message=%s\n",
 			dashOr(p.FromAgent), dashOr(p.ConversationID), dashOr(p.NetworkID), dashOr(p.MessageID))
 	case "status":
-		fmt.Fprintf(&input, "[agentnet status] from=%s\n", dashOr(p.FromAgent))
+		fmt.Fprintf(&input, "[pagnet status] from=%s\n", dashOr(p.FromAgent))
 	default: // notice
-		fmt.Fprintf(&input, "[agentnet notice] from=%s\n", dashOr(p.FromAgent))
+		fmt.Fprintf(&input, "[pagnet notice] from=%s\n", dashOr(p.FromAgent))
 	}
 	input.WriteString(p.Body)
 	if len(p.AcceptanceCriteria) > 0 {
@@ -1103,11 +1103,11 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 		InputKind:    kind,
 		Metadata:     map[string]any{"profile": row.Profile},
 		Env: []string{
-			"AGENTNET_INSTANCE_ID=" + row.InstanceID,
-			"AGENTNET_AGENT_NAME=" + row.AgentName,
-			"AGENTNET_NETWORK_ID=" + row.NetworkID,
-			"AGENTNET_MCP_CONFIG=" + d.mcpConfig(row),
-			"AGENTNET_COORDINATION_CONTRACT=" + contractPath,
+			"PAGNET_INSTANCE_ID=" + row.InstanceID,
+			"PAGNET_AGENT_NAME=" + row.AgentName,
+			"PAGNET_NETWORK_ID=" + row.NetworkID,
+			"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
+			"PAGNET_COORDINATION_CONTRACT=" + contractPath,
 		},
 	}
 }
@@ -1116,22 +1116,22 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 // managed agent: the bridge over the daemon's local Unix socket (the
 // bridge authenticates to the daemon with the instance identity — the
 // host credential never reaches the agent, §5/§17). Workers get the
-// agentnet-mcp surface (network_* tools); representatives get
-// agentnet-control (control_* tools) — the surfaces are separate
+// pagnet-mcp surface (network_* tools); representatives get
+// pagnet-control (control_* tools) — the surfaces are separate
 // binaries on purpose (§9: reduces accidental privilege escalation).
 func (d *Daemon) mcpConfig(row *InstanceRow) string {
-	name, command := "agentnet", "agentnet-mcp"
+	name, command := "pagnet", "pagnet-mcp"
 	if row.Kind == "representative" {
-		name, command = "agentnet-control", "agentnet-control"
+		name, command = "pagnet-control", "pagnet-control"
 	}
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
 			name: map[string]any{
 				"command": command,
-				"args":    []string{"--socket", filepath.Join(d.StateDir, "agentnetd.sock")},
+				"args":    []string{"--socket", filepath.Join(d.StateDir, "pagnetd.sock")},
 				"env": map[string]string{
-					"AGENTNET_INSTANCE_ID": row.InstanceID,
-					"AGENTNET_NETWORK_ID":  row.NetworkID,
+					"PAGNET_INSTANCE_ID": row.InstanceID,
+					"PAGNET_NETWORK_ID":  row.NetworkID,
 				},
 			},
 		},

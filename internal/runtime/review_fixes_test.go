@@ -12,8 +12,8 @@ import (
 // pairs (adapter knobs, per-instance injection) always pass through, and
 // provider API keys keep flowing.
 func TestChildEnv_FiltersControlPlaneKeys(t *testing.T) {
-	t.Setenv("AGENTNET_ADMIN_TOKEN", "admin-secret")
-	t.Setenv("AGENTNET_HOSTNAME_X", "whatever")
+	t.Setenv("PAGNET_ADMIN_TOKEN", "admin-secret")
+	t.Setenv("PAGNET_HOSTNAME_X", "whatever")
 	t.Setenv("DATABASE_URL", "postgres://secret")
 	t.Setenv("TEST_DATABASE_URL", "postgres://secret")
 	t.Setenv("POSTGRES_PASSWORD", "secret")
@@ -40,10 +40,10 @@ func TestChildEnv_FiltersControlPlaneKeys(t *testing.T) {
 	}
 
 	// Explicit extra pairs (e.g. the daemon's fake-runtime simulation
-	// knobs, the per-instance AGENTNET_* injection) always reach the child.
-	env2 := ChildEnv([]string{"AGENTNET_FAKE_RATELIMIT=0.5"},
-		[]string{"AGENTNET_INSTANCE_ID=inst-1"})
-	for _, want := range []string{"AGENTNET_FAKE_RATELIMIT=0.5", "AGENTNET_INSTANCE_ID=inst-1"} {
+	// knobs, the per-instance PAGNET_* injection) always reach the child.
+	env2 := ChildEnv([]string{"PAGNET_FAKE_RATELIMIT=0.5"},
+		[]string{"PAGNET_INSTANCE_ID=inst-1"})
+	for _, want := range []string{"PAGNET_FAKE_RATELIMIT=0.5", "PAGNET_INSTANCE_ID=inst-1"} {
 		found := false
 		for _, kv := range env2 {
 			if kv == want {

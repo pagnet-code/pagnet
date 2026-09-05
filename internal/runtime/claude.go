@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 // Claude drives the Claude Code CLI (`claude`) as a process-per-turn
@@ -38,13 +38,13 @@ import (
 // "No conversation found with session ID", is surfaced as EventSessionLost
 // — never a silent fresh session (§74/§88).
 //
-// User config is never touched. MCP injection (the AGENTNET_MCP_CONFIG the
+// User config is never touched. MCP injection (the PAGNET_MCP_CONFIG the
 // daemon renders per instance) is passed as an inline --mcp-config JSON
 // string: it merges with the user's own MCP servers without writing any
 // file, so there is nothing to clobber and the global user config is
 // untouched (rule 11).
 //
-// Model selection: Claude.Model (explicit) or the AGENTNET_CLAUDE_MODEL
+// Model selection: Claude.Model (explicit) or the PAGNET_CLAUDE_MODEL
 // environment; when empty the user's own default model applies.
 type Claude struct {
 	// Binary is the path to the claude executable. When empty it is
@@ -92,15 +92,15 @@ func (c *Claude) model() string {
 	if c.Model != "" {
 		return c.Model
 	}
-	return os.Getenv("AGENTNET_CLAUDE_MODEL")
+	return os.Getenv("PAGNET_CLAUDE_MODEL")
 }
 
-// agentnetMCPConfig extracts the daemon-rendered AGENTNET_MCP_CONFIG
+// pagnetMCPConfig extracts the daemon-rendered PAGNET_MCP_CONFIG
 // (inline JSON: {"mcpServers": {...}}) from the turn's env, "" when absent.
-func agentnetMCPConfig(env []string) string {
+func pagnetMCPConfig(env []string) string {
 	for _, kv := range env {
-		if strings.HasPrefix(kv, "AGENTNET_MCP_CONFIG=") {
-			return strings.TrimPrefix(kv, "AGENTNET_MCP_CONFIG=")
+		if strings.HasPrefix(kv, "PAGNET_MCP_CONFIG=") {
+			return strings.TrimPrefix(kv, "PAGNET_MCP_CONFIG=")
 		}
 	}
 	return ""
@@ -148,15 +148,15 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	// Inject the MCP bridge as an inline --mcp-config (merges with the
 	// user's own MCP servers, writes no file). A failure here is visible
 	// — the turn does not run silently without its network tools.
-	if mcpJSON := agentnetMCPConfig(spec.Env); mcpJSON != "" {
+	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
 		var cfg struct {
 			MCPServers map[string]any `json:"mcpServers"`
 		}
 		if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
-			return fmt.Errorf("invalid AGENTNET_MCP_CONFIG: %w", err)
+			return fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
 		}
 		if len(cfg.MCPServers) == 0 {
-			return fmt.Errorf("AGENTNET_MCP_CONFIG has no mcpServers")
+			return fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
 		}
 		args = append(args, "--mcp-config", mcpJSON)
 	}

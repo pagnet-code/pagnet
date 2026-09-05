@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 // Provider error classification (addendum Phase I: "rate limits are

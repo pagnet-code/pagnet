@@ -5,9 +5,9 @@ package daemon
 // RW agent keeps the current checkout; each subsequent RW agent on the
 // same repository gets an automatic worktree at
 //
-//	<checkout>/.agentnet/worktrees/<instance-id>/
+//	<checkout>/.pagnet/worktrees/<instance-id>/
 //
-// on a branch `agentnet/<agent-name>/<short-id>`. Read-only agents share
+// on a branch `pagnet/<agent-name>/<short-id>`. Read-only agents share
 // the checkout. If worktree creation is unsafe because of repository
 // state, fail clearly — never silently corrupt work.
 
@@ -19,8 +19,8 @@ import (
 	"regexp"
 	"strings"
 
-	"agentnet/internal/domain"
-	"agentnet/internal/transport"
+	"pagnet/internal/domain"
+	"pagnet/internal/transport"
 )
 
 func gitOut(dir string, args ...string) (string, error) {
@@ -61,7 +61,7 @@ func repoCommonDir(path string) (string, error) {
 
 var branchUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
-// worktreeBranch is the §29 branch name: agentnet/<agent-name>/<short-id>.
+// worktreeBranch is the §29 branch name: pagnet/<agent-name>/<short-id>.
 // Without an assigned task the instance id is the stable short id.
 func worktreeBranch(agentName, instanceID string) string {
 	name := strings.ToLower(branchUnsafe.ReplaceAllString(agentName, "-"))
@@ -73,7 +73,7 @@ func worktreeBranch(agentName, instanceID string) string {
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	return fmt.Sprintf("agentnet/%s/%s", name, short)
+	return fmt.Sprintf("pagnet/%s/%s", name, short)
 }
 
 // resolveWorkspace applies §29 isolation for a launching instance and
@@ -116,14 +116,14 @@ func (d *Daemon) resolveWorkspace(p transport.LaunchAgentPayload, access string)
 }
 
 // removeWorktree removes the instance's isolated worktree when its
-// workspace is a managed one (<checkout>/.agentnet/worktrees/<id>). The
+// workspace is a managed one (<checkout>/.pagnet/worktrees/<id>). The
 // BRANCH is kept — the work product stays reachable as a branch; only
 // the duplicate checkout goes away. Best-effort: a dirty worktree is
 // kept and logged, never force-removed.
 func (d *Daemon) removeWorktree(row *InstanceRow) {
 	wt := row.Workspace
 	if filepath.Base(filepath.Dir(wt)) != "worktrees" ||
-		filepath.Base(filepath.Dir(filepath.Dir(wt))) != ".agentnet" {
+		filepath.Base(filepath.Dir(filepath.Dir(wt))) != ".pagnet" {
 		return
 	}
 	checkout := filepath.Dir(filepath.Dir(filepath.Dir(wt)))
@@ -146,7 +146,7 @@ func (d *Daemon) ensureWorktree(fromRepo, common, instanceID, branch string) (st
 		return "", fmt.Errorf("repository %s has no ordinary checkout (bare repository); "+
 			"worktree isolation is not possible", common)
 	}
-	wt := filepath.Join(main, ".agentnet", "worktrees", instanceID)
+	wt := filepath.Join(main, ".pagnet", "worktrees", instanceID)
 
 	// Already created (daemon restart / replay)?
 	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {

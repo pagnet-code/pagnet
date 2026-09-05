@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"agentnet/internal/domain"
-	"agentnet/internal/transport"
+	"pagnet/internal/domain"
+	"pagnet/internal/transport"
 )
 
 func gitInitRepo(t *testing.T, dir string) {
@@ -69,7 +69,7 @@ func TestResolveWorkspaceSecondRWGetsWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second RW agent must be isolated, got error: %v", err)
 	}
-	want := filepath.Join(repo, ".agentnet", "worktrees", "inst-2")
+	want := filepath.Join(repo, ".pagnet", "worktrees", "inst-2")
 	if got != want {
 		t.Fatalf("worktree path = %s, want %s", got, want)
 	}
@@ -77,8 +77,8 @@ func TestResolveWorkspaceSecondRWGetsWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("branch in worktree: %v: %s", err, out)
 	}
-	if br := strings.TrimSpace(string(out)); br != "agentnet/coder-2/inst-2" {
-		t.Fatalf("worktree branch = %q, want agentnet/coder-2/inst-2", br)
+	if br := strings.TrimSpace(string(out)); br != "pagnet/coder-2/inst-2" {
+		t.Fatalf("worktree branch = %q, want pagnet/coder-2/inst-2", br)
 	}
 }
 

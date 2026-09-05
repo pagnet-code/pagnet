@@ -22,7 +22,7 @@ import (
 func fakeBridgeServer(t *testing.T) (socket string, closeFn func()) {
 	t.Helper()
 	dir := t.TempDir()
-	socket = filepath.Join(dir, "agentnetd.sock")
+	socket = filepath.Join(dir, "pagnetd.sock")
 	l, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

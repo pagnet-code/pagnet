@@ -1,8 +1,8 @@
-# AgentNet
+# pagnet
 
 > **Working name** — the product is intentionally named generically. Branding is isolated so it can be renamed.
 
-AgentNet is a control plane and communication network for AI coding agents. It lets agents built on different runtimes (Claude Code, Qwen Code, OpenCode, future generic CLI agents) run on laptops, local servers, and remote servers while being visible, discoverable, and coordinated through one central server.
+pagnet is a control plane and communication network for AI coding agents. It lets agents built on different runtimes (Claude Code, Qwen Code, OpenCode, future generic CLI agents) run on laptops, local servers, and remote servers while being visible, discoverable, and coordinated through one central server.
 
 ```text
                     CENTRAL SERVER
@@ -23,7 +23,7 @@ AgentNet is a control plane and communication network for AI coding agents. It l
            |            |             |
            v            v             v
         Host A         Host B        Host C
-       agentnetd      agentnetd     agentnetd
+       pagnetd      pagnetd     pagnetd
            |            |             |
        local agents local agents   local agents
 ```
@@ -49,18 +49,18 @@ TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
   -d '{"name":"my-host","allowedRoots":["$HOME"],"ttlSeconds":3600}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-# consume the token; stores the credential in ~/.agentnet/config.yaml (0600)
-agentnet login --server http://localhost:18080 --token "$TOKEN"
+# consume the token; stores the credential in ~/.pagnet/config.yaml (0600)
+pagnet login --server http://localhost:18080 --token "$TOKEN"
 
 # start the host daemon (outbound WSS; keep it running)
-agentnetd
+pagnetd
 ```
 
 **3. Launch an agent** in a Git repository:
 
 ```bash
 cd my-project
-agentnet run . --runtime fake --role coder    # fake | qwen | claude
+pagnet run . --runtime fake --role coder    # fake | qwen | claude
 ```
 
 Then open http://localhost:13000 — the host shows as connected, and the agent
@@ -74,10 +74,10 @@ For self-hosting the whole central stack (Postgres included): see
 
 | Path | What |
 |------|------|
-| `cmd/agentnet` | CLI (login, host, run, agents, tasks, attach, ...) |
-| `cmd/agentnetd` | Per-machine host daemon |
-| `cmd/agentnet-server` | Central control plane (Go) |
-| `cmd/agentnet-mcp` | Local stdio MCP bridge for runtimes |
+| `cmd/pagnet` | CLI (login, host, run, agents, tasks, attach, ...) |
+| `cmd/pagnetd` | Per-machine host daemon |
+| `cmd/pagnet-server` | Central control plane (Go) |
+| `cmd/pagnet-mcp` | Local stdio MCP bridge for runtimes |
 | `internal/` | Go packages (domain, store, controlplane, daemon, runtimes, ...) |
 | `migrations/` | PostgreSQL migrations (goose) |
 | `web/` | Next.js control panel (App Router, TypeScript) |

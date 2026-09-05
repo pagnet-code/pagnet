@@ -39,7 +39,7 @@ func TestValidateTokenModeCredentials(t *testing.T) {
 	if err := short.Validate(); err == nil {
 		t.Error("short token must fail")
 	}
-	for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "agentnet"} {
+	for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "pagnet"} {
 		w := base
 		w.AdminToken = weak
 		if err := w.Validate(); err == nil {

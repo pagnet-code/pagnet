@@ -12,7 +12,7 @@ import (
 // The inherited environment is FILTERED before anything else is appended:
 // runtime processes are untrusted (an LLM with shell access), and the
 // daemon's own environment may carry control-plane material —
-// AGENTNET_* (admin/host credentials, runtime knobs), database DSNs —
+// PAGNET_* (admin/host credentials, runtime knobs), database DSNs —
 // that must never be readable from an agent (spec §5/§15/§86.10).
 //
 // Explicit pairs passed by the caller (adapter knobs, per-instance
@@ -36,11 +36,11 @@ func ChildEnv(extra ...[]string) []string {
 }
 
 // isControlPlaneEnvKey reports whether an inherited env key must not reach
-// an agent process: AgentNet's own configuration/credentials, plus
+// an agent process: pagnet's own configuration/credentials, plus
 // database connection strings.
 func isControlPlaneEnvKey(key string) bool {
 	switch {
-	case strings.HasPrefix(key, "AGENTNET_"):
+	case strings.HasPrefix(key, "PAGNET_"):
 		return true
 	case key == "DATABASE_URL" || key == "TEST_DATABASE_URL":
 		return true

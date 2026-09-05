@@ -73,7 +73,7 @@ func claudeSpec(dir string) TurnSpec {
 	return TurnSpec{
 		InstanceID: "inst-1",
 		Workspace:  dir,
-		SessionDir: filepath.Join(dir, "agentnet-session"),
+		SessionDir: filepath.Join(dir, "pagnet-session"),
 		Input:      "Reply with exactly one word: OK",
 	}
 }
@@ -132,7 +132,7 @@ func TestClaude_ColdTurn(t *testing.T) {
 		t.Fatalf("completed tokens = %+v", evs[3])
 	}
 	// The EXACT captured id is persisted for resume (Phase E).
-	id, err := readStoredSession(filepath.Join(dir, "agentnet-session", claudeSessionFile))
+	id, err := readStoredSession(filepath.Join(dir, "pagnet-session", claudeSessionFile))
 	if err != nil || id != sid {
 		t.Fatalf("stored session = %q, %v; want %q", id, err, sid)
 	}
@@ -273,10 +273,10 @@ func TestClaude_ModelAndMCPArgs(t *testing.T) {
 	out := `{"type":"system","subtype":"init","session_id":"` + sid + `"}
 {"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"` + sid + `"}
 `
-	const mcp = `{"mcpServers":{"agentnet":{"command":"agentnet-mcp","args":["serve","--socket","/s/agentnetd.sock"],"env":{"AGENTNET_INSTANCE_ID":"inst-1"}}}}`
+	const mcp = `{"mcpServers":{"pagnet":{"command":"pagnet-mcp","args":["serve","--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1"}}}}`
 	spec := claudeSpec(t.TempDir())
-	spec.Env = []string{"AGENTNET_MCP_CONFIG=" + mcp}
-	evs, argv := runClaudeStub(t, spec, out, map[string]string{"AGENTNET_CLAUDE_MODEL": "claude-sonnet-5"})
+	spec.Env = []string{"PAGNET_MCP_CONFIG=" + mcp}
+	evs, argv := runClaudeStub(t, spec, out, map[string]string{"PAGNET_CLAUDE_MODEL": "claude-sonnet-5"})
 	if len(evs) == 0 {
 		t.Fatalf("no events")
 	}
@@ -312,19 +312,19 @@ func TestClaude_InvalidMCPConfigFailsLoudly(t *testing.T) {
 
 	c := NewClaude(script)
 	spec := claudeSpec(t.TempDir())
-	spec.Env = []string{"AGENTNET_MCP_CONFIG={not json"}
+	spec.Env = []string{"PAGNET_MCP_CONFIG={not json"}
 	events := make(chan TurnEvent, 8)
 	if err := c.StartTurn(context.Background(), spec, events); err == nil {
-		t.Fatal("want error: invalid AGENTNET_MCP_CONFIG must not run silently")
+		t.Fatal("want error: invalid PAGNET_MCP_CONFIG must not run silently")
 	}
 	b, _ := os.ReadFile(filepath.Join(dir, "args.txt"))
 	if strings.TrimSpace(string(b)) != "" {
-		t.Fatalf("process spawned despite invalid AGENTNET_MCP_CONFIG (argv %s)", b)
+		t.Fatalf("process spawned despite invalid PAGNET_MCP_CONFIG (argv %s)", b)
 	}
 }
 
 func TestClaude_ModelSelection(t *testing.T) {
-	t.Setenv("AGENTNET_CLAUDE_MODEL", "from-env")
+	t.Setenv("PAGNET_CLAUDE_MODEL", "from-env")
 	c := NewClaude("")
 	if c.model() != "from-env" {
 		t.Fatalf("model = %q, want from-env", c.model())
@@ -334,7 +334,7 @@ func TestClaude_ModelSelection(t *testing.T) {
 		t.Fatalf("model = %q, want explicit (field wins)", c.model())
 	}
 	c.Model = ""
-	t.Setenv("AGENTNET_CLAUDE_MODEL", "")
+	t.Setenv("PAGNET_CLAUDE_MODEL", "")
 	if c.model() != "" {
 		t.Fatalf("model = %q, want empty (user default applies)", c.model())
 	}

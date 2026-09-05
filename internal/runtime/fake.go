@@ -10,11 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 // Fake is the MVP runtime adapter. It is a REAL process-per-turn runtime:
-// each turn spawns the `agentnet-fake-runtime` helper as a subprocess that
+// each turn spawns the `pagnet-fake-runtime` helper as a subprocess that
 // speaks a JSONL protocol over stdio and persists a session file. Resume
 // genuinely re-reads that file; rate-limit and resume-failure behaviors are
 // simulated by the helper so the full availability model (retry_at,
@@ -23,11 +23,11 @@ import (
 // It is the reference implementation that the real Qwen/Claude adapters
 // (Phases 8/9) replace, one-for-one, behind the same Adapter contract.
 type Fake struct {
-	// Binary is the path to the agentnet-fake-runtime helper. When empty it
+	// Binary is the path to the pagnet-fake-runtime helper. When empty it
 	// is resolved from PATH / next to the current executable.
 	Binary string
 	// Env is appended to the inherited environment for spawned runtime
-	// processes (E2E simulation knobs, e.g. AGENTNET_FAKE_RATELIMIT).
+	// processes (E2E simulation knobs, e.g. PAGNET_FAKE_RATELIMIT).
 	Env []string
 
 	track procTracker
@@ -50,16 +50,16 @@ func (f *Fake) binary() (string, error) {
 			return f.Binary, nil
 		}
 	}
-	if p, err := exec.LookPath("agentnet-fake-runtime"); err == nil {
+	if p, err := exec.LookPath("pagnet-fake-runtime"); err == nil {
 		return p, nil
 	}
 	if self, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(self), "agentnet-fake-runtime")
+		cand := filepath.Join(filepath.Dir(self), "pagnet-fake-runtime")
 		if _, err := os.Stat(cand); err == nil {
 			return cand, nil
 		}
 	}
-	return "", fmt.Errorf("agentnet-fake-runtime binary not found")
+	return "", fmt.Errorf("pagnet-fake-runtime binary not found")
 }
 
 // StartTurn runs one fake turn.

@@ -1,4 +1,4 @@
-module agentnet
+module pagnet
 
 go 1.27.1
 

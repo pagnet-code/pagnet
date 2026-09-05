@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"agentnet/internal/domain"
+	"pagnet/internal/domain"
 )
 
 func TestClassifyProviderError_Kinds(t *testing.T) {

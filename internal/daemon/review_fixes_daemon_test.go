@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"agentnet/internal/domain"
-	agentruntime "agentnet/internal/runtime"
-	"agentnet/internal/transport"
+	"pagnet/internal/domain"
+	agentruntime "pagnet/internal/runtime"
+	"pagnet/internal/transport"
 )
 
 // waitUntil polls cond until true or the deadline (test helper).
@@ -158,7 +158,7 @@ func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 		}
 		for _, row := range []*InstanceRow{ra, rb} {
 			if row.Workspace != repo {
-				wt := filepath.Join(repo, ".agentnet", "worktrees", row.InstanceID)
+				wt := filepath.Join(repo, ".pagnet", "worktrees", row.InstanceID)
 				if row.Workspace != wt {
 					t.Fatalf("iteration %d: unexpected workspace %q", iter, row.Workspace)
 				}

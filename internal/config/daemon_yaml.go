@@ -8,7 +8,7 @@ import (
 )
 
 // daemonFileConfig mirrors the persistent subset of Daemon stored in
-// stateDir/config.yaml (written by `agentnet login`). Zero values are
+// stateDir/config.yaml (written by `pagnet login`). Zero values are
 // "not set" (env wins).
 type daemonFileConfig struct {
 	ServerURL      string   `yaml:"serverUrl"`
@@ -50,7 +50,7 @@ func loadDaemonYAML(path string, cfg *Daemon) error {
 }
 
 // SaveCurrentNetwork persists the user's default network choice into the
-// daemon state file (`agentnet network use`). It merges with the existing
+// daemon state file (`pagnet network use`). It merges with the existing
 // config rather than rewriting the whole file.
 func SaveCurrentNetwork(stateDir, network string) error {
 	path := filepath.Join(stateDir, "config.yaml")

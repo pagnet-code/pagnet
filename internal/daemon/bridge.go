@@ -10,14 +10,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"agentnet/internal/transport"
+	"pagnet/internal/transport"
 )
 
 // The agent bridge socket. A managed agent never holds the host
-// credential: it talks to the network only through the agentnet-mcp
+// credential: it talks to the network only through the pagnet-mcp
 // process, which connects to THIS socket and authenticates with the
 // instance identity the daemon injected into its environment
-// (AGENTNET_INSTANCE_ID / AGENTNET_NETWORK_ID). The daemon validates that
+// (PAGNET_INSTANCE_ID / PAGNET_NETWORK_ID). The daemon validates that
 // identity against the instances IT launched, then relays the tool call
 // over the host connection (agent.request) and answers the correlated
 // agent.response to the waiting socket client (PROTOCOL §6).
@@ -30,7 +30,7 @@ import (
 //   {"id":"…","ok":true,"result":{…}} | {"id":"…","ok":false,"error":"…"}
 
 const (
-	bridgeSocketName     = "agentnetd.sock"
+	bridgeSocketName     = "pagnetd.sock"
 	bridgeAuthTimeout    = 5 * time.Second
 	bridgeRequestTimeout = 60 * time.Second
 	bridgeMaxLine        = 1 << 20 // 1 MiB per JSON line
