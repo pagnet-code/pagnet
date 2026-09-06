@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,9 @@ func (stubAdapter) StartTurn(context.Context, agentruntime.TurnSpec, chan agentr
 func (stubAdapter) Stop(string) error { return nil }
 func (stubAdapter) Available() bool   { return true }
 func (stubAdapter) PID(string) *int   { return nil }
+func (stubAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
+	return nil, errors.New("stub adapter has no interactive process")
+}
 
 // F4: two CONCURRENT read-write launches on the same repository (parallel
 // per-instance queues) must not both decide they are the first RW agent —

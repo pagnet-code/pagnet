@@ -11,6 +11,7 @@ package runtime
 
 import (
 	"context"
+	"os/exec"
 
 	"pagnet/internal/domain"
 )
@@ -95,4 +96,11 @@ type Adapter interface {
 	// (spec §59), or nil when no turn is running (process-per-turn: the
 	// process only exists for the duration of a turn).
 	PID(instanceID string) *int
+	// InteractiveCmd builds — WITHOUT starting — the runtime's interactive
+	// terminal command for an instance (addendum §7/§8: the ACTUAL runtime
+	// UI under a PTY, not a pagnet reimplementation). spec.Resume selects
+	// the runtime's session-resume flag when a session is stored; Dir and
+	// Env are set the same way as for a turn. The caller owns the returned
+	// command (it is started under a PTY by the daemon).
+	InteractiveCmd(spec TurnSpec) (*exec.Cmd, error)
 }

@@ -142,6 +142,33 @@ func (f *Fake) Stop(instanceID string) error { return f.track.stop(instanceID) }
 
 func (f *Fake) PID(instanceID string) *int { return f.track.pid(instanceID) }
 
+// InteractiveCmd builds the fake runtime's interactive PTY mode: a
+// deterministic, scriptable stand-in for a real runtime's interactive UI
+// (prompt, echo, SIGWINCH line, ANSI/Unicode output, exit/crash commands,
+// two selectable UI variants) so the whole terminal stack is E2E-testable
+// without a real CLI (addendum §68: "fake PTY fixtures that emulate
+// differing runtime UIs").
+func (f *Fake) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
+	bin, err := f.binary()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+		return nil, err
+	}
+	args := []string{"--pty", "--instance-id", spec.InstanceID, "--session-dir", spec.SessionDir}
+	if spec.Resume {
+		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, "session.json"))
+		if stored != "" {
+			args = append(args, "--resume", stored)
+		}
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = spec.Workspace
+	cmd.Env = ChildEnv(f.Env, spec.Env)
+	return cmd, nil
+}
+
 // wireEvent is the fake-runtime helper's stdout event (already normalized).
 type wireEvent struct {
 	Event        string  `json:"event"`

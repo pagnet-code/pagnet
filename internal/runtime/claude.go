@@ -346,6 +346,52 @@ func (c *Claude) Stop(instanceID string) error { return c.track.stop(instanceID)
 
 func (c *Claude) PID(instanceID string) *int { return c.track.pid(instanceID) }
 
+// InteractiveCmd builds the interactive claude REPL (the PTY terminal,
+// addendum §7/§8): the same CLI minus the one-shot turn flags
+// (-p / --output-format stream-json). The browser sees the ACTUAL Claude
+// Code UI of whatever version is installed — pagnet never re-implements it.
+// Not started: the daemon runs it under a PTY and owns its lifecycle.
+func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
+	bin, err := c.binary()
+	if err != nil {
+		return nil, err
+	}
+	if spec.Workspace == "" {
+		return nil, fmt.Errorf("claude adapter requires a workspace (claude sessions are CWD-scoped)")
+	}
+	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+		return nil, err
+	}
+	args := []string{"--permission-mode", "bypassPermissions"}
+	if model := c.model(); model != "" {
+		args = append(args, "--model", model)
+	}
+	if spec.Resume {
+		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, claudeSessionFile))
+		if stored != "" {
+			args = append(args, "--resume", stored)
+		}
+	}
+	// Same MCP bridge injection as a turn: the interactive CLI gets its
+	// network tools from the daemon's pagnet-mcp bridge.
+	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
+		var cfg struct {
+			MCPServers map[string]any `json:"mcpServers"`
+		}
+		if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
+			return nil, fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
+		}
+		if len(cfg.MCPServers) == 0 {
+			return nil, fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
+		}
+		args = append(args, "--mcp-config", mcpJSON)
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = spec.Workspace
+	cmd.Env = ChildEnv(c.Env, spec.Env)
+	return cmd, nil
+}
+
 // --- claude stream-json wire shapes -------------------------------------------
 
 type claudeEvent struct {

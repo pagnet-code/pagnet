@@ -94,6 +94,23 @@ network with three fake agents and sample tasks.
 For self-hosting the whole central stack (Postgres included): see
 `deploy/docker-compose.yml`. The host daemon always runs on the actual host.
 
+## Terminal (interactive attach)
+
+Workers have a live terminal: the runtime's **own interactive CLI**
+(`qwen` / `claude` / the fake's demo UI) running under a PTY on the host,
+proxied through the control plane — the host is never exposed to the
+client.
+
+- **Web** — agent detail → `terminal` tab → **Open terminal**. The PTY
+  starts on attach (resuming the stored runtime session), and **keeps
+  running while you are away**: Detach is observational, Stop kills the
+  process. Scrollback is bounded (256 KiB); re-opening replays it.
+- **CLI** — `pagnet attach <agent>`: raw terminal (keystrokes, arrow
+  keys, Ctrl+C reach the runtime directly; window resizes are forwarded).
+  **Ctrl-]** detaches (tmux-style) — the PTY keeps running on the host.
+
+Representatives keep the text proxy (input → turn → turn output).
+
 ## Repository layout
 
 | Path | What |

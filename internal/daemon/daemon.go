@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,13 @@ type Daemon struct {
 	// and the next attach re-wakes it.
 	attachMu sync.Mutex
 	attaches map[string]map[string]time.Time // instanceID -> attachSessionID
+
+	// PTY terminal sessions (addendum §8–§15): the long-lived interactive
+	// runtime process per instance, separate from the process-per-turn
+	// machinery. In-memory: a daemon restart drops the PTY (the process
+	// cannot survive it); the next attach starts a fresh session with the
+	// stored runtime session resume.
+	terminal *terminalManager
 
 	// Live host connection (for the bridge relay; nil while disconnected).
 	connMu  sync.Mutex
@@ -186,6 +194,7 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		turnCancel:  turnCancel,
 		repoLocks:   map[string]*sync.Mutex{},
 	}
+	d.terminal = newTerminalManager(d)
 	// Spec §91: start from a bounded dedup set (drops rows prunable
 	// while the daemon was down).
 	if err := st.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
@@ -261,10 +270,11 @@ func (d *Daemon) finishQueue(instanceID string) {
 	}
 }
 
-// Close shuts the daemon down: cancels in-flight turns (adapters kill the
-// turn subprocess, spec §90), waits briefly for them to die, then closes
-// the bridge socket and state.
+// Close shuts the daemon down: kills the PTY terminal sessions and
+// cancels in-flight turns (adapters kill the subprocesses, spec §90),
+// waits briefly for them to die, then closes the bridge socket and state.
 func (d *Daemon) Close() error {
+	d.terminal.stopAll()
 	d.turnCancel()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -603,8 +613,48 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
 		})
 
+	// LIVE terminal messages (PROTOCOL §3 "Live messages"): written
+	// straight to the ordered live worker — no durable queue, no ack,
+	// no busy-deferral. Keystroke semantics do not survive a Postgres
+	// round-trip; a dropped key beats a duplicated or reordered one.
 	case transport.MsgTerminalInput:
 		var p transport.TerminalInputPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("terminal input payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		data, err := base64.StdEncoding.DecodeString(p.Data)
+		if err != nil {
+			d.Log.Warn("terminal input not base64", "instance", p.InstanceID, "err", err)
+			return
+		}
+		d.terminal.submit(terminalLiveMsg{
+			instance: p.InstanceID, session: p.SessionID, data: data,
+		})
+
+	case transport.MsgTerminalResize:
+		var p transport.TerminalResizePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("terminal resize payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.terminal.submit(terminalLiveMsg{
+			isResize: true, instance: p.InstanceID, session: p.SessionID,
+			cols: p.Cols, rows: p.Rows,
+		})
+
+	case transport.MsgTerminalStop:
+		var p transport.TerminalStopPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("terminal stop payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doTerminalStop(conn, p) })
+		})
+
+	case transport.MsgAttachInput:
+		var p transport.AttachInputPayload
 		if err := env.DecodePayload(&p); err != nil {
 			// Structurally broken: the CommandID lives inside the payload,
 			// so this copy cannot be acked and the server will re-send it.
@@ -613,7 +663,17 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doTerminalInput(conn, p) })
+			d.guarded(conn, p.CommandID, func() error { return d.doAttachInput(conn, p) })
+		})
+
+	case transport.MsgTerminalSnapshot:
+		var p transport.TerminalSnapshotPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("terminal snapshot payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doTerminalSnapshot(conn, p) })
 		})
 
 	case transport.MsgForgetInstance:
@@ -943,6 +1003,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	if !ok {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
+	d.terminal.stop(instanceID) // a stopped agent has no live terminal
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
 	}
@@ -966,6 +1027,7 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 		return err
 	}
 	if ok {
+		d.terminal.stop(instanceID) // the forgotten instance keeps no process
 		if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 			_ = ad.Stop(instanceID)
 		}
@@ -987,6 +1049,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	if !ok {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
+	d.terminal.stop(instanceID) // cold start: the old PTY session dies with it
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
 	}
@@ -1303,15 +1366,16 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			"instance", spec.InstanceID)
 		return context.Canceled
 	default:
-		// Completed. §35: do not hibernate underneath an attached user. An
-		// active attach keeps the instance awake (idle, session active);
-		// the hibernation happens when the last attach is closed.
-		if d.attached(spec.InstanceID) {
+		// Completed. §35: do not hibernate underneath an attached user —
+		// and not underneath a live PTY either (addendum §10): an active
+		// attach or terminal keeps the instance awake (idle, session
+		// active); hibernation happens when the last one is closed.
+		if d.attached(spec.InstanceID) || d.terminal.active(spec.InstanceID) {
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "idle",
 			})
-			d.Log.Info("turn completed; instance kept awake (attach active)",
+			d.Log.Info("turn completed; instance kept awake (attach/pty active)",
 				"instance", spec.InstanceID)
 			return nil
 		}
@@ -1319,6 +1383,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
+			"reason":     "turn_completed",
 		})
 	}
 	return nil
@@ -1354,9 +1419,12 @@ func (d *Daemon) attached(instanceID string) bool {
 	return len(d.attaches[instanceID]) > 0
 }
 
-// doAttach registers an active interactive session. A hibernated instance
-// is woken so the user has a live agent; a busy one finishes its current
-// turn first (which will then keep it awake because the attach is active).
+// doAttach opens a terminal attach session (addendum §10/§11): it records
+// the attach, starts the instance's PTY when not already running — the
+// PTY start IS the wake of a hibernated instance (the interactive CLI
+// resumes the stored session) — and then streams the bounded PTY snapshot
+// so the (re)connecting client renders history before live output.
+// Detach later is observational: the PTY keeps running (§10).
 func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayload) error {
 	row, ok, err := d.state.GetInstance(p.InstanceID)
 	if err != nil {
@@ -1370,27 +1438,68 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 		return fmt.Errorf("instance %s is %s; attach refused", p.InstanceID, row.Status)
 	}
 	d.addAttach(p.InstanceID, p.SessionID)
-	if d.busy(p.InstanceID) {
-		d.Log.Info("attach active; instance is finishing its current turn",
-			"instance", p.InstanceID)
+
+	if !p.Terminal {
+		// Legacy text proxy (representatives): no PTY — input arrives as
+		// turns (host.attach_input). A hibernated instance is woken by a
+		// wake turn, exactly as the MVP attach did.
+		if d.busy(p.InstanceID) {
+			d.Log.Info("attach active; instance is finishing its current turn",
+				"instance", p.InstanceID)
+			return nil
+		}
+		if row.Status == "hibernated" {
+			d.Log.Info("attach wakes hibernated instance", "instance", p.InstanceID)
+			input := "You were woken. Reason: a human attached an interactive session."
+			return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, "user_input"))
+		}
+		d.Log.Info("attach active (instance already awake)", "instance", p.InstanceID)
 		return nil
 	}
-	if row.Status == "hibernated" {
-		d.Log.Info("attach wakes hibernated instance", "instance", p.InstanceID)
-		input := "You were woken. Reason: a human attached an interactive session."
-		return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, "user_input"))
+
+	s, err := d.terminal.start(p.InstanceID, row.SessionID != "")
+	if err != nil {
+		d.removeAttach(p.InstanceID, p.SessionID)
+		return err
 	}
-	d.Log.Info("attach active (instance already awake)", "instance", p.InstanceID)
+	// Wake semantics: a hibernated instance becomes awake (idle) once its
+	// interactive process is running. A busy instance simply keeps its
+	// turn (process-per-turn) while the PTY runs alongside it.
+	if row.Status == "hibernated" {
+		_ = d.state.SetInstanceStatus(p.InstanceID, "idle", row.SessionID)
+		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+			"instanceId": p.InstanceID, "status": "idle",
+		})
+		d.Log.Info("attach wakes hibernated instance (pty started)", "instance", p.InstanceID)
+	}
+	// The snapshot is sent right after the attach (durable command →
+	// this worker), so any output produced since the last attach is
+	// replayed before live frames for the new client (§11).
+	data, lastSeq := d.terminal.snapshot(s)
+	_ = d.send(conn, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+		InstanceID: p.InstanceID,
+		SessionID:  p.SessionID,
+		Data:       data,
+		Snapshot:   true,
+		LastSeq:    lastSeq,
+	})
 	return nil
 }
 
-// doDetach closes an interactive session. When it was the last one and the
-// instance is idle with no turn running, the instance returns to normal
-// hibernation (§35: "once detached and safe, the managed runtime may
-// return to normal hibernation").
+// doDetach closes an attach session. Detach is observational — the PTY
+// keeps running (§10). When it was the LAST attach, the instance returns
+// to normal hibernation only if no PTY is active (§35: do not hibernate
+// underneath an attached user or a live terminal).
 func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayload) error {
 	last := d.removeAttach(p.InstanceID, p.SessionID)
 	if !last {
+		return nil
+	}
+	if d.terminal.active(p.InstanceID) {
+		// The live PTY keeps the instance awake; its exit (or an explicit
+		// terminal stop) is what hibernates it.
+		d.Log.Info("last attach closed; pty keeps the instance awake",
+			"instance", p.InstanceID)
 		return nil
 	}
 	row, ok, err := d.state.GetInstance(p.InstanceID)
@@ -1405,18 +1514,70 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
+			// No PTY is involved (or it is gone): other sessions on this
+			// instance must NOT be torn down by this hibernation.
+			"reason": "attach_closed",
 		})
 		d.Log.Info("last attach closed; instance hibernated", "instance", p.InstanceID)
 	}
 	return nil
 }
 
-// doTerminalInput executes one interactive user input from an attach
-// session as a turn (spec §54 terminal proxy: the control plane brokers
-// browser/CLI input over the host connection). A hibernated instance is
-// woken by resuming its stored session; input arriving while a turn is in
-// progress stays queued (deferred) and runs after it completes.
-func (d *Daemon) doTerminalInput(conn *websocket.Conn, p transport.TerminalInputPayload) error {
+// doTerminalStop kills the instance's PTY (explicit user stop; instance
+// stop/restart/forget also call terminal.stop directly). Idempotent: a
+// second stop is a clean no-op. When the instance is idle, it hibernates —
+// the terminal is gone, so the keep-awake reason is gone too.
+func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPayload) error {
+	d.terminal.stop(p.InstanceID)
+	row, ok, err := d.state.GetInstance(p.InstanceID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if d.busy(p.InstanceID) {
+		return nil // the finishing turn settles the status
+	}
+	if row.Status == "idle" {
+		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
+			"instanceId": p.InstanceID, "sessionId": row.SessionID,
+			// The stop endpoint already told its clients "stopped".
+			"reason": "stopped",
+		})
+		d.Log.Info("terminal stopped; instance hibernated", "instance", p.InstanceID)
+	}
+	return nil
+}
+
+// doTerminalSnapshot re-emits the PTY snapshot frame for an attach
+// session (addendum §11): the server requests it when a client connects
+// after live output has already flowed, so the late client gets a fresh,
+// bounded screen instead of a stale one. No frame when the PTY is not
+// running — the session's teardown owns the waiting client.
+func (d *Daemon) doTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSnapshotPayload) error {
+	s := d.terminal.get(p.InstanceID)
+	if s == nil {
+		return nil
+	}
+	data, lastSeq := d.terminal.snapshot(s)
+	_ = d.send(conn, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+		InstanceID: p.InstanceID,
+		SessionID:  p.SessionID,
+		Data:       data,
+		Snapshot:   true,
+		LastSeq:    lastSeq,
+	})
+	return nil
+}
+
+// doAttachInput executes one input from a legacy (non-PTY) attach session
+// as a turn — the representative text-proxy semantics (input in, turn
+// output out). A hibernated instance is woken by resuming its stored
+// session; input arriving while a turn is in progress stays queued
+// (deferred) and runs after it completes.
+func (d *Daemon) doAttachInput(conn *websocket.Conn, p transport.AttachInputPayload) error {
 	row, ok, err := d.state.GetInstance(p.InstanceID)
 	if err != nil {
 		return err
@@ -1434,7 +1595,7 @@ func (d *Daemon) doTerminalInput(conn *websocket.Conn, p transport.TerminalInput
 	if d.busy(p.InstanceID) {
 		return ErrDeferred
 	}
-	d.Log.Info("terminal input turn", "instance", p.InstanceID,
+	d.Log.Info("attach input turn (legacy proxy)", "instance", p.InstanceID,
 		"session", p.SessionID, "bytes", len(p.Data))
 	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", p.Data, "user_input"))
 }

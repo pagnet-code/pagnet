@@ -287,6 +287,42 @@ func (q *Qwen) Stop(instanceID string) error { return q.track.stop(instanceID) }
 
 func (q *Qwen) PID(instanceID string) *int { return q.track.pid(instanceID) }
 
+// InteractiveCmd builds the interactive qwen REPL (the PTY terminal,
+// addendum §7/§8): the default interactive mode (no -o stream-json), with
+// the same model override, session resume, and project-scoped MCP bridge
+// as a turn. Not started: the daemon runs it under a PTY and owns its
+// lifecycle.
+func (q *Qwen) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
+	bin, err := q.binary()
+	if err != nil {
+		return nil, err
+	}
+	if spec.Workspace == "" {
+		return nil, fmt.Errorf("qwen adapter requires a workspace (qwen sessions are CWD-scoped)")
+	}
+	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+		return nil, err
+	}
+	var args []string
+	if model := q.model(); model != "" {
+		args = append(args, "-m", model)
+	}
+	if spec.Resume {
+		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, qwenSessionFile))
+		if stored != "" {
+			args = append(args, "-r", stored)
+		}
+	}
+	// Same project-scoped MCP bridge injection as a turn.
+	if err := injectQwenMCP(spec); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = spec.Workspace
+	cmd.Env = ChildEnv(q.Env, spec.Env)
+	return cmd, nil
+}
+
 // --- qwen stream-json wire shapes --------------------------------------------
 
 type qwenEvent struct {
