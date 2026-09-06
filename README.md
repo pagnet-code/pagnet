@@ -39,24 +39,48 @@ cp deploy/example.env deploy/.env   # set DATABASE_URL to any Postgres you run
 make dev                            # control plane (:18080) + web UI (:13000)
 ```
 
-**2. Connect a host** (on the machine where the agents will run). Enroll the
-host with a one-time token, then start the daemon. In `dev` auth mode the
-enrollment call from localhost needs no admin token:
+**2. Sign in as a user.** Auth mode is `PAGNET_AUTH_MODE` (`token`, `local`,
+or `oidc`; `deploy/example.env` documents each):
+
+- **token** (default): one admin bearer. When `PAGNET_ADMIN_TOKEN` is empty
+  the server bootstraps a random token and prints it **once** at startup —
+  grab it from the dev console / `docker compose logs server` and store it:
+
+  ```bash
+  pagnet login --server http://localhost:18080 --token "$ADMIN_TOKEN"
+  ```
+
+- **local**: create the first account in the web UI (`http://localhost:13000`,
+  the `/setup` page — no default credentials), then:
+
+  ```bash
+  pagnet login --server http://localhost:18080   # prompts for username/password
+  ```
+
+- **oidc**: any external IdP via `OIDC_*` env vars (Keycloak included);
+  `pagnet login` runs the device flow.
+
+`pagnet login` stores a revocable API token in `~/.pagnet/config.yaml`
+(0600) and every CLI command uses it automatically.
+
+**3. Connect a host** (on the machine where the agents will run). Enroll the
+host with a one-time token, then start the daemon:
 
 ```bash
 # one-time enrollment token (plaintext is shown exactly once)
 TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{"name":"my-host","allowedRoots":["$HOME"],"ttlSeconds":3600}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
 
-# consume the token; stores the credential in ~/.pagnet/config.yaml (0600)
-pagnet login --server http://localhost:18080 --token "$TOKEN"
+# consume the token; stores the host credential in ~/.pagnet/config.yaml (0600)
+pagnet enroll --server http://localhost:18080 --token "$TOKEN"
 
 # start the host daemon (outbound WSS; keep it running)
 pagnetd
 ```
 
-**3. Launch an agent** in a Git repository:
+**4. Launch an agent** in a Git repository:
 
 ```bash
 cd my-project
@@ -74,7 +98,7 @@ For self-hosting the whole central stack (Postgres included): see
 
 | Path | What |
 |------|------|
-| `cmd/pagnet` | CLI (login, host, run, agents, tasks, attach, ...) |
+| `cmd/pagnet` | CLI (login, enroll, run, agents, tasks, attach, ...) |
 | `cmd/pagnetd` | Per-machine host daemon |
 | `cmd/pagnet-server` | Central control plane (Go) |
 | `cmd/pagnet-mcp` | Local stdio MCP bridge for runtimes |

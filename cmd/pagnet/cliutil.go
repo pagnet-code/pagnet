@@ -27,9 +27,9 @@ type cliCtx struct {
 	token string
 }
 
-// newCLI loads the daemon state config (same file `pagnet login`
-// writes) and applies --server if given. stateDirOverride passes
-// --state-dir straight through ("" = default ~/.pagnet).
+// newCLI loads the daemon state config (same file `pagnet enroll` /
+// `pagnet login` write) and applies --server if given. stateDirOverride
+// passes --state-dir straight through ("" = default ~/.pagnet).
 func newCLI(stateDirOverride string) (*cliCtx, error) {
 	c := &cliCtx{base: serverURL}
 	if stateDirOverride == "" {
@@ -51,13 +51,17 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 		c.base = cfg.ServerURL
 	}
 	c.cfg = cfg
-	c.token = userToken
+	// Bearer precedence: --token / $PAGNET_TOKEN, then the token stored by
+	// `pagnet login` (config.yaml "token" key).
+	if c.token = userToken; c.token == "" {
+		c.token = loadUserToken(c.stateDir)
+	}
 	return c, nil
 }
 
 // do performs an authenticated request against the control plane. The
-// user/admin token (--token / $PAGNET_TOKEN) is the CLI's bearer; an
-// empty token means dev-loopback auto-admin (or a 401 elsewhere).
+// user/admin token (--token / $PAGNET_TOKEN / `pagnet login`) is the
+// CLI's bearer.
 func (c *cliCtx) do(method, path string, body, out any) error {
 	var rd io.Reader
 	if body != nil {
@@ -89,7 +93,7 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 		return err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("http 401: %s (set --token / $PAGNET_TOKEN to a user/admin bearer)", string(raw))
+		return fmt.Errorf("http 401: %s (run `pagnet login` or set --token / $PAGNET_TOKEN to a user/admin bearer)", string(raw))
 	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("http %d: %s", resp.StatusCode, string(raw))

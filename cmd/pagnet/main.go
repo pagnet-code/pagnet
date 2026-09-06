@@ -14,18 +14,19 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 var serverURL string
 
 // userToken is the user/admin bearer token for REST calls (--token or
-// $PAGNET_TOKEN). Host credentials from `pagnet login` authenticate
-// the daemon over WSS only — the REST API is user-scoped and rejects
-// host identities (403 host_identity).
+// $PAGNET_TOKEN); when both are empty the token stored by `pagnet login`
+// applies. Host credentials from `pagnet enroll` authenticate the daemon
+// over WSS only — the REST API is user-scoped and rejects host identities
+// (403 host_identity).
 var userToken string
 
 // root is package-level so shared plumbing (newCLI) can check whether the
@@ -41,10 +42,11 @@ func main() {
 		SilenceErrors: false,
 	}
 	root.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:18080", "control plane URL")
-	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (dev loopback needs none)")
+	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to `pagnet login`)")
 
 	root.AddCommand(
 		loginCmd(),
+		enrollCmd(),
 		runCmd(),
 		networkCmd(),
 		workspacesCmd(),
@@ -75,14 +77,15 @@ func main() {
 	}
 }
 
-// loginCmd implements `pagnet login`: consumes a one-time enrollment
-// token against the control plane and stores the host credential + identity
-// in the daemon state dir (config.yaml, mode 0600).
-func loginCmd() *cobra.Command {
+// enrollCmd implements `pagnet enroll` (formerly `pagnet login`): consumes
+// a one-time enrollment token against the control plane and stores the host
+// credential + identity in the daemon state dir (config.yaml, mode 0600).
+// User sign-in lives in `pagnet login`.
+func enrollCmd() *cobra.Command {
 	var token, name, stateDir string
 	var roots []string
 	cmd := &cobra.Command{
-		Use:   "login",
+		Use:   "enroll",
 		Short: "Connect this host: consume an enrollment token, store the credential",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -127,21 +130,13 @@ func loginCmd() *cobra.Command {
 				savedRoots = roots
 			}
 
-			if err := os.MkdirAll(stateDir, 0o700); err != nil {
-				return err
-			}
-			cfg := map[string]any{
-				"serverUrl":    serverURL,
+			if err := mergeConfigFile(stateDir, map[string]any{
+				"serverUrl":    strings.TrimSuffix(serverURL, "/"),
 				"credential":   resp.Credential,
 				"hostId":       resp.Host.ID,
 				"hostName":     name,
 				"allowedRoots": savedRoots,
-			}
-			b, err := yaml.Marshal(cfg)
-			if err != nil {
-				return err
-			}
-			if err := os.WriteFile(filepath.Join(stateDir, "config.yaml"), b, 0o600); err != nil {
+			}); err != nil {
 				return err
 			}
 			fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)

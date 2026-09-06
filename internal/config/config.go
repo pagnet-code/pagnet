@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,17 +27,24 @@ type Server struct {
 	Addr string
 	// DSN is the PostgreSQL connection string.
 	DSN string
-	// AuthMode: "dev" (local development, no token on localhost) or "token".
-	// Validation is fail-closed (SEC-005): unknown modes, dev mode on a
-	// non-loopback bind, and weak token-mode credentials refuse startup.
+	// AuthMode: "token" (single admin bearer), "local" (DB users,
+	// Argon2id, sessions + API tokens) or "oidc" (external identity
+	// provider, config-driven). Validation is fail-closed (SEC-005):
+	// unknown modes and under-specified modes refuse startup.
 	AuthMode string
-	// AdminToken is the Bearer token for administrative API access.
+	// AdminToken is the Bearer token for administrative API access in
+	// token mode. Empty in token mode is allowed: the server bootstraps
+	// a random token at startup and prints it exactly once (log) — the
+	// zero-setup open-source launch path.
 	AdminToken string
+	// OIDC configures the oidc auth mode. Provider-agnostic standard
+	// OIDC (Keycloak is one of many valid issuers) — nothing about a
+	// specific provider is hardcoded.
+	OIDC OIDC
 	// CORSOrigins are the allowed browser origins (CORS + WebSocket origin
 	// validation). Entries are exact origins ("https://console.example.com")
-	// or the shorthand "localhost" (http(s) on loopback, any port). Empty in
-	// dev mode defaults to loopback; empty in token mode means same-origin
-	// only (hosted deployments behind one origin).
+	// or the shorthand "localhost" (http(s) on loopback, any port). Empty
+	// means same-origin only (hosted deployments behind one origin).
 	CORSOrigins []string
 	// HeartbeatInterval is the expected host heartbeat period.
 	HeartbeatInterval time.Duration
@@ -67,6 +75,23 @@ type Telegram struct {
 // Enabled reports whether the Telegram channel should be started.
 func (t Telegram) Enabled() bool { return t.BotToken != "" }
 
+// OIDC configures the oidc auth mode (standard OIDC, any provider).
+type OIDC struct {
+	// Issuer is the OIDC issuer base URL (discovery: / .well-known/openid-
+	// configuration). e.g. https://keycloak.example.com/realms/pagnet.
+	Issuer string
+	// ClientID / ClientSecret are the registered confidential client.
+	ClientID     string
+	ClientSecret string
+	// RedirectURI is the EXACT URI registered with the provider for the
+	// authorization-code redirect (no wildcards; validated in Validate).
+	RedirectURI string
+}
+
+// Enabled reports whether the OIDC config is present (used for startup
+// checks in oidc mode).
+func (o OIDC) Enabled() bool { return o.Issuer != "" && o.ClientID != "" }
+
 // LoadServer reads server configuration from environment (with env-file
 // fallback).
 func LoadServer() (Server, error) {
@@ -76,7 +101,7 @@ func LoadServer() (Server, error) {
 	cfg := Server{
 		Addr:              envOr("PAGNET_ADDR", "127.0.0.1:18080"),
 		DSN:               envOr("DATABASE_URL", ""),
-		AuthMode:          envOr("PAGNET_AUTH_MODE", "dev"),
+		AuthMode:          envOr("PAGNET_AUTH_MODE", "token"),
 		AdminToken:        envOr("PAGNET_ADMIN_TOKEN", ""),
 		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
 		OfflineThreshold:  envDuration("PAGNET_OFFLINE_THRESHOLD", 45*time.Second),
@@ -96,6 +121,12 @@ func LoadServer() (Server, error) {
 	if v := os.Getenv("PAGNET_CORS_ORIGINS"); v != "" {
 		cfg.CORSOrigins = splitCSV(v)
 	}
+	cfg.OIDC = OIDC{
+		Issuer:       envOr("OIDC_ISSUER", ""),
+		ClientID:     envOr("OIDC_CLIENT_ID", ""),
+		ClientSecret: envOr("OIDC_CLIENT_SECRET", ""),
+		RedirectURI:  envOr("OIDC_REDIRECT_URI", ""),
+	}
 	if cfg.DSN == "" {
 		return cfg, ErrMissingDSN
 	}
@@ -110,15 +141,12 @@ func LoadServer() (Server, error) {
 // safe refuses to start.
 func (s Server) Validate() error {
 	switch s.AuthMode {
-	case "dev":
-		// Dev mode auto-authenticates loopback callers. It must never be
-		// reachable beyond loopback, so the bind address must be loopback.
-		if !IsLoopbackAddr(s.Addr) {
-			return fmt.Errorf("config: PAGNET_AUTH_MODE=dev requires a loopback bind address (got %q); use AUTH_MODE=token for non-loopback binds", s.Addr)
-		}
 	case "token":
+		// Empty AdminToken is the zero-setup path: the server bootstraps
+		// a random token at startup and prints it exactly once. A
+		// configured token must be strong.
 		if s.AdminToken == "" {
-			return errors.New("config: PAGNET_AUTH_MODE=token requires PAGNET_ADMIN_TOKEN")
+			break
 		}
 		if len(s.AdminToken) < 32 {
 			return fmt.Errorf("config: PAGNET_ADMIN_TOKEN must be at least 32 characters (got %d)", len(s.AdminToken))
@@ -128,10 +156,50 @@ func (s Server) Validate() error {
 				return fmt.Errorf("config: PAGNET_ADMIN_TOKEN is a known weak value (%q); set a high-entropy token", weak)
 			}
 		}
+	case "local":
+		// DB users + Argon2id + sessions. No extra env required; the
+		// first admin is created at first run (setup endpoint / CLI).
+	case "oidc":
+		if s.OIDC.Issuer == "" {
+			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_ISSUER")
+		}
+		if !strings.HasPrefix(s.OIDC.Issuer, "https://") && !isLoopbackURLOrEmpty(s.OIDC.Issuer, "http://") {
+			return fmt.Errorf("config: OIDC_ISSUER must be https:// (got %q); loopback http is allowed only for local development", s.OIDC.Issuer)
+		}
+		if s.OIDC.ClientID == "" || s.OIDC.ClientSecret == "" {
+			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET")
+		}
+		if s.OIDC.RedirectURI == "" {
+			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_REDIRECT_URI (the exact URI registered with the provider)")
+		}
+		if !strings.HasPrefix(s.OIDC.RedirectURI, "https://") && !strings.HasPrefix(s.OIDC.RedirectURI, "http://") {
+			return fmt.Errorf("config: OIDC_REDIRECT_URI must be a full http(s) URI (got %q)", s.OIDC.RedirectURI)
+		}
+		if strings.ContainsAny(s.OIDC.RedirectURI, "*") {
+			return errors.New("config: OIDC_REDIRECT_URI must not contain wildcards (the provider must accept it exactly)")
+		}
 	default:
-		return fmt.Errorf("config: unknown PAGNET_AUTH_MODE %q (want \"dev\" or \"token\")", s.AuthMode)
+		return fmt.Errorf("config: unknown PAGNET_AUTH_MODE %q (want \"token\", \"local\" or \"oidc\")", s.AuthMode)
 	}
 	return nil
+}
+
+// isLoopbackURLOrEmpty reports whether uri starts with prefix and is a
+// loopback host (local development against a local IdP / test mocks).
+func isLoopbackURLOrEmpty(uri, prefix string) bool {
+	if !strings.HasPrefix(uri, prefix) {
+		return false
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		host = u.Host
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // IsLoopbackAddr reports whether a listen address binds only to loopback.

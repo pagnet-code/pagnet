@@ -4,35 +4,13 @@ import (
 	"testing"
 )
 
-func TestValidateDevModeRequiresLoopbackBind(t *testing.T) {
-	cases := []struct {
-		addr string
-		ok   bool
-	}{
-		{"127.0.0.1:18080", true},
-		{"localhost:18080", true},
-		{"[::1]:18080", true},
-		{":18080", false},        // all interfaces
-		{"0.0.0.0:18080", false}, // all interfaces
-		{"192.168.1.10:18080", false},
-	}
-	for _, c := range cases {
-		s := Server{Addr: c.addr, AuthMode: "dev"}
-		err := s.Validate()
-		if c.ok && err != nil {
-			t.Errorf("Validate(%q, dev) = %v, want nil", c.addr, err)
-		}
-		if !c.ok && err == nil {
-			t.Errorf("Validate(%q, dev) = nil, want error", c.addr)
-		}
-	}
-}
-
 func TestValidateTokenModeCredentials(t *testing.T) {
 	base := Server{Addr: "127.0.0.1:18080", AuthMode: "token"}
 
-	if err := base.Validate(); err == nil {
-		t.Error("token mode without a token must fail")
+	// Empty token is the zero-setup bootstrap path: the server generates
+	// and prints one at startup.
+	if err := base.Validate(); err != nil {
+		t.Errorf("token mode without a token must pass (bootstrap): %v", err)
 	}
 	short := base
 	short.AdminToken = "too-short"
@@ -53,10 +31,66 @@ func TestValidateTokenModeCredentials(t *testing.T) {
 	}
 }
 
-func TestValidateUnknownMode(t *testing.T) {
-	s := Server{Addr: "127.0.0.1:18080", AuthMode: "oidc"}
-	if err := s.Validate(); err == nil {
-		t.Error("unknown auth mode must fail")
+func TestValidateLocalMode(t *testing.T) {
+	s := Server{Addr: "127.0.0.1:18080", AuthMode: "local"}
+	if err := s.Validate(); err != nil {
+		t.Errorf("local mode must pass with no extra env: %v", err)
+	}
+}
+
+func TestValidateOIDCMode(t *testing.T) {
+	full := Server{
+		Addr:     "127.0.0.1:18080",
+		AuthMode: "oidc",
+		OIDC: OIDC{
+			Issuer:       "https://keycloak.example.com/realms/pagnet",
+			ClientID:     "pagnet",
+			ClientSecret: "s3cret",
+			RedirectURI:  "https://pagnet.example.com/api/v1/auth/oidc/callback",
+		},
+	}
+	if err := full.Validate(); err != nil {
+		t.Fatalf("full oidc config must pass: %v", err)
+	}
+
+	missing := func(mutate func(*Server)) {
+		s := full
+		mutate(&s)
+		if err := s.Validate(); err == nil {
+			t.Error("incomplete oidc config must fail")
+		}
+	}
+	missing(func(s *Server) { s.OIDC.Issuer = "" })
+	missing(func(s *Server) { s.OIDC.ClientID = "" })
+	missing(func(s *Server) { s.OIDC.ClientSecret = "" })
+	missing(func(s *Server) { s.OIDC.RedirectURI = "" })
+
+	// The issuer must be https, except loopback for local dev/test IdPs.
+	nonTLS := full
+	nonTLS.OIDC.Issuer = "http://keycloak.example.com/realms/pagnet"
+	if err := nonTLS.Validate(); err == nil {
+		t.Error("non-loopback http issuer must fail")
+	}
+	localIssuer := full
+	localIssuer.OIDC.Issuer = "http://127.0.0.1:18081/realms/pagnet"
+	if err := localIssuer.Validate(); err != nil {
+		t.Errorf("loopback http issuer (local dev) must pass: %v", err)
+	}
+
+	// Wildcard redirect URIs are never accepted.
+	wild := full
+	wild.OIDC.RedirectURI = "https://pagnet.example.com/*/callback"
+	if err := wild.Validate(); err == nil {
+		t.Error("wildcard redirect URI must fail")
+	}
+}
+
+func TestValidateUnknownModes(t *testing.T) {
+	for _, mode := range []string{"dev", "bogus", "Token"} {
+		s := Server{Addr: "127.0.0.1:18080", AuthMode: mode}
+		if err := s.Validate(); err == nil {
+			t.Errorf("auth mode %q must fail", mode)
+		}
 	}
 }
 

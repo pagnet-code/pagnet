@@ -288,7 +288,7 @@ func openCmd() *cobra.Command {
 				return err
 			}
 			if c.cfg.HostID == "" {
-				return errors.New("no pagnet host config found; run `pagnet login --token <token>` first")
+				return errors.New("no pagnet host config found; run `pagnet enroll --token <enrollment-token>` first")
 			}
 			dir := "."
 			if len(args) == 1 {
@@ -530,8 +530,14 @@ func doctorCmd() *cobra.Command {
 
 			// 2. REST token (user/admin) — host credentials are WSS-only
 			// and never authenticate the CLI.
-			if userToken != "" {
-				r2, err := client.Get(server + "/api/v1/hosts")
+			restToken := userToken
+			if restToken == "" {
+				restToken = loadUserToken(stateDir)
+			}
+			if restToken != "" {
+				req2, _ := http.NewRequest(http.MethodGet, server+"/api/v1/hosts", nil)
+				req2.Header.Set("Authorization", "Bearer "+restToken)
+				r2, err := client.Do(req2)
 				if err != nil {
 					check("REST token", false, err.Error())
 				} else {
@@ -540,16 +546,16 @@ func doctorCmd() *cobra.Command {
 					if r2.StatusCode == 200 {
 						check("REST token", true, "accepted")
 					} else {
-						check("REST token", false, fmt.Sprintf("http %d — check --token / $PAGNET_TOKEN", r2.StatusCode))
+						check("REST token", false, fmt.Sprintf("http %d — run `pagnet login` or check --token / $PAGNET_TOKEN", r2.StatusCode))
 					}
 				}
 			} else {
-				info("REST token", "none set (works on the server's loopback in dev mode only)")
+				info("REST token", "none set — run `pagnet login` (or use --token / $PAGNET_TOKEN)")
 			}
 
 			// 3. Host login stored for the daemon?
 			if cfg.Credential == "" || cfg.HostID == "" {
-				check("host login stored", false, "no login stored — run `pagnet login --token <enrollment-token>`")
+				check("host login stored", false, "no host login stored — run `pagnet enroll --token <enrollment-token>`")
 			} else {
 				check("host login stored", true, "credential + host id present (the daemon uses it over WSS)")
 			}
