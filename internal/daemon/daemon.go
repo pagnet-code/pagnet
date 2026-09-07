@@ -969,6 +969,21 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	d.Log.Info(msg,
 		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": p.InstanceID})
+
+	// North-star §15: a launch has an initial mission. The daemon runs it
+	// as the FIRST turn of a fresh instance — the adapter translates it
+	// into the runtime's mechanism (first prompt / session creation). A
+	// resumed session never receives it again (its context already has it).
+	if p.Mission != "" {
+		row, ok, err := d.state.GetInstance(p.InstanceID)
+		if err != nil {
+			return err
+		}
+		if ok && row.SessionID == "" {
+			d.Log.Info("mission first turn", "instance", p.InstanceID, "chars", len(p.Mission))
+			return d.runTurn(conn, d.turnSpecFor(row, false, p.Mission, "mission"))
+		}
+	}
 	return nil
 }
 

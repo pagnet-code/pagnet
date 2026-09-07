@@ -101,10 +101,13 @@ Workers have a live terminal: the runtime's **own interactive CLI**
 proxied through the control plane — the host is never exposed to the
 client.
 
-- **Web** — agent detail → `terminal` tab → **Open terminal**. The PTY
-  starts on attach (resuming the stored runtime session), and **keeps
-  running while you are away**: Detach is observational, Stop kills the
-  process. Scrollback is bounded (256 KiB); re-opening replays it.
+- **Web** — `/agents` → pick an agent → `terminal` tab: it **attaches
+  automatically**. The PTY starts on attach (resuming the stored runtime
+  session) and **keeps running while you are away**: Detach is
+  observational, Stop kills the process (both in the ⋯ menu). Scrollback
+  is bounded (256 KiB); re-attaching replays the current screen, and a
+  dropped connection shows a "Connection lost — reconnecting…" banner
+  until the backoff succeeds.
 - **CLI** — `pagnet attach <agent>`: raw terminal (keystrokes, arrow
   keys, Ctrl+C reach the runtime directly; window resizes are forwarded).
   **Ctrl-]** detaches (tmux-style) — the PTY keeps running on the host.
