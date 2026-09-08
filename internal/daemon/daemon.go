@@ -43,6 +43,12 @@ type Config struct {
 	// RuntimeEnv is applied to spawned runtime processes (E2E simulation
 	// knobs live here; a real deployment leaves it empty).
 	RuntimeEnv []string
+	// PrimaryWorkspace, when set, is registered as a workspace on every
+	// connect (host.workspace_detected) even when it is not a git
+	// repository — the single-directory worker mode: the inventory scan
+	// only reports git repos, so without this a fresh/empty directory
+	// would never be launchable from the UI or CLI.
+	PrimaryWorkspace string
 }
 
 // Daemon is a running pagnetd instance.
@@ -52,6 +58,10 @@ type Daemon struct {
 
 	state    *State
 	adapters map[domain.RuntimeName]agentruntime.Adapter
+
+	// rootsMu guards AllowedRoots: host.update_roots replaces it at
+	// runtime (the server-side root list is the source of truth).
+	rootsMu sync.RWMutex
 
 	turnMu      sync.Mutex
 	activeTurns map[string]bool
@@ -363,6 +373,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	// triggers the server's reconnect wake re-evaluation (pending commands
 	// are re-sent; we deduplicate locally by CommandID).
 	d.sendInventory(conn)
+	if d.PrimaryWorkspace != "" {
+		// Single-directory worker: register the directory itself even
+		// when it is not a git repository (gitWorkspaceReport degrades
+		// gracefully — empty remote/branch, no resource key).
+		_ = d.send(conn, transport.MsgWorkspaceDetected, gitWorkspaceReport(d.PrimaryWorkspace))
+	}
 
 	heartbeat := time.NewTicker(d.Heartbeat)
 	defer heartbeat.Stop()
@@ -713,6 +729,22 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			}
 		}()
 
+	case transport.MsgUpdateRoots:
+		var p transport.UpdateRootsPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.guarded(conn, p.CommandID, func() error {
+			d.SetAllowedRoots(p.Roots)
+			d.Log.Info("allowed roots updated", "roots", p.Roots)
+			// Re-report: the workspace set may have changed (a root was
+			// added or removed), and the server persists the inventory's
+			// roots as the host's source-of-truth list.
+			d.sendInventory(conn)
+			return nil
+		})
+
 	default:
 		d.Log.Warn("unknown command type", "type", env.Type)
 	}
@@ -831,6 +863,22 @@ func (d *Daemon) maintainState() {
 	}
 }
 
+// allowedRoots returns a snapshot of the current allowed roots (they are
+// replaced at runtime by host.update_roots — the server-side list, set via
+// PUT /hosts/{id}/roots, is the source of truth).
+func (d *Daemon) allowedRoots() []string {
+	d.rootsMu.RLock()
+	defer d.rootsMu.RUnlock()
+	return append([]string(nil), d.AllowedRoots...)
+}
+
+// SetAllowedRoots atomically replaces the allowed roots (host.update_roots).
+func (d *Daemon) SetAllowedRoots(roots []string) {
+	d.rootsMu.Lock()
+	d.AllowedRoots = append([]string(nil), roots...)
+	d.rootsMu.Unlock()
+}
+
 // workspaceAllowed validates a path against the allowed roots (resolved
 // absolute prefix match).
 func (d *Daemon) workspaceAllowed(path string) bool {
@@ -841,7 +889,7 @@ func (d *Daemon) workspaceAllowed(path string) bool {
 	if err != nil {
 		return false
 	}
-	for _, root := range d.AllowedRoots {
+	for _, root := range d.allowedRoots() {
 		rc, err := pathResolved(root)
 		if err != nil {
 			continue
@@ -1723,5 +1771,7 @@ func readDiskFree(path string) (int64, error) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return 0, err
 	}
-	return int64(st.Bavail) * st.Bsize, nil
+	// Bsize is int64 on Linux but uint32 on Darwin — normalize explicitly
+	// so the daemon cross-compiles (make release).
+	return int64(st.Bavail) * int64(st.Bsize), nil
 }

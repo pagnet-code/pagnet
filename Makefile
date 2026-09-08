@@ -12,7 +12,11 @@ API_URL ?=
 # Local development reuses an existing Postgres; credentials live in
 # deploy/.env (see deploy/example.env), which the server also loads as a
 # fallback for unset environment variables.
-.PHONY: dev dev-server dev-web pg-up build test test-race fmt vet tidy demo clean
+RELEASE_DIR := dist
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
+
+.PHONY: dev dev-server dev-web pg-up build test test-race fmt vet tidy demo release clean
 
 ## dev: control plane (18080) + web UI (13000) in foreground (Ctrl+C stops all)
 ## Expects DATABASE_URL reachable (deploy/.env by default).
@@ -60,6 +64,25 @@ tidy:
 ## demo: seed demo-software network with fake agents and sample traffic
 demo: build
 	$(BIN)/pagnet demo
+
+## release: cross-compile the worker binaries (pagnet, pagnetd,
+## pagnet-fake-runtime) into dist/ as pagnet-<version>-<os>-<arch>.tar.gz,
+## plus pagnet-latest-<os>-<arch>.tar.gz copies so `wget .../download/
+## pagnet-latest-linux-amd64.tar.gz` stays stable. Serve dist/ at the
+## server's /download/ (deploy compose mounts it; PAGNET_RELEASE_DIR).
+release:
+	mkdir -p $(RELEASE_DIR)
+	@for t in $(RELEASE_TARGETS); do \
+		os=$${t%/*}; arch=$${t#*/}; \
+		tmp=$$(mktemp -d); \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnetd ./cmd/pagnetd || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-fake-runtime ./cmd/pagnet-fake-runtime || rm -rf $$tmp; \
+		tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz pagnet pagnetd pagnet-fake-runtime || rm -rf $$tmp; \
+		cp $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz $(RELEASE_DIR)/pagnet-latest-$$os-$$arch.tar.gz || rm -rf $$tmp; \
+		rm -rf $$tmp; \
+	done
+	@ls -1 $(RELEASE_DIR)/pagnet-*.tar.gz
 
 clean:
 	rm -rf $(BIN)

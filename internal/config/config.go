@@ -53,6 +53,10 @@ type Server struct {
 	// Empty = direct connections only; forwarding headers from any peer
 	// are ignored and rate-limit keys use the TCP peer.
 	TrustedProxies []string
+	// ReleaseDir, when set, serves worker bootstrap tarballs produced by
+	// `make release` at GET /download/<file> (the wget-install path for
+	// enrolling workers without root).
+	ReleaseDir string
 	// HeartbeatInterval is the expected host heartbeat period.
 	HeartbeatInterval time.Duration
 	// OfflineThreshold marks hosts offline after this silence.
@@ -130,6 +134,9 @@ func LoadServer() (Server, error) {
 	}
 	if v := os.Getenv("PAGNET_TRUSTED_PROXIES"); v != "" {
 		cfg.TrustedProxies = splitCSV(v)
+	}
+	if v := os.Getenv("PAGNET_RELEASE_DIR"); v != "" {
+		cfg.ReleaseDir = v
 	}
 	cfg.OIDC = OIDC{
 		Issuer:       envOr("OIDC_ISSUER", ""),
@@ -297,9 +304,14 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		stateDir = filepath.Join(home, ".pagnet")
 	}
 	cfg := Daemon{
-		StateDir:          stateDir,
-		ServerURL:         get("PAGNET_SERVER", ""),
-		HostName:          get("PAGNET_HOST_NAME", defaultHostName()),
+		StateDir:  stateDir,
+		ServerURL: get("PAGNET_SERVER", ""),
+		// HostName resolves as: explicit env > the registered name in
+		// the state file > the machine hostname. The file name must beat
+		// the hostname guess — a worker state dir is that directory's
+		// worker, not "this machine" (the guess would mislabel every
+		// single-directory worker after its host name).
+		HostName:          get("PAGNET_HOST_NAME", ""),
 		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
 	}
 	if env := get("PAGNET_RUNTIME_ENV", ""); env != "" {
@@ -311,8 +323,12 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 	}
 	if file := filepath.Join(stateDir, "config.yaml"); exists(file) {
 		if err := loadDaemonYAML(file, &cfg); err == nil {
-			// file values fill gaps only
+			// file values fill gaps only (hostName fills the empty
+			// default above; an explicit PAGNET_HOST_NAME still wins)
 		}
+	}
+	if cfg.HostName == "" {
+		cfg.HostName = defaultHostName()
 	}
 	// SEC-410: runtime env pairs are appended AFTER the ChildEnv filter,
 	// so they must pass the blocklist or the daemon refuses to start

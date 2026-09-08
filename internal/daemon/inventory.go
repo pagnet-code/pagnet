@@ -24,7 +24,7 @@ func (d *Daemon) sendInventory(conn *websocket.Conn) {
 		HostID:       d.stateID(),
 		Runtimes:     d.detectRuntimes(),
 		Workspaces:   d.scanWorkspaces(),
-		AllowedRoots: d.AllowedRoots,
+		AllowedRoots: d.allowedRoots(),
 	}
 	_ = d.send(conn, transport.MsgHostInventory, payload)
 }
@@ -76,7 +76,7 @@ func runtimeVersion(path string) string {
 func (d *Daemon) scanWorkspaces() []transport.WorkspaceReport {
 	seen := map[string]bool{}
 	var out []transport.WorkspaceReport
-	for _, root := range d.AllowedRoots {
+	for _, root := range d.allowedRoots() {
 		abs, err := filepath.Abs(root)
 		if err != nil {
 			continue

@@ -35,6 +35,14 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if stateDirOverride == "" {
 		home, _ := os.UserHomeDir()
 		stateDirOverride = filepath.Join(home, ".pagnet")
+		// Single-directory worker: standing inside a directory that `pagnet
+		// worker` has enrolled targets THAT worker's host (its state lives
+		// at ~/.pagnet/workers/<hash-of-cwd>), not the machine-wide daemon.
+		if cwd, err := os.Getwd(); err == nil {
+			if w := filepath.Join(home, ".pagnet", "workers", dirHash(cwd)); isDir(w) {
+				stateDirOverride = w
+			}
+		}
 	}
 	c.stateDir = stateDirOverride
 	cfg, err := config.LoadDaemon(c.stateDir)
@@ -287,4 +295,9 @@ func repeat(s string, n int) string {
 		out = append(out, []byte(s)...)
 	}
 	return string(out[:n])
+}
+
+func isDir(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
 }

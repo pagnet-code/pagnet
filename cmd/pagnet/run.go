@@ -73,12 +73,15 @@ func runCmd() *cobra.Command {
 			default:
 				key = args[0]
 			}
-			if absDir != "" {
+			if absDir != "" && isGitRepo(absDir) {
 				remote, key, err = gitResourceKey(absDir)
 				if err != nil {
 					return err
 				}
 			}
+			// Non-git directory (fresh or non-repository project): the
+			// workspace is just a path under an allowed root — no logical
+			// resource, launch works the same.
 
 			// Optional project config (spec §13) — never required for a
 			// basic launch; provides the network and agent defaults below.
@@ -126,6 +129,18 @@ func runCmd() *cobra.Command {
 					}
 					workspaceID = waitForWorkspace(c, td.ID, absDir, 20*time.Second)
 				}
+				if workspaceID == "" && !isGitRepo(absDir) {
+					// Non-git directories are invisible to the inventory
+					// scan (git repos only) — register directly.
+					var w struct {
+						ID string `json:"ID"`
+					}
+					if err := c.post("/api/v1/hosts/"+td.ID+"/workspaces",
+						map[string]any{"path": absDir}, &w); err != nil {
+						return fmt.Errorf("register workspace: %w", err)
+					}
+					workspaceID = w.ID
+				}
 				if workspaceID == "" {
 					return fmt.Errorf("workspace %s is not registered for this host (is it under an allowed root?)", absDir)
 				}
@@ -159,21 +174,27 @@ func runCmd() *cobra.Command {
 			}
 
 			// 6. Resource (idempotent: created from the key if new).
+			//    Non-git directories have no logical resource: skip.
 			var res struct {
 				ID string `json:"ID"`
 			}
-			body := map[string]any{"key": key}
-			if remote != "" {
-				body["remote"] = remote
-			}
-			if err := c.post("/api/v1/networks/"+netID+"/resources", body, &res); err != nil {
-				return fmt.Errorf("resource: %w", err)
+			if key != "" {
+				body := map[string]any{"key": key}
+				if remote != "" {
+					body["remote"] = remote
+				}
+				if err := c.post("/api/v1/networks/"+netID+"/resources", body, &res); err != nil {
+					return fmt.Errorf("resource: %w", err)
+				}
 			}
 
 			// 7. Agent definition (created if new; bound to the resource).
-			//    Defaults: flags > .pagnet.yaml agent entry > <repo>[-<role>].
+			//    Defaults: flags > .pagnet.yaml agent entry > <repo|dir>[-<role>].
 			agentName := name
 			base := key
+			if base == "" {
+				base = filepath.Base(absDir)
+			}
 			if i := strings.LastIndex(base, "/"); i >= 0 {
 				base = base[i+1:]
 			}
@@ -215,7 +236,7 @@ func runCmd() *cobra.Command {
 				var created struct {
 					ID string `json:"ID"`
 				}
-				if err := c.post("/api/v1/networks/"+netID+"/agents", map[string]any{
+				agentBody := map[string]any{
 					"name":    agentName,
 					"runtime": runtimeName,
 					"profile": role,
@@ -223,13 +244,18 @@ func runCmd() *cobra.Command {
 						map[string]any{"id": "code", "name": "code", "description": "reads and writes code in this repository"},
 					},
 					"executionSettings": map[string]any{"access": access},
-					"responsibilities": []any{
+				}
+				// Responsibilities bind the agent to a logical resource;
+				// non-git directories have none, so omit them.
+				if res.ID != "" {
+					agentBody["responsibilities"] = []any{
 						map[string]any{
 							"resourceId": res.ID,
 							"actions":    []string{"implement", "review", "advise"},
 						},
-					},
-				}, &created); err != nil {
+					}
+				}
+				if err := c.post("/api/v1/networks/"+netID+"/agents", agentBody, &created); err != nil {
 					return fmt.Errorf("create agent: %w", err)
 				}
 				defID = created.ID
@@ -303,6 +329,11 @@ func isLocalDir(p string) bool {
 		return false
 	}
 	return true
+}
+
+func isGitRepo(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 func orDash(s string) string {

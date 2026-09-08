@@ -47,6 +47,7 @@ func main() {
 	root.AddCommand(
 		loginCmd(),
 		enrollCmd(),
+		workerCmd(),
 		runCmd(),
 		networkCmd(),
 		workspacesCmd(),
@@ -89,9 +90,6 @@ func enrollCmd() *cobra.Command {
 		Short: "Connect this host: consume an enrollment token, store the credential",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if token == "" {
-				return errors.New("--token is required (create one via POST /hosts/enrollment-tokens)")
-			}
 			if stateDir == "" {
 				home, err := os.UserHomeDir()
 				if err != nil {
@@ -99,50 +97,8 @@ func enrollCmd() *cobra.Command {
 				}
 				stateDir = filepath.Join(home, ".pagnet")
 			}
-			if name == "" {
-				name, _ = os.Hostname()
-				if name == "" {
-					name = "pagnet-host"
-				}
-			}
-
-			var resp struct {
-				Host struct {
-					ID string `json:"ID"`
-				} `json:"host"`
-				Credential   string   `json:"credential"`
-				AllowedRoots []string `json:"allowedRoots"`
-			}
-			if err := apiPostJSON(serverURL+"/api/v1/hosts/enroll", map[string]any{
-				"token":         token,
-				"hostName":      name,
-				"os":            runtime.GOOS,
-				"arch":          runtime.GOARCH,
-				"daemonVersion": "pagnet-cli/dev",
-			}, &resp); err != nil {
-				return fmt.Errorf("enroll: %w", err)
-			}
-			if resp.Host.ID == "" || resp.Credential == "" {
-				return errors.New("enroll: server response missing host id or credential")
-			}
-			savedRoots := resp.AllowedRoots
-			if len(savedRoots) == 0 {
-				savedRoots = roots
-			}
-
-			if err := mergeConfigFile(stateDir, map[string]any{
-				"serverUrl":    strings.TrimSuffix(serverURL, "/"),
-				"credential":   resp.Credential,
-				"hostId":       resp.Host.ID,
-				"hostName":     name,
-				"allowedRoots": savedRoots,
-			}); err != nil {
+			if err := doEnroll(serverURL, token, name, roots, stateDir); err != nil {
 				return err
-			}
-			fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)
-			fmt.Printf("credential stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
-			if len(savedRoots) > 0 {
-				fmt.Printf("allowed roots: %v\n", savedRoots)
 			}
 			fmt.Println("run `pagnetd` to connect this host")
 			return nil
@@ -153,6 +109,61 @@ func enrollCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&roots, "roots", nil, "allowed workspace root (repeatable; server-side token roots win)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")
 	return cmd
+}
+
+// doEnroll consumes a one-time enrollment token against the control plane
+// and stores the host credential + identity in stateDir (config.yaml,
+// mode 0600). Shared by `pagnet enroll` and `pagnet worker` (first run).
+func doEnroll(server, token, name string, roots []string, stateDir string) error {
+	if token == "" {
+		return errors.New("--token is required (create one in the web UI: Hosts → Add a worker)")
+	}
+	if name == "" {
+		name, _ = os.Hostname()
+		if name == "" {
+			name = "pagnet-host"
+		}
+	}
+
+	var resp struct {
+		Host struct {
+			ID string `json:"ID"`
+		} `json:"host"`
+		Credential   string   `json:"credential"`
+		AllowedRoots []string `json:"allowedRoots"`
+	}
+	if err := apiPostJSON(server+"/api/v1/hosts/enroll", map[string]any{
+		"token":         token,
+		"hostName":      name,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"daemonVersion": "pagnet-cli/dev",
+	}, &resp); err != nil {
+		return fmt.Errorf("enroll: %w", err)
+	}
+	if resp.Host.ID == "" || resp.Credential == "" {
+		return errors.New("enroll: server response missing host id or credential")
+	}
+	savedRoots := resp.AllowedRoots
+	if len(savedRoots) == 0 {
+		savedRoots = roots
+	}
+
+	if err := mergeConfigFile(stateDir, map[string]any{
+		"serverUrl":    strings.TrimSuffix(server, "/"),
+		"credential":   resp.Credential,
+		"hostId":       resp.Host.ID,
+		"hostName":     name,
+		"allowedRoots": savedRoots,
+	}); err != nil {
+		return err
+	}
+	fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)
+	fmt.Printf("credential stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
+	if len(savedRoots) > 0 {
+		fmt.Printf("allowed roots: %v\n", savedRoots)
+	}
+	return nil
 }
 
 // apiPostJSON posts a JSON body and decodes the response into out.

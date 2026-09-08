@@ -36,7 +36,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -268,18 +267,8 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 	// screen). The REPL owns ALL input echo now, the way a real raw-mode
 	// interactive CLI does: it echoes typed characters itself and
 	// redraws on erase.
-	var old *unix.Termios
-	if t, err := unix.IoctlGetTermios(fd, unix.TCGETS); err == nil {
-		old = t
-		raw := *t
-		raw.Lflag &^= unix.ICANON | unix.ISIG | unix.ECHO | unix.ECHOCTL
-		_ = unix.IoctlSetTermios(fd, unix.TCSETS, &raw)
-		defer func() {
-			if old != nil {
-				_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
-			}
-		}()
-	}
+	restore := setRawInput(fd)
+	defer restore()
 
 	ui := os.Getenv("PAGNET_FAKE_UI")
 	if ui == "" {
