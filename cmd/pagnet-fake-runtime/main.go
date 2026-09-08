@@ -82,6 +82,10 @@ func emit(e event) {
 }
 
 func main() {
+	if hasArg(os.Args[1:], "--version") || hasArg(os.Args[1:], "-v") {
+		fmt.Println("pagnet-fake-runtime 1.0.0 (deterministic test runtime)")
+		return
+	}
 	if hasArg(os.Args[1:], "--pty") {
 		runPTY(plyArgValue(os.Args[1:], "--instance-id"),
 			plyArgValue(os.Args[1:], "--session-dir"),

@@ -19,6 +19,24 @@ import (
 	"pagnet/internal/transport"
 )
 
+// Regression: runtime detection must resolve the CLI binary through the
+// adapter (the canonical runtime name is NOT the binary name — qwen-code →
+// `qwen`), or the inventory never reports runtimes the daemon can drive.
+func TestDetectRuntimes_UsesAdapterBinaryResolution(t *testing.T) {
+	d, err := New(Config{StateDir: t.TempDir()}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	d.adapters = map[domain.RuntimeName]agentruntime.Adapter{
+		domain.RuntimeQwenCode: stubAdapter{},
+	}
+	out := d.detectRuntimes()
+	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != "stub" {
+		t.Fatalf("detectRuntimes = %+v, want one qwen-code entry with the adapter-resolved path", out)
+	}
+}
+
 // waitUntil polls cond until true or the deadline (test helper).
 func waitUntil(t *testing.T, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
@@ -107,9 +125,10 @@ func (stubAdapter) Name() domain.RuntimeName { return domain.RuntimeFake }
 func (stubAdapter) StartTurn(context.Context, agentruntime.TurnSpec, chan agentruntime.TurnEvent) error {
 	return nil
 }
-func (stubAdapter) Stop(string) error { return nil }
-func (stubAdapter) Available() bool   { return true }
-func (stubAdapter) PID(string) *int   { return nil }
+func (stubAdapter) Stop(string) error          { return nil }
+func (stubAdapter) Available() bool            { return true }
+func (stubAdapter) BinaryPath() (string, bool) { return "stub", true }
+func (stubAdapter) PID(string) *int            { return nil }
 func (stubAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
 }

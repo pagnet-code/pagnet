@@ -44,6 +44,11 @@ func (f *Fake) Available() bool {
 	return err == nil
 }
 
+func (f *Fake) BinaryPath() (string, bool) {
+	p, err := f.binary()
+	return p, err == nil
+}
+
 func (f *Fake) binary() (string, error) {
 	if f.Binary != "" {
 		if _, err := os.Stat(f.Binary); err == nil {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,25 +38,23 @@ func (d *Daemon) stateID() string {
 	return ""
 }
 
-// detectRuntimes reports every runtime this daemon can drive. The fake
-// runtime is always available (its binary is resolved per turn); real
-// runtimes are reported when their binary is on PATH.
+// detectRuntimes reports every runtime this daemon can actually drive,
+// resolving each CLI binary with the SAME lookup the adapter uses at
+// launch — the canonical runtime name is not the binary name (qwen-code →
+// `qwen`), so probing names directly would report runtimes we cannot run
+// (or miss ones we can).
 func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
-	out := []transport.RuntimeInstallation{
-		{Runtime: string(domain.RuntimeFake)},
-	}
-	for _, rn := range []domain.RuntimeName{
-		domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
-	} {
-		bin := string(rn)
-		if p, err := exec.LookPath(bin); err == nil {
+	out := make([]transport.RuntimeInstallation, 0, len(d.adapters))
+	for name, a := range d.adapters {
+		if p, ok := a.BinaryPath(); ok {
 			out = append(out, transport.RuntimeInstallation{
-				Runtime: string(rn),
+				Runtime: string(name),
 				Path:    p,
 				Version: runtimeVersion(p),
 			})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Runtime < out[j].Runtime })
 	return out
 }
 

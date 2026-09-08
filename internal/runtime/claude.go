@@ -69,6 +69,11 @@ func (c *Claude) Available() bool {
 	return err == nil
 }
 
+func (c *Claude) BinaryPath() (string, bool) {
+	p, err := c.binary()
+	return p, err == nil
+}
+
 func (c *Claude) binary() (string, error) {
 	if c.Binary != "" {
 		if _, err := os.Stat(c.Binary); err == nil {

@@ -92,6 +92,11 @@ type Adapter interface {
 	Stop(instanceID string) error
 	// Available reports whether this runtime is installed and usable.
 	Available() bool
+	// BinaryPath reports the resolved path of the runtime's CLI binary
+	// (same resolution as Available). The canonical runtime name is NOT
+	// the CLI binary name (qwen-code → `qwen`, claude-code → `claude`), so
+	// callers must never derive the binary from Name().
+	BinaryPath() (string, bool)
 	// PID is the OS pid of the instance's currently running turn process
 	// (spec §59), or nil when no turn is running (process-per-turn: the
 	// process only exists for the duration of a turn).

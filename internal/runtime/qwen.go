@@ -66,6 +66,11 @@ func (q *Qwen) Available() bool {
 	return err == nil
 }
 
+func (q *Qwen) BinaryPath() (string, bool) {
+	p, err := q.binary()
+	return p, err == nil
+}
+
 func (q *Qwen) binary() (string, error) {
 	if q.Binary != "" {
 		if _, err := os.Stat(q.Binary); err == nil {
