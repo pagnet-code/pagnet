@@ -888,6 +888,14 @@ func filepathAbs(p string) (string, error) {
 // --- command implementations -------------------------------------------------
 
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
+	// Boundary check (SEC-407): the instance id is server-provided and
+	// becomes filesystem path components (representatives/, sessions/,
+	// contracts/, worktrees/). A non-UUID value — from a buggy or
+	// compromised control plane, or a spoofer holding a stolen host
+	// credential — must not steer paths out of the daemon state dir.
+	if _, err := domain.ParseID(p.InstanceID); err != nil {
+		return fmt.Errorf("launch command carries an invalid instance id")
+	}
 	rn := domain.CanonicalRuntime(p.Runtime)
 	ad, ok := d.adapters[rn]
 	if !ok {

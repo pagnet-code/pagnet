@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -48,6 +49,36 @@ func isControlPlaneEnvKey(key string) bool {
 		return true
 	}
 	return false
+}
+
+// ValidateExtraEnv applies the control-plane blocklist to the
+// operator-supplied runtime env pairs (PAGNET_RUNTIME_ENV / config
+// runtime_env) (SEC-410): these pairs are appended AFTER the ChildEnv
+// filter, so without this check they could re-inject exactly the keys the
+// filter removes (PAGNET_* credentials, DATABASE_URL, POSTGRES_*). The
+// documented PAGNET_FAKE_* fake-runtime simulation namespace is the only
+// PAGNET_ exception. A violation is a hard error (fail closed — the daemon
+// refuses to start) rather than a silent drop.
+func ValidateExtraEnv(pairs []string) error {
+	var blocked []string
+	for _, kv := range pairs {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || key == "" {
+			blocked = append(blocked, kv)
+			continue
+		}
+		if strings.HasPrefix(key, "PAGNET_FAKE_") {
+			continue
+		}
+		if isControlPlaneEnvKey(key) {
+			blocked = append(blocked, key)
+		}
+	}
+	if len(blocked) > 0 {
+		return fmt.Errorf("runtime env pairs are not allowed: %s — control-plane keys cannot be injected into agent processes",
+			strings.Join(blocked, ", "))
+	}
+	return nil
 }
 
 // procTracker tracks the running turn process per instance so adapters can

@@ -57,19 +57,20 @@ func TestResolveWorkspaceSecondRWGetsWorktree(t *testing.T) {
 	d := newTestDaemon(t)
 	repo := t.TempDir()
 	gitInitRepo(t, repo)
+	inst1, inst2 := domain.NewID().String(), domain.NewID().String()
 	if err := d.state.UpsertInstance(InstanceRow{
-		InstanceID: "inst-1", Runtime: "fake", Workspace: repo,
+		InstanceID: inst1, Runtime: "fake", Workspace: repo,
 		Status: "idle", Access: domain.AccessReadWrite, AgentName: "coder-1",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	p := transport.LaunchAgentPayload{InstanceID: "inst-2", WorkspacePath: repo, AgentName: "coder-2"}
+	p := transport.LaunchAgentPayload{InstanceID: inst2, WorkspacePath: repo, AgentName: "coder-2"}
 	got, err := d.resolveWorkspace(p, domain.AccessReadWrite)
 	if err != nil {
 		t.Fatalf("second RW agent must be isolated, got error: %v", err)
 	}
-	want := filepath.Join(repo, ".pagnet", "worktrees", "inst-2")
+	want := filepath.Join(repo, ".pagnet", "worktrees", inst2)
 	if got != want {
 		t.Fatalf("worktree path = %s, want %s", got, want)
 	}
@@ -77,8 +78,8 @@ func TestResolveWorkspaceSecondRWGetsWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("branch in worktree: %v: %s", err, out)
 	}
-	if br := strings.TrimSpace(string(out)); br != "pagnet/coder-2/inst-2" {
-		t.Fatalf("worktree branch = %q, want pagnet/coder-2/inst-2", br)
+	if br := strings.TrimSpace(string(out)); br != "pagnet/coder-2/"+inst2 {
+		t.Fatalf("worktree branch = %q, want pagnet/coder-2/%s", br, inst2)
 	}
 }
 
@@ -107,14 +108,15 @@ func TestResolveWorkspaceIdempotentReplay(t *testing.T) {
 	d := newTestDaemon(t)
 	repo := t.TempDir()
 	gitInitRepo(t, repo)
+	inst1, inst2 := domain.NewID().String(), domain.NewID().String()
 	if err := d.state.UpsertInstance(InstanceRow{
-		InstanceID: "inst-1", Runtime: "fake", Workspace: repo,
+		InstanceID: inst1, Runtime: "fake", Workspace: repo,
 		Status: "idle", Access: domain.AccessReadWrite, AgentName: "coder-1",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	p := transport.LaunchAgentPayload{InstanceID: "inst-2", WorkspacePath: repo, AgentName: "coder-2"}
+	p := transport.LaunchAgentPayload{InstanceID: inst2, WorkspacePath: repo, AgentName: "coder-2"}
 	first, err := d.resolveWorkspace(p, domain.AccessReadWrite)
 	if err != nil {
 		t.Fatal(err)

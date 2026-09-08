@@ -69,7 +69,7 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
 
@@ -153,7 +153,7 @@ func (f *Fake) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
 	args := []string{"--pty", "--instance-id", spec.InstanceID, "--session-dir", spec.SessionDir}

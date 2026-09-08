@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"pagnet/internal/domain"
 )
 
 // writeContract (re)renders the pagnet coordination contract (§16:
@@ -48,11 +50,17 @@ Your pagnet identity:
   instance: %s
 `, name, network, row.InstanceID)
 
+	// SEC-407 (defense in depth): the id becomes a path component — a
+	// non-UUID can never reach the join.
+	if _, err := domain.ParseID(row.InstanceID); err != nil {
+		return "", fmt.Errorf("invalid instance id for contract: %s", row.InstanceID)
+	}
 	path := filepath.Join(d.StateDir, "contracts", row.InstanceID+".md")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// SEC-415: coordination state is operator data, not public.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

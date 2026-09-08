@@ -128,12 +128,14 @@ func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 	t.Cleanup(func() { d.Close() })
 
 	for iter := 0; iter < 5; iter++ {
-		var wg sync.WaitGroup
-		for _, name := range []string{"race-a", "race-b"} {
-			// Fresh instance ids per iteration (rows persist in state).
-			id := "inst-" + name
-			_ = d.state.DeleteInstance(id)
+		// Fresh state per iteration: the "first RW keeps the checkout"
+		// decision depends on the existing rows, and rows persist.
+		rows, _ := d.state.ListInstances()
+		for _, row := range rows {
+			_ = d.state.DeleteInstance(row.InstanceID)
 		}
+		idA, idB := domain.NewID().String(), domain.NewID().String()
+		var wg sync.WaitGroup
 		goLaunch := func(id, name string) {
 			defer wg.Done()
 			_ = d.doLaunch(nil, transport.LaunchAgentPayload{
@@ -145,12 +147,12 @@ func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 			})
 		}
 		wg.Add(2)
-		go goLaunch("inst-race-a", "race-a")
-		go goLaunch("inst-race-b", "race-b")
+		go goLaunch(idA, "race-a")
+		go goLaunch(idB, "race-b")
 		wg.Wait()
 
-		ra, _, _ := d.state.GetInstance("inst-race-a")
-		rb, _, _ := d.state.GetInstance("inst-race-b")
+		ra, _, _ := d.state.GetInstance(idA)
+		rb, _, _ := d.state.GetInstance(idB)
 		if ra == nil || rb == nil {
 			t.Fatalf("iteration %d: missing instance row", iter)
 		}
@@ -187,7 +189,8 @@ func TestDoForget_RemovesWorktreeKeepsBranch(t *testing.T) {
 	d.adapters[domain.RuntimeFake] = stubAdapter{}
 	t.Cleanup(func() { d.Close() })
 
-	for _, id := range []string{"inst-fg-1", "inst-fg-2"} {
+	id1, id2 := domain.NewID().String(), domain.NewID().String()
+	for _, id := range []string{id1, id2} {
 		if err := d.doLaunch(nil, transport.LaunchAgentPayload{
 			InstanceID:    id,
 			WorkspacePath: repo,
@@ -198,16 +201,16 @@ func TestDoForget_RemovesWorktreeKeepsBranch(t *testing.T) {
 			t.Fatalf("launch %s: %v", id, err)
 		}
 	}
-	row2, _, _ := d.state.GetInstance("inst-fg-2")
+	row2, _, _ := d.state.GetInstance(id2)
 	if row2 == nil || row2.Workspace == repo {
 		t.Fatalf("second launch should be in a worktree: %+v", row2)
 	}
-	branch := worktreeBranch("fg-coder", "inst-fg-2")
+	branch := worktreeBranch("fg-coder", id2)
 
-	if err := d.doForget(nil, "inst-fg-2"); err != nil {
+	if err := d.doForget(nil, id2); err != nil {
 		t.Fatalf("forget: %v", err)
 	}
-	if _, ok, _ := d.state.GetInstance("inst-fg-2"); ok {
+	if _, ok, _ := d.state.GetInstance(id2); ok {
 		t.Fatal("local row must be deleted by forget")
 	}
 	if fi, err := os.Stat(row2.Workspace); err == nil && fi.IsDir() {

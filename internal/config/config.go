@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pagnet/internal/runtime"
 )
 
 // ErrMissingDSN is returned when no DATABASE_URL is configured.
@@ -303,6 +305,13 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		if err := loadDaemonYAML(file, &cfg); err == nil {
 			// file values fill gaps only
 		}
+	}
+	// SEC-410: runtime env pairs are appended AFTER the ChildEnv filter,
+	// so they must pass the blocklist or the daemon refuses to start
+	// (fail closed; the documented PAGNET_FAKE_* simulation namespace is
+	// the only PAGNET_ exception).
+	if err := runtime.ValidateExtraEnv(cfg.RuntimeEnv); err != nil {
+		return Daemon{}, err
 	}
 	return cfg, nil
 }

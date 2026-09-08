@@ -123,7 +123,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	if spec.Workspace == "" {
 		return fmt.Errorf("claude adapter requires a workspace (claude sessions are CWD-scoped)")
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
 	sessionPath := filepath.Join(spec.SessionDir, claudeSessionFile)
@@ -359,7 +359,7 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if spec.Workspace == "" {
 		return nil, fmt.Errorf("claude adapter requires a workspace (claude sessions are CWD-scoped)")
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
 	args := []string{"--permission-mode", "bypassPermissions"}

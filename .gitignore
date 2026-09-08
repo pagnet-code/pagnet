@@ -29,3 +29,9 @@ deploy/.env
 .idea/
 .vscode/
 .DS_Store
+
+# Agent session state
+.qwen/
+
+# e2e screenshot artifacts (regenerable)
+web/e2e/*.png

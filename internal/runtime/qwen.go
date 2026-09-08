@@ -104,7 +104,7 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if spec.Workspace == "" {
 		return fmt.Errorf("qwen adapter requires a workspace (qwen sessions are CWD-scoped)")
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
 	sessionPath := filepath.Join(spec.SessionDir, qwenSessionFile)
@@ -300,7 +300,7 @@ func (q *Qwen) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if spec.Workspace == "" {
 		return nil, fmt.Errorf("qwen adapter requires a workspace (qwen sessions are CWD-scoped)")
 	}
-	if err := os.MkdirAll(spec.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
 	var args []string

@@ -61,19 +61,19 @@ func repoCommonDir(path string) (string, error) {
 
 var branchUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
-// worktreeBranch is the §29 branch name: pagnet/<agent-name>/<short-id>.
-// Without an assigned task the instance id is the stable short id.
+// worktreeBranch is the §29 branch name: pagnet/<agent-name>/<instance-id>.
+// The full instance id is used: it is a server-minted UUID (validated at
+// the daemon boundary), so it is a safe git ref and globally unique. An
+// 8-char prefix was a collision hazard — UUIDv7 ids minted in the same
+// millisecond share their first 8 hex chars, and concurrent launches in
+// a burst would then fight over one branch.
 func worktreeBranch(agentName, instanceID string) string {
 	name := strings.ToLower(branchUnsafe.ReplaceAllString(agentName, "-"))
 	name = strings.Trim(name, "-")
 	if name == "" {
 		name = "agent"
 	}
-	short := instanceID
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	return fmt.Sprintf("pagnet/%s/%s", name, short)
+	return fmt.Sprintf("pagnet/%s/%s", name, instanceID)
 }
 
 // resolveWorkspace applies §29 isolation for a launching instance and
@@ -145,6 +145,11 @@ func (d *Daemon) ensureWorktree(fromRepo, common, instanceID, branch string) (st
 	if filepath.Base(common) != ".git" {
 		return "", fmt.Errorf("repository %s has no ordinary checkout (bare repository); "+
 			"worktree isolation is not possible", common)
+	}
+	// SEC-407 (defense in depth): the id becomes a path component inside
+	// the user's repository — a non-UUID can never reach the join.
+	if _, err := domain.ParseID(instanceID); err != nil {
+		return "", fmt.Errorf("invalid instance id for worktree: %s", instanceID)
 	}
 	wt := filepath.Join(main, ".pagnet", "worktrees", instanceID)
 
