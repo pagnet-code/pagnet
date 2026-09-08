@@ -250,18 +250,25 @@ func plyArgValue(args []string, flag string) string {
 func runPTY(instanceID, sessionDir, resumeID string) {
 	fd := int(os.Stdin.Fd())
 
-	// Raw-ish termios: drop canonical mode AND signal generation so the
+	// Raw termios: drop canonical mode, signal generation AND echo so the
 	// process sees individual keystrokes and control sequences (arrows,
 	// Ctrl+C) as BYTES — the way a real interactive CLI (raw mode)
-	// handles its own ^C. ECHO is kept so typed input stays visible
-	// through the PTY line discipline. (With ISIG left on, the kernel
-	// would turn ^C into SIGINT and kill this process before it could
-	// react — the wrong model for an interactive UI.)
+	// handles its own ^C. (With ISIG left on, the kernel would turn ^C
+	// into SIGINT and kill this process before it could react — the wrong
+	// model for an interactive UI.) Input echo is the REPL's own, below.
+	//
+	// ECHO is cleared too: with ICANON off the kernel no longer treats
+	// 0x7f/0x08 as the erase control — and with ECHO on it would echo
+	// those raw backspace bytes into the output (the "strange characters
+	// on backspace" bug: a literal DEL/BS byte or "^?"/"^H" on the
+	// screen). The REPL owns ALL input echo now, the way a real raw-mode
+	// interactive CLI does: it echoes typed characters itself and
+	// redraws on erase.
 	var old *unix.Termios
 	if t, err := unix.IoctlGetTermios(fd, unix.TCGETS); err == nil {
 		old = t
 		raw := *t
-		raw.Lflag &^= unix.ICANON | unix.ISIG
+		raw.Lflag &^= unix.ICANON | unix.ISIG | unix.ECHO | unix.ECHOCTL
 		_ = unix.IoctlSetTermios(fd, unix.TCSETS, &raw)
 		defer func() {
 			if old != nil {
@@ -362,20 +369,26 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 				}
 				line = nil
 				continue
-			case c == '\r':
-				// \r\n pair: the \n finalizes the line.
-				continue
-			case c == 0x7f, c == 0x08: // backspace (kernel already echoed)
-				if len(line) > 0 {
-					line = line[:len(line)-1]
-				}
-				continue
-			case c == '\n':
+			case c == '\r', c == '\n':
+				// Enter (ICRNL maps \r→\n; either byte may arrive). The
+				// REPL owns the newline echo in raw mode.
+				fmt.Print("\r\n")
 				processFakeLine(string(line), prev, save, prompt, winsize)
 				line = nil
 				continue
+			case c == 0x7f, c == 0x08: // backspace (DEL or Ctrl+Backspace)
+				// Raw-mode erase: retract the last visible character
+				// ourselves so screen and line stay in sync — left,
+				// blank, left.
+				if len(line) > 0 {
+					line = line[:len(line)-1]
+					fmt.Print("\b \b")
+				}
+				continue
 			default:
+				// Typed input echo (kernel ECHO is off in raw mode).
 				line = append(line, c)
+				fmt.Print(string(c))
 			}
 			continue
 		}

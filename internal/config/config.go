@@ -48,6 +48,11 @@ type Server struct {
 	// or the shorthand "localhost" (http(s) on loopback, any port). Empty
 	// means same-origin only (hosted deployments behind one origin).
 	CORSOrigins []string
+	// TrustedProxies are the peers (CIDR or IP) allowed to forward the
+	// real client address via X-Forwarded-For / X-Real-IP (SEC-422).
+	// Empty = direct connections only; forwarding headers from any peer
+	// are ignored and rate-limit keys use the TCP peer.
+	TrustedProxies []string
 	// HeartbeatInterval is the expected host heartbeat period.
 	HeartbeatInterval time.Duration
 	// OfflineThreshold marks hosts offline after this silence.
@@ -122,6 +127,9 @@ func LoadServer() (Server, error) {
 	}
 	if v := os.Getenv("PAGNET_CORS_ORIGINS"); v != "" {
 		cfg.CORSOrigins = splitCSV(v)
+	}
+	if v := os.Getenv("PAGNET_TRUSTED_PROXIES"); v != "" {
+		cfg.TrustedProxies = splitCSV(v)
 	}
 	cfg.OIDC = OIDC{
 		Issuer:       envOr("OIDC_ISSUER", ""),
