@@ -1400,7 +1400,14 @@ func (d *Daemon) busy(instanceID string) bool {
 }
 
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
-	contractPath, _ := d.writeContract(row)
+	contractPath, contractText, _ := d.writeContract(row)
+	if !resume {
+		// §23/§24: the coordination contract is standing instructions and
+		// must reach the model. A fresh session has no prior context, so
+		// it rides with the first turn; a resumed session already carries
+		// it in its context.
+		input = input + "\n\n" + contractText
+	}
 	return agentruntime.TurnSpec{
 		TurnID:       domain.NewID().String(),
 		InstanceID:   row.InstanceID,
