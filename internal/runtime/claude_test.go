@@ -343,9 +343,12 @@ func TestClaude_ModelSelection(t *testing.T) {
 func TestClaude_StopKillsProcess(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "claude")
-	// A single-process stub that hangs until killed (read -t is a bash
-	// builtin: killing the process releases the stdout pipe immediately).
-	if err := os.WriteFile(script, []byte("#!/usr/bin/env bash\ncat > /dev/null\nread -r -t 30 _ || exit 1\n"), 0o755); err != nil {
+	// A single-process stub that hangs until killed. The adapter closes stdin
+	// after writing the prompt, so a `read` builtin would return at once on
+	// EOF (the process would exit before Stop, racing the test). `exec sleep`
+	// replaces bash with one sleep process that ignores stdin and hangs;
+	// killing it releases the stdout pipe immediately.
+	if err := os.WriteFile(script, []byte("#!/usr/bin/env bash\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	c := NewClaude(script)
