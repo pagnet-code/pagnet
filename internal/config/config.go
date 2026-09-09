@@ -270,6 +270,11 @@ type Daemon struct {
 	// `pagnet network use <name>`). Empty means "use the only network,
 	// or ask".
 	CurrentNetwork string
+	// NoScan disables automatic git-repository discovery on the allowed
+	// roots. Zero value = scan ON (backwards compatible); when set, the
+	// daemon reports no discovered workspaces and workspaces are managed
+	// explicitly (UI "Add", `pagnet run .`, `pagnet workspaces add`).
+	NoScan bool
 }
 
 // LoadDaemon reads daemon config: env, then the env files (deploy/.env,
@@ -319,6 +324,15 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 			if kv = strings.TrimSpace(kv); kv != "" {
 				cfg.RuntimeEnv = append(cfg.RuntimeEnv, kv)
 			}
+		}
+	}
+	// PAGNET_SCAN_WORKSPACES=0/false/off/no turns off automatic git
+	// discovery for this run (a state-file noScan already set can only
+	// be cleared by `pagnet worker --scan` rewriting the file).
+	if v := strings.ToLower(strings.TrimSpace(get("PAGNET_SCAN_WORKSPACES", ""))); v != "" {
+		switch v {
+		case "0", "false", "off", "no":
+			cfg.NoScan = true
 		}
 	}
 	if file := filepath.Join(stateDir, "config.yaml"); exists(file) {

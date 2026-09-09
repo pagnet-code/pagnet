@@ -34,6 +34,16 @@ var userToken string
 // config's server URL.
 var root *cobra.Command
 
+// envOrDefault is the CLI's env-var contract: a flag default that reads
+// the environment first, so zero-flag runs work (e.g. PAGNET_SERVER,
+// PAGNET_ENROLL_TOKEN, PAGNET_TOKEN).
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 func main() {
 	root = &cobra.Command{
 		Use:           "pagnet",
@@ -41,8 +51,10 @@ func main() {
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
-	root.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:18080", "control plane URL")
-	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to `pagnet login`)")
+	root.PersistentFlags().StringVar(&serverURL, "server",
+		envOrDefault("PAGNET_SERVER", "http://localhost:18080"),
+		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
+	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
 
 	root.AddCommand(
 		loginCmd(),
@@ -104,7 +116,7 @@ func enrollCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "one-time enrollment token (required)")
+	cmd.Flags().StringVar(&token, "token", os.Getenv("PAGNET_ENROLL_TOKEN"), "one-time enrollment token ($PAGNET_ENROLL_TOKEN)")
 	cmd.Flags().StringVar(&name, "name", "", "host name (default: machine hostname)")
 	cmd.Flags().StringArrayVar(&roots, "roots", nil, "allowed workspace root (repeatable; server-side token roots win)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")

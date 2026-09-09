@@ -49,6 +49,11 @@ type Config struct {
 	// only reports git repos, so without this a fresh/empty directory
 	// would never be launchable from the UI or CLI.
 	PrimaryWorkspace string
+	// NoScan disables automatic git-repository discovery (inventory
+	// reports no workspaces; PrimaryWorkspace is still reported, since
+	// it is the worker's identity, not a discovery result). Workspaces
+	// are then managed explicitly from the UI or CLI.
+	NoScan bool
 }
 
 // Daemon is a running pagnetd instance.

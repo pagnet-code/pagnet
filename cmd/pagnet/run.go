@@ -301,6 +301,9 @@ func runCmd() *cobra.Command {
 			fmt.Printf("agent:        %s  (%s)\n", agentName, defID)
 			fmt.Printf("instance:     %s  (status=%s)\n", inst.ID, status)
 			fmt.Println("the daemon injects the pagnet MCP bridge + coordination contract into the runtime")
+			fmt.Println("this command exits now — the agent keeps running on the host daemon")
+			fmt.Printf("watch it in the web console (Agents page → %s), or join its terminal: pagnet attach %s\n",
+				agentName, agentName)
 			return nil
 		},
 	}

@@ -20,10 +20,14 @@ import (
 // wake re-evaluation (§75: pending wakes/commands are re-sent and we
 // deduplicate locally by CommandID) — and on host.request_inventory.
 func (d *Daemon) sendInventory(conn *websocket.Conn) {
+	var workspaces []transport.WorkspaceReport
+	if !d.NoScan {
+		workspaces = d.scanWorkspaces()
+	}
 	payload := transport.InventoryPayload{
 		HostID:       d.stateID(),
 		Runtimes:     d.detectRuntimes(),
-		Workspaces:   d.scanWorkspaces(),
+		Workspaces:   workspaces,
 		AllowedRoots: d.allowedRoots(),
 	}
 	_ = d.send(conn, transport.MsgHostInventory, payload)

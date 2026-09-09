@@ -15,8 +15,10 @@ API_URL ?=
 RELEASE_DIR := dist
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
+# 1 = production tarballs (no pagnet-fake-runtime).
+RELEASE_PROD ?= 0
 
-.PHONY: dev dev-server dev-web pg-up build test test-race fmt vet tidy demo release clean
+.PHONY: dev dev-server dev-web pg-up build test test-race fmt vet tidy demo release release-prod clean
 
 ## dev: control plane (18080) + web UI (13000) in foreground (Ctrl+C stops all)
 ## Expects DATABASE_URL reachable (deploy/.env by default).
@@ -70,19 +72,37 @@ demo: build
 ## plus pagnet-latest-<os>-<arch>.tar.gz copies so `wget .../download/
 ## pagnet-latest-linux-amd64.tar.gz` stays stable. Serve dist/ at the
 ## server's /download/ (deploy compose mounts it; PAGNET_RELEASE_DIR).
+##
+## release-prod: the production variant — tarballs WITHOUT
+## pagnet-fake-runtime. The fake runtime is not hardcoded: a daemon
+## reports only the runtime binaries it can actually find on PATH, so a
+## production host that never receives the fake binary simply never
+## offers it. Note: `release` and `release-prod` share dist/ and the
+## pagnet-latest-* copies (last build wins), so build the variant you
+## intend to serve last.
 release:
+	@echo "building release tarballs (VERSION=$(VERSION), prod=$(RELEASE_PROD))"
 	mkdir -p $(RELEASE_DIR)
 	@for t in $(RELEASE_TARGETS); do \
 		os=$${t%/*}; arch=$${t#*/}; \
 		tmp=$$(mktemp -d); \
+		if [ "$(RELEASE_PROD)" = "1" ]; then tag="-prod"; else tag=""; fi; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnetd ./cmd/pagnetd || rm -rf $$tmp; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-fake-runtime ./cmd/pagnet-fake-runtime || rm -rf $$tmp; \
-		tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz pagnet pagnetd pagnet-fake-runtime || rm -rf $$tmp; \
-		cp $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz $(RELEASE_DIR)/pagnet-latest-$$os-$$arch.tar.gz || rm -rf $$tmp; \
+		if [ "$(RELEASE_PROD)" != "1" ]; then \
+			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-fake-runtime ./cmd/pagnet-fake-runtime || rm -rf $$tmp; \
+			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd pagnet-fake-runtime || rm -rf $$tmp; \
+		else \
+			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd || rm -rf $$tmp; \
+		fi; \
+		cp $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz $(RELEASE_DIR)/pagnet-latest-$$os-$$arch.tar.gz || rm -rf $$tmp; \
 		rm -rf $$tmp; \
 	done
 	@ls -1 $(RELEASE_DIR)/pagnet-*.tar.gz
+
+## release-prod: production tarballs (pagnet + pagnetd only, no fake runtime)
+release-prod:
+	$(MAKE) release RELEASE_PROD=1
 
 clean:
 	rm -rf $(BIN)

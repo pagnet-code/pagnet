@@ -17,6 +17,11 @@ type daemonFileConfig struct {
 	HostName       string   `yaml:"hostName"`
 	AllowedRoots   []string `yaml:"allowedRoots"`
 	CurrentNetwork string   `yaml:"currentNetwork"`
+	// NoScan disables automatic git discovery. The file can only set it
+	// true (zero value = scan ON, so "false" is indistinguishable from
+	// absent); re-enabling goes through `pagnet worker --scan`, which
+	// rewrites the file explicitly.
+	NoScan bool `yaml:"noScan"`
 }
 
 func loadDaemonYAML(path string, cfg *Daemon) error {
@@ -45,6 +50,9 @@ func loadDaemonYAML(path string, cfg *Daemon) error {
 	}
 	if cfg.CurrentNetwork == "" {
 		cfg.CurrentNetwork = fc.CurrentNetwork
+	}
+	if fc.NoScan {
+		cfg.NoScan = true
 	}
 	return nil
 }

@@ -11,6 +11,10 @@ package main
 //
 //	pagnet worker --server http://controlplane:18080 --token <token> --user-token <admin-token>
 //
+// or with env vars (handy for scripts / provisioning):
+//
+//	PAGNET_SERVER=http://controlplane:18080 PAGNET_ENROLL_TOKEN=<token> PAGNET_TOKEN=<admin-token> pagnet worker
+//
 // Subsequent runs:
 //
 //	pagnet worker
@@ -20,9 +24,14 @@ package main
 //
 //	pagnet run . -n <network> -r qwen-code
 //
-// --user-token stores a validated user/admin bearer in the worker state,
-// so `pagnet run .` and friends work from this directory without
-// $PAGNET_TOKEN (REST is user-scoped; the host credential alone gets 401).
+// --user-token (or $PAGNET_TOKEN) stores a validated user/admin bearer in
+// the worker state, so `pagnet run .` and friends work from this
+// directory without $PAGNET_TOKEN (REST is user-scoped; the host
+// credential alone gets 401).
+//
+// --no-scan turns off automatic git-repo discovery (persisted in the
+// worker state; PAGNET_SCAN_WORKSPACES=0 does it for one run). The
+// directory itself is still the worker's workspace either way.
 
 import (
 	"crypto/sha256"
@@ -45,12 +54,16 @@ import (
 )
 
 func workerCmd() *cobra.Command {
-	var name, token, userToken, stateDir string
+	var name, token, userTok, stateDir string
+	var noScan, scan bool
 	cmd := &cobra.Command{
 		Use:   "worker",
 		Short: "Run a single-directory worker here (this directory is its only workspace)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if noScan && scan {
+				return errors.New("--no-scan and --scan are mutually exclusive")
+			}
 			abs, err := filepath.Abs(".")
 			if err != nil {
 				return err
@@ -82,22 +95,42 @@ func workerCmd() *cobra.Command {
 				}
 			}
 			if cfg.ServerURL == "" {
-				return errors.New("no control plane URL in state; run with --server <url>")
+				return errors.New("no control plane URL in state; run with --server <url> (or set $PAGNET_SERVER)")
 			}
-			if userToken != "" {
+			// Explicit flags persist to the worker state so the choice
+			// survives re-runs; without either, the stored value and
+			// PAGNET_SCAN_WORKSPACES (already folded into cfg.NoScan)
+			// apply.
+			noScanEnabled := cfg.NoScan
+			switch {
+			case noScan:
+				noScanEnabled = true
+				if err := mergeConfigFile(stateDir, map[string]any{"noScan": true}); err != nil {
+					return err
+				}
+			case scan:
+				noScanEnabled = false
+				if err := mergeConfigFile(stateDir, map[string]any{"noScan": false}); err != nil {
+					return err
+				}
+			}
+			if userTok == "" {
+				userTok = userToken // root --token / $PAGNET_TOKEN
+			}
+			if userTok != "" {
 				// Validate against /auth/me (never store an unverified
 				// bearer) and persist it in THIS worker's state so
 				// terminal commands run from this directory are
 				// authenticated by default.
 				base := strings.TrimSuffix(cfg.ServerURL, "/") + "/"
-				ok, err := bearerMe(&http.Client{Timeout: 30 * time.Second}, base, userToken)
+				ok, err := bearerMe(&http.Client{Timeout: 30 * time.Second}, base, userTok)
 				if err != nil {
 					return fmt.Errorf("validate --user-token: %w", err)
 				}
 				if !ok {
 					return errors.New("--user-token was rejected by the server")
 				}
-				if err := saveUserToken(stateDir, cfg.ServerURL, userToken); err != nil {
+				if err := saveUserToken(stateDir, cfg.ServerURL, userTok); err != nil {
 					return err
 				}
 			}
@@ -117,6 +150,7 @@ func workerCmd() *cobra.Command {
 				Heartbeat:        cfg.HeartbeatInterval,
 				RuntimeEnv:       cfg.RuntimeEnv,
 				PrimaryWorkspace: abs,
+				NoScan:           noScanEnabled,
 			}, log)
 			if err != nil {
 				return err
@@ -126,11 +160,14 @@ func workerCmd() *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			log.Info("pagnet worker",
-				"dir", abs, "server", cfg.ServerURL, "host", cfg.HostID)
+				"dir", abs, "server", cfg.ServerURL, "host", cfg.HostID, "noScan", noScanEnabled)
 			fmt.Fprintf(os.Stderr,
-				"worker running in %s — Ctrl+C stops it\n"+
-					"join a network from the terminal: pagnet run . -n <network> -r <runtime>\n",
-				abs)
+				"worker running in %s — it connects OUT to %s (no inbound ports needed)\n"+
+					"this is a long-lived daemon: leave it running while agents work here (Ctrl+C stops it)\n"+
+					"find it in the web console → Hosts page (status: online)\n"+
+					"launch agents on it from the web console, or from another terminal in this directory:\n"+
+					"  pagnet run . -n <network> -r <runtime>\n",
+				abs, cfg.ServerURL)
 			if err := d.Run(ctx); err != nil && ctx.Err() == nil {
 				return err
 			}
@@ -138,8 +175,10 @@ func workerCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "host name (default: machine hostname)")
-	cmd.Flags().StringVar(&token, "token", "", "one-time enrollment token (first run only)")
-	cmd.Flags().StringVar(&userToken, "user-token", "", "user/admin bearer validated and stored for `pagnet run .` from this directory")
+	cmd.Flags().StringVar(&token, "token", envOrDefault("PAGNET_ENROLL_TOKEN", ""), "one-time enrollment token, first run only ($PAGNET_ENROLL_TOKEN)")
+	cmd.Flags().StringVar(&userTok, "user-token", "", "user/admin bearer validated and stored for \"pagnet run .\" from this directory ($PAGNET_TOKEN)")
+	cmd.Flags().BoolVar(&noScan, "no-scan", false, "don't auto-discover git repos in the allowed roots (persisted; add workspaces explicitly)")
+	cmd.Flags().BoolVar(&scan, "scan", false, "re-enable automatic git-repo discovery (persisted; overrides a stored --no-scan)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "worker state dir (default ~/.pagnet/workers/<dir-hash>)")
 	return cmd
 }
