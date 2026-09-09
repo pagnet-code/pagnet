@@ -124,6 +124,10 @@ func (c *cliCtx) put(path string, body any) error {
 	return c.do(http.MethodPut, path, body, nil)
 }
 
+func (c *cliCtx) del(path string) error {
+	return c.do(http.MethodDelete, path, nil, nil)
+}
+
 // Network resolution: --network (id, name, or slug) > the saved current
 // network (`pagnet network use`) > the only network > error.
 func (c *cliCtx) resolveNetwork(name string) (id, label string, err error) {

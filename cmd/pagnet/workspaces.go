@@ -4,8 +4,10 @@ package main
 // targets across registered hosts (addendum: Listing launch targets).
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
@@ -71,5 +73,70 @@ func workspacesCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&host, "host", "", "only workspaces on this host (name or id)")
 	cmd.Flags().StringVar(&resource, "resource", "", "only workspaces of this resource (canonical key)")
+	cmd.AddCommand(workspaceRemoveCmd())
+	return cmd
+}
+
+// `pagnet workspaces remove <path> [--host <h>]` — remove a workspace
+// registration (the directory itself is untouched). Discovered git
+// repositories reappear on the next inventory scan; explicitly added
+// non-git workspaces stay gone until re-added.
+func workspaceRemoveCmd() *cobra.Command {
+	var host string
+	cmd := &cobra.Command{
+		Use:   "remove <path>",
+		Short: "Remove a workspace registration (the directory itself is untouched)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := newCLI("")
+			if err != nil {
+				return err
+			}
+			abs, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+			var targets []cliHost
+			switch {
+			case host != "":
+				h, err := c.hostByName(host)
+				if err != nil {
+					return err
+				}
+				targets = []cliHost{*h}
+			case c.cfg.HostID != "":
+				h, err := c.hostDetail(c.cfg.HostID)
+				if err != nil {
+					return err
+				}
+				targets = []cliHost{*h}
+			default:
+				return errors.New("no pagnet host config found; pass --host <name>")
+			}
+			removed := 0
+			for i := range targets {
+				h := &targets[i]
+				detail, err := c.hostDetail(h.ID)
+				if err != nil {
+					return err
+				}
+				for _, ws := range detail.Workspaces {
+					if ws.Path != abs {
+						continue
+					}
+					if err := c.del("/api/v1/hosts/" + h.ID + "/workspaces/" + ws.ID); err != nil {
+						return fmt.Errorf("remove %s from host %s: %w", abs, h.Name, err)
+					}
+					fmt.Printf("removed workspace %s from host %s\n", ws.Path, h.Name)
+					removed++
+				}
+			}
+			if removed == 0 {
+				return fmt.Errorf("workspace %s not found on host %s", abs, targets[0].Name)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "remove from this host (default: this machine's host)")
 	return cmd
 }

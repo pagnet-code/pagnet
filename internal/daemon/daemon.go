@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,6 +29,11 @@ import (
 // be acknowledged or failed: it stays queued server-side and is re-sent by
 // the host dispatcher (e.g. the instance is busy and maxConcurrentTurns=1).
 var ErrDeferred = errors.New("deferred: stays queued")
+
+// ErrUnenrolled means the control plane removed (or revoked) this host:
+// the credential is dead, reconnecting would only 401, and the daemon
+// stops itself instead of retrying forever.
+var ErrUnenrolled = errors.New("host unenrolled from the control plane — the credential is no longer valid; to join again, create a new enrollment token and run `pagnet enroll`")
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
@@ -63,6 +67,10 @@ type Daemon struct {
 
 	state    *State
 	adapters map[domain.RuntimeName]agentruntime.Adapter
+
+	// unenrolled is set by the read loop on host.unenrolled (or by Run on
+	// an auth-rejected dial) so Run exits instead of reconnecting.
+	unenrolled bool
 
 	// rootsMu guards AllowedRoots: host.update_roots replaces it at
 	// runtime (the server-side root list is the source of truth).
@@ -320,10 +328,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		err := d.connectAndRun(ctx)
+		if d.unenrolled {
+			// The control plane removed/revoked this host (live
+			// host.unenrolled, or an auth-rejected dial): the credential
+			// is dead, so stop with a message instead of retrying forever.
+			d.Log.Error("stopping: host unenrolled", "err", ErrUnenrolled)
+			return ErrUnenrolled
+		}
 		if ctx.Err() != nil {
 			break
 		}
 		if err != nil {
+			if isAuthReject(err) {
+				// 401/403 on dial: the credential no longer exists (host
+				// deleted or revoked while we were down). Same outcome as
+				// a live host.unenrolled — stop, with the reason visible.
+				d.unenrolled = true
+				d.Log.Error("stopping: credential rejected by the control plane", "err", err)
+				return ErrUnenrolled
+			}
 			d.Log.Warn("connection lost", "err", err, "retry_in", backoff)
 		}
 		select {
@@ -335,6 +358,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// isAuthReject reports whether a dial error is an auth rejection (401/403)
+// from the control plane — the daemon's credential is dead, not a network
+// problem, so reconnecting cannot help.
+func isAuthReject(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "http 401") || strings.Contains(s, "http 403")
 }
 
 func (d *Daemon) wsURL() string {
@@ -430,6 +464,16 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		if err := json.Unmarshal(raw, &env); err != nil {
 			d.Log.Warn("bad envelope from server", "err", err)
 			continue
+		}
+		if env.Type == transport.MsgHostUnenrolled {
+			// The control plane removed this host (deleted or unenrolled).
+			// Stop with a message the operator sees, not a silent retry
+			// loop into 401s.
+			d.unenrolled = true
+			d.Log.Error("host unenrolled — stopping", "err", ErrUnenrolled)
+			fmt.Fprintln(os.Stderr,
+				"pagnet: this host was unenrolled from the control plane — the daemon is stopping")
+			return ErrUnenrolled
 		}
 		if env.Type == transport.MsgAgentResponse {
 			d.deliverAgentResponse(env)
@@ -1720,56 +1764,8 @@ func (d *Daemon) sendTurn(conn *websocket.Conn, msgType string, spec agentruntim
 }
 
 // --- small platform helpers ---------------------------------------------------
-
-func readLoadAvg() (float64, error) {
-	b, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return 0, err
-	}
-	fields := strings.Fields(string(b))
-	if len(fields) == 0 {
-		return 0, fmt.Errorf("empty loadavg")
-	}
-	return strconv.ParseFloat(fields[0], 64)
-}
-
-// readMemInfo reads host memory from /proc/meminfo (Linux; ok=false
-// elsewhere so the caller can fall back).
-func readMemInfo() (total, used int64, ok bool) {
-	b, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0, 0, false
-	}
-	var memTotal, memAvail uint64
-	for _, line := range strings.Split(string(b), "\n") {
-		if rest, ok := strings.CutPrefix(line, "MemTotal:"); ok {
-			memTotal = meminfoKB(rest)
-		} else if rest, ok := strings.CutPrefix(line, "MemAvailable:"); ok {
-			memAvail = meminfoKB(rest)
-		}
-	}
-	if memTotal == 0 {
-		return 0, 0, false
-	}
-	used = int64(memTotal) - int64(memAvail)
-	if used < 0 {
-		used = 0
-	}
-	return int64(memTotal), used, true
-}
-
-// meminfoKB parses the "12345 kB" value of one /proc/meminfo line.
-func meminfoKB(rest string) uint64 {
-	fields := strings.Fields(rest)
-	if len(fields) == 0 {
-		return 0
-	}
-	n, err := strconv.ParseUint(fields[0], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n * 1024
-}
+// readLoadAvg / readMemInfo are platform-specific (sysinfo_linux.go,
+// sysinfo_darwin.go, sysinfo_other.go).
 
 func readDiskFree(path string) (int64, error) {
 	var st syscall.Statfs_t

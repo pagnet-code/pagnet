@@ -59,6 +59,7 @@ func main() {
 	root.AddCommand(
 		loginCmd(),
 		enrollCmd(),
+		unenrollCmd(),
 		workerCmd(),
 		runCmd(),
 		networkCmd(),
@@ -150,6 +151,9 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
 		"daemonVersion": "pagnet-cli/dev",
+		// Explicit --roots win over the token's roots (the browser
+		// default); the server responds with what it actually applied.
+		"allowedRoots": roots,
 	}, &resp); err != nil {
 		return fmt.Errorf("enroll: %w", err)
 	}
