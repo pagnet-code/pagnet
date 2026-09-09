@@ -42,10 +42,10 @@ pg-up:
 build:
 	mkdir -p $(BIN)
 	$(GO) build -o $(BIN)/pagnet-server ./cmd/pagnet-server
-	$(GO) build -o $(BIN)/pagnetd ./cmd/pagnetd
+	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(BIN)/pagnetd ./cmd/pagnetd
 	$(GO) build -o $(BIN)/pagnet-mcp ./cmd/pagnet-mcp
 	$(GO) build -o $(BIN)/pagnet-control ./cmd/pagnet-control
-	$(GO) build -o $(BIN)/pagnet ./cmd/pagnet
+	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(BIN)/pagnet ./cmd/pagnet
 	$(GO) build -o $(BIN)/pagnet-fake-runtime ./cmd/pagnet-fake-runtime
 
 test:
@@ -91,8 +91,8 @@ release:
 		os=$${t%/*}; arch=$${t#*/}; \
 		tmp=$$(mktemp -d); \
 		if [ "$(RELEASE_PROD)" = "1" ]; then tag="-prod"; else tag=""; fi; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnetd ./cmd/pagnetd || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $$tmp/pagnetd ./cmd/pagnetd || rm -rf $$tmp; \
 		if [ "$(RELEASE_PROD)" != "1" ]; then \
 			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-fake-runtime ./cmd/pagnet-fake-runtime || rm -rf $$tmp; \
 			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd pagnet-fake-runtime || rm -rf $$tmp; \

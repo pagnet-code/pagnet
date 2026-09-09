@@ -22,6 +22,11 @@ import (
 
 var serverURL string
 
+// version is stamped at release-build time (-X main.version=$(VERSION));
+// it rides on the enroll payload so the Hosts page shows a real build
+// identity from the first heartbeat.
+var version = "dev"
+
 // userToken is the user/admin bearer token for REST calls (--token or
 // $PAGNET_TOKEN); when both are empty the token stored by `pagnet login`
 // applies. Host credentials from `pagnet enroll` authenticate the daemon
@@ -150,7 +155,7 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 		"hostName":      name,
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
-		"daemonVersion": "pagnet-cli/dev",
+		"daemonVersion": version,
 		// Explicit --roots win over the token's roots (the browser
 		// default); the server responds with what it actually applied.
 		"allowedRoots": roots,
