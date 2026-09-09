@@ -35,11 +35,12 @@ import (
 // `-r <id>` and a failed resume (exit 1, "No saved session found") is
 // surfaced as EventSessionLost — never a silent fresh session (§74/§88).
 //
-// User config is never touched. MCP injection (the PAGNET_MCP_CONFIG
-// the daemon renders per instance) is merged into the workspace's
-// project-scoped .qwen/settings.json — the official per-project MCP
-// location — preserving any user-managed keys in that file. The global
-// ~/.qwen config (auth, models, user MCP servers) is read-only input.
+// User config is never touched and no file is written into the
+// workspace. MCP injection (the PAGNET_MCP_CONFIG the daemon renders
+// per instance) is passed as an inline --mcp-config JSON string: it
+// merges with the user's own MCP servers (project and global config)
+// without writing any file, so there is nothing to clobber and the
+// user's code directory stays clean.
 //
 // Model selection: Qwen.Model (explicit) or the PAGNET_QWEN_MODEL
 // environment; when empty the user's own default model applies.
@@ -131,12 +132,21 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		resuming = true
 	}
 
-	// Inject the MCP bridge into the workspace's project-scoped config
-	// (merges with any user-managed project settings; never touches
-	// ~/.qwen). A failure here is visible — the turn does not run
-	// silently without its network tools.
-	if err := injectQwenMCP(spec); err != nil {
-		return err
+	// Inject the MCP bridge as an inline --mcp-config (merges with the
+	// user's own MCP servers, writes no file into the workspace). A
+	// failure here is visible — the turn does not run silently without
+	// its network tools.
+	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
+		var cfg struct {
+			MCPServers map[string]any `json:"mcpServers"`
+		}
+		if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
+			return fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
+		}
+		if len(cfg.MCPServers) == 0 {
+			return fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
+		}
+		args = append(args, "--mcp-config", mcpJSON)
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -294,7 +304,7 @@ func (q *Qwen) PID(instanceID string) *int { return q.track.pid(instanceID) }
 
 // InteractiveCmd builds the interactive qwen REPL (the PTY terminal,
 // addendum §7/§8): the default interactive mode (no -o stream-json), with
-// the same model override, session resume, and project-scoped MCP bridge
+// the same model override, session resume, and inline --mcp-config bridge
 // as a turn. Not started: the daemon runs it under a PTY and owns its
 // lifecycle.
 func (q *Qwen) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
@@ -318,9 +328,19 @@ func (q *Qwen) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 			args = append(args, "-r", stored)
 		}
 	}
-	// Same project-scoped MCP bridge injection as a turn.
-	if err := injectQwenMCP(spec); err != nil {
-		return nil, err
+	// Same MCP bridge injection as a turn: the interactive CLI gets its
+	// network tools from the daemon's pagnet-mcp bridge.
+	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
+		var cfg struct {
+			MCPServers map[string]any `json:"mcpServers"`
+		}
+		if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
+			return nil, fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
+		}
+		if len(cfg.MCPServers) == 0 {
+			return nil, fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
+		}
+		args = append(args, "--mcp-config", mcpJSON)
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
@@ -379,62 +399,6 @@ func writeStoredSession(path, id string) error {
 		SessionID string `json:"sessionId"`
 	}{SessionID: id})
 	return os.WriteFile(path, append(b, '\n'), 0o600)
-}
-
-// --- MCP injection ---------------------------------------------------------------
-
-// injectQwenMCP merges the daemon-rendered PAGNET_MCP_CONFIG (inline
-// JSON: {"mcpServers": {...}}) into <workspace>/.qwen/settings.json —
-// qwen's project-scoped MCP config — preserving every other key the user
-// has there. The global user config (~/.qwen) is never written.
-func injectQwenMCP(spec TurnSpec) error {
-	mcpJSON := ""
-	for _, kv := range spec.Env {
-		if strings.HasPrefix(kv, "PAGNET_MCP_CONFIG=") {
-			mcpJSON = strings.TrimPrefix(kv, "PAGNET_MCP_CONFIG=")
-		}
-	}
-	if mcpJSON == "" {
-		return nil
-	}
-	var cfg struct {
-		MCPServers map[string]any `json:"mcpServers"`
-	}
-	if err := json.Unmarshal([]byte(mcpJSON), &cfg); err != nil {
-		return fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
-	}
-	if len(cfg.MCPServers) == 0 {
-		return nil
-	}
-
-	target := filepath.Join(spec.Workspace, ".qwen", "settings.json")
-	existing := map[string]any{}
-	if b, err := os.ReadFile(target); err == nil && len(bytes.TrimSpace(b)) > 0 {
-		if err := json.Unmarshal(b, &existing); err != nil {
-			return fmt.Errorf("existing %s is not valid JSON; refusing to overwrite it (fix or remove it): %w", target, err)
-		}
-	}
-	servers, _ := existing["mcpServers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
-	for k, v := range cfg.MCPServers {
-		servers[k] = v
-	}
-	existing["mcpServers"] = servers
-
-	out, err := json.MarshalIndent(existing, "", "  ")
-	if err != nil {
-		return err
-	}
-	out = append(out, '\n')
-	if b, err := os.ReadFile(target); err == nil && bytes.Equal(b, out) {
-		return nil // already injected (idempotent)
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(target, out, 0o644)
 }
 
 // --- small helpers ---------------------------------------------------------------
