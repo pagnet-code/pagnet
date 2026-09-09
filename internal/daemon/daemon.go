@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -479,8 +480,74 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			d.deliverAgentResponse(env)
 			continue
 		}
+		if env.Type == transport.MsgListDirs {
+			// LIVE request/response (directory picker): answered directly,
+			// not through the durable command queue (no ack, at-most-once).
+			d.handleListDirs(conn, env)
+			continue
+		}
 		d.handleCommand(conn, env)
 	}
+}
+
+// listDirsCap bounds how many subdirectories one listing returns, so a
+// directory with thousands of entries cannot bloat the picker reply.
+const listDirsCap = 500
+
+// listDirs computes the directory listing for the picker: it validates the
+// path against the daemon's allowed roots — the enforcement point, so a
+// browse request can never read outside them — and returns its
+// subdirectories (sorted, capped). It never reads file contents, only
+// directory names. Errors are fixed strings (SEC-012: no internal detail
+// to callers).
+func (d *Daemon) listDirs(path string) (transport.ListDirsResultPayload, error) {
+	res := transport.ListDirsResultPayload{Path: path}
+	if !d.workspaceAllowed(path) {
+		return res, errors.New("path is not under an allowed root")
+	}
+	resolved, err := pathResolved(path)
+	if err != nil {
+		return res, errors.New("cannot resolve path")
+	}
+	res.Path = resolved
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		// Not a directory, gone, or unreadable — report it, don't leak the
+		// raw OS error.
+		return res, errors.New("cannot read directory")
+	}
+	// Directories only (the picker selects a directory), sorted by name,
+	// capped.
+	out := make([]transport.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, transport.DirEntry{Name: e.Name(), IsDir: true})
+		if len(out) >= listDirsCap {
+			break
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	res.Entries = out
+	return res, nil
+}
+
+// handleListDirs answers a LIVE directory-listing request (the
+// click-to-select directory picker) by computing the listing and replying
+// with MsgListDirsResult correlated by RequestID.
+func (d *Daemon) handleListDirs(conn *websocket.Conn, env transport.Envelope) {
+	var p transport.ListDirsPayload
+	if err := env.DecodePayload(&p); err != nil || p.RequestID == "" {
+		return
+	}
+	res, err := d.listDirs(p.Path)
+	res.RequestID = p.RequestID
+	if err != nil {
+		res.Error = err.Error()
+		res.Entries = nil
+	}
+	_ = d.send(conn, transport.MsgListDirsResult, res)
 }
 
 // send wraps a payload in a versioned envelope and writes it. It prefers
@@ -950,6 +1017,24 @@ func (d *Daemon) workspaceAllowed(path string) bool {
 	return false
 }
 
+// applyCWD resolves a launch CWD override (a subdirectory of the
+// workspace the agent should run in) against the resolved checkout. The
+// CWD must be under an allowed root AND inside the selected workspace
+// root (it cannot escape to a sibling or parent). The returned path is
+// the subdir applied to the checkout, so it stays correct when the
+// checkout is an automatic worktree rather than the main workspace.
+func (d *Daemon) applyCWD(workspaceRoot, checkout, cwd string) (string, error) {
+	if !d.workspaceAllowed(cwd) {
+		return "", fmt.Errorf("cwd %q is not under an allowed root", cwd)
+	}
+	rel, err := filepath.Rel(workspaceRoot, cwd)
+	if err != nil || filepath.IsAbs(rel) || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("cwd %q is not inside workspace %q", cwd, workspaceRoot)
+	}
+	return filepath.Join(checkout, rel), nil
+}
+
 // pathResolved is Abs+Clean plus symlink resolution (spec §11: an allowed
 // root must not be bypassed by a symlink pointing outside it). The
 // workspace may not exist yet, so the LONGEST EXISTING PREFIX is resolved
@@ -1009,8 +1094,9 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		access = domain.AccessReadWrite
 	}
 	var (
-		wsPath string
-		lock   *sync.Mutex
+		wsPath   string
+		lock     *sync.Mutex
+		worktree bool
 	)
 	if p.WorkspacePath == "" {
 		// Representative (§37/§72): no git workspace; an pagnet-managed
@@ -1040,6 +1126,18 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			lock.Unlock()
 			return err
 		}
+		worktree = wsPath != p.WorkspacePath
+		// CWD override: run the agent in a subdirectory of the workspace
+		// (it sees only from there forward). The subdir is applied relative
+		// to the resolved checkout, so it stays correct when the checkout
+		// is an automatic worktree rather than the main workspace.
+		if p.CWD != "" {
+			wsPath, err = d.applyCWD(p.WorkspacePath, wsPath, p.CWD)
+			if err != nil {
+				lock.Unlock()
+				return err
+			}
+		}
 	}
 	// Launch registers the instance as idle: process-per-turn means no
 	// process runs until work arrives (the runtime is the turn runner).
@@ -1068,7 +1166,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		lock.Unlock()
 	}
 	msg := "agent launched (idle, process-per-turn)"
-	if wsPath != p.WorkspacePath {
+	if worktree {
 		msg = "agent launched (git worktree isolation, process-per-turn)"
 	}
 	d.Log.Info(msg,
