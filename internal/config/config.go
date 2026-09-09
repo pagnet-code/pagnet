@@ -57,6 +57,14 @@ type Server struct {
 	// `make release` at GET /download/<file> (the wget-install path for
 	// enrolling workers without root).
 	ReleaseDir string
+	// PublicOrigin is the canonical public base URL of this control plane
+	// (e.g. "https://app.pagnet.dev"). When set, /install.sh renders it as
+	// the bootstrap base URL instead of deriving scheme://host from the
+	// request. Behind a TLS-terminating tunnel the request's
+	// X-Forwarded-Proto is unreliable (the intermediate ingress may report
+	// the internal http scheme), so a configured origin is the robust
+	// source of truth. Empty = derive from the request (direct deployments).
+	PublicOrigin string
 	// HeartbeatInterval is the expected host heartbeat period.
 	HeartbeatInterval time.Duration
 	// OfflineThreshold marks hosts offline after this silence.
@@ -137,6 +145,9 @@ func LoadServer() (Server, error) {
 	}
 	if v := os.Getenv("PAGNET_RELEASE_DIR"); v != "" {
 		cfg.ReleaseDir = v
+	}
+	if v := os.Getenv("PAGNET_PUBLIC_ORIGIN"); v != "" {
+		cfg.PublicOrigin = strings.TrimRight(strings.TrimSpace(v), "/")
 	}
 	cfg.OIDC = OIDC{
 		Issuer:       envOr("OIDC_ISSUER", ""),
