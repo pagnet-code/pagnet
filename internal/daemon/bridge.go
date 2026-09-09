@@ -127,7 +127,7 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	}); err != nil {
 		return
 	}
-	d.Log.Debug("bridge authenticated", "instance", row.InstanceID)
+	d.Log.Info("bridge authenticated", "instance", row.InstanceID)
 
 	// Tool-call loop until the client disconnects.
 	for {

@@ -1359,31 +1359,13 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	if kind == "" {
 		kind = "notice"
 	}
-	// The turn input carries the context the agent needs to ACT through the
-	// network tools (reply needs the thread id, task updates need the task
-	// id) — not just the rendered text.
-	var input strings.Builder
-	switch kind {
-	case "ask", "reply":
-		fmt.Fprintf(&input, "[pagnet %s] from=%s thread=%s message=%s\n",
-			kind, dashOr(p.FromAgent), dashOr(p.ThreadID), dashOr(p.MessageID))
-	case "task":
-		fmt.Fprintf(&input, "[pagnet task] id=%s from=%s\n",
-			dashOr(p.TaskID), dashOr(p.FromAgent))
-	case "channel":
-		fmt.Fprintf(&input, "[pagnet channel] from=%s conversation=%s network=%s message=%s\n",
-			dashOr(p.FromAgent), dashOr(p.ConversationID), dashOr(p.NetworkID), dashOr(p.MessageID))
-	case "status":
-		fmt.Fprintf(&input, "[pagnet status] from=%s\n", dashOr(p.FromAgent))
-	default: // notice
-		fmt.Fprintf(&input, "[pagnet notice] from=%s\n", dashOr(p.FromAgent))
-	}
-	input.WriteString(p.Body)
-	if len(p.AcceptanceCriteria) > 0 {
-		input.WriteString("\n\nAcceptance criteria:\n- " + strings.Join(p.AcceptanceCriteria, "\n- "))
-	}
+	// The turn input is a self-describing XML envelope (contract.go):
+	// routing attributes + the immediate action for this delivery kind,
+	// so the agent always knows this is a network message and HOW to
+	// answer it — not just the rendered text.
+	input := deliveryInput(row, p)
 	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
-	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input.String(), kind))
+	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, kind))
 }
 
 func dashOr(s string) string {
@@ -1488,6 +1470,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	}
 	d.activeTurns[spec.InstanceID] = true
 	d.turnMu.Unlock()
+	started := time.Now()
 	defer func() {
 		d.turnMu.Lock()
 		delete(d.activeTurns, spec.InstanceID)
@@ -1629,7 +1612,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 				"instanceId": spec.InstanceID, "status": "idle",
 			})
 			d.Log.Info("turn completed; instance kept awake (attach/pty active)",
-				"instance", spec.InstanceID)
+				"instance", spec.InstanceID, "duration", time.Since(started).Round(time.Second))
 			return nil
 		}
 		// Completed: hibernate with the session preserved.
@@ -1638,6 +1621,9 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
 			"reason":     "turn_completed",
 		})
+		d.Log.Info("turn completed; instance hibernated",
+			"instance", spec.InstanceID, "session", sessionID,
+			"duration", time.Since(started).Round(time.Second))
 	}
 	return nil
 }
