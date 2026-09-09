@@ -83,6 +83,10 @@ demo: build
 release:
 	@echo "building release tarballs (VERSION=$(VERSION), prod=$(RELEASE_PROD))"
 	mkdir -p $(RELEASE_DIR)
+	## Prune versioned tarballs from older builds: dist/ keeps the current
+	## version + the pagnet-latest-* copies, nothing else (no tags yet, so
+	## per-commit artifacts would just accumulate).
+	@find $(RELEASE_DIR) -maxdepth 1 -name 'pagnet-*.tar.gz' ! -name 'pagnet-latest-*.tar.gz' ! -name "pagnet-$(VERSION)-*.tar.gz" -delete
 	@for t in $(RELEASE_TARGETS); do \
 		os=$${t%/*}; arch=$${t#*/}; \
 		tmp=$$(mktemp -d); \
