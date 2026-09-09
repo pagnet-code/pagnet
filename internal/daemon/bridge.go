@@ -39,6 +39,22 @@ const (
 // startBridgeSocket opens the local Unix socket. Called once from Run.
 func (d *Daemon) startBridgeSocket() error {
 	sockPath := filepath.Join(d.StateDir, bridgeSocketName)
+	// Double-start guard: a LIVE daemon already owns this socket? Refuse
+	// to start. Two daemons on one host fight over the host identity —
+	// each new connection supersedes the other, in an endless
+	// reconnect loop that flaps the host online/offline. A stale socket
+	// file (crashed daemon) is safe to replace: connect() to a socket
+	// with no listener fails, so only a live daemon answers the probe.
+	if probe, perr := net.Dial("unix", sockPath); perr == nil {
+		_ = probe.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = probe.Write([]byte(`{"type":"auth","instanceId":"pagnetd-probe","networkId":""}` + "\n"))
+		buf := make([]byte, 1)
+		_, rerr := probe.Read(buf)
+		_ = probe.Close()
+		if rerr == nil {
+			return fmt.Errorf("another pagnetd is already running (bridge socket %s is live); stop it first", sockPath)
+		}
+	}
 	_ = os.Remove(sockPath)
 	l, err := net.Listen("unix", sockPath)
 	if err != nil {

@@ -36,13 +36,13 @@ func readMemInfo() (total, used int64, ok bool) {
 	if err != nil {
 		return 0, 0, false
 	}
-	freeRaw, err := unix.SysctlRaw("vm.stats.page.pagesfree")
-	if err != nil || len(freeRaw) < 8 {
+	free, okFree := darwinPageCount("vm.page_free_count", "vm.stats.page.pagesfree")
+	if !okFree {
 		return 0, 0, false
 	}
-	availPages := binary.LittleEndian.Uint64(freeRaw)
-	if inactRaw, err := unix.SysctlRaw("vm.stats.page.inactcount"); err == nil && len(inactRaw) >= 8 {
-		availPages += binary.LittleEndian.Uint64(inactRaw)
+	availPages := free
+	if inact, okInact := darwinPageCount("vm.page_inactive_count", "vm.stats.page.inactcount"); okInact {
+		availPages += inact
 	}
 	total = int64(totalU)
 	used = total - int64(availPages)*int64(pageU)
@@ -50,4 +50,17 @@ func readMemInfo() (total, used int64, ok bool) {
 		used = 0
 	}
 	return total, used, true
+}
+
+// darwinPageCount reads the first sysctl that exists. macOS renamed the
+// vm_statistics64 page counters between releases (vm.stats.page.* is the
+// pre-10.7 spelling; modern systems expose vm.page_*_count), so try the
+// current name first and fall back to the legacy one.
+func darwinPageCount(names ...string) (uint64, bool) {
+	for _, n := range names {
+		if raw, err := unix.SysctlRaw(n); err == nil && len(raw) >= 8 {
+			return binary.LittleEndian.Uint64(raw), true
+		}
+	}
+	return 0, false
 }

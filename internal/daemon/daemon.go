@@ -36,6 +36,12 @@ var ErrDeferred = errors.New("deferred: stays queued")
 // stops itself instead of retrying forever.
 var ErrUnenrolled = errors.New("host unenrolled from the control plane — the credential is no longer valid; to join again, create a new enrollment token and run `pagnet enroll`")
 
+// ErrSuperseded means a NEWER daemon connection took over this host's
+// identity (the control plane closes the older connection with
+// transport.CloseCodeSuperseded). Another daemon process now owns the
+// host — reconnecting would only fight it forever, so the daemon stops.
+var ErrSuperseded = errors.New("superseded by a newer daemon connection — another pagnetd now owns this host; stop this one")
+
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
 	ServerURL    string
@@ -72,6 +78,11 @@ type Daemon struct {
 	// unenrolled is set by the read loop on host.unenrolled (or by Run on
 	// an auth-rejected dial) so Run exits instead of reconnecting.
 	unenrolled bool
+
+	// superseded is set by the read loop when the control plane closes
+	// the connection with CloseCodeSuperseded (a newer daemon owns the
+	// host now) so Run exits instead of reconnecting.
+	superseded bool
 
 	// rootsMu guards AllowedRoots: host.update_roots replaces it at
 	// runtime (the server-side root list is the source of truth).
@@ -336,6 +347,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.Log.Error("stopping: host unenrolled", "err", ErrUnenrolled)
 			return ErrUnenrolled
 		}
+		if d.superseded {
+			// A newer daemon connection owns this host's identity;
+			// reconnecting would only fight that daemon forever.
+			d.Log.Error("stopping: superseded by a newer daemon", "err", ErrSuperseded)
+			fmt.Fprintln(os.Stderr,
+				"pagnet: a newer pagnetd took over this host — this daemon is stopping")
+			return ErrSuperseded
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -459,6 +478,15 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		}
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) && closeErr.Code == transport.CloseCodeSuperseded {
+				// The control plane closed this connection because a
+				// NEWER daemon connection took over the host identity
+				// (a second pagnetd was started). Stop: reconnecting
+				// would only fight the other daemon forever.
+				d.superseded = true
+				return ErrSuperseded
+			}
 			return err
 		}
 		var env transport.Envelope

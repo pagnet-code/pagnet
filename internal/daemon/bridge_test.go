@@ -146,3 +146,22 @@ func TestBridgeUnknownToolLocal(t *testing.T) {
 		t.Fatalf("bogus tool must fail, got %v", resp)
 	}
 }
+
+// TestStartBridgeSocket_RefusesLiveDoubleStart: two daemons sharing a
+// state dir must not both own the bridge socket — the second refuses to
+// start. Without the guard they would fight over the host identity: each
+// new connection supersedes the other, in an endless reconnect loop that
+// flaps the host online/offline every backoff cycle.
+func TestStartBridgeSocket_RefusesLiveDoubleStart(t *testing.T) {
+	d, _ := startBridgeForTest(t)
+	defer d.stopBridgeSocket()
+
+	d2, err := New(Config{StateDir: d.StateDir}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d2.Close()
+	if err := d2.startBridgeSocket(); err == nil {
+		t.Fatal("second daemon must refuse to start while the first owns the bridge socket")
+	}
+}
