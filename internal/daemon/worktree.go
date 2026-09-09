@@ -56,7 +56,12 @@ func repoCommonDir(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return abs, nil
+	// Git canonicalizes the paths it stores: a linked worktree's .git file
+	// records the gitdir with symlinks resolved (e.g. /private/tmp/... on
+	// macOS), while the checkout itself may be reached through the symlink
+	// (/tmp/...). Resolve symlinks so both sides of a "same repository"
+	// comparison share one canonical identity.
+	return filepath.EvalSymlinks(abs)
 }
 
 var branchUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)

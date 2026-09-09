@@ -71,6 +71,11 @@ func TestResolveWorkspaceSecondRWGetsWorktree(t *testing.T) {
 		t.Fatalf("second RW agent must be isolated, got error: %v", err)
 	}
 	want := filepath.Join(repo, ".pagnet", "worktrees", inst2)
+	// repoCommonDir resolves symlinks (git stores canonical gitdirs), so
+	// the worktree path is canonical even when repo is not (macOS /tmp).
+	if resolved, err := filepath.EvalSymlinks(want); err == nil {
+		want = resolved
+	}
 	if got != want {
 		t.Fatalf("worktree path = %s, want %s", got, want)
 	}
@@ -124,6 +129,48 @@ func TestResolveWorkspaceIdempotentReplay(t *testing.T) {
 	second, err := d.resolveWorkspace(p, domain.AccessReadWrite)
 	if err != nil {
 		t.Fatalf("replay of worktree resolution must be idempotent: %v", err)
+	}
+	if first != second {
+		t.Fatalf("replay resolved differently: %s vs %s", first, second)
+	}
+}
+
+// TestResolveWorkspaceSymlinkedRepoPath: the checkout is reached through a
+// symlink. Git records a worktree's gitdir with the symlink resolved
+// (macOS /tmp -> /private/tmp is the production case), so the "same
+// repository" identity must be compared in canonical form — otherwise the
+// idempotent replay refuses its own worktree.
+func TestResolveWorkspaceSymlinkedRepoPath(t *testing.T) {
+	d := newTestDaemon(t)
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	gitInitRepo(t, link)
+	inst1, inst2 := domain.NewID().String(), domain.NewID().String()
+	if err := d.state.UpsertInstance(InstanceRow{
+		InstanceID: inst1, Runtime: "fake", Workspace: link,
+		Status: "idle", Access: domain.AccessReadWrite, AgentName: "coder-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	p := transport.LaunchAgentPayload{InstanceID: inst2, WorkspacePath: link, AgentName: "coder-2"}
+	first, err := d.resolveWorkspace(p, domain.AccessReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == link {
+		t.Fatal("second RW agent on the same repository must be isolated, kept the checkout")
+	}
+	second, err := d.resolveWorkspace(p, domain.AccessReadWrite)
+	if err != nil {
+		t.Fatalf("replay through a symlinked repo path must be idempotent: %v", err)
 	}
 	if first != second {
 		t.Fatalf("replay resolved differently: %s vs %s", first, second)
