@@ -30,8 +30,12 @@ deploy/.env
 .vscode/
 .DS_Store
 
-# Agent session state
+# Agent session state + agent instruction files (never pushed)
 .qwen/
+.claude/
+AGENTS.md
+CLAUDE.md
+QWEN.md
 
 # e2e screenshot artifacts (regenerable)
 web/e2e/*.png
