@@ -184,6 +184,12 @@ func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 		for _, row := range []*InstanceRow{ra, rb} {
 			if row.Workspace != repo {
 				wt := filepath.Join(repo, ".pagnet", "worktrees", row.InstanceID)
+				// repoCommonDir resolves symlinks (git stores canonical
+				// gitdirs), so the worktree path is canonical even when
+				// repo is not (macOS /tmp -> /private/tmp).
+				if resolved, err := filepath.EvalSymlinks(wt); err == nil {
+					wt = resolved
+				}
 				if row.Workspace != wt {
 					t.Fatalf("iteration %d: unexpected workspace %q", iter, row.Workspace)
 				}
