@@ -859,19 +859,6 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.guarded(conn, p.CommandID, func() error { return d.doTerminalStop(conn, p) })
 		})
 
-	case transport.MsgAttachInput:
-		var p transport.AttachInputPayload
-		if err := env.DecodePayload(&p); err != nil {
-			// Structurally broken: the CommandID lives inside the payload,
-			// so this copy cannot be acked and the server will re-send it.
-			// Make that visible instead of dropping it silently.
-			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
-			return
-		}
-		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doAttachInput(conn, p) })
-		})
-
 	case transport.MsgTerminalSnapshot:
 		var p transport.TerminalSnapshotPayload
 		if err := env.DecodePayload(&p); err != nil {
@@ -1803,24 +1790,6 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	}
 	d.addAttach(p.InstanceID, p.SessionID)
 
-	if !p.Terminal {
-		// Legacy text proxy (representatives): no PTY — input arrives as
-		// turns (host.attach_input). A hibernated instance is woken by a
-		// wake turn, exactly as the MVP attach did.
-		if d.busy(p.InstanceID) {
-			d.Log.Info("attach active; instance is finishing its current turn",
-				"instance", p.InstanceID)
-			return nil
-		}
-		if row.Status == "hibernated" {
-			d.Log.Info("attach wakes hibernated instance", "instance", p.InstanceID)
-			input := "You were woken. Reason: a human attached an interactive session."
-			return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, "user_input"))
-		}
-		d.Log.Info("attach active (instance already awake)", "instance", p.InstanceID)
-		return nil
-	}
-
 	s, err := d.terminal.start(p.InstanceID, row.SessionID != "")
 	if err != nil {
 		d.removeAttach(p.InstanceID, p.SessionID)
@@ -1936,34 +1905,6 @@ func (d *Daemon) doTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSn
 		ConfigStale: d.configStaleFor(p.InstanceID),
 	})
 	return nil
-}
-
-// doAttachInput executes one input from a legacy (non-PTY) attach session
-// as a turn — the representative text-proxy semantics (input in, turn
-// output out). A hibernated instance is woken by resuming its stored
-// session; input arriving while a turn is in progress stays queued
-// (deferred) and runs after it completes.
-func (d *Daemon) doAttachInput(conn *websocket.Conn, p transport.AttachInputPayload) error {
-	row, ok, err := d.state.GetInstance(p.InstanceID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("unknown instance %s", p.InstanceID)
-	}
-	switch row.Status {
-	case "blocked", "failed", "stopped":
-		return fmt.Errorf("instance %s is %s; input refused", p.InstanceID, row.Status)
-	}
-	if strings.TrimSpace(p.Data) == "" {
-		return nil
-	}
-	if d.busy(p.InstanceID) {
-		return ErrDeferred
-	}
-	d.Log.Info("attach input turn (legacy proxy)", "instance", p.InstanceID,
-		"session", p.SessionID, "bytes", len(p.Data))
-	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", p.Data, "user_input"))
 }
 
 func (d *Daemon) reportSession(conn *websocket.Conn, instanceID, sessionID string, resumed bool) {
