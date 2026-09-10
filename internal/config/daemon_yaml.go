@@ -16,12 +16,22 @@ type daemonFileConfig struct {
 	HostID         string   `yaml:"hostId"`
 	HostName       string   `yaml:"hostName"`
 	AllowedRoots   []string `yaml:"allowedRoots"`
+	RootsMode      string   `yaml:"rootsMode"`
 	CurrentNetwork string   `yaml:"currentNetwork"`
 	// NoScan disables automatic git discovery. The file can only set it
 	// true (zero value = scan ON, so "false" is indistinguishable from
 	// absent); re-enabling goes through `pagnet worker --scan`, which
 	// rewrites the file explicitly.
 	NoScan bool `yaml:"noScan"`
+	// Debug enables development/test-only behavior (registers the
+	// deterministic fake runtime). The file can only set it true (zero
+	// value = off); a production state file leaves it absent.
+	Debug bool `yaml:"debug"`
+	// AutoUpdate is worker self-update (P6). A pointer: the default is
+	// ON, so only an EXPLICIT `autoUpdate: false` in the state file
+	// disables it (absent = default ON — unlike the bool fields above,
+	// where false is the zero value and indistinguishable from absent).
+	AutoUpdate *bool `yaml:"autoUpdate"`
 }
 
 func loadDaemonYAML(path string, cfg *Daemon) error {
@@ -48,11 +58,22 @@ func loadDaemonYAML(path string, cfg *Daemon) error {
 	if len(cfg.AllowedRoots) == 0 {
 		cfg.AllowedRoots = fc.AllowedRoots
 	}
+	if cfg.RootsMode == "" {
+		cfg.RootsMode = fc.RootsMode
+	}
 	if cfg.CurrentNetwork == "" {
 		cfg.CurrentNetwork = fc.CurrentNetwork
 	}
 	if fc.NoScan {
 		cfg.NoScan = true
+	}
+	if fc.Debug {
+		cfg.Debug = true
+	}
+	// Only an explicit `autoUpdate: false` disables (default ON, P6);
+	// `autoUpdate: true` and an absent key both keep it enabled.
+	if fc.AutoUpdate != nil && !*fc.AutoUpdate {
+		cfg.AutoUpdate = false
 	}
 	return nil
 }

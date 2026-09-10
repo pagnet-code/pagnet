@@ -77,7 +77,8 @@ func TestListDirs_NestedPath(t *testing.T) {
 func TestListDirs_OutsideRootRefused(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir() // a different temp dir, NOT under root
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root}}, nil)
+	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root},
+		RootsMode: domain.RootsModeAllowList}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

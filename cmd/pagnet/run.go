@@ -267,7 +267,12 @@ func runCmd() *cobra.Command {
 				Status string `json:"Status"`
 			}
 			launchBody := map[string]any{"hostId": targetID, "workspaceId": workspaceID}
-			if runtimeName != "" && runtimeName != "fake" {
+			// An explicit runtime (including "fake", which is only
+			// registered in debug mode) is passed through; an empty
+			// runtime lets the daemon pick the first available real
+			// runtime (the default — production never hard-fails on the
+			// debug-only fake runtime).
+			if runtimeName != "" {
 				launchBody["runtime"] = runtimeName
 			}
 			if err := c.post("/api/v1/networks/"+netID+"/agents/"+defID+"/launch", launchBody, &inst); err != nil {
@@ -309,7 +314,8 @@ func runCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network id, name, or slug (default: the saved/only network)")
 	cmd.Flags().StringVar(&name, "name", "", "agent name (default: <repo>[-<role>])")
-	cmd.Flags().StringVarP(&runtimeName, "runtime", "r", "fake", "runtime for the instance (fake|qwen|claude)")
+	cmd.Flags().StringVarP(&runtimeName, "runtime", "r", "",
+		"runtime for the instance (qwen|claude|opencode|fake); empty = the host's first available runtime (fake is debug-only)")
 	cmd.Flags().StringVarP(&role, "role", "p", "", "role/profile for the agent (e.g. coder)")
 	cmd.Flags().StringVarP(&host, "host", "H", "", "launch on this host (name or id) instead of this one")
 	cmd.Flags().StringVar(&workspace, "workspace", "", "explicit workspace path on the target host")

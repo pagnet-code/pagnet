@@ -150,6 +150,14 @@ func (tm *terminalManager) active(instanceID string) bool {
 	return tm.get(instanceID) != nil
 }
 
+// activeCount is the number of live PTY sessions (the auto-update idle
+// gate, P6: a re-exec must not orphan a running PTY process).
+func (tm *terminalManager) activeCount() int {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return len(tm.sessions)
+}
+
 // start launches the instance's PTY if not already running (idempotent —
 // attach is a durable command and may re-send). The interactive command
 // comes from the runtime adapter (the ACTUAL CLI, addendum §7); resume
@@ -194,6 +202,13 @@ func (tm *terminalManager) start(instanceID string, resume bool) (*ptySession, e
 	}
 	tm.sessions[instanceID] = s
 	tm.mu.Unlock()
+
+	// P6 configStale: the PTY was just spawned with the daemon's CURRENT
+	// injected config (MCP bridge + identity env) — record its
+	// fingerprint so a later auto-update re-exec marks it stale. (A
+	// re-sent attach returns the existing session above and keeps the
+	// fingerprint of the process actually running.)
+	_ = tm.d.state.SetInstanceConfigFingerprint(instanceID, tm.d.instanceFingerprint(row))
 
 	go tm.readLoop(s)
 	go tm.exitLoop(s)

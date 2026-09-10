@@ -137,7 +137,7 @@ func TestDeliveryInputEnvelope(t *testing.T) {
 	// task: update + artifact duty names the task id.
 	in = deliveryInput(row, transport.NetworkEventPayload{
 		Kind: "task", FromAgent: "coordinator", TaskID: "task-9",
-		Body: "verify the auth surface",
+		Body:               "verify the auth surface",
 		AcceptanceCriteria: []string{"readable", "updatable"},
 	})
 	for _, want := range []string{

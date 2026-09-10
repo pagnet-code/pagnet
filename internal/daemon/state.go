@@ -50,7 +50,11 @@ func OpenState(path string) (*State, error) {
 			access        TEXT NOT NULL DEFAULT 'read_write',
 			agent_name    TEXT NOT NULL DEFAULT '',
 			network_id    TEXT NOT NULL DEFAULT '',
-			kind          TEXT NOT NULL DEFAULT 'worker'
+			kind          TEXT NOT NULL DEFAULT 'worker',
+			model         TEXT NOT NULL DEFAULT '',
+			instruction   TEXT NOT NULL DEFAULT '',
+			agent_md_path TEXT NOT NULL DEFAULT '',
+			config_fingerprint TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
@@ -66,6 +70,10 @@ func OpenState(path string) (*State, error) {
 		`ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN network_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'`,
+		`ALTER TABLE instances ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN instruction TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN agent_md_path TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN config_fingerprint TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -119,6 +127,20 @@ type InstanceRow struct {
 	AgentName    string
 	NetworkID    string
 	Kind         string // worker (default) | representative
+	// Model is the resolved model for this instance (launch request >
+	// definition default; "" = the runtime's own default).
+	Model string
+	// Instruction is the standing instruction (AGENT.md-style) for this
+	// instance ("" = none).
+	Instruction string
+	// AgentMDPath is the daemon-state-dir file holding Instruction ("" =
+	// none); claude points --append-system-prompt-file at it.
+	AgentMDPath string
+	// ConfigFingerprint is the fingerprint of the runtime-injected config
+	// (MCP bridge + identity env + daemon version, P6 configStale) that
+	// the instance's last PTY was started with. "" = the instance never
+	// had a PTY (never stale).
+	ConfigFingerprint string
 }
 
 // UpsertInstance records/updates a local instance.
@@ -127,8 +149,8 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 		r.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id, kind)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id, kind, model, instruction, agent_md_path, config_fingerprint)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (instance_id) DO UPDATE SET
 			definition_id = excluded.definition_id,
 			runtime = excluded.runtime,
@@ -141,9 +163,13 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 			access = excluded.access,
 			agent_name = excluded.agent_name,
 			network_id = excluded.network_id,
-			kind = excluded.kind`,
+			kind = excluded.kind,
+			model = excluded.model,
+			instruction = excluded.instruction,
+			agent_md_path = excluded.agent_md_path,
+			config_fingerprint = excluded.config_fingerprint`,
 		r.InstanceID, r.DefinitionID, r.Runtime, r.Workspace, r.Profile, r.Status, r.SessionID, r.PID, r.UpdatedAt,
-		r.Access, r.AgentName, r.NetworkID, r.Kind)
+		r.Access, r.AgentName, r.NetworkID, r.Kind, r.Model, r.Instruction, r.AgentMDPath, r.ConfigFingerprint)
 	return err
 }
 
@@ -170,18 +196,29 @@ func (s *State) SetInstanceSession(instanceID, sessionID string) error {
 	return err
 }
 
+// SetInstanceConfigFingerprint records the runtime-injected-config
+// fingerprint (P6 configStale) the instance's PTY was (re)started with.
+func (s *State) SetInstanceConfigFingerprint(instanceID, fingerprint string) error {
+	_, err := s.db.Exec(`
+		UPDATE instances SET config_fingerprint=?, updated_at=? WHERE instance_id=?`,
+		fingerprint, time.Now().UTC().Format(time.RFC3339), instanceID)
+	return err
+}
+
 // GetInstance fetches a local instance row.
 func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
 	row := s.db.QueryRow(`
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
 		       COALESCE(session_id,''), pid, updated_at,
 		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
-		       COALESCE(kind,'worker')
+		       COALESCE(kind,'worker'), COALESCE(model,''), COALESCE(instruction,''), COALESCE(agent_md_path,''),
+		       COALESCE(config_fingerprint,'')
 		FROM instances WHERE instance_id = ?`, instanceID)
 	var r InstanceRow
 	var pid sql.NullInt64
 	err := row.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace, &r.Profile,
-		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID, &r.Kind)
+		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID, &r.Kind,
+		&r.Model, &r.Instruction, &r.AgentMDPath, &r.ConfigFingerprint)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
@@ -201,7 +238,8 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
 		       COALESCE(session_id,''), pid, updated_at,
 		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
-		       COALESCE(kind,'worker')
+		       COALESCE(kind,'worker'), COALESCE(model,''), COALESCE(instruction,''), COALESCE(agent_md_path,''),
+		       COALESCE(config_fingerprint,'')
 		FROM instances ORDER BY instance_id`)
 	if err != nil {
 		return nil, err
@@ -213,7 +251,8 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 		var pid sql.NullInt64
 		if err := rows.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace,
 			&r.Profile, &r.Status, &r.SessionID, &pid, &r.UpdatedAt,
-			&r.Access, &r.AgentName, &r.NetworkID, &r.Kind); err != nil {
+			&r.Access, &r.AgentName, &r.NetworkID, &r.Kind, &r.Model, &r.Instruction, &r.AgentMDPath,
+			&r.ConfigFingerprint); err != nil {
 			return nil, err
 		}
 		if pid.Valid {

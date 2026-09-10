@@ -57,6 +57,12 @@ type Server struct {
 	// `make release` at GET /download/<file> (the wget-install path for
 	// enrolling workers without root).
 	ReleaseDir string
+	// ReleaseVersion, when set (PAGNET_RELEASE_VERSION), is the latest
+	// worker release the control plane advertises to daemons for
+	// auto-update (host.latest_version, P6). The operator sets it when
+	// publishing a release (e.g. v0.3.0). Empty = advertise nothing
+	// (auto-update is a no-op — the safe default).
+	ReleaseVersion string
 	// PublicOrigin is the canonical public base URL of this control plane
 	// (e.g. "https://app.pagnet.dev"). When set, /install.sh renders it as
 	// the bootstrap base URL instead of deriving scheme://host from the
@@ -145,6 +151,9 @@ func LoadServer() (Server, error) {
 	}
 	if v := os.Getenv("PAGNET_RELEASE_DIR"); v != "" {
 		cfg.ReleaseDir = v
+	}
+	if v := os.Getenv("PAGNET_RELEASE_VERSION"); v != "" {
+		cfg.ReleaseVersion = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("PAGNET_PUBLIC_ORIGIN"); v != "" {
 		cfg.PublicOrigin = strings.TrimRight(strings.TrimSpace(v), "/")
@@ -270,6 +279,9 @@ type Daemon struct {
 	HostName string
 	// AllowedRoots confines workspace discovery and launches.
 	AllowedRoots []string
+	// RootsMode is the roots enforcement mode (allow_all by default,
+	// allow_list to confine to AllowedRoots). Empty = allow_all.
+	RootsMode string
 	// HeartbeatInterval for the outbound connection.
 	HeartbeatInterval time.Duration
 	// RuntimeEnv carries extra KEY=VALUE env pairs applied to spawned
@@ -286,6 +298,17 @@ type Daemon struct {
 	// daemon reports no discovered workspaces and workspaces are managed
 	// explicitly (UI "Add", `pagnet run .`, `pagnet workspaces add`).
 	NoScan bool
+	// Debug enables development/test-only behavior (registers the
+	// deterministic fake runtime). Default FALSE — a production daemon
+	// never offers the fake runtime. Set via PAGNET_DEBUG or the state
+	// file's `debug:` field; the `--debug` flag (pagnetd) ORs in on top.
+	Debug bool
+	// AutoUpdate enables worker self-update (P6): when the control plane
+	// advertises a newer release and the daemon is idle, it downloads the
+	// release tarball and re-execs in place (same PID). Default TRUE —
+	// opt out via PAGNET_AUTO_UPDATE=0/false/off/no, the state file's
+	// `autoUpdate: false`, or the `--no-auto-update` flag (pagnetd).
+	AutoUpdate bool
 }
 
 // LoadDaemon reads daemon config: env, then the env files (deploy/.env,
@@ -329,6 +352,10 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		// single-directory worker after its host name).
 		HostName:          get("PAGNET_HOST_NAME", ""),
 		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
+		// Auto-update is ON by default (P6): the daemon re-execs itself
+		// when the control plane advertises a newer release and the
+		// worker is idle. Opt-out below (env / state file / CLI flag).
+		AutoUpdate: true,
 	}
 	if env := get("PAGNET_RUNTIME_ENV", ""); env != "" {
 		for _, kv := range strings.Split(env, ",") {
@@ -344,6 +371,23 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		switch v {
 		case "0", "false", "off", "no":
 			cfg.NoScan = true
+		}
+	}
+	// PAGNET_DEBUG=1/true/on/yes enables development/test-only behavior
+	// (registers the deterministic fake runtime). Default off: a
+	// production daemon never offers the fake runtime.
+	if v := strings.ToLower(strings.TrimSpace(get("PAGNET_DEBUG", ""))); v != "" {
+		switch v {
+		case "1", "true", "on", "yes":
+			cfg.Debug = true
+		}
+	}
+	// PAGNET_AUTO_UPDATE=0/false/off/no disables worker self-update
+	// (default ON, P6). Anything else — or unset — keeps it enabled.
+	if v := strings.ToLower(strings.TrimSpace(get("PAGNET_AUTO_UPDATE", ""))); v != "" {
+		switch v {
+		case "0", "false", "off", "no":
+			cfg.AutoUpdate = false
 		}
 	}
 	if file := filepath.Join(stateDir, "config.yaml"); exists(file) {

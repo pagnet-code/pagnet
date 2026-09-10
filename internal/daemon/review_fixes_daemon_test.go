@@ -312,6 +312,9 @@ func TestWorkspaceAllowed_SymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, "sneaky")); err != nil {
 		t.Fatal(err)
 	}
+	// Symlink-escape confinement is the allow_list mode (allow_all, the
+	// default, allows any existing path regardless of roots).
+	d.SetRootsMode(domain.RootsModeAllowList)
 	d.AllowedRoots = []string{root}
 
 	if d.workspaceAllowed(filepath.Join(root, "sneaky", "does-not-exist")) {

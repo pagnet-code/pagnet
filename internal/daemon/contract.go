@@ -114,6 +114,36 @@ Your pagnet identity:
 	return path, text, nil
 }
 
+// writeAgentMD (re)renders the instance's standing instruction (the
+// AGENT.md-style file the operator set at launch) into the daemon state
+// dir. It returns the file path the claude runtime is pointed at AND the
+// rendered text: runtimes without a system-prompt-file flag (qwen, fake,
+// opencode-later) have the daemon append the text to a fresh session's
+// first turn — exactly how the coordination contract reaches them. It is
+// idempotent and safe to call per turn: the file lives in the daemon
+// state dir, never in the workspace. It is a no-op (empty path/text) when
+// the instance has no standing instruction.
+func (d *Daemon) writeAgentMD(row *InstanceRow) (string, string, error) {
+	text := row.Instruction
+	if text == "" {
+		return "", "", nil
+	}
+	// SEC-407 (defense in depth): the id becomes a path component — a
+	// non-UUID can never reach the join.
+	if _, err := domain.ParseID(row.InstanceID); err != nil {
+		return "", "", fmt.Errorf("invalid instance id for agentmd: %s", row.InstanceID)
+	}
+	path := filepath.Join(d.StateDir, "agentmd", row.InstanceID+".md")
+	// SEC-415: coordination state is operator data, not public.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		return "", "", err
+	}
+	return path, text, nil
+}
+
 // deliveryInput renders the turn input for a network delivery as a
 // self-describing XML envelope. The message body is wrapped in
 // <pagnet-message> with routing attributes, and a <pagnet-action> block

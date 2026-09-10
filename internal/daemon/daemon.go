@@ -49,8 +49,13 @@ type Config struct {
 	HostID       string
 	StateDir     string
 	AllowedRoots []string
-	Version      string
-	Heartbeat    time.Duration
+	// RootsMode is the initial roots enforcement mode (allow_all by
+	// default, allow_list to confine to AllowedRoots). The server is the
+	// source of truth and replaces it at runtime via host.update_roots.
+	// Empty = allow_all.
+	RootsMode string
+	Version   string
+	Heartbeat time.Duration
 	// RuntimeEnv is applied to spawned runtime processes (E2E simulation
 	// knobs live here; a real deployment leaves it empty).
 	RuntimeEnv []string
@@ -65,6 +70,17 @@ type Config struct {
 	// it is the worker's identity, not a discovery result). Workspaces
 	// are then managed explicitly from the UI or CLI.
 	NoScan bool
+	// Debug enables development/test-only behavior: it registers the
+	// deterministic fake runtime (a test/demo stand-in, never a real
+	// agent runtime). Default FALSE — a production daemon never offers
+	// the fake runtime. Set from --debug / PAGNET_DEBUG / config.
+	Debug bool
+	// AutoUpdate enables worker self-update (P6): when the control plane
+	// advertises a newer release (PAGNET_RELEASE_VERSION) and the daemon
+	// is idle, it downloads the release tarball and re-execs in place
+	// (same PID). Default TRUE — opt out via PAGNET_AUTO_UPDATE=0,
+	// --no-auto-update, or the state file's autoUpdate: false.
+	AutoUpdate bool
 }
 
 // Daemon is a running pagnetd instance.
@@ -162,6 +178,15 @@ type Daemon struct {
 	// same id, which ends once the ack lands.
 	seenMu sync.Mutex
 	seen   map[string]time.Time
+
+	// Auto-update state (P6): latestVersion is the release version the
+	// control plane last advertised (host.latest_version); updating
+	// guards the single-flight download/exec; lastAttempt bounds the
+	// retry rate after a failed attempt (1h backoff).
+	updMu         sync.Mutex
+	latestVersion string
+	updating      bool
+	lastAttempt   time.Time
 }
 
 // Bounded dedup retention (spec §91 "bounded period").
@@ -208,18 +233,28 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 	if cfg.HostID != "" {
 		_ = st.KVSet("host_id", cfg.HostID)
 	}
-	fake := agentruntime.NewFake("")
-	fake.Env = cfg.RuntimeEnv
+	// Real runtimes are always registered: the daemon reports whichever of
+	// these it can actually drive (detectRuntimes resolves each binary).
+	adapters := map[domain.RuntimeName]agentruntime.Adapter{
+		domain.RuntimeQwenCode:   agentruntime.NewQwen(""),
+		domain.RuntimeClaudeCode: agentruntime.NewClaude(""),
+		domain.RuntimeOpenCode:   agentruntime.NewOpenCode(""),
+	}
+	// The fake runtime is a deterministic test/demo stand-in, NOT a real
+	// agent runtime: it is registered ONLY in debug mode (PAGNET_DEBUG /
+	// --debug), so a production daemon never offers it. Debug mode is how
+	// `make demo` and the E2E suite drive fake agents.
+	if cfg.Debug {
+		fake := agentruntime.NewFake("")
+		fake.Env = cfg.RuntimeEnv
+		adapters[domain.RuntimeFake] = fake
+	}
 	turnCtx, turnCancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Config: cfg,
-		Log:    log,
-		state:  st,
-		adapters: map[domain.RuntimeName]agentruntime.Adapter{
-			domain.RuntimeFake:       fake,
-			domain.RuntimeQwenCode:   agentruntime.NewQwen(""),
-			domain.RuntimeClaudeCode: agentruntime.NewClaude(""),
-		},
+		Config:      cfg,
+		Log:         log,
+		state:       st,
+		adapters:    adapters,
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
 		pending:     map[string]chan transport.AgentResponsePayload{},
@@ -242,6 +277,10 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 	if n, err := st.ReconcileRestart(); err == nil && n > 0 {
 		log.Warn("reconciled instances left working by a previous run", "n", n)
 	}
+	// P6 auto-update: clear a leftover staging dir from a previous
+	// update that re-exec'd successfully (nothing runs after the exec to
+	// clean it up).
+	_ = os.RemoveAll(filepath.Join(cfg.StateDir, "update-staging"))
 	return d, nil
 }
 
@@ -512,6 +551,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			// LIVE request/response (directory picker): answered directly,
 			// not through the durable command queue (no ack, at-most-once).
 			d.handleListDirs(conn, env)
+			continue
+		}
+		if env.Type == transport.MsgLatestVersion {
+			// LIVE (auto-update, P6): the advertised release version. The
+			// handler only records it and (at most) spawns the update
+			// goroutine — it never blocks the read loop on a download.
+			d.handleLatestVersion(env)
 			continue
 		}
 		d.handleCommand(conn, env)
@@ -881,7 +927,8 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		}
 		d.guarded(conn, p.CommandID, func() error {
 			d.SetAllowedRoots(p.Roots)
-			d.Log.Info("allowed roots updated", "roots", p.Roots)
+			d.SetRootsMode(p.Mode)
+			d.Log.Info("allowed roots updated", "roots", p.Roots, "mode", p.Mode)
 			// Re-report: the workspace set may have changed (a root was
 			// added or removed), and the server persists the inventory's
 			// roots as the host's source-of-truth list.
@@ -1023,8 +1070,27 @@ func (d *Daemon) SetAllowedRoots(roots []string) {
 	d.rootsMu.Unlock()
 }
 
-// workspaceAllowed validates a path against the allowed roots (resolved
-// absolute prefix match).
+// rootsMode returns the current roots enforcement mode (replaced at
+// runtime by host.update_roots — the server-side mode is the source of
+// truth). Empty = allow_all (the default).
+func (d *Daemon) rootsMode() string {
+	d.rootsMu.RLock()
+	defer d.rootsMu.RUnlock()
+	return d.RootsMode
+}
+
+// SetRootsMode atomically replaces the roots enforcement mode
+// (host.update_roots).
+func (d *Daemon) SetRootsMode(mode string) {
+	d.rootsMu.Lock()
+	d.RootsMode = mode
+	d.rootsMu.Unlock()
+}
+
+// workspaceAllowed validates a path against the host's roots policy
+// (resolved absolute match). allow_all (the default, or an empty mode)
+// allows any absolute, existing path; allow_list confines to the allowed
+// roots (the path must sit under one of them — the existing enforcement).
 func (d *Daemon) workspaceAllowed(path string) bool {
 	if path == "" {
 		return false
@@ -1033,6 +1099,15 @@ func (d *Daemon) workspaceAllowed(path string) bool {
 	if err != nil {
 		return false
 	}
+	if d.rootsMode() != domain.RootsModeAllowList {
+		// allow_all (default): any absolute, existing path (pathResolved
+		// already returns an absolute path).
+		if _, err := os.Stat(clean); err != nil {
+			return false
+		}
+		return true
+	}
+	// allow_list: the path must sit under one of the allowed roots.
 	for _, root := range d.allowedRoots() {
 		rc, err := pathResolved(root)
 		if err != nil {
@@ -1107,6 +1182,23 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		return fmt.Errorf("launch command carries an invalid instance id")
 	}
 	rn := domain.CanonicalRuntime(p.Runtime)
+	if rn == "" {
+		// No runtime requested: pick the first available REAL runtime.
+		// The fake runtime is debug-only and is never auto-selected, so a
+		// production daemon (no fake) still launches on its real runtimes
+		// instead of hard-failing on an empty default.
+		for _, name := range []domain.RuntimeName{
+			domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
+		} {
+			if ad, ok := d.adapters[name]; ok && ad.Available() {
+				rn = name
+				break
+			}
+		}
+		if rn == "" {
+			return fmt.Errorf("no runtime available on this host (install qwen, claude, or opencode)")
+		}
+	}
 	ad, ok := d.adapters[rn]
 	if !ok {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
@@ -1173,7 +1265,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if kind == "" {
 		kind = "worker"
 	}
-	if err := d.state.UpsertInstance(InstanceRow{
+	row := InstanceRow{
 		InstanceID:   p.InstanceID,
 		DefinitionID: p.DefinitionID,
 		Runtime:      string(rn),
@@ -1184,7 +1276,25 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		AgentName:    p.AgentName,
 		NetworkID:    p.NetworkID,
 		Kind:         kind,
-	}); err != nil {
+		Model:        p.Model,
+		Instruction:  p.AgentMD,
+	}
+	// Standing instruction (AGENT.md): materialize it in the daemon state
+	// dir (NEVER the workspace) and record its path on the row so it
+	// persists across turns. claude receives the path via
+	// --append-system-prompt-file; other runtimes have the text appended
+	// to a fresh session's first turn (turnSpecFor).
+	if p.AgentMD != "" {
+		path, _, err := d.writeAgentMD(&row)
+		if err != nil {
+			if lock != nil {
+				lock.Unlock()
+			}
+			return err
+		}
+		row.AgentMDPath = path
+	}
+	if err := d.state.UpsertInstance(row); err != nil {
 		if lock != nil {
 			lock.Unlock()
 		}
@@ -1383,12 +1493,25 @@ func (d *Daemon) busy(instanceID string) bool {
 
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
 	contractPath, contractText, _ := d.writeContract(row)
+	// Standing instruction (AGENT.md): re-rendered per turn (idempotent),
+	// mirroring the coordination contract. claude receives the path via
+	// --append-system-prompt-file (every turn); other runtimes have the
+	// text appended to a fresh session's first turn (they have no such
+	// flag).
+	agentMDPath, agentMDText, _ := d.writeAgentMD(row)
 	if !resume {
 		// §23/§24: the coordination contract is standing instructions and
 		// must reach the model. A fresh session has no prior context, so
 		// it rides with the first turn; a resumed session already carries
 		// it in its context.
 		input = input + "\n\n" + contractText
+		// The standing instruction reaches non-claude runtimes the same
+		// way: appended to a fresh session's first turn. claude gets it
+		// natively via --append-system-prompt-file (spec.AgentMDPath), so
+		// it is NOT appended here (no double delivery).
+		if agentMDText != "" && row.Runtime != string(domain.RuntimeClaudeCode) {
+			input = input + "\n\n" + agentMDText
+		}
 	}
 	return agentruntime.TurnSpec{
 		TurnID:       domain.NewID().String(),
@@ -1399,6 +1522,8 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 		Resume:       resume,
 		Input:        input,
 		InputKind:    kind,
+		Model:        row.Model,
+		AgentMDPath:  agentMDPath,
 		Metadata:     map[string]any{"profile": row.Profile},
 		Env: []string{
 			"PAGNET_INSTANCE_ID=" + row.InstanceID,
@@ -1619,7 +1744,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
-			"reason":     "turn_completed",
+			"reason": "turn_completed",
 		})
 		d.Log.Info("turn completed; instance hibernated",
 			"instance", spec.InstanceID, "session", sessionID,
@@ -1716,11 +1841,12 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	// replayed before live frames for the new client (§11).
 	data, lastSeq := d.terminal.snapshot(s)
 	_ = d.send(conn, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
-		InstanceID: p.InstanceID,
-		SessionID:  p.SessionID,
-		Data:       data,
-		Snapshot:   true,
-		LastSeq:    lastSeq,
+		InstanceID:  p.InstanceID,
+		SessionID:   p.SessionID,
+		Data:        data,
+		Snapshot:    true,
+		LastSeq:     lastSeq,
+		ConfigStale: d.configStaleFor(p.InstanceID),
 	})
 	return nil
 }
@@ -1802,11 +1928,12 @@ func (d *Daemon) doTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSn
 	}
 	data, lastSeq := d.terminal.snapshot(s)
 	_ = d.send(conn, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
-		InstanceID: p.InstanceID,
-		SessionID:  p.SessionID,
-		Data:       data,
-		Snapshot:   true,
-		LastSeq:    lastSeq,
+		InstanceID:  p.InstanceID,
+		SessionID:   p.SessionID,
+		Data:        data,
+		Snapshot:    true,
+		LastSeq:     lastSeq,
+		ConfigStale: d.configStaleFor(p.InstanceID),
 	})
 	return nil
 }

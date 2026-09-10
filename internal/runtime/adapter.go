@@ -37,6 +37,16 @@ type TurnSpec struct {
 	InputKind string
 	// WakeReason is set when this turn exists to satisfy a wake.
 	WakeReason string
+	// Model is the resolved model for this turn ("" = the adapter's own
+	// default: its field, then its env). When set it takes precedence over
+	// both — the daemon resolves launch request > definition default.
+	Model string
+	// AgentMDPath is the daemon-managed standing-instruction file
+	// (AGENT.md-style) the runtime loads as extra system context ("" =
+	// none). Claude maps it to --append-system-prompt-file; runtimes
+	// without such a flag get the daemon append its text to a fresh
+	// session's first turn instead (they never read this path).
+	AgentMDPath string
 	// Metadata carries runtime-agnostic extras (e.g. profile, transcript).
 	Metadata map[string]any
 	// Env is extra KEY=VALUE pairs for the spawned process (per-instance

@@ -117,8 +117,14 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	stored, _ := readStoredSession(sessionPath)
 
 	args := []string{"-o", "stream-json"}
-	if model := q.model(); model != "" {
-		args = append(args, "-m", model)
+	// Model precedence: the turn's resolved model (launch request >
+	// definition default) wins over the adapter's own (field, then env).
+	turnModel := spec.Model
+	if turnModel == "" {
+		turnModel = q.model()
+	}
+	if turnModel != "" {
+		args = append(args, "-m", turnModel)
 	}
 	resuming := false
 	if spec.Resume {
@@ -319,8 +325,14 @@ func (q *Qwen) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		return nil, err
 	}
 	var args []string
-	if model := q.model(); model != "" {
-		args = append(args, "-m", model)
+	// Model precedence: the turn's resolved model wins over the adapter's
+	// own (field, then env).
+	turnModel := spec.Model
+	if turnModel == "" {
+		turnModel = q.model()
+	}
+	if turnModel != "" {
+		args = append(args, "-m", turnModel)
 	}
 	if spec.Resume {
 		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, qwenSessionFile))

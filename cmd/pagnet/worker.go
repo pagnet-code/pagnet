@@ -51,6 +51,7 @@ import (
 
 	"pagnet/internal/config"
 	"pagnet/internal/daemon"
+	"pagnet/internal/domain"
 )
 
 func workerCmd() *cobra.Command {
@@ -84,9 +85,11 @@ func workerCmd() *cobra.Command {
 				return err
 			}
 			if cfg.Credential == "" || cfg.HostID == "" {
-				// First run in this directory: enroll this directory as
-				// its own worker (root = this directory).
-				if err := doEnroll(serverURL, token, name, []string{abs}, stateDir); err != nil {
+				// First run in this directory: enroll the host. The
+				// default is allow_all (open host) — the worker's
+				// directory is NOT forced as a restrictive root; it is
+				// still reported as the primary workspace.
+				if err := doEnroll(serverURL, token, name, nil, "", stateDir); err != nil {
 					return err
 				}
 				cfg, err = config.LoadDaemon(stateDir)
@@ -135,9 +138,14 @@ func workerCmd() *cobra.Command {
 				}
 			}
 			roots := cfg.AllowedRoots
-			if len(roots) == 0 {
+			rootsMode := cfg.RootsMode // empty = allow_all (default)
+			if rootsMode == domain.RootsModeAllowList && len(roots) == 0 {
+				// Sane fallback: an allow_list host with no roots would
+				// allow nothing; default to this worker's directory.
 				roots = []string{abs}
 			}
+			// allow_all (default): no roots forced — the host is open to
+			// any absolute, existing path.
 
 			log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 			d, err := daemon.New(daemon.Config{
@@ -146,11 +154,15 @@ func workerCmd() *cobra.Command {
 				HostID:           cfg.HostID,
 				StateDir:         stateDir,
 				AllowedRoots:     roots,
+				RootsMode:        rootsMode,
 				Version:          "pagnet-worker/dev",
 				Heartbeat:        cfg.HeartbeatInterval,
 				RuntimeEnv:       cfg.RuntimeEnv,
 				PrimaryWorkspace: abs,
 				NoScan:           noScanEnabled,
+				// Debug (PAGNET_DEBUG / state-file debug:) registers the
+				// deterministic fake runtime for local dev/demo.
+				Debug: cfg.Debug,
 			}, log)
 			if err != nil {
 				return err

@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"pagnet/internal/domain"
 )
 
 var serverURL string
@@ -101,7 +103,7 @@ func main() {
 // credential + identity in the daemon state dir (config.yaml, mode 0600).
 // User sign-in lives in `pagnet login`.
 func enrollCmd() *cobra.Command {
-	var token, name, stateDir string
+	var token, name, stateDir, rootsMode string
 	var roots []string
 	cmd := &cobra.Command{
 		Use:   "enroll",
@@ -115,7 +117,7 @@ func enrollCmd() *cobra.Command {
 				}
 				stateDir = filepath.Join(home, ".pagnet")
 			}
-			if err := doEnroll(serverURL, token, name, roots, stateDir); err != nil {
+			if err := doEnroll(serverURL, token, name, roots, rootsMode, stateDir); err != nil {
 				return err
 			}
 			fmt.Println("run `pagnetd` to connect this host")
@@ -125,6 +127,7 @@ func enrollCmd() *cobra.Command {
 	cmd.Flags().StringVar(&token, "token", os.Getenv("PAGNET_ENROLL_TOKEN"), "one-time enrollment token ($PAGNET_ENROLL_TOKEN)")
 	cmd.Flags().StringVar(&name, "name", "", "host name (default: machine hostname)")
 	cmd.Flags().StringArrayVar(&roots, "roots", nil, "allowed workspace root (repeatable; server-side token roots win)")
+	cmd.Flags().StringVar(&rootsMode, "roots-mode", "", "roots enforcement: allow_all (default, any path) or allow_list (confine to --roots)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")
 	return cmd
 }
@@ -132,7 +135,7 @@ func enrollCmd() *cobra.Command {
 // doEnroll consumes a one-time enrollment token against the control plane
 // and stores the host credential + identity in stateDir (config.yaml,
 // mode 0600). Shared by `pagnet enroll` and `pagnet worker` (first run).
-func doEnroll(server, token, name string, roots []string, stateDir string) error {
+func doEnroll(server, token, name string, roots []string, rootsMode string, stateDir string) error {
 	if token == "" {
 		return errors.New("--token is required (create one in the web UI: Hosts → Add a worker)")
 	}
@@ -142,6 +145,15 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 			name = "pagnet-host"
 		}
 	}
+	// Roots mode: an explicit mode wins; explicit roots imply allow_list;
+	// otherwise the default allow_all (open host).
+	mode := rootsMode
+	if mode == "" && len(roots) > 0 {
+		mode = domain.RootsModeAllowList
+	}
+	if mode == "" {
+		mode = domain.RootsModeAllowAll
+	}
 
 	var resp struct {
 		Host struct {
@@ -149,6 +161,7 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 		} `json:"host"`
 		Credential   string   `json:"credential"`
 		AllowedRoots []string `json:"allowedRoots"`
+		RootsMode    string   `json:"rootsMode"`
 	}
 	if err := apiPostJSON(server+"/api/v1/hosts/enroll", map[string]any{
 		"token":         token,
@@ -159,6 +172,7 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 		// Explicit --roots win over the token's roots (the browser
 		// default); the server responds with what it actually applied.
 		"allowedRoots": roots,
+		"rootsMode":    mode,
 	}, &resp); err != nil {
 		return fmt.Errorf("enroll: %w", err)
 	}
@@ -169,6 +183,10 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 	if len(savedRoots) == 0 {
 		savedRoots = roots
 	}
+	savedMode := resp.RootsMode
+	if savedMode == "" {
+		savedMode = mode
+	}
 
 	if err := mergeConfigFile(stateDir, map[string]any{
 		"serverUrl":    strings.TrimSuffix(server, "/"),
@@ -176,11 +194,13 @@ func doEnroll(server, token, name string, roots []string, stateDir string) error
 		"hostId":       resp.Host.ID,
 		"hostName":     name,
 		"allowedRoots": savedRoots,
+		"rootsMode":    savedMode,
 	}); err != nil {
 		return err
 	}
 	fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)
 	fmt.Printf("credential stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
+	fmt.Printf("roots mode: %s\n", savedMode)
 	if len(savedRoots) > 0 {
 		fmt.Printf("allowed roots: %v\n", savedRoots)
 	}

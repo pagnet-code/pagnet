@@ -6,6 +6,8 @@ package daemon
 import (
 	"path/filepath"
 	"testing"
+
+	"pagnet/internal/domain"
 )
 
 func TestSetAllowedRoots(t *testing.T) {
@@ -13,6 +15,9 @@ func TestSetAllowedRoots(t *testing.T) {
 	root := t.TempDir()
 	other := t.TempDir()
 
+	// Roots enforcement is the allow_list mode (allow_all, the default,
+	// allows any existing path regardless of roots).
+	d.SetRootsMode(domain.RootsModeAllowList)
 	d.SetAllowedRoots([]string{root})
 	if got := d.allowedRoots(); len(got) != 1 || got[0] != root {
 		t.Fatalf("allowedRoots() = %v, want [%s]", got, root)

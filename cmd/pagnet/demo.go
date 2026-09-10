@@ -45,6 +45,14 @@ func demoCmd() *cobra.Command {
 }
 
 func runDemo(c *cliCtx, network, webURL string) error {
+	// The demo seeds FAKE agents, and the fake runtime is registered only
+	// in debug mode. Enable debug in this process's environment so the
+	// demo is unambiguously a debug tool (and any daemon sharing this
+	// environment registers the fake runtime); the host daemon that
+	// executes the launches must be running with debug too (pagnetd
+	// --debug / PAGNET_DEBUG=1) for the fake agents to actually run.
+	_ = os.Setenv("PAGNET_DEBUG", "1")
+
 	// 1. Network (create if missing).
 	var nets []struct {
 		ID   string `json:"ID"`
@@ -144,7 +152,7 @@ func runDemo(c *cliCtx, network, webURL string) error {
 			}
 			if err := c.post("/api/v1/networks/"+netID+"/agents/"+defID+"/launch",
 				map[string]any{"hostId": hostID, "workspaceId": workspaceID, "runtime": "fake"}, &inst); err != nil {
-				return fmt.Errorf("launch %s: %w", a.name, err)
+				return fmt.Errorf("launch %s: %w (the fake runtime is debug-only — run the host daemon with --debug or PAGNET_DEBUG=1)", a.name, err)
 			}
 			instID = inst.ID
 			fmt.Printf("agent:     %-14s def=%s instance=%s\n", a.name, defID, instID)
@@ -210,6 +218,7 @@ func runDemo(c *cliCtx, network, webURL string) error {
 
 	fmt.Printf("\nDone. Open the web UI to watch the demo:\n  %s\n", webURL)
 	fmt.Println("The fake agents echo their turns; real qwen/claude agents drive full task state.")
+	fmt.Println("The fake runtime is debug-only: the host daemon must run with --debug or PAGNET_DEBUG=1.")
 	return nil
 }
 

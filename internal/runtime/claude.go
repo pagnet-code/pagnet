@@ -136,8 +136,20 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 
 	args := []string{"-p", "--verbose", "--output-format", "stream-json",
 		"--permission-mode", "bypassPermissions"}
-	if model := c.model(); model != "" {
-		args = append(args, "--model", model)
+	// Model precedence: the turn's resolved model (launch request >
+	// definition default) wins over the adapter's own (field, then env).
+	turnModel := spec.Model
+	if turnModel == "" {
+		turnModel = c.model()
+	}
+	if turnModel != "" {
+		args = append(args, "--model", turnModel)
+	}
+	// Standing instruction (AGENT.md): native extra system context. The
+	// file lives in the daemon state dir (never the workspace) and is
+	// re-applied every turn, so it persists across the session.
+	if spec.AgentMDPath != "" {
+		args = append(args, "--append-system-prompt-file", spec.AgentMDPath)
 	}
 	resuming := false
 	if spec.Resume {
@@ -368,8 +380,18 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		return nil, err
 	}
 	args := []string{"--permission-mode", "bypassPermissions"}
-	if model := c.model(); model != "" {
-		args = append(args, "--model", model)
+	// Model precedence: the turn's resolved model wins over the adapter's
+	// own (field, then env).
+	turnModel := spec.Model
+	if turnModel == "" {
+		turnModel = c.model()
+	}
+	if turnModel != "" {
+		args = append(args, "--model", turnModel)
+	}
+	// Standing instruction (AGENT.md): native extra system context.
+	if spec.AgentMDPath != "" {
+		args = append(args, "--append-system-prompt-file", spec.AgentMDPath)
 	}
 	if spec.Resume {
 		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, claudeSessionFile))
