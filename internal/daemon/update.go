@@ -258,6 +258,7 @@ func (d *Daemon) performAutoUpdate(latest string) {
 		if e := replaceFile(newBin, exe); e != nil {
 			d.Log.Warn("auto-update: installed binary not replaced (re-exec uses the staged copy)", "err", e)
 		}
+		d.installBridges(filepath.Dir(exe))
 	}
 	d.Log.Info("auto-updating to " + latest + " (idle)")
 	if err := syscall.Exec(newBin, os.Args, os.Environ()); err != nil {
@@ -292,12 +293,12 @@ func (d *Daemon) activeWorkCount() int {
 // downloadAndExtract fetches the host's release tarball from the
 // control plane's /download/ endpoint (the existing release-serving
 // handler, same pagnet-latest-<os>-<arch>.tar.gz convention as the
-// wget-install bootstrap) and extracts the pagnetd binary into the
-// staging dir; it returns the binary's path. The staging dir is removed
-// on failure; on success the update re-execs and never returns (the
+// wget-install bootstrap) and extracts the binaries the daemon depends on
+// into the staging dir; it returns the pagnetd path. The staging dir is
+// removed on failure; on success the update re-execs and never returns (the
 // next daemon start clears the leftover).
 func (d *Daemon) downloadAndExtract() (string, error) {
-	staging := filepath.Join(d.StateDir, "update-staging")
+	staging := d.updateStagingDir()
 	if err := os.RemoveAll(staging); err != nil {
 		return "", fmt.Errorf("clear staging dir: %w", err)
 	}
@@ -310,12 +311,45 @@ func (d *Daemon) downloadAndExtract() (string, error) {
 		cleanup()
 		return "", fmt.Errorf("download: %w", err)
 	}
-	newBin, err := extractPagnetd(tarPath, staging)
+	newBin, err := extractReleaseBinaries(tarPath, staging)
 	if err != nil {
 		cleanup()
 		return "", fmt.Errorf("extract: %w", err)
 	}
 	return newBin, nil
+}
+
+// updateStagingDir is where a release tarball is unpacked ahead of the
+// re-exec. It is deterministic because performAutoUpdate reads the bridges
+// back out of it to install them next to the real binary.
+func (d *Daemon) updateStagingDir() string {
+	return filepath.Join(d.StateDir, "update-staging")
+}
+
+// installBridges puts the MCP bridges from the staged release next to the
+// daemon's own binary, which is where resolveBridge looks when they are not
+// on PATH. Replacing only pagnetd would leave a self-updated worker handing
+// its agents a bridge it does not have — and a runtime treats a missing
+// stdio MCP server as optional, so the agent would simply come up without
+// its network tools. Best-effort like the pagnetd replace: a read-only
+// install dir must not fail the update. A member missing from an older
+// tarball is skipped rather than fatal.
+func (d *Daemon) installBridges(installDir string) {
+	if installDir == "" || installDir == d.updateStagingDir() {
+		return // already running from the staging copy
+	}
+	for _, name := range bridgeBinaries {
+		src := filepath.Join(d.updateStagingDir(), name)
+		if _, err := os.Stat(src); err != nil {
+			d.Log.Warn("auto-update: release tarball carries no "+name+
+				"; this worker needs install.sh re-run to get the bridge", "err", err)
+			continue
+		}
+		if err := replaceFile(src, filepath.Join(installDir, name)); err != nil {
+			d.Log.Warn("auto-update: "+name+" not updated (install.sh owns this dir)",
+				"dir", installDir, "err", err)
+		}
+	}
 }
 
 // downloadRelease fetches the host's release tarball over HTTPS with the
@@ -348,10 +382,12 @@ func (d *Daemon) downloadRelease(dst string) error {
 	return werr
 }
 
-// extractPagnetd unpacks the release tarball (a flat pagnet-*.tar.gz:
-// pagnet, pagnetd, [pagnet-fake-runtime]) into dir and returns the path
-// of the pagnetd binary inside it.
-func extractPagnetd(tarPath, dir string) (string, error) {
+// extractReleaseBinaries unpacks the wanted members of the release tarball
+// (a flat pagnet-*.tar.gz) into dir and returns the path of the pagnetd
+// binary inside it. A tarball built before the bridges shipped simply has
+// fewer members — only a missing pagnetd is fatal, so an old /download/
+// cannot break a worker's self-update.
+func extractReleaseBinaries(tarPath, dir string) (string, error) {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return "", err
@@ -372,10 +408,11 @@ func extractPagnetd(tarPath, dir string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("tar: %w", err)
 		}
-		if hdr.Typeflag != tar.TypeReg || filepath.Base(hdr.Name) != "pagnetd" {
+		base := filepath.Base(hdr.Name)
+		if hdr.Typeflag != tar.TypeReg || !releaseWanted(base) {
 			continue
 		}
-		dst := filepath.Join(dir, filepath.Base(hdr.Name))
+		dst := filepath.Join(dir, base)
 		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 		if err != nil {
 			return "", err
@@ -387,7 +424,7 @@ func extractPagnetd(tarPath, dir string) (string, error) {
 		if err := out.Close(); err != nil {
 			return "", err
 		}
-		if found == "" {
+		if base == "pagnetd" && found == "" {
 			found = dst
 		}
 	}
@@ -395,6 +432,28 @@ func extractPagnetd(tarPath, dir string) (string, error) {
 		return "", fmt.Errorf("pagnetd binary not found in tarball")
 	}
 	return found, nil
+}
+
+// bridgeBinaries are the binaries the daemon hands to every agent it starts:
+// the worker MCP surface and the representative control surface (§9 keeps
+// them in separate binaries). They are part of a release, not extras — a
+// worker that updates without them silently loses its agents' network tools.
+var bridgeBinaries = []string{"pagnet-mcp", "pagnet-control"}
+
+// releaseWanted reports whether a tarball member is one the daemon needs to
+// keep. pagnet and pagnet-fake-runtime are deliberately not wanted: the CLI
+// may be in use in the operator's shell and the fake runtime is --debug-only,
+// so a self-update must not swap either out from under them.
+func releaseWanted(name string) bool {
+	if name == "pagnetd" {
+		return true
+	}
+	for _, b := range bridgeBinaries {
+		if b == name {
+			return true
+		}
+	}
+	return false
 }
 
 // replaceFile copies src over dst atomically (write a sibling temp file,

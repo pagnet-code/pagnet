@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1550,7 +1551,7 @@ func (d *Daemon) mcpConfig(row *InstanceRow) string {
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
 			name: map[string]any{
-				"command": command,
+				"command": resolveBridge(command),
 				"args":    []string{"--socket", filepath.Join(d.StateDir, "pagnetd.sock")},
 				"env": map[string]string{
 					"PAGNET_INSTANCE_ID": row.InstanceID,
@@ -1561,6 +1562,32 @@ func (d *Daemon) mcpConfig(row *InstanceRow) string {
 	}
 	b, _ := json.Marshal(cfg)
 	return string(b)
+}
+
+// resolveBridge locates a bridge binary the way the runtime adapters locate
+// their CLI (see Qwen.binary): PATH first, then the directory holding this
+// daemon's own executable — which is where the release tarball unpacks the
+// bridges next to pagnetd, and where `make build` puts them in a checkout.
+// Handing the runtime a bare name instead makes the spawn a PATH lookup in
+// the daemon's environment (ChildEnv filters credentials only, so PATH is
+// inherited unchanged), and that environment is not guaranteed to contain
+// the install dir: install.sh only nags about it, macOS does not ship
+// ~/.local/bin on PATH, and a daemon started from a checkout has no pagnet
+// dir on PATH at all. When it misses, nothing spawns and the instance
+// silently comes up with no network tools — the bridge is a stdio server the
+// runtime is free to treat as optional. The bare name is returned only when
+// neither probe finds a binary, so the failure surfaces where it used to.
+func resolveBridge(name string) string {
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	if self, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(self), name)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return name
 }
 
 // runTurn executes one turn through the adapter, translating normalized

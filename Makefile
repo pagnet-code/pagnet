@@ -67,11 +67,18 @@ tidy:
 demo: build
 	$(BIN)/pagnet demo
 
-## release: cross-compile the worker binaries (pagnet, pagnetd,
-## pagnet-fake-runtime) into dist/ as pagnet-<version>-<os>-<arch>.tar.gz,
-## plus pagnet-latest-<os>-<arch>.tar.gz copies so `wget .../download/
-## pagnet-latest-linux-amd64.tar.gz` stays stable. Serve dist/ at the
-## server's /download/ (deploy compose mounts it; PAGNET_RELEASE_DIR).
+## release: cross-compile the worker binaries (pagnet, pagnetd, the MCP
+## bridges, pagnet-fake-runtime) into dist/ as
+## pagnet-<version>-<os>-<arch>.tar.gz, plus pagnet-latest-<os>-<arch>.tar.gz
+## copies so `wget .../download/ pagnet-latest-linux-amd64.tar.gz` stays
+## stable. Serve dist/ at the server's /download/ (deploy compose mounts it;
+## PAGNET_RELEASE_DIR).
+##
+## The bridges ship in every variant and are not optional: install.sh unpacks
+## the tarball into ~/.local/bin, and the daemon hands that directory's
+## pagnet-mcp / pagnet-control to every agent it starts as its MCP server. A
+## tarball without them yields workers whose agents silently have no network
+## tools at all — which is the entire point of a worker.
 ##
 ## release-prod: the production variant — tarballs WITHOUT
 ## pagnet-fake-runtime. The fake runtime is not hardcoded: a daemon
@@ -93,18 +100,21 @@ release:
 		if [ "$(RELEASE_PROD)" = "1" ]; then tag="-prod"; else tag=""; fi; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $$tmp/pagnetd ./cmd/pagnetd || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-mcp ./cmd/pagnet-mcp || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-control ./cmd/pagnet-control || rm -rf $$tmp; \
 		if [ "$(RELEASE_PROD)" != "1" ]; then \
 			GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w" -o $$tmp/pagnet-fake-runtime ./cmd/pagnet-fake-runtime || rm -rf $$tmp; \
-			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd pagnet-fake-runtime || rm -rf $$tmp; \
+			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd pagnet-mcp pagnet-control pagnet-fake-runtime || rm -rf $$tmp; \
 		else \
-			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd || rm -rf $$tmp; \
+			tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz pagnet pagnetd pagnet-mcp pagnet-control || rm -rf $$tmp; \
 		fi; \
 		cp $(RELEASE_DIR)/pagnet-$(VERSION)$$tag-$$os-$$arch.tar.gz $(RELEASE_DIR)/pagnet-latest-$$os-$$arch.tar.gz || rm -rf $$tmp; \
 		rm -rf $$tmp; \
 	done
 	@ls -1 $(RELEASE_DIR)/pagnet-*.tar.gz
 
-## release-prod: production tarballs (pagnet + pagnetd only, no fake runtime)
+## release-prod: production tarballs (pagnet, pagnetd and the bridges; no
+## fake runtime)
 release-prod:
 	$(MAKE) release RELEASE_PROD=1
 
