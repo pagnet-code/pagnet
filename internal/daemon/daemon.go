@@ -1827,6 +1827,12 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayload) error {
 	last := d.removeAttach(p.InstanceID, p.SessionID)
 	if !last {
+		// Other clients still hold this instance's shared PTY: restore one
+		// of their geometries — the shared size would otherwise stick
+		// with the client that just left.
+		if d.terminal.active(p.InstanceID) {
+			d.terminal.reapplySize(p.InstanceID, p.SessionID)
+		}
 		return nil
 	}
 	if d.terminal.active(p.InstanceID) {

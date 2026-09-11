@@ -78,11 +78,24 @@ type terminalLiveMsg struct {
 	rows     uint16
 }
 
+// lastSize is one attached client's most recent requested geometry,
+// remembered per (instance, attach session) so the shared PTY's size can
+// be restored to a SURVIVING client when the last resizer detaches
+// (otherwise the size silently sticks with the detaching client's window
+// and the remaining clients' TUI reflows to a size they never asked for).
+type lastSize struct {
+	cols uint16
+	rows uint16
+	at   time.Time
+}
+
 type terminalManager struct {
 	d *Daemon
 
 	mu       sync.Mutex
 	sessions map[string]*ptySession // instanceID -> live session
+	// lastSize: instanceID -> attachSessionID -> latest resize.
+	lastSize map[string]map[string]lastSize
 
 	// Single ordered worker: keystroke order across ALL instances is
 	// preserved (it only matters per instance, but one FIFO is the
@@ -96,6 +109,7 @@ func newTerminalManager(d *Daemon) *terminalManager {
 	tm := &terminalManager{
 		d:        d,
 		sessions: map[string]*ptySession{},
+		lastSize: map[string]map[string]lastSize{},
 		liveCh:   make(chan terminalLiveMsg, 1024),
 	}
 	go tm.liveLoop()
@@ -111,6 +125,7 @@ func (tm *terminalManager) liveLoop() {
 		if m.isResize {
 			if m.cols > 0 && m.rows > 0 {
 				_ = pty.Setsize(s.f, &pty.Winsize{Rows: m.rows, Cols: m.cols})
+				tm.recordSize(m.instance, m.session, m.cols, m.rows)
 			}
 			continue
 		}
@@ -142,6 +157,46 @@ func (tm *terminalManager) get(instanceID string) *ptySession {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	return tm.sessions[instanceID]
+}
+
+// recordSize remembers the attach session's latest requested geometry
+// (see reapplySize).
+func (tm *terminalManager) recordSize(instanceID, sessionID string, cols, rows uint16) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.lastSize[instanceID] == nil {
+		tm.lastSize[instanceID] = map[string]lastSize{}
+	}
+	tm.lastSize[instanceID][sessionID] = lastSize{cols: cols, rows: rows, at: time.Now()}
+}
+
+// reapplySize restores the shared PTY's geometry to a still-attached
+// client after the last resizer detached. The most recently resized
+// surviving session wins; the detacher's record is dropped. When no
+// survivor has a recorded size, the PTY keeps its size — every client
+// sends its own fit-resize shortly after (re)attach.
+func (tm *terminalManager) reapplySize(instanceID, excludeSession string) {
+	tm.mu.Lock()
+	s := tm.sessions[instanceID]
+	var bestSz lastSize
+	found := false
+	for sess, sz := range tm.lastSize[instanceID] {
+		if sess == excludeSession {
+			continue
+		}
+		if !found || sz.at.After(bestSz.at) {
+			bestSz = sz
+			found = true
+		}
+	}
+	delete(tm.lastSize[instanceID], excludeSession)
+	tm.mu.Unlock()
+	if !found || s == nil || s.f == nil {
+		return
+	}
+	_ = pty.Setsize(s.f, &pty.Winsize{Rows: bestSz.rows, Cols: bestSz.cols})
+	tm.d.Log.Info("pty size re-applied from surviving attach",
+		"instance", instanceID, "cols", bestSz.cols, "rows", bestSz.rows)
 }
 
 // active reports whether the instance has a live PTY (§35 keep-awake:
@@ -263,6 +318,7 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 	killed := false
 	if tm.sessions[s.instanceID] == s {
 		delete(tm.sessions, s.instanceID)
+		delete(tm.lastSize, s.instanceID)
 		killed = s.killed
 	}
 	tm.mu.Unlock()
@@ -299,6 +355,7 @@ func (tm *terminalManager) stop(instanceID string) {
 	if s != nil {
 		s.killed = true
 		delete(tm.sessions, instanceID)
+		delete(tm.lastSize, instanceID)
 	}
 	tm.mu.Unlock()
 	if s == nil || s.cmd.Process == nil {
