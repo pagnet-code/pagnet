@@ -32,6 +32,7 @@ deploy/.env
 
 # Agent session state + agent instruction files (never pushed)
 .qwen/
+.qwen-session
 .claude/
 .pagnet/
 AGENTS.md

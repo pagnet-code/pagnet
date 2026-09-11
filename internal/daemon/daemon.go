@@ -91,6 +91,13 @@ type Daemon struct {
 	state    *State
 	adapters map[domain.RuntimeName]agentruntime.Adapter
 
+	// bootID is this process's runner identity (Phase 3 Host→Runner model):
+	// minted once at startup and carried in every WSS connect so the control
+	// plane registers the daemon as a runner under the host, keyed by
+	// (host_id, boot_id). A reconnect of the same process reuses its runner;
+	// a new process (new boot id) is a distinct, coexisting runner.
+	bootID string
+
 	// unenrolled is set by the read loop on host.unenrolled (or by Run on
 	// an auth-rejected dial) so Run exits instead of reconnecting.
 	unenrolled bool
@@ -255,6 +262,7 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		Log:         log,
 		state:       st,
 		adapters:    adapters,
+		bootID:      domain.NewID().String(),
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
 		pending:     map[string]chan transport.AgentResponsePayload{},
@@ -443,6 +451,11 @@ func (d *Daemon) wsURL() string {
 		u.Scheme = "ws"
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/api/v1/hosts/ws"
+	// Runner boot identity (Phase 3): the control plane registers this
+	// daemon process as a runner under the host, keyed by (host_id, boot_id).
+	q := u.Query()
+	q.Set("boot_id", d.bootID)
+	u.RawQuery = q.Encode()
 	return u.String()
 }
 
