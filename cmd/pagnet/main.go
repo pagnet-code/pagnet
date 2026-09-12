@@ -107,6 +107,8 @@ func main() {
 		openCmd(),
 		initCmd(),
 		doctorCmd(),
+		// internal (hidden): daemon-spawned MCP bridge entrypoints
+		mcpCmd(),
 	)
 
 	if err := root.Execute(); err != nil {
