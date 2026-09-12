@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 // --- listDirs (the click-to-select directory picker) -----------------------

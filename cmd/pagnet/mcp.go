@@ -17,7 +17,7 @@ package main
 import (
 	"github.com/spf13/cobra"
 
-	"pagnet/internal/agentbridge"
+	"github.com/pagnet-code/pagnet/internal/agentbridge"
 )
 
 // mcpCmd is the hidden `pagnet mcp` parent (internal entrypoints).

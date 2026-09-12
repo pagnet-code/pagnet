@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 type cliCtx struct {

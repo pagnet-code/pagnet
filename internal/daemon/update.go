@@ -27,8 +27,8 @@ import (
 	"syscall"
 	"time"
 
-	"pagnet/internal/release"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/release"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 const (

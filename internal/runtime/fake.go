@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/domain"
 )
 
 // Fake is the MVP runtime adapter. It is a REAL process-per-turn runtime:

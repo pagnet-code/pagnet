@@ -23,7 +23,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"pagnet/internal/release"
+	"github.com/pagnet-code/pagnet/internal/release"
 )
 
 func updateCmd() *cobra.Command {

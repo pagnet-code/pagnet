@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 // The agent bridge socket. A managed agent never holds the host

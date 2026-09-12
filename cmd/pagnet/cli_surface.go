@@ -21,7 +21,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
-	"pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 // --- §55 list verbs: agents / hosts / networks / tasks ----------------------

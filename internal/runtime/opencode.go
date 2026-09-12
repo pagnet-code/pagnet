@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/domain"
 )
 
 // OpenCode drives the opencode CLI (`opencode`) as a process-per-turn

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/runtime"
 )
 
 // ErrMissingDSN is returned when no DATABASE_URL is configured.

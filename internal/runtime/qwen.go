@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/domain"
 )
 
 // Qwen drives the qwen-code CLI (`qwen`) as a process-per-turn runtime

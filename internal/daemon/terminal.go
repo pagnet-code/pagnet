@@ -33,8 +33,8 @@ import (
 
 	"github.com/creack/pty"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 const (

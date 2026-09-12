@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/domain"
 )
 
 // Claude drives the Claude Code CLI (`claude`) as a process-per-turn

@@ -9,7 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 func networkCmd() *cobra.Command {

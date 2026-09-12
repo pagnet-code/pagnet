@@ -19,8 +19,8 @@ import (
 	"regexp"
 	"strings"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 func gitOut(dir string, args ...string) (string, error) {

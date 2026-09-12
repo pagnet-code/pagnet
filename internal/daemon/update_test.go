@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/release"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/release"
 )
 
 // shouldUpdate is the pure version-comparison gate for worker

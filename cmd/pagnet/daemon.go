@@ -27,8 +27,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"pagnet/internal/config"
-	"pagnet/internal/daemon"
+	"github.com/pagnet-code/pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/daemon"
 )
 
 // The daemon flag values. The same flag set is registered on the ROOT

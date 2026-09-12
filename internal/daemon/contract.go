@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 // writeContract (re)renders the pagnet coordination contract (§16:

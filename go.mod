@@ -1,4 +1,4 @@
-module pagnet
+module github.com/pagnet-code/pagnet
 
 go 1.27.1
 

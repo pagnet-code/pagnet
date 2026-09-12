@@ -17,7 +17,7 @@ import (
 	"runtime"
 	"testing"
 
-	"pagnet/internal/release"
+	"github.com/pagnet-code/pagnet/internal/release"
 )
 
 // writeUpdateTarball builds a flat pagnet-*.tar.gz with the given member

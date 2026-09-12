@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"pagnet/internal/domain"
-	"pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/transport"
 )
 
 // SEC-407: the instance id becomes path components under the daemon state

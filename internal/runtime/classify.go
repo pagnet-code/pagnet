@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/internal/domain"
 )
 
 // Provider error classification (addendum Phase I: "rate limits are
