@@ -40,7 +40,7 @@ var ErrUnenrolled = errors.New("host unenrolled from the control plane — the c
 // identity (the control plane closes the older connection with
 // transport.CloseCodeSuperseded). Another daemon process now owns the
 // host — reconnecting would only fight it forever, so the daemon stops.
-var ErrSuperseded = errors.New("superseded by a newer daemon connection — another pagnetd now owns this host; stop this one")
+var ErrSuperseded = errors.New("superseded by a newer daemon connection — another daemon now owns this host; stop this one")
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
@@ -83,7 +83,7 @@ type Config struct {
 	AutoUpdate bool
 }
 
-// Daemon is a running pagnetd instance.
+// Daemon is a running host-daemon instance.
 type Daemon struct {
 	Config
 	Log *slog.Logger
@@ -425,7 +425,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// reconnecting would only fight that daemon forever.
 			d.Log.Error("stopping: superseded by a newer daemon", "err", ErrSuperseded)
 			fmt.Fprintln(os.Stderr,
-				"pagnet: a newer pagnetd took over this host — this daemon is stopping")
+				"pagnet: a newer daemon took over this host — this daemon is stopping")
 			return ErrSuperseded
 		}
 		if ctx.Err() != nil {
@@ -560,7 +560,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			if errors.As(err, &closeErr) && closeErr.Code == transport.CloseCodeSuperseded {
 				// The control plane closed this connection because a
 				// NEWER daemon connection took over the host identity
-				// (a second pagnetd was started). Stop: reconnecting
+				// (a second daemon was started). Stop: reconnecting
 				// would only fight the other daemon forever.
 				d.superseded = true
 				return ErrSuperseded

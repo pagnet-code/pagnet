@@ -273,7 +273,7 @@ func TestClaude_ModelAndMCPArgs(t *testing.T) {
 	out := `{"type":"system","subtype":"init","session_id":"` + sid + `"}
 {"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"` + sid + `"}
 `
-	const mcp = `{"mcpServers":{"pagnet":{"command":"pagnet-mcp","args":["serve","--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1"}}}}`
+	const mcp = `{"mcpServers":{"pagnet":{"command":"/usr/local/bin/pagnet","args":["mcp","worker","--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1"}}}}`
 	spec := claudeSpec(t.TempDir())
 	spec.Env = []string{"PAGNET_MCP_CONFIG=" + mcp}
 	evs, argv := runClaudeStub(t, spec, out, map[string]string{"PAGNET_CLAUDE_MODEL": "claude-sonnet-5"})

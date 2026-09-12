@@ -49,8 +49,9 @@ func runDemo(c *cliCtx, network, webURL string) error {
 	// in debug mode. Enable debug in this process's environment so the
 	// demo is unambiguously a debug tool (and any daemon sharing this
 	// environment registers the fake runtime); the host daemon that
-	// executes the launches must be running with debug too (pagnetd
-	// --debug / PAGNET_DEBUG=1) for the fake agents to actually run.
+	// executes the launches must be running with debug too (pagnet
+	// daemon --debug / PAGNET_DEBUG=1) for the fake agents to actually
+	// run.
 	_ = os.Setenv("PAGNET_DEBUG", "1")
 
 	// 1. Network (create if missing).
@@ -102,7 +103,7 @@ func runDemo(c *cliCtx, network, webURL string) error {
 		break
 	}
 	if hostID == "" {
-		return fmt.Errorf("no online host with a registered workspace — start `pagnetd` (with a git repository under an allowed root) and re-run")
+		return fmt.Errorf("no online host with a registered workspace — start `pagnet -d` (with a git repository under an allowed root) and re-run")
 	}
 	fmt.Printf("host:      %s (%s)\n", hostName, hostID)
 	fmt.Printf("workspace: %s\n", workspaceID)

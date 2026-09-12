@@ -573,7 +573,7 @@ func doctorCmd() *cobra.Command {
 					}
 					check("daemon running", true, detail)
 				} else {
-					check("daemon running", false, "host is "+d.Status+" — start `pagnetd`")
+					check("daemon running", false, "host is "+d.Status+" — start `pagnet -d`")
 				}
 			} else {
 				check("daemon running", false, "no host id in config")

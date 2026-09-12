@@ -108,7 +108,7 @@ func runCmd() *cobra.Command {
 				return err
 			}
 			if td.Status != "online" {
-				return fmt.Errorf("host %s is %s — start `pagnetd` there first", td.Name, td.Status)
+				return fmt.Errorf("host %s is %s — start `pagnet -d` there first", td.Name, td.Status)
 			}
 
 			// 5. Pick the workspace on the target host.

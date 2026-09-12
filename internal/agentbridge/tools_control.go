@@ -1,6 +1,7 @@
 // The fixed control_* tools (spec §8–9) — the representative's control
-// surface. Shared by the pagnet-control binary and `pagnet mcp control`
-// (packaging migration): one registration, two entrypoints.
+// surface, registered by `pagnet mcp control` (the daemon's own
+// executable, spawned as <self> mcp control): one registration, one
+// entrypoint.
 //
 // The tool names are FIXED protocol names; they must never drift:
 // control_whoami, control_list_networks, control_use_network,

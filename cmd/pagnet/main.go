@@ -154,7 +154,7 @@ func enrollCmd() *cobra.Command {
 			if err := doEnroll(serverURL, token, name, roots, rootsMode, stateDir); err != nil {
 				return err
 			}
-			fmt.Println("run `pagnetd` to connect this host")
+			fmt.Println("run `pagnet -d` to connect this host")
 			return nil
 		},
 	}

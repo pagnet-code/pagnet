@@ -7,12 +7,10 @@
 // launches (PAGNET_MCP_CONFIG), so the parent command is hidden from
 // the top-level help. The tool names are fixed protocol names — see
 // internal/agentbridge (tools_worker.go / tools_control.go). The run
-// body is the shared agentbridge.RunBridge — the same implementation
-// pagnetd's hidden mcp subcommands route to (step 5: the daemon spawns
-// the bridges as <self> mcp worker|control, so every binary that can
-// run the daemon must be able to run the bridge). The old
-// pagnet-mcp / pagnet-control binaries keep building and behave
-// identically until a later migration step removes them.
+// body is the shared agentbridge.RunBridge. The daemon spawns the
+// bridges as <self> mcp worker|control (step 5), so the unified binary
+// is the only bridge implementation (the separate bridge binaries are
+// gone).
 
 package main
 

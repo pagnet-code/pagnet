@@ -411,7 +411,7 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		}
 	}
 	// Same MCP bridge injection as a turn: the interactive CLI gets its
-	// network tools from the daemon's pagnet-mcp bridge.
+	// network tools from the daemon's MCP bridge.
 	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
 		var cfg struct {
 			MCPServers map[string]any `json:"mcpServers"`

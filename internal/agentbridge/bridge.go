@@ -1,9 +1,9 @@
 // Package agentbridge is the client half of the daemon's Unix-socket agent
-// bridge (PROTOCOL §6, §8–9). Both MCP binaries — pagnet-mcp (worker,
-// network_* tools) and pagnet-control (representative, control_* tools) —
-// authenticate to the local daemon with their instance identity and relay
-// fixed tool calls; the daemon validates the identity against the
-// instances it launched and forwards them to the control plane.
+// bridge (PROTOCOL §6, §8–9). Both MCP surfaces — the worker bridge
+// (network_* tools) and the control bridge (representative, control_*
+// tools) — authenticate to the local daemon with their instance identity
+// and relay fixed tool calls; the daemon validates the identity against
+// the instances it launched and forwards them to the control plane.
 package agentbridge
 
 import (

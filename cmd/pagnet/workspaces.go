@@ -64,7 +64,7 @@ func workspacesCmd() *cobra.Command {
 				}
 			}
 			if len(rows) == 0 {
-				fmt.Println("no matching workspaces (hosts report workspaces after a scan; run `pagnetd`)")
+				fmt.Println("no matching workspaces (hosts report workspaces after a scan; run `pagnet -d`)")
 				return nil
 			}
 			printTable([]string{"HOST", "RESOURCE", "WORKSPACE", "BRANCH", "HOST STATUS"}, rows)

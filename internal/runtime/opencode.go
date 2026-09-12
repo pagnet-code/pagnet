@@ -42,7 +42,7 @@ import (
 // materialized as an opencode config in the instance's SessionDir (managed
 // state, NEVER the workspace) and pointed at with OPENCODE_CONFIG: opencode
 // has no inline --mcp-config flag — its MCP servers come from config, so the
-// daemon's pagnet-mcp bridge is written as a local stdio server there.
+// daemon's MCP bridge is written as a local stdio server there.
 //
 // Model selection: OpenCode.Model (explicit) or the PAGNET_OPENCODE_MODEL
 // environment; when empty the user's own default model applies. The model
@@ -331,7 +331,7 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		}
 	}
 	// Same MCP bridge injection as a turn: the interactive TUI gets its
-	// network tools from the daemon's pagnet-mcp bridge via the config.
+	// network tools from the daemon's MCP bridge via the config.
 	extraEnv := append([]string{}, o.Env...)
 	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
 		cfgPath, err := writeOpenCodeMCPConfig(spec.SessionDir, mcpJSON)
@@ -350,7 +350,7 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 // ({"mcpServers": {...}}) as an opencode config in the instance's SessionDir
 // (managed state, never the workspace) and returns the config path. opencode
 // has no inline --mcp-config flag — its MCP servers come from config — so the
-// daemon's pagnet-mcp bridge is written as a local stdio server
+// daemon's MCP bridge is written as a local stdio server
 // ({"mcp": {name: {type:"local", command:[...], environment:{...}}}}) and
 // pointed at with OPENCODE_CONFIG.
 func writeOpenCodeMCPConfig(sessionDir, mcpJSON string) (string, error) {

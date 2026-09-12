@@ -1,9 +1,8 @@
 // The shared MCP bridge body (packaging migration step 5). The daemon
-// spawns its bridges as <self> mcp worker|control, so EVERY binary that
-// can run the daemon (pagnet, and pagnetd until the unified binary
-// replaces it) must be able to run the bridge too. The entrypoints live
-// in the cmd/ packages; this is the one shared run/dial implementation
-// they all route to.
+// spawns its bridges as <self> mcp worker|control, so the unified binary
+// (the only daemon entrypoint) must be able to run the bridge too. The
+// entrypoints live in the cmd/ packages; this is the one shared
+// run/dial implementation they route to.
 
 package agentbridge
 

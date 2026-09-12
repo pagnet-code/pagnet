@@ -1,16 +1,16 @@
 // The unified daemon entrypoint (packaging migration, step 2):
 //
 //	pagnet daemon — the host daemon in the FOREGROUND (containers,
-//	                supervisors; the pagnetd flag set, same behavior)
+//	                supervisors)
 //	pagnet -d     — the same daemon DETACHED from the terminal: re-exec
 //	                of `pagnet daemon`, stdio appended to
 //	                <state-dir>/pagnetd.log, prints the pid and exits
 //
 // The daemon itself is the shared internal/daemon implementation — the
 // same code path `pagnet worker` runs, with the machine-wide state dir
-// (~/.pagnet by default) instead of a per-directory one. The old
-// `pagnetd` binary keeps building and behaves identically until the
-// migration's later steps remove it.
+// (~/.pagnet by default) instead of a per-directory one. The unified
+// binary is the only daemon entrypoint (the separate daemon binary is
+// gone; pre-unified installs migrate via install.sh / `pagnet update`).
 
 package main
 
@@ -56,7 +56,7 @@ func daemonCmd() *cobra.Command {
 	return cmd
 }
 
-// registerDaemonFlags binds the pagnetd flag set to cmd.
+// registerDaemonFlags binds the daemon flag set to cmd.
 func registerDaemonFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&daemonStateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")
 	cmd.Flags().StringVar(&daemonLogLevel, "log-level", envOrDefault("PAGNET_LOG_LEVEL", "info"),
@@ -75,8 +75,8 @@ func registerDaemonFlags(cmd *cobra.Command) {
 		"disable worker self-update (default on; also PAGNET_AUTO_UPDATE=0 or state-file autoUpdate: false)")
 }
 
-// runDaemon is the `pagnet daemon` foreground body — the same init path
-// as pagnetd: state-dir config, daemon.New, signals, Run.
+// runDaemon is the `pagnet daemon` foreground body: state-dir config,
+// daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
 	var level slog.Level
 	switch daemonLogLevel {

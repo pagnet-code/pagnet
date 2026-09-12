@@ -1,4 +1,4 @@
-// Package daemon implements pagnetd: the outbound host daemon. It keeps a
+// Package daemon implements the outbound host daemon. It keeps a
 // single WSS to the control plane (one per host, all agents multiplexed),
 // reports heartbeats and inventory, executes structured commands
 // idempotently (SQLite-remembered CommandIDs), and runs runtime adapters.

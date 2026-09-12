@@ -1,6 +1,7 @@
 // The fixed network_* tools (PROTOCOL §6) — the worker agent's network
-// surface. Shared by the pagnet-mcp binary and `pagnet mcp worker`
-// (packaging migration): one registration, two entrypoints.
+// surface, registered by `pagnet mcp worker` (the daemon's own
+// executable, spawned as <self> mcp worker): one registration, one
+// entrypoint.
 //
 // The tool names are FIXED protocol names; they must never drift:
 // network_whoami, network_discover, network_ask, network_delegate,

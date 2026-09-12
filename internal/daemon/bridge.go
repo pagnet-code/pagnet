@@ -14,8 +14,9 @@ import (
 )
 
 // The agent bridge socket. A managed agent never holds the host
-// credential: it talks to the network only through the pagnet-mcp
-// process, which connects to THIS socket and authenticates with the
+// credential: it talks to the network only through the MCP bridge
+// process (the daemon's own executable, spawned as <self> mcp worker),
+// which connects to THIS socket and authenticates with the
 // instance identity the daemon injected into its environment
 // (PAGNET_INSTANCE_ID / PAGNET_NETWORK_ID). The daemon validates that
 // identity against the instances IT launched, then relays the tool call
@@ -47,12 +48,12 @@ func (d *Daemon) startBridgeSocket() error {
 	// with no listener fails, so only a live daemon answers the probe.
 	if probe, perr := net.Dial("unix", sockPath); perr == nil {
 		_ = probe.SetDeadline(time.Now().Add(2 * time.Second))
-		_, _ = probe.Write([]byte(`{"type":"auth","instanceId":"pagnetd-probe","networkId":""}` + "\n"))
+		_, _ = probe.Write([]byte(`{"type":"auth","instanceId":"pagnet-probe","networkId":""}` + "\n"))
 		buf := make([]byte, 1)
 		_, rerr := probe.Read(buf)
 		_ = probe.Close()
 		if rerr == nil {
-			return fmt.Errorf("another pagnetd is already running (bridge socket %s is live); stop it first", sockPath)
+			return fmt.Errorf("another daemon is already running (bridge socket %s is live); stop it first", sockPath)
 		}
 	}
 	_ = os.Remove(sockPath)

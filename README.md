@@ -23,7 +23,7 @@ pagnet is a control plane and communication network for AI coding agents. It let
            |            |             |
            v            v             v
         Host A         Host B        Host C
-       pagnetd      pagnetd     pagnetd
+        pagnet        pagnet       pagnet
            |            |             |
        local agents local agents   local agents
 ```
@@ -77,7 +77,7 @@ TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
 pagnet enroll --server http://localhost:18080 --token "$TOKEN"
 
 # start the host daemon (outbound WSS; keep it running)
-pagnetd
+pagnet daemon          # foreground — or: pagnet -d (detached, logs to ~/.pagnet/pagnetd.log)
 ```
 
 **4. Launch an agent** in a Git repository:
@@ -118,10 +118,9 @@ Representatives keep the text proxy (input → turn → turn output).
 
 | Path | What |
 |------|------|
-| `cmd/pagnet` | CLI (login, enroll, run, agents, tasks, attach, ...) |
-| `cmd/pagnetd` | Per-machine host daemon |
+| `cmd/pagnet` | The one production binary: CLI (login, enroll, run, agents, tasks, attach, ...), host daemon (`pagnet daemon` / `pagnet -d`), and the MCP bridges (`pagnet mcp worker\|control`, spawned by the daemon) |
 | `cmd/pagnet-server` | Central control plane (Go) |
-| `cmd/pagnet-mcp` | Local stdio MCP bridge for runtimes |
+| `cmd/pagnet-fake-runtime` | Deterministic fake runtime (test/dev infrastructure, not shipped) |
 | `internal/` | Go packages (domain, store, controlplane, daemon, runtimes, ...) |
 | `migrations/` | PostgreSQL migrations (goose) |
 | `web/` | Next.js control panel (App Router, TypeScript) |
