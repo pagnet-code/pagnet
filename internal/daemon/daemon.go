@@ -1647,6 +1647,14 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	var failedKind, failedErr string
 	var failedRetry *string
 	var sessionLost, completed bool
+	// Phase 5: native-interaction observation. pendingInteraction tracks a
+	// started-but-unresolved interaction; interactionDeferrable is the
+	// adapter's capability for its kind (decides hibernate vs stay-waiting
+	// at turn end). interactionIDs maps the runtime-native id to the
+	// pagnet-side id the daemon mints (correlates started/resolved).
+	pendingInteraction := false
+	interactionDeferrable := false
+	interactionIDs := map[string]string{}
 
 	for ev := range events {
 		switch ev.Type {
@@ -1671,6 +1679,21 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			failedKind = string(ev.FailureKind)
 			failedErr = ev.Error
 			failedRetry = ev.RetryAt
+		case agentruntime.EventInteractionStarted:
+			if ev.Interaction != nil {
+				pendingInteraction = true
+				if obs, ok := ad.(agentruntime.InteractionObserver); ok {
+					interactionDeferrable = obs.SupportsDeferredInteraction(ev.Interaction.Kind)
+				}
+				d.sendInteraction(conn, transport.MsgInteractionStarted,
+					spec, sessionID, row.Runtime, ev.Interaction, interactionIDs)
+			}
+		case agentruntime.EventInteractionResolved:
+			if ev.Interaction != nil {
+				pendingInteraction = false
+				d.sendInteraction(conn, transport.MsgInteractionResolved,
+					spec, sessionID, row.Runtime, ev.Interaction, interactionIDs)
+			}
 		}
 	}
 	turnErr := <-turnDone
@@ -1767,7 +1790,24 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 				"instance", spec.InstanceID, "duration", time.Since(started).Round(time.Second))
 			return nil
 		}
-		// Completed: hibernate with the session preserved.
+		// Phase 5: a NON-deferrable interaction is still pending. The
+		// runtime cannot safely exit with it outstanding, so the instance
+		// keeps its waiting status (the control plane set it to 'blocked'
+		// on interaction.started) instead of hibernating. No polling / no
+		// token burn: the instance simply waits until a human answers in
+		// the native TUI (attach) and the resolution clears it.
+		if pendingInteraction && !interactionDeferrable {
+			_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", sessionID)
+			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+				"instanceId": spec.InstanceID, "status": "blocked",
+			})
+			d.Log.Info("turn completed; non-deferrable interaction pending — instance stays waiting",
+				"instance", spec.InstanceID, "duration", time.Since(started).Round(time.Second))
+			return nil
+		}
+		// Completed: hibernate with the session preserved. (A deferrable
+		// pending interaction is safe to hibernate under — the interaction
+		// is durable and the instance wakes on the next work/resolve.)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
@@ -1994,6 +2034,42 @@ func (d *Daemon) sendTurn(conn *websocket.Conn, msgType string, spec agentruntim
 		}
 	}
 	_ = d.send(conn, msgType, payload)
+}
+
+// sendInteraction emits a normalized native-interaction observation
+// (interaction.started / interaction.resolved) to the control plane. The
+// pagnet-side interaction id is minted here and cached per runtime-native
+// id (interactionIDs), so the later resolution reuses the same id — the
+// control plane's CreateInteraction is idempotent on it. The vendor payload
+// is passed through opaque (never parsed).
+func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agentruntime.TurnSpec,
+	sessionID, runtime string, ie *agentruntime.InteractionEvent, ids map[string]string) {
+	key := ie.NativeInteractionID
+	if key == "" {
+		// The runtime did not name the interaction: a stable per-turn key
+		// still correlates the started/resolved pair.
+		key = "\x00unnamed"
+	}
+	id, ok := ids[key]
+	if !ok {
+		id = domain.NewID().String()
+		ids[key] = id
+	}
+	corr := ie.NativeInteractionID
+	_ = d.send(conn, msgType, transport.InteractionEventPayload{
+		InteractionID:       id,
+		InstanceID:          spec.InstanceID,
+		SessionID:           sessionID,
+		Runtime:             runtime,
+		NativeInteractionID: ie.NativeInteractionID,
+		Kind:                ie.Kind,
+		Summary:             ie.Summary,
+		NativePayload:       ie.NativePayload,
+		CorrelationID:       corr,
+		Resolved:            ie.Resolved,
+		Decision:            ie.Decision,
+		Answer:              ie.Answer,
+	})
 }
 
 // --- small platform helpers ---------------------------------------------------

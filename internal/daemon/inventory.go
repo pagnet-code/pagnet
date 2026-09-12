@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"pagnet/internal/domain"
+	agentruntime "pagnet/internal/runtime"
 	"pagnet/internal/transport"
 )
 
@@ -51,15 +52,54 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 	out := make([]transport.RuntimeInstallation, 0, len(d.adapters))
 	for name, a := range d.adapters {
 		if p, ok := a.BinaryPath(); ok {
-			out = append(out, transport.RuntimeInstallation{
+			ri := transport.RuntimeInstallation{
 				Runtime: string(name),
 				Path:    p,
 				Version: runtimeVersion(p),
-			})
+			}
+			// Phase 5: report the adapter's OBSERVED native-interaction
+			// capability flags (the persisted compatibility matrix, plan
+			// §8.6). A non-implementer reports no capabilities (the
+			// conservative "cannot observe" default).
+			if obs, ok := a.(agentruntime.InteractionObserver); ok {
+				ri.Capabilities = &transport.RuntimeCapabilities{
+					ObserveInteractions: obs.ObserveInteractions(),
+					NativeInteractiveUI: obs.NativeInteractiveUI(),
+					DeferredInteraction: deferMap(obs),
+					RemoteResolve:       remoteResolveMap(obs),
+				}
+			}
+			out = append(out, ri)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Runtime < out[j].Runtime })
 	return out
+}
+
+// interactionKinds is the set of kinds the capability maps are probed for
+// (the adapter decides per kind; an absent kind is "not supported").
+var interactionKinds = []string{
+	"question", "permission", "plan_approval", "authentication", "confirmation", "other",
+}
+
+func deferMap(obs agentruntime.InteractionObserver) map[string]bool {
+	m := map[string]bool{}
+	for _, k := range interactionKinds {
+		if obs.SupportsDeferredInteraction(k) {
+			m[k] = true
+		}
+	}
+	return m
+}
+
+func remoteResolveMap(obs agentruntime.InteractionObserver) map[string]bool {
+	m := map[string]bool{}
+	for _, k := range interactionKinds {
+		if obs.SupportsRemoteResolve(k) {
+			m[k] = true
+		}
+	}
+	return m
 }
 
 func runtimeVersion(path string) string {
