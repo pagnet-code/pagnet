@@ -36,7 +36,9 @@ type TenantMembership struct {
 }
 
 func (m TenantMembership) IsOwner() bool { return m.Role == MembershipRoleOwner }
-func (m TenantMembership) IsAdmin() bool { return m.Role == MembershipRoleOwner || m.Role == MembershipRoleAdmin }
+func (m TenantMembership) IsAdmin() bool {
+	return m.Role == MembershipRoleOwner || m.Role == MembershipRoleAdmin
+}
 
 // Session is a live browser session. The cookie carries an opaque token;
 // only its SHA-256 hash is stored, so a database leak never yields a

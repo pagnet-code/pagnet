@@ -69,10 +69,10 @@ func (q *Qwen) Name() domain.RuntimeName { return domain.RuntimeQwenCode }
 // have a native interactive TUI (the PTY attach path). Wiring real
 // observation (a documented hook / plugin event) is a follow-up — the flags
 // must flip only when a tested integration exists, never by assumption.
-func (q *Qwen) ObserveInteractions() bool            { return false }
-func (q *Qwen) NativeInteractiveUI() bool            { return true }
+func (q *Qwen) ObserveInteractions() bool               { return false }
+func (q *Qwen) NativeInteractiveUI() bool               { return true }
 func (q *Qwen) SupportsDeferredInteraction(string) bool { return false }
-func (q *Qwen) SupportsRemoteResolve(string) bool     { return false }
+func (q *Qwen) SupportsRemoteResolve(string) bool       { return false }
 
 func (q *Qwen) Available() bool {
 	_, err := q.binary()

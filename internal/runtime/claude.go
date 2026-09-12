@@ -70,10 +70,10 @@ func (c *Claude) Name() domain.RuntimeName { return domain.RuntimeClaudeCode }
 // remote-resolve native interactions. The runtime DOES have a native
 // interactive TUI (the PTY attach path). Wiring real observation is a
 // follow-up — the flags flip only when a tested integration exists.
-func (c *Claude) ObserveInteractions() bool              { return false }
-func (c *Claude) NativeInteractiveUI() bool              { return true }
+func (c *Claude) ObserveInteractions() bool               { return false }
+func (c *Claude) NativeInteractiveUI() bool               { return true }
 func (c *Claude) SupportsDeferredInteraction(string) bool { return false }
-func (c *Claude) SupportsRemoteResolve(string) bool      { return false }
+func (c *Claude) SupportsRemoteResolve(string) bool       { return false }
 
 func (c *Claude) Available() bool {
 	_, err := c.binary()

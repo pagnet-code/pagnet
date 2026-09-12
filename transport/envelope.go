@@ -393,10 +393,10 @@ type RuntimeInstallation struct {
 // capability flags, reported per (runtime, version). deferredInteraction /
 // remoteResolve are per-kind bool maps (absent kind = not supported).
 type RuntimeCapabilities struct {
-	ObserveInteractions   bool              `json:"observeInteractions"`
-	NativeInteractiveUI   bool              `json:"nativeInteractiveUi"`
-	DeferredInteraction   map[string]bool   `json:"deferredInteraction,omitempty"`
-	RemoteResolve         map[string]bool   `json:"remoteResolve,omitempty"`
+	ObserveInteractions bool            `json:"observeInteractions"`
+	NativeInteractiveUI bool            `json:"nativeInteractiveUi"`
+	DeferredInteraction map[string]bool `json:"deferredInteraction,omitempty"`
+	RemoteResolve       map[string]bool `json:"remoteResolve,omitempty"`
 }
 
 // WorkspaceReport describes a workspace discovered under an allowed root.

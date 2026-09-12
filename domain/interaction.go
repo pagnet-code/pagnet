@@ -87,7 +87,7 @@ type RuntimeInteraction struct {
 	CorrelationID *string
 	// Answer is the remote answer, stored opaque (only set when the
 	// interaction was resolved through the remote-resolve API).
-	Answer *string
+	Answer     *string
 	CreatedAt  time.Time
 	ResolvedAt *time.Time
 }
