@@ -116,27 +116,35 @@ Representatives keep the text proxy (input → turn → turn output).
 
 ## Repository layout
 
+This repository is the open-source **client**: everything that runs on your
+machines plus the wire/domain contracts they share with the control plane.
+
 | Path | What |
 |------|------|
 | `cmd/pagnet` | The one production binary: CLI (login, enroll, run, agents, tasks, attach, ...), host daemon (`pagnet daemon` / `pagnet -d`), and the MCP bridges (`pagnet mcp worker\|control`, spawned by the daemon) |
-| `cmd/pagnet-server` | Central control plane (Go) |
 | `cmd/pagnet-fake-runtime` | Deterministic fake runtime (test/dev infrastructure, not shipped) |
-| `internal/` | Go packages (domain, store, controlplane, daemon, runtimes, ...) |
-| `migrations/` | PostgreSQL migrations (goose) |
-| `web/` | Next.js control panel (App Router, TypeScript) |
-| `deploy/` | Docker Compose + example env |
-| `docs/` | Architecture, protocol, development docs |
+| `domain/` | Domain model shared with the control plane |
+| `transport/` | Wire protocol (WSS envelopes) shared with the control plane |
+| `internal/` | Client packages (daemon, runtime adapters, MCP bridges, config, release updater) |
+
+The rest of the product lives in sibling repositories:
+
+- **pagnet-server** — the control plane (Go + PostgreSQL)
+- **pagnet-web** — the Next.js control panel
+- **pagnet-monorepo** — Docker Compose deployment + cross-repo E2E suite
 
 ## Development
 
 ```bash
-make dev       # control plane (:18080) + web UI (:13000); Postgres is optional via `make pg-up`
 make test      # go test ./...          (or `make test-race` for -race)
-make build     # build all Go binaries into bin/
+make build     # build the Go binaries into bin/
+make install   # go-install pagnet into GOPATH/bin
 make demo      # build + seed a demo network with fake agents and traffic
+make release   # one-binary tarballs for all targets into dist/
 ```
 
-See `docs/ARCHITECTURE.md`, `docs/PROTOCOL.md`, and `docs/IMPLEMENTATION_STATUS.md`.
+Run the CLI against any control plane (hosted or self-hosted) with
+`pagnet login` — see the deployment docs in the pagnet-monorepo repository.
 
 ## License
 
