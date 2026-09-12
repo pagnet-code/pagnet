@@ -17,20 +17,17 @@ package daemon
 //     keeps running its current build.
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"pagnet/internal/release"
 	"pagnet/internal/transport"
 )
 
@@ -38,8 +35,6 @@ const (
 	// updateBackoff bounds the retry rate after a failed update attempt:
 	// a bad release must not hammer the control plane's /download/.
 	updateBackoff = time.Hour
-	// updateDownloadTimeout bounds the tarball download.
-	updateDownloadTimeout = 5 * time.Minute
 )
 
 // shouldUpdate reports whether a daemon running `current` should update
@@ -251,17 +246,20 @@ func (d *Daemon) performAutoUpdate(latest string) {
 		d.Log.Info("deferring auto-update to "+latest+": worker not idle", "active", n)
 		return
 	}
-	// Best-effort: also update the ON-DISK install (on Linux the rename
-	// replaces even a running executable — the process keeps its inode —
-	// but a read-only install dir must not break the update).
-	if exe, e := os.Executable(); e == nil {
-		if e := replaceFile(newBin, exe); e != nil {
-			d.Log.Warn("auto-update: installed binary not replaced (re-exec uses the staged copy)", "err", e)
-		}
-		d.installBridges(filepath.Dir(exe))
+	// ATOMIC SELF-REPLACE: the daemon replaces its OWN executable — the
+	// staged binary is written into the self path's directory and
+	// renamed over it (same directory: the rename is atomic, and on
+	// Linux it replaces even a running executable, the live process
+	// keeps its inode). Best-effort: a read-only install dir must not
+	// break the update — the re-exec then uses the staged copy, and the
+	// on-disk install keeps the old build until a writable update.
+	execPath := d.selfExe
+	if err := release.ReplaceBinary(newBin, d.selfExe); err != nil {
+		d.Log.Warn("auto-update: installed binary not replaced (re-exec uses the staged copy)", "err", err)
+		execPath = newBin
 	}
 	d.Log.Info("auto-updating to " + latest + " (idle)")
-	if err := syscall.Exec(newBin, os.Args, os.Environ()); err != nil {
+	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
 		// Exec only fails on a broken binary/OS error: log + back off,
 		// the daemon keeps running its current build.
 		d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)
@@ -293,10 +291,10 @@ func (d *Daemon) activeWorkCount() int {
 // downloadAndExtract fetches the host's release tarball from the
 // control plane's /download/ endpoint (the existing release-serving
 // handler, same pagnet-latest-<os>-<arch>.tar.gz convention as the
-// wget-install bootstrap) and extracts the binaries the daemon depends on
-// into the staging dir; it returns the pagnetd path. The staging dir is
-// removed on failure; on success the update re-execs and never returns (the
-// next daemon start clears the leftover).
+// wget-install bootstrap) and extracts the unified pagnet binary into
+// the staging dir; it returns the staged binary's path. The staging dir
+// is removed on failure; on success the update re-execs and never
+// returns (the next daemon start clears the leftover).
 func (d *Daemon) downloadAndExtract() (string, error) {
 	staging := d.updateStagingDir()
 	if err := os.RemoveAll(staging); err != nil {
@@ -307,11 +305,11 @@ func (d *Daemon) downloadAndExtract() (string, error) {
 	}
 	cleanup := func() { _ = os.RemoveAll(staging) }
 	tarPath := filepath.Join(staging, "release.tar.gz")
-	if err := d.downloadRelease(tarPath); err != nil {
+	if err := release.Download(d.ServerURL, tarPath); err != nil {
 		cleanup()
 		return "", fmt.Errorf("download: %w", err)
 	}
-	newBin, err := extractReleaseBinaries(tarPath, staging)
+	newBin, err := release.ExtractPagnet(tarPath, staging)
 	if err != nil {
 		cleanup()
 		return "", fmt.Errorf("extract: %w", err)
@@ -319,171 +317,10 @@ func (d *Daemon) downloadAndExtract() (string, error) {
 	return newBin, nil
 }
 
-// updateStagingDir is where a release tarball is unpacked ahead of the
-// re-exec. It is deterministic because performAutoUpdate reads the bridges
-// back out of it to install them next to the real binary.
+// updateStagingDir is where the release tarball is unpacked ahead of the
+// re-exec.
 func (d *Daemon) updateStagingDir() string {
 	return filepath.Join(d.StateDir, "update-staging")
-}
-
-// installBridges puts the MCP bridges from the staged release next to the
-// daemon's own binary. Transitional (packaging migration, removed with the
-// separate bridge binaries in step 6): the daemon itself no longer needs
-// the sibling binaries — it spawns the bridges from its own executable
-// (mcpConfig) — but the release still ships them, and keeping the on-disk
-// install complete covers any older daemon build still resolving them.
-// Best-effort like the pagnetd replace: a read-only install dir must not
-// fail the update. A member missing from an older tarball is skipped
-// rather than fatal.
-func (d *Daemon) installBridges(installDir string) {
-	if installDir == "" || installDir == d.updateStagingDir() {
-		return // already running from the staging copy
-	}
-	for _, name := range bridgeBinaries {
-		src := filepath.Join(d.updateStagingDir(), name)
-		if _, err := os.Stat(src); err != nil {
-			d.Log.Warn("auto-update: release tarball carries no "+name+
-				"; this worker needs install.sh re-run to get the bridge", "err", err)
-			continue
-		}
-		if err := replaceFile(src, filepath.Join(installDir, name)); err != nil {
-			d.Log.Warn("auto-update: "+name+" not updated (install.sh owns this dir)",
-				"dir", installDir, "err", err)
-		}
-	}
-}
-
-// downloadRelease fetches the host's release tarball over HTTPS with the
-// daemon's host credential (the same bearer it uses for the host WSS).
-func (d *Daemon) downloadRelease(dst string) error {
-	u := strings.TrimSuffix(d.ServerURL, "/") +
-		"/download/pagnet-latest-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
-	req, err := http.NewRequest(http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+d.Credential)
-	client := &http.Client{Timeout: updateDownloadTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d", resp.StatusCode)
-	}
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	_, werr := io.Copy(f, resp.Body)
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	return werr
-}
-
-// extractReleaseBinaries unpacks the wanted members of the release tarball
-// (a flat pagnet-*.tar.gz) into dir and returns the path of the pagnetd
-// binary inside it. A tarball built before the bridges shipped simply has
-// fewer members — only a missing pagnetd is fatal, so an old /download/
-// cannot break a worker's self-update.
-func extractReleaseBinaries(tarPath, dir string) (string, error) {
-	f, err := os.Open(tarPath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("gzip: %w", err)
-	}
-	defer gz.Close()
-	tr := tar.NewReader(gz)
-	var found string
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", fmt.Errorf("tar: %w", err)
-		}
-		base := filepath.Base(hdr.Name)
-		if hdr.Typeflag != tar.TypeReg || !releaseWanted(base) {
-			continue
-		}
-		dst := filepath.Join(dir, base)
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-		if err != nil {
-			return "", err
-		}
-		if _, err := io.Copy(out, tr); err != nil {
-			out.Close()
-			return "", err
-		}
-		if err := out.Close(); err != nil {
-			return "", err
-		}
-		if base == "pagnetd" && found == "" {
-			found = dst
-		}
-	}
-	if found == "" {
-		return "", fmt.Errorf("pagnetd binary not found in tarball")
-	}
-	return found, nil
-}
-
-// bridgeBinaries are the binaries the daemon hands to every agent it starts:
-// the worker MCP surface and the representative control surface (§9 keeps
-// them in separate binaries). They are part of a release, not extras — a
-// worker that updates without them silently loses its agents' network tools.
-var bridgeBinaries = []string{"pagnet-mcp", "pagnet-control"}
-
-// releaseWanted reports whether a tarball member is one the daemon needs to
-// keep. pagnet and pagnet-fake-runtime are deliberately not wanted: the CLI
-// may be in use in the operator's shell and the fake runtime is --debug-only,
-// so a self-update must not swap either out from under them.
-func releaseWanted(name string) bool {
-	if name == "pagnetd" {
-		return true
-	}
-	for _, b := range bridgeBinaries {
-		if b == name {
-			return true
-		}
-	}
-	return false
-}
-
-// replaceFile copies src over dst atomically (write a sibling temp file,
-// rename). On Linux the rename replaces even a RUNNING executable (the
-// live process keeps its inode) — that is how the on-disk install is
-// updated alongside the re-exec.
-func replaceFile(src, dst string) error {
-	b, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".pagnetd-update-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, dst)
 }
 
 // instanceFingerprint is the fingerprint of the runtime-injected config
