@@ -83,6 +83,7 @@ func main() {
 		unenrollCmd(),
 		workerCmd(),
 		daemonCmd(),
+		versionCmd(),
 		runCmd(),
 		networkCmd(),
 		workspacesCmd(),
@@ -110,6 +111,21 @@ func main() {
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
+	}
+}
+
+// versionCmd prints the build version stamped at release-build time
+// (-X main.version=$(VERSION)). The unified binary carries the version
+// for ALL modes (packaging migration): one `pagnet version` answers for
+// the CLI, the daemon, and the MCP bridges.
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the pagnet version",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
+			fmt.Fprintln(cmd.OutOrStdout(), "pagnet", version)
+		},
 	}
 }
 
