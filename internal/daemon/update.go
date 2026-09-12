@@ -327,13 +327,14 @@ func (d *Daemon) updateStagingDir() string {
 }
 
 // installBridges puts the MCP bridges from the staged release next to the
-// daemon's own binary, which is where resolveBridge looks when they are not
-// on PATH. Replacing only pagnetd would leave a self-updated worker handing
-// its agents a bridge it does not have — and a runtime treats a missing
-// stdio MCP server as optional, so the agent would simply come up without
-// its network tools. Best-effort like the pagnetd replace: a read-only
-// install dir must not fail the update. A member missing from an older
-// tarball is skipped rather than fatal.
+// daemon's own binary. Transitional (packaging migration, removed with the
+// separate bridge binaries in step 6): the daemon itself no longer needs
+// the sibling binaries — it spawns the bridges from its own executable
+// (mcpConfig) — but the release still ships them, and keeping the on-disk
+// install complete covers any older daemon build still resolving them.
+// Best-effort like the pagnetd replace: a read-only install dir must not
+// fail the update. A member missing from an older tarball is skipped
+// rather than fatal.
 func (d *Daemon) installBridges(installDir string) {
 	if installDir == "" || installDir == d.updateStagingDir() {
 		return // already running from the staging copy

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -91,6 +90,14 @@ type Daemon struct {
 
 	state    *State
 	adapters map[domain.RuntimeName]agentruntime.Adapter
+
+	// selfExe is this process's canonicalized own executable path,
+	// resolved ONCE at construction (New). The agent runtimes spawn the
+	// MCP bridges as <selfExe> mcp worker|control (packaging migration
+	// step 5): the daemon never searches PATH for sibling bridge
+	// binaries — an install dir that is not on PATH must still give
+	// agents their network tools.
+	selfExe string
 
 	// bootID is this process's runner identity (Phase 3 Host→Runner model):
 	// minted once at startup and carried in every WSS connect so the control
@@ -226,8 +233,25 @@ type instQueue struct {
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
 func New(cfg Config, log *slog.Logger) (*Daemon, error) {
+	return newDaemon(cfg, log, resolveSelfExecutable)
+}
+
+// newDaemon is New with an explicit self-executable resolver: the MCP
+// bridges are spawned from the daemon's own binary path, and the
+// resolver is the seam tests use to exercise the explicit startup
+// failure (a daemon that cannot resolve its own executable must not
+// start — its agents would come up with no network tools).
+func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, error)) (*Daemon, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	// The MCP bridges are spawned as <self> mcp worker|control: resolve
+	// the daemon's own executable ONCE, up front, and fail explicitly
+	// when it cannot be resolved — never fall back to a bare name or a
+	// PATH search (packaging migration step 5).
+	selfExe, err := selfExeResolver()
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve own executable for MCP bridge spawn: %w", err)
 	}
 	// 0700: the state dir holds the host credential (config.yaml) and the
 	// agent-bridge socket — never world-traversable (SEC-102).
@@ -263,6 +287,7 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 		Log:         log,
 		state:       st,
 		adapters:    adapters,
+		selfExe:     selfExe,
 		bootID:      domain.NewID().String(),
 		activeTurns: map[string]bool{},
 		attaches:    map[string]map[string]time.Time{},
@@ -1540,19 +1565,24 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 // managed agent: the bridge over the daemon's local Unix socket (the
 // bridge authenticates to the daemon with the instance identity — the
 // host credential never reaches the agent, §5/§17). Workers get the
-// pagnet-mcp surface (network_* tools); representatives get
-// pagnet-control (control_* tools) — the surfaces are separate
-// binaries on purpose (§9: reduces accidental privilege escalation).
+// worker MCP surface (network_* tools); representatives get the
+// control surface (control_* tools). The bridge is the daemon's OWN
+// executable (self-spawn, packaging migration step 5): the runtime
+// spawns <self> mcp worker|control, so the install dir never has to be
+// on PATH — and a daemon that cannot resolve its own executable
+// refuses to start (New) instead of handing agents a bridge it cannot
+// spawn.
 func (d *Daemon) mcpConfig(row *InstanceRow) string {
-	name, command := "pagnet", "pagnet-mcp"
+	name, args := "pagnet", []string{"mcp", "worker"}
 	if row.Kind == "representative" {
-		name, command = "pagnet-control", "pagnet-control"
+		name, args = "pagnet-control", []string{"mcp", "control"}
 	}
+	args = append(args, "--socket", filepath.Join(d.StateDir, "pagnetd.sock"))
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
 			name: map[string]any{
-				"command": resolveBridge(command),
-				"args":    []string{"--socket", filepath.Join(d.StateDir, "pagnetd.sock")},
+				"command": d.selfExe,
+				"args":    args,
 				"env": map[string]string{
 					"PAGNET_INSTANCE_ID": row.InstanceID,
 					"PAGNET_NETWORK_ID":  row.NetworkID,
@@ -1564,30 +1594,27 @@ func (d *Daemon) mcpConfig(row *InstanceRow) string {
 	return string(b)
 }
 
-// resolveBridge locates a bridge binary the way the runtime adapters locate
-// their CLI (see Qwen.binary): PATH first, then the directory holding this
-// daemon's own executable — which is where the release tarball unpacks the
-// bridges next to pagnetd, and where `make build` puts them in a checkout.
-// Handing the runtime a bare name instead makes the spawn a PATH lookup in
-// the daemon's environment (ChildEnv filters credentials only, so PATH is
-// inherited unchanged), and that environment is not guaranteed to contain
-// the install dir: install.sh only nags about it, macOS does not ship
-// ~/.local/bin on PATH, and a daemon started from a checkout has no pagnet
-// dir on PATH at all. When it misses, nothing spawns and the instance
-// silently comes up with no network tools — the bridge is a stdio server the
-// runtime is free to treat as optional. The bare name is returned only when
-// neither probe finds a binary, so the failure surfaces where it used to.
-func resolveBridge(name string) string {
-	if p, err := exec.LookPath(name); err == nil {
-		return p
+// resolveSelfExecutable resolves this process's own executable path,
+// canonicalized (symlinks resolved): the command the agent runtimes
+// spawn the MCP bridges from (<self> mcp worker|control). It fails
+// explicitly when the daemon cannot tell where its own binary lives —
+// a bare name would become a PATH lookup in the RUNTIME's environment
+// (ChildEnv filters credentials only, so PATH is inherited unchanged),
+// and that environment is not guaranteed to contain the install dir:
+// a miss means the agent silently comes up with no network tools.
+func resolveSelfExecutable() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("os.Executable: %w", err)
 	}
-	if self, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(self), name)
-		if _, err := os.Stat(cand); err == nil {
-			return cand
-		}
+	if exe == "" {
+		return "", errors.New("os.Executable returned an empty path")
 	}
-	return name
+	canonical, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize %s: %w", exe, err)
+	}
+	return canonical, nil
 }
 
 // runTurn executes one turn through the adapter, translating normalized

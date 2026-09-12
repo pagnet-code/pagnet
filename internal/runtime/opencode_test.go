@@ -151,9 +151,12 @@ func TestOpenCode_ColdTurnNoResume(t *testing.T) {
 // TestOpenCode_MCPConfigRendering: the daemon-rendered PAGNET_MCP_CONFIG is
 // materialized as an opencode config in the instance's SessionDir (managed
 // state, NEVER the workspace) with the pagnet bridge as a local stdio
-// server, and OPENCODE_CONFIG points at it.
+// server, and OPENCODE_CONFIG points at it. The fixture is the daemon's
+// self-spawn shape (packaging migration step 5): command is the daemon's
+// own executable, args carry the mcp worker subcommand — opencode must
+// materialize command+args as one local stdio command.
 func TestOpenCode_MCPConfigRendering(t *testing.T) {
-	const mcp = `{"mcpServers":{"pagnet":{"command":"pagnet-mcp","args":["--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1","PAGNET_NETWORK_ID":"net-1"}}}}`
+	const mcp = `{"mcpServers":{"pagnet":{"command":"/usr/local/bin/pagnet","args":["mcp","worker","--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1","PAGNET_NETWORK_ID":"net-1"}}}}`
 	spec := opencodeSpec(t.TempDir())
 	spec.Env = []string{"PAGNET_MCP_CONFIG=" + mcp}
 	runOpenCodeStub(t, spec, nil)
@@ -181,7 +184,7 @@ func TestOpenCode_MCPConfigRendering(t *testing.T) {
 	if srv.Type != "local" || !srv.Enabled {
 		t.Fatalf("pagnet server = %+v, want type=local enabled=true", srv)
 	}
-	wantCmd := []string{"pagnet-mcp", "--socket", "/s/pagnetd.sock"}
+	wantCmd := []string{"/usr/local/bin/pagnet", "mcp", "worker", "--socket", "/s/pagnetd.sock"}
 	if len(srv.Command) != len(wantCmd) {
 		t.Fatalf("command = %v, want %v", srv.Command, wantCmd)
 	}
