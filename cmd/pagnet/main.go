@@ -57,17 +57,32 @@ func main() {
 		Short:         "pagnet CLI — control plane for AI coding agent networks",
 		SilenceUsage:  true,
 		SilenceErrors: false,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if detach {
+				return runDetach(cmd)
+			}
+			return cmd.Help()
+		},
 	}
 	root.PersistentFlags().StringVar(&serverURL, "server",
 		envOrDefault("PAGNET_SERVER", "http://localhost:18080"),
 		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
 	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
+	// -d/--detach is a ROOT-level launcher (re-exec `pagnet daemon`
+	// detached); the daemon flag set is registered locally so
+	// `pagnet -d --state-dir ...` parses. Deliberately NOT persistent:
+	// subcommands keep their own flag surfaces.
+	root.Flags().BoolVarP(&detach, "detach", "d", false,
+		"run the daemon in the background: detach from the terminal, append logs to <state-dir>/pagnetd.log, print the pid and exit")
+	registerDaemonFlags(root)
 
 	root.AddCommand(
 		loginCmd(),
 		enrollCmd(),
 		unenrollCmd(),
 		workerCmd(),
+		daemonCmd(),
 		runCmd(),
 		networkCmd(),
 		workspacesCmd(),
