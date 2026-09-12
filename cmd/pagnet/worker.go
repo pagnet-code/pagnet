@@ -51,7 +51,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/daemon"
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 func workerCmd() *cobra.Command {

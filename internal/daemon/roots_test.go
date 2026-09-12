@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 func TestSetAllowedRoots(t *testing.T) {

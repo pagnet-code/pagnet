@@ -26,7 +26,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 func runCmd() *cobra.Command {

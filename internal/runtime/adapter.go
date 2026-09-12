@@ -14,7 +14,7 @@ import (
 	"encoding/json"
 	"os/exec"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 // TurnSpec describes one turn to run. The adapter decides how to translate it

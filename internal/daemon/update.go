@@ -28,7 +28,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/release"
-	"github.com/pagnet-code/pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 const (

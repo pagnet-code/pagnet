@@ -1,0 +1,547 @@
+// Package transport defines the pagnet host protocol wire format.
+//
+// This is the public protocol contract shared with pagnet-server.
+//
+// Transport is a serialization boundary: domain objects (Task, Message,
+// Artifact, ...) are defined in the domain package and NEVER shaped around
+// this wire format. Future transports (REST, A2A, Matrix, NATS) serialize
+// the same domain objects.
+package transport
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/pagnet-code/pagnet/domain"
+)
+
+// ProtocolVersion is the current host-protocol envelope version.
+const ProtocolVersion = 1
+
+// Envelope is the single versioned wrapper for every daemon/control-plane
+// command and event on the host connection. Domain fields never appear at
+// the top level.
+type Envelope struct {
+	ProtocolVersion int             `json:"protocolVersion"`
+	ID              string          `json:"id"`
+	Type            string          `json:"type"`
+	Timestamp       time.Time       `json:"timestamp"`
+	CorrelationID   *string         `json:"correlationId,omitempty"`
+	CausationID     *string         `json:"causationId,omitempty"`
+	Payload         json.RawMessage `json:"payload"`
+}
+
+// NewEnvelope wraps a payload in a versioned envelope with a fresh id.
+func NewEnvelope(messageType string, payload any) (Envelope, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return Envelope{}, err
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		id, _ = uuid.NewRandom()
+	}
+	return Envelope{
+		ProtocolVersion: ProtocolVersion,
+		ID:              id.String(),
+		Type:            messageType,
+		Timestamp:       time.Now().UTC(),
+		Payload:         raw,
+	}, nil
+}
+
+// WithContext attaches correlation/causation ids carried in ctx (if any).
+func (e Envelope) WithContext(ctx context.Context) Envelope {
+	if id, ok := domain.CorrelationID(ctx); ok {
+		s := id.String()
+		e.CorrelationID = &s
+	}
+	if id, ok := domain.CausationID(ctx); ok {
+		s := id.String()
+		e.CausationID = &s
+	}
+	return e
+}
+
+// DecodePayload unmarshals the envelope payload into v.
+func (e Envelope) DecodePayload(v any) error {
+	return json.Unmarshal(e.Payload, v)
+}
+
+// Message types: control plane -> host. Commands are STRUCTURED only; the
+// daemon decides locally how to translate them into process invocations.
+// The server never sends shell commands.
+const (
+	MsgLaunchAgent         = "host.launch_agent"
+	MsgStopAgent           = "host.stop_agent"
+	MsgRestartAgent        = "host.restart_agent"
+	MsgForgetInstance      = "host.forget_instance" // instance deleted server-side: clean up locally
+	MsgWakeAgent           = "agent.wake"           // wake a hibernated instance (resume session)
+	MsgDeliverNetworkEvent = "host.deliver_network_event"
+	MsgRequestInventory    = "host.request_inventory"
+	// MsgHostUnenrolled tells a LIVE daemon that its host was removed from
+	// the control plane (deleted or unenrolled). The credential is dead —
+	// reconnecting would only 401 — so the daemon stops itself with a
+	// message the operator can see. Live (at-most-once): a daemon that
+	// misses it will 401 on its next dial and stop the same way.
+	MsgHostUnenrolled = "host.unenrolled"
+	// CloseCodeSuperseded is the WebSocket close code the control plane
+	// sends to a host connection that a NEWER connection from the same
+	// host just replaced. The daemon that receives it must stop: its
+	// identity is now owned by another daemon process, and reconnecting
+	// would only fight that daemon forever (each connect supersedes the
+	// other, in an endless backoff loop).
+	CloseCodeSuperseded = 4001
+	// MsgUpdateRoots replaces the daemon's allowed workspace roots at
+	// runtime. The server-side root list (PUT /hosts/{id}/roots) is the
+	// source of truth; without this command the daemon would keep
+	// enforcing its startup config forever after a root change.
+	// Durable + idempotent.
+	MsgUpdateRoots = "host.update_roots"
+	// MsgAttachTerminal opens an attach session for an instance and, if the
+	// instance's PTY terminal is not running, starts it (resume stored
+	// session when the runtime supports it). Durable + idempotent.
+	MsgAttachTerminal = "host.attach_terminal"
+	// MsgDetachTerminal closes an attach session. Detach is observational:
+	// the PTY keeps running (addendum §10). Durable + idempotent.
+	MsgDetachTerminal = "host.detach_terminal"
+	// MsgTerminalStop kills the instance's PTY session (user closed the
+	// terminal, or the instance was stopped/restarted/forgotten).
+	// Durable + idempotent.
+	MsgTerminalStop = "host.terminal_stop"
+	// MsgTerminalSnapshot asks the daemon to re-emit the PTY snapshot
+	// frame (bounded ring + lastSeq) for an attach session. The server
+	// uses it when a client connects AFTER live output has already
+	// flowed (the cached attach-time snapshot is stale): the new
+	// snapshot is a superset the late client renders before live output
+	// (addendum §11 replay → live). Durable + idempotent (re-emitting
+	// the ring is side-effect free).
+	MsgTerminalSnapshot = "host.terminal_snapshot"
+	// MsgTerminalInput / MsgTerminalResize are LIVE messages: written
+	// directly onto the host connection (at-most-once, dropped under
+	// back-pressure, never durably queued or acked). Keystroke semantics
+	// do not survive a Postgres round-trip or a busy-deferral.
+	MsgTerminalInput  = "host.terminal_input"
+	MsgTerminalResize = "host.terminal_resize"
+	// MsgListDirs is a LIVE request (at-most-once, not durably queued or
+	// acked): the control plane asks the daemon to list the subdirectories
+	// of a path, for the click-to-select directory picker. The daemon
+	// validates the path against its allowed roots (the enforcement point)
+	// and answers with MsgListDirsResult, correlated by RequestID.
+	MsgListDirs = "host.list_dirs"
+	// MsgLatestVersion advertises the latest worker release version to
+	// the daemon (worker auto-update, P6). Live (at-most-once): sent on
+	// connect and with every heartbeat. The daemon's update check is
+	// idempotent and self-gating (idle gate + 1h failure backoff), so a
+	// missed or duplicated advertisement is harmless.
+	MsgLatestVersion = "host.latest_version"
+)
+
+// Message types: host -> control plane (events).
+const (
+	MsgHeartbeat            = "host.heartbeat"
+	MsgAgentStarted         = "host.agent_started"
+	MsgAgentStopped         = "host.agent_stopped"
+	MsgAgentStatus          = "host.agent_status"
+	MsgAgentHibernated      = "host.agent_hibernated" // process exited after turn; session preserved
+	MsgRuntimeOutput        = "host.runtime_output"
+	MsgRuntimeTurnStarted   = "host.runtime_turn_started"
+	MsgRuntimeTurnCompleted = "host.runtime_turn_completed"
+	MsgRuntimeTurnFailed    = "host.runtime_turn_failed"
+	MsgWorkspaceDetected    = "host.workspace_detected"
+	MsgHostInventory        = "host.host_inventory"
+	// MsgTerminalOutput streams PTY bytes for an attach session: raw
+	// terminal output (base64), session-keyed, in order. Snapshot frames
+	// (Snapshot=true) replay the bounded ring buffer for a (re)attaching
+	// client; LastSeq marks where live output resumes, so replay → live
+	// never duplicates (addendum §11).
+	MsgTerminalOutput = "host.terminal_output"
+	MsgCommandAck     = "host.command_ack"
+	MsgRuntimeSession = "host.runtime_session"
+	MsgAgentRequest   = "agent.request" // agent -> control plane, relayed by the daemon bridge socket
+	// MsgListDirsResult is the daemon's reply to MsgListDirs, correlated by
+	// RequestID. Carries the subdirectory listing (or an error when the
+	// path is not under an allowed root / not a directory / unreadable).
+	MsgListDirsResult = "host.list_dirs_result"
+	// MsgInteractionStarted / MsgInteractionResolved carry a normalized
+	// native runtime interaction (question, permission prompt, ...) the
+	// adapter observed. Phase 5: pagnet OBSERVES the interaction — it does
+	// not render it; the native TUI stays the place a human answers. These
+	// are fire-and-forget observations (at-most-once), like the other
+	// runtime turn events: a missed event means the interaction is not
+	// recorded, never a corrupted one.
+	MsgInteractionStarted  = "interaction.started"
+	MsgInteractionResolved = "interaction.resolved"
+)
+
+// MsgAgentResponse is control plane -> host: the result of an
+// MsgAgentRequest, correlated by RequestID (the request envelope's id).
+const MsgAgentResponse = "agent.response"
+
+// LaunchAgentPayload is a structured launch command (never shell).
+type LaunchAgentPayload struct {
+	// CommandID provides idempotency across reconnects/resends.
+	CommandID string `json:"commandId"`
+	// InstanceID is pre-allocated by the control plane.
+	InstanceID   string `json:"instanceId"`
+	DefinitionID string `json:"definitionId"`
+	Runtime      string `json:"runtime"`
+	// Workspace must belong to the host and sit under an allowed root;
+	// the daemon validates both locally.
+	WorkspaceID   string `json:"workspaceId"`
+	WorkspacePath string `json:"workspacePath"`
+	// CWD is the agent's working directory: an absolute path that is a
+	// subdirectory of WorkspacePath (the agent sees only from here
+	// forward). Empty = run at the workspace root (the default). The
+	// daemon validates it against the allowed roots and keeps the
+	// repo/worktree keying on WorkspacePath.
+	CWD     string `json:"cwd,omitempty"`
+	Profile string `json:"profile"`
+	// Transcript: metadata | network | full (default network).
+	Transcript string         `json:"transcript"`
+	Options    map[string]any `json:"options,omitempty"`
+	// AgentName is the definition's name (used for worktree branch names,
+	// §29: pagnet/<agent-name>/<task-short-id>).
+	AgentName string `json:"agentName,omitempty"`
+	// NetworkID scopes the agent's network identity (injected into the
+	// runtime environment for the MCP bridge).
+	NetworkID string `json:"networkId,omitempty"`
+	// Access: read_write (default) or read_only. Second+ RW agents on the
+	// same repository get an automatic git worktree (§29); read-only
+	// agents share the checkout.
+	Access string `json:"access,omitempty"`
+	// Kind: worker (default) or representative. Representatives have no
+	// workspace (WorkspacePath is empty) and run in an pagnet-managed
+	// state directory (§37); the daemon selects their MCP surface
+	// (the control bridge) from this.
+	Kind string `json:"kind,omitempty"`
+	// Mission is the agent's initial instruction (north-star §15). The
+	// daemon runs it as the FIRST turn of a fresh instance; a resumed
+	// session never receives it again.
+	Mission string `json:"mission,omitempty"`
+	// Model is the resolved model for this launch ("" = the runtime's own
+	// default). Precedence: launch request > definition default > runtime.
+	Model string `json:"model,omitempty"`
+	// AgentMD is the standing instruction (AGENT.md-style) for this launch
+	// ("" = none). The daemon materializes it in its state dir — never the
+	// workspace: claude receives it via --append-system-prompt-file, other
+	// runtimes have it appended to a fresh session's first turn (exactly
+	// how the coordination contract reaches them).
+	AgentMD string `json:"agentMd,omitempty"`
+}
+
+// WakeAgentPayload wakes a hibernated instance: the daemon resumes the
+// stored runtime session and starts a turn for the queued work.
+// wakeRequestId provides idempotency across reconnects/resends.
+type WakeAgentPayload struct {
+	WakeRequestID string `json:"wakeRequestId"`
+	InstanceID    string `json:"instanceId"`
+	Reason        string `json:"reason"`
+}
+
+// RequestInventoryPayload asks the host to rescan runtimes/workspaces and
+// reply with host.host_inventory. CommandID provides idempotency across
+// reconnects/resends — without it the daemon cannot ack the command and
+// the dispatcher would re-send it forever.
+type RequestInventoryPayload struct {
+	CommandID string `json:"commandId"`
+}
+
+// UpdateRootsPayload replaces the host's allowed workspace roots and their
+// enforcement mode. Empty Roots is a valid value (an allow_list host then
+// allows nothing; an allow_all host allows any path regardless).
+type UpdateRootsPayload struct {
+	CommandID string   `json:"commandId"`
+	Roots     []string `json:"roots"`
+	// Mode is the roots enforcement mode (allow_all by default, allow_list
+	// to confine to Roots). Empty = allow_all.
+	Mode string `json:"mode,omitempty"`
+}
+
+// LatestVersionPayload advertises the latest worker release version to a
+// daemon (auto-update, P6). The operator sets PAGNET_RELEASE_VERSION on
+// the control plane when publishing a release (e.g. v0.3.0); empty means
+// nothing is advertised and auto-update is a no-op (the safe default).
+type LatestVersionPayload struct {
+	LatestVersion string `json:"latestVersion"`
+}
+
+// ListDirsPayload is a LIVE request to list the subdirectories of Path
+// (the click-to-select directory picker). The daemon validates Path
+// against its allowed roots before reading it.
+type ListDirsPayload struct {
+	RequestID string `json:"requestId"`
+	Path      string `json:"path"`
+}
+
+// DirEntry is one subdirectory in a ListDirsResultPayload.
+type DirEntry struct {
+	Name  string `json:"name"`
+	IsDir bool   `json:"isDir"`
+}
+
+// ListDirsResultPayload is the daemon's reply to ListDirsPayload,
+// correlated by RequestID. Path is the directory that was listed (the
+// picker's current location); Entries are its subdirectories (sorted,
+// capped). Error is set when the path is not under an allowed root, is
+// not a directory, or cannot be read.
+type ListDirsResultPayload struct {
+	RequestID string     `json:"requestId"`
+	Path      string     `json:"path"`
+	Entries   []DirEntry `json:"entries"`
+	Error     string     `json:"error,omitempty"`
+}
+
+// StopAgentPayload stops an agent instance.
+type StopAgentPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+}
+
+// RestartAgentPayload restarts an agent instance.
+type RestartAgentPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+}
+
+// ForgetInstancePayload tells the daemon an instance was deleted on the
+// control plane: stop any process, remove the isolated worktree (branch
+// kept), drop the local row.
+type ForgetInstancePayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+}
+
+// NetworkEventPayload is an inbound work/notification for a managed agent
+// (ASK, TASK, NOTICE, STATUS, or user terminal input).
+type NetworkEventPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+	// MessageID is set when the work is a durable message: a clean command
+	// ack marks that message delivered (message.delivered). A failed turn
+	// acks with an error, so the message stays pending for re-delivery.
+	MessageID string `json:"messageId,omitempty"`
+	// Kind: ask | task | notice | status | user_input
+	Kind string `json:"kind"`
+	// ThreadID is set for ask/notice messages.
+	ThreadID string `json:"threadId,omitempty"`
+	// TaskID is set for task events.
+	TaskID string `json:"taskId,omitempty"`
+	// FromAgent is the logical sender name (for the rendered turn prompt).
+	FromAgent string `json:"fromAgent,omitempty"`
+	// ConversationID is set for channel deliveries (a human conversation
+	// with a representative).
+	ConversationID string `json:"conversationId,omitempty"`
+	// NetworkID is set for channel deliveries: the conversation's active
+	// network ("" when none selected yet).
+	NetworkID string `json:"networkId,omitempty"`
+	// Resource is the canonical resource key, when relevant.
+	Resource string `json:"resource,omitempty"`
+	// Body is the rendered text of the turn input.
+	Body string `json:"body"`
+	// AcceptanceCriteria for task events.
+	AcceptanceCriteria []string `json:"acceptanceCriteria,omitempty"`
+}
+
+// HeartbeatPayload carries host liveness + machine metrics.
+type HeartbeatPayload struct {
+	HostID    string `json:"hostId"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	DaemonVer string `json:"daemonVersion"`
+	Metrics   struct {
+		CPUCount      int     `json:"cpuCount"`
+		CPULoad       float64 `json:"cpuLoad"`
+		MemTotalBytes int64   `json:"memTotalBytes"`
+		MemUsedBytes  int64   `json:"memUsedBytes"`
+		DiskFreeBytes int64   `json:"diskFreeBytes"`
+	} `json:"metrics"`
+	Instances []InstanceStatus `json:"instances,omitempty"`
+}
+
+// InstanceStatus is per-agent liveness piggybacked on heartbeats.
+type InstanceStatus struct {
+	InstanceID string `json:"instanceId"`
+	Status     string `json:"status"`
+	PID        int    `json:"pid,omitempty"`
+}
+
+// InventoryPayload reports detected runtimes and workspaces.
+type InventoryPayload struct {
+	HostID       string                `json:"hostId"`
+	Runtimes     []RuntimeInstallation `json:"runtimes"`
+	Workspaces   []WorkspaceReport     `json:"workspaces"`
+	AllowedRoots []string              `json:"allowedRoots"`
+}
+
+// RuntimeInstallation describes a detected runtime on the host.
+type RuntimeInstallation struct {
+	Runtime string `json:"runtime"`
+	Version string `json:"version,omitempty"`
+	Path    string `json:"path,omitempty"`
+	// Capabilities are the OBSERVED native-interaction capability flags the
+	// daemon reports from its adapter (Phase 5, plan §8.6): the persisted
+	// compatibility matrix. Empty when the adapter does not implement the
+	// capability model (the conservative "cannot observe" default).
+	Capabilities *RuntimeCapabilities `json:"capabilities,omitempty"`
+}
+
+// RuntimeCapabilities is one adapter's observed native-interaction
+// capability flags, reported per (runtime, version). deferredInteraction /
+// remoteResolve are per-kind bool maps (absent kind = not supported).
+type RuntimeCapabilities struct {
+	ObserveInteractions   bool              `json:"observeInteractions"`
+	NativeInteractiveUI   bool              `json:"nativeInteractiveUi"`
+	DeferredInteraction   map[string]bool   `json:"deferredInteraction,omitempty"`
+	RemoteResolve         map[string]bool   `json:"remoteResolve,omitempty"`
+}
+
+// WorkspaceReport describes a workspace discovered under an allowed root.
+type WorkspaceReport struct {
+	Path   string `json:"path"`
+	Branch string `json:"branch,omitempty"`
+	Remote string `json:"remote,omitempty"`
+	// ResourceKey is the canonical resource key when Git metadata was
+	// detected (e.g. "github.com/xemahq/dsl").
+	ResourceKey string `json:"resourceKey,omitempty"`
+}
+
+// TerminalAttachPayload opens a terminal/attach session for an instance:
+// the daemon records the attach, starts the instance's PTY if it is not
+// running (resuming the stored runtime session when possible), and streams
+// the PTY snapshot as terminal_output frames before resuming live output.
+// Terminal is always true — kept on the wire because an in-flight older
+// daemon still branches on it.
+type TerminalAttachPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+	Terminal   bool   `json:"terminal,omitempty"`
+}
+
+// DetachTerminalPayload closes an attach session. Detach is observational —
+// the PTY keeps running (addendum §10). When it was the last attach, the
+// instance may return to hibernation only if no PTY is active (§35: do not
+// hibernate underneath an attached user or a live terminal).
+type DetachTerminalPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+}
+
+// TerminalStopPayload kills the instance's PTY session. Durable and
+// idempotent (a second stop is an acknowledged no-op).
+type TerminalStopPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+}
+
+// TerminalSnapshotPayload requests one PTY snapshot frame for an attach
+// session. The daemon answers with a host.terminal_output snapshot frame
+// when the PTY is live (no frame when it is not — in that case the
+// session's teardown owns the waiting client).
+type TerminalSnapshotPayload struct {
+	CommandID  string `json:"commandId"`
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+}
+
+// TerminalInputPayload is raw user input on an attach session: base64 PTY
+// stdin bytes (keystrokes, control sequences, pasted text). LIVE message —
+// no CommandID, never acked, delivered at most once.
+type TerminalInputPayload struct {
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+	Data       string `json:"data"` // base64
+}
+
+// TerminalResizePayload updates the PTY window size (SIGWINCH). LIVE
+// message; the client debounces.
+type TerminalResizePayload struct {
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+	Cols       uint16 `json:"cols"`
+	Rows       uint16 `json:"rows"`
+}
+
+// TerminalOutputPayload is one ordered chunk of PTY output for an attach
+// session.
+//
+//   - Live frames: Data = raw bytes (base64), Seq = the session's
+//     monotonically increasing output counter after this chunk.
+//   - Snapshot frames (Snapshot=true, sent right after an attach): Data =
+//     the bounded ring buffer so far ("" when empty), LastSeq = the counter
+//     at snapshot time. The server switches the attaching client to live
+//     output immediately after forwarding the snapshot, so no byte is ever
+//     delivered twice (addendum §11).
+type TerminalOutputPayload struct {
+	InstanceID string `json:"instanceId"`
+	SessionID  string `json:"sessionId"`
+	Data       string `json:"data"` // base64
+	Seq        uint64 `json:"seq,omitempty"`
+	Snapshot   bool   `json:"snapshot,omitempty"`
+	LastSeq    uint64 `json:"lastSeq,omitempty"`
+	// ConfigStale (snapshot frames only, P6): the instance's PTY was
+	// started under a different runtime-injected config (MCP bridge +
+	// identity env) than the daemon renders now — the main trigger is an
+	// auto-update re-exec. The UI shows a "restart the terminal to apply"
+	// hint next to the existing Restart action (no auto-restart).
+	ConfigStale bool `json:"configStale,omitempty"`
+}
+
+// AgentRequestPayload is one agent tool call relayed by the daemon to the
+// control plane (the agent talks to the network only through the MCP
+// bridge -> daemon Unix socket -> this envelope; the host credential never
+// reaches the agent). The control plane derives the acting instance from
+// the host connection and validates it against the payload.
+type AgentRequestPayload struct {
+	InstanceID string          `json:"instanceId"`
+	Tool       string          `json:"tool"` // fixed network_* tool name (PROTOCOL §6)
+	Args       json.RawMessage `json:"args"`
+}
+
+// AgentResponsePayload answers one AgentRequest. RequestID is the
+// request envelope's id; the daemon correlates it with the waiting
+// bridge-socket client.
+type AgentResponsePayload struct {
+	RequestID string          `json:"requestId"`
+	OK        bool            `json:"ok"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
+}
+
+// InteractionEventPayload is a normalized native runtime interaction the
+// adapter observed (Phase 5). The daemon mints InteractionID (idempotency
+// across reconnect/resend); the control plane stores it and orchestrates
+// around it. The vendor payload stays opaque — never parsed server-side
+// for correctness.
+type InteractionEventPayload struct {
+	// InteractionID is the pagnet-side id (daemon-minted; idempotency key).
+	InteractionID string `json:"interactionId"`
+	InstanceID    string `json:"instanceId"`
+	// SessionID is the runtime-native session the interaction belongs to.
+	SessionID string `json:"sessionId,omitempty"`
+	Runtime   string `json:"runtime"`
+	// NativeInteractionID is the runtime's own id for the interaction
+	// ("" when the runtime does not name them).
+	NativeInteractionID string `json:"nativeInteractionId,omitempty"`
+	// Kind: question | permission | plan_approval | authentication |
+	// confirmation | other.
+	Kind string `json:"kind"`
+	// Summary is a public-safe one-liner (never protected content).
+	Summary string `json:"summary,omitempty"`
+	// NativePayload is the opaque, versioned vendor payload (as-is).
+	NativePayload json.RawMessage `json:"nativePayload,omitempty"`
+	// CorrelationID links the started/resolved pair.
+	CorrelationID string `json:"correlationId,omitempty"`
+	// Resolved marks a resolution (MsgInteractionResolved).
+	Resolved bool `json:"resolved,omitempty"`
+	// Decision is the resolution outcome (resolved|declined|cancelled).
+	Decision string `json:"decision,omitempty"`
+	// Answer is the (opaque) answer, when the runtime reported one.
+	Answer string `json:"answer,omitempty"`
+}

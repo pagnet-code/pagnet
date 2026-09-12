@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
-	"github.com/pagnet-code/pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // Regression: runtime detection must resolve the CLI binary through the

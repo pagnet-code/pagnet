@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
-	"github.com/pagnet-code/pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // The coordination contract is kind-aware and must reach the model:

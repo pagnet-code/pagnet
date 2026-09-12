@@ -11,9 +11,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/pagnet-code/pagnet/internal/domain"
+	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
-	"github.com/pagnet-code/pagnet/internal/transport"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // sendInventory reports detected runtimes and workspaces to the control

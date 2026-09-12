@@ -1,0 +1,60 @@
+package domain
+
+import (
+	"context"
+	"time"
+)
+
+// Event is an immutable historical observation about something that happened
+// in the agent network. Events power monitoring, audit history, the graph
+// and the historical timeline.
+//
+// Events are a DOMAIN feature ("what happened in the agent network"), kept
+// deliberately separate from OpenTelemetry infrastructure telemetry.
+type Event struct {
+	ID            ID
+	TenantID      ID
+	NetworkID     *ID // nil for tenant-level events
+	Timestamp     time.Time
+	EventType     string
+	ActorType     string // user | host | agent_instance | system
+	ActorID       string
+	TargetType    string
+	TargetID      string
+	TaskID        *ID
+	MessageID     *ID
+	CorrelationID *ID
+	CausationID   *ID
+	TraceID       string
+	Metadata      map[string]any
+}
+
+// NewEvent builds an Event with a fresh ID/timestamp and correlation,
+// causation and trace context pulled from ctx where present.
+func NewEvent(ctx context.Context, tenantID ID, networkID *ID, eventType, actorType, actorID, targetType, targetID string, metadata map[string]any) Event {
+	ev := Event{
+		ID:         NewID(),
+		TenantID:   tenantID,
+		NetworkID:  networkID,
+		Timestamp:  time.Now().UTC(),
+		EventType:  eventType,
+		ActorType:  actorType,
+		ActorID:    actorID,
+		TargetType: targetType,
+		TargetID:   targetID,
+		Metadata:   metadata,
+	}
+	if metadata == nil {
+		ev.Metadata = map[string]any{}
+	}
+	if id, ok := CorrelationID(ctx); ok {
+		ev.CorrelationID = &id
+	}
+	if id, ok := CausationID(ctx); ok {
+		ev.CausationID = &id
+	}
+	if span := traceSpan(ctx); span.SpanContext().IsValid() {
+		ev.TraceID = span.SpanContext().TraceID().String()
+	}
+	return ev
+}
