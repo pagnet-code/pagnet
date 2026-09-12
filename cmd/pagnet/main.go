@@ -83,6 +83,7 @@ func main() {
 		unenrollCmd(),
 		workerCmd(),
 		daemonCmd(),
+		updateCmd(),
 		versionCmd(),
 		runCmd(),
 		networkCmd(),
