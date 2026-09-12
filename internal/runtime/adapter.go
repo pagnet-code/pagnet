@@ -11,6 +11,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 
 	"pagnet/internal/domain"
@@ -74,6 +75,9 @@ type TurnEvent struct {
 	Error       string
 	// RetryAt is ONLY set from a provider-provided value (never guessed).
 	RetryAt *string
+	// Interaction is set on EventInteractionStarted /
+	// EventInteractionResolved (nil for all other event types).
+	Interaction *InteractionEvent
 }
 
 // TurnEvent types (generic; NOT runtime-specific).
@@ -86,7 +90,48 @@ const (
 	EventTurnFailed     = "runtime.turn.failed"
 	// EventSessionLost: a resume was requested but no usable session existed.
 	EventSessionLost = "runtime.session.lost"
+	// EventInteractionStarted: the runtime began a native interaction
+	// (question, permission prompt, plan approval, ...). Carries
+	// Interaction. Pagnet observes it; it does NOT render it (plan §8.1).
+	EventInteractionStarted = "runtime.interaction.started"
+	// EventInteractionResolved: a pending native interaction was resolved
+	// (in the native TUI or remotely). Carries Interaction (Resolved=true).
+	EventInteractionResolved = "runtime.interaction.resolved"
 )
+
+// InteractionEvent is a normalized observation of a native runtime
+// interaction. The adapter emits it on the turn's events channel as
+// EventInteractionStarted / EventInteractionResolved; the daemon translates
+// it into the host protocol. The vendor payload stays opaque — the server
+// never parses it for correctness (plan §8.2).
+type InteractionEvent struct {
+	// Runtime is the canonical runtime name (the daemon fills it from the
+	// instance when the adapter leaves it empty).
+	Runtime domain.RuntimeName
+	// SessionID is the runtime-native session the interaction belongs to.
+	SessionID string
+	// NativeInteractionID is the runtime's own id for the interaction
+	// ("" when the runtime does not name them).
+	NativeInteractionID string
+	// Kind: question | permission | plan_approval | authentication |
+	// confirmation | other.
+	Kind string
+	// Summary is a public-safe one-liner (notifications/UI). It is NEVER
+	// protected content — the protected material stays in the native TUI.
+	Summary string
+	// NativePayload is the opaque, versioned vendor payload (stored as-is).
+	NativePayload json.RawMessage
+	// CorrelationID links the started/resolved pair and any pagnet-side
+	// correlation the runtime supplied.
+	CorrelationID string
+	// Resolved marks a resolution event (false = started).
+	Resolved bool
+	// Decision is the resolution outcome (resolved|declined|cancelled),
+	// set when Resolved.
+	Decision string
+	// Answer is the (opaque) answer, when the runtime reported one.
+	Answer string
+}
 
 // Adapter is the contract a runtime implements.
 type Adapter interface {
@@ -118,4 +163,36 @@ type Adapter interface {
 	// Env are set the same way as for a turn. The caller owns the returned
 	// command (it is started under a PTY by the daemon).
 	InteractiveCmd(spec TurnSpec) (*exec.Cmd, error)
+}
+
+// InteractionObserver is the native-interaction capability model (plan
+// §8.3). It is a SUB-interface: an Adapter that can observe the runtime's
+// native interactions (questions, permission prompts, plan approvals, ...)
+// implements it, and the daemon/control plane query it to decide how to
+// handle a pending interaction (defer vs wait, remote-resolve vs
+// native-TUI-only). Adapters without a documented observation hook do not
+// implement it — the conservative default is "cannot observe" (the daemon
+// treats a non-implementer as ObserveInteractions()==false).
+//
+// The event normalization surface is the TurnEvent channel: an observing
+// adapter emits EventInteractionStarted / EventInteractionResolved (carrying
+// an InteractionEvent) from StartTurn, exactly like the other turn events.
+type InteractionObserver interface {
+	// ObserveInteractions reports whether the adapter can observe native
+	// interactions at all (a documented hook / structured output exists
+	// today). Conservative: false unless a hook is actually wired.
+	ObserveInteractions() bool
+	// NativeInteractiveUI reports whether the runtime has a native
+	// interactive TUI — the place a human answers when pagnet cannot
+	// remote-resolve the interaction.
+	NativeInteractiveUI() bool
+	// SupportsDeferredInteraction reports whether a turn can exit safely
+	// while a pending interaction of kind is stored (headless defer: the
+	// instance may hibernate and be woken later).
+	SupportsDeferredInteraction(kind string) bool
+	// SupportsRemoteResolve reports whether a pending interaction of kind
+	// can be resolved remotely (the runtime can supply the answer back
+	// into the native session). When false, the answer must be given in
+	// the native TUI and the remote-resolve API rejects with 409.
+	SupportsRemoteResolve(kind string) bool
 }

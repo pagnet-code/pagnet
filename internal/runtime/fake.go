@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"pagnet/internal/domain"
 )
@@ -38,6 +39,45 @@ func NewFake(binary string) *Fake {
 }
 
 func (f *Fake) Name() domain.RuntimeName { return domain.RuntimeFake }
+
+// --- native-interaction capability model (plan §8.3) ------------------------
+//
+// The fake is the reference observing adapter: it CAN observe interactions
+// (its helper is scriptable to emit them) and it has a native interactive
+// UI (its PTY mode). Whether a pending interaction may be deferred (turn
+// exits, instance hibernates) or resolved remotely is a per-deployment knob
+// driven by the SAME env pairs that script the helper subprocess, so the
+// reported capability and the simulated behavior always agree:
+//
+//	PAGNET_FAKE_DEFER=1            -> SupportsDeferredInteraction = true
+//	PAGNET_FAKE_REMOTE_RESOLVE=1   -> SupportsRemoteResolve = true
+//
+// Both default to false (the conservative "cannot defer / cannot
+// remote-resolve" posture), matching a runtime with no official defer or
+// remote-answer mechanism.
+
+func (f *Fake) ObserveInteractions() bool { return true }
+
+func (f *Fake) NativeInteractiveUI() bool { return true }
+
+func (f *Fake) SupportsDeferredInteraction(kind string) bool {
+	return f.envValue("PAGNET_FAKE_DEFER") == "1"
+}
+
+func (f *Fake) SupportsRemoteResolve(kind string) bool {
+	return f.envValue("PAGNET_FAKE_REMOTE_RESOLVE") == "1"
+}
+
+// envValue reads a KEY=VALUE pair from the adapter's Env (the same pairs
+// handed to the spawned helper), "" when absent.
+func (f *Fake) envValue(key string) string {
+	for _, kv := range f.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			return v
+		}
+	}
+	return ""
+}
 
 func (f *Fake) Available() bool {
 	_, err := f.binary()
@@ -186,6 +226,15 @@ type wireEvent struct {
 	Kind         string  `json:"kind,omitempty"`
 	Error        string  `json:"error,omitempty"`
 	RetryAt      *string `json:"retryAt,omitempty"`
+	// Native-interaction fields (EventInteractionStarted / Resolved). The
+	// daemon mints the pagnet-side interaction id (idempotency); the helper
+	// only supplies the runtime-native id + the normalized fields.
+	NativeInteractionID string          `json:"nativeInteractionId,omitempty"`
+	InteractionKind     string          `json:"interactionKind,omitempty"`
+	Summary             string          `json:"summary,omitempty"`
+	NativePayload       json.RawMessage `json:"nativePayload,omitempty"`
+	Decision            string          `json:"decision,omitempty"`
+	Answer              string          `json:"answer,omitempty"`
 }
 
 // normalize maps a wire event to the adapter's TurnEvent vocabulary.
@@ -205,6 +254,22 @@ func normalize(ev wireEvent) TurnEvent {
 	case EventSessionStarted, EventSessionResumed, EventTurnStarted,
 		EventTurnOutput, EventTurnCompleted, EventTurnFailed, EventSessionLost:
 		// pass through
+	case EventInteractionStarted, EventInteractionResolved:
+		// Native interaction observed: normalize into the generic
+		// InteractionEvent (the vendor payload stays opaque). The daemon
+		// mints the pagnet-side id + correlation; the native id links the
+		// started/resolved pair.
+		out.Interaction = &InteractionEvent{
+			Runtime:             domain.RuntimeFake,
+			SessionID:           ev.SessionID,
+			NativeInteractionID: ev.NativeInteractionID,
+			Kind:                ev.InteractionKind,
+			Summary:             ev.Summary,
+			NativePayload:       ev.NativePayload,
+			Resolved:            ev.Event == EventInteractionResolved,
+			Decision:            ev.Decision,
+			Answer:              ev.Answer,
+		}
 	default:
 		// Unknown event names from the helper are surfaced as output so
 		// nothing is silently dropped.

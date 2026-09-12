@@ -62,6 +62,18 @@ func NewQwen(binary string) *Qwen {
 
 func (q *Qwen) Name() domain.RuntimeName { return domain.RuntimeQwenCode }
 
+// Native-interaction capability model (plan §8.3): CONSERVATIVE. The
+// stream-json surface the adapter consumes today (system/assistant/result)
+// carries no documented interaction hook, so the adapter reports it cannot
+// observe, defer, or remote-resolve native interactions. The runtime DOES
+// have a native interactive TUI (the PTY attach path). Wiring real
+// observation (a documented hook / plugin event) is a follow-up — the flags
+// must flip only when a tested integration exists, never by assumption.
+func (q *Qwen) ObserveInteractions() bool            { return false }
+func (q *Qwen) NativeInteractiveUI() bool            { return true }
+func (q *Qwen) SupportsDeferredInteraction(string) bool { return false }
+func (q *Qwen) SupportsRemoteResolve(string) bool     { return false }
+
 func (q *Qwen) Available() bool {
 	_, err := q.binary()
 	return err == nil

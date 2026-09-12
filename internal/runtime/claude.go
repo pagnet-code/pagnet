@@ -64,6 +64,17 @@ func NewClaude(binary string) *Claude {
 
 func (c *Claude) Name() domain.RuntimeName { return domain.RuntimeClaudeCode }
 
+// Native-interaction capability model (plan §8.3): CONSERVATIVE. The
+// stream-json surface the adapter consumes today carries no documented
+// interaction hook, so the adapter reports it cannot observe, defer, or
+// remote-resolve native interactions. The runtime DOES have a native
+// interactive TUI (the PTY attach path). Wiring real observation is a
+// follow-up — the flags flip only when a tested integration exists.
+func (c *Claude) ObserveInteractions() bool              { return false }
+func (c *Claude) NativeInteractiveUI() bool              { return true }
+func (c *Claude) SupportsDeferredInteraction(string) bool { return false }
+func (c *Claude) SupportsRemoteResolve(string) bool      { return false }
+
 func (c *Claude) Available() bool {
 	_, err := c.binary()
 	return err == nil

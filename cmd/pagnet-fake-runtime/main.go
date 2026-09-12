@@ -73,6 +73,15 @@ type event struct {
 	Kind         string  `json:"kind,omitempty"`
 	Error        string  `json:"error,omitempty"`
 	RetryAt      *string `json:"retryAt,omitempty"`
+	// Native-interaction fields (Phase 5). The helper only supplies the
+	// runtime-native id + normalized fields; the adapter/daemon mint the
+	// pagnet-side interaction id.
+	NativeInteractionID string          `json:"nativeInteractionId,omitempty"`
+	InteractionKind     string          `json:"interactionKind,omitempty"`
+	Summary             string          `json:"summary,omitempty"`
+	NativePayload       json.RawMessage `json:"nativePayload,omitempty"`
+	Decision            string          `json:"decision,omitempty"`
+	Answer              string          `json:"answer,omitempty"`
 }
 
 func emit(e event) {
@@ -149,6 +158,43 @@ func main() {
 	}
 
 	emit(event{Event: "runtime.turn.started", SessionID: prev.SessionID})
+
+	// Native-interaction simulation (Phase 5): when scripted, the fake
+	// "asks" a native question mid-turn (runtime.interaction.started) and,
+	// when also scripted, the (fake) user answers in the native TUI before
+	// the turn ends (runtime.interaction.resolved). The turn ALWAYS
+	// completes — the fake is process-per-turn; "defer" (PAGNET_FAKE_DEFER)
+	// only changes how the DAEMON treats the pending interaction (hibernate
+	// vs keep waiting), not whether the process exits.
+	if kind := os.Getenv("PAGNET_FAKE_INTERACTION"); kind != "" {
+		nativeID := "fake-int-" + short(s.InstanceID)
+		payload, _ := json.Marshal(map[string]any{
+			"version": 1,
+			"prompt":  "fake native question (opaque vendor payload)",
+		})
+		summary := os.Getenv("PAGNET_FAKE_INTERACTION_SUMMARY")
+		if summary == "" {
+			summary = "fake " + kind + " (simulated)"
+		}
+		emit(event{
+			Event:               "runtime.interaction.started",
+			SessionID:           prev.SessionID,
+			NativeInteractionID: nativeID,
+			InteractionKind:     kind,
+			Summary:             summary,
+			NativePayload:       payload,
+		})
+		if decision := os.Getenv("PAGNET_FAKE_INTERACTION_RESOLVE"); decision != "" {
+			emit(event{
+				Event:               "runtime.interaction.resolved",
+				SessionID:           prev.SessionID,
+				NativeInteractionID: nativeID,
+				InteractionKind:     kind,
+				Decision:            decision,
+				Answer:              os.Getenv("PAGNET_FAKE_INTERACTION_ANSWER"),
+			})
+		}
+	}
 
 	// Deterministic "work": echo the input; transcript-level network means
 	// the daemon receives one output chunk.

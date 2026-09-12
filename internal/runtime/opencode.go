@@ -65,6 +65,17 @@ func NewOpenCode(binary string) *OpenCode {
 
 func (o *OpenCode) Name() domain.RuntimeName { return domain.RuntimeOpenCode }
 
+// Native-interaction capability model (plan §8.3): CONSERVATIVE. The
+// surface the adapter consumes today carries no documented interaction
+// hook, so the adapter reports it cannot observe, defer, or remote-resolve
+// native interactions. The runtime DOES have a native interactive TUI (the
+// PTY attach path). Wiring real observation is a follow-up — the flags flip
+// only when a tested integration exists.
+func (o *OpenCode) ObserveInteractions() bool               { return false }
+func (o *OpenCode) NativeInteractiveUI() bool               { return true }
+func (o *OpenCode) SupportsDeferredInteraction(string) bool { return false }
+func (o *OpenCode) SupportsRemoteResolve(string) bool       { return false }
+
 func (o *OpenCode) Available() bool {
 	_, err := o.binary()
 	return err == nil
