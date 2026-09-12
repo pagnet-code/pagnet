@@ -1,16 +1,16 @@
-// Package config loads server and daemon configuration.
+// Package config loads host daemon configuration.
 //
 // Precedence: process environment > deploy/.env > ./.env > defaults.
 // The env files are a convenience for local development; real deployments
 // set the environment explicitly (or use a state dir for the daemon).
+//
+// The small env helpers (envDuration, loadEnvFileMap) are duplicated from
+// internal/configserver on purpose: after the repo split the two packages
+// live in different modules, so they cannot share an import.
 package config
 
 import (
 	"bufio"
-	"errors"
-	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,251 +19,6 @@ import (
 
 	"github.com/pagnet-code/pagnet/internal/runtime"
 )
-
-// ErrMissingDSN is returned when no DATABASE_URL is configured.
-var ErrMissingDSN = errors.New("DATABASE_URL is not set (see deploy/example.env)")
-
-// Server is the control plane configuration.
-type Server struct {
-	// Addr is the listen address (e.g. "127.0.0.1:18080").
-	Addr string
-	// DSN is the PostgreSQL connection string.
-	DSN string
-	// AuthMode: "token" (single admin bearer), "local" (DB users,
-	// Argon2id, sessions + API tokens) or "oidc" (external identity
-	// provider, config-driven). Validation is fail-closed (SEC-005):
-	// unknown modes and under-specified modes refuse startup.
-	AuthMode string
-	// AdminToken is the Bearer token for administrative API access in
-	// token mode. Empty in token mode is allowed: the server bootstraps
-	// a random token at startup and prints it exactly once (log) — the
-	// zero-setup open-source launch path.
-	AdminToken string
-	// OIDC configures the oidc auth mode. Provider-agnostic standard
-	// OIDC (Keycloak is one of many valid issuers) — nothing about a
-	// specific provider is hardcoded.
-	OIDC OIDC
-	// CORSOrigins are the allowed browser origins (CORS + WebSocket origin
-	// validation). Entries are exact origins ("https://console.example.com")
-	// or the shorthand "localhost" (http(s) on loopback, any port). Empty
-	// means same-origin only (hosted deployments behind one origin).
-	CORSOrigins []string
-	// TrustedProxies are the peers (CIDR or IP) allowed to forward the
-	// real client address via X-Forwarded-For / X-Real-IP (SEC-422).
-	// Empty = direct connections only; forwarding headers from any peer
-	// are ignored and rate-limit keys use the TCP peer.
-	TrustedProxies []string
-	// ReleaseDir, when set, serves worker bootstrap tarballs produced by
-	// `make release` at GET /download/<file> (the wget-install path for
-	// enrolling workers without root).
-	ReleaseDir string
-	// ReleaseVersion, when set (PAGNET_RELEASE_VERSION), is the latest
-	// worker release the control plane advertises to daemons for
-	// auto-update (host.latest_version, P6). The operator sets it when
-	// publishing a release (e.g. v0.3.0). Empty = advertise nothing
-	// (auto-update is a no-op — the safe default).
-	ReleaseVersion string
-	// PublicOrigin is the canonical public base URL of this control plane
-	// (e.g. "https://app.pagnet.dev"). When set, /install.sh renders it as
-	// the bootstrap base URL instead of deriving scheme://host from the
-	// request. Behind a TLS-terminating tunnel the request's
-	// X-Forwarded-Proto is unreliable (the intermediate ingress may report
-	// the internal http scheme), so a configured origin is the robust
-	// source of truth. Empty = derive from the request (direct deployments).
-	PublicOrigin string
-	// HeartbeatInterval is the expected host heartbeat period.
-	HeartbeatInterval time.Duration
-	// OfflineThreshold marks hosts offline after this silence.
-	OfflineThreshold time.Duration
-	// LogLevel: debug | info | warn | error
-	LogLevel string
-	// Telegram configures the Telegram channel gateway (addendum Phase G).
-	// Enabled when BotToken is set. The token is server-side only (§15).
-	Telegram Telegram
-}
-
-// Telegram is the Telegram channel gateway configuration.
-type Telegram struct {
-	// BotToken: server-side only — never passed to runtimes/MCP/logs (§15).
-	BotToken string
-	// SecretToken authenticates the public webhook (Telegram's supported
-	// secret-token mechanism). Generated at startup when empty.
-	SecretToken string
-	// WebhookURL is registered via setWebhook when set.
-	WebhookURL string
-	// AllowedUsers / AllowedChats: explicit §15 restrictions (comma-
-	// separated ids). When both are empty the pairing binding is the gate.
-	AllowedUsers []string
-	AllowedChats []string
-}
-
-// Enabled reports whether the Telegram channel should be started.
-func (t Telegram) Enabled() bool { return t.BotToken != "" }
-
-// OIDC configures the oidc auth mode (standard OIDC, any provider).
-type OIDC struct {
-	// Issuer is the OIDC issuer base URL (discovery: / .well-known/openid-
-	// configuration). e.g. https://keycloak.example.com/realms/pagnet.
-	Issuer string
-	// ClientID / ClientSecret are the registered confidential client.
-	ClientID     string
-	ClientSecret string
-	// RedirectURI is the EXACT URI registered with the provider for the
-	// authorization-code redirect (no wildcards; validated in Validate).
-	RedirectURI string
-}
-
-// Enabled reports whether the OIDC config is present (used for startup
-// checks in oidc mode).
-func (o OIDC) Enabled() bool { return o.Issuer != "" && o.ClientID != "" }
-
-// LoadServer reads server configuration from environment (with env-file
-// fallback).
-func LoadServer() (Server, error) {
-	LoadEnvFile("deploy/.env")
-	LoadEnvFile(".env")
-
-	cfg := Server{
-		Addr:              envOr("PAGNET_ADDR", "127.0.0.1:18080"),
-		DSN:               envOr("DATABASE_URL", ""),
-		AuthMode:          envOr("PAGNET_AUTH_MODE", "token"),
-		AdminToken:        envOr("PAGNET_ADMIN_TOKEN", ""),
-		HeartbeatInterval: envDuration("PAGNET_HEARTBEAT_INTERVAL", 15*time.Second),
-		OfflineThreshold:  envDuration("PAGNET_OFFLINE_THRESHOLD", 45*time.Second),
-		LogLevel:          envOr("PAGNET_LOG_LEVEL", "info"),
-		Telegram: Telegram{
-			BotToken:    envOr("PAGNET_TG_BOT_TOKEN", ""),
-			SecretToken: envOr("PAGNET_TG_SECRET_TOKEN", ""),
-			WebhookURL:  envOr("PAGNET_TG_WEBHOOK_URL", ""),
-		},
-	}
-	if v := os.Getenv("PAGNET_TG_ALLOWED_USERS"); v != "" {
-		cfg.Telegram.AllowedUsers = splitCSV(v)
-	}
-	if v := os.Getenv("PAGNET_TG_ALLOWED_CHATS"); v != "" {
-		cfg.Telegram.AllowedChats = splitCSV(v)
-	}
-	if v := os.Getenv("PAGNET_CORS_ORIGINS"); v != "" {
-		cfg.CORSOrigins = splitCSV(v)
-	}
-	if v := os.Getenv("PAGNET_TRUSTED_PROXIES"); v != "" {
-		cfg.TrustedProxies = splitCSV(v)
-	}
-	if v := os.Getenv("PAGNET_RELEASE_DIR"); v != "" {
-		cfg.ReleaseDir = v
-	}
-	if v := os.Getenv("PAGNET_RELEASE_VERSION"); v != "" {
-		cfg.ReleaseVersion = strings.TrimSpace(v)
-	}
-	if v := os.Getenv("PAGNET_PUBLIC_ORIGIN"); v != "" {
-		cfg.PublicOrigin = strings.TrimRight(strings.TrimSpace(v), "/")
-	}
-	cfg.OIDC = OIDC{
-		Issuer:       envOr("OIDC_ISSUER", ""),
-		ClientID:     envOr("OIDC_CLIENT_ID", ""),
-		ClientSecret: envOr("OIDC_CLIENT_SECRET", ""),
-		RedirectURI:  envOr("OIDC_REDIRECT_URI", ""),
-	}
-	if cfg.DSN == "" {
-		return cfg, ErrMissingDSN
-	}
-	if err := cfg.Validate(); err != nil {
-		return cfg, err
-	}
-	return cfg, nil
-}
-
-// Validate enforces fail-closed auth/startup invariants (SEC-005). There is
-// deliberately no permissive fallback: a configuration that cannot be proven
-// safe refuses to start.
-func (s Server) Validate() error {
-	switch s.AuthMode {
-	case "token":
-		// Empty AdminToken is the zero-setup path: the server bootstraps
-		// a random token at startup and prints it exactly once. A
-		// configured token must be strong.
-		if s.AdminToken == "" {
-			break
-		}
-		if len(s.AdminToken) < 32 {
-			return fmt.Errorf("config: PAGNET_ADMIN_TOKEN must be at least 32 characters (got %d)", len(s.AdminToken))
-		}
-		for _, weak := range []string{"change-me", "changeme", "admin", "secret", "password", "pagnet"} {
-			if strings.EqualFold(s.AdminToken, weak) {
-				return fmt.Errorf("config: PAGNET_ADMIN_TOKEN is a known weak value (%q); set a high-entropy token", weak)
-			}
-		}
-	case "local":
-		// DB users + Argon2id + sessions. No extra env required; the
-		// first admin is created at first run (setup endpoint / CLI).
-	case "oidc":
-		if s.OIDC.Issuer == "" {
-			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_ISSUER")
-		}
-		if !strings.HasPrefix(s.OIDC.Issuer, "https://") && !isLoopbackURLOrEmpty(s.OIDC.Issuer, "http://") {
-			return fmt.Errorf("config: OIDC_ISSUER must be https:// (got %q); loopback http is allowed only for local development", s.OIDC.Issuer)
-		}
-		if s.OIDC.ClientID == "" || s.OIDC.ClientSecret == "" {
-			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET")
-		}
-		if s.OIDC.RedirectURI == "" {
-			return errors.New("config: PAGNET_AUTH_MODE=oidc requires OIDC_REDIRECT_URI (the exact URI registered with the provider)")
-		}
-		if !strings.HasPrefix(s.OIDC.RedirectURI, "https://") && !strings.HasPrefix(s.OIDC.RedirectURI, "http://") {
-			return fmt.Errorf("config: OIDC_REDIRECT_URI must be a full http(s) URI (got %q)", s.OIDC.RedirectURI)
-		}
-		if strings.ContainsAny(s.OIDC.RedirectURI, "*") {
-			return errors.New("config: OIDC_REDIRECT_URI must not contain wildcards (the provider must accept it exactly)")
-		}
-	default:
-		return fmt.Errorf("config: unknown PAGNET_AUTH_MODE %q (want \"token\", \"local\" or \"oidc\")", s.AuthMode)
-	}
-	return nil
-}
-
-// isLoopbackURLOrEmpty reports whether uri starts with prefix and is a
-// loopback host (local development against a local IdP / test mocks).
-func isLoopbackURLOrEmpty(uri, prefix string) bool {
-	if !strings.HasPrefix(uri, prefix) {
-		return false
-	}
-	u, err := url.Parse(uri)
-	if err != nil {
-		return false
-	}
-	host, _, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		host = u.Host
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-// IsLoopbackAddr reports whether a listen address binds only to loopback.
-// An empty host (":18080") binds all interfaces and is NOT loopback.
-func IsLoopbackAddr(addr string) bool {
-	host := addr
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		host = h
-	}
-	if host == "" {
-		return false
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return host == "localhost"
-}
-
-func splitCSV(v string) []string {
-	var out []string
-	for _, part := range strings.Split(v, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
 
 // Daemon is the host daemon configuration.
 type Daemon struct {
@@ -315,8 +70,8 @@ type Daemon struct {
 // .env) for the daemon's own keys only, then the daemon state file
 // (stateDir/config.yaml) for persistent values (server URL, host name).
 //
-// Unlike LoadServer, the daemon NEVER os.Setenv values from the env files:
-// deploy/.env carries control-plane secrets (DATABASE_URL,
+// Unlike the server's LoadServer, the daemon NEVER os.Setenv values from
+// the env files: deploy/.env carries control-plane secrets (DATABASE_URL,
 // PAGNET_ADMIN_TOKEN) and the daemon spawns untrusted agent processes —
 // a value set in the daemon's process environment would be inherited by
 // every runtime (spec §86.10: agent processes must not receive
@@ -422,18 +177,6 @@ func exists(p string) bool {
 	return err == nil
 }
 
-// LoadEnvFile reads KEY=VALUE lines from p and sets any variable that is not
-// already present in the environment. Missing file is not an error.
-// Restricted to LoadServer: the server process is trusted, while the daemon
-// (which spawns agent processes) must use loadEnvFileMap instead.
-func LoadEnvFile(p string) {
-	for k, v := range loadEnvFileMap(p) {
-		if _, present := os.LookupEnv(k); !present {
-			_ = os.Setenv(k, v)
-		}
-	}
-}
-
 // loadEnvFileMap parses KEY=VALUE lines from p into a map without touching
 // the process environment. Missing file is not an error.
 func loadEnvFileMap(p string) map[string]string {
@@ -461,13 +204,6 @@ func loadEnvFileMap(p string) map[string]string {
 		out[key] = val
 	}
 	return out
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
