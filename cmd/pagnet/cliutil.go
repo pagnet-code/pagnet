@@ -60,9 +60,17 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	}
 	c.cfg = cfg
 	// Bearer precedence: --token / $PAGNET_TOKEN, then the token stored by
-	// `pagnet login` (config.yaml "token" key).
+	// `pagnet login` (OS keyring, or the config.yaml fallback).
 	if c.token = userToken; c.token == "" {
-		c.token = loadUserToken(c.stateDir)
+		c.token = loadUserToken(c.stateDir, c.base)
+	}
+	// No stored credentials + oidc mode: run the device flow once (interactive)
+	// so the original command continues without a re-run. Non-oidc modes and
+	// non-TTY contexts keep the existing 401 / clear-error behavior.
+	if c.token == "" {
+		if err := ensureUserToken(c); err != nil {
+			return nil, err
+		}
 	}
 	return c, nil
 }

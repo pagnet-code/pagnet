@@ -344,6 +344,10 @@ func openBrowser(url string) error {
 	return nil
 }
 
+// openBrowserFn is a test seam for openBrowser (the device flow uses it so
+// tests can observe / suppress the browser-open attempt).
+var openBrowserFn = openBrowser
+
 // --- init --------------------------------------------------------------------
 
 // pagnetYAML is the optional project config (spec §13). It is never
@@ -532,7 +536,7 @@ func doctorCmd() *cobra.Command {
 			// and never authenticate the CLI.
 			restToken := userToken
 			if restToken == "" {
-				restToken = loadUserToken(stateDir)
+				restToken = loadUserToken(stateDir, server)
 			}
 			if restToken != "" {
 				req2, _ := http.NewRequest(http.MethodGet, server+"/api/v1/hosts", nil)

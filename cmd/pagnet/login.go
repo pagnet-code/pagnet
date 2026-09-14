@@ -20,11 +20,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/99designs/keyring"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -106,7 +108,7 @@ func loginCmd() *cobra.Command {
 				fmt.Println("local mode: signed in; a new API token was created for the CLI.")
 
 			case "oidc":
-				apiToken, err := loginOIDCDeviceFlow(client, base, noBrowser)
+				apiToken, err := loginOIDCDeviceFlow(base, noBrowser)
 				if err != nil {
 					return err
 				}
@@ -151,8 +153,34 @@ func bearerMe(client *http.Client, base, token string) (bool, error) {
 
 // --- token storage (user bearer in the shared state file) ---------------------
 
-// loadUserToken reads the stored user bearer ("" when absent).
-func loadUserToken(stateDir string) string {
+// credentialKey is the OS-keyring key for a server's user token (scoped per
+// server so different control planes keep separate credentials).
+func credentialKey(server string) string {
+	return "pagnet-token-" + strings.TrimSuffix(server, "/")
+}
+
+// openKeyringFn opens the OS keyring (a test seam: replace it to force the
+// 0600-file fallback in tests, where no system keyring is available). An
+// empty Config means "all available backends".
+var openKeyringFn = func() (keyring.Keyring, error) {
+	return keyring.Open(keyring.Config{})
+}
+
+// loadUserToken reads the stored user bearer ("" when absent). The OS keyring
+// is preferred when available; the 0600 state file is the fallback.
+func loadUserToken(stateDir, server string) string {
+	if server != "" {
+		if kr, err := openKeyringFn(); err == nil {
+			if item, err := kr.Get(credentialKey(server)); err == nil {
+				return string(item.Data)
+			}
+		}
+	}
+	return loadUserTokenFile(stateDir)
+}
+
+// loadUserTokenFile reads the token from the state file (the fallback store).
+func loadUserTokenFile(stateDir string) string {
 	b, err := os.ReadFile(filepath.Join(stateDir, "config.yaml"))
 	if err != nil {
 		return ""
@@ -194,13 +222,57 @@ func mergeConfigFile(stateDir string, fields map[string]any) error {
 	return os.WriteFile(path, b, 0o600)
 }
 
-// saveUserToken stores the user bearer (and the server it came from).
+// saveUserToken stores the user bearer. The OS keyring is preferred when
+// available (the token is then removed from the file); otherwise the 0600
+// state file is the fallback. The server URL (non-secret) is always kept in
+// the file.
 func saveUserToken(stateDir, server, token string) error {
-	fields := map[string]any{"token": token}
+	fields := map[string]any{}
 	if server != "" {
 		fields["serverUrl"] = strings.TrimSuffix(server, "/")
 	}
+	if kr, err := openKeyringFn(); err == nil {
+		if err := kr.Set(keyring.Item{
+			Key:   credentialKey(server),
+			Data:  []byte(token),
+			Label: "Pagnet API token",
+		}); err == nil {
+			// Keyring holds the token: drop the file copy (a previous
+			// fallback login may have left one there).
+			return clearFileToken(stateDir, fields)
+		}
+		// Keyring set failed: fall through to the file fallback.
+	}
+	fields["token"] = token
 	return mergeConfigFile(stateDir, fields)
+}
+
+// clearFileToken removes the token from the state file (keeping other fields,
+// e.g. the server URL and host credential) — used when the keyring now holds
+// the token.
+func clearFileToken(stateDir string, fields map[string]any) error {
+	path := filepath.Join(stateDir, "config.yaml")
+	var fc map[string]any
+	if b, err := os.ReadFile(path); err == nil {
+		if err := yaml.Unmarshal(b, &fc); err != nil {
+			fc = map[string]any{}
+		}
+	}
+	if fc == nil {
+		fc = map[string]any{}
+	}
+	delete(fc, "token")
+	for k, v := range fields {
+		fc[k] = v
+	}
+	b, err := yaml.Marshal(fc)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
 
 // --- prompts ------------------------------------------------------------------
@@ -317,101 +389,249 @@ func loginLocalAPIToken(client *http.Client, base, username, password, label str
 	return created.Token, nil
 }
 
-// --- oidc mode: RFC 8628 device flow -------------------------------------------
+// --- oidc mode: RFC 8628 device flow (client-mediated) -------------------------
+//
+// The CLI is the OIDC client's public device: it runs the Device
+// Authorization Grant against the identity provider directly. The control
+// plane only (a) hands out the IdP endpoints + client id (device-config) and
+// (b) validates the resulting ID token and mints an API token (device/token).
 
-func loginOIDCDeviceFlow(client *http.Client, base string, noBrowser bool) (string, error) {
-	// 1. Start the flow.
-	resp, err := client.Post(base+"api/v1/auth/oidc/device", "application/json", strings.NewReader(`{}`))
+// deviceConfig is the control plane's device-config response (all strings).
+type deviceConfig struct {
+	Issuer                      string `json:"issuer"`
+	DeviceAuthorizationEndpoint string `json:"deviceAuthorizationEndpoint"`
+	TokenEndpoint               string `json:"tokenEndpoint"`
+	ClientID                    string `json:"clientId"`
+	Scope                       string `json:"scope"`
+}
+
+// loginOIDCDeviceFlow performs the client-mediated RFC 8628 device flow and
+// returns the minted pagnet API token. noBrowser (or $PAGNET_NO_BROWSER=1)
+// skips the browser-open attempt (the URL + code are always printed).
+func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// 1. Device config from the control plane (public endpoint).
+	var cfg deviceConfig
+	resp, err := client.Get(base + "api/v1/auth/oidc/device-config")
+	if err != nil {
+		return "", fmt.Errorf("device flow: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", apiError(resp, "could not fetch the device config (is the server in oidc mode?)")
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		resp.Body.Close()
+		return "", fmt.Errorf("device flow: %w", err)
+	}
+	resp.Body.Close()
+	if cfg.DeviceAuthorizationEndpoint == "" || cfg.TokenEndpoint == "" || cfg.ClientID == "" {
+		return "", errors.New("device flow: the server returned an incomplete device config")
+	}
+
+	// 2. Start the device flow at the IdP.
+	authForm := url.Values{}
+	authForm.Set("client_id", cfg.ClientID)
+	if cfg.Scope != "" {
+		authForm.Set("scope", cfg.Scope)
+	}
+	daResp, err := postForm(client, cfg.DeviceAuthorizationEndpoint, authForm)
+	if err != nil {
+		return "", fmt.Errorf("device flow: %w", err)
+	}
+	defer daResp.Body.Close()
+	if daResp.StatusCode != http.StatusOK {
+		return "", apiError(daResp, "could not start the device flow at the identity provider")
+	}
+	var da struct {
+		DeviceCode              string `json:"device_code"`
+		UserCode                string `json:"user_code"`
+		VerificationURI         string `json:"verification_uri"`
+		VerificationURIComplete string `json:"verification_uri_complete"`
+		ExpiresIn               int    `json:"expires_in"`
+		Interval                int    `json:"interval"`
+	}
+	if err := json.NewDecoder(daResp.Body).Decode(&da); err != nil || da.DeviceCode == "" {
+		return "", errors.New("device flow: unexpected device-authorization response")
+	}
+
+	// 3. Show the verification URL + code; best-effort open a browser.
+	verifyURL := da.VerificationURIComplete
+	if verifyURL == "" {
+		verifyURL = da.VerificationURI
+	}
+	if verifyURL == "" {
+		verifyURL = cfg.Issuer
+	}
+	fmt.Println("\nSign in with your identity provider:")
+	fmt.Printf("  1. Open  %s\n", verifyURL)
+	if da.UserCode != "" {
+		fmt.Printf("  2. Enter the code  %s\n\n", da.UserCode)
+	} else {
+		fmt.Println()
+	}
+	if !noBrowser && os.Getenv("PAGNET_NO_BROWSER") != "1" {
+		if err := openBrowserFn(verifyURL); err != nil {
+			fmt.Println("(could not open a browser:", err.Error(), "- open the URL above)")
+		}
+	}
+	fmt.Print("Waiting for authorization")
+
+	// 4. Poll the IdP token endpoint (RFC 8628). Respect the IdP's interval
+	//    and expires_in; hard-cap the wait at ~3 minutes.
+	interval := time.Duration(da.Interval) * time.Second
+	if interval < time.Second {
+		interval = time.Second
+	}
+	deadline := time.Now().Add(time.Duration(da.ExpiresIn) * time.Second)
+	if da.ExpiresIn <= 0 || time.Until(deadline) > 3*time.Minute {
+		deadline = time.Now().Add(3 * time.Minute)
+	}
+	for time.Now().Before(deadline) {
+		pollForm := url.Values{}
+		pollForm.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+		pollForm.Set("device_code", da.DeviceCode)
+		pollForm.Set("client_id", cfg.ClientID)
+		r, err := postForm(client, cfg.TokenEndpoint, pollForm)
+		if err != nil {
+			return "", fmt.Errorf("device flow: %w", err)
+		}
+		switch {
+		case r.StatusCode == http.StatusOK:
+			var ts struct {
+				IDToken string `json:"id_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&ts); err != nil || ts.IDToken == "" {
+				r.Body.Close()
+				return "", errors.New("device flow: the identity provider returned no ID token")
+			}
+			r.Body.Close()
+			fmt.Println(" done")
+			// 5. Exchange the ID token for a pagnet API token.
+			return exchangeIDToken(client, base, ts.IDToken)
+		case r.StatusCode == http.StatusBadRequest:
+			var e struct {
+				Error string `json:"error"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&e)
+			r.Body.Close()
+			switch e.Error {
+			case "authorization_pending", "":
+				// keep polling at the current interval
+			case "slow_down":
+				interval += 5 * time.Second // the IdP asked us to slow down
+			case "expired_token":
+				fmt.Println()
+				return "", errors.New("device flow expired before you signed in; run the command again")
+			case "access_denied":
+				fmt.Println()
+				return "", errors.New("you denied the login in the browser; run the command again")
+			default:
+				fmt.Println()
+				return "", fmt.Errorf("device flow: the identity provider rejected the device code (%s)", e.Error)
+			}
+		default:
+			raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+			r.Body.Close()
+			return "", fmt.Errorf("device flow: identity provider http %d: %s", r.StatusCode, raw)
+		}
+		time.Sleep(interval)
+	}
+	fmt.Println()
+	return "", errors.New("timed out waiting for browser authorization")
+}
+
+// exchangeIDToken posts the ID token to the control plane and returns the
+// minted pagnet API token.
+func exchangeIDToken(client *http.Client, base, idToken string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"idToken": idToken})
+	resp, err := client.Post(base+"api/v1/auth/oidc/device/token", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("device flow: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", apiError(resp, "could not exchange the ID token for an API token")
+	}
+	var ok struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil || !strings.HasPrefix(ok.Token, "pagt_") {
+		return "", errors.New("device flow: unexpected token-exchange response")
+	}
+	return ok.Token, nil
+}
+
+// postForm POSTs form-encoded data and returns the response (the caller owns
+// the body).
+func postForm(client *http.Client, u string, form url.Values) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	return client.Do(req)
+}
+
+// --- auto-login (no stored credentials -> device flow once -> continue) --------
+
+// hasTTY reports whether the process has an interactive terminal (stderr).
+// The device flow is interactive (it waits for browser authorization), so a
+// non-TTY context (script, CI) fails fast instead of looping.
+func hasTTY() bool {
+	return term.IsTerminal(int(os.Stderr.Fd()))
+}
+
+// hasTTYFn is a test seam for hasTTY.
+var hasTTYFn = hasTTY
+
+// serverAuthMode queries the public /auth/setup/status endpoint.
+func serverAuthMode(base string) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(base + "api/v1/auth/setup/status")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", apiError(resp, "could not start the device flow (is the server in oidc mode?)")
+		return "", fmt.Errorf("http %d", resp.StatusCode)
 	}
-	var da struct {
-		DeviceCode      string `json:"deviceCode"`
-		UserCode        string `json:"userCode"`
-		VerificationURI string `json:"verificationURI"`
-		ExpiresIn       int    `json:"expiresIn"`
+	var s struct {
+		Mode string `json:"mode"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&da); err != nil || da.DeviceCode == "" {
-		return "", errors.New("unexpected device-flow response")
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		return "", err
 	}
-	deadline := time.Now().Add(time.Duration(da.ExpiresIn) * time.Second)
-	if da.ExpiresIn <= 0 {
-		deadline = time.Now().Add(5 * time.Minute)
-	}
+	return s.Mode, nil
+}
 
-	verifyURL := da.VerificationURI
-	if verifyURL == "" {
-		verifyURL = base
+// ensureUserToken makes the CLI's user bearer available for an authenticated
+// command. When no token is stored and the server is in oidc mode, it runs the
+// device flow once (interactive) and stores the resulting token, so the
+// original command continues without a re-run. Without a TTY it fails with a
+// clear error instead of looping. Non-oidc modes keep the existing 401 path.
+func ensureUserToken(c *cliCtx) error {
+	if c.token != "" || c.base == "" {
+		return nil
 	}
-	fmt.Println("\nSign in with your identity provider:")
-	fmt.Printf("  1. Open  %s\n", verifyURL)
-	fmt.Printf("  2. Enter the code  %s\n\n", da.UserCode)
-	if !noBrowser {
-		// Best effort: the printed URL above is the headless fallback.
-		_ = openBrowser(verifyURL)
+	mode, err := serverAuthMode(c.base)
+	if err != nil || mode != "oidc" {
+		return nil // not oidc mode (or unreachable): keep the existing 401 behavior
 	}
-	fmt.Print("Waiting for authorization")
-
-	// 2. Poll. The server long-polls the provider (~25s per request) and
-	//    answers 401 authorization_pending until the user authorizes.
-	pending := 0
-	for time.Now().Before(deadline) {
-		req, _ := http.NewRequest(http.MethodPost, base+"api/v1/auth/oidc/device/token",
-			strings.NewReader(fmt.Sprintf(`{"deviceCode":%q}`, da.DeviceCode)))
-		req.Header.Set("Content-Type", "application/json")
-		r, err := client.Do(req)
-		if err != nil {
-			return "", fmt.Errorf("device flow: %w", err)
-		}
-		switch r.StatusCode {
-		case http.StatusOK:
-			var ok struct {
-				APIToken string `json:"apiToken"`
-			}
-			defer r.Body.Close()
-			if err := json.NewDecoder(r.Body).Decode(&ok); err != nil ||
-				!strings.HasPrefix(ok.APIToken, "pagt_") {
-				return "", errors.New("unexpected device-flow token response")
-			}
-			fmt.Println(" done")
-			return ok.APIToken, nil
-		case http.StatusUnauthorized:
-			var e struct {
-				Error struct {
-					Code string `json:"code"`
-				} `json:"error"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&e)
-			r.Body.Close()
-			switch e.Error.Code {
-			case "authorization_pending":
-				pending++
-				if pending%3 == 0 {
-					fmt.Print(".")
-				}
-				// The server already waited its poll window; a short
-				// local pause keeps the provider's rate limits happy.
-				time.Sleep(2 * time.Second)
-				continue
-			case "device_code_invalid", "device_code_expired":
-				fmt.Println()
-				return "", fmt.Errorf("device flow: %s — start again", e.Error.Code)
-			default:
-				fmt.Println()
-				return "", errors.New("device flow: authorization pending (unknown server response)")
-			}
-		default:
-			raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
-			r.Body.Close()
-			return "", fmt.Errorf("device flow: http %d: %s", r.StatusCode, raw)
-		}
+	if !hasTTYFn() {
+		return errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first")
 	}
-	fmt.Println()
-	return "", errors.New("timed out waiting for browser authorization")
+	token, err := loginOIDCDeviceFlow(c.base, false)
+	if err != nil {
+		return err
+	}
+	c.token = token
+	if err := saveUserToken(c.stateDir, c.base, token); err != nil {
+		return err
+	}
+	fmt.Printf("signed in; token stored in %s\n", c.stateDir)
+	return nil
 }
 
 // apiError renders the server's {"error":{"code","message"}} shape.
