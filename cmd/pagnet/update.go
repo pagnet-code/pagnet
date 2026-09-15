@@ -38,7 +38,7 @@ func updateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&stateDir, "state-dir", "",
-		"daemon state dir (default ~/.pagnet; used to detect a running daemon)")
+		"daemon state dir (default ~/.pagnet; stored control plane URL + running-daemon detection)")
 	return cmd
 }
 
@@ -47,7 +47,12 @@ func updateCmd() *cobra.Command {
 // then print how to restart the daemon so the new version takes effect.
 func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
 	if serverURL == "" {
-		return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+		// No --server / $PAGNET_SERVER: on an already-connected machine the
+		// stored control plane applies (same rule as login / the REST commands).
+		serverURL = storedServerURL(stateDir)
+	}
+	if serverURL == "" {
+		return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}
 	// Resolve SELF explicitly (canonicalized): a bare name would make the
 	// replace a PATH guess, and a symlinked install must update the real

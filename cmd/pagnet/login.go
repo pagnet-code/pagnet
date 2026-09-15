@@ -87,6 +87,7 @@ func loginCmd() *cobra.Command {
 			}
 			resp.Body.Close()
 
+			saved := false
 			switch status.Mode {
 			case "token":
 				if token == "" {
@@ -125,20 +126,23 @@ func loginCmd() *cobra.Command {
 			case "oidc":
 				// Reuse the shared helper: it validates a stored token
 				// first (idempotent re-login) and runs the sign-in flow
-				// otherwise.
+				// otherwise. It persists the token itself.
 				apiToken, err := ensureUserToken(stateDir, base, noBrowser, hasTTYFn())
 				if err != nil {
 					return err
 				}
 				token = apiToken
+				saved = true
 				fmt.Println("signed in.")
 
 			default:
 				return fmt.Errorf("unknown server auth mode %q", status.Mode)
 			}
 
-			if err := saveUserToken(stateDir, base, token); err != nil {
-				return err
+			if !saved {
+				if err := saveUserToken(stateDir, base, token); err != nil {
+					return err
+				}
 			}
 			fmt.Printf("token stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
 			fmt.Println("override per call with --token or $PAGNET_TOKEN")
@@ -659,6 +663,16 @@ func serverAuthMode(base string) (string, error) {
 	return s.Mode, nil
 }
 
+// storedServerURL returns the control plane URL from the daemon state config
+// ("" when absent or unreadable) — the fallback for commands on an already
+// connected machine when --server / $PAGNET_SERVER is empty.
+func storedServerURL(stateDir string) string {
+	if cfg, err := config.LoadDaemon(stateDir); err == nil {
+		return cfg.ServerURL
+	}
+	return ""
+}
+
 // ensureUserToken makes the CLI's user bearer available for an authenticated
 // command:
 //
@@ -676,6 +690,9 @@ func serverAuthMode(base string) (string, error) {
 // --token / $PAGNET_TOKEN must not call this at all: the short-circuit
 // happens before any endpoint is touched.
 func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string, error) {
+	if base == "" {
+		return "", errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
+	}
 	if !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
@@ -713,7 +730,7 @@ func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string
 			return "", errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first (or set --token / $PAGNET_TOKEN)")
 		}
 		var username, password string
-		if username, err = askLine("username: "); err != nil {
+		if username, err = askLineFn("username: "); err != nil {
 			return "", err
 		}
 		if password, err = askPassword("password: "); err != nil {

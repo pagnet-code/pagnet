@@ -36,7 +36,13 @@ func demoCmd() *cobra.Command {
 			// bearer token authenticates the REST calls; empty means dev
 			// loopback auto-admin.
 			if serverURL == "" {
-				return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+				// No --server / $PAGNET_SERVER: on an already-connected
+				// machine the stored control plane applies (same rule as
+				// login / the REST commands).
+				serverURL = storedServerURL("")
+			}
+			if serverURL == "" {
+				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 			}
 			c := &cliCtx{base: serverURL, token: adminToken}
 			return runDemo(c, network, webURL)

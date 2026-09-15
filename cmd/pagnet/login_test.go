@@ -109,7 +109,7 @@ func newStubIdP(t *testing.T, pollResponses []string) *stubIdP {
 // id_token for a pagt_ token, and (for the self-enroll test) mints + consumes
 // a one-time enrollment token.
 type stubPagnetServer struct {
-	URL string
+	URL  string
 	mode string
 
 	mu                sync.Mutex
@@ -577,5 +577,40 @@ func TestNewCLITokenShortCircuit(t *testing.T) {
 	// The short-circuit: zero device-endpoint calls.
 	if n := ts.deviceConfigCallCount(); n != 0 {
 		t.Errorf("device-config calls = %d, want 0 (--token short-circuits the flow)", n)
+	}
+}
+
+// --- first-run hardening: the "/" error must have no producer ---------------
+
+// An empty base must produce the clean "no control plane URL" error, never
+// the banned "cannot reach the control plane at /" string. The guard lives
+// INSIDE ensureUserToken so a future caller passing an empty base cannot
+// reintroduce it.
+func TestEnsureUserTokenEmptyBase(t *testing.T) {
+	_, err := ensureUserToken(t.TempDir(), "", false, false)
+	if err == nil {
+		t.Fatal("expected an error for an empty base")
+	}
+	if strings.Contains(err.Error(), "control plane at /") {
+		t.Fatalf("the forbidden '/' error has a producer again: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no control plane URL") {
+		t.Fatalf("err = %v, want the clean missing-URL error", err)
+	}
+}
+
+func TestStoredServerURL(t *testing.T) {
+	// An ambient PAGNET_SERVER would shadow the state file in LoadDaemon.
+	t.Setenv("PAGNET_SERVER", "")
+	dir := t.TempDir()
+	if got := storedServerURL(dir); got != "" {
+		t.Fatalf("empty state dir: storedServerURL = %q, want \"\"", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"),
+		[]byte("serverUrl: http://127.0.0.1:19999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := storedServerURL(dir); got != "http://127.0.0.1:19999" {
+		t.Fatalf("storedServerURL = %q, want the state config value", got)
 	}
 }
