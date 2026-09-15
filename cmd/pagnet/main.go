@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 var serverURL string
@@ -66,7 +67,7 @@ func main() {
 		},
 	}
 	root.PersistentFlags().StringVar(&serverURL, "server",
-		envOrDefault("PAGNET_SERVER", "http://localhost:18080"),
+		envOrDefault("PAGNET_SERVER", ""),
 		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
 	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
 	// -d/--detach is a ROOT-level launcher (re-exec `pagnet serve`
@@ -141,7 +142,7 @@ func enrollCmd() *cobra.Command {
 	var roots []string
 	cmd := &cobra.Command{
 		Use:   "enroll",
-		Short: "Connect this host: consume an enrollment token, store the credential",
+		Short: "Connect this host: signs you in (first run) and consumes an enrollment token",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if stateDir == "" {
@@ -151,14 +152,22 @@ func enrollCmd() *cobra.Command {
 				}
 				stateDir = filepath.Join(home, ".pagnet")
 			}
-			if err := doEnroll(serverURL, token, name, roots, rootsMode, stateDir); err != nil {
+			if token == "" {
+				// No enrollment token: sign in (the browser opens on
+				// first run), mint a one-time token for this host, and
+				// enroll with it. With --token the scripted/CI path is
+				// unchanged (no sign-in at all).
+				if err := enrollHostForeground(stateDir, name, roots, rootsMode); err != nil {
+					return err
+				}
+			} else if err := doEnroll(serverURL, token, name, roots, rootsMode, stateDir); err != nil {
 				return err
 			}
 			fmt.Println("run `pagnet -d` to connect this host")
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", os.Getenv("PAGNET_ENROLL_TOKEN"), "one-time enrollment token ($PAGNET_ENROLL_TOKEN)")
+	cmd.Flags().StringVar(&token, "token", os.Getenv("PAGNET_ENROLL_TOKEN"), "one-time enrollment token ($PAGNET_ENROLL_TOKEN; without it, enroll signs you in and mints one for this host)")
 	cmd.Flags().StringVar(&name, "name", "", "host name (default: machine hostname)")
 	cmd.Flags().StringArrayVar(&roots, "roots", nil, "allowed workspace root (repeatable; server-side token roots win)")
 	cmd.Flags().StringVar(&rootsMode, "roots-mode", "", "roots enforcement: allow_all (default, any path) or allow_list (confine to --roots)")
@@ -170,6 +179,9 @@ func enrollCmd() *cobra.Command {
 // and stores the host credential + identity in stateDir (config.yaml,
 // mode 0600). Shared by `pagnet enroll` and `pagnet worker` (first run).
 func doEnroll(server, token, name string, roots []string, rootsMode string, stateDir string) error {
+	if server == "" {
+		return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+	}
 	if token == "" {
 		return errors.New("--token is required (create one in the web UI: Hosts → Add a worker)")
 	}
@@ -239,6 +251,132 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, stat
 		fmt.Printf("allowed roots: %v\n", savedRoots)
 	}
 	return nil
+}
+
+// userTokenForEnroll returns a validated user bearer for the self-enroll
+// flow: an explicit --token / $PAGNET_TOKEN wins (the short-circuit — no
+// sign-in flow, zero device-endpoint calls), otherwise the shared sign-in
+// helper (stored token, or the first-run sign-in). The token is stored so
+// later CLI commands are authenticated.
+func userTokenForEnroll(stateDir, base string) (string, error) {
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	if userToken != "" {
+		client := &http.Client{Timeout: 60 * time.Second}
+		ok, err := bearerMe(client, base, userToken)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", errors.New("the server rejected the token")
+		}
+		if err := saveUserToken(stateDir, base, userToken); err != nil {
+			return "", err
+		}
+		return userToken, nil
+	}
+	return ensureUserToken(stateDir, base, os.Getenv("PAGNET_NO_BROWSER") == "1", hasTTYFn())
+}
+
+// mintEnrollmentToken mints a one-time host enrollment token for hostName
+// with the user's bearer (the same API the web console's "Add a worker"
+// uses) and returns its plaintext (shown exactly once).
+func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"name":         hostName,
+		"allowedRoots": roots,
+	})
+	req, err := http.NewRequest(http.MethodPost, base+"api/v1/hosts/enrollment-tokens", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+userTok)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("create enrollment token: http %d: %s", resp.StatusCode, string(raw))
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.Token == "" {
+		return "", errors.New("create enrollment token: unexpected response")
+	}
+	return out.Token, nil
+}
+
+// resolveEnrollServer resolves the control-plane URL for the first-run
+// enroll flow, in order:
+//
+//  1. the --server flag (or its default source, $PAGNET_SERVER);
+//  2. the state config's ServerURL (partial state: URL present, credential
+//     missing) — LoadDaemon already folds in the env files' PAGNET_SERVER;
+//  3. an interactive prompt (empty answer → one re-prompt, then error);
+//  4. a clean error (non-interactive).
+//
+// A guessed/built-in default is deliberately NOT a source: a fresh machine
+// must not silently probe a URL the user never gave.
+func resolveEnrollServer(stateDir string) (string, error) {
+	if serverURL != "" {
+		return strings.TrimSuffix(serverURL, "/"), nil
+	}
+	if cfg, err := config.LoadDaemon(stateDir); err == nil && cfg.ServerURL != "" {
+		return strings.TrimSuffix(cfg.ServerURL, "/"), nil
+	}
+	if hasTTYFn() {
+		for attempt := 0; attempt < 2; attempt++ {
+			line, err := askLineFn("control plane URL: ")
+			if err != nil {
+				return "", err
+			}
+			if line != "" {
+				return strings.TrimSuffix(line, "/"), nil
+			}
+		}
+		return "", errors.New("no control plane URL entered — set --server / $PAGNET_SERVER or re-run and enter the URL")
+	}
+	return "", errors.New("no control plane URL stored — run 'pagnet enroll --server <url>' first (or set --server / $PAGNET_SERVER)")
+}
+
+// enrollHostForeground runs the first-run host connection in the
+// FOREGROUND: resolve the control-plane URL, sign in (the browser opens on
+// first run), mint a one-time enrollment token for this host, and complete
+// the enrollment with it. Shared by `pagnet enroll` (without --token) and
+// `pagnet serve` / `pagnet -d` (which must finish it before the daemon
+// starts / detaches — the sign-in URL prints first, and the sign-in flow
+// never runs inside the detached child).
+func enrollHostForeground(stateDir, name string, roots []string, rootsMode string) error {
+	server, err := resolveEnrollServer(stateDir)
+	if err != nil {
+		return err
+	}
+	base := server + "/"
+	userTok, err := userTokenForEnroll(stateDir, base)
+	if err != nil {
+		return err
+	}
+	hostName := name
+	if hostName == "" {
+		hostName, _ = os.Hostname()
+		if hostName == "" {
+			hostName = "pagnet-host"
+		}
+	}
+	minted, err := mintEnrollmentToken(base, userTok, hostName, roots)
+	if err != nil {
+		return err
+	}
+	return doEnroll(server, minted, hostName, roots, rootsMode, stateDir)
 }
 
 // apiPostJSON posts a JSON body and decodes the response into out.

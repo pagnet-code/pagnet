@@ -45,7 +45,7 @@ func runCmd() *cobra.Command {
 				return err
 			}
 			if c.cfg.Credential == "" || c.cfg.HostID == "" {
-				return errors.New("no pagnet host config found; run `pagnet enroll --token <enrollment-token>` first")
+				return errors.New("no pagnet host config found; run `pagnet enroll --server <url>` first")
 			}
 			local := c.cfg.HostID
 

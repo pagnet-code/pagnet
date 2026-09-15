@@ -32,67 +32,41 @@ Hosts connect **outbound only** — no inbound ports, NAT-friendly.
 
 ## Quick start
 
-**1. Start the central stack** (control plane on :18080, web UI on :13000):
+**1. Install** (on the machine where the agents will run):
 
 ```bash
-cp deploy/example.env deploy/.env   # set DATABASE_URL to any Postgres you run
-make dev                            # control plane (:18080) + web UI (:13000)
+curl -fsSL https://<your-control-plane>/install.sh | bash
 ```
 
-**2. Sign in as a user.** Auth mode is `PAGNET_AUTH_MODE` (`token`, `local`,
-or `oidc`; `deploy/example.env` documents each):
+On first run this signs you in (your browser opens — the one manual step),
+connects this host, and starts the local service. On an already-connected
+machine it only upgrades the binary and restarts the service (idempotent).
 
-- **token** (default): one admin bearer. When `PAGNET_ADMIN_TOKEN` is empty
-  the server bootstraps a random token and prints it **once** at startup —
-  grab it from the dev console / `docker compose logs server` and store it:
-
-  ```bash
-  pagnet login --server http://localhost:18080 --token "$ADMIN_TOKEN"
-  ```
-
-- **local**: create the first account in the web UI (`http://localhost:13000`,
-  the `/setup` page — no default credentials), then:
-
-  ```bash
-  pagnet login --server http://localhost:18080   # prompts for username/password
-  ```
-
-- **oidc**: any external IdP via `OIDC_*` env vars (Keycloak included);
-  `pagnet login` runs the device flow.
-
-`pagnet login` stores a revocable API token in `~/.pagnet/config.yaml`
-(0600) and every CLI command uses it automatically.
-
-**3. Connect a host** (on the machine where the agents will run). Enroll the
-host with a one-time token, then start the daemon:
+**2. Connect this host** (manual install / reconnect) — signs you in (opens
+your browser on first run) and connects this host:
 
 ```bash
-# one-time enrollment token (plaintext is shown exactly once)
-TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{"name":"my-host","allowedRoots":["$HOME"],"ttlSeconds":3600}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-
-# consume the token; stores the host credential in ~/.pagnet/config.yaml (0600)
-pagnet enroll --server http://localhost:18080 --token "$TOKEN"
-
-# start the host daemon (outbound WSS; keep it running)
-pagnet serve           # foreground — or: pagnet -d (detached, logs to ~/.pagnet/pagnetd.log)
+pagnet enroll --server https://<your-control-plane>
 ```
 
-**4. Launch an agent** in a Git repository:
+**3. Start the local service** (outbound only — no inbound ports). Restarts
+the service if it is already running (idempotent):
 
 ```bash
-cd my-project
-pagnet run . --runtime fake --role coder    # fake | qwen | claude
+pagnet -d
 ```
 
-Then open http://localhost:13000 — the host shows as connected, and the agent
-appears under the default network. `make demo` seeds a ready-to-watch demo
-network with three fake agents and sample tasks.
+**4. Uninstall** (removes the service and local state):
 
-For self-hosting the whole central stack (Postgres included): see
-`deploy/docker-compose.yml`. The host daemon always runs on the actual host.
+```bash
+curl -fsSL https://<your-control-plane>/uninstall.sh | bash
+```
+
+Then open the web UI — the host shows as connected, and you can launch agents
+on it (`pagnet run . --runtime <runtime>` inside a Git repository, or from the
+console). `pagnet serve` runs the same service in the foreground (containers,
+supervisors); `pagnet login` signs in explicitly; `pagnet doctor` diagnoses
+the local setup.
 
 ## Terminal (interactive attach)
 

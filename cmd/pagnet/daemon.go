@@ -15,7 +15,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -95,8 +94,18 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.ServerURL == "" {
-		return errors.New("no control plane URL; run `pagnet enroll --server <url>` first")
+	if cfg.ServerURL == "" || cfg.Credential == "" {
+		// First run on this machine: connect the host in the FOREGROUND
+		// (the sign-in URL must print before the daemon starts). The
+		// daemon itself only needs the host credential — a missing user
+		// token never blocks daemon start.
+		if err := enrollHostForeground(cfg.StateDir, "", nil, ""); err != nil {
+			return err
+		}
+		cfg, err = config.LoadDaemon(daemonStateDir)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
 	}
 
 	d, err := daemon.New(daemon.Config{
@@ -147,6 +156,15 @@ func runDetach(cmd *cobra.Command) error {
 			return err
 		}
 		stateDir = filepath.Join(home, ".pagnet")
+	}
+	// First run on this machine: connect the host in the FOREGROUND
+	// before detaching — the sign-in URL must print, and the sign-in
+	// flow never runs inside the detached child. (A config load failure
+	// is not fatal here: the child reports it.)
+	if cfg, err := config.LoadDaemon(stateDir); err == nil && (cfg.ServerURL == "" || cfg.Credential == "") {
+		if err := enrollHostForeground(stateDir, "", nil, ""); err != nil {
+			return err
+		}
 	}
 	changed := map[string]bool{
 		"state-dir":      cmd.Flags().Changed("state-dir"),

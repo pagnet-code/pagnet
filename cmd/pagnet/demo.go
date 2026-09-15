@@ -13,6 +13,7 @@ package main
 // live instances and never duplicate the sample tasks.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -34,6 +35,9 @@ func demoCmd() *cobra.Command {
 			// Standalone admin client: no host login required. The admin
 			// bearer token authenticates the REST calls; empty means dev
 			// loopback auto-admin.
+			if serverURL == "" {
+				return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+			}
 			c := &cliCtx{base: serverURL, token: adminToken}
 			return runDemo(c, network, webURL)
 		},

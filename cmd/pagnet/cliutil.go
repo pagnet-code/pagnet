@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,14 @@ type cliCtx struct {
 	// credential (cfg.Credential): host identities are WSS-only and the
 	// REST API rejects them (403 host_identity).
 	token string
+	// reauth enables the one-shot 401 recovery in do(): re-run the
+	// sign-in flow once and retry the call. Set by newCLI; direct
+	// constructions (e.g. doctor) keep the plain 401 error.
+	reauth bool
+	// Sign-in flow parameters for the reauth path (set by newCLI).
+	noBrowser   bool
+	interactive bool
+	retried     bool
 }
 
 // newCLI loads the daemon state config (same file `pagnet enroll` /
@@ -58,19 +67,24 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if !serverExplicit && cfg.ServerURL != "" {
 		c.base = cfg.ServerURL
 	}
-	c.cfg = cfg
-	// Bearer precedence: --token / $PAGNET_TOKEN, then the token stored by
-	// `pagnet login` (OS keyring, or the config.yaml fallback).
-	if c.token = userToken; c.token == "" {
-		c.token = loadUserToken(c.stateDir, c.base)
+	if c.base == "" {
+		return nil, errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}
-	// No stored credentials + oidc mode: run the device flow once (interactive)
-	// so the original command continues without a re-run. Non-oidc modes and
-	// non-TTY contexts keep the existing 401 / clear-error behavior.
-	if c.token == "" {
-		if err := ensureUserToken(c); err != nil {
+	c.cfg = cfg
+	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no
+	// auth endpoint is called at all), then the shared sign-in helper,
+	// which validates the stored token or runs the sign-in flow per the
+	// server's auth mode (first run: the browser opens, the command
+	// continues without a re-run).
+	if c.token = userToken; c.token == "" {
+		c.reauth = true
+		c.noBrowser = os.Getenv("PAGNET_NO_BROWSER") == "1"
+		c.interactive = hasTTYFn()
+		tok, err := ensureUserToken(c.stateDir, c.base, c.noBrowser, c.interactive)
+		if err != nil {
 			return nil, err
 		}
+		c.token = tok
 	}
 	return c, nil
 }
@@ -109,6 +123,18 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 		return err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
+		// A stored token that got revoked/expired: re-run the sign-in
+		// flow once and retry the original call once, then fail with the
+		// API error.
+		if c.reauth && !c.retried {
+			c.retried = true
+			tok, err := ensureUserToken(c.stateDir, c.base, c.noBrowser, c.interactive)
+			if err == nil {
+				c.token = tok
+				return c.do(method, path, body, out)
+			}
+			return err // the exact missing piece (e.g. no interactive terminal)
+		}
 		return fmt.Errorf("http 401: %s (run `pagnet login` or set --token / $PAGNET_TOKEN to a user/admin bearer)", string(raw))
 	}
 	if resp.StatusCode >= 300 {

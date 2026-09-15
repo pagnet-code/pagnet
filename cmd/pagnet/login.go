@@ -15,6 +15,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +33,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
+
+	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 func loginCmd() *cobra.Command {
@@ -54,6 +59,16 @@ func loginCmd() *cobra.Command {
 				stateDir = filepath.Join(home, ".pagnet")
 			}
 			base := serverURL
+			if base == "" {
+				// No --server / $PAGNET_SERVER: the logged-in server
+				// applies (same rule as the REST commands).
+				if cfg, err := config.LoadDaemon(stateDir); err == nil && cfg.ServerURL != "" {
+					base = cfg.ServerURL
+				}
+			}
+			if base == "" {
+				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
+			}
 			if !strings.HasSuffix(base, "/") {
 				base += "/"
 			}
@@ -87,7 +102,7 @@ func loginCmd() *cobra.Command {
 				if !ok {
 					return errors.New("the server rejected the token")
 				}
-				fmt.Println("token mode: admin token verified.")
+				fmt.Println("admin token verified.")
 
 			case "local":
 				if username == "" {
@@ -105,15 +120,18 @@ func loginCmd() *cobra.Command {
 					return err
 				}
 				token = apiToken
-				fmt.Println("local mode: signed in; a new API token was created for the CLI.")
+				fmt.Println("signed in; a new API token was created for the CLI.")
 
 			case "oidc":
-				apiToken, err := loginOIDCDeviceFlow(base, noBrowser)
+				// Reuse the shared helper: it validates a stored token
+				// first (idempotent re-login) and runs the sign-in flow
+				// otherwise.
+				apiToken, err := ensureUserToken(stateDir, base, noBrowser, hasTTYFn())
 				if err != nil {
 					return err
 				}
 				token = apiToken
-				fmt.Println("oidc mode: device flow complete; an API token was created for the CLI.")
+				fmt.Println("signed in.")
 
 			default:
 				return fmt.Errorf("unknown server auth mode %q", status.Mode)
@@ -312,6 +330,9 @@ func askLine(prompt string) (string, error) {
 	return strings.TrimSpace(line), nil
 }
 
+// askLineFn is a test seam for askLine (the interactive prompt).
+var askLineFn = askLine
+
 func askPassword(prompt string) (string, error) {
 	fmt.Fprint(os.Stderr, prompt)
 	defer fmt.Fprintln(os.Stderr)
@@ -405,6 +426,32 @@ type deviceConfig struct {
 	Scope                       string `json:"scope"`
 }
 
+// --- PKCE (RFC 7636 / RFC 9126) ------------------------------------------------
+//
+// The CLI is a public client (no client secret), so the device grant carries
+// PKCE: the verifier never leaves the device except in the token polls, and
+// the S256 challenge is sent with the device-authorization request. IdPs that
+// do not require PKCE accept the extra parameters (RFC 9126 makes this the
+// conformant behavior for public clients).
+
+// pkceVerifier generates a code_verifier per RFC 7636: 32 random bytes,
+// base64url-encoded without padding — 43 unreserved characters (the RFC's
+// minimum length).
+func pkceVerifier() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate PKCE verifier: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// pkceChallenge computes the S256 code_challenge for a verifier:
+// BASE64URL(SHA256(ASCII(verifier))) without padding (RFC 7636 §4.2).
+func pkceChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 // loginOIDCDeviceFlow performs the client-mediated RFC 8628 device flow and
 // returns the minted pagnet API token. noBrowser (or $PAGNET_NO_BROWSER=1)
 // skips the browser-open attempt (the URL + code are always printed).
@@ -429,12 +476,18 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 		return "", errors.New("device flow: the server returned an incomplete device config")
 	}
 
-	// 2. Start the device flow at the IdP.
+	// 2. Start the device flow at the IdP (with PKCE, RFC 9126).
+	verifier, err := pkceVerifier()
+	if err != nil {
+		return "", err
+	}
 	authForm := url.Values{}
 	authForm.Set("client_id", cfg.ClientID)
 	if cfg.Scope != "" {
 		authForm.Set("scope", cfg.Scope)
 	}
+	authForm.Set("code_challenge", pkceChallenge(verifier))
+	authForm.Set("code_challenge_method", "S256")
 	daResp, err := postForm(client, cfg.DeviceAuthorizationEndpoint, authForm)
 	if err != nil {
 		return "", fmt.Errorf("device flow: %w", err)
@@ -463,19 +516,18 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 	if verifyURL == "" {
 		verifyURL = cfg.Issuer
 	}
-	fmt.Println("\nSign in with your identity provider:")
-	fmt.Printf("  1. Open  %s\n", verifyURL)
+	fmt.Println()
+	fmt.Printf("Open %s in a browser to sign in.\n", verifyURL)
 	if da.UserCode != "" {
-		fmt.Printf("  2. Enter the code  %s\n\n", da.UserCode)
-	} else {
-		fmt.Println()
+		fmt.Printf("Enter the code %s when prompted.\n", da.UserCode)
 	}
 	if !noBrowser && os.Getenv("PAGNET_NO_BROWSER") != "1" {
+		fmt.Printf("Opening your browser to sign in to %s…\n", strings.TrimSuffix(base, "/"))
 		if err := openBrowserFn(verifyURL); err != nil {
-			fmt.Println("(could not open a browser:", err.Error(), "- open the URL above)")
+			fmt.Println("(could not open a browser — use the URL above)")
 		}
 	}
-	fmt.Print("Waiting for authorization")
+	fmt.Print("Waiting for you to sign in")
 
 	// 4. Poll the IdP token endpoint (RFC 8628). Respect the IdP's interval
 	//    and expires_in; hard-cap the wait at ~3 minutes.
@@ -492,6 +544,7 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 		pollForm.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 		pollForm.Set("device_code", da.DeviceCode)
 		pollForm.Set("client_id", cfg.ClientID)
+		pollForm.Set("code_verifier", verifier)
 		r, err := postForm(client, cfg.TokenEndpoint, pollForm)
 		if err != nil {
 			return "", fmt.Errorf("device flow: %w", err)
@@ -607,31 +660,79 @@ func serverAuthMode(base string) (string, error) {
 }
 
 // ensureUserToken makes the CLI's user bearer available for an authenticated
-// command. When no token is stored and the server is in oidc mode, it runs the
-// device flow once (interactive) and stores the resulting token, so the
-// original command continues without a re-run. Without a TTY it fails with a
-// clear error instead of looping. Non-oidc modes keep the existing 401 path.
-func ensureUserToken(c *cliCtx) error {
-	if c.token != "" || c.base == "" {
-		return nil
+// command:
+//
+//   - a stored token that still validates (GET /auth/me) is returned as-is —
+//     zero auth-endpoint chatter beyond /auth/me;
+//   - absent or rejected: the server's auth mode decides —
+//     oidc  → the sign-in flow (browser; noBrowser prints the URL and polls),
+//     local → username/password prompts (interactive only),
+//     token → clean error: the admin token cannot be minted by a flow.
+//
+// Non-interactive runs (no TTY) never hang or open a browser: without
+// noBrowser they fail with the exact missing piece; with noBrowser the oidc
+// flow prints the URL and keeps polling (the deliberate headless case — the
+// user signs in from another device). Callers holding an explicit
+// --token / $PAGNET_TOKEN must not call this at all: the short-circuit
+// happens before any endpoint is touched.
+func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string, error) {
+	if !strings.HasSuffix(base, "/") {
+		base += "/"
 	}
-	mode, err := serverAuthMode(c.base)
-	if err != nil || mode != "oidc" {
-		return nil // not oidc mode (or unreachable): keep the existing 401 behavior
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	// 1. A stored token that still validates is the one to use.
+	if tok := loadUserToken(stateDir, base); tok != "" {
+		if ok, err := bearerMe(client, base, tok); err == nil && ok {
+			return tok, nil
+		}
+		// Rejected (or unreachable): fall through and sign in again.
 	}
-	if !hasTTYFn() {
-		return errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first")
-	}
-	token, err := loginOIDCDeviceFlow(c.base, false)
+
+	// 2. Which auth mode is the server running? (public endpoint)
+	mode, err := serverAuthMode(base)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("cannot reach the control plane at %s: %w", base, err)
 	}
-	c.token = token
-	if err := saveUserToken(c.stateDir, c.base, token); err != nil {
-		return err
+	switch mode {
+	case "oidc":
+		if !interactive && !noBrowser {
+			return "", errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first (or set --token / $PAGNET_TOKEN)")
+		}
+		tok, err := loginOIDCDeviceFlow(base, noBrowser)
+		if err != nil {
+			return "", err
+		}
+		if err := saveUserToken(stateDir, base, tok); err != nil {
+			return "", err
+		}
+		fmt.Printf("signed in; token stored in %s\n", stateDir)
+		return tok, nil
+	case "local":
+		if !interactive {
+			return "", errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first (or set --token / $PAGNET_TOKEN)")
+		}
+		var username, password string
+		if username, err = askLine("username: "); err != nil {
+			return "", err
+		}
+		if password, err = askPassword("password: "); err != nil {
+			return "", err
+		}
+		tok, err := loginLocalAPIToken(client, base, username, password, "cli")
+		if err != nil {
+			return "", err
+		}
+		if err := saveUserToken(stateDir, base, tok); err != nil {
+			return "", err
+		}
+		fmt.Printf("signed in; token stored in %s\n", stateDir)
+		return tok, nil
+	case "token":
+		return "", errors.New("the server is in token mode: the admin token cannot be minted by a sign-in flow — set --token / $PAGNET_TOKEN to the admin token (the server prints it once at startup when PAGNET_ADMIN_TOKEN is unset)")
+	default:
+		return "", fmt.Errorf("unknown server auth mode %q", mode)
 	}
-	fmt.Printf("signed in; token stored in %s\n", c.stateDir)
-	return nil
 }
 
 // apiError renders the server's {"error":{"code","message"}} shape.

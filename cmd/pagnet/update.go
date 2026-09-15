@@ -12,6 +12,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -45,6 +46,9 @@ func updateCmd() *cobra.Command {
 // pagnet executable this command runs from) with the latest release,
 // then print how to restart the daemon so the new version takes effect.
 func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
+	if serverURL == "" {
+		return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+	}
 	// Resolve SELF explicitly (canonicalized): a bare name would make the
 	// replace a PATH guess, and a symlinked install must update the real
 	// file.

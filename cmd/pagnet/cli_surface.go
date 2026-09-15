@@ -288,7 +288,7 @@ func openCmd() *cobra.Command {
 				return err
 			}
 			if c.cfg.HostID == "" {
-				return errors.New("no pagnet host config found; run `pagnet enroll --token <enrollment-token>` first")
+				return errors.New("no pagnet host config found; run `pagnet enroll --server <url>` first")
 			}
 			dir := "."
 			if len(args) == 1 {
@@ -512,6 +512,11 @@ func doctorCmd() *cobra.Command {
 				!root.PersistentFlags().Changed("server") && cfg.ServerURL != "" {
 				server = cfg.ServerURL
 			}
+			if server == "" {
+				check("server reachable", false, "no control plane URL — set --server / $PAGNET_SERVER")
+				fmt.Println("\ndiagnosis failed: no control plane URL configured")
+				return errors.New("no control plane URL")
+			}
 
 			// 1. Server reachable?
 			client := &http.Client{Timeout: 5 * time.Second}
@@ -559,14 +564,14 @@ func doctorCmd() *cobra.Command {
 
 			// 3. Host login stored for the daemon?
 			if cfg.Credential == "" || cfg.HostID == "" {
-				check("host login stored", false, "no host login stored — run `pagnet enroll --token <enrollment-token>`")
+				check("host login stored", false, "no host login stored — run `pagnet enroll --server <url>`")
 			} else {
 				check("host login stored", true, "credential + host id present (the daemon uses it over WSS)")
 			}
 
 			// 4. Daemon running (server's view of this host)?
 			if cfg.HostID != "" {
-				c := &cliCtx{base: server, cfg: cfg, token: userToken}
+				c := &cliCtx{base: server, cfg: cfg, token: restToken}
 				d, err := c.hostDetail(cfg.HostID)
 				if err != nil {
 					check("daemon running", false, "cannot fetch host: "+err.Error())
@@ -584,7 +589,7 @@ func doctorCmd() *cobra.Command {
 			}
 
 			// 5. Default network exists?
-			c := &cliCtx{base: server, cfg: cfg, token: userToken}
+			c := &cliCtx{base: server, cfg: cfg, token: restToken}
 			if id, label, err := c.resolveNetwork(""); err != nil {
 				check("default network", false, err.Error())
 			} else {
