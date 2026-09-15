@@ -69,12 +69,12 @@ func main() {
 		envOrDefault("PAGNET_SERVER", "http://localhost:18080"),
 		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
 	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
-	// -d/--detach is a ROOT-level launcher (re-exec `pagnet daemon`
+	// -d/--detach is a ROOT-level launcher (re-exec `pagnet serve`
 	// detached); the daemon flag set is registered locally so
 	// `pagnet -d --state-dir ...` parses. Deliberately NOT persistent:
 	// subcommands keep their own flag surfaces.
 	root.Flags().BoolVarP(&detach, "detach", "d", false,
-		"run the daemon in the background: detach from the terminal, append logs to <state-dir>/pagnetd.log, print the pid and exit")
+		"start the pagnet service detached (log to <state-dir>/pagnetd.log, print the pid)")
 	registerDaemonFlags(root)
 
 	root.AddCommand(

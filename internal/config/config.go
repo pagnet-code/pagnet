@@ -56,13 +56,13 @@ type Daemon struct {
 	// Debug enables development/test-only behavior (registers the
 	// deterministic fake runtime). Default FALSE — a production daemon
 	// never offers the fake runtime. Set via PAGNET_DEBUG or the state
-	// file's `debug:` field; the `--debug` flag (pagnet daemon) ORs in on top.
+	// file's `debug:` field; the `--debug` flag (pagnet serve) ORs in on top.
 	Debug bool
 	// AutoUpdate enables worker self-update (P6): when the control plane
 	// advertises a newer release and the daemon is idle, it downloads the
 	// release tarball and re-execs in place (same PID). Default TRUE —
 	// opt out via PAGNET_AUTO_UPDATE=0/false/off/no, the state file's
-	// `autoUpdate: false`, or the `--no-auto-update` flag (pagnet daemon).
+	// `autoUpdate: false`, or the `--no-auto-update` flag (pagnet serve).
 	AutoUpdate bool
 }
 

@@ -1,10 +1,10 @@
 // The unified daemon entrypoint (packaging migration, step 2):
 //
-//	pagnet daemon — the host daemon in the FOREGROUND (containers,
-//	                supervisors)
-//	pagnet -d     — the same daemon DETACHED from the terminal: re-exec
-//	                of `pagnet daemon`, stdio appended to
-//	                <state-dir>/pagnetd.log, prints the pid and exits
+//	pagnet serve — the host daemon in the FOREGROUND (containers,
+//	               supervisors)
+//	pagnet -d    — the same daemon DETACHED from the terminal: re-exec
+//	               of `pagnet serve`, stdio appended to
+//	               <state-dir>/pagnetd.log, prints the pid and exits
 //
 // The daemon itself is the shared internal/daemon implementation — the
 // same code path `pagnet worker` runs, with the machine-wide state dir
@@ -33,7 +33,7 @@ import (
 
 // The daemon flag values. The same flag set is registered on the ROOT
 // command (local flags, so `pagnet -d --state-dir ...` parses) and on
-// the `daemon` subcommand; both write these variables, and only one
+// the `serve` subcommand; both write these variables, and only one
 // command runs per invocation.
 var (
 	daemonStateDir     string
@@ -44,11 +44,11 @@ var (
 	detach bool
 )
 
-// daemonCmd is `pagnet daemon`: the host daemon in the foreground.
+// daemonCmd is `pagnet serve`: the host daemon in the foreground.
 func daemonCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "daemon",
-		Short: "Run the pagnet host daemon in the foreground (top-level -d detaches it)",
+		Use:   "serve",
+		Short: "Run the pagnet local service in the foreground (top-level -d starts it detached)",
 		Args:  cobra.NoArgs,
 		RunE:  runDaemon,
 	}
@@ -75,7 +75,7 @@ func registerDaemonFlags(cmd *cobra.Command) {
 		"disable worker self-update (default on; also PAGNET_AUTO_UPDATE=0 or state-file autoUpdate: false)")
 }
 
-// runDaemon is the `pagnet daemon` foreground body: state-dir config,
+// runDaemon is the `pagnet serve` foreground body: state-dir config,
 // daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
 	var level slog.Level
@@ -123,7 +123,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Info("pagnet daemon starting",
+	log.Info("pagnet serve starting",
 		"server", cfg.ServerURL, "state_dir", cfg.StateDir,
 		"allowed_roots", cfg.AllowedRoots)
 	if err := d.Run(ctx); err != nil {
@@ -133,10 +133,10 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 }
 
 // runDetach implements `pagnet -d`: re-exec this binary as
-// `pagnet daemon <flags>` in a new session, stdio appended to
+// `pagnet serve <flags>` in a new session, stdio appended to
 // <state-dir>/pagnetd.log, and print the child pid. -d is a launcher
 // convenience, not a second runtime mode: the child runs the identical
-// foreground `daemon` path.
+// foreground `serve` path.
 func runDetach(cmd *cobra.Command) error {
 	// The log path needs the state dir BEFORE the re-exec: the flag
 	// value when given, else LoadDaemon's default (~/.pagnet).
@@ -157,15 +157,15 @@ func runDetach(cmd *cobra.Command) error {
 	return daemonizeSelf(stateDir, detachArgs(os.Args[1:], changed))
 }
 
-// detachArgs builds the child argv for `pagnet -d`: the `daemon`
+// detachArgs builds the child argv for `pagnet -d`: the `serve`
 // subcommand plus only the daemon flags the user explicitly set
 // (changed). The -d/--detach flag itself is stripped, and anything that
 // is not a daemon flag (--server, --token, unknown args) is dropped —
-// the child is `daemon`, which knows only the daemon flag set.
+// the child is `serve`, which knows only the daemon flag set.
 func detachArgs(osArgs []string, changed map[string]bool) []string {
 	valueFlags := map[string]bool{"state-dir": true, "log-level": true}
 	boolFlags := map[string]bool{"debug": true, "no-auto-update": true}
-	args := []string{"daemon"}
+	args := []string{"serve"}
 	for i := 0; i < len(osArgs); i++ {
 		a := osArgs[i]
 		name, hasVal := a, false
@@ -230,6 +230,6 @@ func daemonizeSelf(stateDir string, args []string) error {
 	// The child owns its session; the parent must not wait on it.
 	_ = child.Process.Release()
 	f.Close()
-	fmt.Printf("pagnet daemon started (pid %d) — log: %s\n", pid, logPath)
+	fmt.Printf("pagnet service started (pid %d) — log: %s\n", pid, logPath)
 	return nil
 }

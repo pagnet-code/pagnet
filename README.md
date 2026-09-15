@@ -77,7 +77,7 @@ TOKEN=$(curl -s -X POST localhost:18080/api/v1/hosts/enrollment-tokens \
 pagnet enroll --server http://localhost:18080 --token "$TOKEN"
 
 # start the host daemon (outbound WSS; keep it running)
-pagnet daemon          # foreground — or: pagnet -d (detached, logs to ~/.pagnet/pagnetd.log)
+pagnet serve           # foreground — or: pagnet -d (detached, logs to ~/.pagnet/pagnetd.log)
 ```
 
 **4. Launch an agent** in a Git repository:
@@ -121,7 +121,7 @@ machines plus the wire/domain contracts they share with the control plane.
 
 | Path | What |
 |------|------|
-| `cmd/pagnet` | The one production binary: CLI (login, enroll, run, agents, tasks, attach, ...), host daemon (`pagnet daemon` / `pagnet -d`), and the MCP bridges (`pagnet mcp worker\|control`, spawned by the daemon) |
+| `cmd/pagnet` | The one production binary: CLI (login, enroll, run, agents, tasks, attach, ...), local service (`pagnet serve` / `pagnet -d`), and the MCP bridges (`pagnet mcp worker\|control`, spawned by the daemon) |
 | `cmd/pagnet-fake-runtime` | Deterministic fake runtime (test/dev infrastructure, not shipped) |
 | `domain/` | Domain model shared with the control plane |
 | `transport/` | Wire protocol (WSS envelopes) shared with the control plane |
