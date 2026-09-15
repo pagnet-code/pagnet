@@ -35,7 +35,8 @@ func OpenState(path string) (*State, error) {
 		CREATE TABLE IF NOT EXISTS processed_commands (
 			command_id   TEXT PRIMARY KEY,
 			type         TEXT NOT NULL,
-			processed_at TEXT NOT NULL
+			processed_at TEXT NOT NULL,
+			result       TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS instances (
 			instance_id   TEXT PRIMARY KEY,
@@ -66,6 +67,7 @@ func OpenState(path string) (*State, error) {
 	// Best-effort ALTERs for state dirs created before these columns
 	// existed (a fresh CREATE TABLE already has them).
 	for _, col := range []string{
+		`ALTER TABLE processed_commands ADD COLUMN result TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN access TEXT NOT NULL DEFAULT 'read_write'`,
 		`ALTER TABLE instances ADD COLUMN agent_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN network_id TEXT NOT NULL DEFAULT ''`,
@@ -92,13 +94,33 @@ func (s *State) IsProcessed(commandID string) (bool, error) {
 	return n > 0, err
 }
 
-// MarkProcessed records command execution (idempotent).
-func (s *State) MarkProcessed(commandID, msgType string) error {
+// GetProcessedResult returns the ack result that was persisted when
+// commandID was executed ("" when the command carried no result, e.g. a
+// non-crypto command). ok is false when the command was never processed.
+// The result is the verbatim JSON the daemon acked, so a re-send of an
+// already-processed command re-acks the SAME result (F8: a lost ack + server
+// re-send must not yield a zero-value result that the server misreads).
+func (s *State) GetProcessedResult(commandID string) (string, bool) {
+	var result string
+	err := s.db.QueryRow(`SELECT result FROM processed_commands WHERE command_id = ?`, commandID).Scan(&result)
+	if err == sql.ErrNoRows {
+		return "", false
+	}
+	if err != nil {
+		return "", false
+	}
+	return result, true
+}
+
+// MarkProcessed records command execution (idempotent), persisting the ack
+// result (JSON, "" when the command carries none) so a re-send of the command
+// can re-ack the stored result verbatim.
+func (s *State) MarkProcessed(commandID, msgType string, result []byte) error {
 	_, err := s.db.Exec(`
-		INSERT INTO processed_commands (command_id, type, processed_at)
-		VALUES (?, ?, ?)
+		INSERT INTO processed_commands (command_id, type, processed_at, result)
+		VALUES (?, ?, ?, ?)
 		ON CONFLICT (command_id) DO NOTHING`,
-		commandID, msgType, time.Now().UTC().Format(time.RFC3339))
+		commandID, msgType, time.Now().UTC().Format(time.RFC3339), string(result))
 	return err
 }
 

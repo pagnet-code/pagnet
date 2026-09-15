@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,11 +34,30 @@ type NKA struct {
 	keyring  *Keyring
 
 	challengesMu sync.Mutex
-	// challenges maps a challenge object id to its (random) plaintext, so
-	// VerifyChallenge can check the host's proof. Single-use: consumed on
-	// verify.
-	challenges map[string][]byte
+	// challenges maps a challenge object id to its (random) plaintext and
+	// creation time, so VerifyChallenge can check the host's proof.
+	// Single-use: consumed on verify. The map is bounded (challengeTTL +
+	// challengeCap) so an abandoned enrollment round (a host that never
+	// proves) cannot leak entries in the long-lived per-network NKA cache.
+	challenges map[string]challengeEntry
 }
+
+// challengeEntry is a pending decryption challenge: the random plaintext the
+// host must decrypt, plus its creation time (for TTL pruning).
+type challengeEntry struct {
+	plaintext []byte
+	createdAt time.Time
+}
+
+// challengeTTL bounds how long an unconsumed challenge is remembered. A host
+// that is issued a challenge but never proves (abandoned round) leaves no
+// residue past this window.
+const challengeTTL = 10 * time.Minute
+
+// challengeCap bounds the number of pending challenges the NKA holds at once
+// (a burst of concurrent enrollments must not grow the map without bound);
+// the oldest entries are dropped first.
+const challengeCap = 32
 
 // NewNKA loads the NKA for a network. The keyring must already exist on disk
 // (create it with ActivateNetwork).
@@ -52,7 +72,7 @@ func NewNKA(stateDir, tenantID, networkID, hostID string) (*NKA, error) {
 		HostID:     hostID,
 		stateDir:   stateDir,
 		keyring:    kr,
-		challenges: map[string][]byte{},
+		challenges: map[string]challengeEntry{},
 	}, nil
 }
 
@@ -113,20 +133,10 @@ func keyPackageInfo(networkID string) []byte {
 	return []byte("pagnet/e2ee/keypackage/v1/" + networkID)
 }
 
-// KeyPackage is the HPKE-encrypted keyring for a new host. The control plane
-// stores/relays only these opaque bytes (plan §11.7).
-type KeyPackage struct {
-	// Enc is the HPKE encapsulated (ephemeral) key.
-	Enc []byte `json:"enc"`
-	// Ciphertext is the HPKE-sealed keyring.
-	Ciphertext []byte `json:"ciphertext"`
-	// Info is the HPKE info context (public).
-	Info []byte `json:"info"`
-}
-
 // BuildKeyPackage wraps the current keyring to the new host's X25519 public
-// key using HPKE. Only that host can open it.
-func (n *NKA) BuildKeyPackage(hostPub []byte) (*KeyPackage, error) {
+// key using HPKE. Only that host can open it. The returned e2ee.KeyPackage is
+// the wire type the control plane relays opaquely (plan §11.7).
+func (n *NKA) BuildKeyPackage(hostPub []byte) (*e2ee.KeyPackage, error) {
 	keyringJSON, err := json.Marshal(n.keyring)
 	if err != nil {
 		return nil, fmt.Errorf("crypto: marshal keyring for package: %w", err)
@@ -136,12 +146,12 @@ func (n *NKA) BuildKeyPackage(hostPub []byte) (*KeyPackage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &KeyPackage{Enc: enc, Ciphertext: ct, Info: info}, nil
+	return &e2ee.KeyPackage{Enc: enc, Ciphertext: ct, Info: info}, nil
 }
 
 // OpenKeyPackage unwraps a key package with the host's X25519 private key,
 // returning the network keyring. This is the new-host side of enrollment.
-func OpenKeyPackage(pkg *KeyPackage, hostPriv []byte) (*Keyring, error) {
+func OpenKeyPackage(pkg *e2ee.KeyPackage, hostPriv []byte) (*Keyring, error) {
 	keyringJSON, err := OpenKey(hostPriv, pkg.Enc, pkg.Info, nil, pkg.Ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("crypto: open key package: %w", err)
@@ -156,24 +166,11 @@ func OpenKeyPackage(pkg *KeyPackage, hostPriv []byte) (*Keyring, error) {
 // challengeObjectType is the AAD object type for decryption challenges.
 const challengeObjectType = "e2ee_challenge"
 
-// Challenge is a decryption challenge: a random value encrypted under the
-// keyring, which the new host must decrypt and MAC to prove it holds the
-// keys (plan §11.7 step 7). The Challenge is safe to relay: it carries no
-// plaintext or key material.
-type Challenge struct {
-	// Envelope is the encrypted challenge (e2ee.EncryptedPayloadV1).
-	Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
-	// AAD is the AAD used to encrypt the challenge (public routing metadata).
-	AAD e2ee.AAD `json:"aad"`
-	// Nonce is a random nonce the host must include in its proof (replay
-	// protection).
-	Nonce []byte `json:"nonce"`
-}
-
 // IssueChallenge creates a decryption challenge under the current epoch. The
 // NKA remembers the challenge plaintext (in memory) so it can verify the
-// host's proof later.
-func (n *NKA) IssueChallenge(newHostID string, now time.Time) (*Challenge, error) {
+// host's proof later. The returned e2ee.Challenge is the wire type the
+// control plane relays opaquely (plan §11.7 step 7).
+func (n *NKA) IssueChallenge(newHostID string, now time.Time) (*e2ee.Challenge, error) {
 	epoch, err := n.keyring.ActiveEpoch()
 	if err != nil {
 		return nil, err
@@ -207,24 +204,52 @@ func (n *NKA) IssueChallenge(newHostID string, now time.Time) (*Challenge, error
 		return nil, fmt.Errorf("crypto: read challenge nonce: %w", err)
 	}
 	n.challengesMu.Lock()
-	n.challenges[objectID] = challenge
+	n.purgeChallenges(now)
+	n.challenges[objectID] = challengeEntry{plaintext: challenge, createdAt: now}
+	n.enforceChallengeCap()
 	n.challengesMu.Unlock()
-	return &Challenge{Envelope: env, AAD: aad, Nonce: nonce}, nil
+	return &e2ee.Challenge{Envelope: env, AAD: aad, Nonce: nonce}, nil
+}
+
+// purgeChallenges drops challenge entries older than challengeTTL. The
+// caller holds challengesMu.
+func (n *NKA) purgeChallenges(now time.Time) {
+	cutoff := now.Add(-challengeTTL)
+	for id, e := range n.challenges {
+		if e.createdAt.Before(cutoff) {
+			delete(n.challenges, id)
+		}
+	}
+}
+
+// enforceChallengeCap bounds the challenge map at challengeCap entries,
+// dropping the oldest first. The caller holds challengesMu.
+func (n *NKA) enforceChallengeCap() {
+	if len(n.challenges) <= challengeCap {
+		return
+	}
+	type kv struct {
+		id string
+		at time.Time
+	}
+	entries := make([]kv, 0, len(n.challenges))
+	for id, e := range n.challenges {
+		entries = append(entries, kv{id: id, at: e.createdAt})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
+	excess := len(n.challenges) - challengeCap
+	for i := 0; i < excess; i++ {
+		delete(n.challenges, entries[i].id)
+	}
 }
 
 // proofContext is the context bound into the challenge-proof MAC.
 const proofContext = "pagnet/e2ee/challenge-proof/v1"
 
-// Proof is the new host's response to a challenge: an HMAC over the nonce,
-// keyed by the decrypted challenge plaintext. Only a host that decrypted the
-// challenge (i.e. holds the epoch key) can produce a valid proof.
-type Proof struct {
-	MAC []byte `json:"mac"`
-}
-
 // ComputeChallengeProof decrypts the challenge with the host's keyring and
-// returns the proof. This is the new-host side of the challenge.
-func ComputeChallengeProof(kr *Keyring, ch *Challenge) (*Proof, error) {
+// returns the proof. This is the new-host side of the challenge. The returned
+// e2ee.Proof is the wire type the control plane relays opaquely.
+func ComputeChallengeProof(kr *Keyring, ch *e2ee.Challenge) (*e2ee.Proof, error) {
 	epoch, ok := kr.EpochByID(ch.Envelope.KeyEpochID)
 	if !ok {
 		return nil, fmt.Errorf("crypto: keyring has no epoch %s", ch.Envelope.KeyEpochID)
@@ -237,21 +262,22 @@ func ComputeChallengeProof(kr *Keyring, ch *Challenge) (*Proof, error) {
 	if err != nil {
 		return nil, fmt.Errorf("crypto: decrypt challenge: %w", err)
 	}
-	return &Proof{MAC: challengeMAC(plaintext, ch.Nonce)}, nil
+	return &e2ee.Proof{MAC: challengeMAC(plaintext, ch.Nonce)}, nil
 }
 
 // VerifyChallenge checks the new host's proof against the remembered
 // challenge plaintext. The challenge is single-use: it is consumed whether or
 // not the proof is valid.
-func (n *NKA) VerifyChallenge(ch *Challenge, proof *Proof) error {
+func (n *NKA) VerifyChallenge(ch *e2ee.Challenge, proof *e2ee.Proof) error {
 	n.challengesMu.Lock()
-	plaintext, ok := n.challenges[ch.AAD.ObjectID]
+	n.purgeChallenges(time.Now().UTC())
+	entry, ok := n.challenges[ch.AAD.ObjectID]
 	delete(n.challenges, ch.AAD.ObjectID)
 	n.challengesMu.Unlock()
 	if !ok {
 		return fmt.Errorf("crypto: unknown or already-consumed challenge %s", ch.AAD.ObjectID)
 	}
-	expected := challengeMAC(plaintext, ch.Nonce)
+	expected := challengeMAC(entry.plaintext, ch.Nonce)
 	if !hmac.Equal(proof.MAC, expected) {
 		return fmt.Errorf("crypto: challenge proof MAC mismatch")
 	}

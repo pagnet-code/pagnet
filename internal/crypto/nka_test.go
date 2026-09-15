@@ -1,8 +1,11 @@
 package crypto
 
 import (
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/pagnet-code/pagnet/e2ee"
 )
 
 const (
@@ -17,7 +20,9 @@ const (
 // host proves decryption → NKA verifies (plan §11.7).
 func TestNKAEnrollmentFlow(t *testing.T) {
 	stateDir := t.TempDir()
-	now := testTime()
+	// Real now: the challenge TTL purge (VerifyChallenge) is time-based, so a
+	// fixed past date would age the challenge past the TTL mid-test.
+	now := time.Now().UTC()
 
 	// (a) The NKA host activates the network (first key epoch).
 	if _, err := ActivateNetwork(stateDir, testTenantID, testNetworkID, now); err != nil {
@@ -127,14 +132,15 @@ func TestNKAChallengeWrongKeyring(t *testing.T) {
 // verification (replay protection).
 func TestNKAChallengeSingleUse(t *testing.T) {
 	stateDir := t.TempDir()
-	if _, err := ActivateNetwork(stateDir, testTenantID, testNetworkID, testTime()); err != nil {
+	now := time.Now().UTC()
+	if _, err := ActivateNetwork(stateDir, testTenantID, testNetworkID, now); err != nil {
 		t.Fatalf("ActivateNetwork: %v", err)
 	}
 	nka, err := NewNKA(stateDir, testTenantID, testNetworkID, testNKAHost)
 	if err != nil {
 		t.Fatalf("NewNKA: %v", err)
 	}
-	ch, err := nka.IssueChallenge(testNewHost, testTime())
+	ch, err := nka.IssueChallenge(testNewHost, now)
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -155,7 +161,9 @@ func TestNKAChallengeSingleUse(t *testing.T) {
 // the new epoch and a host with the rotated keyring can still verify.
 func TestNKARotateThenChallenge(t *testing.T) {
 	stateDir := t.TempDir()
-	now := testTime()
+	// Real now: the challenge TTL purge (VerifyChallenge) is time-based, so a
+	// fixed past date would age the challenge past the TTL mid-test.
+	now := time.Now().UTC()
 	if _, err := ActivateNetwork(stateDir, testTenantID, testNetworkID, now); err != nil {
 		t.Fatalf("ActivateNetwork: %v", err)
 	}
@@ -195,5 +203,89 @@ func TestNKARotateThenChallenge(t *testing.T) {
 	// The host with only the OLD keyring cannot verify the new-epoch challenge.
 	if _, err := ComputeChallengeProof(kr, ch); err == nil {
 		t.Fatal("old keyring verified a new-epoch challenge, want failure")
+	}
+}
+
+// TestNKAChallengeTTL verifies an unconsumed challenge older than challengeTTL
+// is pruned (an abandoned enrollment round leaves no residue in the long-lived
+// per-network NKA cache).
+func TestNKAChallengeTTL(t *testing.T) {
+	nka := &NKA{
+		TenantID: testTenantID, NetworkID: testNetworkID, HostID: testNKAHost,
+		challenges: map[string]challengeEntry{},
+	}
+	now := testTime()
+	nka.challenges["old"] = challengeEntry{plaintext: []byte("x"), createdAt: now}
+	nka.challenges["fresh"] = challengeEntry{plaintext: []byte("y"), createdAt: now.Add(5 * time.Minute)}
+
+	// Purge at now + TTL + 1s: "old" (age > TTL) is dropped, "fresh" (age 5m) kept.
+	nka.purgeChallenges(now.Add(challengeTTL + time.Second))
+	if _, ok := nka.challenges["old"]; ok {
+		t.Fatal("an expired challenge survived the TTL purge")
+	}
+	if _, ok := nka.challenges["fresh"]; !ok {
+		t.Fatal("a fresh challenge was dropped by the TTL purge")
+	}
+}
+
+// TestNKAChallengeCap verifies the challenge map is bounded at challengeCap
+// entries, dropping the oldest first.
+func TestNKAChallengeCap(t *testing.T) {
+	nka := &NKA{
+		TenantID: testTenantID, NetworkID: testNetworkID, HostID: testNKAHost,
+		challenges: map[string]challengeEntry{},
+	}
+	now := testTime()
+	for i := 0; i < challengeCap+5; i++ {
+		nka.challenges[fmt.Sprintf("h%d", i)] = challengeEntry{
+			plaintext: []byte("x"), createdAt: now.Add(time.Duration(i) * time.Second),
+		}
+	}
+	nka.enforceChallengeCap()
+	if len(nka.challenges) != challengeCap {
+		t.Fatalf("challenge map has %d entries, want the cap %d", len(nka.challenges), challengeCap)
+	}
+	if _, ok := nka.challenges["h0"]; ok {
+		t.Fatal("the oldest challenge survived the cap, want it dropped")
+	}
+	if _, ok := nka.challenges[fmt.Sprintf("h%d", challengeCap+4)]; !ok {
+		t.Fatal("the newest challenge was dropped by the cap, want it kept")
+	}
+}
+
+// TestNKAChallengeIssueWiring verifies IssueChallenge actually applies the TTL
+// prune + cap (the direct-method tests above cover the logic; this covers the
+// wiring through the public issue path).
+func TestNKAChallengeIssueWiring(t *testing.T) {
+	stateDir := t.TempDir()
+	now := testTime()
+	if _, err := ActivateNetwork(stateDir, testTenantID, testNetworkID, now); err != nil {
+		t.Fatalf("ActivateNetwork: %v", err)
+	}
+	nka, err := NewNKA(stateDir, testTenantID, testNetworkID, testNKAHost)
+	if err != nil {
+		t.Fatalf("NewNKA: %v", err)
+	}
+	// Issue challengeCap+1 challenges at increasing times; the map must stay
+	// bounded at the cap (the oldest is dropped on each issue past the cap).
+	var first *e2ee.Challenge
+	for i := 0; i <= challengeCap; i++ {
+		ch, err := nka.IssueChallenge(fmt.Sprintf("host-%d", i), now.Add(time.Duration(i)*time.Second))
+		if err != nil {
+			t.Fatalf("IssueChallenge (%d): %v", i, err)
+		}
+		if i == 0 {
+			first = ch
+		}
+	}
+	nka.challengesMu.Lock()
+	n := len(nka.challenges)
+	_, firstKept := nka.challenges[first.AAD.ObjectID]
+	nka.challengesMu.Unlock()
+	if n != challengeCap {
+		t.Fatalf("challenge map has %d entries after %d issues, want the cap %d", n, challengeCap+1, challengeCap)
+	}
+	if firstKept {
+		t.Fatal("the oldest challenge survived the cap through IssueChallenge")
 	}
 }

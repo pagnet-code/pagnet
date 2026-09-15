@@ -380,6 +380,16 @@ const (
 	// User notifications (Phase 6): pushed on the SSE stream when a
 	// notification row is created, so the web badge updates live.
 	EventNotificationCreated = "notification.created"
+
+	// Private Network E2EE lifecycle (Phase 8, plan §11.6/§11.7/§11.8).
+	// These are domain observations of the crypto lifecycle; the key material
+	// itself never crosses to the control plane (the events carry routing
+	// metadata only — host/epoch ids, never keys or ciphertext).
+	EventNetworkPrivacyActivated      = "network.privacy_activated"
+	EventNetworkCryptoRotated         = "network.crypto_rotated"
+	EventNetworkCryptoRotationFailed  = "network.crypto_rotation_failed"
+	EventHostCryptoReady              = "host.crypto_ready"
+	EventHostCryptoEnrollmentFailed   = "host.crypto_enrollment_failed"
 )
 
 // Actor types for events.

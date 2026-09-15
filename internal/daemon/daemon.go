@@ -202,6 +202,13 @@ type Daemon struct {
 	latestVersion string
 	updating      bool
 	lastAttempt   time.Time
+
+	// cryptoMu guards cryptoMgr (lazy init on the first crypto command or
+	// inventory report). The manager caches the stable host E2EE identity
+	// and per-network NKA instances (the NKA must stay alive across an
+	// enrollment round-trip — see crypto.go).
+	cryptoMu  sync.Mutex
+	cryptoMgr *cryptoManager
 }
 
 // Bounded dedup retention (spec §91 "bounded period").
@@ -713,6 +720,22 @@ func (d *Daemon) sendAck(conn *websocket.Conn, commandID, errMsg string) error {
 	})
 }
 
+// sendAckResult is sendAck for commands that report a result payload in the
+// ack (the E2EE crypto commands, plan §11.6/§11.7/§11.8). The `result` field
+// is included only when non-nil and `error` only when non-empty — the two are
+// mutually exclusive (a command either succeeds with a result or fails with
+// an error). The error return is the WRITE error, as in sendAck.
+func (d *Daemon) sendAckResult(conn *websocket.Conn, commandID string, errMsg string, result any) error {
+	payload := map[string]any{"commandId": commandID}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	if result != nil {
+		payload["result"] = result
+	}
+	return d.send(conn, transport.MsgCommandAck, payload)
+}
+
 func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 	metrics := transport.HeartbeatPayload{
 		OS:        runtime.GOOS,
@@ -962,6 +985,82 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return nil
 		})
 
+	// E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8). All
+	// are durable + idempotent and network-scoped: they enqueue on the
+	// per-network queue key "crypto:<networkId>" so a network's activation /
+	// enrollment legs run strictly in order (the WSS read loop only enqueues
+	// — it never blocks on the local cryptography). The ack carries the leg's
+	// result in the ack's `result` field (guardedResult).
+	case transport.MsgCryptoActivate:
+		var p transport.CryptoActivatePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoActivate(p) })
+		})
+
+	case transport.MsgCryptoKeyPackage:
+		var p transport.CryptoKeyPackagePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoKeyPackage(p) })
+		})
+
+	case transport.MsgCryptoInstallKeyPackage:
+		var p transport.CryptoInstallKeyPackagePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoInstallKeyPackage(p) })
+		})
+
+	case transport.MsgCryptoChallenge:
+		var p transport.CryptoChallengePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoChallenge(p) })
+		})
+
+	case transport.MsgCryptoProve:
+		var p transport.CryptoProvePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoProve(p) })
+		})
+
+	case transport.MsgCryptoVerify:
+		var p transport.CryptoVerifyPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoVerify(p) })
+		})
+
+	case transport.MsgCryptoRotate:
+		var p transport.CryptoRotatePayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoRotate(p) })
+		})
+
 	default:
 		d.Log.Warn("unknown command type", "type", env.Type)
 	}
@@ -978,7 +1077,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID string, job func()) {
 	if commandID != "" {
 		if d.alreadyProcessed(commandID) {
-			d.sendAck(conn, commandID, "")
+			d.reAckProcessed(conn, commandID)
 			return
 		}
 		d.seenMu.Lock()
@@ -1003,6 +1102,24 @@ func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID stri
 	}
 	if !d.enqueueInstance(instanceID, job) {
 		d.releaseClaim(commandID)
+	}
+}
+
+// reAckProcessed re-acks an already-processed command (a server re-send after
+// a lost ack), echoing the STORED result verbatim (F8). A command that carried
+// no result (non-crypto) gets the plain empty ack; a crypto command re-acks
+// its original result so a lost ack + re-send does not yield a zero-value
+// result that the server would misread (e.g. an empty activate result would
+// look like a failed self-test and revert a successful activation).
+func (d *Daemon) reAckProcessed(conn *websocket.Conn, commandID string) {
+	if result, ok := d.state.GetProcessedResult(commandID); ok && result != "" {
+		if aerr := d.sendAckResult(conn, commandID, "", json.RawMessage(result)); aerr != nil {
+			d.Log.Warn("re-ack (stored result) lost; server re-send will re-ack", "command", commandID, "err", aerr)
+		}
+		return
+	}
+	if aerr := d.sendAck(conn, commandID, ""); aerr != nil {
+		d.Log.Warn("re-ack lost; server re-send will re-ack", "command", commandID, "err", aerr)
 	}
 }
 
@@ -1033,13 +1150,60 @@ func (d *Daemon) guarded(conn *websocket.Conn, commandID string, fn func() error
 		return // claim kept: terminal failure, re-sends are stale
 	}
 	if commandID != "" {
-		_ = d.state.MarkProcessed(commandID, "")
+		_ = d.state.MarkProcessed(commandID, "", nil)
 	}
 	if aerr := d.sendAck(conn, commandID, ""); aerr != nil {
 		// The outcome never reaches the server. Release the claim so the
 		// re-send is the copy that finishes the protocol: it either re-acks
 		// via alreadyProcessed (MarkProcessed succeeded) or re-runs (it
 		// did not) — both safe, every handler tolerates re-execution.
+		d.Log.Warn("ack lost; releasing claim for server re-send", "command", commandID, "err", aerr)
+		d.releaseClaim(commandID)
+	}
+}
+
+// guardedResult is guarded for commands that report a result payload in the
+// ack (the E2EE crypto commands, plan §11.6/§11.7/§11.8). It has the SAME
+// deferred / canceled / failure semantics as guarded, except a clean success
+// acks the result (via sendAckResult) instead of an empty ack. The crypto
+// commands are fast (local cryptography, no runtime turn), so they are
+// enqueued on a per-network queue key (see handleCommand) and never defer.
+func (d *Daemon) guardedResult(conn *websocket.Conn, commandID string, fn func() (any, error)) {
+	result, err := fn()
+	if errors.Is(err, ErrDeferred) {
+		d.releaseClaim(commandID)
+		d.Log.Debug("command deferred (stays queued)", "command", commandID)
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		// Daemon shutdown interrupted the command. Do NOT ack it as a
+		// failure: the command must stay pending so the server's re-send
+		// after reconnect is the one that runs (or re-acks).
+		return
+	}
+	if err != nil {
+		if aerr := d.sendAckResult(conn, commandID, err.Error(), nil); aerr != nil {
+			d.Log.Warn("failure ack lost; server re-send will re-fail it", "command", commandID, "err", aerr)
+		}
+		return // claim kept: terminal failure, re-sends are stale
+	}
+	// Persist the ack result with the processed-command record so a re-send
+	// of this command (lost ack) re-acks the SAME result verbatim (F8). A
+	// nil result (e.g. install/verify legs) stores "" — the re-ack is then
+	// the plain empty ack, which is correct for a result-less command.
+	var resultJSON []byte
+	if result != nil {
+		if b, err := json.Marshal(result); err == nil {
+			resultJSON = b
+		}
+	}
+	if commandID != "" {
+		_ = d.state.MarkProcessed(commandID, "", resultJSON)
+	}
+	if aerr := d.sendAckResult(conn, commandID, "", result); aerr != nil {
+		// The outcome never reaches the server. Release the claim so the
+		// re-send is the copy that finishes the protocol (both safe: the
+		// crypto handlers are idempotent).
 		d.Log.Warn("ack lost; releasing claim for server re-send", "command", commandID, "err", aerr)
 		d.releaseClaim(commandID)
 	}

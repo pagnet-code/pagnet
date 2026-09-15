@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,18 @@ func (d *Daemon) sendInventory(conn *websocket.Conn) {
 		Runtimes:     d.detectRuntimes(),
 		Workspaces:   workspaces,
 		AllowedRoots: d.allowedRoots(),
+	}
+	// Report the host's stable E2EE public identity (plan §11.5) so the
+	// control plane knows the host is crypto-capable and can address it for
+	// Private Network activation/enrollment. Public keys only — the private
+	// keys never leave the host. Best-effort: a failure to ensure the
+	// identity omits the block (the host is simply not crypto-capable yet)
+	// and never fails the inventory report.
+	if id, err := d.cryptoManager().hostIdentity(); err == nil {
+		payload.Crypto = &transport.InventoryCrypto{
+			X25519Pub:  base64.StdEncoding.EncodeToString(id.X25519Pub),
+			Ed25519Pub: base64.StdEncoding.EncodeToString(id.Ed25519Pub),
+		}
 	}
 	_ = d.send(conn, transport.MsgHostInventory, payload)
 }

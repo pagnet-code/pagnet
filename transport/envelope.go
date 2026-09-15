@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
 )
 
 // ProtocolVersion is the current host-protocol envelope version.
@@ -138,6 +139,41 @@ const (
 	// idempotent and self-gating (idle gate + 1h failure backoff), so a
 	// missed or duplicated advertisement is harmless.
 	MsgLatestVersion = "host.latest_version"
+
+	// E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8). All
+	// are DURABLE + idempotent (commandId) and network-scoped (they carry a
+	// networkId, not an instanceId). The daemon runs the customer-side
+	// cryptography locally; the control plane only relays the opaque
+	// payloads (key package / challenge / proof) and never sees key
+	// material. The ack carries the leg's result in the ack's `result`
+	// field (see the crypto *Result payloads below).
+	//
+	// MsgCryptoActivate: the selected host creates the first Network Key
+	// Authority / key epoch locally, runs the crypto self-test, and reports
+	// its public identity + epoch id (plan §11.6 step 4–6).
+	MsgCryptoActivate = "host.crypto_activate"
+	// MsgCryptoKeyPackage: the NKA host builds the HPKE key package sealed
+	// to the target host's X25519 public key (enrollment leg 1, §11.7).
+	MsgCryptoKeyPackage = "host.crypto_key_package"
+	// MsgCryptoInstallKeyPackage: the target host opens the key package with
+	// its X25519 private key and stores the network keyring (enrollment leg
+	// 2, §11.7).
+	MsgCryptoInstallKeyPackage = "host.crypto_install_key_package"
+	// MsgCryptoChallenge: the NKA host issues a decryption challenge for the
+	// target host (enrollment leg 3, §11.7 step 7).
+	MsgCryptoChallenge = "host.crypto_challenge"
+	// MsgCryptoProve: the target host decrypts the challenge and returns the
+	// proof (enrollment leg 4, §11.7 step 7).
+	MsgCryptoProve = "host.crypto_prove"
+	// MsgCryptoVerify: the NKA host verifies the target host's proof
+	// (enrollment leg 5, §11.7 step 8). A clean ack marks the host
+	// crypto-ready.
+	MsgCryptoVerify = "host.crypto_verify"
+	// MsgCryptoRotate: the NKA host mints a new key epoch, marking the
+	// previous one rotated (plan §11.8). The old epoch is retained
+	// customer-side to read history; the control plane only records the new
+	// epoch id.
+	MsgCryptoRotate = "host.crypto_rotate"
 )
 
 // Message types: host -> control plane (events).
@@ -375,6 +411,22 @@ type InventoryPayload struct {
 	Runtimes     []RuntimeInstallation `json:"runtimes"`
 	Workspaces   []WorkspaceReport     `json:"workspaces"`
 	AllowedRoots []string              `json:"allowedRoots"`
+	// Crypto is the host's stable per-host E2EE public identity (plan
+	// §11.5), reported so the control plane knows the host is crypto-capable
+	// and can address it for Private Network activation/enrollment. Public
+	// keys only — the private keys never leave the host. Nil when the host
+	// has no crypto identity material.
+	Crypto *InventoryCrypto `json:"crypto,omitempty"`
+}
+
+// InventoryCrypto is the host's public E2EE identity (the HPKE receiver key
+// and the signing key), base64-encoded. It is a property of the stable Host,
+// not the ephemeral Runner, and is stable across daemon restarts.
+type InventoryCrypto struct {
+	// X25519Pub is the HPKE receiver public key (base64, 32 bytes).
+	X25519Pub string `json:"x25519Pub"`
+	// Ed25519Pub is the signing public key (base64, 32 bytes).
+	Ed25519Pub string `json:"ed25519Pub"`
 }
 
 // RuntimeInstallation describes a detected runtime on the host.
@@ -544,4 +596,136 @@ type InteractionEventPayload struct {
 	Decision string `json:"decision,omitempty"`
 	// Answer is the (opaque) answer, when the runtime reported one.
 	Answer string `json:"answer,omitempty"`
+}
+
+// --- E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8) --------
+//
+// These are the durable, idempotent, network-scoped commands the control
+// plane uses to activate a Private Network and enroll additional hosts. The
+// daemon runs the customer-side cryptography locally; the control plane
+// relays the opaque payloads (key package / challenge / proof) and never
+// sees key material. Every payload carries:
+//   - CommandID: the idempotency key (the daemon dedups + acks on it).
+//   - NetworkID: the Private Network the operation targets.
+//   - TenantID: the tenant, carried so the daemon can bind it into the AAD
+//     (the daemon does not otherwise know the tenant id).
+//
+// The control plane fills TenantID from the authenticated identity / network
+// ownership; it is routing metadata, not a secret.
+
+// CryptoActivatePayload asks the selected host to create the first Network
+// Key Authority / key epoch for the network, run the crypto self-test, and
+// report its public identity + epoch id (plan §11.6 step 4–6).
+type CryptoActivatePayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+}
+
+// CryptoKeyPackagePayload asks the NKA host to build the HPKE key package
+// sealed to the target host's X25519 public key (enrollment leg 1, §11.7).
+type CryptoKeyPackagePayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	// TargetHostID is the enrolling host (the package recipient).
+	TargetHostID string `json:"targetHostId"`
+	// TargetX25519Pub is the target host's HPKE receiver public key (base64).
+	TargetX25519Pub string `json:"targetX25519Pub"`
+}
+
+// CryptoInstallKeyPackagePayload carries the HPKE key package to the target
+// host, which opens it with its X25519 private key and stores the network
+// keyring (enrollment leg 2, §11.7).
+type CryptoInstallKeyPackagePayload struct {
+	CommandID  string          `json:"commandId"`
+	TenantID   string          `json:"tenantId"`
+	NetworkID  string          `json:"networkId"`
+	KeyPackage e2ee.KeyPackage `json:"keyPackage"`
+}
+
+// CryptoChallengePayload asks the NKA host to issue a decryption challenge
+// for the target host (enrollment leg 3, §11.7 step 7).
+type CryptoChallengePayload struct {
+	CommandID    string `json:"commandId"`
+	TenantID     string `json:"tenantId"`
+	NetworkID    string `json:"networkId"`
+	TargetHostID string `json:"targetHostId"`
+}
+
+// CryptoProvePayload carries the challenge to the target host, which decrypts
+// it and returns the proof (enrollment leg 4, §11.7 step 7).
+type CryptoProvePayload struct {
+	CommandID string         `json:"commandId"`
+	TenantID  string         `json:"tenantId"`
+	NetworkID string         `json:"networkId"`
+	Challenge e2ee.Challenge `json:"challenge"`
+}
+
+// CryptoVerifyPayload carries the challenge + the target host's proof to the
+// NKA host, which verifies it (enrollment leg 5, §11.7 step 8).
+type CryptoVerifyPayload struct {
+	CommandID string         `json:"commandId"`
+	TenantID  string         `json:"tenantId"`
+	NetworkID string         `json:"networkId"`
+	Challenge e2ee.Challenge `json:"challenge"`
+	Proof     e2ee.Proof     `json:"proof"`
+}
+
+// CryptoRotatePayload asks the NKA host to mint a new key epoch for the
+// network (plan §11.8). The previous epoch is marked rotated and retained
+// customer-side to read history; the control plane records only the new
+// epoch id.
+type CryptoRotatePayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+}
+
+// --- crypto ack results ------------------------------------------------------
+//
+// The daemon reports a crypto command's outcome in the command ack's
+// `result` field (a JSON object). These are the result shapes per command.
+// They carry public keys and opaque ciphertext only — never key material.
+
+// CryptoHostPublic is a host's public E2EE identity (base64 keys).
+type CryptoHostPublic struct {
+	// X25519 is the HPKE receiver public key (base64, 32 bytes).
+	X25519 string `json:"x25519"`
+	// Ed25519 is the signing public key (base64, 32 bytes).
+	Ed25519 string `json:"ed25519"`
+}
+
+// CryptoActivateResult is the ack result of host.crypto_activate: the host's
+// public identity, the new epoch id, and the self-test outcome. A clean ack
+// with SelfTestOK=true is what flips the network to active (plan §11.6
+// step 6: the state flips ONLY after the self-test round trip succeeds).
+type CryptoActivateResult struct {
+	HostPub    CryptoHostPublic `json:"hostPub"`
+	EpochID    string           `json:"epochId"`
+	SelfTestOK bool             `json:"selfTestOk"`
+}
+
+// CryptoKeyPackageResult is the ack result of host.crypto_key_package: the
+// opaque HPKE key package for the target host.
+type CryptoKeyPackageResult struct {
+	KeyPackage e2ee.KeyPackage `json:"keyPackage"`
+}
+
+// CryptoChallengeResult is the ack result of host.crypto_challenge: the
+// opaque decryption challenge for the target host.
+type CryptoChallengeResult struct {
+	Challenge e2ee.Challenge `json:"challenge"`
+}
+
+// CryptoProveResult is the ack result of host.crypto_prove: the target host's
+// opaque proof.
+type CryptoProveResult struct {
+	Proof e2ee.Proof `json:"proof"`
+}
+
+// CryptoRotateResult is the ack result of host.crypto_rotate: the id of the
+// newly minted epoch.
+type CryptoRotateResult struct {
+	EpochID string `json:"epochId"`
 }
