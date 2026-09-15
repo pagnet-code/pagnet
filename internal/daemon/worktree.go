@@ -12,21 +12,27 @@ package daemon
 // state, fail clearly — never silently corrupt work.
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-func gitOut(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
+// gitOut runs one bounded git command (abuse addendum Part B §36/§37): a
+// context timeout AND the daemon's bounded helper concurrency, so a
+// pathological repository or a reconnect-driven probe storm can never
+// spawn hundreds of unbounded git processes. Worktree operations can be
+// slow (they move files), so the timeout is generous.
+func (d *Daemon) gitOut(dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out, err := d.helper.RunCombined(ctx, dir, "git", args...)
 	if err != nil {
 		return "", fmt.Errorf("git %s: %v: %s",
 			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
@@ -34,8 +40,8 @@ func gitOut(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func isGitRepo(path string) bool {
-	out, err := gitOut(path, "rev-parse", "--is-inside-work-tree")
+func (d *Daemon) isGitRepo(path string) bool {
+	out, err := d.gitOut(path, "rev-parse", "--is-inside-work-tree")
 	return err == nil && out == "true"
 }
 
@@ -43,8 +49,8 @@ func isGitRepo(path string) bool {
 // path: the directory holding the shared .git data. A normal checkout and
 // all of its linked worktrees resolve to the SAME common dir, which is
 // exactly the identity "same repository" needs.
-func repoCommonDir(path string) (string, error) {
-	out, err := gitOut(path, "rev-parse", "--git-common-dir")
+func (d *Daemon) repoCommonDir(path string) (string, error) {
+	out, err := d.gitOut(path, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return "", err
 	}
@@ -86,10 +92,10 @@ func worktreeBranch(agentName, instanceID string) string {
 // RW agent (and every read-only agent) keeps the given checkout; a
 // second+ RW agent on the same repository is moved into a worktree.
 func (d *Daemon) resolveWorkspace(p transport.LaunchAgentPayload, access string) (string, error) {
-	if access == domain.AccessReadOnly || !isGitRepo(p.WorkspacePath) {
+	if access == domain.AccessReadOnly || !d.isGitRepo(p.WorkspacePath) {
 		return p.WorkspacePath, nil
 	}
-	common, err := repoCommonDir(p.WorkspacePath)
+	common, err := d.repoCommonDir(p.WorkspacePath)
 	if err != nil {
 		// Not a resolvable git repository (or git missing): run in the
 		// checkout as-is — there is nothing to isolate.
@@ -106,7 +112,7 @@ func (d *Daemon) resolveWorkspace(p transport.LaunchAgentPayload, access string)
 		if other.Access != domain.AccessReadWrite {
 			continue
 		}
-		oc, err := repoCommonDir(other.Workspace)
+		oc, err := d.repoCommonDir(other.Workspace)
 		if err != nil || oc != common {
 			continue
 		}
@@ -132,10 +138,10 @@ func (d *Daemon) removeWorktree(row *InstanceRow) {
 		return
 	}
 	checkout := filepath.Dir(filepath.Dir(filepath.Dir(wt)))
-	if !isGitRepo(checkout) {
+	if !d.isGitRepo(checkout) {
 		return
 	}
-	if out, err := gitOut(checkout, "worktree", "remove", wt); err != nil {
+	if out, err := d.gitOut(checkout, "worktree", "remove", wt); err != nil {
 		d.Log.Warn("worktree remove failed (kept)", "worktree", wt, "err", err, "out", out)
 		return
 	}
@@ -160,7 +166,7 @@ func (d *Daemon) ensureWorktree(fromRepo, common, instanceID, branch string) (st
 
 	// Already created (daemon restart / replay)?
 	if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-		if oc, err := repoCommonDir(wt); err == nil && oc == common {
+		if oc, err := d.repoCommonDir(wt); err == nil && oc == common {
 			return wt, nil
 		}
 		return "", fmt.Errorf("refusing to use %s: path exists but is not a worktree of this repository", wt)
@@ -170,10 +176,10 @@ func (d *Daemon) ensureWorktree(fromRepo, common, instanceID, branch string) (st
 	// but branch kept).
 	var out string
 	var err error
-	if _, verr := gitOut(fromRepo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); verr == nil {
-		out, err = gitOut(fromRepo, "worktree", "add", wt, branch)
+	if _, verr := d.gitOut(fromRepo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); verr == nil {
+		out, err = d.gitOut(fromRepo, "worktree", "add", wt, branch)
 	} else {
-		out, err = gitOut(fromRepo, "worktree", "add", "-b", branch, wt)
+		out, err = d.gitOut(fromRepo, "worktree", "add", "-b", branch, wt)
 	}
 	if err != nil {
 		// §29: fail clearly rather than silently corrupt work.

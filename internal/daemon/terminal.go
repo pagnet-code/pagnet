@@ -24,16 +24,17 @@ package daemon
 // stored runtime session when the runtime supports it.
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
-	"os/exec"
 	"sync"
 	"time"
 
 	"github.com/creack/pty"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -53,8 +54,29 @@ const (
 // ptySession is one live PTY for an instance.
 type ptySession struct {
 	instanceID string
-	cmd        *exec.Cmd
-	f          *os.File
+	// h is the supervisor's handle for this PTY session (ClassPTY): the
+	// session is an isolated process SESSION (Setsid+Setctty, its own
+	// group, pgid == leader pid). Termination kills the WHOLE group —
+	// the runtime TUI AND its slave-holding helper descendants — so the
+	// PTY is released and the read loop unblocks (abuse addendum Part B
+	// §26). The session never holds the raw *exec.Cmd: it requests
+	// termination and observes the exit; the supervisor's owner (this
+	// session's exitLoop) is the single reaper.
+	h *proc.Handle
+	// f is the PTY master (h.PTY()). The read loop streams from it; it
+	// errors (EIO) once every slave fd is closed (the group is dead).
+	f *os.File
+	// live is closed once h and f are set (the session is ready). A
+	// concurrent start that finds a not-yet-live session waits on it
+	// (external audit F-002: atomic STARTING reservation — exactly one
+	// start launches; the rest reconcile to the reserved session instead
+	// of racing a second Launch, which the supervisor would dedup to the
+	// SAME process and the old re-check-and-kill path would then
+	// terminate, killing the shared session). startErr is set (before
+	// live is closed) when the launch fails; the channel close is the
+	// happens-before edge that makes the read race-free.
+	live     chan struct{}
+	startErr error
 
 	// bufMu guards seq + ring: the reader appends, attach snapshots read.
 	// seq counts BYTES (monotonic per session) — the replay→live dedup
@@ -119,8 +141,10 @@ func newTerminalManager(d *Daemon) *terminalManager {
 func (tm *terminalManager) liveLoop() {
 	for m := range tm.liveCh {
 		s := tm.get(m.instance)
-		if s == nil {
-			continue // no live PTY: the byte has nowhere to go
+		if s == nil || s.f == nil {
+			// No live PTY yet (or a starting session whose master is not
+			// open): the byte has nowhere to go (external audit F-002).
+			continue
 		}
 		if m.isResize {
 			if m.cols > 0 && m.rows > 0 {
@@ -217,46 +241,90 @@ func (tm *terminalManager) activeCount() int {
 // attach is a durable command and may re-send). The interactive command
 // comes from the runtime adapter (the ACTUAL CLI, addendum §7); resume
 // selects the stored runtime session.
+//
+// Atomic STARTING reservation (external audit F-002): the slot is
+// reserved in the sessions map BEFORE the (slow) launch, so a concurrent
+// start reconciles to the reserved session (waiting on its live channel)
+// instead of racing a second Launch. The supervisor would dedup the
+// duplicate to the SAME process, and the old re-check-and-kill path would
+// then terminate that shared handle — killing the winner's session. With
+// the reservation, exactly one start launches; the rest wait.
 func (tm *terminalManager) start(instanceID string, resume bool) (*ptySession, error) {
 	tm.mu.Lock()
 	if s := tm.sessions[instanceID]; s != nil {
 		tm.mu.Unlock()
-		return s, nil
+		return tm.awaitLive(s)
 	}
+	s := &ptySession{instanceID: instanceID, live: make(chan struct{})}
+	tm.sessions[instanceID] = s
 	tm.mu.Unlock()
 
-	row, ok, err := tm.d.state.GetInstance(instanceID)
-	if err != nil {
+	if err := tm.launchPTY(s, instanceID, resume); err != nil {
+		tm.mu.Lock()
+		if tm.sessions[instanceID] == s {
+			delete(tm.sessions, instanceID)
+		}
+		tm.mu.Unlock()
+		s.startErr = err
+		close(s.live)
 		return nil, err
 	}
+	close(s.live)
+	return s, nil
+}
+
+// awaitLive blocks until the reserved session is live (or its launch
+// failed) and returns the result. The channel close is the happens-before
+// edge that makes reading startErr race-free.
+func (tm *terminalManager) awaitLive(s *ptySession) (*ptySession, error) {
+	<-s.live
+	if s.startErr != nil {
+		return nil, s.startErr
+	}
+	return s, nil
+}
+
+// launchPTY performs the actual (slow) PTY launch into an already-
+// reserved session. It sets s.h/s.f and starts the read/exit loops; the
+// caller closes s.live on return.
+func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bool) error {
+	row, ok, err := tm.d.state.GetInstance(instanceID)
+	if err != nil {
+		return err
+	}
 	if !ok {
-		return nil, fmt.Errorf("unknown instance %s", instanceID)
+		return fmt.Errorf("unknown instance %s", instanceID)
 	}
 	ad, ok := tm.d.adapters[domain.RuntimeName(row.Runtime)]
 	if !ok {
-		return nil, fmt.Errorf("no adapter for runtime %q", row.Runtime)
+		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
 	}
 	cmd, err := ad.InteractiveCmd(tm.d.turnSpecFor(row, resume, "", "terminal"))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	f, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Rows: terminalDefaultRows,
-		Cols: terminalDefaultCols,
+	// The supervisor launches the PTY under an isolated process SESSION
+	// (Setsid+Setctty — the same SysProcAttr pty.StartWithSize always
+	// set, now owned in one place) and hands back the master. context.
+	// Background is deliberate: a PTY session is long-lived and must NOT
+	// be tied to a turn's context (it survives turns and detaches, §10).
+	h, err := tm.d.sup.Launch(context.Background(), proc.LaunchRequest{
+		InstanceID: instanceID,
+		TurnID:     proc.PTYTurnID,
+		Runtime:    row.Runtime,
+		Class:      proc.ClassPTY,
+		Cmd:        cmd,
+		PTYSize: &pty.Winsize{
+			Rows: terminalDefaultRows,
+			Cols: terminalDefaultCols,
+		},
+		Marker: "PAGNET_INSTANCE_ID=" + instanceID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("pty start: %w", err)
+		return fmt.Errorf("pty start: %w", err)
 	}
-	s := &ptySession{instanceID: instanceID, cmd: cmd, f: f}
-	tm.mu.Lock()
-	if existing := tm.sessions[instanceID]; existing != nil {
-		tm.mu.Unlock()
-		_ = f.Close()
-		_ = cmd.Process.Kill()
-		return existing, nil
-	}
-	tm.sessions[instanceID] = s
-	tm.mu.Unlock()
+	s.h = h
+	s.f = h.PTY()
 
 	// P6 configStale: the PTY was just spawned with the daemon's CURRENT
 	// injected config (MCP bridge + identity env) — record its
@@ -267,8 +335,8 @@ func (tm *terminalManager) start(instanceID string, resume bool) (*ptySession, e
 
 	go tm.readLoop(s)
 	go tm.exitLoop(s)
-	tm.d.Log.Info("pty started", "instance", instanceID, "pid", cmd.Process.Pid, "resume", resume)
-	return s, nil
+	tm.d.Log.Info("pty started", "instance", instanceID, "pid", h.PID(), "resume", resume)
+	return nil
 }
 
 // readLoop streams PTY output: ring append + one ordered terminal_output
@@ -312,8 +380,11 @@ func (tm *terminalManager) snapshot(s *ptySession) (data string, lastSeq uint64)
 // the session killed first — that path owns instance state (stop/
 // restart/forget/shutdown).
 func (tm *terminalManager) exitLoop(s *ptySession) {
-	waitErr := s.cmd.Wait()
-	_ = s.f.Close()
+	// Owner's reap (single Wait): reaps the session leader AND reclaims
+	// any slave-holding descendants that outlived it (§19/§24/§26) — this
+	// is what releases the PTY and unblocks the read loop.
+	waitErr := s.h.Wait()
+	_ = s.f.Close() // backstop: the master already errored when the group died
 	tm.mu.Lock()
 	killed := false
 	if tm.sessions[s.instanceID] == s {
@@ -347,21 +418,34 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 		"instance", s.instanceID, "wait", waitErr)
 }
 
-// stop kills the instance's PTY. Idempotent; suppresses the natural-exit
-// event (the caller drives instance state).
+// stop terminates the instance's PTY session. Idempotent; suppresses the
+// natural-exit event (the caller drives instance state). It terminates the
+// WHOLE process group (the session leader AND its slave-holding
+// descendants) via the supervisor — never just the direct child, which
+// would leave the PTY allocated and the read loop blocked (§26).
 func (tm *terminalManager) stop(instanceID string) {
 	tm.mu.Lock()
 	s := tm.sessions[instanceID]
-	if s != nil {
+	tm.mu.Unlock()
+	if s == nil {
+		return
+	}
+	// A starting session has no handle yet: wait for the launch to settle
+	// (external audit F-002) so we never terminate a nil handle or orphan
+	// a just-launched process. If the launch already failed there is
+	// nothing to terminate.
+	<-s.live
+	if s.startErr != nil {
+		return
+	}
+	tm.mu.Lock()
+	if tm.sessions[instanceID] == s {
 		s.killed = true
 		delete(tm.sessions, instanceID)
 		delete(tm.lastSize, instanceID)
 	}
 	tm.mu.Unlock()
-	if s == nil || s.cmd.Process == nil {
-		return
-	}
-	_ = s.cmd.Process.Kill()
+	s.h.Terminate("stopped")
 	tm.d.Log.Info("pty stopped", "instance", instanceID)
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 )
 
 // Fake is the MVP runtime adapter. It is a REAL process-per-turn runtime:
@@ -31,12 +32,16 @@ type Fake struct {
 	// processes (E2E simulation knobs, e.g. PAGNET_FAKE_RATELIMIT).
 	Env []string
 
-	track procTracker
+	life lifecycleState
 }
 
 func NewFake(binary string) *Fake {
-	return &Fake{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
+	return &Fake{Binary: binary}
 }
+
+// SetLifecycle implements LifecycleSetter (the daemon injects its central
+// process supervisor; standalone use falls back to a private one).
+func (f *Fake) SetLifecycle(l proc.Lifecycle) { f.life.SetLifecycle(l) }
 
 func (f *Fake) Name() domain.RuntimeName { return domain.RuntimeFake }
 
@@ -118,9 +123,9 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, bin)
+	cmd := exec.Command(bin)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(f.Env, spec.Env)
+	cmd.Env = EnsureTurnMarker(ChildEnv(f.Env, spec.Env), spec.TurnID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -132,11 +137,25 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn fake runtime: %w", err)
+	// The supervisor owns the Start, the process group (Setpgid), the
+	// launch guards, and the lifecycle. The ctx is handed to it (its
+	// watcher terminates the whole group on cancellation — never just
+	// the direct child).
+	h, err := f.life.get().Launch(ctx, proc.LaunchRequest{
+		InstanceID: spec.InstanceID,
+		TurnID:     spec.TurnID,
+		Runtime:    string(f.Name()),
+		Class:      proc.ClassTurn,
+		Cmd:        cmd,
+		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+	})
+	if err != nil {
+		return err
 	}
-	f.track.track(spec.InstanceID, cmd)
-	defer f.track.release(spec.InstanceID, cmd)
+	// defer-safe finalizer: if the owner returns without reaping (early
+	// return, panic), Close aborts the group and reaps. After a normal
+	// h.Wait it is a no-op.
+	defer h.Close()
 
 	// Send the turn spec.
 	specWire := map[string]any{
@@ -157,6 +176,7 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	terminal := false
 	for scanner.Scan() {
 		var ev wireEvent
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
@@ -166,12 +186,44 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		select {
 		case events <- norm:
 		case <-ctx.Done():
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
+			// The supervisor's ctx watcher terminates the whole group;
+			// the owner just stops reading. defer h.Close() reaps.
 			return ctx.Err()
 		}
+		if isTerminalEvent(norm.Type) {
+			// The turn is over: stop scanning. A descendant that
+			// outlived the runtime and holds the stdout pipe would
+			// otherwise block this read until the turn's context
+			// expires (the 2026-09-15 pipe-hold hazard).
+			terminal = true
+			break
+		}
 	}
-	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+	// A truncated stream (a line over the scanner buffer, or an I/O
+	// error) before a terminal event is a failure, not a clean exit —
+	// surface it instead of treating the partial stream as completed
+	// (external audit F-012).
+	if scanErr := scanner.Err(); scanErr != nil && !terminal {
+		if proc.GroupAlive(h.PGID()) {
+			h.Terminate("scan_error")
+		}
+		_ = h.Wait()
+		events <- TurnEvent{
+			Type:        EventTurnFailed,
+			FailureKind: domain.RuntimeFailureProcessError,
+			Error:       fmt.Sprintf("fake runtime stream error: %v", scanErr),
+		}
+		return nil
+	}
+	// The turn reported a terminal event, but a descendant may still be
+	// alive holding the stdout/stderr pipes. Terminate the group so the
+	// Wait below reaps promptly instead of blocking on the held pipe.
+	if terminal && proc.GroupAlive(h.PGID()) {
+		h.Terminate("turn_ended")
+	}
+	// Owner's reap (single Wait): after all stdout is drained. Also
+	// reclaims any descendants that outlived the runtime (§19/§24).
+	if err := h.Wait(); err != nil && ctx.Err() == nil {
 		// Surface a crash as a process_error turn failure.
 		events <- TurnEvent{
 			Type:        EventTurnFailed,
@@ -182,10 +234,11 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	return nil
 }
 
-// Stop kills the running process for an instance.
-func (f *Fake) Stop(instanceID string) error { return f.track.stop(instanceID) }
+// Stop terminates the instance's active turn process group (no-op if
+// none). Delegates to the process supervisor.
+func (f *Fake) Stop(instanceID string) error { return f.life.get().Stop(instanceID) }
 
-func (f *Fake) PID(instanceID string) *int { return f.track.pid(instanceID) }
+func (f *Fake) PID(instanceID string) *int { return f.life.get().PID(instanceID) }
 
 // InteractiveCmd builds the fake runtime's interactive PTY mode: a
 // deterministic, scriptable stand-in for a real runtime's interactive UI

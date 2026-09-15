@@ -1,0 +1,154 @@
+//go:build darwin
+
+package proc
+
+import (
+	"os"
+	"strconv"
+
+	"golang.org/x/sys/unix"
+)
+
+// macOS process information comes from the kernel's KERN_PROC sysctl
+// (the same source `ps` uses — read-only, no helper processes, §30/§33).
+//
+// The original P0 incident happened on macOS, so this file is not a
+// porting afterthought: group enumeration, start-identity, and
+// pressure detection all run on the kernel API here, and the Darwin
+// build-tagged tests exercise them on a macOS host (see
+// docs/macOS-acceptance.md).
+
+// darwinProc is the subset of KinfoProc the supervisor needs.
+type darwinProc struct {
+	pid   int
+	pgrp  int
+	uid   int
+	stat  byte  // P_stat & 0x1f: process state (darwinSZombie = dead)
+	start int64 // P_starttime: Timeval since boot (start identity)
+}
+
+// darwinSZombie is the BSD/macOS process state for a zombie (SZOMB in
+// <sys/proc.h>). x/sys/unix does not export the p_stat state constants
+// for darwin, so the value is defined here. A zombie is a dead process
+// awaiting reap — it cannot be signaled into dying.
+const darwinSZombie = 5
+
+func readDarwinProcs() []darwinProc {
+	kps, err := unix.SysctlKinfoProcSlice("kern.proc.all")
+	if err != nil {
+		return nil
+	}
+	out := make([]darwinProc, 0, len(kps))
+	for _, kp := range kps {
+		if kp.Proc.P_pid == 0 {
+			continue
+		}
+		out = append(out, darwinProc{
+			pid:   int(kp.Proc.P_pid),
+			pgrp:  int(kp.Proc.P_pgrp),
+			uid:   int(kp.Eproc.Ucred.Uid),
+			stat:  byte(int(kp.Proc.P_stat) & 0x1f),
+			start: kp.Proc.P_starttime.Sec,
+		})
+	}
+	return out
+}
+
+// CountGroup returns the number of processes currently in group pgid.
+func CountGroup(pgid int) int {
+	n := 0
+	for _, p := range readDarwinProcs() {
+		if p.pgrp == pgid {
+			n++
+		}
+	}
+	return n
+}
+
+// CountOwned returns the total number of processes in any of the owned
+// process groups (one KERN_PROC_ALL pass, not one per group).
+func CountOwned(groups map[int]bool) int {
+	if len(groups) == 0 {
+		return 0
+	}
+	n := 0
+	for _, p := range readDarwinProcs() {
+		if groups[p.pgrp] {
+			n++
+		}
+	}
+	return n
+}
+
+// CountGroups returns the per-group process counts for the given owned
+// groups in ONE KERN_PROC_ALL pass (the monitor calls this every tick).
+func CountGroups(groups map[int]bool) map[int]int {
+	out := make(map[int]int, len(groups))
+	if len(groups) == 0 {
+		return out
+	}
+	for _, p := range readDarwinProcs() {
+		if groups[p.pgrp] {
+			out[p.pgrp]++
+		}
+	}
+	return out
+}
+
+// GroupMembers lists the pids currently in group pgid.
+func GroupMembers(pgid int) []int {
+	var out []int
+	for _, p := range readDarwinProcs() {
+		if p.pgrp == pgid {
+			out = append(out, p.pid)
+		}
+	}
+	return out
+}
+
+// GroupHasLiveMember reports whether the group has any member that is
+// actually alive (state != SZOMB). A zombie is a dead process awaiting
+// reap and cannot be signaled into dying, so the TERM→grace→KILL poll
+// must not wait on it (see the Linux implementation for the full
+// rationale — the 2026-09-15 5s-per-cycle leak-test regression).
+func GroupHasLiveMember(pgid int) bool {
+	for _, p := range readDarwinProcs() {
+		if p.pgrp == pgid && p.stat != darwinSZombie {
+			return true
+		}
+	}
+	return false
+}
+
+// UserProcessCount returns the number of processes of the current user
+// (the population RLIMIT_NPROC bounds).
+func UserProcessCount() (int, error) {
+	uid := os.Getuid()
+	n := 0
+	for _, p := range readDarwinProcs() {
+		if p.uid == uid {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// StartIdentity returns the kernel start-time marker of pid
+// (P_starttime, seconds since boot). A PID reuse gets a different
+// start time, so this is the PID-reuse-safe identity the ownership
+// record stores (§39).
+func StartIdentity(pid int) (string, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(kp.Proc.P_starttime.Sec, 10), nil
+}
+
+// EnvHasMarker: macOS does not expose other processes' environments
+// through any supported API, so marker-based ownership proof is not
+// available there. Reconciliation falls back to leader-identity
+// verification only (never killing on a bare PID, §39).
+func EnvHasMarker(pid int, marker string) (bool, error) {
+	return false, ErrMarkerUnavailable
+}

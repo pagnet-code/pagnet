@@ -3,29 +3,32 @@ package runtime
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"sync"
 )
 
 // ChildEnv builds the environment for a spawned runtime process.
 //
-// The inherited environment is FILTERED before anything else is appended:
-// runtime processes are untrusted (an LLM with shell access), and the
-// daemon's own environment may carry control-plane material —
-// PAGNET_* (admin/host credentials, runtime knobs), database DSNs —
-// that must never be readable from an agent (spec §5/§15/§86.10).
+// The inherited environment is ALLOWLISTED before anything else is
+// appended: runtime processes are untrusted (an LLM with shell access),
+// and the daemon's own environment — and the user's shell environment —
+// may carry secrets that must never be readable from an agent (spec
+// §5/§15/§86.10; external audit F-009). A blocklist is inherently
+// incomplete (it would leak GH_TOKEN, AWS_*, SSH_AUTH_SOCK, ...), so the
+// filter is fail-closed: only the keys a runtime actually needs (PATH,
+// HOME, locale, provider auth) pass through; everything else is dropped.
 //
 // Explicit pairs passed by the caller (adapter knobs, per-instance
 // injection like the MCP bridge config and the identity vars) are
-// appended after the filter, in order, and always win. Provider API keys
-// (ANTHROPIC_API_KEY, DASHSCOPE_API_KEY, ...) are NOT on the blocklist and
-// keep flowing through — the runtimes need them.
+// appended after the filter, in order, and always win — they are
+// pagnet's own, deliberately-injected values, not inherited secrets.
 func ChildEnv(extra ...[]string) []string {
-	out := make([]string, 0, len(os.Environ())+8)
+	out := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
 		key, _, ok := strings.Cut(kv, "=")
-		if !ok || isControlPlaneEnvKey(key) {
+		// Fail closed: only allowlisted keys pass. isControlPlaneEnvKey is
+		// kept as defense-in-depth (a control-plane key is never allowed,
+		// even if it were ever added to the allowlist by mistake).
+		if !ok || !isAllowedChildEnvKey(key) || isControlPlaneEnvKey(key) {
 			continue
 		}
 		out = append(out, kv)
@@ -34,6 +37,63 @@ func ChildEnv(extra ...[]string) []string {
 		out = append(out, pairs...)
 	}
 	return out
+}
+
+// allowedChildEnvExact is the exact-match allowlist of inherited keys that
+// may reach an agent process: the minimal set a runtime CLI needs to run
+// (PATH, HOME, identity, locale, terminal, temp dir, XDG) plus the provider
+// auth keys / base-URL overrides the runtimes use to reach their LLM
+// provider. Anything not listed here is dropped (external audit F-009).
+var allowedChildEnvExact = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"TERM": true, "COLUMNS": true, "LINES": true, "TMPDIR": true,
+	"TZ": true, "LANG": true, "LANGUAGE": true,
+	"XDG_CONFIG_HOME": true, "XDG_DATA_HOME": true, "XDG_CACHE_HOME": true,
+	"XDG_STATE_HOME": true, "XDG_RUNTIME_DIR": true,
+	// Provider auth (the runtimes need these to reach their LLM provider).
+	"ANTHROPIC_API_KEY": true, "ANTHROPIC_BASE_URL": true,
+	"DASHSCOPE_API_KEY": true, "DASHSCOPE_BASE_URL": true,
+	"OPENAI_API_KEY": true, "OPENAI_BASE_URL": true,
+	"OPENROUTER_API_KEY": true, "OPENROUTER_BASE_URL": true,
+	"GEMINI_API_KEY": true, "GROQ_API_KEY": true, "MISTRAL_API_KEY": true,
+	"TOGETHER_API_KEY": true, "FIREWORKS_API_KEY": true,
+	"PERPLEXITY_API_KEY": true, "DEEPSEEK_API_KEY": true,
+}
+
+// allowedChildEnvPrefix is the prefix allowlist (the LC_* locale family).
+var allowedChildEnvPrefix = []string{"LC_"}
+
+// isAllowedChildEnvKey reports whether an inherited env key may reach an
+// agent process (exact match or prefix match against the allowlists).
+func isAllowedChildEnvKey(key string) bool {
+	if allowedChildEnvExact[key] {
+		return true
+	}
+	for _, p := range allowedChildEnvPrefix {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureTurnMarker guarantees the ownership-marker pair
+// PAGNET_TURN_ID=<turnID> is present exactly once in env (abuse addendum
+// Part B §42). The marker is the process-tree ownership proof the
+// supervisor stores in the ownership record for restart reconciliation
+// and for diagnostics. It is appended when absent (the daemon may already
+// have injected it via the turn spec's Env; a duplicate is never added).
+func EnsureTurnMarker(env []string, turnID string) []string {
+	if turnID == "" {
+		return env
+	}
+	pair := "PAGNET_TURN_ID=" + turnID
+	for _, kv := range env {
+		if kv == pair {
+			return env
+		}
+	}
+	return append(env, pair)
 }
 
 // isControlPlaneEnvKey reports whether an inherited env key must not reach
@@ -77,50 +137,6 @@ func ValidateExtraEnv(pairs []string) error {
 	if len(blocked) > 0 {
 		return fmt.Errorf("runtime env pairs are not allowed: %s — control-plane keys cannot be injected into agent processes",
 			strings.Join(blocked, ", "))
-	}
-	return nil
-}
-
-// procTracker tracks the running turn process per instance so adapters can
-// answer Stop and PID (§59) consistently.
-type procTracker struct {
-	mu    sync.Mutex
-	procs map[string]*exec.Cmd
-}
-
-func (t *procTracker) track(instanceID string, cmd *exec.Cmd) {
-	t.mu.Lock()
-	t.procs[instanceID] = cmd
-	t.mu.Unlock()
-}
-
-// release drops the entry if it still points at cmd (a later turn may have
-// replaced it).
-func (t *procTracker) release(instanceID string, cmd *exec.Cmd) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if cur, ok := t.procs[instanceID]; ok && cur == cmd {
-		delete(t.procs, instanceID)
-	}
-}
-
-func (t *procTracker) stop(instanceID string) error {
-	t.mu.Lock()
-	cmd := t.procs[instanceID]
-	t.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		return cmd.Process.Kill()
-	}
-	return nil
-}
-
-func (t *procTracker) pid(instanceID string) *int {
-	t.mu.Lock()
-	cmd := t.procs[instanceID]
-	t.mu.Unlock()
-	if cmd != nil && cmd.Process != nil {
-		p := cmd.Process.Pid
-		return &p
 	}
 	return nil
 }

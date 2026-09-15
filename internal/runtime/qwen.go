@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 )
 
 // Qwen drives the qwen-code CLI (`qwen`) as a process-per-turn runtime
@@ -53,12 +54,16 @@ type Qwen struct {
 	// Env is appended to the inherited environment for spawned processes.
 	Env []string
 
-	track procTracker
+	life lifecycleState
 }
 
 func NewQwen(binary string) *Qwen {
-	return &Qwen{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
+	return &Qwen{Binary: binary}
 }
+
+// SetLifecycle implements LifecycleSetter (the daemon injects its central
+// process supervisor; standalone use falls back to a private one).
+func (q *Qwen) SetLifecycle(l proc.Lifecycle) { q.life.SetLifecycle(l) }
 
 func (q *Qwen) Name() domain.RuntimeName { return domain.RuntimeQwenCode }
 
@@ -167,9 +172,9 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		args = append(args, "--mcp-config", mcpJSON)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(q.Env, spec.Env)
+	cmd.Env = EnsureTurnMarker(ChildEnv(q.Env, spec.Env), spec.TurnID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -181,11 +186,21 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn qwen: %w", err)
+	// The supervisor owns the Start, the process group (Setpgid), the
+	// launch guards, and the lifecycle; its ctx watcher terminates the
+	// whole group on cancellation.
+	h, err := q.life.get().Launch(ctx, proc.LaunchRequest{
+		InstanceID: spec.InstanceID,
+		TurnID:     spec.TurnID,
+		Runtime:    string(q.Name()),
+		Class:      proc.ClassTurn,
+		Cmd:        cmd,
+		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+	})
+	if err != nil {
+		return err
 	}
-	q.track.track(spec.InstanceID, cmd)
-	defer q.track.release(spec.InstanceID, cmd)
+	defer h.Close()
 
 	// The prompt goes on stdin: no ARG_MAX limit, no shell, no quoting.
 	_, _ = io.WriteString(stdin, spec.Input)
@@ -205,8 +220,9 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		select {
 		case events <- ev:
 		case <-ctx.Done():
+			// The supervisor's ctx watcher terminates the whole group;
+			// the owner just stops emitting. defer h.Close() reaps.
 			cancelled = true
-			_ = cmd.Process.Kill()
 		}
 	}
 
@@ -225,10 +241,10 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 				// A requested resume that re-bases onto a different
 				// session is a lost session, not a silent fresh one.
 				terminal = true
-				_ = cmd.Process.Kill()
+				h.Abort("session_mismatch")
 				events <- TurnEvent{Type: EventSessionLost, SessionID: stored,
 					Error: "qwen resume started a different session (wanted " + stored + ", got " + sid + ")"}
-				_ = cmd.Wait()
+				_ = h.Wait()
 				return nil
 			}
 			sessionID = sid
@@ -283,9 +299,42 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 				CachedTokens: intPtr(ev.Usage.CacheRead),
 			})
 		}
+		if terminal {
+			// The turn is over: stop scanning. A descendant that
+			// outlived the runtime and holds the stdout pipe would
+			// otherwise block this read until the turn's context
+			// expires (the 2026-09-15 pipe-hold hazard).
+			break
+		}
 	}
-
-	waitErr := cmd.Wait()
+	// A truncated stream (a line over the scanner buffer, or an I/O
+	// error) before a terminal event is a failure, not a clean exit —
+	// surface it instead of treating the partial stream as completed
+	// (external audit F-012).
+	if scanErr := scanner.Err(); scanErr != nil && !terminal {
+		if proc.GroupAlive(h.PGID()) {
+			h.Terminate("scan_error")
+		}
+		_ = h.Wait()
+		if cancelled {
+			return ctx.Err()
+		}
+		events <- TurnEvent{
+			Type:        EventTurnFailed,
+			FailureKind: domain.RuntimeFailureProcessError,
+			Error:       fmt.Sprintf("qwen stream error: %v", scanErr),
+		}
+		return nil
+	}
+	// The turn reported a terminal event, but a descendant may still be
+	// alive holding the stdout/stderr pipes. Terminate the group so the
+	// Wait below reaps promptly instead of blocking on the held pipe.
+	if terminal && proc.GroupAlive(h.PGID()) {
+		h.Terminate("turn_ended")
+	}
+	// Owner's reap (single Wait) after all stdout is drained; also
+	// reclaims any descendants that outlived the runtime (§19/§24).
+	waitErr := h.Wait()
 	if cancelled {
 		return ctx.Err()
 	}
@@ -311,14 +360,14 @@ func (q *Qwen) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		kind, retryAt = ClassifyProviderError(trunc(stderrBuf.String()))
 	}
 	events <- TurnEvent{Type: EventTurnFailed, FailureKind: kind,
-		Error: trunc(firstNonEmpty(stderrBuf.String(), waitErr.Error())), RetryAt: retryAt}
+		Error: trunc(firstNonEmpty(stderrBuf.String(), errorString(waitErr))), RetryAt: retryAt}
 	return nil
 }
 
 // Stop kills the running process for an instance.
-func (q *Qwen) Stop(instanceID string) error { return q.track.stop(instanceID) }
+func (q *Qwen) Stop(instanceID string) error { return q.life.get().Stop(instanceID) }
 
-func (q *Qwen) PID(instanceID string) *int { return q.track.pid(instanceID) }
+func (q *Qwen) PID(instanceID string) *int { return q.life.get().PID(instanceID) }
 
 // InteractiveCmd builds the interactive qwen REPL (the PTY terminal,
 // addendum §7/§8): the default interactive mode (no -o stream-json), with
@@ -422,7 +471,7 @@ func writeStoredSession(path, id string) error {
 	b, _ := json.Marshal(struct {
 		SessionID string `json:"sessionId"`
 	}{SessionID: id})
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	return atomicWriteFile(path, append(b, '\n'), 0o600)
 }
 
 // --- small helpers ---------------------------------------------------------------

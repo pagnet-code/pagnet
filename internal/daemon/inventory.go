@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -22,6 +21,46 @@ import (
 // wake re-evaluation (§75: pending wakes/commands are re-sent and we
 // deduplicate locally by CommandID) — and on host.request_inventory.
 func (d *Daemon) sendInventory(conn *websocket.Conn) {
+	_ = d.send(conn, transport.MsgHostInventory, d.buildInventoryPayload())
+}
+
+// inventoryFlight is one in-flight inventory scan (external audit F-016).
+type inventoryFlight struct {
+	done    chan struct{}
+	payload transport.InventoryPayload
+}
+
+// buildInventoryPayload builds the inventory payload under a single-flight
+// guard (external audit F-016): the workspace scan + runtime version probes
+// fan out bounded helper processes, and a reconnect + a
+// host.request_inventory + an UpdateRoots can arrive close together. The
+// first caller scans; concurrent callers wait for it and reuse the result
+// instead of running the scan concurrently (which would multiply the probe
+// storm). The flight is cleared once the scan settles, so the next caller
+// gets a fresh scan.
+func (d *Daemon) buildInventoryPayload() transport.InventoryPayload {
+	d.invMu.Lock()
+	if f := d.invFlight; f != nil {
+		d.invMu.Unlock()
+		<-f.done
+		return f.payload
+	}
+	f := &inventoryFlight{done: make(chan struct{})}
+	d.invFlight = f
+	d.invMu.Unlock()
+
+	payload := d.doScanInventory()
+	f.payload = payload
+	close(f.done)
+	d.invMu.Lock()
+	d.invFlight = nil
+	d.invMu.Unlock()
+	return payload
+}
+
+// doScanInventory performs the actual (expensive) scan: workspace walk +
+// git probes + runtime version probes + the host's E2EE public identity.
+func (d *Daemon) doScanInventory() transport.InventoryPayload {
 	var workspaces []transport.WorkspaceReport
 	if !d.NoScan {
 		workspaces = d.scanWorkspaces()
@@ -44,7 +83,7 @@ func (d *Daemon) sendInventory(conn *websocket.Conn) {
 			Ed25519Pub: base64.StdEncoding.EncodeToString(id.Ed25519Pub),
 		}
 	}
-	_ = d.send(conn, transport.MsgHostInventory, payload)
+	return payload
 }
 
 // stateID returns the host id the daemon enrolled with (kept in KV state so
@@ -68,7 +107,7 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 			ri := transport.RuntimeInstallation{
 				Runtime: string(name),
 				Path:    p,
-				Version: runtimeVersion(p),
+				Version: d.runtimeVersion(p),
 			}
 			// Phase 5: report the adapter's OBSERVED native-interaction
 			// capability flags (the persisted compatibility matrix, plan
@@ -115,12 +154,15 @@ func remoteResolveMap(obs agentruntime.InteractionObserver) map[string]bool {
 	return m
 }
 
-func runtimeVersion(path string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+// runtimeVersion probes a runtime CLI's version (abuse addendum Part B
+// §36/§37): bounded by the daemon's helper concurrency AND a short
+// timeout, so a reconnect-driven inventory (which re-probes every
+// runtime) can never spawn an unbounded version-check storm.
+func (d *Daemon) runtimeVersion(path string) string {
 	for _, flag := range []string{"--version", "-v"} {
-		cmd := exec.CommandContext(ctx, path, flag)
-		out, err := cmd.Output()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		out, err := d.helper.Run(ctx, "", path, flag)
+		cancel()
 		if err == nil {
 			return firstLine(string(out))
 		}
@@ -159,17 +201,17 @@ func (d *Daemon) scanWorkspaces() []transport.WorkspaceReport {
 				return filepath.SkipDir
 			}
 			seen[path] = true
-			out = append(out, gitWorkspaceReport(path))
+			out = append(out, d.gitWorkspaceReport(path))
 			return filepath.SkipDir // don't nest inside a repo
 		})
 	}
 	return out
 }
 
-func gitWorkspaceReport(dir string) transport.WorkspaceReport {
+func (d *Daemon) gitWorkspaceReport(dir string) transport.WorkspaceReport {
 	wr := transport.WorkspaceReport{Path: dir}
-	remote := gitOutput(dir, "remote", "get-url", "origin")
-	branch := gitOutput(dir, "branch", "--show-current")
+	remote := d.gitOutput(dir, "remote", "get-url", "origin")
+	branch := d.gitOutput(dir, "branch", "--show-current")
 	wr.Remote = remote
 	wr.Branch = branch
 	if remote != "" {
@@ -191,12 +233,14 @@ func firstLine(s string) string {
 	return s
 }
 
-func gitOutput(dir string, args ...string) string {
+// gitOutput runs one bounded git probe (abuse addendum Part B §36/§37):
+// a short timeout AND the daemon's bounded helper concurrency, so a
+// workspace scan over many repositories can never fan out into hundreds
+// of parallel git processes.
+func (d *Daemon) gitOutput(dir string, args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := d.helper.Run(ctx, dir, "git", args...)
 	if err != nil {
 		return ""
 	}

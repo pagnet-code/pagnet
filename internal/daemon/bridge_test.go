@@ -3,11 +3,16 @@ package daemon
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 type bridgeClient struct {
@@ -163,5 +168,130 @@ func TestStartBridgeSocket_RefusesLiveDoubleStart(t *testing.T) {
 	defer d2.Close()
 	if err := d2.startBridgeSocket(); err == nil {
 		t.Fatal("second daemon must refuse to start while the first owns the bridge socket")
+	}
+}
+
+// TestBridgePerInstanceConnCap (external audit F-010): a single instance
+// must not hold more than bridgeMaxConnsPerInst bridge connections. The
+// (cap+1)th connection for the same instance is refused with a
+// per-instance error (the global slot is released by the deferred
+// releaseBridgeConn).
+func TestBridgePerInstanceConnCap(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+
+	for i := 0; i < bridgeMaxConnsPerInst; i++ {
+		c := bridgeDial(t, sock)
+		if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
+			t.Fatalf("conn %d: auth = %v, want auth_ok", i, resp)
+		}
+	}
+	// The (cap+1)th connection for the same instance is refused.
+	c := bridgeDial(t, sock)
+	resp := c.auth(t, "inst-1", "net-1")
+	if resp["type"] != "error" {
+		t.Fatalf("conn %d: auth = %v, want error (per-instance cap)", bridgeMaxConnsPerInst, resp)
+	}
+	if !strings.Contains(resp["error"].(string), "this instance") {
+		t.Fatalf("error = %v, want the per-instance cap message", resp["error"])
+	}
+}
+
+// TestBridgeGlobalConnCap (external audit F-010): once the global
+// connection cap is reached, new connections are refused regardless of
+// instance.
+func TestBridgeGlobalConnCap(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+
+	// Saturate the global counter (under the lock, to avoid a data race
+	// with the handler goroutine's locked read).
+	d.bridgeConnMu.Lock()
+	d.bridgeConns = bridgeMaxConns
+	d.bridgeConnMu.Unlock()
+	t.Cleanup(func() {
+		d.bridgeConnMu.Lock()
+		d.bridgeConns = 0
+		d.bridgeConnMu.Unlock()
+	})
+
+	resp := bridgeDial(t, sock).auth(t, "inst-1", "net-1")
+	if resp["type"] != "error" {
+		t.Fatalf("auth = %v, want error (global cap)", resp)
+	}
+	if !strings.Contains(resp["error"].(string), "bridge connection limit reached") {
+		t.Fatalf("error = %v, want the global cap message", resp["error"])
+	}
+}
+
+// TestBridgeRequestRequiresIDAndTool (external audit F-010): a request
+// with an empty id or an empty tool is rejected (an id-less request
+// cannot be correlated to a response; an empty tool is a no-op that would
+// still consume a relay slot).
+func TestBridgeRequestRequiresIDAndTool(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+
+	c := bridgeDial(t, sock)
+	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
+		t.Fatalf("auth = %v, want auth_ok", resp)
+	}
+	// Empty id: rejected, response echoes the empty id.
+	c.write(t, map[string]any{"id": "", "tool": "network_whoami"})
+	resp := c.read(t)
+	if resp["ok"] == true || resp["id"] != "" {
+		t.Fatalf("empty-id request = %v, want ok=false + empty id", resp)
+	}
+	// Empty tool: rejected, response echoes the id.
+	c.write(t, map[string]any{"id": "7", "tool": ""})
+	resp = c.read(t)
+	if resp["ok"] == true || resp["id"] != "7" {
+		t.Fatalf("empty-tool request = %v, want ok=false + id 7", resp)
+	}
+}
+
+// TestBridgeBoundedPending (external audit F-010): the pending
+// agent.request map is capped; once full, new relays are refused instead
+// of growing the map without bound.
+func TestBridgeBoundedPending(t *testing.T) {
+	d := newTestDaemon(t)
+	client, _ := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+
+	// Saturate the pending map (under the lock that guards it).
+	d.pendingMu.Lock()
+	for i := 0; i < bridgeMaxPending; i++ {
+		d.pending[fmt.Sprintf("fill-%d", i)] = make(chan transport.AgentResponsePayload, 1)
+	}
+	d.pendingMu.Unlock()
+
+	_, errMsg := d.relayToServer("inst-1", "network_whoami", nil)
+	if errMsg == "" || !strings.Contains(errMsg, "in-flight") {
+		t.Fatalf("relayToServer = %q, want the bounded-pending error", errMsg)
+	}
+}
+
+// TestBridgeReadDeadlineCutsSlowLoris (external audit F-010): a
+// connection that connects but never sends its auth must be cut off by the
+// read deadline instead of holding a goroutine + socket descriptor
+// indefinitely. The deadline is shortened for the test.
+func TestBridgeReadDeadlineCutsSlowLoris(t *testing.T) {
+	_, sock := startBridgeForTest(t)
+
+	prev := atomic.LoadInt64(&bridgeConnReadTimeoutNs)
+	atomic.StoreInt64(&bridgeConnReadTimeoutNs, int64(200*time.Millisecond))
+	t.Cleanup(func() { atomic.StoreInt64(&bridgeConnReadTimeoutNs, prev) })
+
+	conn := bridgeDial(t, sock)
+	// Send nothing. The daemon must close the connection after the
+	// read deadline; a subsequent read returns EOF.
+	start := time.Now()
+	if line, err := readLine(conn.r); err == nil {
+		t.Fatalf("slow-loris connection was not cut off (read %q, want EOF)", line)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("read deadline took too long: %v", elapsed)
 	}
 }

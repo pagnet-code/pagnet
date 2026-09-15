@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 )
 
 // Claude drives the Claude Code CLI (`claude`) as a process-per-turn
@@ -55,12 +56,16 @@ type Claude struct {
 	// Env is appended to the inherited environment for spawned processes.
 	Env []string
 
-	track procTracker
+	life lifecycleState
 }
 
 func NewClaude(binary string) *Claude {
-	return &Claude{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
+	return &Claude{Binary: binary}
 }
+
+// SetLifecycle implements LifecycleSetter (the daemon injects its central
+// process supervisor; standalone use falls back to a private one).
+func (c *Claude) SetLifecycle(l proc.Lifecycle) { c.life.SetLifecycle(l) }
 
 func (c *Claude) Name() domain.RuntimeName { return domain.RuntimeClaudeCode }
 
@@ -145,6 +150,12 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	sessionPath := filepath.Join(spec.SessionDir, claudeSessionFile)
 	stored, _ := readStoredSession(sessionPath)
 
+	// --permission-mode bypassPermissions is the EXPLICIT permission
+	// config for the UNATTENDED managed turn (external audit F-014): no
+	// human is present to approve tool use, so the turn must act without
+	// approval. This is deliberate and scoped to managed turns only — the
+	// interactive REPL (InteractiveCmd) does NOT carry it, so a human in
+	// the TUI keeps the CLI's normal approve/deny flow.
 	args := []string{"-p", "--verbose", "--output-format", "stream-json",
 		"--permission-mode", "bypassPermissions"}
 	// Model precedence: the turn's resolved model (launch request >
@@ -189,9 +200,9 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		args = append(args, "--mcp-config", mcpJSON)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(c.Env, spec.Env)
+	cmd.Env = EnsureTurnMarker(ChildEnv(c.Env, spec.Env), spec.TurnID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -203,11 +214,21 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn claude: %w", err)
+	// The supervisor owns the Start, the process group (Setpgid), the
+	// launch guards, and the lifecycle; its ctx watcher terminates the
+	// whole group on cancellation.
+	h, err := c.life.get().Launch(ctx, proc.LaunchRequest{
+		InstanceID: spec.InstanceID,
+		TurnID:     spec.TurnID,
+		Runtime:    string(c.Name()),
+		Class:      proc.ClassTurn,
+		Cmd:        cmd,
+		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+	})
+	if err != nil {
+		return err
 	}
-	c.track.track(spec.InstanceID, cmd)
-	defer c.track.release(spec.InstanceID, cmd)
+	defer h.Close()
 
 	// The prompt goes on stdin: no ARG_MAX limit, no shell, no quoting.
 	_, _ = io.WriteString(stdin, spec.Input)
@@ -227,8 +248,9 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		select {
 		case events <- ev:
 		case <-ctx.Done():
+			// The supervisor's ctx watcher terminates the whole group;
+			// the owner just stops emitting. defer h.Close() reaps.
 			cancelled = true
-			_ = cmd.Process.Kill()
 		}
 	}
 
@@ -247,10 +269,10 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 				// A requested resume that re-bases onto a different
 				// session is a lost session, not a silent fresh one.
 				terminal = true
-				_ = cmd.Process.Kill()
+				h.Abort("session_mismatch")
 				events <- TurnEvent{Type: EventSessionLost, SessionID: stored,
 					Error: "claude resume started a different session (wanted " + stored + ", got " + sid + ")"}
-				_ = cmd.Wait()
+				_ = h.Wait()
 				return nil
 			}
 			sessionID = sid
@@ -318,9 +340,42 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 				CachedTokens: intPtr(ev.Usage.CacheRead),
 			})
 		}
+		if terminal {
+			// The turn is over: stop scanning. A descendant that
+			// outlived the runtime and holds the stdout pipe would
+			// otherwise block this read until the turn's context
+			// expires (the 2026-09-15 pipe-hold hazard).
+			break
+		}
 	}
-
-	waitErr := cmd.Wait()
+	// A truncated stream (a line over the scanner buffer, or an I/O
+	// error) before a terminal event is a failure, not a clean exit —
+	// surface it instead of treating the partial stream as completed
+	// (external audit F-012).
+	if scanErr := scanner.Err(); scanErr != nil && !terminal {
+		if proc.GroupAlive(h.PGID()) {
+			h.Terminate("scan_error")
+		}
+		_ = h.Wait()
+		if cancelled {
+			return ctx.Err()
+		}
+		events <- TurnEvent{
+			Type:        EventTurnFailed,
+			FailureKind: domain.RuntimeFailureProcessError,
+			Error:       fmt.Sprintf("claude stream error: %v", scanErr),
+		}
+		return nil
+	}
+	// The turn reported a terminal event, but a descendant may still be
+	// alive holding the stdout/stderr pipes. Terminate the group so the
+	// Wait below reaps promptly instead of blocking on the held pipe.
+	if terminal && proc.GroupAlive(h.PGID()) {
+		h.Terminate("turn_ended")
+	}
+	// Owner's reap (single Wait) after all stdout is drained; also
+	// reclaims any descendants that outlived the runtime (§19/§24).
+	waitErr := h.Wait()
 	if cancelled {
 		return ctx.Err()
 	}
@@ -346,7 +401,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		kind, retryAt = ClassifyProviderError(trunc(stderrBuf.String()))
 	}
 	events <- TurnEvent{Type: EventTurnFailed, FailureKind: kind,
-		Error: trunc(firstNonEmpty(stderrBuf.String(), waitErr.Error())), RetryAt: retryAt}
+		Error: trunc(firstNonEmpty(stderrBuf.String(), errorString(waitErr))), RetryAt: retryAt}
 	return nil
 }
 
@@ -370,9 +425,9 @@ func sessionMissingInStderr(stderr string) bool {
 }
 
 // Stop kills the running process for an instance.
-func (c *Claude) Stop(instanceID string) error { return c.track.stop(instanceID) }
+func (c *Claude) Stop(instanceID string) error { return c.life.get().Stop(instanceID) }
 
-func (c *Claude) PID(instanceID string) *int { return c.track.pid(instanceID) }
+func (c *Claude) PID(instanceID string) *int { return c.life.get().PID(instanceID) }
 
 // InteractiveCmd builds the interactive claude REPL (the PTY terminal,
 // addendum §7/§8): the same CLI minus the one-shot turn flags
@@ -390,7 +445,16 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
-	args := []string{"--permission-mode", "bypassPermissions"}
+	// NO --permission-mode here (external audit F-014): the interactive
+	// REPL is a HUMAN-in-the-loop session — the browser shows the actual
+	// Claude Code TUI, and the human approves/denies tool use through the
+	// CLI's normal permission flow. Bypassing permissions in an interactive
+	// session would silently auto-approve every tool call, defeating the
+	// oversight the TUI exists to provide. Only the UNATTENDED managed
+	// turn (StartTurn, no human present) carries the explicit
+	// --permission-mode bypassPermissions config it needs to act without
+	// approval.
+	args := []string{}
 	// Model precedence: the turn's resolved model wins over the adapter's
 	// own (field, then env).
 	turnModel := spec.Model

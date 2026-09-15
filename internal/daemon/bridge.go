@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
@@ -35,7 +36,26 @@ const (
 	bridgeAuthTimeout    = 5 * time.Second
 	bridgeRequestTimeout = 60 * time.Second
 	bridgeMaxLine        = 1 << 20 // 1 MiB per JSON line
+	// Connection caps (external audit F-010): a managed agent opens ONE
+	// bridge connection per MCP client; a misbehaving or hostile agent
+	// must not be able to exhaust daemon resources by opening unbounded
+	// connections. Global cap bounds the total; per-instance cap bounds
+	// one agent's share.
+	bridgeMaxConns        = 256
+	bridgeMaxConnsPerInst = 8
+	// Bounded pending relays (external audit F-010): the pending
+	// agent.request map must not grow without bound (a hostile client
+	// could open many in-flight requests and exhaust memory).
+	bridgeMaxPending = 128
 )
+
+// bridgeConnReadTimeoutNs (external audit F-010): read deadline after
+// Accept, in nanoseconds. A connection that connects but never sends its
+// auth (slow-loris) must not hold a goroutine and a socket descriptor
+// indefinitely. It is an atomic (not a const) so tests can shorten it
+// without a data race (the handler goroutine reads it concurrently).
+// Production default: 30s.
+var bridgeConnReadTimeoutNs int64 = int64(30 * time.Second)
 
 // startBridgeSocket opens the local Unix socket. Called once from Run.
 func (d *Daemon) startBridgeSocket() error {
@@ -93,8 +113,66 @@ func (d *Daemon) stopBridgeSocket() {
 	d.bridgeL = nil
 }
 
+// acquireBridgeConn reserves a connection slot under the global and
+// per-instance caps (external audit F-010). It returns false when the
+// cap is reached; the caller must close the connection. The per-instance
+// count is only known after auth, so the global slot is taken up front
+// and the per-instance slot is taken (and, on failure, released) after
+// the instance id is known.
+func (d *Daemon) acquireBridgeConn() bool {
+	d.bridgeConnMu.Lock()
+	defer d.bridgeConnMu.Unlock()
+	if d.bridgeConns >= bridgeMaxConns {
+		return false
+	}
+	d.bridgeConns++
+	return true
+}
+
+// acquireBridgeInstSlot reserves a per-instance slot (after auth). It
+// returns false when the instance's cap is reached; the caller must
+// release the global slot too.
+func (d *Daemon) acquireBridgeInstSlot(instanceID string) bool {
+	d.bridgeConnMu.Lock()
+	defer d.bridgeConnMu.Unlock()
+	if d.bridgeConnsInst[instanceID] >= bridgeMaxConnsPerInst {
+		return false
+	}
+	d.bridgeConnsInst[instanceID]++
+	return true
+}
+
+// releaseBridgeConn releases a global slot and (when instanceID != "")
+// the per-instance slot.
+func (d *Daemon) releaseBridgeConn(instanceID string) {
+	d.bridgeConnMu.Lock()
+	defer d.bridgeConnMu.Unlock()
+	if d.bridgeConns > 0 {
+		d.bridgeConns--
+	}
+	if instanceID != "" {
+		if d.bridgeConnsInst[instanceID] > 0 {
+			d.bridgeConnsInst[instanceID]--
+		}
+		if d.bridgeConnsInst[instanceID] == 0 {
+			delete(d.bridgeConnsInst, instanceID)
+		}
+	}
+}
+
 func (d *Daemon) handleBridgeConn(c net.Conn) {
 	defer c.Close()
+	// Read deadline after Accept (external audit F-010): a connection
+	// that never sends its auth (slow-loris) is cut off instead of
+	// holding a goroutine + socket descriptor indefinitely.
+	_ = c.SetReadDeadline(time.Now().Add(time.Duration(atomic.LoadInt64(&bridgeConnReadTimeoutNs))))
+	// Global connection cap (external audit F-010).
+	if !d.acquireBridgeConn() {
+		writeBridgeError(c, "bridge connection limit reached")
+		return
+	}
+	instanceID := ""
+	defer d.releaseBridgeConn(instanceID)
 	r := bufio.NewReader(c)
 
 	line, err := readLine(r)
@@ -123,6 +201,14 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		writeBridgeError(c, "instance is stopped")
 		return
 	}
+	// Per-instance connection cap (external audit F-010): a single agent
+	// must not hold unbounded bridge connections. On failure the deferred
+	// releaseBridgeConn("") still releases the global slot.
+	if !d.acquireBridgeInstSlot(row.InstanceID) {
+		writeBridgeError(c, "bridge connection limit reached for this instance")
+		return
+	}
+	instanceID = row.InstanceID
 	if _, err := writeBridge(c, map[string]any{
 		"type": "auth_ok", "instanceId": row.InstanceID,
 	}); err != nil {
@@ -141,9 +227,12 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 			Tool string          `json:"tool"`
 			Args json.RawMessage `json:"args"`
 		}
-		if err := json.Unmarshal(line, &req); err != nil || req.Tool == "" {
+		// Non-empty id AND tool (external audit F-010): a request with no
+		// id cannot be correlated to a response, and an empty tool is a
+		// no-op that would still consume a relay slot.
+		if err := json.Unmarshal(line, &req); err != nil || req.ID == "" || req.Tool == "" {
 			writeBridge(c, map[string]any{"id": req.ID, "ok": false,
-				"error": "bad request (need id + tool)"})
+				"error": "bad request (need non-empty id + tool)"})
 			continue
 		}
 		if req.Args == nil {
@@ -183,8 +272,18 @@ func (d *Daemon) relayToServer(instanceID, tool string, args json.RawMessage) (j
 	}
 	// The server echoes the request envelope's id back as the response's
 	// RequestID, so the correlation key IS env.ID.
-	respCh := make(chan transport.AgentResponsePayload, 1)
+	// Bounded pending (external audit F-010): a hostile client could open
+	// many in-flight requests and exhaust memory, so the pending map is
+	// capped. Refuse new relays once the cap is reached (the caller
+	// answers the bridge client with the error). The length check is done
+	// under the same lock that guards the map (reading a map while another
+	// goroutine writes it is a data race).
 	d.pendingMu.Lock()
+	if len(d.pending) >= bridgeMaxPending {
+		d.pendingMu.Unlock()
+		return nil, "too many in-flight bridge requests; retry shortly"
+	}
+	respCh := make(chan transport.AgentResponsePayload, 1)
 	d.pending[env.ID] = respCh
 	d.pendingMu.Unlock()
 	defer func() {

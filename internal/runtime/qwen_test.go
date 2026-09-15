@@ -40,8 +40,12 @@ func runQwenStub(t *testing.T, spec TurnSpec, out string, stubEnv map[string]str
 		t.Fatal(err)
 	}
 	argsPath := filepath.Join(dir, "args.txt")
-	t.Setenv("QWEN_FAKE_OUT", outPath)
-	t.Setenv("QWEN_FAKE_ARGS", argsPath)
+	// The child (stub script) reads these from ITS environment. Pass them
+	// as explicit injection pairs (spec.Env): they are pagnet's own test
+	// values, not inherited secrets, so they bypass the ChildEnv
+	// allowlist (external audit F-009). Adapter-side env (stubEnv) is
+	// read by the adapter via os.Getenv, so it stays on t.Setenv.
+	spec.Env = append(spec.Env, "QWEN_FAKE_OUT="+outPath, "QWEN_FAKE_ARGS="+argsPath)
 	for k, v := range stubEnv {
 		t.Setenv(k, v)
 	}
@@ -165,5 +169,41 @@ func TestQwenModelSelection(t *testing.T) {
 	t.Setenv("PAGNET_QWEN_MODEL", "")
 	if q.model() != "" {
 		t.Fatalf("model = %q, want empty (user default applies)", q.model())
+	}
+}
+
+// TestQwen_StreamTruncationIsFailure (external audit F-012): a line that
+// exceeds the scanner's max buffer (8 MiB) makes scanner.Scan() stop with
+// bufio.ErrTooLong. The adapter must surface that as a turn failure, NOT
+// treat the truncated stream as a clean exit (which it would, since no
+// result line was seen).
+func TestQwen_StreamTruncationIsFailure(t *testing.T) {
+	// A valid init line, then a single line well over the 8 MiB buffer.
+	long := make([]byte, 9*1024*1024)
+	for i := range long {
+		long[i] = 'x'
+	}
+	out := `{"type":"system","subtype":"init","session_id":"sid-1","model":"m"}` + "\n" +
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"` + string(long) + `"}` + "\n"
+	spec := qwenSpec(t.TempDir())
+	evs, _ := runQwenStub(t, spec, out, nil)
+	// The turn must end in a failure (stream error), not a completion.
+	var sawFailed, sawCompleted bool
+	for _, ev := range evs {
+		switch ev.Type {
+		case EventTurnFailed:
+			sawFailed = true
+			if !strings.Contains(ev.Error, "stream error") {
+				t.Errorf("failure error = %q, want a stream error", ev.Error)
+			}
+		case EventTurnCompleted:
+			sawCompleted = true
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("expected a turn.failed (stream error), got events %v", evs)
+	}
+	if sawCompleted {
+		t.Fatalf("truncated stream must not be reported as completed")
 	}
 }

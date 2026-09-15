@@ -12,7 +12,9 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -98,6 +100,70 @@ const (
 	// (in the native TUI or remotely). Carries Interaction (Resolved=true).
 	EventInteractionResolved = "runtime.interaction.resolved"
 )
+
+// isTerminalEvent reports whether the event type ends the turn's event
+// stream (the runtime emits nothing after it). Adapters break their stdout
+// scan on a terminal event so a descendant that outlived the runtime and
+// still holds the stdout pipe cannot block the turn until its context
+// expires (the 2026-09-15 pipe-hold hazard).
+func isTerminalEvent(ty string) bool {
+	switch ty {
+	case EventTurnCompleted, EventTurnFailed, EventSessionLost:
+		return true
+	}
+	return false
+}
+
+// errorString renders an error for a turn-failure message without
+// panicking on a nil error. A runtime can exit cleanly (nil wait error)
+// yet still fail to emit a result line; the failure text must fall back
+// to the stderr/placeholder, not crash the daemon on a nil dereference
+// (external audit F-011).
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// atomicWriteFile writes data to path atomically: write a temp file in
+// the SAME directory, fsync, then rename over path. A crash mid-write
+// leaves the previous file intact — never a partial/corrupt one (external
+// audit F-013). The temp file is created 0600 and chmod'd to perm before
+// it is linked into place, so the session/config file is never world-
+// readable even transiently.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
 
 // InteractionEvent is a normalized observation of a native runtime
 // interaction. The adapter emits it on the turn's events channel as

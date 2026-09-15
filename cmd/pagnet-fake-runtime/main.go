@@ -14,6 +14,15 @@
 //     rate_limited; with a duration the retryAt is provider-style, with
 //     "unknown" no retryAt is provided (manual recovery path).
 //   - PAGNET_FAKE_RESUME_FAIL=1: a resume request always loses the session.
+//   - PAGNET_FAKE_HOLD=<duration>: keep the turn process alive for the
+//     duration (cancellation/stop lifecycle tests).
+//   - PAGNET_FAKE_DESCENDANTS=<n>: spawn n descendant branches
+//     (sh → sleep) that outlive the runtime process — the process-tree
+//     containment fixture (abuse addendum §47). The branches inherit this
+//     process's environment, so a PAGNET_P0_LEAK marker in the turn env
+//     marks the whole tree for measurement.
+//   - PAGNET_FAKE_PTY_CHILD=1 (PTY mode): spawn a child that keeps the
+//     PTY slave open (PTY lifecycle fixture: slave-holding descendants).
 //
 // Interactive PTY mode (--pty): a deterministic, scriptable stand-in for a
 // real runtime's interactive UI (addendum §68 "fake PTY fixtures that
@@ -30,8 +39,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -159,6 +170,17 @@ func main() {
 
 	emit(event{Event: "runtime.turn.started", SessionID: prev.SessionID})
 
+	// Process-tree containment fixture (§47): spawn descendant branches
+	// that outlive this process (a real runtime's shells / MCP bridges /
+	// node helpers). Deliberately NOT waited on: reaping the tree is the
+	// supervisor's job, never the runtime's.
+	spawnDescendants()
+
+	// Hold the process alive (cancellation / stop lifecycle tests).
+	if hold := os.Getenv("PAGNET_FAKE_HOLD"); hold != "" {
+		time.Sleep(parseDuration(hold))
+	}
+
 	// Native-interaction simulation (Phase 5): when scripted, the fake
 	// "asks" a native question mid-turn (runtime.interaction.started) and,
 	// when also scripted, the (fake) user answers in the native TUI before
@@ -236,7 +258,45 @@ func loadSession(path string) *session {
 
 func saveSession(path string, s *session) error {
 	b, _ := json.MarshalIndent(s, "", "  ")
-	return os.WriteFile(path, b, 0o644)
+	// 0600 (private) + atomic (temp+rename): a crash mid-write must not
+	// corrupt the resumable session, and the session file is never
+	// world-readable (external audit F-013/F-015).
+	return atomicWriteFile(path, b, 0o600)
+}
+
+// atomicWriteFile writes data to path atomically (temp file in the same
+// directory, fsync, rename) with the given perm.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
 }
 
 func short(s string) string {
@@ -274,6 +334,42 @@ func parseDuration(s string) time.Duration {
 		return d
 	}
 	return 30 * time.Second
+}
+
+// spawnDescendants starts PAGNET_FAKE_DESCENDANTS branches (default 2)
+// of `sh -c 'sleep 3600 & sleep 3600'` — parent → child → grandchild,
+// the §47 tree shape. The branches inherit this process's environment
+// (ownership markers included) and are left running: they simulate the
+// helper processes a real runtime leaves behind (MCP bridges, shells,
+// node). Containment of the tree is the pagnet supervisor's job.
+//
+// The descendants' stdio is /dev/null, NOT an inheritance of this
+// process's pipes: a real runtime's background helpers do not write to
+// the turn's stdout, and a descendant that holds the turn's stdout/
+// stderr pipe open keeps the reader blocked on EOF until it dies — the
+// hang mode behind the 2026-09-15 stress incident (every test cycle
+// waited out the full turn context before the group was reclaimed).
+func spawnDescendants() {
+	n := 2
+	if v := os.Getenv("PAGNET_FAKE_DESCENDANTS"); v != "" {
+		if m, err := strconv.Atoi(v); err == nil && m > 0 {
+			n = m
+		}
+	}
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "descendant fixture devnull:", err)
+		return
+	}
+	defer devNull.Close()
+	for i := 0; i < n; i++ {
+		cmd := exec.Command("sh", "-c", "sleep 3600 & sleep 3600")
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull // Stdin nil → /dev/null
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, "descendant fixture spawn:", err)
+		}
+	}
 }
 
 func hasArg(args []string, flag string) bool {
@@ -372,6 +468,28 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 		fmt.Printf("initial size: %dx%d — unicode ok: äöü 日本語 🚀\r\n", cols, rows)
 	}
 	fmt.Print(prompt)
+
+	// PTY lifecycle fixture: a child that keeps the PTY slave open (a
+	// real TUI's helper processes inherit the slave). It must inherit
+	// the slave fds explicitly — exec would otherwise give it fresh
+	// pipes.
+	//
+	// The child IGNORES SIGHUP (trap "" HUP; exec …): when the session
+	// leader (the runtime) dies, the kernel broadcasts SIGHUP to the PTY
+	// foreground process group. A helper with the default SIGHUP
+	// disposition would die from that broadcast and the leak would be
+	// masked — but real helpers (daemons, nohup'd processes, job-control
+	// background jobs) ignore SIGHUP or sit in their own group and
+	// SURVIVE, keeping the slave open. Ignoring HUP here reproduces the
+	// production shape: the direct child is killed, the slave-holding
+	// descendant is not.
+	if os.Getenv("PAGNET_FAKE_PTY_CHILD") == "1" {
+		c := exec.Command("sh", "-c", "trap \"\" HUP; exec sleep 3600")
+		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := c.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "pty child fixture spawn: %v\r\n", err)
+		}
+	}
 
 	save := func() {
 		if sessionDir == "" {

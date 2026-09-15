@@ -34,7 +34,10 @@ func runOpenCodeStub(t *testing.T, spec TurnSpec, stubEnv map[string]string) []s
 		t.Fatal(err)
 	}
 	argsPath := filepath.Join(dir, "args.txt")
-	t.Setenv("OPENCODE_FAKE_ARGS", argsPath)
+	// The child (stub script) reads this from ITS environment; pass it as
+	// an explicit injection pair so it bypasses the ChildEnv allowlist
+	// (external audit F-009). Adapter-side env stays on t.Setenv.
+	spec.Env = append(spec.Env, "OPENCODE_FAKE_ARGS="+argsPath)
 	for k, v := range stubEnv {
 		t.Setenv(k, v)
 	}

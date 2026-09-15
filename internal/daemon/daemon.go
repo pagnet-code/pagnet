@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -81,6 +82,37 @@ type Config struct {
 	// (same PID). Default TRUE — opt out via PAGNET_AUTO_UPDATE=0,
 	// --no-auto-update, or the state file's autoUpdate: false.
 	AutoUpdate bool
+
+	// --- Process-containment limits (abuse addendum Part B §29–§35) ---
+	// Zero values fall back to the supervisor's safe defaults (and the
+	// PAGNET_* environment, see proc.EnvConfig). These are SAFETY ceilings,
+	// not product licensing: they bound how much of the host one pagnet
+	// installation may consume.
+	// MaxActiveTurns: global ceiling of simultaneously active turn
+	// processes (the launch semaphore). Default 4.
+	MaxActiveTurns int
+	// TurnProcessesWarn / TurnProcessesHard: per-turn owned-process
+	// thresholds. Hard crossing terminates the turn group. Default 64/128.
+	TurnProcessesWarn int
+	TurnProcessesHard int
+	// OwnedProcessesHard: global owned-process ceiling across all active
+	// turns. Reaching it refuses new launches. Default 256.
+	OwnedProcessesHard int
+	// HostPressurePct: refuse new launches at this percentage of the
+	// effective soft RLIMIT_NPROC (0 = disabled). Default 80.
+	HostPressurePct int
+	// TurnTermGrace: TERM → grace → KILL window for group termination.
+	// Default 5s.
+	TurnTermGrace time.Duration
+	// LaunchBackoffMin/Max: exponential backoff bounds after
+	// resource-pressure launch failures. Default 1s/30s.
+	LaunchBackoffMin time.Duration
+	LaunchBackoffMax time.Duration
+	// LaunchCircuitFailures/Window/Block: the launch circuit breaker.
+	// Default 5 failures / 60s window / 60s block.
+	LaunchCircuitFailures int
+	LaunchCircuitWindow   time.Duration
+	LaunchCircuitBlock    time.Duration
 }
 
 // Daemon is a running host-daemon instance.
@@ -129,6 +161,11 @@ type Daemon struct {
 	turnCtx    context.Context
 	turnCancel context.CancelFunc
 
+	// closeOnce makes Close idempotent: tests and shutdown paths may call
+	// it more than once (explicit Close + t.Cleanup), and the underlying
+	// resources (sql.DB, supervisor) must not be torn down twice.
+	closeOnce sync.Once
+
 	// Per-repository lock serializing the §29 isolation decision
 	// (resolveWorkspace) and the instance registration that follows it:
 	// concurrent launches of different instances run on parallel
@@ -151,6 +188,16 @@ type Daemon struct {
 	// stored runtime session resume.
 	terminal *terminalManager
 
+	// sup is the CENTRAL turn-process supervisor (abuse addendum Part B
+	// §20): one registry, launch gate, semaphore, and cleanup path for
+	// every turn process AND every PTY session this daemon owns. It is
+	// injected into each runtime adapter (LifecycleSetter) and used
+	// directly by the terminal manager.
+	sup *proc.Supervisor
+	// helper is the bounded short-lived-command executor (§37) for git
+	// probes, runtime version checks, and worktree operations.
+	helper *proc.Helper
+
 	// Live host connection (for the bridge relay; nil while disconnected).
 	connMu  sync.Mutex
 	curConn *websocket.Conn
@@ -165,6 +212,21 @@ type Daemon struct {
 	// Bridge Unix socket listener (agent MCP bridge, PROTOCOL §6).
 	bridgeMu sync.Mutex
 	bridgeL  net.Listener
+	// Bridge connection accounting (external audit F-010): caps on
+	// concurrent bridge connections, global and per-instance, so a
+	// misbehaving or hostile agent cannot exhaust daemon resources by
+	// opening unbounded bridge connections.
+	bridgeConnMu    sync.Mutex
+	bridgeConns     int
+	bridgeConnsInst map[string]int
+
+	// Inventory single-flight (external audit F-016): the workspace scan +
+	// runtime version probes fan out bounded helper processes, and a
+	// reconnect + a host.request_inventory + an UpdateRoots can arrive
+	// close together. invFlight guards the scan so concurrent callers
+	// share one scan instead of multiplying the probe storm.
+	invMu     sync.Mutex
+	invFlight *inventoryFlight
 
 	// Per-instance command queues: commands for one instance run strictly
 	// in order (launch before deliver, wake before deliver, ...), while
@@ -238,6 +300,50 @@ type instQueue struct {
 	done chan struct{}
 }
 
+// procConfigFromDaemon builds the supervisor's process-containment
+// config from the daemon Config. Precedence (highest first): explicit
+// daemon Config fields (set by the serve command) > PAGNET_* environment
+// (proc.EnvConfig) > safe defaults. The StateDir is always the daemon's
+// state dir (ownership records live there, §39).
+func procConfigFromDaemon(cfg Config) proc.Config {
+	c := proc.EnvConfig() // env + safe defaults
+	c.StateDir = cfg.StateDir
+	if cfg.MaxActiveTurns > 0 {
+		c.MaxActiveTurns = cfg.MaxActiveTurns
+	}
+	if cfg.TurnProcessesWarn > 0 {
+		c.TurnProcessesWarn = cfg.TurnProcessesWarn
+	}
+	if cfg.TurnProcessesHard > 0 {
+		c.TurnProcessesHard = cfg.TurnProcessesHard
+	}
+	if cfg.OwnedProcessesHard > 0 {
+		c.OwnedProcessesHard = cfg.OwnedProcessesHard
+	}
+	if cfg.HostPressurePct >= 0 && cfg.HostPressurePct != 0 {
+		c.HostPressurePct = cfg.HostPressurePct
+	}
+	if cfg.TurnTermGrace > 0 {
+		c.TermGrace = cfg.TurnTermGrace
+	}
+	if cfg.LaunchBackoffMin > 0 {
+		c.BackoffMin = cfg.LaunchBackoffMin
+	}
+	if cfg.LaunchBackoffMax > 0 {
+		c.BackoffMax = cfg.LaunchBackoffMax
+	}
+	if cfg.LaunchCircuitFailures > 0 {
+		c.CircuitFailures = cfg.LaunchCircuitFailures
+	}
+	if cfg.LaunchCircuitWindow > 0 {
+		c.CircuitWindow = cfg.LaunchCircuitWindow
+	}
+	if cfg.LaunchCircuitBlock > 0 {
+		c.CircuitBlock = cfg.LaunchCircuitBlock
+	}
+	return c
+}
+
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
 func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 	return newDaemon(cfg, log, resolveSelfExecutable)
@@ -288,24 +394,46 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		fake.Env = cfg.RuntimeEnv
 		adapters[domain.RuntimeFake] = fake
 	}
+	// Central turn-process supervisor (abuse addendum Part B §20): ONE
+	// registry/launch-gate/cleanup path for every turn process and PTY
+	// session this daemon owns. Limits come from the daemon Config (set by
+	// the serve command) with the PAGNET_* environment and safe defaults
+	// as fallbacks.
+	sup := proc.NewSupervisor(procConfigFromDaemon(cfg), log)
+	// Inject the central supervisor into every adapter that manages OS
+	// processes (the LifecycleSetter seam; test stubs skip it).
+	for _, ad := range adapters {
+		if ls, ok := ad.(agentruntime.LifecycleSetter); ok {
+			ls.SetLifecycle(sup)
+		}
+	}
+	// Bounded helper-command executor (§37) for git/version/worktree probes.
+	helper := proc.NewHelper(0)
 	turnCtx, turnCancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		Config:      cfg,
-		Log:         log,
-		state:       st,
-		adapters:    adapters,
-		selfExe:     selfExe,
-		bootID:      domain.NewID().String(),
-		activeTurns: map[string]bool{},
-		attaches:    map[string]map[string]time.Time{},
-		pending:     map[string]chan transport.AgentResponsePayload{},
-		instQueues:  map[string]*instQueue{},
-		seen:        map[string]time.Time{},
-		turnCtx:     turnCtx,
-		turnCancel:  turnCancel,
-		repoLocks:   map[string]*sync.Mutex{},
+		Config:          cfg,
+		Log:             log,
+		state:           st,
+		adapters:        adapters,
+		selfExe:         selfExe,
+		bootID:          domain.NewID().String(),
+		activeTurns:     map[string]bool{},
+		attaches:        map[string]map[string]time.Time{},
+		pending:         map[string]chan transport.AgentResponsePayload{},
+		bridgeConnsInst: map[string]int{},
+		instQueues:      map[string]*instQueue{},
+		seen:            map[string]time.Time{},
+		turnCtx:         turnCtx,
+		turnCancel:      turnCancel,
+		repoLocks:       map[string]*sync.Mutex{},
+		sup:             sup,
+		helper:          helper,
 	}
 	d.terminal = newTerminalManager(d)
+	// Crash/restart reconciliation (§39): a hard crash may have left a
+	// turn process tree alive. Verify ownership (start-identity, never a
+	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
+	sup.Reconcile()
 	// Spec §91: start from a bounded dedup set (drops rows prunable
 	// while the daemon was down).
 	if err := st.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
@@ -388,21 +516,45 @@ func (d *Daemon) finishQueue(instanceID string) {
 // Close shuts the daemon down: kills the PTY terminal sessions and
 // cancels in-flight turns (adapters kill the subprocesses, spec §90),
 // waits briefly for them to die, then closes the bridge socket and state.
+// Idempotent: a second call returns nil without re-tearing-down resources.
 func (d *Daemon) Close() error {
-	d.terminal.stopAll()
-	d.turnCancel()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		d.turnMu.Lock()
-		n := len(d.activeTurns)
-		d.turnMu.Unlock()
-		if n == 0 {
-			break
+	var err error
+	d.closeOnce.Do(func() {
+		// Shutdown (abuse addendum Part B §38): stop accepting new
+		// launches, terminate every owned process group (turns AND PTYs)
+		// with a bounded grace, reap, and flush state. The supervisor owns
+		// the group termination and the bounded wait — never wait forever
+		// for one runtime.
+		d.turnCancel()       // ctx watchers terminate active turn groups
+		d.terminal.stopAll() // stop PTY sessions (delegates to the supervisor)
+		if n := d.sup.StopAll(10 * time.Second); n > 0 {
+			d.Log.Error("shutdown: process groups not reaped within deadline", "survivors", n)
 		}
-		time.Sleep(100 * time.Millisecond)
+		d.stopBridgeSocket()
+		err = d.state.Close()
+	})
+	return err
+}
+
+// acquireServeLock takes an exclusive advisory lock on
+// <StateDir>/serve.lock (external audit F-006) and returns a release
+// function. The lock is held for the daemon's lifetime; closing the fd
+// (on release or process exit) drops the flock. A second daemon with the
+// same state dir gets EWOULDBLOCK and must refuse to start.
+func (d *Daemon) acquireServeLock() (func(), error) {
+	path := filepath.Join(d.StateDir, "serve.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("serve lock: %w", err)
 	}
-	d.stopBridgeSocket()
-	return d.state.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("another pagnet daemon is already running (state dir %s is locked): %w", d.StateDir, err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
 }
 
 // Run connects and stays connected (reconnecting with backoff) until ctx is
@@ -411,6 +563,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if d.Credential == "" {
 		return fmt.Errorf("no host credential; run `pagnet login` first")
 	}
+	// State-dir flock (external audit F-006): refuse to run if another
+	// daemon already owns this state dir. Two daemons on one host with the
+	// same state dir would fight over the host identity (each new
+	// connection supersedes the other) and double-launch processes. The
+	// bridge-socket double-start guard is a narrower second layer that only
+	// catches a LIVE socket; this lock closes the window before the socket
+	// exists.
+	releaseLock, err := d.acquireServeLock()
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
 	// fail cleanly (not hang) while the host connection is down.
@@ -521,7 +685,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		// Single-directory worker: register the directory itself even
 		// when it is not a git repository (gitWorkspaceReport degrades
 		// gracefully — empty remote/branch, no resource key).
-		_ = d.send(conn, transport.MsgWorkspaceDetected, gitWorkspaceReport(d.PrimaryWorkspace))
+		_ = d.send(conn, transport.MsgWorkspaceDetected, d.gitWorkspaceReport(d.PrimaryWorkspace))
 	}
 
 	heartbeat := time.NewTicker(d.Heartbeat)
@@ -1425,7 +1589,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		// queues, so without this lock two near-simultaneous RW launches
 		// could both read "no other RW agent" and both keep the main
 		// checkout.
-		lock = d.repoLock(workspaceLockKey(p.WorkspacePath))
+		lock = d.repoLock(d.workspaceLockKey(p.WorkspacePath))
 		lock.Lock()
 		// §29: a second read/write agent on the same repository is
 		// isolated into an automatic git worktree (fail clearly if that
@@ -1533,8 +1697,8 @@ func (d *Daemon) repoLock(key string) *sync.Mutex {
 // workspaceLockKey is the serialization identity of a workspace: the
 // repository's common dir when it is a git repo (checkout + all of its
 // worktrees share it), the absolute path otherwise.
-func workspaceLockKey(path string) string {
-	if common, err := repoCommonDir(path); err == nil {
+func (d *Daemon) workspaceLockKey(path string) string {
+	if common, err := d.repoCommonDir(path); err == nil {
 		return common
 	}
 	abs, _ := filepathAbs(path)
@@ -1552,6 +1716,13 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	d.terminal.stop(instanceID) // a stopped agent has no live terminal
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
+	}
+	// Wait for the reap (external audit F-004): Stop is async, and a
+	// Stop→immediate-Start that does not wait would race the reap and hit
+	// ErrInstanceBusy while the old turn is still registered. Bounded by
+	// the TERM→grace→KILL sequence (well under the timeout).
+	if !d.sup.WaitForStop(instanceID, 10*time.Second) {
+		d.Log.Warn("stop: turn not fully reaped within the wait window", "instance", instanceID)
 	}
 	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err
@@ -1945,6 +2116,37 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.Log.Info("turn interrupted by daemon shutdown; no failure recorded, work stays queued",
 			"instance", spec.InstanceID)
 		return turnErr
+	case errors.Is(turnErr, proc.ErrShuttingDown):
+		// The supervisor is shutting down and refused the launch. Same
+		// semantics as a shutdown cancel: no failure recorded, work stays
+		// queued for the control plane's re-send.
+		_ = d.state.SetInstanceSession(spec.InstanceID, preTurnSession)
+		d.Log.Info("turn launch refused: supervisor shutting down; work stays queued",
+			"instance", spec.InstanceID)
+		return turnErr
+	case errors.Is(turnErr, proc.ErrInstanceBusy):
+		// Defense-in-depth: the daemon's activeTurns guard should prevent
+		// a second turn for one instance, but if the supervisor sees a
+		// live turn, defer — the command stays queued and is re-sent.
+		return ErrDeferred
+	case errors.Is(turnErr, proc.ErrHostPressure), errors.Is(turnErr, proc.ErrLimitRefused):
+		// A pagnet-owned safety ceiling (active turns, owned processes,
+		// circuit) or host process pressure refused the launch (§32/§33/
+		// §54). This is a clean OPERATIONAL condition, not a runtime
+		// failure and never a silent retry: no process was spawned, and
+		// the distinct kind lets the control plane and operator see the
+		// host protecting itself. The supervisor's backoff/circuit bounds
+		// any re-send cadence.
+		kind := "runtime_launch_refused"
+		if errors.Is(turnErr, proc.ErrHostPressure) {
+			kind = "host_resource_pressure"
+		}
+		d.Log.Warn("turn launch refused by process supervisor",
+			"instance", spec.InstanceID, "kind", kind, "error", turnErr.Error())
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", kind+":"+turnErr.Error(), nil)
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		return fmt.Errorf("turn launch refused: %s: %v", kind, turnErr)
 	case turnErr != nil:
 		// Adapter-level failure (spawn/IO), no turn events were produced.
 		d.Log.Warn("turn failed (adapter error)",

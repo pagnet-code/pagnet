@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/proc"
 )
 
 // OpenCode drives the opencode CLI (`opencode`) as a process-per-turn
@@ -56,12 +57,16 @@ type OpenCode struct {
 	// Env is appended to the inherited environment for spawned processes.
 	Env []string
 
-	track procTracker
+	life lifecycleState
 }
 
 func NewOpenCode(binary string) *OpenCode {
-	return &OpenCode{Binary: binary, track: procTracker{procs: map[string]*exec.Cmd{}}}
+	return &OpenCode{Binary: binary}
 }
+
+// SetLifecycle implements LifecycleSetter (the daemon injects its central
+// process supervisor; standalone use falls back to a private one).
+func (o *OpenCode) SetLifecycle(l proc.Lifecycle) { o.life.SetLifecycle(l) }
 
 func (o *OpenCode) Name() domain.RuntimeName { return domain.RuntimeOpenCode }
 
@@ -168,9 +173,9 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 		extraEnv = append(extraEnv, "OPENCODE_CONFIG="+cfgPath)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(extraEnv, spec.Env)
+	cmd.Env = EnsureTurnMarker(ChildEnv(extraEnv, spec.Env), spec.TurnID)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -178,11 +183,21 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("spawn opencode: %w", err)
+	// The supervisor owns the Start, the process group (Setpgid), the
+	// launch guards, and the lifecycle; its ctx watcher terminates the
+	// whole group on cancellation.
+	h, err := o.life.get().Launch(ctx, proc.LaunchRequest{
+		InstanceID: spec.InstanceID,
+		TurnID:     spec.TurnID,
+		Runtime:    string(o.Name()),
+		Class:      proc.ClassTurn,
+		Cmd:        cmd,
+		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+	})
+	if err != nil {
+		return err
 	}
-	o.track.track(spec.InstanceID, cmd)
-	defer o.track.release(spec.InstanceID, cmd)
+	defer h.Close()
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -199,8 +214,9 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 		select {
 		case events <- ev:
 		case <-ctx.Done():
+			// The supervisor's ctx watcher terminates the whole group;
+			// the owner just stops emitting. defer h.Close() reaps.
 			cancelled = true
-			_ = cmd.Process.Kill()
 		}
 	}
 
@@ -215,10 +231,10 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 				// A requested resume that re-bases onto a different
 				// session is a lost session, not a silent fresh one.
 				terminal = true
-				_ = cmd.Process.Kill()
+				h.Abort("session_mismatch")
 				events <- TurnEvent{Type: EventSessionLost, SessionID: stored,
 					Error: "opencode resume started a different session (wanted " + stored + ", got " + sid + ")"}
-				_ = cmd.Wait()
+				_ = h.Wait()
 				return nil
 			}
 			sessionID = sid
@@ -249,8 +265,35 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 			errText = opencodeErrorText(ev.Error)
 		}
 	}
+	// A truncated stream (a line over the scanner buffer, or an I/O
+	// error) is a failure, not a clean exit — surface it instead of
+	// treating the partial stream as completed (external audit F-012).
+	if scanErr := scanner.Err(); scanErr != nil {
+		if proc.GroupAlive(h.PGID()) {
+			h.Terminate("scan_error")
+		}
+		_ = h.Wait()
+		if cancelled {
+			return ctx.Err()
+		}
+		events <- TurnEvent{
+			Type:        EventTurnFailed,
+			FailureKind: domain.RuntimeFailureProcessError,
+			Error:       fmt.Sprintf("opencode stream error: %v", scanErr),
+		}
+		return nil
+	}
 
-	waitErr := cmd.Wait()
+	// NOTE (pipe-hold): unlike qwen/claude, `opencode run --format json`
+	// emits no terminal event in the stream — the turn ends when the
+	// process exits. So there is no early-break signal here; a
+	// descendant holding the stdout pipe blocks until the turn's context
+	// expires, at which point the supervisor's ctx watcher terminates the
+	// whole group. Bounded, by design.
+	//
+	// Owner's reap (single Wait) after all stdout is drained; also
+	// reclaims any descendants that outlived the runtime (§19/§24).
+	waitErr := h.Wait()
 	if cancelled {
 		return ctx.Err()
 	}
@@ -295,9 +338,9 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 }
 
 // Stop kills the running process for an instance.
-func (o *OpenCode) Stop(instanceID string) error { return o.track.stop(instanceID) }
+func (o *OpenCode) Stop(instanceID string) error { return o.life.get().Stop(instanceID) }
 
-func (o *OpenCode) PID(instanceID string) *int { return o.track.pid(instanceID) }
+func (o *OpenCode) PID(instanceID string) *int { return o.life.get().PID(instanceID) }
 
 // InteractiveCmd builds the interactive opencode TUI (the PTY terminal,
 // addendum §7/§8): the default interactive mode (no `run`), with the same

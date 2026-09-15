@@ -41,8 +41,10 @@ func runClaudeStub(t *testing.T, spec TurnSpec, out string, stubEnv map[string]s
 		t.Fatal(err)
 	}
 	argsPath := filepath.Join(dir, "args.txt")
-	t.Setenv("CLAUDE_FAKE_OUT", outPath)
-	t.Setenv("CLAUDE_FAKE_ARGS", argsPath)
+	// The child (stub script) reads these from ITS environment; pass them
+	// as explicit injection pairs so they bypass the ChildEnv allowlist
+	// (external audit F-009). Adapter-side env stays on t.Setenv.
+	spec.Env = append(spec.Env, "CLAUDE_FAKE_OUT="+outPath, "CLAUDE_FAKE_ARGS="+argsPath)
 	for k, v := range stubEnv {
 		t.Setenv(k, v)
 	}
@@ -337,6 +339,27 @@ func TestClaude_ModelSelection(t *testing.T) {
 	t.Setenv("PAGNET_CLAUDE_MODEL", "")
 	if c.model() != "" {
 		t.Fatalf("model = %q, want empty (user default applies)", c.model())
+	}
+}
+
+// TestClaude_InteractiveCmdNoBypassPermissions (external audit F-014):
+// the interactive REPL is a human-in-the-loop session; it must NOT carry
+// --permission-mode bypassPermissions (a human in the TUI keeps the CLI's
+// normal approve/deny flow). Only the unattended managed turn (StartTurn)
+// bypasses permissions.
+func TestClaude_InteractiveCmdNoBypassPermissions(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := claudeSpec(t.TempDir())
+	cmd, err := NewClaude(bin).InteractiveCmd(spec)
+	if err != nil {
+		t.Fatalf("InteractiveCmd: %v", err)
+	}
+	if argHas(cmd.Args, "--permission-mode") {
+		t.Fatalf("interactive REPL must not bypass permissions (human approves in the TUI): %v", cmd.Args)
 	}
 }
 
