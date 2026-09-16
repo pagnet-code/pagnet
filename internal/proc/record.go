@@ -57,8 +57,23 @@ func recordPath(dir string, t *managedTurn) string {
 	return filepath.Join(dir, safe(t.InstanceID)+"--"+safe(t.TurnID)+".json")
 }
 
-// writeRecord persists the ownership record (best-effort: a record
-// failure degrades restart reconciliation, never the turn).
+// writeRecord persists the ownership record DURABLY and ATOMICALLY:
+// temp file in the SAME directory as the final path → write →
+// fsync(file) → close → rename (same-directory rename is atomic) →
+// fsync(directory, best-effort, like the keyring writer). A crash at any
+// point leaves either the previous complete record or no record — never
+// a torn file that Reconcile cannot parse (a torn record would strand
+// the tree without ownership proof). os.CreateTemp uses 0600 (the record
+// names pids of user-visible processes) regardless of umask.
+//
+// The post-Start launch site fails closed on the returned error (a
+// process without a durable record is a process the supervisor cannot
+// own after a crash, §39); there is no other call site.
+//
+// Note: the repo has no SHARED atomic-write helper — internal/runtime,
+// internal/crypto, and internal/config each carry their own unexported
+// copy (this follows that pattern; runtime cannot be imported here —
+// it imports proc).
 func (s *Supervisor) writeRecord(t *managedTurn) error {
 	dir := s.recordDir()
 	if dir == "" {
@@ -82,8 +97,36 @@ func (s *Supervisor) writeRecord(t *managedTurn) error {
 	if err != nil {
 		return err
 	}
-	// 0600: the record names pids of user-visible processes.
-	return os.WriteFile(recordPath(dir, t), b, 0o600)
+	tmp, err := os.CreateTemp(dir, ".rec-*.json")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, recordPath(dir, t)); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// Directory fsync (best-effort): persist the rename itself, so the
+	// record survives a crash after the rename returns.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func (s *Supervisor) removeRecord(t *managedTurn) {

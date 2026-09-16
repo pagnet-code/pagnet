@@ -13,6 +13,16 @@ import (
 // Linux process information comes from /proc (no helper processes —
 // §30/§33: never spawn `ps` on the safety path).
 
+func init() {
+	// Linux supports PDEATHSIG: if the daemon dies (crash/kill), the
+	// kernel SIGKILLs the direct child immediately — the kernel backstop
+	// for the start→record crash window (see childDeathSignal).
+	childDeathSignal = true
+	applyChildDeathSignal = func(a *syscall.SysProcAttr) {
+		a.Pdeathsig = syscall.SIGKILL
+	}
+}
+
 // procStat is the subset of /proc/<pid>/stat (+ the /proc/<pid> inode
 // owner) the supervisor needs.
 type procStat struct {
@@ -170,6 +180,21 @@ func UserProcessCount() (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// ProcessGroupOf returns the process group id of pid (field 5 of
+// /proc/<pid>/stat). The comm field may contain spaces/parens, so
+// parsing starts after the LAST ')' (parseProcStat).
+func ProcessGroupOf(pid int) (int, error) {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, err
+	}
+	st := parseProcStat(pid, b)
+	if st == nil {
+		return 0, os.ErrNotExist
+	}
+	return st.pgrp, nil
 }
 
 // StartIdentity returns the kernel start-time marker of pid (clock

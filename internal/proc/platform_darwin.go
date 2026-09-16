@@ -133,6 +133,16 @@ func UserProcessCount() (int, error) {
 	return n, nil
 }
 
+// ProcessGroupOf returns the process group id of pid (KERN_PROC_PID,
+// the same kinfo_proc source as StartIdentity).
+func ProcessGroupOf(pid int) (int, error) {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return 0, err
+	}
+	return int(kp.Proc.P_pgrp), nil
+}
+
 // StartIdentity returns the kernel start-time marker of pid
 // (P_starttime, seconds since boot). A PID reuse gets a different
 // start time, so this is the PID-reuse-safe identity the ownership

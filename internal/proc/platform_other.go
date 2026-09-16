@@ -55,6 +55,9 @@ func GroupHasLiveMember(pgid int) bool { return false }
 // UserProcessCount is unsupported here.
 func UserProcessCount() (int, error) { return 0, errUnsupported }
 
+// ProcessGroupOf is unsupported here.
+func ProcessGroupOf(pid int) (int, error) { return 0, errUnsupported }
+
 // StartIdentity is unsupported here.
 func StartIdentity(pid int) (string, error) { return "", errUnsupported }
 
