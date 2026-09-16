@@ -728,25 +728,52 @@ type managedTurn struct {
 	termReason atomic.Value // string
 }
 
-// ownerWait is the single finalize: reap the direct child exactly once,
-// then reclaim any group members that outlived it. §19/§24: when the turn
-// is no longer executing there must be no forgotten runtime process tree —
-// a runtime that exits cleanly can still leave descendants behind (MCP
-// bridges, shells, helpers), and those are the leak. Reaping the direct
-// child first means GroupAlive then reflects ONLY descendants, so a clean
-// completion with no survivors returns immediately (no grace wait).
+// ownerWait is the single finalize: reclaim any group members that
+// outlived the turn, then reap the direct child exactly once. §19/§24:
+// when the turn is no longer executing there must be no forgotten runtime
+// process tree — a runtime that exits cleanly can still leave descendants
+// behind (MCP bridges, shells, helpers), and those are the leak.
+//
+// The reclaim runs BEFORE the reap, anchored on the unreaped direct child:
+// the child is the group leader (pgid == its pid), and while it is still
+// unreaped (alive or zombie) no other process can hold this pgid — a new
+// process becomes a group leader with pgid == its pid only once that pid
+// is free, and the pid is free only after the reap. A post-reap group
+// check could therefore observe a NEW turn that reused the freed pid and
+// SIGTERM its group (the E2E82 hibernate/wake P0: a rep hibernates, a new
+// turn launches milliseconds later, and the previous turn's termination
+// lands on the new turn's still-starting process).
+//
+// The check is zombie-aware (GroupHasLiveMember, not the signal-0
+// GroupAlive): the dying/zombie child is a group member but is already
+// dead, so a clean completion with no survivors skips the termination
+// entirely and returns immediately (no grace wait).
+//
+// Edge cases:
+//   - Handle.Close / launch-failure paths: abort()/Terminate() has
+//     signaled the group but the child may still be ALIVE (not yet a
+//     zombie) at the pre-reap check. That is safe: the group is this
+//     turn's own (the child is unreaped), terminateGroup on an
+//     already-dying group is harmless, and its poll waits for the KILL
+//     to land.
+//   - Normal path: ownerWait is called only after all stdout reads are
+//     done, so the child has already exited (zombie) and the check sees
+//     only true descendants.
+//
 // Idempotent: only the first caller reaps; the rest observe the exit.
 func (t *managedTurn) ownerWait() (Exit, error) {
 	if !t.reaped.CompareAndSwap(false, true) {
 		t.waitForExit()
 		return t.exit(), nil
 	}
-	waitErr := t.cmd.Wait()
-	if pgid := int(t.pgid.Load()); pgid > 0 && GroupAlive(pgid) {
+	// Pre-reap descendant reclaim, anchored on the unreaped direct child
+	// (see the doc above for why pre-reap and why zombie-aware).
+	if pgid := int(t.pgid.Load()); pgid > 0 && GroupHasLiveMember(pgid) {
 		t.s.log.Warn("reclaiming descendants that outlived the turn",
 			"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
 		t.terminateGroup()
 	}
+	waitErr := t.cmd.Wait()
 	return t.finish(waitErr), nil
 }
 
