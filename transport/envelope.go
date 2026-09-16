@@ -139,6 +139,14 @@ const (
 	// idempotent and self-gating (idle gate + 1h failure backoff), so a
 	// missed or duplicated advertisement is harmless.
 	MsgLatestVersion = "host.latest_version"
+	// MsgNetworkCrypto is a LIVE server->host signal carrying one network's
+	// E2EE lifecycle state (status + current epoch id + tenant id). The
+	// daemon caches it per network and uses it to decide whether to encrypt
+	// protected content (status=active) and under which epoch (epochId). It
+	// is re-sent on every (re)connect and on state changes (activation,
+	// rotation), so a daemon that misses it re-receives it on reconnect.
+	// Live (at-most-once): it is a state signal, not a durable command.
+	MsgNetworkCrypto = "host.network_crypto"
 
 	// E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8). All
 	// are DURABLE + idempotent (commandId) and network-scoped (they carry a
@@ -305,6 +313,22 @@ type LatestVersionPayload struct {
 	LatestVersion string `json:"latestVersion"`
 }
 
+// NetworkCryptoPayload carries one network's E2EE lifecycle state to the
+// daemon (the customer-side encryption decision input, plan §12). The daemon
+// uses Status to decide whether to encrypt protected content (only when
+// "active") and EpochID to choose the epoch to encrypt under (the BINDING
+// epoch rule: the sender always encrypts under the announced epoch).
+// TenantID is carried so the daemon can bind it into the AAD (the daemon
+// does not otherwise know the tenant id). The control plane stores only this
+// routing metadata — never key material.
+type NetworkCryptoPayload struct {
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	// Status: standard | activating | active.
+	Status  string `json:"status"`
+	EpochID string `json:"epochId,omitempty"`
+}
+
 // ListDirsPayload is a LIVE request to list the subdirectories of Path
 // (the click-to-select directory picker). The daemon validates Path
 // against its allowed roots before reading it.
@@ -376,10 +400,25 @@ type NetworkEventPayload struct {
 	NetworkID string `json:"networkId,omitempty"`
 	// Resource is the canonical resource key, when relevant.
 	Resource string `json:"resource,omitempty"`
-	// Body is the rendered text of the turn input.
+	// Body is the rendered text of the turn input. On an active private
+	// network this is EMPTY for encrypted deliveries: the protected text
+	// crosses the boundary only as Envelope (ciphertext), and the recipient
+	// daemon decrypts it just before the turn input.
 	Body string `json:"body"`
-	// AcceptanceCriteria for task events.
+	// AcceptanceCriteria for task events. On an active private network the
+	// criteria ride inside the task Envelope (encrypted with the objective),
+	// so this is empty for encrypted deliveries.
 	AcceptanceCriteria []string `json:"acceptanceCriteria,omitempty"`
+	// Envelope is the E2EE envelope for an encrypted delivery (private
+	// networks, plan §12). When set, the recipient daemon decrypts it (with
+	// AAD) before rendering the turn input. The control plane relays it
+	// byte-for-byte and never reads the ciphertext.
+	Envelope *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	// AAD is the associated-data the Envelope was bound to, relayed verbatim
+	// from the sender (the AAD server obligation, PROTOCOL §3). The recipient
+	// reconstructs the AAD from these server-relayed fields and decrypts; if
+	// the server altered any bound field, GCM authentication fails.
+	AAD *e2ee.AAD `json:"aad,omitempty"`
 }
 
 // HeartbeatPayload carries host liveness + machine metrics.
@@ -594,8 +633,18 @@ type InteractionEventPayload struct {
 	Resolved bool `json:"resolved,omitempty"`
 	// Decision is the resolution outcome (resolved|declined|cancelled).
 	Decision string `json:"decision,omitempty"`
-	// Answer is the (opaque) answer, when the runtime reported one.
+	// Answer is the (opaque) answer, when the runtime reported one. On an
+	// active private network this is EMPTY for encrypted observations: the
+	// answer (with Summary + NativePayload) crosses only as DetailEnvelope.
 	Answer string `json:"answer,omitempty"`
+	// DetailEnvelope is the E2EE envelope for the interaction's protected
+	// detail (summary + native payload + answer) on an active private network
+	// (plan §12.3). Kind + state + ids stay plaintext; the detail is
+	// ciphertext. The control plane relays it byte-for-byte.
+	DetailEnvelope *e2ee.EncryptedPayloadV1 `json:"detailEnvelope,omitempty"`
+	// DetailAAD is the associated-data the DetailEnvelope was bound to,
+	// relayed verbatim (the AAD server obligation, PROTOCOL §3).
+	DetailAAD *e2ee.AAD `json:"detailAAD,omitempty"`
 }
 
 // --- E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8) --------

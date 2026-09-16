@@ -32,6 +32,12 @@ type Task struct {
 	InitiatorUserID *ID
 	Source          string
 	SourceRef       string
+	// Metadata is the task's server-side JSONB metadata (plan §12.2). On an
+	// active private network the protected content (objective / criteria /
+	// blocked reason) rides here as an opaque envelope + verbatim AAD; the
+	// objective / acceptance_criteria fields stay empty. Empty for standard
+	// tasks.
+	Metadata map[string]any
 }
 
 // TaskDependency expresses task -> task dependencies.

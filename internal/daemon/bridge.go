@@ -238,7 +238,20 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		if req.Args == nil {
 			req.Args = json.RawMessage("{}")
 		}
-		result, errMsg := d.relayToServer(row.InstanceID, req.Tool, req.Args)
+		// E2EE (plan §12): on an active private network the daemon encrypts
+		// the tool call's protected fields before they cross the cloud
+		// boundary (the server stores/relays the opaque envelope + verbatim
+		// AAD and routes on metadata without decrypting). Standard networks
+		// are byte-identical (encryptToolArgs returns the args unchanged).
+		encArgs, encErr := d.encryptToolArgs(row, req.Tool, req.Args)
+		if encErr != "" {
+			resp := map[string]any{"id": req.ID, "ok": false, "error": encErr}
+			if _, err := writeBridge(c, resp); err != nil {
+				return
+			}
+			continue
+		}
+		result, errMsg := d.relayToServer(row.InstanceID, req.Tool, encArgs)
 		resp := map[string]any{"id": req.ID}
 		if errMsg == "" {
 			resp["ok"] = true

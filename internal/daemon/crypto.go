@@ -28,6 +28,21 @@ type cryptoManager struct {
 	mu       sync.Mutex
 	identity *crypto.HostIdentity
 	nkas     map[string]*crypto.NKA // networkID -> NKA (this host acting as NKA)
+	// netCrypto caches the server-announced E2EE lifecycle state per network
+	// (host.network_crypto, plan §12). It is the daemon's input for the
+	// customer-side encryption decision: whether to encrypt (status=active)
+	// and under which epoch (epochId). Re-pushed on every (re)connect and on
+	// state changes, so it is always current while the daemon is connected.
+	netCrypto map[string]NetworkCryptoState
+}
+
+// NetworkCryptoState is the daemon's cached view of one network's E2EE
+// lifecycle state (from the control plane's host.network_crypto signal).
+type NetworkCryptoState struct {
+	NetworkID string
+	TenantID  string
+	Status    string // standard | activating | active
+	EpochID   string // the announced current epoch ("" until active)
 }
 
 // cryptoManager returns the daemon's crypto manager, creating it on first use.
@@ -35,9 +50,32 @@ func (d *Daemon) cryptoManager() *cryptoManager {
 	d.cryptoMu.Lock()
 	defer d.cryptoMu.Unlock()
 	if d.cryptoMgr == nil {
-		d.cryptoMgr = &cryptoManager{d: d, nkas: map[string]*crypto.NKA{}}
+		d.cryptoMgr = &cryptoManager{
+			d:         d,
+			nkas:      map[string]*crypto.NKA{},
+			netCrypto: map[string]NetworkCryptoState{},
+		}
 	}
 	return d.cryptoMgr
+}
+
+// SetNetworkCrypto caches the server-announced E2EE lifecycle state for a
+// network (host.network_crypto). It is idempotent (a re-push overwrites).
+func (m *cryptoManager) SetNetworkCrypto(networkID string, st NetworkCryptoState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st.NetworkID = networkID
+	m.netCrypto[networkID] = st
+}
+
+// NetworkCrypto returns the cached E2EE lifecycle state for a network
+// (ok=false when the daemon has not yet received a host.network_crypto for
+// it — e.g. before the first connect-time push lands).
+func (m *cryptoManager) NetworkCrypto(networkID string) (NetworkCryptoState, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st, ok := m.netCrypto[networkID]
+	return st, ok
 }
 
 // hostIdentity returns the host's stable E2EE identity, generating and

@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/transport"
@@ -768,6 +769,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			// handler only records it and (at most) spawns the update
 			// goroutine — it never blocks the read loop on a download.
 			d.handleLatestVersion(env)
+			continue
+		}
+		if env.Type == transport.MsgNetworkCrypto {
+			// LIVE (E2EE, plan §12): the network's crypto lifecycle state
+			// (status + announced epoch + tenant id). The handler only
+			// updates the in-memory cache — it never blocks the read loop.
+			d.handleNetworkCrypto(env)
 			continue
 		}
 		d.handleCommand(conn, env)
@@ -1830,6 +1838,28 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	if kind == "" {
 		kind = "notice"
 	}
+	// E2EE (plan §12): an encrypted delivery carries the protected text as an
+	// envelope (ciphertext) + the verbatim AAD. Decrypt it JUST BEFORE the
+	// turn input so the plaintext never crossed the cloud boundary. The
+	// network id is the instance's (workers) or the payload's (representatives
+	// are network-NULL). A decrypt failure fails the turn clean (the work
+	// stays durable server-side for re-delivery) — never a silent plaintext
+	// fallback.
+	if p.Envelope != nil && p.AAD != nil {
+		netID := row.NetworkID
+		if netID == "" {
+			netID = p.NetworkID
+		}
+		plain, err := d.decryptProtected(netID, *p.Envelope, *p.AAD)
+		if err != nil {
+			return fmt.Errorf("decrypt delivery: %w", err)
+		}
+		p.Body = plain
+		// For tasks the acceptance criteria ride inside the envelope (the
+		// plaintext already contains them), so the separate criteria list is
+		// left empty to avoid double-rendering.
+		p.AcceptanceCriteria = nil
+	}
 	// The turn input is a self-describing XML envelope (contract.go):
 	// routing attributes + the immediate action for this delivery kind,
 	// so the agent always knows this is a network message and HOW to
@@ -2017,6 +2047,13 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	pendingInteraction := false
 	interactionDeferrable := false
 	interactionIDs := map[string]string{}
+	// E2EE (plan §12): the per-turn runtime-output stream id (object id for
+	// the encrypted output chunks). Minted only when the instance's network
+	// is an active private network; empty otherwise (plaintext output).
+	var runtimeStreamID string
+	if st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID); ok && st.Status == "active" && st.EpochID != "" {
+		runtimeStreamID = newObjectID()
+	}
 
 	for ev := range events {
 		switch ev.Type {
@@ -2030,9 +2067,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		case agentruntime.EventTurnStarted:
 			d.sendTurn(conn, transport.MsgRuntimeTurnStarted, spec, sessionID, nil, nil, nil, "", "", nil)
 		case agentruntime.EventTurnOutput:
-			_ = d.send(conn, transport.MsgRuntimeOutput, map[string]any{
-				"instanceId": spec.InstanceID, "output": ev.Output,
-			})
+			d.sendRuntimeOutput(conn, row, runtimeStreamID, ev.Output)
 		case agentruntime.EventTurnCompleted:
 			completed = true
 			d.sendTurn(conn, transport.MsgRuntimeTurnCompleted, spec, sessionID,
@@ -2449,7 +2484,7 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 		ids[key] = id
 	}
 	corr := ie.NativeInteractionID
-	_ = d.send(conn, msgType, transport.InteractionEventPayload{
+	payload := transport.InteractionEventPayload{
 		InteractionID:       id,
 		InstanceID:          spec.InstanceID,
 		SessionID:           sessionID,
@@ -2462,7 +2497,38 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 		Resolved:            ie.Resolved,
 		Decision:            ie.Decision,
 		Answer:              ie.Answer,
-	})
+	}
+	// E2EE (plan §12.3): on an active private network the interaction's
+	// protected detail (summary + native payload + answer) crosses only as an
+	// envelope; kind + state + ids stay plaintext. The interaction id (minted
+	// above) is the object id, so the started/resolved pair share it.
+	if row, ok, _ := d.state.GetInstance(spec.InstanceID); ok && row.NetworkID != "" {
+		if st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID); ok && st.Status == "active" && st.EpochID != "" {
+			sender := row.AgentName
+			if sender == "" {
+				sender = row.InstanceID
+			}
+			plain := ie.Summary
+			if len(ie.NativePayload) > 0 {
+				plain += "\n" + string(ie.NativePayload)
+			}
+			if ie.Answer != "" {
+				plain += "\nanswer: " + ie.Answer
+			}
+			if env, aad, err := d.encryptProtected(st, e2ee.ObjectTypeRuntimeInteraction, id, sender, "", plain); err == nil {
+				payload.Summary = ""
+				payload.NativePayload = nil
+				payload.Answer = ""
+				payload.DetailEnvelope = &env
+				payload.DetailAAD = &aad
+			} else {
+				d.Log.Warn("interaction detail encrypt failed; observation dropped",
+					"instance", spec.InstanceID, "err", err)
+				return
+			}
+		}
+	}
+	_ = d.send(conn, msgType, payload)
 }
 
 // --- small platform helpers ---------------------------------------------------

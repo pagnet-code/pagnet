@@ -90,6 +90,12 @@ type RuntimeInteraction struct {
 	Answer     *string
 	CreatedAt  time.Time
 	ResolvedAt *time.Time
+	// Metadata is the interaction's server-side JSONB metadata (plan §12.3).
+	// On an active private network the protected detail (summary + native
+	// payload + answer) rides here as an opaque envelope + verbatim AAD; the
+	// summary / native_payload / answer columns stay empty. Empty for
+	// standard interactions.
+	Metadata map[string]any
 }
 
 // RuntimeCapability is the persisted compatibility-matrix row for one
