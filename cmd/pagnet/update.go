@@ -98,9 +98,11 @@ func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
 }
 
 // updateBinaryAt downloads the latest release for this platform from
-// serverURL's public /download/, validates that it carries the unified
-// pagnet binary, and atomically replaces the binary at path. A failure
-// (bad server, wrong artifact) leaves the installed binary untouched.
+// serverURL's public /download/, verifying the signed release manifest
+// (Ed25519 signature against the pinned key + the tarball's sha256),
+// validates that it carries the unified pagnet binary, and atomically
+// replaces the binary at path. A failure (bad server, untrusted manifest,
+// wrong artifact) leaves the installed binary untouched.
 func updateBinaryAt(serverURL, path string) error {
 	tmp, err := os.MkdirTemp("", "pagnet-update-*")
 	if err != nil {
@@ -108,7 +110,7 @@ func updateBinaryAt(serverURL, path string) error {
 	}
 	defer os.RemoveAll(tmp)
 	tarPath := filepath.Join(tmp, "release.tar.gz")
-	if err := release.Download(serverURL, tarPath); err != nil {
+	if err := release.DownloadLatestVerified(serverURL, tarPath, insecureRemoteHTTP); err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 	newBin, err := release.ExtractPagnet(tarPath, tmp)

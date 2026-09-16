@@ -10,7 +10,7 @@ RELEASE_DIR := dist
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
 
-.PHONY: build install test test-race fmt vet tidy demo release clean
+.PHONY: build install test test-race fmt vet tidy demo release release-sign clean
 
 ## build: compile the Go binaries into bin/
 ## (pagnet is the single production binary — CLI, daemon and MCP bridges;
@@ -73,6 +73,18 @@ release:
 		rm -rf $$tmp; \
 	done
 	@ls -1 $(RELEASE_DIR)/pagnet-*.tar.gz
+
+## release-sign: sign the release manifest for VERSION from the tarballs in
+## RELEASE_DIR and create the pagnet-release-manifest-latest.json copy.
+## Requires PAGNET_RELEASE_SIGNING_KEY (the base64 Ed25519 seed — a GitHub
+## repo secret; never committed). The manifest is the trust anchor for the
+## client's auto-update: the updater verifies its Ed25519 signature against
+## the pinned public key before installing anything.
+release-sign:
+	@test -n "$(PAGNET_RELEASE_SIGNING_KEY)" || { echo "PAGNET_RELEASE_SIGNING_KEY is not set (the base64 Ed25519 seed)"; exit 1; }
+	$(GO) run ./cmd/pagnet-release-sign --version $(VERSION) --dir $(RELEASE_DIR)
+	cp $(RELEASE_DIR)/pagnet-release-manifest-$(VERSION).json $(RELEASE_DIR)/pagnet-release-manifest-latest.json
+	@ls -1 $(RELEASE_DIR)/pagnet-release-manifest-*.json
 
 clean:
 	rm -rf $(BIN) $(RELEASE_DIR)

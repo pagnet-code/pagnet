@@ -215,7 +215,13 @@ func TestBridgeGlobalConnCap(t *testing.T) {
 		d.bridgeConnMu.Unlock()
 	})
 
-	resp := bridgeDial(t, sock).auth(t, "inst-1", "net-1")
+	// The handler enforces the global cap BEFORE reading the auth message
+	// (it writes the error and closes the connection immediately). So the
+	// test must NOT write the auth first: doing so races the handler's
+	// close and can fail with a broken pipe under load. Just read the
+	// error the handler already sent.
+	c := bridgeDial(t, sock)
+	resp := c.read(t)
 	if resp["type"] != "error" {
 		t.Fatalf("auth = %v, want error (global cap)", resp)
 	}

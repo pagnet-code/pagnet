@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
 type cliCtx struct {
@@ -69,6 +70,12 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	}
 	if c.base == "" {
 		return nil, errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
+	}
+	// HTTPS-required-for-non-loopback (client-hardening wave 2): every
+	// REST command resolves its base URL here, so this single check
+	// covers the whole CLI REST surface.
+	if err := netpolicy.Check(c.base, insecureRemoteHTTP); err != nil {
+		return nil, err
 	}
 	c.cfg = cfg
 	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no

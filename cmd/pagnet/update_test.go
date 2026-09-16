@@ -9,6 +9,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -53,24 +54,42 @@ func writeUpdateTarball(t *testing.T, dir string, names ...string) string {
 	return path
 }
 
-// fakeReleaseServer serves the tarball at the /download/ path the
-// updater expects for this platform (the pagnet-latest-* convention).
-func fakeReleaseServer(t *testing.T, tarPath string) *httptest.Server {
+// fakeReleaseServer serves the layout the verified updater expects: a
+// release manifest at /download/pagnet-release-manifest-latest.json (with
+// the given version) and the versioned platform tarball at
+// /download/pagnet-<version>-<os>-<arch>.tar.gz. The manifest is unsigned
+// (garbage signature): the tests exercise the download/extract mechanics
+// via the dev-only PAGNET_ALLOW_UNSIGNED_RELEASES fallback, and the
+// signature-verification path is covered by the internal/release tests.
+func fakeReleaseServer(t *testing.T, version, tarPath string) *httptest.Server {
 	t.Helper()
+	manifest := release.Manifest{
+		Version:   version,
+		Created:   "2026-09-16T00:00:00Z",
+		Assets:    []release.Asset{{Name: release.TarballNameFor(version, runtime.GOOS, runtime.GOARCH), SHA256: "unsigned"}},
+		KeyID:     release.KeyID,
+		Signature: "unsigned-test-manifest",
+	}
+	mb, _ := json.Marshal(&manifest)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/download/"+release.TarballName(runtime.GOOS, runtime.GOARCH) {
+		switch r.URL.Path {
+		case "/download/" + release.ManifestName("latest"):
+			_, _ = w.Write(mb)
+		case "/download/" + release.TarballNameFor(version, runtime.GOOS, runtime.GOARCH):
 			http.ServeFile(w, r, tarPath)
-			return
+		default:
+			http.NotFound(w, r)
 		}
-		http.NotFound(w, r)
 	}))
 	t.Cleanup(ts.Close)
 	return ts
 }
 
 func TestUpdateBinaryAt(t *testing.T) {
+	const version = "v1.2.3"
+	t.Setenv(release.EnvAllowUnsigned, "1")
 	tarPath := writeUpdateTarball(t, t.TempDir(), "pagnet", "LICENSE", "README.md")
-	ts := fakeReleaseServer(t, tarPath)
+	ts := fakeReleaseServer(t, version, tarPath)
 
 	install := t.TempDir()
 	fake := filepath.Join(install, "pagnet")
@@ -108,8 +127,10 @@ func TestUpdateBinaryAt_MissingBinary(t *testing.T) {
 	// A tarball without the pagnet member (a foreign or broken artifact):
 	// the update fails and the installed binary is left untouched —
 	// never a partial replace.
+	const version = "v1.2.3"
+	t.Setenv(release.EnvAllowUnsigned, "1")
 	tarPath := writeUpdateTarball(t, t.TempDir(), "pagnetd", "pagnet-mcp")
-	ts := fakeReleaseServer(t, tarPath)
+	ts := fakeReleaseServer(t, version, tarPath)
 
 	install := t.TempDir()
 	fake := filepath.Join(install, "pagnet")
@@ -129,8 +150,9 @@ func TestUpdateBinaryAt_MissingBinary(t *testing.T) {
 }
 
 func TestUpdateBinaryAt_DownloadError(t *testing.T) {
-	// The server has no artifact for this platform (404): clean error,
-	// target untouched.
+	// The server serves no manifest (404): the verified updater refuses
+	// before downloading anything; clean error, target untouched.
+	t.Setenv(release.EnvAllowUnsigned, "")
 	ts := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(ts.Close)
 
@@ -140,7 +162,7 @@ func TestUpdateBinaryAt_DownloadError(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := updateBinaryAt(ts.URL, fake); err == nil {
-		t.Fatal("want an error when the download 404s")
+		t.Fatal("want an error when the manifest 404s")
 	}
 	got, err := os.ReadFile(fake)
 	if err != nil {

@@ -35,6 +35,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/pagnet-code/pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
 func loginCmd() *cobra.Command {
@@ -68,6 +69,12 @@ func loginCmd() *cobra.Command {
 			}
 			if base == "" {
 				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
+			}
+			// HTTPS-required-for-non-loopback (client-hardening wave 2):
+			// login speaks raw HTTP to the control plane, so it checks the
+			// policy itself (it does not go through newCLI).
+			if err := netpolicy.Check(base, insecureRemoteHTTP); err != nil {
+				return err
 			}
 			if !strings.HasSuffix(base, "/") {
 				base += "/"

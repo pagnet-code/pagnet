@@ -37,6 +37,12 @@ var version = "dev"
 // (403 host_identity).
 var userToken string
 
+// insecureRemoteHTTP is the --insecure-remote-http flag: it opts into
+// plain HTTP for a non-loopback control plane / release URL (development
+// only). Off by default; ORed with the PAGNET_INSECURE_REMOTE_HTTP env by
+// the netpolicy check. A non-loopback remote must otherwise be HTTPS.
+var insecureRemoteHTTP bool
+
 // root is package-level so shared plumbing (newCLI) can check whether the
 // user explicitly set --server (flag.Changed) before applying the saved
 // config's server URL.
@@ -70,6 +76,12 @@ func main() {
 		envOrDefault("PAGNET_SERVER", ""),
 		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
 	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
+	// --insecure-remote-http opts into plain HTTP for a non-loopback
+	// control plane / release URL (development only). Off by default; a
+	// non-loopback remote must otherwise be HTTPS. The PAGNET_INSECURE_
+	// REMOTE_HTTP=1 env is an equivalent opt-in (checked by netpolicy).
+	root.PersistentFlags().BoolVar(&insecureRemoteHTTP, "insecure-remote-http", false,
+		"allow plain HTTP for a non-loopback control plane / release URL (development only; also PAGNET_INSECURE_REMOTE_HTTP=1)")
 	// -d/--detach is a ROOT-level launcher (re-exec `pagnet serve`
 	// detached); the daemon flag set is registered locally so
 	// `pagnet -d --state-dir ...` parses. Deliberately NOT persistent:

@@ -7,6 +7,7 @@ package daemon
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -315,18 +316,27 @@ func TestExtractPagnet(t *testing.T) {
 	})
 }
 
-// TestPerformAutoUpdate_BadTarballGraceful: a release tarball without the
-// unified binary (e.g. the server still serves a pre-unified artifact)
-// must fail the update GRACEFULLY — backoff recorded, single-flight flag
-// released, the daemon keeps running its current build. No crash, no
-// tight retry: the 1h backoff bounds the next attempt (the WSS read loop
-// is never blocked, the failure is logged and swallowed).
-func TestPerformAutoUpdate_BadTarballGraceful(t *testing.T) {
-	dir := t.TempDir()
-	writeReleaseTarball(t, dir, "pagnetd", "pagnet-mcp") // no pagnet member
+// TestPerformAutoUpdate_UntrustedReleaseGraceful: a release whose manifest
+// does not verify (here: a bad signature) must fail the update GRACEFULLY
+// — backoff recorded, single-flight flag released, the daemon keeps
+// running its current build. No crash, no tight retry: the 1h backoff
+// bounds the next attempt (the WSS read loop is never blocked, the failure
+// is logged and swallowed). The tarball is never even downloaded: the
+// manifest is verified first.
+func TestPerformAutoUpdate_UntrustedReleaseGraceful(t *testing.T) {
+	// A manifest with a garbage signature: the daemon must refuse it
+	// before downloading any tarball.
+	m := release.Manifest{
+		Version:   "1.0.1",
+		Created:   "2026-09-16T00:00:00Z",
+		Assets:    []release.Asset{{Name: release.TarballNameFor("1.0.1", runtime.GOOS, runtime.GOARCH), SHA256: "deadbeef"}},
+		KeyID:     release.KeyID,
+		Signature: "not-a-real-signature",
+	}
+	mb, _ := json.Marshal(&m)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/download/"+release.TarballName(runtime.GOOS, runtime.GOARCH) {
-			http.ServeFile(w, r, filepath.Join(dir, "release.tar.gz"))
+		if r.URL.Path == "/download/"+release.ManifestName("1.0.1") {
+			_, _ = w.Write(mb)
 			return
 		}
 		http.NotFound(w, r)

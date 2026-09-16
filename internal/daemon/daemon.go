@@ -23,6 +23,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/transport"
@@ -83,6 +84,12 @@ type Config struct {
 	// (same PID). Default TRUE — opt out via PAGNET_AUTO_UPDATE=0,
 	// --no-auto-update, or the state file's autoUpdate: false.
 	AutoUpdate bool
+	// InsecureRemoteHTTP is the --insecure-remote-http flag value: it opts
+	// into plain HTTP for a non-loopback control plane / release URL
+	// (development only). ORed with the PAGNET_INSECURE_REMOTE_HTTP env by
+	// the netpolicy check. Default FALSE — a non-loopback remote must be
+	// HTTPS.
+	InsecureRemoteHTTP bool
 
 	// --- Process-containment limits (abuse addendum Part B §29–§35) ---
 	// Zero values fall back to the supervisor's safe defaults (and the
@@ -358,6 +365,13 @@ func New(cfg Config, log *slog.Logger) (*Daemon, error) {
 func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, error)) (*Daemon, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	// HTTPS-required-for-non-loopback (client-hardening wave 2): a
+	// non-loopback control plane over plain HTTP is refused at
+	// construction, so a misconfigured daemon fails fast instead of
+	// shipping the host credential over an unencrypted channel.
+	if err := netpolicy.Check(cfg.ServerURL, cfg.InsecureRemoteHTTP); err != nil {
+		return nil, err
 	}
 	// The MCP bridges are spawned as <self> mcp worker|control: resolve
 	// the daemon's own executable ONCE, up front, and fail explicitly
@@ -658,6 +672,13 @@ func (d *Daemon) wsURL() string {
 }
 
 func (d *Daemon) connectAndRun(ctx context.Context) error {
+	// Re-check the HTTPS policy on every (re)connect: New checked it at
+	// construction, but this is the actual dial — a defense-in-depth
+	// guard so no code path can ever open a plain-HTTP non-loopback
+	// control-plane connection.
+	if err := netpolicy.Check(d.ServerURL, d.InsecureRemoteHTTP); err != nil {
+		return err
+	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(), hdr)

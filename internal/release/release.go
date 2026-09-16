@@ -17,11 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 )
 
@@ -41,38 +38,6 @@ var ErrNoBinary = errors.New("pagnet binary not found in tarball")
 // /download/ (the pagnet-latest-* convention of `make release`).
 func TarballName(goos, goarch string) string {
 	return "pagnet-latest-" + goos + "-" + goarch + ".tar.gz"
-}
-
-// Download fetches the platform's release tarball from the control
-// plane's public /download/ endpoint into dst. The endpoint is open by
-// design (open-source binaries; the control plane itself stays behind
-// the admin credential).
-func Download(serverURL, dst string) error {
-	u := strings.TrimSuffix(serverURL, "/") + "/download/" +
-		TarballName(runtime.GOOS, runtime.GOARCH)
-	req, err := http.NewRequest(http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	client := &http.Client{Timeout: DownloadTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d", resp.StatusCode)
-	}
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	_, werr := io.Copy(f, resp.Body)
-	cerr := f.Close()
-	if werr == nil {
-		werr = cerr
-	}
-	return werr
 }
 
 // ExtractPagnet unpacks the release tarball (a flat pagnet-*.tar.gz)

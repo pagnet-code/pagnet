@@ -36,16 +36,38 @@ jobs:
       - name: Build release tarballs
         run: make release
 
+      # Sign the release manifest (the trust anchor for the client's
+      # auto-update). The manifest is signed with the Ed25519 key from the
+      # PAGNET_RELEASE_SIGNING_KEY repo secret and published alongside the
+      # tarballs. If the secret is absent the release still publishes
+      # (unsigned) with a prominent warning — the client then refuses
+      # auto-updates by default until a signed release is published (the
+      # intended safe state, not a failure to hide).
+      - name: Sign release manifest
+        env:
+          PAGNET_RELEASE_SIGNING_KEY: ${{ secrets.PAGNET_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${PAGNET_RELEASE_SIGNING_KEY}" ]; then
+            echo "::warning::PAGNET_RELEASE_SIGNING_KEY is not set — publishing an UNSIGNED release. Clients will refuse auto-updates (and manual updates) until the key is set and a signed release is published. This is the intended safe state, not a failure."
+            exit 0
+          fi
+          make release-sign
+
       - name: List artifacts
-        run: ls -1 dist/pagnet-*.tar.gz
+        run: |
+          ls -1 dist/pagnet-*.tar.gz
+          ls -1 dist/pagnet-release-manifest-*.json 2>/dev/null || echo "(no signed manifest — unsigned release)"
 
       - name: Publish tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/pagnet-*.tar.gz \
+          # nullglob: an unmatched manifest glob expands to nothing, so an
+          # unsigned release uploads only the tarballs.
+          shopt -s nullglob
+          files=(dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json)
+          gh release create "${GITHUB_REF_NAME}" "${files[@]}" \
             --title "${GITHUB_REF_NAME}" \
             --notes "pagnet ${GITHUB_REF_NAME}" \
             --latest
@@ -58,8 +80,9 @@ jobs:
           # Replace the rolling "dev" release on every main push so there is
           # always a current dev build to grab.
           gh release delete dev --yes --cleanup-tag 2>/dev/null || true
-          gh release create dev \
-            dist/pagnet-*.tar.gz \
+          shopt -s nullglob
+          files=(dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json)
+          gh release create dev "${files[@]}" \
             --title "dev" \
             --prerelease \
             --notes "Rolling dev build (${GITHUB_SHA::7})"

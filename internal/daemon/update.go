@@ -235,7 +235,7 @@ func (d *Daemon) performAutoUpdate(latest string) {
 	d.updMu.Lock()
 	d.lastAttempt = time.Now()
 	d.updMu.Unlock()
-	newBin, err := d.downloadAndExtract()
+	newBin, err := d.downloadAndExtract(latest)
 	if err != nil {
 		d.Log.Error("auto-update failed: "+err.Error()+"; backing off 1h", "latest", latest)
 		return
@@ -288,14 +288,16 @@ func (d *Daemon) activeWorkCount() int {
 	return n
 }
 
-// downloadAndExtract fetches the host's release tarball from the
-// control plane's /download/ endpoint (the existing release-serving
-// handler, same pagnet-latest-<os>-<arch>.tar.gz convention as the
-// wget-install bootstrap) and extracts the unified pagnet binary into
+// downloadAndExtract fetches the release tarball for version from the
+// control plane's /download/ endpoint, verifying the signed release
+// manifest first (Ed25519 signature against the pinned key + the
+// tarball's sha256) and then extracting the unified pagnet binary into
 // the staging dir; it returns the staged binary's path. The staging dir
 // is removed on failure; on success the update re-execs and never
-// returns (the next daemon start clears the leftover).
-func (d *Daemon) downloadAndExtract() (string, error) {
+// returns (the next daemon start clears the leftover). A manifest that
+// does not verify — or a tarball that does not hash to the manifest —
+// refuses the update: the daemon keeps running its current build.
+func (d *Daemon) downloadAndExtract(version string) (string, error) {
 	staging := d.updateStagingDir()
 	if err := os.RemoveAll(staging); err != nil {
 		return "", fmt.Errorf("clear staging dir: %w", err)
@@ -305,7 +307,7 @@ func (d *Daemon) downloadAndExtract() (string, error) {
 	}
 	cleanup := func() { _ = os.RemoveAll(staging) }
 	tarPath := filepath.Join(staging, "release.tar.gz")
-	if err := release.Download(d.ServerURL, tarPath); err != nil {
+	if err := release.DownloadVerified(d.ServerURL, version, tarPath, d.InsecureRemoteHTTP); err != nil {
 		cleanup()
 		return "", fmt.Errorf("download: %w", err)
 	}

@@ -52,6 +52,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/daemon"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
 func workerCmd() *cobra.Command {
@@ -99,6 +100,12 @@ func workerCmd() *cobra.Command {
 			}
 			if cfg.ServerURL == "" {
 				return errors.New("no control plane URL in state; run with --server <url> (or set $PAGNET_SERVER)")
+			}
+			// HTTPS-required-for-non-loopback (client-hardening wave 2):
+			// check before the --user-token validation (bearerMe) speaks
+			// HTTP to the control plane. daemon.New re-checks it too.
+			if err := netpolicy.Check(cfg.ServerURL, insecureRemoteHTTP); err != nil {
+				return err
 			}
 			// Explicit flags persist to the worker state so the choice
 			// survives re-runs; without either, the stored value and
@@ -163,6 +170,8 @@ func workerCmd() *cobra.Command {
 				// Debug (PAGNET_DEBUG / state-file debug:) registers the
 				// deterministic fake runtime for local dev/demo.
 				Debug: cfg.Debug,
+				// --insecure-remote-http (dev-only plain-HTTP opt-in).
+				InsecureRemoteHTTP: insecureRemoteHTTP,
 			}, log)
 			if err != nil {
 				return err

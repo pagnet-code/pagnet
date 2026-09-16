@@ -124,6 +124,9 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		// The --no-auto-update flag ANDs with PAGNET_AUTO_UPDATE / the
 		// state file's autoUpdate: field (opt-out; default on, P6).
 		AutoUpdate: cfg.AutoUpdate && !daemonNoAutoUpdate,
+		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
+		// non-loopback control plane / release URL).
+		InsecureRemoteHTTP: insecureRemoteHTTP,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("init daemon: %w", err)

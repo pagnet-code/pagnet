@@ -88,6 +88,25 @@ client.
 
 Representatives keep the text proxy (input → turn → turn output).
 
+## Security model
+
+The network trust boundary is the control-plane connection: hosts connect
+outbound over HTTPS/WSS, and the client refuses plain HTTP for any
+non-loopback control-plane or release URL (loopback `http://` stays allowed
+for the dev stack; opt in elsewhere with `PAGNET_INSECURE_REMOTE_HTTP=1` or
+`--insecure-remote-http`). Auto-updates install only a release whose
+manifest is signed by a pinned key and whose tarball hashes to that
+manifest.
+
+The local trust boundary is the OS user, not a local authentication
+mechanism. The daemon's Unix socket, state directory, and keyring are
+protected by file permissions (0700 / 0600) only: a process running as the
+**same UID** can read the keyring (the stored user token) and drive the
+daemon socket, and the daemon does not authenticate same-UID peers — that
+is the standard Unix-socket trust model. Run pagnet as a dedicated user if
+other local users or processes must not be able to read its credentials or
+issue commands to it.
+
 ## Repository layout
 
 This repository is the open-source **client**: everything that runs on your

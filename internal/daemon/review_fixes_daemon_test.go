@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -56,26 +57,29 @@ func waitUntil(t *testing.T, what string, timeout time.Duration, cond func() boo
 // set without re-execution.
 func TestEnqueueCommand_ResendDedup(t *testing.T) {
 	d := newTestDaemon(t)
-	ran := 0
+	// ran is written by the job's goroutine and read by this test goroutine:
+	// it must be atomic (a plain int here is a data race the -race detector
+	// catches under load).
+	var ran int32
 	// Production job shape: the enqueued job wraps the handler in guarded
 	// (claim already taken by enqueueCommand; guarded does the ack + the
 	// persistent MarkProcessed on success).
 	job := func() {
-		d.guarded(nil, "cmd-1", func() error { ran++; return nil })
+		d.guarded(nil, "cmd-1", func() error { atomic.AddInt32(&ran, 1); return nil })
 	}
 	d.enqueueCommand(nil, "inst-1", "cmd-1", job)
 	// Duplicate while the original is queued/in flight: dropped.
 	d.enqueueCommand(nil, "inst-1", "cmd-1", job)
-	waitUntil(t, "first run", 2*time.Second, func() bool { return ran == 1 })
+	waitUntil(t, "first run", 2*time.Second, func() bool { return atomic.LoadInt32(&ran) == 1 })
 	time.Sleep(50 * time.Millisecond) // let any stray duplicate run
-	if ran != 1 {
-		t.Fatalf("command ran %d times, want exactly 1", ran)
+	if got := atomic.LoadInt32(&ran); got != 1 {
+		t.Fatalf("command ran %d times, want exactly 1", got)
 	}
 	// After the clean run (MarkProcessed): acked, still not re-run.
 	d.enqueueCommand(nil, "inst-1", "cmd-1", job)
 	time.Sleep(100 * time.Millisecond)
-	if ran != 1 {
-		t.Fatalf("processed command re-ran: %d", ran)
+	if got := atomic.LoadInt32(&ran); got != 1 {
+		t.Fatalf("processed command re-ran: %d", got)
 	}
 }
 
