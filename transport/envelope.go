@@ -182,6 +182,36 @@ const (
 	// customer-side to read history; the control plane only records the new
 	// epoch id.
 	MsgCryptoRotate = "host.crypto_rotate"
+
+	// Browser key-session commands (plan §13, p10). These are the
+	// request/response crypto operations a browser (or any non-daemon
+	// client) performs against an active private network. Like the
+	// lifecycle commands above they are DURABLE + idempotent (commandId)
+	// and network-scoped, and the control plane is an OPAQUE RELAY: it
+	// dispatches the command to a selected key host and relays the ack's
+	// result byte-for-byte. The daemon runs the customer-side cryptography
+	// (HPKE base-mode ephemeral-static over the network keyring); the
+	// control plane never sees plaintext or a CEK.
+	//
+	// MsgCryptoSessionStart: the daemon records an in-memory browser
+	// session (authorization record) and reports its static X25519 public
+	// key (the wrap target for browser-originated writes).
+	MsgCryptoSessionStart = "host.crypto_session_start"
+	// MsgCryptoUnwrapCek: the daemon unwraps each object's CEK with the
+	// customer-side network epoch key and re-wraps it under the browser's
+	// session ephemeral-static X25519 public key (HPKE base, fresh sender
+	// ephemeral per object). The browser decrypts the CEK and then the
+	// object payload with its own AAD.
+	MsgCryptoUnwrapCek = "host.crypto_unwrap_cek"
+	// MsgCryptoWrapCek: the daemon unwraps the browser's HPKE-wrapped CEK
+	// with its static X25519 private key and wraps it under the CURRENT
+	// network epoch (the p8 keyring format). The browser fills the
+	// EncryptedPayloadV1 envelope and submits it through the normal
+	// protected-field write path (authorization is enforced THERE).
+	MsgCryptoWrapCek = "host.crypto_wrap_cek"
+	// MsgCryptoSessionEnd: explicit session teardown (optional — the TTL
+	// covers it). Idempotent (an unknown session is a clean no-op ack).
+	MsgCryptoSessionEnd = "host.crypto_session_end"
 )
 
 // Message types: host -> control plane (events).
@@ -777,4 +807,147 @@ type CryptoProveResult struct {
 // newly minted epoch.
 type CryptoRotateResult struct {
 	EpochID string `json:"epochId"`
+}
+
+// --- browser key-session commands (plan §13, p10) ----------------------------
+//
+// These are the request/response crypto operations a browser performs against
+// an active private network. The control plane is an OPAQUE RELAY: it
+// dispatches the command to a selected key host and relays the ack's result
+// byte-for-byte. The daemon runs the customer-side cryptography (HPKE
+// base-mode ephemeral-static over the network keyring); the control plane
+// never sees plaintext or a CEK. Every payload carries CommandID
+// (idempotency), NetworkID (the target), and TenantID (routing metadata the
+// daemon binds into its local checks — the daemon does not otherwise know the
+// tenant id).
+//
+// The "session" is an AUTHORIZATION RECORD, not a channel: the daemon holds
+// an in-memory {sessionId, userId, networkId, browserPub, createdAt,
+// expiresAt} (TTL 15 min, refreshed on use). A daemon restart drops it (the
+// same no-durability posture as the NKA challenge store); a stale sessionId
+// then fails clean with the stable code `crypto_session_gone`.
+
+// CryptoSessionStartPayload asks the selected key host to record a browser
+// session for (userId, networkId) and report its static X25519 public key.
+// BrowserPub is the browser's session ephemeral-static X25519 public key
+// (base64) — the unwrap target. It is public metadata, not a secret.
+type CryptoSessionStartPayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	// SessionID is the server-minted session id (the daemon stores the
+	// record under it; the browser reuses it on every operation).
+	SessionID string `json:"sessionId"`
+	// UserID is the server-attested acting user (routing metadata; the
+	// daemon binds it into the session record for the single-flight
+	// per-user+network replacement rule).
+	UserID string `json:"userId"`
+	// BrowserPub is the browser's session ephemeral-static X25519 public
+	// key (base64, 32 bytes).
+	BrowserPub string `json:"browserPub"`
+}
+
+// CryptoSessionStartResult is the ack result of host.crypto_session_start:
+// the host's static X25519 public key (base64) — the wrap target for
+// browser-originated CEK wraps — plus the network's current key epoch id.
+// Public metadata only. The browser needs EpochID to build the write-path
+// AAD (the AAD binds key_epoch_id, which the browser cannot know otherwise);
+// it encrypts under that epoch and the daemon re-wraps the CEK under the same
+// one, so the envelope's key_epoch_id matches the AAD.
+type CryptoSessionStartResult struct {
+	// HostX25519 is the host's static HPKE receiver public key (base64).
+	HostX25519 string `json:"hostX25519"`
+	// EpochID is the network's current (announced) key epoch id.
+	EpochID string `json:"epochId"`
+}
+
+// CryptoHPKEWrap is one HPKE base-mode (X25519/HKDF-SHA256/AES-256-GCM)
+// sealed value: the encapsulated (sender ephemeral) key + the ciphertext.
+// Byte fields are base64 in JSON. It is the wire shape for a CEK wrapped to
+// a static X25519 public key in either direction (daemon→browser unwrap,
+// browser→daemon wrap). The control plane relays it opaquely.
+type CryptoHPKEWrap struct {
+	// Enc is the HPKE encapsulated (ephemeral) key (base64).
+	Enc []byte `json:"enc"`
+	// Ciphertext is the HPKE-sealed value (base64).
+	Ciphertext []byte `json:"ciphertext"`
+}
+
+// CryptoUnwrapCekObject is one object in an unwrap batch: its id + the
+// stored envelope (opaque — the daemon reads only key_epoch_id +
+// wrapped_content_key to unwrap the CEK). The control plane resolves the id
+// to the stored envelope and relays it byte-for-byte.
+type CryptoUnwrapCekObject struct {
+	ObjectID string                  `json:"objectId"`
+	Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
+}
+
+// CryptoUnwrapCekPayload asks the key host to unwrap each object's CEK with
+// the customer-side network epoch key and re-wrap it under the session's
+// browser public key. AAD is the AAD the BROWSER will verify against (relayed
+// verbatim; the daemon does not need it to unwrap — the CEK wrap carries no
+// AAD — and it echoes nothing back).
+type CryptoUnwrapCekPayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	SessionID string `json:"sessionId"`
+	// AAD is the browser's AAD (relayed verbatim; not used by the unwrap).
+	AAD e2ee.AAD `json:"aad"`
+	// Objects is the batch (≤ 100), each with its stored envelope.
+	Objects []CryptoUnwrapCekObject `json:"objects"`
+}
+
+// CryptoUnwrapCekResultItem is one object's unwrap outcome: either the
+// HPKE-wrapped CEK (WrappedCek) or a stable per-object error code (Error).
+// The error is a STABLE CODE ONLY (e.g. `epoch_unknown`) — never key
+// material, keyring paths, or host internals.
+type CryptoUnwrapCekResultItem struct {
+	ObjectID   string          `json:"objectId"`
+	WrappedCek *CryptoHPKEWrap `json:"wrappedCek,omitempty"`
+	Error      string          `json:"error,omitempty"`
+}
+
+// CryptoUnwrapCekResult is the ack result of host.crypto_unwrap_cek: one
+// item per requested object (per-object errors do not fail the batch).
+type CryptoUnwrapCekResult struct {
+	Results []CryptoUnwrapCekResultItem `json:"results"`
+}
+
+// CryptoWrapCekPayload asks the key host to unwrap the browser's HPKE-wrapped
+// CEK (sealed to the host's static X25519 public key) and re-wrap it under
+// the CURRENT network epoch. ObjectType/ObjectID are routing metadata for the
+// browser's AAD (the daemon does not bind them — the browser does).
+type CryptoWrapCekPayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	SessionID string `json:"sessionId"`
+	// AAD is the browser's AAD (relayed verbatim; not used by the wrap).
+	AAD        e2ee.AAD `json:"aad"`
+	ObjectType string   `json:"objectType"`
+	ObjectID   string   `json:"objectId"`
+	// WrappedCek is the browser's HPKE wrap of the fresh CEK (sealed to the
+	// host's static public key from the session-start ack).
+	WrappedCek CryptoHPKEWrap `json:"wrappedCek"`
+}
+
+// CryptoWrapCekResult is the ack result of host.crypto_wrap_cek: the current
+// epoch id + the CEK wrapped under it (the p8 keyring format
+// nonce||GCM(cek, epochKey), base64). The browser fills the
+// EncryptedPayloadV1 envelope with these and submits it through the normal
+// protected-field write path.
+type CryptoWrapCekResult struct {
+	KeyEpochID        string `json:"keyEpochId"`
+	WrappedContentKey string `json:"wrappedContentKey"`
+}
+
+// CryptoSessionEndPayload asks the key host to drop the browser session
+// (explicit teardown). Idempotent: an unknown or already-expired session is
+// a clean no-op ack.
+type CryptoSessionEndPayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	SessionID string `json:"sessionId"`
 }

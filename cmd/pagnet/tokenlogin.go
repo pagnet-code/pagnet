@@ -87,26 +87,19 @@ func parsePagnetTokenFormat(s string) (string, error) {
 }
 
 // checkTokenShape validates the "<lookup-id>_<secret>" tail of a pgn_ token
-// (governance §7-8). The lookup id is the first base64url segment (it
-// contains no authority and no "_" — base64url "_" is confined to the
-// secret side by the server's fixed-length parser); the secret is the rest.
-// The exact lengths are the server's central-parser decision, so the client
-// enforces only the conservative floor: non-empty base64url segments and a
-// secret of at least 256 bits of base64url material (43 characters) —
-// governance invariant 3.
+// (governance §7-8). POSITIONAL, exactly like the server's central parser
+// (pagnet-server internal/credentials) and the web's local check
+// (packages/auth token-format): a 12-byte lookup id encodes to 16 base64url
+// chars, then "_", then a 32-byte secret = 43 chars. base64url itself
+// contains "_", so splitting on the first "_" would misparse valid tokens
+// whose lookup id contains "_" — the lengths are fixed by the version
+// carried in the prefix (governance §7-8, invariant 3).
 func checkTokenShape(rest string) error {
-	lookup, secret, ok := strings.Cut(rest, "_")
-	if !ok || lookup == "" || secret == "" {
-		return errors.New("expected the <lookup-id>_<secret> shape")
+	if len(rest) != 16+1+43 || rest[16] != '_' {
+		return errors.New("expected a 16-char lookup id, \"_\", and a 43-char secret (base64url)")
 	}
-	if !isBase64URL(lookup) || !isBase64URL(secret) {
+	if !isBase64URL(rest[:16]) || !isBase64URL(rest[17:]) {
 		return errors.New("expected base64url characters (A-Za-z0-9-_)")
-	}
-	if len(lookup) < 8 {
-		return errors.New("lookup id too short")
-	}
-	if len(secret) < 43 {
-		return errors.New("token secret too short (expected at least 256 bits)")
 	}
 	return nil
 }

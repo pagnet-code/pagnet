@@ -34,6 +34,10 @@ type cryptoManager struct {
 	// and under which epoch (epochId). Re-pushed on every (re)connect and on
 	// state changes, so it is always current while the daemon is connected.
 	netCrypto map[string]NetworkCryptoState
+	// sessions is the in-memory browser key-session store (plan §13, p10).
+	// It is per-daemon (not per-network) and NOT durable: a daemon restart
+	// drops every session (a reused sessionId is a clean 410).
+	sessions *sessionStore
 }
 
 // NetworkCryptoState is the daemon's cached view of one network's E2EE
@@ -54,6 +58,7 @@ func (d *Daemon) cryptoManager() *cryptoManager {
 			d:         d,
 			nkas:      map[string]*crypto.NKA{},
 			netCrypto: map[string]NetworkCryptoState{},
+			sessions:  newSessionStore(),
 		}
 	}
 	return d.cryptoMgr

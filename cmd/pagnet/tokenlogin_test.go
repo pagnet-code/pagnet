@@ -142,6 +142,12 @@ func TestParsePagnetTokenFormat(t *testing.T) {
 		{"account missing secret", "pgn_acc_v1_K4T9M7QZaB1c3d5f", "", "malformed Account Token"},
 		{"account short secret", "pgn_acc_v1_K4T9M7QZaB1c3d5f_short", "", "malformed Account Token"},
 		{"access no separator", "pgn_pat_v1_K4T9M7QZaB1c3d5f", "", "malformed Access Token"},
+		// base64url contains "_", so a valid lookup id may carry one — the
+		// positional check must accept it (first-underscore splitting
+		// misparsed these).
+		{"lookup id containing underscore (valid)", "pgn_acc_v1__K4T9M7QZaB1c3d5_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", credentialKindAccount, ""},
+		{"separator not at the fixed position", "pgn_acc_v1_K4T9M7QZaB1c3d5fX_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", "", "malformed Account Token"},
+		{"tail too long", "pgn_acc_v1_K4T9M7QZaB1c3d5f_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGX", "", "malformed Account Token"},
 		{"bad charset", "pgn_acc_v1_K4T9M7QZaB1c3d5f_abcdefghijklmnopqrstuvwxyz0123456789ABCD.EF", "", "base64url"},
 		{"legacy empty secret", "pagt_", "", "malformed legacy API token"},
 	}

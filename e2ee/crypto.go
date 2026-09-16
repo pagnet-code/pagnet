@@ -16,6 +16,11 @@ const (
 	cekSize      = 32
 )
 
+// CEKSize returns the size in bytes of a per-object content-encryption key
+// (256 bits). Exported for the browser key-session path (p10), where the
+// daemon validates the length of a browser-supplied CEK after HPKE unwrap.
+func CEKSize() int { return cekSize }
+
 // Encrypt encrypts plaintext under a fresh per-object CEK, wrapped under the
 // network key-epoch key, producing a versioned envelope.
 //
@@ -104,6 +109,26 @@ func Decrypt(env EncryptedPayloadV1, epochKey [32]byte, aad AAD) ([]byte, error)
 		return nil, fmt.Errorf("e2ee: decode ciphertext: %w", err)
 	}
 	return openPayload(cek, nonce, ct, aad.CanonicalBytes())
+}
+
+// WrapCEK wraps a CEK under the network key-epoch key with a fresh random
+// nonce: nonce(12) || GCM(cek). It is the exported form of wrapCEK used by
+// the daemon's browser key-session write path (p10), where the daemon
+// re-wraps a browser-supplied CEK under the CURRENT epoch.
+func WrapCEK(epochKey, cek [32]byte) ([]byte, error) {
+	var nonce [gcmNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, fmt.Errorf("e2ee: read wrap nonce: %w", err)
+	}
+	return wrapCEK(epochKey, cek, nonce)
+}
+
+// UnwrapCEK unwraps a CEK wrapped by WrapCEK (nonce(12) || GCM(cek)) under
+// the network key-epoch key. It is the exported form of unwrapCEK used by
+// the daemon's browser key-session read path (p10), where the daemon opens
+// each stored object's CEK before re-wrapping it to the browser.
+func UnwrapCEK(epochKey [32]byte, wrapped []byte) ([32]byte, error) {
+	return unwrapCEK(epochKey, wrapped)
 }
 
 // wrapCEK wraps a CEK under the epoch key: nonce(12) || GCM(cek). No

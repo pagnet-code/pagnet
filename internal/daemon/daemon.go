@@ -1369,6 +1369,52 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoRotate(p) })
 		})
 
+	// Browser key-session commands (plan §13, p10). Same durable + idempotent,
+	// network-scoped, per-network-queue posture as the other crypto commands
+	// (the WSS read loop only enqueues — it never blocks on local
+	// cryptography). The ack carries the result in the ack's `result` field
+	// (guardedResult); a gone session acks the crypto_session_gone sentinel
+	// (the control plane maps it to 410).
+	case transport.MsgCryptoSessionStart:
+		var p transport.CryptoSessionStartPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoSessionStart(p) })
+		})
+
+	case transport.MsgCryptoUnwrapCek:
+		var p transport.CryptoUnwrapCekPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoUnwrapCek(p) })
+		})
+
+	case transport.MsgCryptoWrapCek:
+		var p transport.CryptoWrapCekPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoWrapCek(p) })
+		})
+
+	case transport.MsgCryptoSessionEnd:
+		var p transport.CryptoSessionEndPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoSessionEnd(p) })
+		})
+
 	default:
 		d.Log.Warn("unknown command type", "type", env.Type)
 	}
