@@ -2,142 +2,82 @@
 
 > **Working name** — the product is intentionally named generically. Branding is isolated so it can be renamed.
 
-pagnet is a control plane and communication network for AI coding agents. It lets agents built on different runtimes (Claude Code, Qwen Code, OpenCode, future generic CLI agents) run on laptops, local servers, and remote servers while being visible, discoverable, and coordinated through one central server.
+pagnet is an always-on control plane and communication network for AI coding
+agents. Agent runtimes (Claude Code, Qwen Code, OpenCode, future generic CLI
+agents) run on your laptops, local servers, and remote servers — hibernating
+when idle, waking on demand — visible, discoverable, and coordinated through
+one central server. You direct the network through a human-facing
+representative agent. Hosts connect **outbound only** — no inbound ports,
+NAT-friendly.
 
-```text
-                    CENTRAL SERVER
+## Install
 
-          +-----------------------------+
-          |       Control Plane         |
-          |             Go              |
-          |                             |
-          | networks   agents   tasks   |
-          | hosts      resources ...    |
-          +-------------+---------------+
-                        |
-                  PostgreSQL
-                        |
-              HTTPS / WebSocket
-                        |
-           +------------+-------------+
-           |            |             |
-           v            v             v
-        Host A         Host B        Host C
-        pagnet        pagnet       pagnet
-           |            |             |
-       local agents local agents   local agents
-```
-
-Hosts connect **outbound only** — no inbound ports, NAT-friendly.
-
-## Quick start
-
-**1. Install** (on the machine where the agents will run):
+On the machine where the agents will run:
 
 ```bash
 curl -fsSL https://<your-control-plane>/install.sh | bash
 ```
 
 On first run this signs you in (your browser opens — the one manual step),
-connects this host, and starts the local service. On an already-connected
+connects this host, and starts the local service; on an already-connected
 machine it only upgrades the binary and restarts the service (idempotent).
+To remove the service and local state again:
+`curl -fsSL https://<your-control-plane>/uninstall.sh | bash`.
 
-**2. Connect this host** (manual install / reconnect) — signs you in (opens
-your browser on first run) and connects this host:
+## Quick start
 
-```bash
-pagnet enroll --server https://<your-control-plane>
-```
-
-**3. Start the local service** (outbound only — no inbound ports). Restarts
-the service if it is already running (idempotent):
-
-```bash
-pagnet -d
-```
-
-**4. Uninstall** (removes the service and local state):
-
-```bash
-curl -fsSL https://<your-control-plane>/uninstall.sh | bash
-```
-
-Then open the web UI — the host shows as connected, and you can launch agents
-on it (`pagnet run . --runtime <runtime>` inside a Git repository, or from the
-console). `pagnet serve` runs the same service in the foreground (containers,
-supervisors); `pagnet login` signs in explicitly; `pagnet doctor` diagnoses
-the local setup.
-
-## Terminal (interactive attach)
-
-Workers have a live terminal: the runtime's **own interactive CLI**
-(`qwen` / `claude` / the fake's demo UI) running under a PTY on the host,
-proxied through the control plane — the host is never exposed to the
-client.
-
-- **Web** — `/agents` → pick an agent → `terminal` tab: it **attaches
-  automatically**. The PTY starts on attach (resuming the stored runtime
-  session) and **keeps running while you are away**: Detach is
-  observational, Stop kills the process (both in the ⋯ menu). Scrollback
-  is bounded (256 KiB); re-attaching replays the current screen, and a
-  dropped connection shows a "Connection lost — reconnecting…" banner
-  until the backoff succeeds.
-- **CLI** — `pagnet attach <agent>`: raw terminal (keystrokes, arrow
-  keys, Ctrl+C reach the runtime directly; window resizes are forwarded).
-  **Ctrl-]** detaches (tmux-style) — the PTY keeps running on the host.
-
-Representatives keep the text proxy (input → turn → turn output).
+- **Launch your first agent** — `pagnet run . --runtime <runtime>` inside a
+  Git repository, or from the web console. →
+  [docs.pagnet.dev/getting-started/first-agent](https://docs.pagnet.dev/getting-started/first-agent)
+- **Attach a live terminal** — the runtime's own CLI, proxied through the
+  control plane (web terminal tab or `pagnet attach <agent>`; Ctrl-] detaches
+  and the session keeps running). →
+  [docs.pagnet.dev/getting-started/attach](https://docs.pagnet.dev/getting-started/attach)
+- **Understand hibernation & wake** — idle agents hibernate with resumable
+  runtime sessions and wake on demand. →
+  [docs.pagnet.dev/concepts/hibernation-and-sessions](https://docs.pagnet.dev/concepts/hibernation-and-sessions)
+- **Work through your representative** — human chat that drives the network:
+  grants, channels, conversations. →
+  [docs.pagnet.dev/concepts/representatives](https://docs.pagnet.dev/concepts/representatives)
+- **Deploy the control plane** — Docker Compose on your own server. →
+  [docs.pagnet.dev/deployment/docker](https://docs.pagnet.dev/deployment/docker)
+- **Let agents use the network** — MCP bridges spawned by the local daemon. →
+  [docs.pagnet.dev/mcp/overview](https://docs.pagnet.dev/mcp/overview)
 
 ## Security model
 
-The network trust boundary is the control-plane connection: hosts connect
-outbound over HTTPS/WSS, and the client refuses plain HTTP for any
-non-loopback control-plane or release URL (loopback `http://` stays allowed
-for the dev stack; opt in elsewhere with `PAGNET_INSECURE_REMOTE_HTTP=1` or
-`--insecure-remote-http`). Auto-updates install only a release whose
-manifest is signed by a pinned key and whose tarball hashes to that
-manifest.
+- **The network trust boundary is the control-plane connection.** Hosts
+  connect outbound over HTTPS/WSS, and the client fails closed: plain HTTP
+  to any non-loopback control-plane or release URL is refused (loopback
+  `http://` stays allowed for the dev stack; explicit opt-out with
+  `PAGNET_INSECURE_REMOTE_HTTP=1` or `--insecure-remote-http`).
+- **Signed releases.** Auto-update installs only a release whose
+  canonical-JSON manifest is Ed25519-signed under the pinned key
+  `pagnet-2026-09` (pinned in the binary, not fetched) and whose tarball
+  hashes to that manifest; unsigned manifests are refused.
+- **Process containment.** Turn processes run in their own process group and
+  are reconciled by durable ownership records on daemon restart, with a
+  Linux `Pdeathsig` backstop on the direct child.
+- **The local trust boundary is the OS user.** The daemon's Unix socket,
+  state directory, and keyring are protected by file permissions
+  (0700 / 0600) only, and the daemon does not authenticate same-UID peers —
+  run pagnet as a dedicated user if other local processes must not read its
+  credentials or drive it.
 
-The local trust boundary is the OS user, not a local authentication
-mechanism. The daemon's Unix socket, state directory, and keyring are
-protected by file permissions (0700 / 0600) only: a process running as the
-**same UID** can read the keyring (the stored user token) and drive the
-daemon socket, and the daemon does not authenticate same-UID peers — that
-is the standard Unix-socket trust model. Run pagnet as a dedicated user if
-other local users or processes must not be able to read its credentials or
-issue commands to it.
-
-## Repository layout
+## This repository
 
 This repository is the open-source **client**: everything that runs on your
-machines plus the wire/domain contracts they share with the control plane.
+machines plus the wire/domain contracts they share with the control plane —
+the `pagnet` binary (CLI, local service, MCP bridges), `domain/`,
+`transport/`, and `internal/`. The control plane (**pagnet-server**, Go +
+PostgreSQL), the web control panel (**pagnet-web**), and the Docker Compose
+deployment + cross-repo E2E suite (**pagnet-monorepo**) live in sibling
+repositories.
 
-| Path | What |
-|------|------|
-| `cmd/pagnet` | The one production binary: CLI (login, enroll, run, agents, tasks, attach, ...), local service (`pagnet serve` / `pagnet -d`), and the MCP bridges (`pagnet mcp worker\|control`, spawned by the daemon) |
-| `cmd/pagnet-fake-runtime` | Deterministic fake runtime (test/dev infrastructure, not shipped) |
-| `domain/` | Domain model shared with the control plane |
-| `transport/` | Wire protocol (WSS envelopes) shared with the control plane |
-| `internal/` | Client packages (daemon, runtime adapters, MCP bridges, config, release updater) |
+## Documentation
 
-The rest of the product lives in sibling repositories:
-
-- **pagnet-server** — the control plane (Go + PostgreSQL)
-- **pagnet-web** — the Next.js control panel
-- **pagnet-monorepo** — Docker Compose deployment + cross-repo E2E suite
-
-## Development
-
-```bash
-make test      # go test ./...          (or `make test-race` for -race)
-make build     # build the Go binaries into bin/
-make install   # go-install pagnet into GOPATH/bin
-make demo      # build + seed a demo network with fake agents and traffic
-make release   # one-binary tarballs for all targets into dist/
-```
-
-Run the CLI against any control plane (hosted or self-hosted) with
-`pagnet login` — see the deployment docs in the pagnet-monorepo repository.
+- Docs: [docs.pagnet.dev](https://docs.pagnet.dev)
+- Site: [pagnet.dev](https://pagnet.dev)
 
 ## License
 
