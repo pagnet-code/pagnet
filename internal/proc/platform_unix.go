@@ -36,13 +36,51 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// childDeathSignal is set on platforms that support a parent-death
+// signal to the DIRECT child (Linux PDEATHSIG). Scope, stated precisely:
+//
+//   - it protects the DIRECT runtime child only — if the daemon dies
+//     (crash/kill), the kernel SIGKILLs that one process immediately,
+//     which additionally reduces the unrecorded direct-child crash
+//     window on Linux (a child started but not yet durably recorded dies
+//     with the daemon instead of surviving unowned);
+//   - it is NOT a whole-tree kernel kill: descendants are reparented to
+//     init (MCP stdio bridges exit when their pipes close; PTY trees
+//     additionally get SIGHUP via session-leader death + master close);
+//   - it is NOT a replacement for process-group cleanup or restart
+//     reconciliation — the durable ownership record + Reconcile remain
+//     the PRIMARY orphan-recovery mechanism.
+//
+// Residual window (honest statement): between cmd.Start() and the
+// durable record commit, a descendant may already exist; if the daemon
+// dies in that interval, such a descendant can survive without any
+// ownership proof and cannot be safely identified (never kill on a bare
+// PID or name, §56). That residual is accepted; PDEATHSIG only shrinks
+// the direct-child part of it on Linux.
+//
+// The signal itself is applied by applyChildDeathSignal: the Pdeathsig
+// field exists only in the linux syscall package, so the assignment
+// cannot live in this shared file — the platform file's init sets both
+// the flag and the applier together.
+var childDeathSignal = false
+
+// applyChildDeathSignal applies the platform parent-death signal to a
+// child's SysProcAttr. nil on platforms without the feature.
+var applyChildDeathSignal func(*syscall.SysProcAttr)
+
 // GroupAttrs returns the SysProcAttr that puts the child in its OWN
 // process group (child pgid == child pid). Turns use this: descendants
 // inherit the group, so the whole tree is one signalable unit. The
 // child stays in pagnet's session — it has no controlling terminal
-// (turn I/O is pipes), which is exactly the isolation we want.
+// (turn I/O is pipes), which is exactly the isolation we want. On
+// platforms with childDeathSignal, the direct child additionally gets
+// the kernel parent-death guarantee (see the seam above).
 func GroupAttrs() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setpgid: true}
+	a := &syscall.SysProcAttr{Setpgid: true}
+	if childDeathSignal && applyChildDeathSignal != nil {
+		applyChildDeathSignal(a)
+	}
+	return a
 }
 
 // SessionAttrs returns the SysProcAttr for a PTY session: the child
@@ -51,8 +89,14 @@ func GroupAttrs() *syscall.SysProcAttr {
 // is what creack/pty's StartWithSize has always set (Setsid+Setctty);
 // the supervisor now sets it explicitly so the PTY lifecycle is owned in
 // one place and the group-kill math (pgid == leader pid) is documented.
+// On platforms with childDeathSignal, the session leader additionally
+// gets the kernel parent-death guarantee (see the seam above).
 func SessionAttrs() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	a := &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	if childDeathSignal && applyChildDeathSignal != nil {
+		applyChildDeathSignal(a)
+	}
+	return a
 }
 
 // SignalGroup sends sig to the whole process group pgid via the OS kill

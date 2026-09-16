@@ -259,7 +259,24 @@ func (d *Daemon) performAutoUpdate(latest string) {
 		execPath = newBin
 	}
 	d.Log.Info("auto-updating to " + latest + " (idle)")
-	if err := syscall.Exec(execPath, os.Args, os.Environ()); err != nil {
+	// Carry the serve lock across the re-exec: the flock is held by the
+	// open file description, and Go opens every file with O_CLOEXEC —
+	// at exec the lock fd would be closed and the lock silently
+	// released, opening a window in which a second `pagnet serve` can
+	// take over the state dir before the new image re-acquires it.
+	// Clearing CLOEXEC + passing the fd lets the new image adopt the
+	// SAME lock (acquireServeLock); the lock is never released.
+	execEnv := os.Environ()
+	if envVar, err := d.serveLockExecEnv(); err != nil {
+		// Never re-exec without the lock carried: that would recreate
+		// the release window. Fail the attempt (1h backoff) and keep
+		// running the current build.
+		d.Log.Error("auto-update failed: "+err.Error()+"; backing off 1h", "latest", latest)
+		return
+	} else if envVar != "" {
+		execEnv = append(execEnv, envVar)
+	}
+	if err := syscall.Exec(execPath, os.Args, execEnv); err != nil {
 		// Exec only fails on a broken binary/OS error: log + back off,
 		// the daemon keeps running its current build.
 		d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)

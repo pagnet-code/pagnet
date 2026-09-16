@@ -543,7 +543,28 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		"runtime", req.Runtime, "class", req.Class,
 		"pid", t.pid.Load(), "pgid", t.pgid.Load())
 
-	_ = s.writeRecord(t)
+	// The durable ownership record + restart reconciliation are the
+	// PRIMARY orphan-recovery mechanism (§39): the record is the ONLY
+	// cross-restart memory of this tree, and a daemon crash between
+	// Start and a durable record would leave a live tree that Reconcile
+	// can never prove ours — and therefore can never reclaim. (The
+	// Linux PDEATHSIG backstop only shrinks the direct-child part of
+	// this window; it is not what makes this safe.) Fail closed:
+	// terminate the tree we just started rather than run a process we
+	// cannot own.
+	if err := s.writeRecord(t); err != nil {
+		s.log.Error("ownership record write failed; failing launch (unrecorded process = unowned process)",
+			"instance", key.InstanceID, "turn", key.TurnID, "err", err)
+		t.Terminate("ownership_record_failed")
+		// No other goroutine holds this handle yet: Launch is the owner
+		// on this path, and the reap (ownerWait → finish → cleanup)
+		// unregisters the turn and releases the slot exactly once. The
+		// fail() helper must NOT also run — it would release the slot a
+		// second time (stealing another turn's semaphore token).
+		t.ownerWait()
+		s.launchFailedTotal.Add(1)
+		return nil, fmt.Errorf("ownership record: %w", err)
+	}
 
 	// Context watcher: cancellation terminates the GROUP (not just the
 	// direct child). The owner goroutine (the adapter's turn loop / the
