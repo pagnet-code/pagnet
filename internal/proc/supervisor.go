@@ -734,31 +734,47 @@ type managedTurn struct {
 // process tree — a runtime that exits cleanly can still leave descendants
 // behind (MCP bridges, shells, helpers), and those are the leak.
 //
-// The reclaim runs BEFORE the reap, anchored on the unreaped direct child:
-// the child is the group leader (pgid == its pid), and while it is still
-// unreaped (alive or zombie) no other process can hold this pgid — a new
-// process becomes a group leader with pgid == its pid only once that pid
-// is free, and the pid is free only after the reap. A post-reap group
-// check could therefore observe a NEW turn that reused the freed pid and
-// SIGTERM its group (the E2E82 hibernate/wake P0: a rep hibernates, a new
-// turn launches milliseconds later, and the previous turn's termination
-// lands on the new turn's still-starting process).
+// The reclaim is anchored against the PID-reuse race by one check on each
+// side of the reap (E2E82 hibernate/wake P0: a rep hibernates, a new turn
+// launches milliseconds later, and the previous turn's termination lands
+// on the new turn's still-starting process):
 //
-// The check is zombie-aware (GroupHasLiveMember, not the signal-0
-// GroupAlive): the dying/zombie child is a group member but is already
-// dead, so a clean completion with no survivors skips the termination
-// entirely and returns immediately (no grace wait).
+//  1. Pre-reap: the direct child is the group leader (pgid == its pid),
+//     and while it is UNREAPED no other process can hold this pgid — a
+//     process becomes a group leader with pgid == its pid only once that
+//     pid is free, and the pid is free only after the reap. So while the
+//     child is unreaped, any live group member is this turn's own
+//     descendant. The check fires ONLY when the child has already EXITED
+//     (zombie, ProcessIsZombie): if the child is still alive, the group
+//     is the RUNNING turn itself — an owner may legitimately Wait on a
+//     live turn, and the Wait must block, not terminate it. Firing here
+//     on a live child would kill the running turn (the 2026-09-16
+//     TestProcessExplosion regression: an early Wait killed the
+//     just-launched group before the monitor's explosion tick).
+//  2. Post-reap: the child's pid is now released, so the pgid is no
+//     longer anchored — a new turn may have already reused it. Live
+//     survivors (possible when the child exited DURING an early Wait,
+//     after check 1 skipped it because the child was alive) are
+//     reclaimed only when no process currently holds the pgid number: a
+//     group with that pgid must be led by a process with exactly that
+//     pid, so an unheld number proves the survivors are this turn's own
+//     descendants. A held number means the pid was reused by an
+//     unrelated new turn — NEVER kill it (the E2E82 danger case).
+//
+// Both checks are zombie-aware (GroupHasLiveMember, not the signal-0
+// GroupAlive): a zombie is dead and cannot be signaled into dying, so a
+// clean completion with no survivors skips the termination entirely and
+// returns immediately (no grace wait).
 //
 // Edge cases:
 //   - Handle.Close / launch-failure paths: abort()/Terminate() has
-//     signaled the group but the child may still be ALIVE (not yet a
-//     zombie) at the pre-reap check. That is safe: the group is this
-//     turn's own (the child is unreaped), terminateGroup on an
-//     already-dying group is harmless, and its poll waits for the KILL
-//     to land.
-//   - Normal path: ownerWait is called only after all stdout reads are
-//     done, so the child has already exited (zombie) and the check sees
-//     only true descendants.
+//     signaled the group but the child may still be ALIVE at the pre-reap
+//     check. Check 1 then skips; the child dies from the in-flight group
+//     signal, cmd.Wait reaps it, and check 2 reclaims anything that
+//     still survives.
+//   - Normal path: the owner reaps after all stdout reads are done, so
+//     the child has already exited (zombie) and check 1 sees only true
+//     descendants.
 //
 // Idempotent: only the first caller reaps; the rest observe the exit.
 func (t *managedTurn) ownerWait() (Exit, error) {
@@ -766,14 +782,26 @@ func (t *managedTurn) ownerWait() (Exit, error) {
 		t.waitForExit()
 		return t.exit(), nil
 	}
-	// Pre-reap descendant reclaim, anchored on the unreaped direct child
-	// (see the doc above for why pre-reap and why zombie-aware).
-	if pgid := int(t.pgid.Load()); pgid > 0 && GroupHasLiveMember(pgid) {
+	pid := int(t.pid.Load())
+	pgid := int(t.pgid.Load())
+	// Pre-reap descendant reclaim (anchored on the unreaped child; only
+	// when the child has already exited — a live child means a running
+	// turn, and this Wait must block, not terminate it).
+	if pgid > 0 && ProcessIsZombie(pid) && GroupHasLiveMember(pgid) {
 		t.s.log.Warn("reclaiming descendants that outlived the turn",
 			"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
 		t.terminateGroup()
 	}
 	waitErr := t.cmd.Wait()
+	// Post-reap descendant reclaim (early-Wait case: the child exited
+	// during the Wait above). Fire only when the pgid number is unheld —
+	// a held number is a pid reused by an unrelated new turn (E2E82):
+	// never kill.
+	if pgid > 0 && !ProcessAlive(pgid) && GroupHasLiveMember(pgid) {
+		t.s.log.Warn("reclaiming descendants that outlived the turn (post-reap)",
+			"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
+		t.terminateGroup()
+	}
 	return t.finish(waitErr), nil
 }
 

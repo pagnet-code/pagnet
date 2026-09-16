@@ -11,26 +11,38 @@
 // hibernates, a new turn launches milliseconds later, and the previous
 // turn's kill hits the new turn).
 //
-// The fix anchors the reclaim on the UNREAPED direct child (the group
-// leader, pgid == its pid): while the child is unreaped, no other
-// process can hold this pgid, so the pre-reap group check can only ever
-// see this turn's own members. These tests pin the two properties the
-// fix must preserve:
+// The fix anchors the reclaim on each side of the reap:
+//
+//   - PRE-reap: the reclaim is gated on the direct child having already
+//     exited (zombie). While the child is unreaped it still holds its
+//     pid, so no other process can hold this pgid — the group is this
+//     turn's own. A LIVE child means the group is the running turn
+//     itself, and the reclaim must not fire.
+//   - POST-reap: the pid is released, so the reclaim fires only when no
+//     process currently holds the pgid number (a held number is a pid
+//     reused by an unrelated new turn — never kill it).
+//
+// These tests pin the three properties the fix must preserve:
 //
 //	(a) the §19/§24 descendant reclaim still works — a turn whose child
 //	    exits but leaves a live descendant in the same pgid has that
 //	    descendant reclaimed, and the turn still exits normally;
 //	(b) the anchoring invariant — after Wait returns, the group has no
 //	    LIVE members, so nothing from the old turn survives to be
-//	    confused with a new turn that reuses the pid.
+//	    confused with a new turn that reuses the pid;
+//	(c) the early-Wait contract — an owner that calls Wait while the
+//	    turn is still running must block, not terminate: the pre-reap
+//	    check must not fire on a live child (the 2026-09-16 first cut of
+//	    the pre-reap reclaim killed the just-launched group, and
+//	    TestProcessExplosion lost its monitor explosion tick).
 //
 // The pid-reuse sequence itself (a new turn reusing the freed pid) is
 // NOT deterministically reproducible in-package: the kernel assigns pids
 // and reuse cannot be forced. The fix closes that race by construction
-// (the reclaim is pre-reap, so it is anchored on the unreaped child),
-// and the load-sensitive E2E82 suite is the end-to-end evidence. These
-// tests therefore do NOT attempt to fake pid reuse; they assert the
-// anchoring invariant directly.
+// (pre-reap: anchored on the unreaped child; post-reap: gated on the
+// pgid number being unheld), and the load-sensitive E2E82 suite is the
+// end-to-end evidence. These tests therefore do NOT attempt to fake pid
+// reuse; they assert the anchoring invariants directly.
 package proc
 
 import (
@@ -132,5 +144,45 @@ func TestOwnerWaitAnchoringInvariant(t *testing.T) {
 	}
 	if GroupHasLiveMember(pid) {
 		t.Fatalf("group %d has live members after Wait (anchoring invariant violated)", pid)
+	}
+}
+
+// (c) The early-Wait contract: an owner that calls Wait while the turn is
+// still RUNNING must block — the pre-reap reclaim must not fire on a live
+// child (the group is the running turn itself). The turn is terminated
+// only by the explicit Terminate that follows, and Wait returns that
+// exit (not a silent early one).
+func TestOwnerWaitEarlyDoesNotTerminateRunningTurn(t *testing.T) {
+	s := newTestSupervisor(t, Config{MaxActiveTurns: 4, TermGrace: 2 * time.Second,
+		MonitorInterval: time.Hour})
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	h, err := s.Launch(context.Background(), LaunchRequest{
+		InstanceID: "inst-earlywait", TurnID: "t",
+		Runtime: "test", Class: ClassTurn, Cmd: cmd,
+	})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	pid := waitForPID(t, h)
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- h.Wait() }()
+	// Give the early Wait (and its pre-reap check) time to run. If the
+	// check fires on the live child, the group is terminated and loses
+	// its live members long before this assertion.
+	time.Sleep(300 * time.Millisecond)
+	if !GroupHasLiveMember(pid) {
+		t.Fatalf("early Wait terminated the running turn (group %d has no live members)", pid)
+	}
+	select {
+	case err := <-waitErr:
+		t.Fatalf("Wait returned before the turn was stopped: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Only the explicit termination kills the turn; Wait then returns the
+	// signal exit (the group was TERMed, not a clean exit 0).
+	h.Terminate("test-stop")
+	waitGroupNoLiveMembers(t, pid)
+	if err := <-waitErr; err == nil {
+		t.Fatalf("Wait after explicit stop returned nil, want the signal exit")
 	}
 }

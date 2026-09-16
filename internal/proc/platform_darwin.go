@@ -133,6 +133,18 @@ func UserProcessCount() (int, error) {
 	return n, nil
 }
 
+// ProcessIsZombie reports whether pid exists and has already exited
+// (P_stat == SZOMB, KERN_PROC_PID): dead, awaiting reap. See the Linux
+// implementation for the ownership-anchor rationale (managedTurn.
+// ownerWait).
+func ProcessIsZombie(pid int) bool {
+	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return false
+	}
+	return byte(int(kp.Proc.P_stat)&0x1f) == darwinSZombie
+}
+
 // ProcessGroupOf returns the process group id of pid (KERN_PROC_PID,
 // the same kinfo_proc source as StartIdentity).
 func ProcessGroupOf(pid int) (int, error) {

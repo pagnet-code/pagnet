@@ -182,6 +182,23 @@ func UserProcessCount() (int, error) {
 	return n, nil
 }
 
+// ProcessIsZombie reports whether pid exists and has already exited
+// (state 'Z' in /proc/<pid>/stat): dead, awaiting reap. An unreaped
+// zombie still HOLDS its pid, so the process group it led (pgid == pid)
+// remains anchored to it — no other process can hold that pgid until the
+// reap frees the pid. The turn-exit descendant reclaim uses this to
+// distinguish "the child has exited; surviving group members are its
+// descendants" from "the child is still running; the group is the live
+// turn" (managedTurn.ownerWait).
+func ProcessIsZombie(pid int) bool {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return false
+	}
+	st := parseProcStat(pid, b)
+	return st != nil && st.state == 'Z'
+}
+
 // ProcessGroupOf returns the process group id of pid (field 5 of
 // /proc/<pid>/stat). The comm field may contain spaces/parens, so
 // parsing starts after the LAST ')' (parseProcStat).

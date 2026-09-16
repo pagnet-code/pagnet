@@ -52,6 +52,10 @@ func GroupMembers(pgid int) []int { return nil }
 // verifiable, consistent with GroupAlive).
 func GroupHasLiveMember(pgid int) bool { return false }
 
+// ProcessIsZombie is unsupported here (reports false: nothing
+// verifiable, consistent with GroupHasLiveMember).
+func ProcessIsZombie(pid int) bool { return false }
+
 // UserProcessCount is unsupported here.
 func UserProcessCount() (int, error) { return 0, errUnsupported }
 
