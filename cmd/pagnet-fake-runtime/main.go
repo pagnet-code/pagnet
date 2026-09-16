@@ -190,10 +190,22 @@ func main() {
 	// vs keep waiting), not whether the process exits.
 	if kind := os.Getenv("PAGNET_FAKE_INTERACTION"); kind != "" {
 		nativeID := "fake-int-" + short(s.InstanceID)
-		payload, _ := json.Marshal(map[string]any{
-			"version": 1,
-			"prompt":  "fake native question (opaque vendor payload)",
-		})
+		// PAGNET_FAKE_INTERACTION_PAYLOAD overrides the opaque vendor
+		// payload (raw JSON) so e2e can script arbitrary payload shapes;
+		// invalid JSON is a fixture error, not a silent fallback.
+		var payload json.RawMessage
+		if raw := os.Getenv("PAGNET_FAKE_INTERACTION_PAYLOAD"); raw != "" {
+			if !json.Valid([]byte(raw)) {
+				fmt.Fprintf(os.Stderr, "PAGNET_FAKE_INTERACTION_PAYLOAD is not valid JSON: %q\n", raw)
+				os.Exit(2)
+			}
+			payload = json.RawMessage(raw)
+		} else {
+			payload, _ = json.Marshal(map[string]any{
+				"version": 1,
+				"prompt":  "fake native question (opaque vendor payload)",
+			})
+		}
 		summary := os.Getenv("PAGNET_FAKE_INTERACTION_SUMMARY")
 		if summary == "" {
 			summary = "fake " + kind + " (simulated)"
