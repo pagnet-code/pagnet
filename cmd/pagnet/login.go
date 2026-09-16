@@ -1,17 +1,22 @@
 package main
 
 // `pagnet login` — user authentication for REST calls (phase 2 auth
-// architecture). Mode-aware:
+// architecture + AUTH-3 token-first paste login). Mode-aware:
 //
+//   - paste (interactive, local/oidc servers): hidden-input paste of a
+//     Pagnet Token — Account/Access tokens are exchanged once for a
+//     derived client credential (see tokenlogin.go); legacy pagt_
+//     tokens are verified and kept as-is;
 //   - token:  --token <admin token> (validated against /auth/me)
 //   - local:  --username/--password → the server mints a revocable API
 //     token (the CLI never keeps browser session cookies)
 //   - oidc:   RFC 8628 device flow — the CLI shows a user code, the user
 //     authorizes in a browser, and the server issues an API token.
 //
-// The resulting bearer is stored in the state dir's config.yaml (mode 0600,
-// "token" key) and used by every command unless --token or $PAGNET_TOKEN
-// overrides it. Host enrollment lives in `pagnet enroll`.
+// The resulting bearer is stored via the OS keyring when available, else
+// in the state dir's config.yaml (mode 0600, "token" key) and used by
+// every command unless --token or $PAGNET_TOKEN overrides it. Host
+// enrollment lives in `pagnet enroll`.
 
 import (
 	"bytes"
@@ -49,8 +54,21 @@ func loginCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Sign in as a user: store the API token for REST calls (token / local / oidc modes)",
-		Args:  cobra.NoArgs,
+		Short: "Sign in as a user: store the CLI credential (paste a Pagnet Token, or the server's sign-in mode)",
+		Long: `Sign in to the control plane and store the credential every command uses.
+
+Token-first (production) servers: pagnet login prompts for your Pagnet
+Token with echo off — paste an Account Token (pgn_acc_v1_…), an Access
+Token (pgn_pat_v1_…), or a legacy API token (pagt_…). An Account/Access
+Token is exchanged ONCE for a revocable derived client credential: only
+the derived credential is stored (OS keyring, 0600 file fallback), never
+the pasted token itself. Press Enter at the prompt to use the server's
+other sign-in mode instead (browser/OIDC, or username/password).
+
+--token / $PAGNET_TOKEN stay available for scripted use but are the less
+safe path: argv and the environment can leak into shell history, process
+listings, and CI logs.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if stateDir == "" {
 				home, err := os.UserHomeDir()
@@ -112,7 +130,50 @@ func loginCmd() *cobra.Command {
 				}
 				fmt.Println("admin token verified.")
 
-			case "local":
+			case "local", "oidc":
+				// AUTH-3 token-first paste login (governance §17,
+				// token-first §11/§35): the interactive path is the hidden
+				// paste prompt — the token never lands in argv or shell
+				// history. --token / $PAGNET_TOKEN stay the scripted path
+				// (documented as less safe) and skip the prompt. An empty
+				// paste (Enter) falls through to the mode's existing
+				// sign-in flow (browser/OIDC or username/password).
+				pasted := token
+				if pasted == "" {
+					pasted = userToken // $PAGNET_TOKEN (scripted)
+				}
+				if pasted == "" && username == "" && password == "" && hasTTYFn() {
+					if status.Mode == "oidc" {
+						fmt.Fprintln(os.Stderr, "Paste your Pagnet Token, or press Enter to sign in through your browser.")
+					} else {
+						fmt.Fprintln(os.Stderr, "Paste your Pagnet Token, or press Enter for username/password sign-in.")
+					}
+					if pasted, err = askPagnetTokenFn("Paste your Pagnet Token: "); err != nil {
+						return err
+					}
+				}
+				if pasted != "" {
+					res, err := loginWithPastedToken(stateDir, base, client, pasted)
+					if err != nil {
+						return err
+					}
+					fmt.Println(res.Summary)
+					saved = true
+					break
+				}
+				if status.Mode == "oidc" {
+					// Reuse the shared helper: it validates a stored token
+					// first (idempotent re-login) and runs the sign-in flow
+					// otherwise. It persists the token itself.
+					apiToken, err := ensureUserToken(stateDir, base, noBrowser, hasTTYFn())
+					if err != nil {
+						return err
+					}
+					token = apiToken
+					saved = true
+					fmt.Println("signed in.")
+					break
+				}
 				if username == "" {
 					if username, err = askLine("username: "); err != nil {
 						return err
@@ -130,18 +191,6 @@ func loginCmd() *cobra.Command {
 				token = apiToken
 				fmt.Println("signed in; a new API token was created for the CLI.")
 
-			case "oidc":
-				// Reuse the shared helper: it validates a stored token
-				// first (idempotent re-login) and runs the sign-in flow
-				// otherwise. It persists the token itself.
-				apiToken, err := ensureUserToken(stateDir, base, noBrowser, hasTTYFn())
-				if err != nil {
-					return err
-				}
-				token = apiToken
-				saved = true
-				fmt.Println("signed in.")
-
 			default:
 				return fmt.Errorf("unknown server auth mode %q", status.Mode)
 			}
@@ -156,7 +205,7 @@ func loginCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "admin token (token mode)")
+	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet/legacy token (local/oidc modes) — less safe than the paste prompt (shell history / process listings)")
 	cmd.Flags().StringVar(&username, "username", "", "username (local mode)")
 	cmd.Flags().StringVar(&password, "password", "", "password (local mode; prompted when omitted)")
 	cmd.Flags().StringVar(&label, "label", "cli", "API token label (local mode)")
@@ -226,7 +275,8 @@ func loadUserTokenFile(stateDir string) string {
 // mergeConfigFile merges fields into the state dir's config.yaml,
 // preserving unrelated keys — `pagnet login` (user token) and
 // `pagnet enroll` (host credential) share the file and must not wipe
-// each other's fields.
+// each other's fields. A nil value DELETES the key (used to clear stale
+// credential metadata and the file token copy).
 func mergeConfigFile(stateDir string, fields map[string]any) error {
 	path := filepath.Join(stateDir, "config.yaml")
 	var fc map[string]any
@@ -239,6 +289,10 @@ func mergeConfigFile(stateDir string, fields map[string]any) error {
 		fc = map[string]any{}
 	}
 	for k, v := range fields {
+		if v == nil {
+			delete(fc, k)
+			continue
+		}
 		fc[k] = v
 	}
 	b, err := yaml.Marshal(fc)
@@ -251,57 +305,14 @@ func mergeConfigFile(stateDir string, fields map[string]any) error {
 	return os.WriteFile(path, b, 0o600)
 }
 
-// saveUserToken stores the user bearer. The OS keyring is preferred when
-// available (the token is then removed from the file); otherwise the 0600
-// state file is the fallback. The server URL (non-secret) is always kept in
+// saveUserToken stores the user bearer produced by the mode-based sign-in
+// flows (token / local / oidc — a legacy-shaped API token). The derived-
+// credential metadata of a previous token-first login is cleared (those
+// flows carry none). Storage itself is saveCredential: OS keyring preferred,
+// 0600 state file fallback; the server URL (non-secret) is always kept in
 // the file.
 func saveUserToken(stateDir, server, token string) error {
-	fields := map[string]any{}
-	if server != "" {
-		fields["serverUrl"] = strings.TrimSuffix(server, "/")
-	}
-	if kr, err := openKeyringFn(); err == nil {
-		if err := kr.Set(keyring.Item{
-			Key:   credentialKey(server),
-			Data:  []byte(token),
-			Label: "Pagnet API token",
-		}); err == nil {
-			// Keyring holds the token: drop the file copy (a previous
-			// fallback login may have left one there).
-			return clearFileToken(stateDir, fields)
-		}
-		// Keyring set failed: fall through to the file fallback.
-	}
-	fields["token"] = token
-	return mergeConfigFile(stateDir, fields)
-}
-
-// clearFileToken removes the token from the state file (keeping other fields,
-// e.g. the server URL and host credential) — used when the keyring now holds
-// the token.
-func clearFileToken(stateDir string, fields map[string]any) error {
-	path := filepath.Join(stateDir, "config.yaml")
-	var fc map[string]any
-	if b, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(b, &fc); err != nil {
-			fc = map[string]any{}
-		}
-	}
-	if fc == nil {
-		fc = map[string]any{}
-	}
-	delete(fc, "token")
-	for k, v := range fields {
-		fc[k] = v
-	}
-	b, err := yaml.Marshal(fc)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, b, 0o600)
+	return saveCredential(stateDir, server, token, credentialMeta{})
 }
 
 // --- prompts ------------------------------------------------------------------
