@@ -243,6 +243,42 @@ type RuntimeSession struct {
 	// ConfigFingerprint is the standing-config fingerprint (model / MCP /
 	// identity), preserved from the existing staleness concept.
 	ConfigFingerprint string
+	// Env is the endpoint's LAUNCH environment: the generic KEY=VALUE
+	// pairs the daemon injects for this instance (identity vars, MCP
+	// bridge config, coordination contract — whatever the turn spec
+	// carries; the core is vendor-agnostic and never interprets them).
+	//
+	// Launch-env semantics (runtime-lifecycle refactor, Phase 2 / R8):
+	// the endpoint's environment is FIXED AT LAUNCH (spawn). The driver
+	// uses Env when it starts the endpoint process; a change to Env while
+	// the endpoint is live does NOT reach the running process. The
+	// Manager detects a changed Env on the next EnsureActive and restarts
+	// the endpoint (stop + re-activate, the session is preserved and
+	// resumed when materialised) so the new env takes effect — the
+	// hibernate+wake restart is the pickup mechanism, never a per-submit
+	// env update (an OS process's environment cannot change after spawn,
+	// and no vendor protocol offers a mid-session env update).
+	//
+	// The daemon sets Env from the turn spec before each Submit; for a
+	// stable instance the spec env is constant, so the restart is a
+	// correctness backstop for a config change, not a per-turn cost.
+	Env []string
+	// PendingInteractions are the native interaction ids that have been
+	// observed started but not yet resolved (plan §20: never hibernate a
+	// session with an unresolved interaction). The Manager maintains it
+	// from the normalized event stream (interaction.started adds,
+	// interaction.resolved removes) and clears it when the endpoint that
+	// hosted the interaction is gone (a dead endpoint's interaction is
+	// stale — it cannot be resolved against a re-activated session).
+	PendingInteractions map[string]bool
+}
+
+// HasPendingInteraction reports whether the session has an observed
+// started-but-unresolved native interaction. Such a session must never be
+// hibernated (plan §20) — the hibernate would lose the in-flight
+// interaction the runtime is waiting on.
+func (s *RuntimeSession) HasPendingInteraction() bool {
+	return len(s.PendingInteractions) > 0
 }
 
 // Resumable reports whether the session may be resumed (it must be
@@ -275,6 +311,12 @@ type RuntimeEndpoint struct {
 	Sessions []string
 	// StartedAt is when the endpoint process started.
 	StartedAt time.Time
+	// LaunchEnv is the environment the endpoint process was spawned with
+	// (a copy of the session's Env at activation time). The Manager
+	// compares a later turn's Env against it: a difference means the
+	// launch env changed and the endpoint must be restarted to pick it
+	// up (see RuntimeSession.Env for the launch-env semantics).
+	LaunchEnv []string
 }
 
 // BusyPolicy is how a submit is handled when the session is already busy
@@ -339,6 +381,14 @@ type SessionEvent struct {
 	Type string
 	// SessionID is the native session the event belongs to.
 	SessionID string
+	// TurnID is the LOGICAL turn id the event belongs to (the id the
+	// SubmitRequest carried; the driver echoes it back on every event it
+	// emits for that turn). It is the end-to-end logical identity of the
+	// turn: the daemon correlates its host-protocol events with it, and
+	// Phases 4–8 map it to the vendor's idempotency key where the vendor
+	// offers one (the core never invents a vendor key format). Empty for
+	// events that are not part of a turn (activation events).
+	TurnID string
 	// Output is a transcript chunk (turn.output).
 	Output string
 	// Model, when the runtime reports it.

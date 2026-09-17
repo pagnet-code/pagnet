@@ -80,17 +80,32 @@ func (m *Manager) Session(instanceID string, runtime domain.RuntimeName, workspa
 	}
 	d := m.drivers[runtime]
 	s := &RuntimeSession{
-		InstanceID: instanceID,
-		Runtime:    runtime,
-		Workspace:  workspace,
-		State:      StateInactive,
-		Ownership:  OwnershipPagnet,
+		InstanceID:          instanceID,
+		Runtime:             runtime,
+		Workspace:           workspace,
+		State:               StateInactive,
+		Ownership:           OwnershipPagnet,
+		PendingInteractions: map[string]bool{},
 	}
 	if d != nil {
 		s.Capabilities = d.Capabilities()
 	}
 	m.sessions[instanceID] = s
 	return s
+}
+
+// SetLaunchEnv sets the session's launch environment (the turn spec's env,
+// Phase 2 / R8). It is called by the daemon before each Submit so the
+// endpoint (re)activation uses the current spec env. See RuntimeSession.Env
+// for the launch-env semantics (fixed at spawn; a change restarts the
+// endpoint on the next EnsureActive).
+func (m *Manager) SetLaunchEnv(sess *RuntimeSession, env []string) {
+	if sess == nil {
+		return
+	}
+	m.mu.Lock()
+	sess.Env = env
+	m.mu.Unlock()
 }
 
 // GetSession returns the session for an instance (nil when none).
@@ -152,27 +167,57 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	m.mu.Lock()
 	st := sess.State
 	ep := sess.Endpoint
+	wantEnv := sess.Env
+	pending := len(sess.PendingInteractions) > 0
 	m.mu.Unlock()
 	if st.Live() {
 		d := m.driverLocked(sess.Runtime)
-		if d == nil || d.Live(sess.InstanceID) {
+		live := d == nil || d.Live(sess.InstanceID)
+		// Launch-env change (Phase 2 / R8): the endpoint's environment is
+		// FIXED AT SPAWN. When the session's current env differs from the
+		// env the live endpoint was launched with, the endpoint must be
+		// RESTARTED (stopped + re-activated) so the new env takes effect —
+		// the session is preserved (a materialised session resumes the
+		// same native session on re-activation). The one exception is a
+		// session with an unresolved interaction: restarting it would lose
+		// the in-flight interaction (plan §20: never hibernate a session
+		// with an unresolved interaction), so the env change is DEFERRED —
+		// the live endpoint is returned and the change is applied at the
+		// next restart opportunity.
+		staleEnv := live && ep != nil && !sameEnv(wantEnv, ep.LaunchEnv)
+		if live && !staleEnv {
 			return ep, nil
 		}
-		// The endpoint died unexpectedly: clear the stale reference and
-		// fall through to (re)activation. A MATERIALISED session keeps its
-		// native id (the on-disk state survives) and resumes the same
-		// native session. An UNMATERIALISED session never had a real
-		// exchange, so its minted native id is stale (nothing durable to
-		// resume) — clear it so the re-activation COLD-STARTS a fresh
-		// session, instead of tripping the resume gate (which is for an
-		// explicit resume request of a stored id, not a death
-		// re-activation).
+		if staleEnv && pending {
+			return ep, nil
+		}
+		if staleEnv {
+			// Stop the (still-live) endpoint, preserving the session —
+			// the driver's hibernate is the graceful stop (the runtime
+			// persists its native session state on the way out). Then fall
+			// through to re-activation with the new env.
+			if err := d.Hibernate(ctx, sess); err != nil {
+				return nil, err
+			}
+		}
+		// The endpoint died unexpectedly (or was just stopped for a
+		// launch-env change): clear the stale reference and fall through
+		// to (re)activation. A MATERIALISED session keeps its native id
+		// (the on-disk state survives) and resumes the same native
+		// session. An UNMATERIALISED session never had a real exchange, so
+		// its minted native id is stale (nothing durable to resume) —
+		// clear it so the re-activation COLD-STARTS a fresh session,
+		// instead of tripping the resume gate (which is for an explicit
+		// resume request of a stored id, not a death re-activation).
 		m.mu.Lock()
 		sess.Endpoint = nil
 		sess.State = StateInactive
 		if !sess.Materialised {
 			sess.NativeID = ""
 		}
+		// A dead endpoint's pending interactions are stale: they cannot be
+		// resolved against a re-activated session.
+		sess.PendingInteractions = map[string]bool{}
 		m.mu.Unlock()
 	}
 	d := m.driverLocked(sess.Runtime)
@@ -200,8 +245,28 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	sess.Endpoint = ep
 	sess.State = StateIdle
 	sess.LastActivity = m.now()
+	// Record the env the endpoint was actually launched with, so a later
+	// turn's env can be compared against it (the launch-env-change
+	// restart above).
+	ep.LaunchEnv = append([]string(nil), sess.Env...)
 	m.mu.Unlock()
 	return ep, nil
+}
+
+// sameEnv reports whether two launch environments are identical. Pair
+// order is part of the comparison: the daemon builds the spec env
+// deterministically and the launch env is a copy of it, so any difference
+// (value, order, or length) is a change.
+func sameEnv(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Submit delivers one logical input into the session and streams the
@@ -319,14 +384,20 @@ func (m *Manager) settlePrompt(sess *RuntimeSession, result *TurnResult) {
 }
 
 // Hibernate stops the session's endpoint, preserving the session
-// (invariant F). It refuses to hibernate a busy session (a turn in flight
-// or a pending interaction) — the caller must drain first.
+// (invariant F). It refuses to hibernate a busy session (a turn in
+// flight) or a session with an unresolved interaction (plan §20: never
+// hibernate busy / unresolved-interaction sessions) — the caller must
+// drain first.
 func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
 	m.mu.Lock()
 	st := sess.State
+	pending := len(sess.PendingInteractions) > 0
 	m.mu.Unlock()
 	if st == StateBusy {
 		return errors.New("session: cannot hibernate a busy session")
+	}
+	if pending {
+		return errors.New("session: cannot hibernate a session with an unresolved interaction")
 	}
 	d := m.driverLocked(sess.Runtime)
 	if d == nil {
@@ -358,6 +429,17 @@ func (m *Manager) Stop(instanceID string) error {
 		return nil
 	}
 	return d.Stop(instanceID)
+}
+
+// HasPendingInteraction reports whether the instance's session has an
+// observed started-but-unresolved native interaction (locked read). The
+// daemon consults it before hibernating (plan §20: never hibernate a
+// session with an unresolved interaction).
+func (m *Manager) HasPendingInteraction(instanceID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[instanceID]
+	return s != nil && len(s.PendingInteractions) > 0
 }
 
 // PID is the session's endpoint process id (nil when none).
@@ -431,6 +513,19 @@ func (m *Manager) applyEvent(sess *RuntimeSession, result *TurnResult, ev Sessio
 	case EventTurnCompleted:
 		sess.Materialised = true
 		sess.LastActivity = m.now()
+	case EventInteractionStarted:
+		// The interaction is now outstanding: it must be resolved before
+		// the session may be hibernated (plan §20).
+		if ev.Interaction != nil && ev.Interaction.NativeInteractionID != "" {
+			if sess.PendingInteractions == nil {
+				sess.PendingInteractions = map[string]bool{}
+			}
+			sess.PendingInteractions[ev.Interaction.NativeInteractionID] = true
+		}
+	case EventInteractionResolved:
+		if ev.Interaction != nil && ev.Interaction.NativeInteractionID != "" {
+			delete(sess.PendingInteractions, ev.Interaction.NativeInteractionID)
+		}
 	}
 	m.mu.Unlock()
 	if result == nil {

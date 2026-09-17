@@ -472,6 +472,38 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		// long-lived: they do NOT take a turn-semaphore token (that would
 		// cap resident endpoints at MaxActiveTurns, which is a per-TURN
 		// ceiling, not a residency ceiling — addendum §20).
+		//
+		// §20 PROCESS SAFETY LIMITS — endpoint residency (Phase 2
+		// decision, documented per the plan's "document any new ceiling"):
+		//
+		//   - MaxActiveTurns is LOGICAL TURN CONCURRENCY only. It bounds
+		//     how many process-per-turn launches run at once; it is NOT a
+		//     residency ceiling and must never be read as "maximum total
+		//     AgentInstances that may remain resident forever".
+		//   - Endpoint RESIDENCY is bounded naturally here: one endpoint
+		//     per instance (the exclusivity check below), and instances
+		//     are the unit the control plane creates/forgets. There is no
+		//     unbounded per-daemon endpoint growth beyond the instance
+		//     count.
+		//   - NO configurable resident-endpoint limit is added (plan:
+		//     "Add a configurable resident-endpoint limit only if
+		//     necessary"). It is not necessary: per-instance exclusivity
+		//     already bounds residency, and the OS safety nets below still
+		//     apply to endpoints (they are owned processes in the same
+		//     registry). If a future deployment needs a hard cap, THIS
+		//     switch case is where it lives (a count of endpointByInst
+		//     against a config ceiling, refused with ErrLimitRefused).
+		//   - The OS safety nets are PRESERVED for endpoints: the global
+		//     owned-process hard ceiling, the host-pressure guard, and the
+		//     monitor's descendant-explosion detection all count endpoint
+		//     groups (they are in the turns registry).
+		//   - "Prefer hibernating an eligible IDLE endpoint over refusing
+		//     work" (plan §20) is a FUTURE policy knob, not implemented:
+		//     today a launch refused under pressure/ceiling reports its
+		//     distinct operational kind (the daemon's
+		//     classifyTurnError) and the control plane re-sends; the
+		//     hibernate-to-make-room policy would hook in at this refusal
+		//     site.
 		if _, ok := s.endpointByInst[key.InstanceID]; ok {
 			s.mu.Unlock()
 			s.refusedLimit.Add(1)

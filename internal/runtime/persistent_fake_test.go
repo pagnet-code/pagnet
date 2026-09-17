@@ -25,6 +25,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -477,4 +479,169 @@ func TestPersistentFake_EndpointDeathUnmaterialisedColdStarts(t *testing.T) {
 	if !hasSessionEvent(evs, session.EventSessionStarted) {
 		t.Fatalf("expected a fresh session.started (cold start) after an unmaterialised death: %+v", evs)
 	}
+}
+
+// --- Phase 2: launch-env injection (R8) + turn identity --------------------
+
+// specEnvFor mirrors the daemon's turn-spec env pairs for the instance (the
+// identity vars, MCP bridge config, coordination contract).
+func specEnvFor(instanceID string) []string {
+	return []string{
+		"PAGNET_INSTANCE_ID=" + instanceID,
+		"PAGNET_AGENT_NAME=test-agent",
+		"PAGNET_NETWORK_ID=net-1",
+		`PAGNET_MCP_CONFIG={"mcpServers":{"bridge":{"command":"pagnet-mcp-bridge"}}}`,
+		"PAGNET_COORDINATION_CONTRACT=test-contract",
+	}
+}
+
+// readProcEnviron reads the process's actual environment from
+// /proc/<pid>/environ (Linux). It is the ground-truth check that the
+// endpoint CHILD really received the pairs (not just that the driver
+// computed them).
+func readProcEnviron(t *testing.T, pid int) map[string]string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("proc environ check is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		t.Fatalf("read /proc/%d/environ: %v", pid, err)
+	}
+	env := map[string]string{}
+	for _, kv := range strings.Split(string(b), "\x00") {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	return env
+}
+
+// Phase 2 deliverable 3 (R8): the endpoint child process receives the
+// session's launch environment — the spec pairs the daemon injects for the
+// instance. The check reads the CHILD's actual /proc/<pid>/environ, so it
+// proves the pairs reached the process, not just the driver's intent.
+func TestPersistentFake_EndpointChildEnvHasSpecPairs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("proc environ check is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
+	sup, m, _, _ := newPersistentFixture(t)
+	workspace := t.TempDir()
+	sess := m.Session("inst-env", domain.RuntimeFakePersistent, workspace)
+	m.SetLaunchEnv(sess, specEnvFor("inst-env"))
+
+	res, _ := submitTurn(t, m, sess, "t1", "first")
+	if !res.Completed {
+		t.Fatalf("turn did not complete: %+v", res)
+	}
+	pid := sup.EndpointPID("inst-env")
+	if pid == nil {
+		t.Fatal("no live endpoint PID")
+	}
+	env := readProcEnviron(t, *pid)
+	for _, kv := range specEnvFor("inst-env") {
+		k, v, _ := strings.Cut(kv, "=")
+		if got, ok := env[k]; !ok {
+			t.Fatalf("endpoint child env missing %s", k)
+		} else if got != v {
+			t.Fatalf("endpoint child env %s = %q, want %q", k, got, v)
+		}
+	}
+	t.Logf("endpoint child (pid %d) carries all %d spec pairs", *pid, len(specEnvFor("inst-env")))
+}
+
+// Phase 2 deliverable 3 (R8): the launch env is FIXED AT SPAWN. When the
+// session's env changes between turns, the Manager RESTARTS the endpoint
+// (new process) so the new env takes effect — and the session is PRESERVED
+// (the materialised native session resumes on the new endpoint, never a
+// silent fresh conversation).
+func TestPersistentFake_EnvChangeRestartsEndpoint(t *testing.T) {
+	sup, m, _, _ := newPersistentFixture(t)
+	workspace := t.TempDir()
+	sess := m.Session("inst-envchg", domain.RuntimeFakePersistent, workspace)
+	m.SetLaunchEnv(sess, []string{
+		"PAGNET_INSTANCE_ID=inst-envchg",
+		`PAGNET_MCP_CONFIG={"version":1}`,
+	})
+
+	res1, _ := submitTurn(t, m, sess, "t1", "first")
+	if !res1.Completed {
+		t.Fatalf("turn 1 did not complete: %+v", res1)
+	}
+	pid1 := sup.EndpointPID("inst-envchg")
+	if pid1 == nil {
+		t.Fatal("no live endpoint after turn 1")
+	}
+	if runtime.GOOS == "linux" {
+		if env := readProcEnviron(t, *pid1); env["PAGNET_MCP_CONFIG"] != `{"version":1}` {
+			t.Fatalf("turn-1 endpoint env PAGNET_MCP_CONFIG = %q, want the v1 config", env["PAGNET_MCP_CONFIG"])
+		}
+	}
+
+	// Change the launch env (the daemon does this from the turn spec).
+	m.SetLaunchEnv(sess, []string{
+		"PAGNET_INSTANCE_ID=inst-envchg",
+		`PAGNET_MCP_CONFIG={"version":2}`,
+	})
+
+	res2, evs2 := submitTurn(t, m, sess, "t2", "second")
+	if !res2.Completed {
+		t.Fatalf("turn 2 did not complete: %+v", res2)
+	}
+	pid2 := sup.EndpointPID("inst-envchg")
+	if pid2 == nil {
+		t.Fatal("no live endpoint after turn 2")
+	}
+	if *pid2 == *pid1 {
+		t.Fatalf("the env change did not restart the endpoint: pid stayed %d", *pid1)
+	}
+	// The session was PRESERVED across the restart (same native session,
+	// resumed — not a fresh conversation).
+	if res2.SessionID != res1.SessionID {
+		t.Fatalf("session id changed across the env-restart: before=%q after=%q", res1.SessionID, res2.SessionID)
+	}
+	if !hasSessionEvent(evs2, session.EventSessionResumed) {
+		t.Fatalf("expected session.resumed after the env-restart (the session must be preserved): %+v", evs2)
+	}
+	if runtime.GOOS == "linux" {
+		env := readProcEnviron(t, *pid2)
+		if env["PAGNET_MCP_CONFIG"] != `{"version":2}` {
+			t.Fatalf("restarted endpoint env PAGNET_MCP_CONFIG = %q, want the v2 config", env["PAGNET_MCP_CONFIG"])
+		}
+	}
+	t.Logf("env change restarted the endpoint (pid %d -> %d), session %q resumed", *pid1, *pid2, res2.SessionID)
+}
+
+// Phase 2 deliverable 4: the logical turn id the submit carries is ECHOED
+// on every event of the turn (the end-to-end turn-identity contract the
+// real drivers honor in Phases 4-8, where the daemon maps TurnID -> the
+// vendor's native key).
+func TestPersistentFake_TurnIDEchoedInEvents(t *testing.T) {
+	_, m, _, _ := newPersistentFixture(t)
+	workspace := t.TempDir()
+	sess := m.Session("inst-tnid", domain.RuntimeFakePersistent, workspace)
+
+	res, evs := submitTurn(t, m, sess, "turn-abc-123", "first")
+	if !res.Completed {
+		t.Fatalf("turn did not complete: %+v", res)
+	}
+	// Every TURN event (busy, turn.started, turn.output, turn.completed,
+	// idle, interaction.*) carries the submit's logical turn id. The
+	// activation event (session.started) is a session-lifecycle event, not
+	// a turn event, so it is exempt.
+	turnEvents := 0
+	for _, ev := range evs {
+		switch ev.Type {
+		case session.EventSessionStarted, session.EventSessionResumed, session.EventSessionLost:
+			continue
+		}
+		turnEvents++
+		if ev.TurnID != "turn-abc-123" {
+			t.Fatalf("event %s carries turn id %q, want the submit's logical id %q", ev.Type, ev.TurnID, "turn-abc-123")
+		}
+	}
+	if turnEvents == 0 {
+		t.Fatalf("no turn events observed: %+v", evs)
+	}
+	t.Logf("all %d turn events carry the logical turn id", turnEvents)
 }

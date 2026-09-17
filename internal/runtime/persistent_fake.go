@@ -131,7 +131,13 @@ func (f *PersistentFake) Activate(ctx context.Context, sess *session.RuntimeSess
 		events <- actEv
 	}
 	if actEv.Type == session.EventSessionLost {
-		f.dropEndpoint(sess.InstanceID)
+		// The resume found no usable session. The endpoint that was just
+		// launched for the attempt must be fully stopped AND reaped (not
+		// just best-effort dropped) so a lost resume never leaves a stale
+		// endpoint in the supervisor's registry: stopEndpoint runs the
+		// TERM → grace → KILL sequence (a no-op when the process already
+		// exited on its own), waits for the reap, and drops the record.
+		f.stopEndpoint(sess.InstanceID)
 		return nil, session.ErrSessionLost
 	}
 	sess.NativeID = actEv.SessionID
@@ -367,12 +373,32 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if cmd.Dir == "" {
 		cmd.Dir = "."
 	}
+	// Launch env (Phase 2 / R8): the endpoint child receives the session's
+	// launch environment — the generic spec pairs the daemon injects for
+	// the instance (identity vars, MCP bridge config, coordination
+	// contract). The env is FIXED AT LAUNCH (session.RuntimeSession.Env):
+	// a change restarts the endpoint through the Manager; it is never
+	// updated per submit.
+	//
 	// The ownership marker (R1): the endpoint child's environment carries
 	// PAGNET_INSTANCE_ID=<id>, the SAME pair the supervisor stores in the
 	// ownership record (LaunchRequest.Marker). Every future persistent
 	// driver copies this pattern — the marker is the process-tree ownership
-	// proof for restart reconciliation and diagnostics.
-	cmd.Env = ChildEnv(f.Env, []string{"PAGNET_INSTANCE_ID=" + sess.InstanceID})
+	// proof for restart reconciliation and diagnostics. The daemon's spec
+	// env already carries it; it is ensured here so standalone use (no
+	// spec env) keeps the marker.
+	env := append([]string(nil), sess.Env...)
+	hasMarker := false
+	for _, kv := range env {
+		if kv == "PAGNET_INSTANCE_ID="+sess.InstanceID {
+			hasMarker = true
+			break
+		}
+	}
+	if !hasMarker {
+		env = append(env, "PAGNET_INSTANCE_ID="+sess.InstanceID)
+	}
+	cmd.Env = ChildEnv(f.Env, env)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -635,6 +661,7 @@ func normalizePersist(ev persistWireEvent) session.SessionEvent {
 	out := session.SessionEvent{
 		Type:         ev.Event,
 		SessionID:    ev.SessionID,
+		TurnID:       ev.TurnID, // the logical turn id the fake echoes back
 		Output:       ev.Output,
 		Model:        ev.Model,
 		InputTokens:  nil,

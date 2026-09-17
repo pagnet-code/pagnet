@@ -66,6 +66,16 @@ type Driver interface {
 	// returns the live endpoint. It is idempotent: when the endpoint is
 	// already live it returns it unchanged.
 	//
+	// Launch env (Phase 2 / R8): when the Driver starts the endpoint
+	// process it spawns it with sess.Env (the generic, vendor-agnostic
+	// KEY=VALUE pairs the daemon injects for the instance — identity
+	// vars, MCP bridge config, coordination contract, ...). The env is
+	// FIXED AT LAUNCH: a Driver that keeps the endpoint alive across
+	// submits cannot change its environment later. The Manager detects a
+	// changed sess.Env and restarts the endpoint (stop + re-Activate) so
+	// the new env takes effect; a Driver never receives a per-submit env
+	// update.
+	//
 	// Resume gate (enforced by the Manager, mirrored here for standalone
 	// use): a resume of a non-materialised session returns
 	// ErrNotMaterialised; a resume with no usable native session returns

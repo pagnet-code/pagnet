@@ -2092,10 +2092,107 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		d.Log.Info("instance busy; wake coalesced", "instance", instanceID)
 		return nil
 	}
+	// Session-oriented wake (Phase 2): a session-driven instance that is
+	// ALREADY LIVE (a persistent endpoint is up — idle or a turn in flight)
+	// has nothing to wake: the session is already active, so the wake is a
+	// NO-OP (plan Phase 2: "Wake of an active/idle instance = no-op (already
+	// live)"). Only a HIBERNATED session-driven instance (endpoint stopped,
+	// session preserved) is woken: the wake turn's EnsureActive re-activates
+	// the endpoint, resuming the stored native session. (d.busy above only
+	// tracks the legacy activeTurns map, which the persistent path does not
+	// set, so the session's own liveness is the authoritative check here.)
+	if d.sessionDriverFor(row) != nil {
+		if sess := d.sessions.GetSession(instanceID); sess != nil && sess.State.Live() {
+			d.Log.Info("instance already live; wake is a no-op", "instance", instanceID)
+			return nil
+		}
+	}
 	resume := row.SessionID != ""
 	input := "You were woken. Reason: " + reason
 	d.Log.Info("wake turn", "instance", instanceID, "reason", reason, "resume", resume)
 	return d.runTurn(conn, d.turnSpecFor(row, resume, input, "wake"))
+}
+
+// hibernateInstance is the SESSION-ORIENTED hibernate for a session-driven
+// instance (runtime-lifecycle refactor, Phase 2): it stops the persistent
+// endpoint (TERM → grace → KILL via the supervisor; the runtime saves its
+// native session state on SIGTERM — that is how the native session
+// survives) and marks the instance hibernated with the session PRESERVED
+// (invariant F: the native id + materialised flag remain in the Manager —
+// stopping the endpoint must not delete the session).
+//
+// Trigger semantics — mirrored from the legacy process-per-turn path.
+// Investigation of the legacy daemon: there is NO idle timer and NO
+// explicit server hibernate command. Legacy hibernation is a state
+// transition that happens exactly when the instance has no work in flight
+// AND nothing keeps it awake — the turn process exits at turn end
+// (process exits ⇒ hibernated), the last attach closes with no PTY
+// (doDetach), or the terminal is stopped (doTerminalStop) — every one of
+// those sites is gated on status idle + not busy + no attach/PTY, and
+// every one emits the same wire shape (status hibernated +
+// host.agent_hibernated {sessionId, reason}). This operation uses the
+// SAME conditions and the SAME wire shape; only the mechanism differs —
+// the endpoint is stopped instead of a process exit being observed. The
+// legacy call sites (doDetach / doTerminalStop) route session-driven
+// instances here; the turn-end site does not apply (the persistent
+// endpoint does not exit at turn end — that is the point of the
+// persistent model, plan §41).
+//
+// Never hibernate (plan §20 + addendum):
+//   - a busy session (turn in flight) — the status gate below (only
+//     "idle" is hibernatable) plus the Manager's own StateBusy refusal;
+//   - a session with an unresolved interaction — the pending-interaction
+//     gate below plus the Manager's own refusal;
+//   - an actively attached terminal — the keep-awake gate below. The full
+//     attached-terminal surface for session-driven instances (attaching a
+//     human to the endpoint's native UI) lands with Phase 3 (terminal
+//     session unification); the gate is in place now so the trigger
+//     semantics are already complete.
+//
+// It is a no-op (nil) when the instance is kept awake by an attach/PTY.
+func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason string) error {
+	row, ok, err := d.state.GetInstance(instanceID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("unknown instance %s", instanceID)
+	}
+	// Only an IDLE instance is hibernatable: working = a turn is in flight
+	// (a busy session is never hibernated), blocked/failed/stopped are not
+	// hibernatable at all. Mirrors the legacy gate (the legacy call sites
+	// hibernate only when status == idle).
+	if row.Status != "idle" {
+		return fmt.Errorf("instance %s is %s; not hibernatable", instanceID, row.Status)
+	}
+	// Never hibernate underneath an attached user or a live terminal (§35
+	// keep-awake; plan §20 "actively attached human terminal").
+	if d.attached(instanceID) || d.terminal.active(instanceID) {
+		d.Log.Info("hibernate deferred: instance kept awake (attach/pty active)",
+			"instance", instanceID)
+		return nil
+	}
+	// Never hibernate a session with an unresolved interaction (plan §20).
+	// The Manager refuses too (defense in depth).
+	if d.sessions.HasPendingInteraction(instanceID) {
+		return fmt.Errorf("instance %s has an unresolved interaction; not hibernatable", instanceID)
+	}
+	// Stop the endpoint, PRESERVING the session (invariant F). The driver's
+	// hibernate is synchronous: it runs the TERM → grace → KILL sequence
+	// and waits for the endpoint to be reaped.
+	if sess := d.sessions.GetSession(instanceID); sess != nil {
+		if err := d.sessions.Hibernate(context.Background(), sess); err != nil {
+			return err
+		}
+	}
+	_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
+	_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
+		"instanceId": instanceID, "sessionId": row.SessionID,
+		"reason": reason,
+	})
+	d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
+		"instance", instanceID, "session", row.SessionID, "reason", reason)
+	return nil
 }
 
 func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload) error {
@@ -2563,6 +2660,11 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	// (Codex R4: the id is pagnet-persisted, never vendor-listed).
 	sess := d.sessions.Session(spec.InstanceID, runtime, spec.Workspace)
 	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
+	// Launch env (Phase 2 / R8): the endpoint (re)activation uses the turn
+	// spec's env — the daemon's per-instance injection (identity vars, MCP
+	// bridge config, coordination contract). The env is fixed at spawn; a
+	// change restarts the endpoint (session.RuntimeSession.Env semantics).
+	d.sessions.SetLaunchEnv(sess, spec.Env)
 
 	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
@@ -2596,6 +2698,17 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	interactionIDs := map[string]string{}
 
 	for ev := range events {
+		// Turn identity (Phase 2): the driver echoes the submit's logical
+		// turn id on every event it emits for that turn, so the event
+		// stream carries the logical identity end-to-end. An event that
+		// carries a DIFFERENT id is an attribution anomaly (the stream is
+		// crossed with another turn) — log it loudly. The host-protocol
+		// events still carry the spec's id (the authoritative one).
+		if ev.TurnID != "" && ev.TurnID != spec.TurnID {
+			d.Log.Warn("turn event attribution mismatch",
+				"instance", spec.InstanceID, "expected", spec.TurnID,
+				"got", ev.TurnID, "event", ev.Type)
+		}
 		switch ev.Type {
 		case session.EventSessionStarted, session.EventSessionResumed:
 			sessionID = ev.SessionID
@@ -2852,6 +2965,13 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 		return nil
 	}
 	if row.Status == "idle" {
+		// Session-driven (Phase 2): the persistent endpoint is still LIVE
+		// — hibernating means stopping it (session preserved), not just
+		// writing the status. Same trigger, same wire shape (reason
+		// attach_closed).
+		if d.sessionDriverFor(row) != nil {
+			return d.hibernateInstance(conn, p.InstanceID, "attach_closed")
+		}
 		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
@@ -2881,6 +3001,13 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 		return nil // the finishing turn settles the status
 	}
 	if row.Status == "idle" {
+		// Session-driven (Phase 2): the persistent endpoint is still LIVE
+		// — hibernating means stopping it (session preserved), not just
+		// writing the status. Same trigger, same wire shape (reason
+		// stopped).
+		if d.sessionDriverFor(row) != nil {
+			return d.hibernateInstance(conn, p.InstanceID, "stopped")
+		}
 		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,

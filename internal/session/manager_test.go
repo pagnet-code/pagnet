@@ -22,6 +22,16 @@ type memDriver struct {
 	stored map[string]bool
 	// failResume forces the next resume to lose the session.
 	failResume bool
+	// scriptedInteraction, when non-empty, makes the next prompt turn
+	// BLOCK on a native interaction (the turn is busy until a
+	// SubmitInteraction answers it) — models a runtime that parks a turn
+	// on a pending interaction (the fake's PAGNET_FAKE_INTERACTION).
+	scriptedInteraction string
+	// danglingInteraction, when non-empty, makes the next prompt turn
+	// complete while leaving a native interaction UNRESOLVED (the session
+	// goes idle with a pending interaction) — models a runtime whose turn
+	// ends with an outstanding deferrable interaction.
+	danglingInteraction string
 
 	activated    int
 	hibernated   int
@@ -29,16 +39,24 @@ type memDriver struct {
 	interactions int
 	// live tracks which instances have a live endpoint.
 	live map[string]bool
-	// pid is the fake endpoint pid (stable per instance while live).
+	// pid is the fake endpoint pid; it increments on every activation so
+	// a re-activation is a NEW process (the hibernate/wake and
+	// launch-env-restart proofs assert on it).
 	pid int
+	// answerOnce/answerCh model the in-flight interaction's answer:
+	// SubmitInteraction closes answerCh once, unblocking the scripted
+	// turn.
+	answerOnce sync.Once
+	answerCh   chan struct{}
 }
 
 func newMemDriver() *memDriver {
 	return &memDriver{
-		minted: "native-abc",
-		stored: map[string]bool{},
-		live:   map[string]bool{},
-		pid:    4242,
+		minted:   "native-abc",
+		stored:   map[string]bool{},
+		live:     map[string]bool{},
+		pid:      4242,
+		answerCh: make(chan struct{}),
 	}
 }
 
@@ -83,14 +101,18 @@ func (d *memDriver) Activate(ctx context.Context, sess *RuntimeSession, events c
 	}
 	d.mu.Lock()
 	d.live[sess.InstanceID] = true
+	// A fresh activation is a NEW process: bump the pid so re-activation
+	// (hibernate/wake, launch-env restart) is observable as a new endpoint.
+	d.pid++
+	pid := d.pid
 	d.mu.Unlock()
 	return &RuntimeEndpoint{
 		ID:        "ep-" + sess.InstanceID,
 		Runtime:   sess.Runtime,
 		Ownership: OwnershipPagnet,
 		Lease:     LeaseClaimed,
-		PID:       d.pid,
-		PGID:      d.pid,
+		PID:       pid,
+		PGID:      pid,
 		Healthy:   true,
 		Transport: "stdio",
 		Sessions:  []string{sess.NativeID},
@@ -110,15 +132,50 @@ func (d *memDriver) Submit(ctx context.Context, sess *RuntimeSession, req Submit
 		return errors.New("memDriver: no live endpoint")
 	}
 	if req.Kind == SubmitInteraction {
-		// The answer is delivered; the in-flight turn's stream carries the
-		// interaction.resolved. This stream carries no turn events.
+		// The answer is delivered. For a scripted (blocking) interaction it
+		// unblocks the in-flight turn (whose stream carries the
+		// interaction.resolved). For a dangling one, THIS stream carries
+		// the resolution (the turn already completed).
+		d.answerOnce.Do(func() { close(d.answerCh) })
+		if d.danglingInteraction != "" {
+			events <- SessionEvent{
+				Type:      EventInteractionResolved,
+				SessionID: sess.NativeID,
+				TurnID:    req.TurnID,
+				Interaction: &InteractionEvent{
+					NativeInteractionID: "int-1", Kind: d.danglingInteraction,
+					Resolved: true, Decision: req.Decision, Answer: req.Answer,
+				},
+			}
+		}
 		return nil
 	}
-	events <- SessionEvent{Type: EventBusy, SessionID: sess.NativeID}
-	events <- SessionEvent{Type: EventTurnStarted, SessionID: sess.NativeID}
-	events <- SessionEvent{Type: EventTurnOutput, SessionID: sess.NativeID, Output: "echo: " + req.Input}
-	events <- SessionEvent{Type: EventTurnCompleted, SessionID: sess.NativeID, Model: "mem-1"}
-	events <- SessionEvent{Type: EventIdle, SessionID: sess.NativeID}
+	// Every turn event echoes the submit's logical turn id (the
+	// end-to-end turn-identity contract the real drivers honor).
+	events <- SessionEvent{Type: EventBusy, SessionID: sess.NativeID, TurnID: req.TurnID}
+	events <- SessionEvent{Type: EventTurnStarted, SessionID: sess.NativeID, TurnID: req.TurnID}
+	if d.scriptedInteraction != "" {
+		// The turn blocks on the native interaction until it is answered.
+		events <- SessionEvent{
+			Type: EventInteractionStarted, SessionID: sess.NativeID, TurnID: req.TurnID,
+			Interaction: &InteractionEvent{NativeInteractionID: "int-1", Kind: d.scriptedInteraction, Summary: "mem " + d.scriptedInteraction},
+		}
+		<-d.answerCh
+		events <- SessionEvent{
+			Type: EventInteractionResolved, SessionID: sess.NativeID, TurnID: req.TurnID,
+			Interaction: &InteractionEvent{NativeInteractionID: "int-1", Kind: d.scriptedInteraction, Resolved: true, Decision: "resolved"},
+		}
+	}
+	if d.danglingInteraction != "" {
+		// The turn completes with the interaction still outstanding.
+		events <- SessionEvent{
+			Type: EventInteractionStarted, SessionID: sess.NativeID, TurnID: req.TurnID,
+			Interaction: &InteractionEvent{NativeInteractionID: "int-1", Kind: d.danglingInteraction, Summary: "mem " + d.danglingInteraction},
+		}
+	}
+	events <- SessionEvent{Type: EventTurnOutput, SessionID: sess.NativeID, TurnID: req.TurnID, Output: "echo: " + req.Input}
+	events <- SessionEvent{Type: EventTurnCompleted, SessionID: sess.NativeID, TurnID: req.TurnID, Model: "mem-1"}
+	events <- SessionEvent{Type: EventIdle, SessionID: sess.NativeID, TurnID: req.TurnID}
 	return nil
 }
 
@@ -170,6 +227,12 @@ func (d *memDriver) activatedCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.activated
+}
+
+func (d *memDriver) hibernatedCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.hibernated
 }
 
 func newTestManager(t *testing.T, d Driver) *Manager {
@@ -618,5 +681,266 @@ func TestValidateSubmitRequest(t *testing.T) {
 	}
 	if err := ValidateSubmitRequest(SubmitRequest{Kind: SubmitInteraction, InteractionID: "i", Decision: "resolved"}); err != nil {
 		t.Fatalf("valid interaction rejected: %v", err)
+	}
+}
+
+// Phase 2 (deliverable 4): the submit's logical turn id is echoed by the
+// driver on every event it emits for the turn, so the normalized event
+// stream carries the logical identity end-to-end (the daemon correlates
+// its host-protocol events with it; Phases 4–8 map it to the vendor's
+// idempotency key).
+func TestManager_TurnIDEchoedInEvents(t *testing.T) {
+	d := newMemDriver()
+	m := newTestManager(t, d)
+	sess := m.Session("inst-turnid", domain.RuntimeFake, "/tmp/ws")
+
+	events := make(chan SessionEvent, 16)
+	done := make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{
+			TurnID: "turn-xyz-123", Kind: SubmitPrompt, Input: "hello",
+		}, events)
+		done <- r
+	}()
+	var turnEvents int
+	for ev := range events {
+		switch ev.Type {
+		case EventSessionStarted, EventSessionResumed:
+			// Activation events are not part of a turn: no turn id.
+			if ev.TurnID != "" {
+				t.Fatalf("activation event carries a turn id: %+v", ev)
+			}
+		default:
+			turnEvents++
+			if ev.TurnID != "turn-xyz-123" {
+				t.Fatalf("turn event %q does not echo the submit's turn id: got %q", ev.Type, ev.TurnID)
+			}
+		}
+	}
+	res := <-done
+	if !res.Completed {
+		t.Fatalf("turn not completed: %+v", res)
+	}
+	if turnEvents == 0 {
+		t.Fatal("no turn events observed")
+	}
+}
+
+// Phase 2 (deliverable 1, plan §20): a session with an UNRESOLVED
+// interaction is never hibernated — even when it is idle (the turn
+// completed with the interaction still outstanding). The hibernate is
+// refused until the interaction is resolved.
+func TestManager_HibernateRefusesPendingInteraction(t *testing.T) {
+	d := newMemDriver()
+	d.danglingInteraction = "question"
+	m := newTestManager(t, d)
+	sess := m.Session("inst-pending", domain.RuntimeFake, "/tmp/ws")
+
+	// The turn completes, leaving the interaction unresolved (idle +
+	// pending).
+	events := make(chan SessionEvent, 16)
+	done := make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t1", Kind: SubmitPrompt, Input: "hi"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	res := <-done
+	if !res.Completed {
+		t.Fatalf("turn not completed: %+v", res)
+	}
+	if sess.State != StateIdle {
+		t.Fatalf("state after the turn = %v, want idle", sess.State)
+	}
+	if !m.HasPendingInteraction("inst-pending") {
+		t.Fatal("the unresolved interaction was not tracked as pending")
+	}
+
+	// Hibernate is REFUSED (plan §20: never hibernate an unresolved
+	// interaction) — even though the session is idle.
+	if err := m.Hibernate(context.Background(), sess); err == nil {
+		t.Fatal("hibernate of a session with an unresolved interaction was not refused")
+	}
+	if !d.live["inst-pending"] {
+		t.Fatal("the endpoint was stopped despite the hibernate refusal")
+	}
+
+	// Resolve the interaction (the submit path).
+	iEvents := make(chan SessionEvent, 16)
+	if _, err := m.Submit(context.Background(), sess, SubmitRequest{
+		TurnID: "t2", Kind: SubmitInteraction, InteractionID: "int-1", Decision: "resolved", Answer: "yes",
+	}, iEvents); err != nil {
+		t.Fatalf("interaction submit: %v", err)
+	}
+	for range iEvents {
+	}
+	if m.HasPendingInteraction("inst-pending") {
+		t.Fatal("the interaction is still pending after the resolution")
+	}
+
+	// Now the hibernate succeeds (idle, no pending interaction).
+	if err := m.Hibernate(context.Background(), sess); err != nil {
+		t.Fatalf("hibernate after the resolution: %v", err)
+	}
+	if sess.State != StateInactive {
+		t.Fatalf("state after hibernate = %v, want inactive", sess.State)
+	}
+}
+
+// Phase 2 (deliverable 3 / R8): the endpoint's launch env is FIXED AT
+// LAUNCH. When the session's env changes while the endpoint is live, the
+// Manager RESTARTS the endpoint (stop + re-activate) so the new env takes
+// effect — the session is preserved (a materialised session resumes the
+// same native session; the endpoint is a NEW process).
+func TestManager_EnvChangeRestartsEndpoint(t *testing.T) {
+	d := newMemDriver()
+	m := newTestManager(t, d)
+	sess := m.Session("inst-env", domain.RuntimeFake, "/tmp/ws")
+
+	// Turn 1 with env A (cold start).
+	m.SetLaunchEnv(sess, []string{"PAGNET_TEST_ENV=A"})
+	events := make(chan SessionEvent, 16)
+	done := make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t1", Kind: SubmitPrompt, Input: "one"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 1 not completed: %+v", res)
+	}
+	sessionID := sess.NativeID
+	if sessionID == "" {
+		t.Fatal("no native session id after turn 1")
+	}
+	pid1 := d.PID("inst-env")
+	if pid1 == nil {
+		t.Fatal("no live endpoint after turn 1")
+	}
+	if ep := sess.Endpoint; ep == nil || !sameEnv(ep.LaunchEnv, []string{"PAGNET_TEST_ENV=A"}) {
+		t.Fatalf("endpoint launch env not recorded: %+v", sess.Endpoint)
+	}
+
+	// Turn 2 with a CHANGED env: the endpoint must be restarted (new
+	// process) and the SAME session resumed.
+	m.SetLaunchEnv(sess, []string{"PAGNET_TEST_ENV=B"})
+	events = make(chan SessionEvent, 16)
+	done = make(chan *TurnResult, 1)
+	var resumed bool
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t2", Kind: SubmitPrompt, Input: "two"}, events)
+		done <- r
+	}()
+	for ev := range events {
+		if ev.Type == EventSessionResumed && ev.SessionID == sessionID {
+			resumed = true
+		}
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 2 not completed: %+v", res)
+	}
+	if n := d.activatedCount(); n != 2 {
+		t.Fatalf("driver activated = %d, want 2 (the env change restarts the endpoint)", n)
+	}
+	if n := d.hibernatedCount(); n != 1 {
+		t.Fatalf("driver hibernated = %d, want 1 (the restart stops the old endpoint)", n)
+	}
+	pid2 := d.PID("inst-env")
+	if pid2 == nil {
+		t.Fatal("no live endpoint after turn 2")
+	}
+	if *pid2 == *pid1 {
+		t.Fatalf("the env change did not restart the endpoint (pid %d unchanged)", *pid1)
+	}
+	if !resumed {
+		t.Fatal("the restart did not resume the same native session")
+	}
+	if sess.NativeID != sessionID {
+		t.Fatalf("native session id changed across the restart: %q != %q", sess.NativeID, sessionID)
+	}
+	if ep := sess.Endpoint; ep == nil || !sameEnv(ep.LaunchEnv, []string{"PAGNET_TEST_ENV=B"}) {
+		t.Fatalf("restarted endpoint launch env = %+v, want the new env", sess.Endpoint)
+	}
+}
+
+// Phase 2 (deliverable 3 / R8 + plan §20): a launch-env change on a
+// session with an UNRESOLVED interaction is DEFERRED — restarting the
+// endpoint would lose the in-flight interaction (never hibernate an
+// unresolved interaction). The live endpoint is kept; the change is
+// applied at the next restart opportunity (after the resolution).
+func TestManager_EnvChangeDeferredWithPendingInteraction(t *testing.T) {
+	d := newMemDriver()
+	d.danglingInteraction = "question"
+	m := newTestManager(t, d)
+	sess := m.Session("inst-envdef", domain.RuntimeFake, "/tmp/ws")
+
+	// Turn 1 with env A, completing with the interaction unresolved.
+	m.SetLaunchEnv(sess, []string{"PAGNET_TEST_ENV=A"})
+	events := make(chan SessionEvent, 16)
+	done := make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t1", Kind: SubmitPrompt, Input: "one"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 1 not completed: %+v", res)
+	}
+	pid1 := d.PID("inst-envdef")
+	if pid1 == nil {
+		t.Fatal("no live endpoint after turn 1")
+	}
+
+	// Turn 2 with a CHANGED env while the interaction is still pending:
+	// the restart is DEFERRED (the live endpoint is kept).
+	m.SetLaunchEnv(sess, []string{"PAGNET_TEST_ENV=B"})
+	events = make(chan SessionEvent, 16)
+	done = make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t2", Kind: SubmitPrompt, Input: "two"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 2 not completed: %+v", res)
+	}
+	if n := d.activatedCount(); n != 1 {
+		t.Fatalf("driver activated = %d, want 1 (the env change must be deferred while the interaction is pending)", n)
+	}
+	pid2 := d.PID("inst-envdef")
+	if pid2 == nil || *pid2 != *pid1 {
+		t.Fatalf("the deferred env change restarted the endpoint anyway: pid1=%v pid2=%v", pid1, pid2)
+	}
+
+	// Resolve the interaction, then turn 3: the restart now happens.
+	iEvents := make(chan SessionEvent, 16)
+	if _, err := m.Submit(context.Background(), sess, SubmitRequest{
+		TurnID: "t3", Kind: SubmitInteraction, InteractionID: "int-1", Decision: "resolved", Answer: "yes",
+	}, iEvents); err != nil {
+		t.Fatalf("interaction submit: %v", err)
+	}
+	for range iEvents {
+	}
+	events = make(chan SessionEvent, 16)
+	done = make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t4", Kind: SubmitPrompt, Input: "three"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 3 not completed: %+v", res)
+	}
+	if n := d.activatedCount(); n != 2 {
+		t.Fatalf("driver activated = %d, want 2 (the deferred env change applies after the resolution)", n)
+	}
+	pid3 := d.PID("inst-envdef")
+	if pid3 == nil || *pid3 == *pid1 {
+		t.Fatalf("the deferred env change did not restart the endpoint: pid1=%d pid3=%v", *pid1, pid3)
 	}
 }
