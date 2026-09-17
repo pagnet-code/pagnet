@@ -15,8 +15,9 @@ import (
 // The original P0 incident happened on macOS, so this file is not a
 // porting afterthought: group enumeration, start-identity, and
 // pressure detection all run on the kernel API here, and the Darwin
-// build-tagged tests exercise them on a macOS host (see
-// docs/macOS-acceptance.md).
+// build-tagged tests exercise them on a macOS host. The CI
+// `client (macos-latest)` job is the de-facto darwin acceptance runner
+// (there is no separate acceptance document).
 
 // darwinProc is the subset of KinfoProc the supervisor needs.
 type darwinProc struct {
@@ -24,7 +25,7 @@ type darwinProc struct {
 	pgrp  int
 	uid   int
 	stat  byte  // P_stat & 0x1f: process state (darwinSZombie = dead)
-	start int64 // P_starttime: Timeval since boot (start identity)
+	start int64 // P_starttime: microseconds since boot (start identity)
 }
 
 // darwinSZombie is the BSD/macOS process state for a zombie (SZOMB in
@@ -33,11 +34,17 @@ type darwinProc struct {
 // awaiting reap — it cannot be signaled into dying.
 const darwinSZombie = 5
 
-func readDarwinProcs() []darwinProc {
+// readDarwinProcs enumerates every process via kern.proc.all and returns
+// the subset the supervisor needs. A failed enumeration is returned as an
+// error (and recorded for EnumError) — it is UNKNOWN, never an empty list:
+// a nil/empty result from a failed pass must not be read as "no processes".
+func readDarwinProcs() ([]darwinProc, error) {
 	kps, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
-		return nil
+		setEnumErr(err)
+		return nil, err
 	}
+	setEnumErr(nil)
 	out := make([]darwinProc, 0, len(kps))
 	for _, kp := range kps {
 		if kp.Proc.P_pid == 0 {
@@ -48,16 +55,17 @@ func readDarwinProcs() []darwinProc {
 			pgrp:  int(kp.Proc.P_pgrp),
 			uid:   int(kp.Eproc.Ucred.Uid),
 			stat:  byte(int(kp.Proc.P_stat) & 0x1f),
-			start: kp.Proc.P_starttime.Sec,
+			start: kp.Proc.P_starttime.Sec*1000000 + int64(kp.Proc.P_starttime.Usec),
 		})
 	}
-	return out
+	return out, nil
 }
 
 // CountGroup returns the number of processes currently in group pgid.
 func CountGroup(pgid int) int {
+	procs, _ := readDarwinProcs()
 	n := 0
-	for _, p := range readDarwinProcs() {
+	for _, p := range procs {
 		if p.pgrp == pgid {
 			n++
 		}
@@ -65,18 +73,30 @@ func CountGroup(pgid int) int {
 	return n
 }
 
-// CountOwned returns the total number of processes in any of the owned
-// process groups (one KERN_PROC_ALL pass, not one per group).
-func CountOwned(groups map[int]bool) int {
+// CountOwnedErr is CountOwned with the enumeration error surfaced: a
+// non-nil error means the count is UNKNOWN (the enumeration failed), not
+// zero. The supervisor's owned-process ceiling uses this to fail closed.
+func CountOwnedErr(groups map[int]bool) (int, error) {
+	procs, err := readDarwinProcs()
+	if err != nil {
+		return 0, err
+	}
 	if len(groups) == 0 {
-		return 0
+		return 0, nil
 	}
 	n := 0
-	for _, p := range readDarwinProcs() {
+	for _, p := range procs {
 		if groups[p.pgrp] {
 			n++
 		}
 	}
+	return n, nil
+}
+
+// CountOwned returns the total number of processes in any of the owned
+// process groups (one KERN_PROC_ALL pass, not one per group).
+func CountOwned(groups map[int]bool) int {
+	n, _ := CountOwnedErr(groups)
 	return n
 }
 
@@ -87,7 +107,8 @@ func CountGroups(groups map[int]bool) map[int]int {
 	if len(groups) == 0 {
 		return out
 	}
-	for _, p := range readDarwinProcs() {
+	procs, _ := readDarwinProcs()
+	for _, p := range procs {
 		if groups[p.pgrp] {
 			out[p.pgrp]++
 		}
@@ -97,13 +118,31 @@ func CountGroups(groups map[int]bool) map[int]int {
 
 // GroupMembers lists the pids currently in group pgid.
 func GroupMembers(pgid int) []int {
+	procs, _ := readDarwinProcs()
 	var out []int
-	for _, p := range readDarwinProcs() {
+	for _, p := range procs {
 		if p.pgrp == pgid {
 			out = append(out, p.pid)
 		}
 	}
 	return out
+}
+
+// GroupHasLiveMemberErr is GroupHasLiveMember with the enumeration error
+// surfaced: a non-nil error means the group's state is UNKNOWN (the
+// enumeration failed), NOT "no live member". The supervisor's descendant
+// reclaim and termination poll use this to fail closed.
+func GroupHasLiveMemberErr(pgid int) (bool, error) {
+	procs, err := readDarwinProcs()
+	if err != nil {
+		return false, err
+	}
+	for _, p := range procs {
+		if p.pgrp == pgid && p.stat != darwinSZombie {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // GroupHasLiveMember reports whether the group has any member that is
@@ -112,20 +151,17 @@ func GroupMembers(pgid int) []int {
 // must not wait on it (see the Linux implementation for the full
 // rationale — the 2026-09-15 5s-per-cycle leak-test regression).
 func GroupHasLiveMember(pgid int) bool {
-	for _, p := range readDarwinProcs() {
-		if p.pgrp == pgid && p.stat != darwinSZombie {
-			return true
-		}
-	}
-	return false
+	ok, _ := GroupHasLiveMemberErr(pgid)
+	return ok
 }
 
 // UserProcessCount returns the number of processes of the current user
 // (the population RLIMIT_NPROC bounds).
 func UserProcessCount() (int, error) {
 	uid := os.Getuid()
+	procs, _ := readDarwinProcs()
 	n := 0
-	for _, p := range readDarwinProcs() {
+	for _, p := range procs {
 		if p.uid == uid {
 			n++
 		}
@@ -156,15 +192,20 @@ func ProcessGroupOf(pid int) (int, error) {
 }
 
 // StartIdentity returns the kernel start-time marker of pid
-// (P_starttime, seconds since boot). A PID reuse gets a different
-// start time, so this is the PID-reuse-safe identity the ownership
-// record stores (§39).
+// (P_starttime, the full Timeval). The marker is MICROSECONDS since boot
+// (Sec*1000000 + Usec), not seconds: second granularity would let two
+// processes started within the same second share an identity, breaking
+// the PID-reuse contract (§39) — a reused PID must yield a different
+// identity, and processes launched milliseconds apart must too. A PID
+// reuse gets a different start time, so this is the PID-reuse-safe
+// identity the ownership record stores (§39).
 func StartIdentity(pid int) (string, error) {
 	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
 	if err != nil {
 		return "", err
 	}
-	return strconv.FormatInt(kp.Proc.P_starttime.Sec, 10), nil
+	micros := kp.Proc.P_starttime.Sec*1000000 + int64(kp.Proc.P_starttime.Usec)
+	return strconv.FormatInt(micros, 10), nil
 }
 
 // EnvHasMarker: macOS does not expose other processes' environments

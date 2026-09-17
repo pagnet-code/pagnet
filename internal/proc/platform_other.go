@@ -45,6 +45,9 @@ func CountGroup(pgid int) int { return 0 }
 // CountOwned is unsupported here.
 func CountOwned(groups map[int]bool) int { return 0 }
 
+// CountOwnedErr is unsupported here (fails closed: the count is unknown).
+func CountOwnedErr(groups map[int]bool) (int, error) { return 0, errUnsupported }
+
 // CountGroups is unsupported here.
 func CountGroups(groups map[int]bool) map[int]int { return map[int]int{} }
 
@@ -54,6 +57,10 @@ func GroupMembers(pgid int) []int { return nil }
 // GroupHasLiveMember is unsupported here (reports false: nothing
 // verifiable, consistent with GroupAlive).
 func GroupHasLiveMember(pgid int) bool { return false }
+
+// GroupHasLiveMemberErr is unsupported here (fails closed: the group's
+// state is unknown).
+func GroupHasLiveMemberErr(pgid int) (bool, error) { return false, errUnsupported }
 
 // ProcessIsZombie is unsupported here (reports false: nothing
 // verifiable, consistent with GroupHasLiveMember).

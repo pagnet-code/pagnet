@@ -176,6 +176,15 @@ type Config struct {
 	// the host's RLIMIT_NPROC or spawning thousands of processes.
 	processLimitFn     func() int
 	userProcessCountFn func() (int, error)
+
+	// countOwnedFn / groupLiveMemberFn are test seams for the
+	// fail-closed-on-UNKNOWN enumeration paths (a failed process
+	// enumeration is UNKNOWN, never EMPTY): nil = the platform
+	// ...Err implementation. They let a test exercise the refusal and
+	// reclaim-skip logic deterministically without breaking the host's
+	// /proc or kern.proc.
+	countOwnedFn      func(map[int]bool) (int, error)
+	groupLiveMemberFn func(int) (bool, error)
 }
 
 // DefaultConfig returns the safe defaults (§29/§31/§32/§33/§35).
@@ -310,6 +319,13 @@ type Supervisor struct {
 	processLimitFn     func() int
 	userProcessCountFn func() (int, error)
 
+	// Fail-closed-on-UNKNOWN enumeration sources; resolved from the
+	// Config seams (or the platform ...Err implementation) at
+	// construction. A non-nil error from either means the enumeration
+	// FAILED: the result is UNKNOWN, never empty.
+	countOwnedFn      func(map[int]bool) (int, error)
+	groupLiveMemberFn func(int) (bool, error)
+
 	mu             sync.Mutex
 	turns          map[Key]*managedTurn
 	byInstance     map[string]*managedTurn
@@ -398,6 +414,14 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 	if upc == nil {
 		upc = UserProcessCount
 	}
+	co := cfg.countOwnedFn
+	if co == nil {
+		co = CountOwnedErr
+	}
+	glm := cfg.groupLiveMemberFn
+	if glm == nil {
+		glm = GroupHasLiveMemberErr
+	}
 	s := &Supervisor{
 		cfg:                cfg,
 		log:                log,
@@ -411,6 +435,8 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 		monitorDone:        make(chan struct{}),
 		processLimitFn:     pl,
 		userProcessCountFn: upc,
+		countOwnedFn:       co,
+		groupLiveMemberFn:  glm,
 	}
 	go s.monitor()
 	return s
@@ -579,7 +605,18 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		return fail(err)
 	}
 	// Global owned-process ceiling (§32).
-	if n := s.ownedSnapshot(); n >= s.cfg.OwnedProcessesHard {
+	if n, err := s.ownedSnapshot(); err != nil {
+		// UNKNOWN enumeration: the owned count is not "0" — launching
+		// against an unverifiable ceiling is exactly the fail-open this
+		// guard exists to prevent. Refuse (on a healthy machine the
+		// enumeration succeeds, so this only bites when the platform's
+		// process view is actually broken).
+		s.refusedLimit.Add(1)
+		s.log.Warn("launch refused: owned-process enumeration failed (unknown count)",
+			"instance", key.InstanceID, "err", err)
+		return fail(fmt.Errorf("%w: owned-process enumeration failed: %v",
+			ErrLimitRefused, err))
+	} else if n >= s.cfg.OwnedProcessesHard {
 		err := fmt.Errorf("%w: owned processes %d at/above ceiling %d",
 			ErrLimitRefused, n, s.cfg.OwnedProcessesHard)
 		s.refusedLimit.Add(1)
@@ -917,6 +954,16 @@ type managedTurn struct {
 // clean completion with no survivors skips the termination entirely and
 // returns immediately (no grace wait).
 //
+// Both checks are also UNKNOWN-aware (GroupHasLiveMemberErr, not the
+// plain GroupHasLiveMember): a FAILED process enumeration is UNKNOWN,
+// never EMPTY. When the enumeration errors, the "no live member"
+// conclusion is unverifiable and the reclaim does NOT fire — it skips
+// and logs. A skipped reclaim is at most a bounded leak (the post-reap
+// GroupAlive verification in finish, a signal-0 probe that does not
+// depend on enumeration, still catches and logs it); a false kill of a
+// live group is not. This is the fix for the darwin CI false-kill
+// hazard: kern.proc.all failing on the runner used to read as "empty".
+//
 // Edge cases:
 //   - Handle.Close / launch-failure paths: abort()/Terminate() has
 //     signaled the group but the child may still be ALIVE at the pre-reap
@@ -938,20 +985,43 @@ func (t *managedTurn) ownerWait() (Exit, error) {
 	// Pre-reap descendant reclaim (anchored on the unreaped child; only
 	// when the child has already exited — a live child means a running
 	// turn, and this Wait must block, not terminate it).
-	if pgid > 0 && ProcessIsZombie(pid) && GroupHasLiveMember(pgid) {
-		t.s.log.Warn("reclaiming descendants that outlived the turn",
-			"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
-		t.terminateGroup()
+	if pgid > 0 && ProcessIsZombie(pid) {
+		live, err := t.s.groupLiveMemberFn(pgid)
+		switch {
+		case err != nil:
+			// UNKNOWN enumeration: a failed pass is never EMPTY — the
+			// group's state is unverifiable, so the reclaim must NOT
+			// fire. A skipped reclaim is at most a bounded leak the
+			// post-reap GroupAlive verification (signal-0, not
+			// enumeration) still catches; a false kill is not.
+			t.s.log.Warn("pre-reap reclaim skipped: group state unknown (enumeration failed)",
+				"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid, "err", err)
+		case live:
+			t.s.log.Warn("reclaiming descendants that outlived the turn",
+				"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
+			t.terminateGroup()
+		}
 	}
 	waitErr := t.cmd.Wait()
 	// Post-reap descendant reclaim (early-Wait case: the child exited
 	// during the Wait above). Fire only when the pgid number is unheld —
 	// a held number is a pid reused by an unrelated new turn (E2E82):
 	// never kill.
-	if pgid > 0 && !ProcessAlive(pgid) && GroupHasLiveMember(pgid) {
-		t.s.log.Warn("reclaiming descendants that outlived the turn (post-reap)",
-			"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
-		t.terminateGroup()
+	if pgid > 0 && !ProcessAlive(pgid) {
+		live, err := t.s.groupLiveMemberFn(pgid)
+		switch {
+		case err != nil:
+			// UNKNOWN enumeration: the "no live member" conclusion is
+			// unverifiable, so the reclaim must NOT fire (the
+			// false-kill-on-broken-enumeration hazard). Same bounded-leak
+			// trade-off as the pre-reap check.
+			t.s.log.Warn("post-reap reclaim skipped: group state unknown (enumeration failed)",
+				"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid, "err", err)
+		case live:
+			t.s.log.Warn("reclaiming descendants that outlived the turn (post-reap)",
+				"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
+			t.terminateGroup()
+		}
 	}
 	return t.finish(waitErr), nil
 }
@@ -1043,13 +1113,20 @@ func (t *managedTurn) terminateSequence(reason string) {
 // all die on TERM returns well before the grace, and an already-dead
 // group returns immediately.
 //
-// The poll uses GroupHasLiveMember (zombie-aware), NOT GroupAlive
-// (signal-0): a zombie is a dead process awaiting reap and cannot be
-// signaled into dying. The turn's direct child is typically a zombie at
-// this point (it exited, and the owner reaps it via cmd.Wait AFTER this
-// returns) — waiting on it would burn the full grace window for nothing
-// (the 2026-09-15 5s-per-cycle leak-test regression). Only LIVE
-// descendants (shells, MCP bridges, helpers) are worth waiting for.
+// The poll uses GroupHasLiveMemberErr (zombie-aware, error-surfacing),
+// NOT GroupAlive (signal-0): a zombie is a dead process awaiting reap
+// and cannot be signaled into dying. The turn's direct child is
+// typically a zombie at this point (it exited, and the owner reaps it
+// via cmd.Wait AFTER this returns) — waiting on it would burn the full
+// grace window for nothing (the 2026-09-15 5s-per-cycle leak-test
+// regression). Only LIVE descendants (shells, MCP bridges, helpers) are
+// worth waiting for.
+//
+// The poll is also UNKNOWN-aware: a FAILED enumeration is treated as
+// "still alive", never as "dead". A termination that cannot be verified
+// as complete must escalate to KILL at the deadline — exiting early on
+// an unverifiable "dead" would leave a live group behind (the same
+// UNKNOWN-never-EMPTY invariant as the reclaim and ceiling paths).
 //
 // Idempotent and safe to run concurrently from the external Terminate
 // path and the owner's post-reap descendant reclaim (signaling a dead
@@ -1063,10 +1140,17 @@ func (t *managedTurn) terminateGroup() {
 		t.s.log.Warn("group TERM failed", "pgid", pgid, "err", err)
 	}
 	deadline := t.s.now().Add(t.s.cfg.TermGrace)
-	for GroupHasLiveMember(pgid) && t.s.now().Before(deadline) {
+	for t.s.now().Before(deadline) {
+		live, err := t.s.groupLiveMemberFn(pgid)
+		if err == nil && !live {
+			return // group verified dead
+		}
+		// live, or UNKNOWN (enumeration failed): keep waiting.
 		time.Sleep(50 * time.Millisecond)
 	}
-	if GroupHasLiveMember(pgid) {
+	live, err := t.s.groupLiveMemberFn(pgid)
+	if err != nil || live {
+		// still live, or UNKNOWN at the deadline: KILL (fail closed).
 		if err := SignalGroup(pgid, syscall.SIGKILL); err == nil {
 			t.forced.Store(true)
 			t.s.forceKillTotal.Add(1)
@@ -1205,8 +1289,11 @@ func (s *Supervisor) pressureCheck() error {
 	return nil
 }
 
-// ownedSnapshot counts processes in all currently owned groups.
-func (s *Supervisor) ownedSnapshot() int {
+// ownedSnapshot counts processes in all currently owned groups. A
+// non-nil error means the enumeration FAILED: the count is UNKNOWN, not
+// zero (the caller must fail closed, not read it as "no owned
+// processes").
+func (s *Supervisor) ownedSnapshot() (int, error) {
 	s.mu.Lock()
 	groups := make(map[int]bool, len(s.turns))
 	for _, t := range s.turns {
@@ -1215,7 +1302,7 @@ func (s *Supervisor) ownedSnapshot() int {
 		}
 	}
 	s.mu.Unlock()
-	return CountOwned(groups)
+	return s.countOwnedFn(groups)
 }
 
 // --- circuit / backoff ---------------------------------------------------------

@@ -31,10 +31,46 @@ package proc
 
 import (
 	"errors"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
+
+// --- enumeration error (UNKNOWN, never EMPTY) ---------------------------------
+//
+// A WHOLESALE process-enumeration failure (kern.proc.all on Darwin, the
+// /proc root on Linux) is UNKNOWN, never EMPTY: a failed pass must not be
+// read as "zero processes". The failing pass records its error here so
+// tests and logs can observe it (EnumError). The fail-closed supervisor
+// paths do NOT rely on this last-error (it is process-global and can be
+// overwritten by a concurrent pass); they use the ...Err variants, which
+// tie the error to the specific enumeration pass.
+//
+// Per-pid read races (a process exiting between the directory scan and the
+// per-pid read) are EXPECTED and are NOT enumeration errors: they skip a
+// single pid that is already gone, which is correct.
+var (
+	enumMu      sync.Mutex
+	lastEnumErr error
+)
+
+// setEnumErr records the result of one enumeration pass (nil = success).
+func setEnumErr(err error) {
+	enumMu.Lock()
+	lastEnumErr = err
+	enumMu.Unlock()
+}
+
+// EnumError returns the most recent process-enumeration error (nil when the
+// most recent pass succeeded). A non-nil value means the most recent
+// enumeration FAILED: any count or membership result taken from that pass
+// is UNKNOWN, not empty.
+func EnumError() error {
+	enumMu.Lock()
+	defer enumMu.Unlock()
+	return lastEnumErr
+}
 
 // childDeathSignal is set on platforms that support a parent-death
 // signal to the DIRECT child (Linux PDEATHSIG). Scope, stated precisely:

@@ -40,11 +40,21 @@ type procStat struct {
 // The uid comes from the OWNER of the /proc/<pid> inode (the kernel
 // sets it to the process's uid); /proc/<pid>/stat has no uid field —
 // field 6 is the session id, which must not be mistaken for it.
-func readProcStats() []procStat {
+//
+// Error semantics (UNKNOWN, never EMPTY): a WHOLESALE enumeration
+// failure — the /proc root itself unreadable (os.ReadDir error) — is
+// returned as an error (and recorded for EnumError). It must NOT be read
+// as "zero processes". Per-pid read failures (os.Stat / os.ReadFile on a
+// single /proc/<pid>) are the EXPECTED ENOENT race of a process exiting
+// between the directory scan and the per-pid read: they skip that one pid
+// and are NOT an enumeration error.
+func readProcStats() ([]procStat, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		setEnumErr(err)
+		return nil, err
 	}
+	setEnumErr(nil)
 	var out []procStat
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -57,7 +67,7 @@ func readProcStats() []procStat {
 		dir := filepath.Join("/proc", e.Name())
 		fi, err := os.Stat(dir)
 		if err != nil {
-			continue
+			continue // per-pid ENOENT race: the process exited; skip it
 		}
 		sys, ok := fi.Sys().(*syscall.Stat_t)
 		if !ok {
@@ -65,14 +75,14 @@ func readProcStats() []procStat {
 		}
 		b, err := os.ReadFile(filepath.Join(dir, "stat"))
 		if err != nil {
-			continue
+			continue // per-pid ENOENT race: the process exited; skip it
 		}
 		if st := parseProcStat(pid, b); st != nil {
 			st.uid = int(sys.Uid)
 			out = append(out, *st)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // parseProcStat parses /proc/<pid>/stat. The comm field (2) may contain
@@ -101,8 +111,9 @@ func parseProcStat(pid int, b []byte) *procStat {
 // CountGroup returns the number of processes currently in group pgid
 // (zombies included — they count against the process limit too).
 func CountGroup(pgid int) int {
+	stats, _ := readProcStats()
 	n := 0
-	for _, st := range readProcStats() {
+	for _, st := range stats {
 		if st.pgrp == pgid {
 			n++
 		}
@@ -110,18 +121,31 @@ func CountGroup(pgid int) int {
 	return n
 }
 
-// CountOwned returns the total number of processes in any of the owned
-// process groups (one /proc scan, not one per group).
-func CountOwned(groups map[int]bool) int {
+// CountOwnedErr is CountOwned with the enumeration error surfaced: a
+// non-nil error means the count is UNKNOWN (the /proc root was
+// unreadable), not zero. The supervisor's owned-process ceiling uses
+// this to fail closed.
+func CountOwnedErr(groups map[int]bool) (int, error) {
+	stats, err := readProcStats()
+	if err != nil {
+		return 0, err
+	}
 	if len(groups) == 0 {
-		return 0
+		return 0, nil
 	}
 	n := 0
-	for _, st := range readProcStats() {
+	for _, st := range stats {
 		if groups[st.pgrp] {
 			n++
 		}
 	}
+	return n, nil
+}
+
+// CountOwned returns the total number of processes in any of the owned
+// process groups (one /proc scan, not one per group).
+func CountOwned(groups map[int]bool) int {
+	n, _ := CountOwnedErr(groups)
 	return n
 }
 
@@ -132,7 +156,8 @@ func CountGroups(groups map[int]bool) map[int]int {
 	if len(groups) == 0 {
 		return out
 	}
-	for _, st := range readProcStats() {
+	stats, _ := readProcStats()
+	for _, st := range stats {
 		if groups[st.pgrp] {
 			out[st.pgrp]++
 		}
@@ -142,13 +167,31 @@ func CountGroups(groups map[int]bool) map[int]int {
 
 // GroupMembers lists the pids currently in group pgid.
 func GroupMembers(pgid int) []int {
+	stats, _ := readProcStats()
 	var out []int
-	for _, st := range readProcStats() {
+	for _, st := range stats {
 		if st.pgrp == pgid {
 			out = append(out, st.pid)
 		}
 	}
 	return out
+}
+
+// GroupHasLiveMemberErr is GroupHasLiveMember with the enumeration error
+// surfaced: a non-nil error means the group's state is UNKNOWN (the /proc
+// root was unreadable), NOT "no live member". The supervisor's descendant
+// reclaim and termination poll use this to fail closed.
+func GroupHasLiveMemberErr(pgid int) (bool, error) {
+	stats, err := readProcStats()
+	if err != nil {
+		return false, err
+	}
+	for _, st := range stats {
+		if st.pgrp == pgid && st.state != 'Z' {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // GroupHasLiveMember reports whether the group has any member that is
@@ -161,20 +204,17 @@ func GroupMembers(pgid int) []int {
 // separately; this check is about the descendants that a group kill
 // can still reach.
 func GroupHasLiveMember(pgid int) bool {
-	for _, st := range readProcStats() {
-		if st.pgrp == pgid && st.state != 'Z' {
-			return true
-		}
-	}
-	return false
+	ok, _ := GroupHasLiveMemberErr(pgid)
+	return ok
 }
 
 // UserProcessCount returns the number of processes of the current user
 // (the population RLIMIT_NPROC bounds).
 func UserProcessCount() (int, error) {
 	uid := os.Getuid()
+	stats, _ := readProcStats()
 	n := 0
-	for _, st := range readProcStats() {
+	for _, st := range stats {
 		if st.uid == uid {
 			n++
 		}

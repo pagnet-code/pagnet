@@ -434,7 +434,11 @@ func TestOwnedCeiling(t *testing.T) {
 	waitForPID(t, h1)
 	// Wait until the owned count reflects the running process.
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && s.ownedSnapshot() < 1 {
+	for time.Now().Before(deadline) {
+		n, err := s.ownedSnapshot()
+		if err == nil && n >= 1 {
+			break
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	_, err = s.Launch(ctx, LaunchRequest{InstanceID: "b", TurnID: "t",
