@@ -12,6 +12,14 @@ import (
 // macOS process information comes from the kernel's KERN_PROC sysctl
 // (the same source `ps` uses — read-only, no helper processes, §30/§33).
 //
+// Root cause of the 2026-09-17 macos-latest CI failures (proven against
+// the XNU headers): extern_proc.p_pgrp is a kernel POINTER (struct pgrp *),
+// not a pgid — modern XNU bzeros the whole kinfo_proc and
+// fill_user64_externproc() never assigns p_pgrp, so kp.Proc.P_pgrp is
+// ALWAYS 0 on every macOS. The authoritative pgid is eproc.e_pgid (pid_t),
+// filled by the kernel as ep->e_pgid = p->p_pgrpid — the same source ps
+// reads: kp.Eproc.Pgid for enumeration, getpgid(2) for per-pid queries.
+//
 // The original P0 incident happened on macOS, so this file is not a
 // porting afterthought: group enumeration, start-identity, and
 // pressure detection all run on the kernel API here, and the Darwin
@@ -21,8 +29,10 @@ import (
 
 // darwinProc is the subset of KinfoProc the supervisor needs.
 type darwinProc struct {
-	pid   int
-	pgrp  int
+	pid  int
+	pgrp int // Eproc.Pgid (eproc.e_pgid): the kernel-filled pgid — the same
+	// source `ps` reads. extern_proc.p_pgrp is a kernel pointer that
+	// modern XNU never fills (always 0) and must never be read.
 	uid   int
 	stat  byte  // P_stat & 0x1f: process state (darwinSZombie = dead)
 	start int64 // P_starttime: microseconds since boot (start identity)
@@ -52,7 +62,7 @@ func readDarwinProcs() ([]darwinProc, error) {
 		}
 		out = append(out, darwinProc{
 			pid:   int(kp.Proc.P_pid),
-			pgrp:  int(kp.Proc.P_pgrp),
+			pgrp:  int(kp.Eproc.Pgid),
 			uid:   int(kp.Eproc.Ucred.Uid),
 			stat:  byte(int(kp.Proc.P_stat) & 0x1f),
 			start: kp.Proc.P_starttime.Sec*1000000 + int64(kp.Proc.P_starttime.Usec),
@@ -132,6 +142,7 @@ func GroupMembers(pgid int) []int {
 // surfaced: a non-nil error means the group's state is UNKNOWN (the
 // enumeration failed), NOT "no live member". The supervisor's descendant
 // reclaim and termination poll use this to fail closed.
+// kill(-pgid, 0) was rejected as the liveness check: it cannot see zombies; see platform_linux.go.
 func GroupHasLiveMemberErr(pgid int) (bool, error) {
 	procs, err := readDarwinProcs()
 	if err != nil {
@@ -181,14 +192,9 @@ func ProcessIsZombie(pid int) bool {
 	return byte(int(kp.Proc.P_stat)&0x1f) == darwinSZombie
 }
 
-// ProcessGroupOf returns the process group id of pid (KERN_PROC_PID,
-// the same kinfo_proc source as StartIdentity).
+// ProcessGroupOf returns the process group id of pid (getpgid(2)).
 func ProcessGroupOf(pid int) (int, error) {
-	kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil {
-		return 0, err
-	}
-	return int(kp.Proc.P_pgrp), nil
+	return unix.Getpgid(pid)
 }
 
 // StartIdentity returns the kernel start-time marker of pid
