@@ -16,6 +16,12 @@
 //   - PAGNET_FAKE_RESUME_FAIL=1: a resume request always loses the session.
 //   - PAGNET_FAKE_HOLD=<duration>: keep the turn process alive for the
 //     duration (cancellation/stop lifecycle tests).
+//   - PAGNET_FAKE_EXIT_DELAY=<duration>: delay the process's exit AFTER
+//     its last event (completion/failure/lost) — a runtime that takes
+//     time to shut down (flushing, closing connections). The process is
+//     still alive when the adapter's post-terminal-event cleanup TERM
+//     arrives: the deterministic fixture for the turn-lifecycle
+//     exit-window race (2026-09-16 e2e cascade).
 //   - PAGNET_FAKE_DESCENDANTS=<n>: spawn n descendant branches
 //     (sh → sleep) that outlive the runtime process — the process-tree
 //     containment fixture (abuse addendum §47). The branches inherit this
@@ -124,6 +130,16 @@ func main() {
 	if err := json.NewDecoder(os.Stdin).Decode(&s); err != nil {
 		fmt.Fprintln(os.Stderr, "bad spec:", err)
 		os.Exit(2)
+	}
+
+	// PAGNET_FAKE_EXIT_DELAY: registered here, run at main's return —
+	// AFTER the last event has been written to the (unbuffered) stdout
+	// pipe — so the process stays alive past its terminal event on every
+	// exit path (completion, failure, lost). (os.Exit paths skip defers;
+	// those are fixture errors, not turn outcomes.)
+	if d := os.Getenv("PAGNET_FAKE_EXIT_DELAY"); d != "" {
+		delay := parseDuration(d)
+		defer time.Sleep(delay)
 	}
 
 	sessionPath := filepath.Join(s.SessionDir, "session.json")

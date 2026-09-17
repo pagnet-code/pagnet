@@ -223,12 +223,26 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	}
 	// Owner's reap (single Wait): after all stdout is drained. Also
 	// reclaims any descendants that outlived the runtime (§19/§24).
-	if err := h.Wait(); err != nil && ctx.Err() == nil {
+	waitErr := h.Wait()
+	if terminal {
+		// The turn's outcome is decided by the OBSERVED terminal event,
+		// never by the Wait result: the cleanup TERM just sent (or the
+		// ctx watcher's) can land in the helper's own exit window and
+		// make Wait report "signal: terminated" for a turn that already
+		// completed. A self-inflicted cleanup TERM is a normal exit, not
+		// a process error (the 2026-09-16 e2e turn-lifecycle race; the
+		// qwen/claude/opencode adapters apply the same rule).
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if waitErr != nil {
 		// Surface a crash as a process_error turn failure.
 		events <- TurnEvent{
 			Type:        EventTurnFailed,
 			FailureKind: domain.RuntimeFailureProcessError,
-			Error:       fmt.Sprintf("fake runtime exited: %v (%s)", err, stderrBuf.String()),
+			Error:       fmt.Sprintf("fake runtime exited: %v (%s)", waitErr, stderrBuf.String()),
 		}
 	}
 	return nil
