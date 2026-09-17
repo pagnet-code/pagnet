@@ -99,6 +99,26 @@ func SessionAttrs() *syscall.SysProcAttr {
 	return a
 }
 
+// SessionAttrsFor is the SysProcAttr for a PTY-owning ClassEndpoint
+// child (Phase 3 terminal session unification): the child's fd 0 is the
+// MACHINE pipe (the JSONL control channel), so the controlling terminal
+// must be named explicitly — Ctty = the PTY slave fd. Ctty: 0 (as in
+// SessionAttrs) would point at fd 0, which is not a tty, and TIOCSCTTY
+// would fail and kill the launch. This is why the supervisor opens the
+// PTY pair itself and calls cmd.Start() for this class instead of using
+// creack/pty's StartWithAttrs/StartWithSize (which leave Ctty = 0 and
+// overwrite the caller's SysProcAttr). Like SessionAttrs, the child is
+// the session leader (pgid == pid), and on platforms with
+// childDeathSignal it additionally gets the kernel parent-death
+// guarantee (see the seam above).
+func SessionAttrsFor(ctty int) *syscall.SysProcAttr {
+	a := &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: ctty}
+	if childDeathSignal && applyChildDeathSignal != nil {
+		applyChildDeathSignal(a)
+	}
+	return a
+}
+
 // SignalGroup sends sig to the whole process group pgid via the OS kill
 // syscall on the NEGATIVE pgid. §23: the critical cleanup path never
 // spawns a helper process — when the host is process-exhausted,

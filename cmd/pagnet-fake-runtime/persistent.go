@@ -46,6 +46,28 @@ package main
 //   - PAGNET_FAKE_INTERACTION_SUMMARY / _PAYLOAD / _ANSWER: shape the
 //     interaction.
 //   - PAGNET_FAKE_RATELIMIT / _RESUME_FAIL: failure simulation.
+//
+// TUI (Phase 3 terminal session unification): when the endpoint OWNS a
+// controlling terminal (the daemon launches it with a PTY), a
+// deterministic LINE-mode TUI runs on /dev/tty — the HUMAN plane:
+//
+//   - human lines typed on the tty are dispatched through the SAME
+//     turnQueue as machine submits (one turn at a time; pagnet owns
+//     serialisation);
+//   - turn events render to the tty (turn.output → its text,
+//     turn.completed → "done", interaction.started → "? <summary>"); the
+//     TUI does NOT answer interactions (those are resolved on the machine
+//     plane);
+//   - `let <k> <v>` / `print <k>` are session-memory commands (persisted
+//     in the session file, so they survive hibernate/wake);
+//   - the MACHINE plane (stdin/stdout JSONL) is untouched: the TUI is a
+//     second sink/source on the same process, never a replacement, and
+//     no PTY byte is ever interpreted as machine protocol.
+//
+// When /dev/tty cannot be opened (the endpoint was launched without a
+// PTY — the pre-Phase-3 shape, or a test), the TUI degrades OFF and
+// everything runs through the machine plane only (existing tests pass
+// unmodified).
 
 import (
 	"bufio"
@@ -54,6 +76,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -89,6 +113,84 @@ type persistEvent struct {
 func emitPersist(e persistEvent) {
 	b, _ := json.Marshal(e)
 	fmt.Fprintln(os.Stdout, string(b))
+}
+
+// openTUI opens the controlling terminal (the human plane) for the
+// endpoint's TUI. It returns nil — degrading the TUI OFF, with everything
+// running through the machine plane only — unless BOTH:
+//
+//   - the driver launched this endpoint WITH a TUI PTY (PAGNET_FAKE_TUI=1,
+//     set by the driver when its PTYSize is non-nil), AND
+//   - the controlling terminal is openable.
+//
+// The gate is the driver's signal, NOT "is /dev/tty openable": an endpoint
+// launched WITHOUT a PTY may still inherit a controlling terminal from its
+// parent's session (e.g. a test run from a terminal), and that inherited
+// tty is not the endpoint's own TUI. Turning the TUI on there would let the
+// human plane (an undrained inherited terminal) block the machine plane —
+// the TUI is a feature of the PTY-owning topology, not "any available tty".
+func openTUI() *os.File {
+	if os.Getenv("PAGNET_FAKE_TUI") != "1" {
+		return nil
+	}
+	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// sessionMemCmd is a parsed `let <k> <v>` / `print <k>` session-memory
+// command.
+type sessionMemCmd struct {
+	op    string // "let" | "print"
+	key   string
+	value string
+}
+
+// isMemKey reports whether s is a valid session-memory key: alphanumeric
+// plus '_', '-', '.' (an identifier-like token, never empty).
+func isMemKey(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r == '_' || r == '-' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sessionMemoryCmd scans the input's LINES for a session-memory command
+// (`let <k> <v>` or `print <k>`). It line-scans (rather than
+// prefix-matching the whole input) because a machine-plane delivery wraps
+// the body in a <pagnet-message> XML envelope: the command is a line
+// INSIDE the envelope, not the whole input. It returns nil when no line
+// is a memory command.
+func sessionMemoryCmd(input string) *sessionMemCmd {
+	for _, line := range strings.Split(input, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "let":
+			if len(f) == 3 && isMemKey(f[1]) {
+				return &sessionMemCmd{op: "let", key: f[1], value: f[2]}
+			}
+		case "print":
+			if len(f) == 2 && isMemKey(f[1]) {
+				return &sessionMemCmd{op: "print", key: f[1]}
+			}
+		}
+	}
+	return nil
 }
 
 // sigtermDrainTimeout bounds how long the SIGTERM (hibernate) path waits
@@ -138,12 +240,100 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	turnQueue := make(chan persistCmd, 16)
 	interactionCh := make(chan persistCmd, 1)
 
+	// TUI (human plane): open the controlling terminal when the endpoint
+	// owns one (the daemon launches it with a PTY). tty == nil degrades
+	// the TUI OFF (pre-Phase-3 shape / test): the machine plane alone
+	// carries everything.
+	tty := openTUI()
+	var ttyMu sync.Mutex
+	ttyDead := false
+	ttyWrite := func(s string) {
+		if tty == nil {
+			return
+		}
+		ttyMu.Lock()
+		defer ttyMu.Unlock()
+		if ttyDead {
+			return
+		}
+		if _, err := tty.WriteString(s); err != nil {
+			// The master went away (view torn down / endpoint stopping):
+			// stop trying — never block shutdown on a dead tty.
+			ttyDead = true
+		}
+	}
+
 	// stdout write serialisation (the worker and the main loop both emit).
 	var outMu sync.Mutex
 	emit := func(e persistEvent) {
 		outMu.Lock()
 		defer outMu.Unlock()
 		emitPersist(e)
+		// TUI: render the turn's visible events to the controlling
+		// terminal. A SECOND sink — the machine plane (stdout JSONL) was
+		// just emitted and is untouched. The TUI does NOT answer
+		// interactions (those resolve on the machine plane).
+		switch e.Event {
+		case "runtime.turn.output":
+			ttyWrite(e.Output + "\n")
+		case "runtime.turn.completed":
+			ttyWrite("done\n")
+		case "runtime.interaction.started":
+			ttyWrite("? " + e.Summary + "\n")
+		}
+	}
+
+	// stopping is closed at the START of shutdown. Every sender to the
+	// turn queue (the TUI reader below and the stdin dispatch) selects on
+	// it, so a shutdown can unblock a sender that is blocked on a full
+	// queue — closing the queue while a sender is blocked on it would
+	// panic (send on closed channel). A send case on an already-closed
+	// channel is never "ready" in a select, so once stopping is closed the
+	// select always resolves to the drop path, never a panic.
+	stopping := make(chan struct{})
+	tuiDone := make(chan struct{})
+	if tty != nil {
+		go func() {
+			defer close(tuiDone)
+			r := bufio.NewReader(tty)
+			for {
+				line, err := r.ReadString('\n')
+				if err != nil {
+					// tty closed (shutdown) or EOF (master closed): the
+					// TUI is done; the machine plane keeps running.
+					return
+				}
+				line = strings.TrimRight(line, "\r\n")
+				if line == "" {
+					continue
+				}
+				ttyWrite("you> " + line + "\n")
+				cmd := persistCmd{
+					Type:      "submit",
+					TurnID:    "tui-" + strconv.FormatInt(time.Now().UnixNano(), 10),
+					Input:     line,
+					InputKind: "user_input",
+				}
+				select {
+				case turnQueue <- cmd:
+				case <-stopping:
+					return
+				}
+			}
+		}()
+	}
+	// stopTUI closes the tty (unblocking the reader if it is waiting on a
+	// line) and waits for the reader to exit. It is called AFTER stopping
+	// is closed, so the reader has already dropped any in-flight send.
+	stopTUI := func() {
+		if tty == nil {
+			return
+		}
+		ttyMu.Lock()
+		ttyDead = true
+		_ = tty.Close()
+		ttyMu.Unlock()
+		<-tuiDone
 	}
 
 	workerDone := make(chan struct{})
@@ -167,7 +357,12 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	dispatch := func(cmd persistCmd) {
 		switch cmd.Type {
 		case "submit":
-			turnQueue <- cmd
+			// Select on stopping: a shutdown unblocks a full queue (a
+			// plain send would race the queue close and panic).
+			select {
+			case turnQueue <- cmd:
+			case <-stopping:
+			}
 		case "interaction":
 			interactionCh <- cmd
 		default:
@@ -175,10 +370,20 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 			// a known one).
 		}
 	}
-	// The turn queue is closed exactly once (the EOF path and the SIGTERM
-	// path both want to drain the worker; a double close would panic).
-	var closeQueueOnce sync.Once
-	closeTurnQueue := func() { closeQueueOnce.Do(func() { close(turnQueue) }) }
+	// shutdown begins the orderly teardown, exactly once (the stdin-EOF
+	// path and the SIGTERM path both want to drain the worker; a double
+	// close of stopping or the queue would panic). Order matters:
+	//   1. close stopping  — every sender drops its in-flight send;
+	//   2. stopTUI         — close the tty, wait for the TUI reader out;
+	//   3. close the queue — safe now: no sender is blocked on it.
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			close(stopping)
+			stopTUI()
+			close(turnQueue)
+		})
+	}
 
 	readLoop := make(chan struct{})
 	go func() {
@@ -190,23 +395,23 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 			}
 			dispatch(cmd)
 		}
-		// EOF: close the turn queue so the worker drains and exits.
-		closeTurnQueue()
+		// EOF: begin the orderly teardown so the worker drains and exits.
+		shutdown()
 	}()
 
 	select {
 	case <-sigCh:
 		// Hibernate: drain the in-flight worker BEFORE saving (R2 — the EOF
 		// path already did; the SIGTERM path must too, or the save races
-		// the worker's own session write). Closing the turn queue lets the
-		// worker finish its in-flight turn (which saves the session at the
-		// end of the turn). The drain is BOUNDED: a worker blocked on a
-		// native interaction would otherwise hang shutdown past the
-		// supervisor's TERM→grace→KILL window. When the drain times out
-		// (worker still blocked), do NOT save — it would race the worker's
-		// own write; the last COMPLETED turn is already saved by
-		// runPersistTurn.
-		closeTurnQueue()
+		// the worker's own session write). shutdown() stops the senders
+		// and closes the turn queue, letting the worker finish its
+		// in-flight turn (which saves the session at the end of the turn).
+		// The drain is BOUNDED: a worker blocked on a native interaction
+		// would otherwise hang shutdown past the supervisor's
+		// TERM→grace→KILL window. When the drain times out (worker still
+		// blocked), do NOT save — it would race the worker's own write;
+		// the last COMPLETED turn is already saved by runPersistTurn.
+		shutdown()
 		select {
 		case <-workerDone:
 			// The worker finished (and saved the session for its last turn).
@@ -217,7 +422,8 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 			return
 		}
 	case <-readLoop:
-		// stdin closed: drain in-flight work, then exit.
+		// stdin closed: the readLoop goroutine already ran shutdown();
+		// drain in-flight work, then exit.
 		<-workerDone
 	}
 	if prev != nil {
@@ -249,6 +455,41 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 		}
 		emit(persistEvent{Event: "runtime.turn.failed", TurnID: cmd.TurnID, SessionID: prev.SessionID,
 			Kind: "rate_limited", Error: "rate limited (simulated)", RetryAt: retryAt})
+		emit(persistEvent{Event: "runtime.idle", TurnID: cmd.TurnID, SessionID: prev.SessionID})
+		return
+	}
+
+	// Session memory (Phase 3): `let <k> <v>` stores a value, `print <k>`
+	// reads it back. Both are FULL turns (busy/started/output/completed/
+	// idle, Turns++, persisted) so they flow through the same turn
+	// lifecycle — and because the value is persisted in the session file,
+	// it survives hibernate/wake (invariant F).
+	if mem := sessionMemoryCmd(cmd.Input); mem != nil {
+		var out string
+		if mem.op == "let" {
+			if prev.Vars == nil {
+				prev.Vars = map[string]string{}
+			}
+			prev.Vars[mem.key] = mem.value
+			out = fmt.Sprintf("[fake-persist %s] let %s = %s",
+				kindOr(cmd.InputKind, "turn"), mem.key, mem.value)
+		} else {
+			if v, ok := prev.Vars[mem.key]; ok {
+				out = fmt.Sprintf("[fake-persist %s] print %s: %s",
+					kindOr(cmd.InputKind, "turn"), mem.key, v)
+			} else {
+				out = fmt.Sprintf("[fake-persist %s] print %s: %s unset",
+					kindOr(cmd.InputKind, "turn"), mem.key, mem.key)
+			}
+		}
+		emit(persistEvent{Event: "runtime.turn.output", TurnID: cmd.TurnID, SessionID: prev.SessionID, Output: out})
+		prev.Turns++
+		prev.LastInput = firstLine(cmd.Input)
+		prev.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		_ = saveSession(sessionPath, prev)
+		emit(persistEvent{
+			Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1",
+		})
 		emit(persistEvent{Event: "runtime.idle", TurnID: cmd.TurnID, SessionID: prev.SessionID})
 		return
 	}

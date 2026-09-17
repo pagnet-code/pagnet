@@ -21,6 +21,9 @@ func GroupAttrs() *syscall.SysProcAttr { return nil }
 // SessionAttrs is unsupported here.
 func SessionAttrs() *syscall.SysProcAttr { return nil }
 
+// SessionAttrsFor is unsupported here (mirrors SessionAttrs).
+func SessionAttrsFor(ctty int) *syscall.SysProcAttr { return nil }
+
 // SignalGroup is unsupported here.
 func SignalGroup(pgid int, sig syscall.Signal) error { return errUnsupported }
 

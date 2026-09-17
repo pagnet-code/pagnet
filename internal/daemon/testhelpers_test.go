@@ -33,8 +33,22 @@ func p0FakeBinary(t *testing.T) string {
 	bin := filepath.Join(dir, "pagnet-fake-runtime")
 	needBuild := true
 	if fi, err := os.Stat(bin); err == nil {
-		if src, err := os.Stat(filepath.Join("..", "..", "cmd", "pagnet-fake-runtime", "main.go")); err == nil && fi.ModTime().After(src.ModTime()) {
-			needBuild = false
+		// Track the NEWEST source file in the package (not just main.go):
+		// the fake runtime spans multiple files (main.go, persistent.go,
+		// ...), and a change to ANY of them must trigger a rebuild — a
+		// main.go-only check silently serves a stale binary after a
+		// non-main.go edit.
+		srcFiles, gerr := filepath.Glob(filepath.Join("..", "..", "cmd", "pagnet-fake-runtime", "*.go"))
+		if gerr == nil {
+			var newest time.Time
+			for _, f := range srcFiles {
+				if s, serr := os.Stat(f); serr == nil && s.ModTime().After(newest) {
+					newest = s.ModTime()
+				}
+			}
+			if !newest.IsZero() && fi.ModTime().After(newest) {
+				needBuild = false
+			}
 		}
 	}
 	if needBuild {

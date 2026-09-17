@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/creack/pty"
+
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -47,6 +49,12 @@ type PersistentFake struct {
 	// Env is appended to the inherited environment for the endpoint
 	// process (E2E simulation knobs, e.g. PAGNET_FAKE_INTERACTION).
 	Env []string
+	// PTYSize, when non-nil, makes each endpoint OWN its TUI PTY (Phase 3
+	// terminal session unification): the supervisor launches the endpoint
+	// with the PTY slave as its controlling terminal (the human plane)
+	// while the stdin/stdout pipes remain the machine plane. nil keeps the
+	// pre-Phase-3 shape (no PTY; the fake's TUI degrades off).
+	PTYSize *pty.Winsize
 
 	life lifecycleState
 
@@ -71,16 +79,21 @@ func (f *PersistentFake) Name() domain.RuntimeName { return domain.RuntimeFakePe
 // capability advertisement — addendum §15/§17).
 func (f *PersistentFake) Capabilities() session.Capabilities {
 	return session.Capabilities{
-		PersistentEndpoint:              true,
-		MultipleSessionsPerEndpoint:     false, // one session per endpoint (v1)
-		StructuredEvents:                true,
-		NativeSubmit:                    true,
-		NativeQueueWhileBusy:            false, // pagnet owns serialisation
-		NativeSteer:                     false,
-		Interrupt:                       false,
-		NativeInteractionObserve:        true,
-		RemoteInteractionResolve:        true,
-		NativeTUI:                       false, // the persistent mode has no TUI
+		PersistentEndpoint:          true,
+		MultipleSessionsPerEndpoint: false, // one session per endpoint (v1)
+		StructuredEvents:            true,
+		NativeSubmit:                true,
+		NativeQueueWhileBusy:        false, // pagnet owns serialisation
+		NativeSteer:                 false,
+		Interrupt:                   false,
+		NativeInteractionObserve:    true,
+		RemoteInteractionResolve:    true,
+		// Phase 3 (terminal session unification): the persistent endpoint
+		// OWNS a native TUI on its controlling terminal (the fake's
+		// deterministic line-mode TUI on /dev/tty). The daemon's terminal
+		// plane attaches a human to that PTY instead of spawning a second
+		// interactive process.
+		NativeTUI:                       true,
 		SecondClientTerminalAttach:      false,
 		TerminalAttachmentFullAuthority: false,
 		LiveExternalAdoption:            false,
@@ -237,6 +250,24 @@ func (f *PersistentFake) Live(instanceID string) bool {
 	e := f.endpoints[instanceID]
 	f.mu.Unlock()
 	return e != nil && e.live()
+}
+
+// PTYMaster is the endpoint's TUI PTY master (the human plane) — nil when
+// the endpoint is not live or was launched without a PTY (the pre-Phase-3
+// shape). It implements the session.PTYOwner interface so the daemon's
+// terminal plane can attach a human to the ENDPOINT'S OWN PTY instead of
+// spawning a second interactive process. The master is owned by the
+// process handle: callers hold it as a VIEW and never close it (the
+// handle closes it at cleanup; a closed master is EOF to the view, which
+// tears the view down observationally).
+func (f *PersistentFake) PTYMaster(instanceID string) *os.File {
+	f.mu.Lock()
+	e := f.endpoints[instanceID]
+	f.mu.Unlock()
+	if e == nil || !e.live() || e.h == nil {
+		return nil
+	}
+	return e.h.PTY()
 }
 
 // Available reports whether the fake runtime's binary is resolvable (the
@@ -398,6 +429,17 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if !hasMarker {
 		env = append(env, "PAGNET_INSTANCE_ID="+sess.InstanceID)
 	}
+	// Phase 3 (terminal session unification): when this driver launches the
+	// endpoint WITH a TUI PTY (PTYSize non-nil), it tells the fake to turn
+	// its TUI on. The fake gates its TUI on this signal (NOT on "is /dev/tty
+	// openable"): an endpoint launched WITHOUT a PTY may still inherit a
+	// controlling terminal from its parent's session, and that inherited
+	// tty is not the endpoint's own TUI — turning the TUI on there would
+	// let the human plane (an undrained inherited terminal) block the
+	// machine plane. The TUI is a feature of the PTY-owning topology.
+	if f.PTYSize != nil {
+		env = append(env, "PAGNET_FAKE_TUI=1")
+	}
 	cmd.Env = ChildEnv(f.Env, env)
 
 	stdin, err := cmd.StdinPipe()
@@ -432,6 +474,11 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		Class:      proc.ClassEndpoint,
 		Cmd:        cmd,
 		Marker:     "PAGNET_INSTANCE_ID=" + sess.InstanceID,
+		// Phase 3: when the driver is configured with a PTYSize, the
+		// endpoint OWNS its TUI PTY (the supervisor opens the pair and
+		// makes the slave the controlling terminal). nil = pre-Phase-3
+		// shape (no PTY).
+		PTYSize: f.PTYSize,
 	})
 	if err != nil {
 		return nil, err
@@ -511,8 +558,19 @@ func (e *persistEndpoint) readLoop() {
 func (e *persistEndpoint) routeTurnEvent(norm session.SessionEvent) {
 	e.mu.Lock()
 	ch := e.currentTurnEvents
+	turnID := e.currentTurnID
 	e.mu.Unlock()
 	if ch == nil {
+		return
+	}
+	// Phase 3 (terminal session unification): a turn NOT initiated by the
+	// current machine submit (the TUI's human turn, dispatched through the
+	// same in-process turn queue) carries its own turn id. Its events are
+	// rendered to the TUI (the human plane) and are NOT part of this
+	// submit's stream — forwarding them would cross the streams (a double
+	// turn.completed for one submit, an attribution anomaly). The machine
+	// plane only ever sees events for the turn it submitted.
+	if norm.TurnID != "" && norm.TurnID != turnID {
 		return
 	}
 	ch <- norm

@@ -108,6 +108,15 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// Export the state dir into the process environment so the session-driven
+	// driver (persistent_fake.stateDir) and the supervisor (supervisor.go)
+	// resolve the SAME dir as the daemon's --state-dir. Without this, the
+	// driver falls back to ~/.local/state/pagnet and writes session files
+	// where the e2e harness (and the daemon's own state) cannot find them.
+	if cfg.StateDir != "" {
+		os.Setenv("PAGNET_STATE_DIR", cfg.StateDir)
+	}
+
 	d, err := daemon.New(daemon.Config{
 		ServerURL:    cfg.ServerURL,
 		Credential:   cfg.Credential,

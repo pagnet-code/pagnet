@@ -65,6 +65,10 @@ type session struct {
 	Turns     int    `json:"turns"`
 	LastInput string `json:"lastInput,omitempty"`
 	UpdatedAt string `json:"updatedAt"`
+	// Vars is the endpoint's session memory (Phase 3 terminal session
+	// unification): `let <k> <v>` / `print <k>` persist here so the value
+	// survives hibernate/wake (the session file is the resume payload).
+	Vars map[string]string `json:"vars,omitempty"`
 	// pagnet injection observed by the runtime process (spec E2E 8:
 	// "MCP injected, coordination contract injected"). Real runtimes
 	// consume the MCP config as their MCP client config; the fake only

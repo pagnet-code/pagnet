@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"golang.org/x/sys/unix"
 
@@ -440,6 +441,14 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		sessions = session.NewManager()
 		persistentFake = agentruntime.NewPersistentFake("")
 		persistentFake.Env = cfg.RuntimeEnv
+		// Phase 3 (terminal session unification): the fake persistent
+		// endpoint OWNS its TUI PTY, so a terminal attach connects a human
+		// to the ENDPOINT'S OWN PTY (the human plane) instead of spawning a
+		// second interactive process. The PTY is allocated per-endpoint at
+		// launch (PTYSize non-nil); PTY ownership stays optional — a
+		// runtime whose driver leaves PTYSize nil keeps the no-PTY topology
+		// (invariant I1).
+		persistentFake.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		sessions.RegisterDriver(persistentFake)
 	}
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
@@ -2143,11 +2152,13 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 //     "idle" is hibernatable) plus the Manager's own StateBusy refusal;
 //   - a session with an unresolved interaction — the pending-interaction
 //     gate below plus the Manager's own refusal;
-//   - an actively attached terminal — the keep-awake gate below. The full
-//     attached-terminal surface for session-driven instances (attaching a
-//     human to the endpoint's native UI) lands with Phase 3 (terminal
-//     session unification); the gate is in place now so the trigger
-//     semantics are already complete.
+//   - an actively attached terminal — the keep-awake gate below. Phase 3
+//     (terminal session unification) landed the attached-terminal surface
+//     for session-driven instances: a human attaches to the ENDPOINT'S OWN
+//     TUI PTY (a terminal VIEW), and keep-awake is the HUMAN attach
+//     (d.attached) — NOT the view itself (A6: terminal.active excludes
+//     views, so a detached view does not block hibernation of an idle
+//     endpoint).
 //
 // It is a no-op (nil) when the instance is kept awake by an attach/PTY.
 func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason string) error {
@@ -2652,19 +2663,13 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 // so the PID is stable across turns. Hibernation (stopping the endpoint,
 // preserving the session) is a separate, explicit operation.
 func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnSpec, row *InstanceRow) error {
-	runtime := domain.RuntimeName(row.Runtime)
 	started := time.Now()
 
-	// The session this turn runs in. Restore the pagnet-persisted native id
-	// (row.SessionID) so a daemon restart can resume the stored session
-	// (Codex R4: the id is pagnet-persisted, never vendor-listed).
-	sess := d.sessions.Session(spec.InstanceID, runtime, spec.Workspace)
-	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
-	// Launch env (Phase 2 / R8): the endpoint (re)activation uses the turn
-	// spec's env — the daemon's per-instance injection (identity vars, MCP
-	// bridge config, coordination contract). The env is fixed at spawn; a
-	// change restarts the endpoint (session.RuntimeSession.Env semantics).
-	d.sessions.SetLaunchEnv(sess, spec.Env)
+	// The session this turn runs in (prepareSession: the pagnet-persisted
+	// native id is restored so a daemon restart can resume the stored
+	// session — Codex R4 — and the launch env is set for the endpoint
+	// (re)activation).
+	sess := d.prepareSession(row, spec)
 
 	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
@@ -2741,6 +2746,11 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		}
 	}
 	<-submitDone
+
+	// Phase 3 (A5/G8): the endpoint was (re)activated by this turn — the
+	// human-plane view onto its PTY is ensured at the activation site
+	// (no-op unless the endpoint owns a PTY and is live).
+	d.ensureEndpointView(row)
 
 	attemptedSession := sessionID
 	if attemptedSession == "" {
@@ -2854,6 +2864,196 @@ func sessionInteractionToAdapter(ie *session.InteractionEvent) *agentruntime.Int
 	}
 }
 
+// --- Phase 3: session-driven terminal plane (terminal session unification) ---
+//
+// A session-driven runtime's terminal is the ENDPOINT'S OWN PTY (A1): one
+// process owns both planes — the PTY is the HUMAN plane (raw bytes to the
+// native TUI), the JSONL pipes are the MACHINE plane (native protocol;
+// never PTY keystrokes). Attach (A3) = "ensure the session is active, then
+// view its PTY": hibernated → wake/resume, live → observational, and NEVER
+// a second interactive process. The view (terminal.attachEndpoint) is
+// created at ACTIVATION (A5/G8); keep-awake is the human attach
+// (d.attached), not the view (A6).
+
+// prepareSession is the session setup shared by every session-driven
+// activation path (turns and attach): the logical session for the row,
+// with the pagnet-persisted native id restored (Codex R4: the id is
+// pagnet-persisted, never vendor-listed) and the launch env set (Phase 2 /
+// R8: fixed at spawn; a change restarts the endpoint —
+// session.RuntimeSession.Env semantics).
+func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *session.RuntimeSession {
+	sess := d.sessions.Session(spec.InstanceID, domain.RuntimeName(row.Runtime), spec.Workspace)
+	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
+	d.sessions.SetLaunchEnv(sess, spec.Env)
+	return sess
+}
+
+// ensureEndpointView creates (or reconciles to) the human-plane VIEW onto
+// a session-driven endpoint's own TUI PTY, at the ACTIVATION site (A5/G8:
+// the view exists from activation, not from the first attach). It is a
+// no-op unless the instance is session-driven AND the endpoint is live
+// with a PTY (PTYSize-gated — the no-PTY topology is first-class, I1).
+// The view is observational (it never owns the endpoint's lifecycle, G3/G5)
+// and does NOT keep the instance awake (A6: keep-awake is d.attached).
+//
+// The config fingerprint (P6 configStale) is stamped only when a NEW view
+// is created — i.e. at a genuine (re)activation, when the running endpoint
+// was just launched with the daemon's CURRENT injected config. A reconcile
+// to an existing view never re-stamps: the fingerprint must keep describing
+// the config the running endpoint was actually launched with.
+func (d *Daemon) ensureEndpointView(row *InstanceRow) {
+	if d.sessionDriverFor(row) == nil {
+		return
+	}
+	master := d.sessions.PTYMaster(row.InstanceID)
+	if master == nil {
+		return // no live endpoint, or a PTY-less endpoint (I1)
+	}
+	if _, created, err := d.terminal.attachEndpoint(row.InstanceID, master); err != nil {
+		d.Log.Warn("endpoint view attach failed", "instance", row.InstanceID,
+			"error", err.Error())
+		return
+	} else if created {
+		_ = d.state.SetInstanceConfigFingerprint(row.InstanceID, d.instanceFingerprint(row))
+	}
+}
+
+// attachSessionDriven is the doAttach path for a session-driven runtime
+// (A3): it connects the human to the ENDPOINT'S OWN PTY. It never spawns a
+// second interactive process — a hibernated (or live-but-endpoint-gone)
+// instance is woken/resumed through the SAME activation path a turn uses
+// (EnsureActive), and a live instance is attached to observationally.
+func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalAttachPayload, row *InstanceRow) error {
+	// Capability gate: the terminal surface exists only when the runtime
+	// has a native TUI. Refuse BEFORE any attach bookkeeping (no
+	// addAttach for a refused attach) — an honest "no terminal surface",
+	// never a spawned stand-in process.
+	if !d.sessionDriverFor(row).Capabilities().NativeTUI {
+		return fmt.Errorf("instance %s runtime %s has no terminal surface (no native TUI); attach refused",
+			p.InstanceID, row.Runtime)
+	}
+	switch row.Status {
+	case "hibernated":
+		// Wake/resume: the session is materialised (or cold-started when
+		// it never was); a lost session blocks the instance (invariant F).
+		if err := d.activateSessionForAttach(conn, row); err != nil {
+			return err
+		}
+	case "idle":
+		if d.sessions.PTYMaster(row.InstanceID) == nil {
+			// Idle on paper but the endpoint is not live (a daemon restart
+			// leaves the persisted status behind; the process cannot
+			// survive it). (Re)activate — resume when materialised.
+			if err := d.activateSessionForAttach(conn, row); err != nil {
+				return err
+			}
+		}
+		// Live endpoint: observational attach (the view was ensured at the
+		// activation site — A5; ensure it idempotently).
+		d.ensureEndpointView(row)
+	case "working", "waking", "starting":
+		// A turn is driving the live endpoint: attach observationally
+		// (the view exists from the activation site; ensure idempotently).
+		d.ensureEndpointView(row)
+	default:
+		// "blocked"/"failed"/"stopped" are already refused by doAttach;
+		// any other status (e.g. "hibernating") is not attachable.
+		return fmt.Errorf("instance %s is %s; attach refused", p.InstanceID, row.Status)
+	}
+	d.addAttach(p.InstanceID, p.SessionID)
+	master := d.sessions.PTYMaster(row.InstanceID)
+	if master == nil {
+		d.removeAttach(p.InstanceID, p.SessionID)
+		return fmt.Errorf("instance %s endpoint is not active; attach refused", p.InstanceID)
+	}
+	s, _, err := d.terminal.attachEndpoint(p.InstanceID, master)
+	if err != nil {
+		d.removeAttach(p.InstanceID, p.SessionID)
+		return err
+	}
+	// The snapshot is sent right after the attach (durable command →
+	// this worker), so any output produced since the last attach is
+	// replayed before live frames for the new client (§11).
+	data, lastSeq := d.terminal.snapshot(s)
+	_ = d.send(conn, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+		InstanceID:  p.InstanceID,
+		SessionID:   p.SessionID,
+		Data:        data,
+		Snapshot:    true,
+		LastSeq:     lastSeq,
+		ConfigStale: d.configStaleFor(p.InstanceID),
+	})
+	return nil
+}
+
+// activateSessionForAttach (re)activates a session-driven instance's
+// endpoint so a terminal attach has a live PTY to view. It is the SAME
+// activation path a turn uses (prepareSession + EnsureActive) — no
+// separate wake machinery, no second process.
+//
+// Outcomes:
+//   - success: the session events are reported (started/resumed), the
+//     instance is idle (a live endpoint, no turn in flight), and the view
+//     is ensured at this activation site (A5/G8).
+//   - ErrSessionLost: the stored session is unrecoverable — drop the local
+//     reference and BLOCK the instance until a human explicitly restarts
+//     (invariant F: never a silent fresh session).
+//   - any other error: the attach is refused (the instance status is left
+//     for the turn/hibernate paths to settle).
+func (d *Daemon) activateSessionForAttach(conn *websocket.Conn, row *InstanceRow) error {
+	spec := d.turnSpecFor(row, row.SessionID != "", "", "terminal")
+	sess := d.prepareSession(row, spec)
+	events := make(chan session.SessionEvent, 16)
+	_, err := d.sessions.EnsureActive(d.turnCtx, sess, events)
+	// The driver sends the activation events and returns when activation
+	// settles (it does NOT close the channel — the caller owns the
+	// lifecycle). Drain non-blockingly, then close.
+drain:
+	for {
+		select {
+		case ev := <-events:
+			switch ev.Type {
+			case session.EventSessionStarted, session.EventSessionResumed:
+				d.reportSession(conn, row.InstanceID, ev.SessionID,
+					ev.Type == session.EventSessionResumed)
+				_ = d.state.SetInstanceStatus(row.InstanceID, "working", ev.SessionID)
+			case session.EventSessionLost:
+				// Surfaced via the error below (invariant F).
+			}
+		default:
+			break drain
+		}
+	}
+	close(events)
+	if err != nil {
+		if errors.Is(err, session.ErrSessionLost) {
+			// The resume failed — do NOT silently start a fresh session.
+			// Drop the local reference and block until a human explicitly
+			// restarts (cold start). Same handling as the turn path.
+			_ = d.state.SetInstanceSession(row.InstanceID, "")
+			_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
+			d.Log.Warn("attach activation lost the session; instance blocked",
+				"instance", row.InstanceID)
+			return fmt.Errorf("session lost: no resumable session (instance blocked)")
+		}
+		d.Log.Warn("attach activation failed", "instance", row.InstanceID,
+			"error", err.Error())
+		return err
+	}
+	sessionID := row.SessionID
+	if sess.NativeID != "" {
+		sessionID = sess.NativeID
+	}
+	_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
+	_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+		"instanceId": row.InstanceID, "status": "idle",
+	})
+	d.Log.Info("attach activated endpoint (session-driven)", "instance", row.InstanceID,
+		"session", sessionID)
+	d.ensureEndpointView(row)
+	return nil
+}
+
 // --- attach sessions (§35) ---------------------------------------------------
 
 func (d *Daemon) addAttach(instanceID, sessionID string) {
@@ -2902,6 +3102,14 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	case "blocked", "failed", "stopped":
 		return fmt.Errorf("instance %s is %s; attach refused", p.InstanceID, row.Status)
 	}
+	// Phase 3 (A3): a session-driven runtime's terminal is the ENDPOINT'S
+	// OWN PTY. Attach connects the human to it — waking/resuming the
+	// session if the endpoint is not live, and attaching observationally
+	// if it is — and NEVER spawns a second interactive process. The
+	// legacy ClassPTY path below is unchanged for non-session runtimes.
+	if d.sessionDriverFor(row) != nil {
+		return d.attachSessionDriven(conn, p, row)
+	}
 	d.addAttach(p.InstanceID, p.SessionID)
 
 	s, err := d.terminal.start(p.InstanceID, row.SessionID != "")
@@ -2943,8 +3151,10 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 	if !last {
 		// Other clients still hold this instance's shared PTY: restore one
 		// of their geometries — the shared size would otherwise stick
-		// with the client that just left.
-		if d.terminal.active(p.InstanceID) {
+		// with the client that just left. hasSession (not active): a
+		// session-driven instance's endpoint VIEW also has a shared size
+		// to restore for its surviving clients (Phase 3).
+		if d.terminal.hasSession(p.InstanceID) {
 			d.terminal.reapplySize(p.InstanceID, p.SessionID)
 		}
 		return nil

@@ -63,9 +63,19 @@ const (
 	ClassPTY
 	// ClassEndpoint is a long-lived persistent runtime endpoint (the
 	// runtime-lifecycle refactor): one per instance, isolated process
-	// group via Setpgid (no PTY), NOT subject to the per-turn semaphore.
-	// It survives logical turns and is hibernated/woken by the session
+	// group via Setpgid, NOT subject to the per-turn semaphore. It
+	// survives logical turns and is hibernated/woken by the session
 	// core, never killed by a turn ending.
+	//
+	// Phase 3 (terminal session unification): launched WITH a PTYSize,
+	// the endpoint OWNS its TUI PTY — the PTY slave is its controlling
+	// terminal (the HUMAN plane; the runtime's TUI renders there and
+	// reads human lines from it) while the caller's stdin/stdout pipes
+	// remain the MACHINE plane (the JSONL control channel). The attrs
+	// then use Setsid+Setctty with Ctty = the slave fd (see
+	// SessionAttrsFor). Launched WITHOUT a PTYSize, the class keeps its
+	// pre-Phase-3 shape byte-for-byte (Setpgid, no PTY, no controlling
+	// terminal).
 	ClassEndpoint
 )
 
@@ -100,7 +110,13 @@ type LaunchRequest struct {
 	// classes — the stdin/stdout pipes). The supervisor owns the Start,
 	// the process group, and the lifecycle from here.
 	Cmd *exec.Cmd
-	// PTYSize is the initial winsize for ClassPTY launches.
+	// PTYSize is the initial winsize for ClassPTY launches, and — for
+	// ClassEndpoint launches — the marker that the endpoint OWNS its TUI
+	// PTY (Phase 3 terminal session unification): a non-nil PTYSize on a
+	// ClassEndpoint makes the PTY slave the endpoint's controlling
+	// terminal (the human plane) while Cmd.Stdin/Stdout stay the machine
+	// plane. A nil PTYSize on a ClassEndpoint keeps the pre-Phase-3
+	// shape (no PTY, no controlling terminal).
 	PTYSize *pty.Winsize
 	// Marker is the full ownership-marker env pair (e.g.
 	// "PAGNET_TURN_ID=<id>") that is ALREADY in Cmd.Env; it is stored in
@@ -582,15 +598,61 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		}
 		var master *os.File
 		master, startErr = pty.StartWithAttrs(req.Cmd, ws, SessionAttrs())
-		t.ptyMaster = master
+		t.ptyMaster.Store(master)
+	case ClassEndpoint:
+		if req.PTYSize != nil {
+			// PTY-owning endpoint (Phase 3 terminal session unification,
+			// topology A1): the endpoint OWNS its TUI PTY — the PTY slave
+			// is its CONTROLLING terminal (the human plane) while
+			// Cmd.Stdin/Stdout stay the machine plane (the JSONL control
+			// channel — untouched).
+			//
+			// The pair is opened HERE and cmd.Start() is called directly —
+			// never pty.StartWithAttrs/StartWithSize (gotcha G1): with fd
+			// 0 = the machine pipe, the controlling terminal must be set
+			// with Ctty = the slave fd. creack/pty's StartWith* leave
+			// Ctty = 0 (valid only because they wire the slave to fd 0)
+			// and OVERWRITE c.SysProcAttr; Ctty: 0 here would point at
+			// the machine pipe, which is not a tty — TIOCSCTTY fails and
+			// the launch dies.
+			//
+			// The slave must be a valid fd in the CHILD: Go validates
+			// Ctty against the child's fd list, and the kernel's
+			// TIOCSCTTY needs an open fd. os.File fds are CLOEXEC, so the
+			// slave is passed as the LAST extra file (child fd 3 + any
+			// caller extras) and Ctty points at that child fd.
+			ws := req.PTYSize
+			master, slave, openErr := pty.Open()
+			if openErr != nil {
+				startErr = openErr
+			} else {
+				_ = pty.Setsize(master, ws)
+				ctty := 3 + len(req.Cmd.ExtraFiles)
+				req.Cmd.ExtraFiles = append(req.Cmd.ExtraFiles, slave)
+				req.Cmd.SysProcAttr = SessionAttrsFor(ctty)
+				startErr = req.Cmd.Start()
+				// The parent keeps only the master; the child holds the
+				// slave as its controlling terminal (inherited extra fd).
+				_ = slave.Close()
+				if startErr == nil {
+					t.ptyMaster.Store(master)
+				} else {
+					_ = master.Close()
+				}
+			}
+		} else {
+			// No PTY (the pre-Phase-3 endpoint shape): byte-identical to
+			// today — group-isolated, no controlling terminal.
+			req.Cmd.SysProcAttr = GroupAttrs()
+			startErr = req.Cmd.Start()
+		}
 	default:
 		req.Cmd.SysProcAttr = GroupAttrs()
 		startErr = req.Cmd.Start()
 	}
 	if startErr != nil {
-		if t.ptyMaster != nil {
-			_ = t.ptyMaster.Close()
-			t.ptyMaster = nil
+		if m := t.ptyMaster.Swap(nil); m != nil {
+			_ = m.Close()
 		}
 		var err error
 		if IsResourcePressureError(startErr) {
@@ -729,8 +791,11 @@ func (h *Handle) PGID() int { return int(h.t.pgid.Load()) }
 // reaps).
 func (h *Handle) Exit() <-chan Exit { return h.t.exitCh }
 
-// PTY is the PTY master (ClassPTY handles only; nil for turns).
-func (h *Handle) PTY() *os.File { return h.t.ptyMaster }
+// PTY is the PTY master (ClassPTY handles and PTY-owning ClassEndpoint
+// handles; nil for turns and PTY-less endpoints). The master is owned
+// by the handle: it is closed at handle cleanup, and callers (the
+// terminal view, Phase 3) hold it as a VIEW and never close it.
+func (h *Handle) PTY() *os.File { return h.t.ptyMaster.Load() }
 
 // Wait is the OWNER's reap: call it exactly once, from the goroutine
 // that read the process's stdout (turn) or owns the session (PTY),
@@ -783,8 +848,13 @@ type managedTurn struct {
 	Runtime string
 	Marker  string
 
-	cmd       *exec.Cmd
-	ptyMaster *os.File
+	cmd *exec.Cmd
+	// ptyMaster is atomic: Launch stores it (before the handle is
+	// published) and finish() swaps it to nil (after the process exits)
+	// from the owner's reap goroutine, while Handle.PTY() reads it from
+	// other goroutines (the terminal view, Phase 3). A plain *os.File
+	// would be a data race (caught by -race).
+	ptyMaster atomic.Pointer[os.File]
 	// pid/pgid are atomic: Launch writes them (after the process starts,
 	// outside s.mu) and the monitor + Handle.PID/PGID read them from other
 	// goroutines without s.mu. A plain int would be a data race (caught by
@@ -909,9 +979,8 @@ func (t *managedTurn) finish(waitErr error) Exit {
 	})
 	// PTY master backstop close (cmd.Wait already closed it via the
 	// descriptor cleanup; this covers the launch-failure path).
-	if t.ptyMaster != nil {
-		_ = t.ptyMaster.Close()
-		t.ptyMaster = nil
+	if m := t.ptyMaster.Swap(nil); m != nil {
+		_ = m.Close()
 	}
 	t.s.cleanup(t)
 	// Post-reap group verification (§23): the direct child is reaped, so
@@ -1099,6 +1168,16 @@ func (s *Supervisor) EndpointPID(instanceID string) *int {
 	}
 	p := int(t.pid.Load())
 	return &p
+}
+
+// EndpointCount is the number of live ClassEndpoint handles. The
+// auto-update idle gate uses it (Phase 3 A7): a re-exec with a live
+// endpoint would orphan it — the endpoint outlives turns, so nothing
+// else would stop it.
+func (s *Supervisor) EndpointCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.endpointByInst)
 }
 
 // --- guards ------------------------------------------------------------------

@@ -88,6 +88,22 @@ type ptySession struct {
 	// killed marks an explicit Stop: the exit watcher must NOT emit the
 	// natural-exit (hibernated) event — the stopper owns instance state.
 	killed bool
+
+	// endpointView marks a Phase 3 (terminal session unification) VIEW of
+	// a session-driven endpoint's OWN TUI PTY, as opposed to a legacy
+	// ClassPTY session the terminal plane launched itself. A view:
+	//   - holds h == nil (the endpoint's handle is owned by the session
+	//     core / its driver — the view never Waits or Terminates it, G3/G5);
+	//   - holds f = the endpoint's PTY master as a VIEW (never closes it —
+	//     the process handle owns it; a closed master is EOF to the view);
+	//   - is torn down observationally on master EOF (eofCh): the session
+	//     core owns the endpoint's lifecycle and instance status, so the
+	//     view's teardown writes NO status and emits NO hibernated event.
+	endpointView bool
+	// eofCh is closed when the view's master hits EOF (the endpoint died).
+	// It is the view's exit signal (readLoop closes it; exitLoop waits on
+	// it). Legacy sessions leave it nil.
+	eofCh chan struct{}
 }
 
 // terminalLiveMsg is one input/resize unit on the ordered live channel.
@@ -223,18 +239,33 @@ func (tm *terminalManager) reapplySize(instanceID, excludeSession string) {
 		"instance", instanceID, "cols", bestSz.cols, "rows", bestSz.rows)
 }
 
-// active reports whether the instance has a live PTY (§35 keep-awake:
-// while attached OR PTY-active the daemon does not hibernate).
+// active reports whether the instance has a live LEGACY PTY session (§35
+// keep-awake: while attached OR PTY-active the daemon does not hibernate).
+// Phase 3 (A6): endpoint VIEWS are excluded — a view is an observational
+// relay of an endpoint the session core already keeps alive; counting it
+// as "terminal-active" would block hibernation of an idle endpoint that
+// merely has a (possibly detached) view. Keep-awake for a session-driven
+// endpoint is the HUMAN attach (d.attached), not the view.
 func (tm *terminalManager) active(instanceID string) bool {
-	return tm.get(instanceID) != nil
+	s := tm.get(instanceID)
+	return s != nil && !s.endpointView
 }
 
-// activeCount is the number of live PTY sessions (the auto-update idle
-// gate, P6: a re-exec must not orphan a running PTY process).
+// activeCount is the number of live LEGACY PTY sessions (the auto-update
+// idle gate, P6: a re-exec must not orphan a running PTY process). Phase 3
+// (A6): endpoint views are excluded — they are not processes the terminal
+// plane launched; the live endpoints they view are counted separately by
+// the supervisor's EndpointCount (A7).
 func (tm *terminalManager) activeCount() int {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	return len(tm.sessions)
+	n := 0
+	for _, s := range tm.sessions {
+		if !s.endpointView {
+			n++
+		}
+	}
+	return n
 }
 
 // start launches the instance's PTY if not already running (idempotent —
@@ -282,6 +313,84 @@ func (tm *terminalManager) awaitLive(s *ptySession) (*ptySession, error) {
 		return nil, s.startErr
 	}
 	return s, nil
+}
+
+// attachEndpoint creates (or reconciles to) a VIEW of a session-driven
+// endpoint's OWN TUI PTY (Phase 3 terminal session unification). Unlike
+// start/launchPTY (which LAUNCH a legacy ClassPTY process), attachEndpoint
+// never spawns a process: it holds the endpoint's existing PTY master as a
+// view and relays a human to it (the two-planes invariant — the human plane
+// is the endpoint's own PTY, not a second interactive process).
+//
+// Idempotent + reconciled under tm.mu (the same reservation discipline as
+// start):
+//   - master nil → error (the endpoint has no live PTY — the daemon refuses
+//     the attach cleanly: no crash, no hang, no partial state);
+//   - an existing LEGACY session → error (a view and a launched PTY are
+//     mutually exclusive for an instance);
+//   - an existing DEAD view (eofCh closed — master EOF) → drop it and create
+//     a fresh one (G7: never attach to a dead master — re-activation creates
+//     a fresh view);
+//   - an existing LIVE view → return it (reconcile, no second view).
+//
+// The created result reports whether a NEW view was created (true) or the
+// call reconciled to an existing live view (false) — the caller uses it to
+// stamp the config fingerprint only at a genuine (re)activation, so a
+// reconcile never hides a stale fingerprint.
+//
+// The view is live immediately (no slow launch): live is closed before
+// return and the read/exit loops are started. The view never closes the
+// master, Waits, or Terminates (the process handle owns those — G3/G5).
+func (tm *terminalManager) attachEndpoint(instanceID string, master *os.File) (*ptySession, bool, error) {
+	if master == nil {
+		return nil, false, fmt.Errorf("endpoint %s has no live TUI PTY to attach", instanceID)
+	}
+	tm.mu.Lock()
+	if s := tm.sessions[instanceID]; s != nil {
+		if !s.endpointView {
+			tm.mu.Unlock()
+			return nil, false, fmt.Errorf("instance %s has a legacy PTY session; a view cannot attach to it", instanceID)
+		}
+		// Existing view: if it is dead (master EOF), drop it and recreate
+		// (G7); if live, reconcile to it (idempotent).
+		dead := false
+		select {
+		case <-s.eofCh:
+			dead = true
+		default:
+		}
+		if !dead {
+			tm.mu.Unlock()
+			return s, false, nil
+		}
+		delete(tm.sessions, instanceID)
+		delete(tm.lastSize, instanceID)
+	}
+	s := &ptySession{
+		instanceID:   instanceID,
+		f:            master,
+		live:         make(chan struct{}),
+		endpointView: true,
+		eofCh:        make(chan struct{}),
+	}
+	tm.sessions[instanceID] = s
+	tm.mu.Unlock()
+
+	// A view is ready immediately (no launch): close live, start the
+	// read/exit loops.
+	close(s.live)
+	go tm.readLoop(s)
+	go tm.exitLoop(s)
+	tm.d.Log.Info("endpoint view attached", "instance", instanceID)
+	return s, true, nil
+}
+
+// hasSession reports whether the instance has ANY terminal session (legacy
+// PTY or endpoint view). It is the doDetach reapplySize gate: a view counts
+// as a session for size-reapply purposes even though active() excludes it
+// (A6: keep-awake is the human attach, not the view).
+func (tm *terminalManager) hasSession(instanceID string) bool {
+	return tm.get(instanceID) != nil
 }
 
 // launchPTY performs the actual (slow) PTY launch into an already-
@@ -363,6 +472,12 @@ func (tm *terminalManager) readLoop(s *ptySession) {
 			})
 		}
 		if err != nil {
+			// View: master EOF means the endpoint died. Signal the view's
+			// exit loop (observational teardown — no status write). This
+			// goroutine is the single reader, so the close is once.
+			if s.endpointView {
+				close(s.eofCh)
+			}
 			return
 		}
 	}
@@ -379,7 +494,27 @@ func (tm *terminalManager) snapshot(s *ptySession) (data string, lastSeq uint64)
 // exitLoop reports the PTY process's natural exit. An explicit Stop marks
 // the session killed first — that path owns instance state (stop/
 // restart/forget/shutdown).
+//
+// Phase 3 (terminal session unification): a view's exit is OBSERVATIONAL.
+// The endpoint's lifecycle and instance status are owned by the session
+// core (its driver reaps the process; the daemon's turn/hibernate paths
+// settle the status). The view merely watched the master; on master EOF it
+// drops itself from the map and logs — it writes NO status and emits NO
+// hibernated event, and it never closes the master or Waits the process
+// (the process handle owns both).
 func (tm *terminalManager) exitLoop(s *ptySession) {
+	if s.endpointView {
+		<-s.eofCh // the read loop closed it on master EOF (endpoint died)
+		tm.mu.Lock()
+		if tm.sessions[s.instanceID] == s {
+			delete(tm.sessions, s.instanceID)
+			delete(tm.lastSize, s.instanceID)
+		}
+		tm.mu.Unlock()
+		tm.d.Log.Info("endpoint view torn down (master EOF; session core owns lifecycle)",
+			"instance", s.instanceID)
+		return
+	}
 	// Owner's reap (single Wait): reaps the session leader AND reclaims
 	// any slave-holding descendants that outlived it (§19/§24/§26) — this
 	// is what releases the PTY and unblocks the read loop.
@@ -433,7 +568,8 @@ func (tm *terminalManager) stop(instanceID string) {
 	// A starting session has no handle yet: wait for the launch to settle
 	// (external audit F-002) so we never terminate a nil handle or orphan
 	// a just-launched process. If the launch already failed there is
-	// nothing to terminate.
+	// nothing to terminate. (A view is live immediately, so this is a
+	// no-op wait for it.)
 	<-s.live
 	if s.startErr != nil {
 		return
@@ -445,6 +581,18 @@ func (tm *terminalManager) stop(instanceID string) {
 		delete(tm.lastSize, instanceID)
 	}
 	tm.mu.Unlock()
+	// Phase 3 (G5): a view must NOT terminate the endpoint — the session
+	// core owns the endpoint's process stop (its driver runs the TERM →
+	// grace → KILL sequence). Stopping a view only drops the view; the
+	// endpoint keeps running (the caller — doTerminalStop / doStop —
+	// separately stops the session-driven endpoint through the session
+	// core). The view's exit loop will drop it on master EOF if the
+	// endpoint is in fact stopped.
+	if s.endpointView {
+		tm.d.Log.Info("endpoint view dropped (endpoint stop owned by session core)",
+			"instance", instanceID)
+		return
+	}
 	s.h.Terminate("stopped")
 	tm.d.Log.Info("pty stopped", "instance", instanceID)
 }

@@ -284,15 +284,21 @@ func (d *Daemon) performAutoUpdate(latest string) {
 }
 
 // activeWorkCount is the idle-gate metric: the number of active work
-// units — in-flight turns, live PTY sessions, and instances in a
-// working/starting/waking state. Zero = the daemon is idle enough to
-// re-exec without orphaning a runtime process.
+// units — in-flight turns, live PTY sessions, LIVE session-driven
+// endpoints, and instances in a working/starting/waking state. Zero = the
+// daemon is idle enough to re-exec without orphaning a runtime process.
+//
+// Phase 3 (A7): the live endpoints count (sup.EndpointCount) is added
+// because a re-exec orphans them — they are long-lived processes the
+// supervisor launched, exactly like the legacy PTY sessions counted above
+// (terminal.activeCount counts legacy ClassPTY only, A6).
 func (d *Daemon) activeWorkCount() int {
 	n := 0
 	d.turnMu.Lock()
 	n += len(d.activeTurns)
 	d.turnMu.Unlock()
 	n += d.terminal.activeCount()
+	n += d.sup.EndpointCount()
 	insts, err := d.state.ListInstances()
 	if err == nil {
 		for _, i := range insts {
