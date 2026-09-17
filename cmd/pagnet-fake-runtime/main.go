@@ -110,6 +110,12 @@ func main() {
 			plyArgValue(os.Args[1:], "--session-dir"),
 			plyArgValue(os.Args[1:], "--resume"))
 	}
+	if hasArg(os.Args[1:], "--persistent") {
+		runPersistent(plyArgValue(os.Args[1:], "--instance-id"),
+			plyArgValue(os.Args[1:], "--session-dir"),
+			plyArgValue(os.Args[1:], "--resume"))
+		return
+	}
 	var s spec
 	if err := json.NewDecoder(os.Stdin).Decode(&s); err != nil {
 		fmt.Fprintln(os.Stderr, "bad spec:", err)

@@ -28,6 +28,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -217,6 +218,14 @@ type Daemon struct {
 	// helper is the bounded short-lived-command executor (§37) for git
 	// probes, runtime version checks, and worktree operations.
 	helper *proc.Helper
+
+	// sessions is the persistent-session core (runtime-lifecycle refactor,
+	// Phase 1): the vendor-agnostic RuntimeSession/Driver/Manager the
+	// daemon drives for PERSISTENT runtimes (one long-lived endpoint that
+	// services many logical submits). Nil outside debug mode (the fake
+	// persistent runtime is the only Phase-1 driver; the five real vendors
+	// still use the legacy process-per-turn Adapter path until Phase 2).
+	sessions *session.Manager
 
 	// Live host connection (for the bridge relay; nil while disconnected).
 	connMu  sync.Mutex
@@ -416,10 +425,22 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// agent runtime: it is registered ONLY in debug mode (PAGNET_DEBUG /
 	// --debug), so a production daemon never offers it. Debug mode is how
 	// `make demo` and the E2E suite drive fake agents.
+	var sessions *session.Manager
+	var persistentFake *agentruntime.PersistentFake
 	if cfg.Debug {
 		fake := agentruntime.NewFake("")
 		fake.Env = cfg.RuntimeEnv
 		adapters[domain.RuntimeFake] = fake
+		// The fake PERSISTENT runtime (runtime-lifecycle refactor, Phase 1):
+		// the reference implementation of the persistent model — ONE long-
+		// lived endpoint process that services many logical submits. It is
+		// driven through the session core (Manager + Driver), not the
+		// legacy process-per-turn Adapter path. Like the process-per-turn
+		// Fake it is debug-only and NOT a real agent runtime.
+		sessions = session.NewManager()
+		persistentFake = agentruntime.NewPersistentFake("")
+		persistentFake.Env = cfg.RuntimeEnv
+		sessions.RegisterDriver(persistentFake)
 	}
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
 	// registry/launch-gate/cleanup path for every turn process and PTY
@@ -433,6 +454,12 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		if ls, ok := ad.(agentruntime.LifecycleSetter); ok {
 			ls.SetLifecycle(sup)
 		}
+	}
+	// The persistent fake driver owns its long-lived endpoint process
+	// through the supervisor's ClassEndpoint path, so it gets the same
+	// central supervisor (the LifecycleSetter seam).
+	if persistentFake != nil {
+		persistentFake.SetLifecycle(sup)
 	}
 	// Bounded helper-command executor (§37) for git/version/worktree probes.
 	helper := proc.NewHelper(0)
@@ -455,6 +482,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		repoLocks:       map[string]*sync.Mutex{},
 		sup:             sup,
 		helper:          helper,
+		sessions:        sessions,
 	}
 	d.terminal = newTerminalManager(d)
 	// Crash/restart reconciliation (§39): a hard crash may have left a
@@ -1743,11 +1771,16 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			return fmt.Errorf("no runtime available on this host (install qwen, claude, or opencode)")
 		}
 	}
-	ad, ok := d.adapters[rn]
-	if !ok {
+	// The runtime must be drivable on this host (an adapter OR a registered
+	// session driver) and installed. A process-per-turn runtime is checked
+	// via its adapter; a session-driven runtime (Phase 1: fake-persistent)
+	// via its driver. The endpoint for a session-driven runtime launches
+	// LAZILY on the first turn (EnsureActive), not at launch time — launch
+	// only records/accepts the instance.
+	if !d.runtimeSupported(rn) {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
-	if !ad.Available() {
+	if !d.runtimeAvailable(rn) {
 		// Fail the launch now, not at the first turn: a host without the
 		// runtime CLI must not ack a clean launch and idle until work
 		// arrives.
@@ -1895,6 +1928,48 @@ func (d *Daemon) workspaceLockKey(path string) string {
 	return abs
 }
 
+// sessionDriverFor returns the session driver for the instance's runtime
+// (nil when the runtime is NOT session-driven — i.e. the legacy
+// process-per-turn path). The Phase-1 persistent endpoint lives in the
+// session core (d.sessions), not the adapter map, so stop/forget/restart
+// must drive it through the Manager. The same condition as the runTurn
+// branch: the new code is guarded so the legacy path stays byte-identical.
+func (d *Daemon) sessionDriverFor(row *InstanceRow) session.Driver {
+	if d.sessions == nil {
+		return nil
+	}
+	return d.sessions.DriverFor(domain.RuntimeName(row.Runtime))
+}
+
+// runtimeSupported reports whether rn is drivable on this host: a
+// process-per-turn runtime via its adapter, or a session-driven runtime
+// (Phase 1: fake-persistent) via a registered session driver.
+func (d *Daemon) runtimeSupported(rn domain.RuntimeName) bool {
+	if _, ok := d.adapters[rn]; ok {
+		return true
+	}
+	return d.sessions != nil && d.sessions.DriverFor(rn) != nil
+}
+
+// runtimeAvailable reports whether rn is installed and usable: a
+// process-per-turn runtime via its adapter's availability check, a
+// session-driven runtime (Phase 1: fake-persistent) via its driver. A
+// session driver without an availability check is assumed available.
+func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
+	if ad, ok := d.adapters[rn]; ok {
+		return ad.Available()
+	}
+	if d.sessions != nil {
+		if drv := d.sessions.DriverFor(rn); drv != nil {
+			if pf, ok := drv.(*agentruntime.PersistentFake); ok {
+				return pf.Available()
+			}
+			return true
+		}
+	}
+	return false
+}
+
 func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	row, ok, err := d.state.GetInstance(instanceID)
 	if err != nil {
@@ -1906,6 +1981,14 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	d.terminal.stop(instanceID) // a stopped agent has no live terminal
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
+	}
+	// Phase 1 (runtime-lifecycle refactor): a persistent runtime's endpoint
+	// lives in the session core, not the adapter map. Stop it (TERM →
+	// grace → KILL via the supervisor) before the "stopped" bookkeeping.
+	// The driver's Stop is synchronous (it waits for the endpoint to be
+	// reaped), so no separate WaitForStop is needed for it.
+	if d.sessionDriverFor(row) != nil {
+		_ = d.sessions.Stop(instanceID)
 	}
 	// Wait for the reap (external audit F-004): Stop is async, and a
 	// Stop→immediate-Start that does not wait would race the reap and hit
@@ -1938,6 +2021,15 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 		if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 			_ = ad.Stop(instanceID)
 		}
+		// Phase 1: stop the persistent endpoint AND drop the session state
+		// from the Manager. The instance is gone for good — there is
+		// nothing to preserve. Dropping the session (and its prompt lock)
+		// is what bounds the Manager's maps: without it, every forgotten
+		// instance would leak a session entry and a lock forever.
+		if d.sessionDriverFor(row) != nil {
+			_ = d.sessions.Stop(instanceID)
+			d.sessions.Forget(instanceID)
+		}
 		d.removeWorktree(row)
 	}
 	if err := d.state.DeleteInstance(instanceID); err != nil {
@@ -1959,6 +2051,14 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	d.terminal.stop(instanceID) // cold start: the old PTY session dies with it
 	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
 		_ = ad.Stop(instanceID)
+	}
+	// Phase 1: stop the persistent endpoint AND clear the in-memory session
+	// so the next turn starts FRESH (a new session id) — the explicit
+	// "start fresh" semantics. Stop must precede Forget (Stop resolves the
+	// driver through the session).
+	if d.sessionDriverFor(row) != nil {
+		_ = d.sessions.Stop(instanceID)
+		d.sessions.Forget(instanceID)
 	}
 	// Cold start: the prior session is NOT resumed on restart — the local
 	// session reference is cleared so the next turn starts fresh (this is
@@ -2175,6 +2275,23 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	// The session this turn starts from; a shutdown-interrupted turn rolls
 	// back to exactly this (see the context.Canceled branch below).
 	preTurnSession := row.SessionID
+
+	// Phase 1 (runtime-lifecycle refactor): a PERSISTENT runtime is driven
+	// through the session core — one long-lived endpoint that services many
+	// logical submits (EnsureActive + Submit + consume normalized events) —
+	// not the legacy process-per-turn Adapter path. The five real vendors
+	// and the process-per-turn Fake keep the legacy path below (their
+	// migration is Phase 2). The session core serializes prompt turns per
+	// instance (promptLock), so no separate active-turn guard is needed.
+	//
+	// This is checked BEFORE the adapter lookup: a session-driven runtime
+	// has NO adapter (it lives in the session core), so the adapter lookup
+	// would fail for it. For a legacy runtime the check is a no-op (no
+	// driver registered), so the legacy path below is byte-identical.
+	if d.sessions != nil && d.sessions.DriverFor(domain.RuntimeName(row.Runtime)) != nil {
+		return d.runTurnPersistent(conn, spec, row)
+	}
+
 	ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
@@ -2428,6 +2545,200 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			"duration", time.Since(started).Round(time.Second))
 	}
 	return nil
+}
+
+// runTurnPersistent drives one turn through the session core (the
+// runtime-lifecycle refactor, Phase 1): EnsureActive + Submit + consume
+// normalized events, translating them into host protocol. Unlike the legacy
+// process-per-turn path, the endpoint process is LONG-LIVED: it is NOT
+// stopped when the turn completes (the instance goes idle, not hibernated),
+// so the PID is stable across turns. Hibernation (stopping the endpoint,
+// preserving the session) is a separate, explicit operation.
+func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnSpec, row *InstanceRow) error {
+	runtime := domain.RuntimeName(row.Runtime)
+	started := time.Now()
+
+	// The session this turn runs in. Restore the pagnet-persisted native id
+	// (row.SessionID) so a daemon restart can resume the stored session
+	// (Codex R4: the id is pagnet-persisted, never vendor-listed).
+	sess := d.sessions.Session(spec.InstanceID, runtime, spec.Workspace)
+	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
+
+	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
+		return err
+	}
+
+	// E2EE (plan §12): the per-turn runtime-output stream id (object id for
+	// the encrypted output chunks). Minted only when the instance's network
+	// is an active private network; empty otherwise (plaintext output).
+	var runtimeStreamID string
+	if st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID); ok && st.Status == "active" && st.EpochID != "" {
+		runtimeStreamID = newObjectID()
+	}
+
+	events := make(chan session.SessionEvent, 16)
+	submitDone := make(chan struct{})
+	var submitErr error
+	go func() {
+		defer close(submitDone)
+		_, submitErr = d.sessions.Submit(d.turnCtx, sess, session.SubmitRequest{
+			TurnID:    spec.TurnID,
+			Kind:      session.SubmitPrompt,
+			Input:     spec.Input,
+			InputKind: spec.InputKind,
+		}, events)
+	}()
+
+	sessionID := row.SessionID
+	var failedKind, failedErr string
+	var failedRetry *string
+	var sessionLost, completed bool
+	interactionIDs := map[string]string{}
+
+	for ev := range events {
+		switch ev.Type {
+		case session.EventSessionStarted, session.EventSessionResumed:
+			sessionID = ev.SessionID
+			d.reportSession(conn, spec.InstanceID, ev.SessionID, ev.Type == session.EventSessionResumed)
+			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+		case session.EventSessionLost:
+			sessionLost = true
+		case session.EventTurnStarted:
+			d.sendTurn(conn, transport.MsgRuntimeTurnStarted, spec, sessionID, nil, nil, nil, "", "", nil)
+		case session.EventTurnOutput:
+			d.sendRuntimeOutput(conn, row, runtimeStreamID, ev.Output)
+		case session.EventTurnCompleted:
+			completed = true
+			d.sendTurn(conn, transport.MsgRuntimeTurnCompleted, spec, sessionID,
+				ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.Model, "", nil)
+		case session.EventTurnFailed:
+			failedKind = ev.FailureKind
+			failedErr = ev.Error
+			failedRetry = ev.RetryAt
+		case session.EventInteractionStarted:
+			if ev.Interaction != nil {
+				d.sendInteraction(conn, transport.MsgInteractionStarted, spec, sessionID,
+					row.Runtime, sessionInteractionToAdapter(ev.Interaction), interactionIDs)
+			}
+		case session.EventInteractionResolved:
+			if ev.Interaction != nil {
+				d.sendInteraction(conn, transport.MsgInteractionResolved, spec, sessionID,
+					row.Runtime, sessionInteractionToAdapter(ev.Interaction), interactionIDs)
+			}
+		}
+	}
+	<-submitDone
+
+	attemptedSession := sessionID
+	if attemptedSession == "" {
+		attemptedSession = row.SessionID
+	}
+
+	// D4: the persistent path mirrors the legacy process-per-turn error
+	// taxonomy EXACTLY. The supervisor's operational errors keep their
+	// distinct semantics (a daemon restart mid-turn must not brick the
+	// instance); they are NOT collapsed into a generic process_error.
+	outcome, refusedKind := classifyTurnError(submitErr, completed, sessionLost, failedKind)
+	switch outcome {
+	case outcomeSessionLost:
+		// The resume failed — do NOT silently start a fresh session. Report
+		// the attempted session id so the control plane marks it invalid,
+		// drop the local reference, and block the instance until a human
+		// explicitly restarts (cold start).
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", "session_lost:no resumable session", nil)
+		_ = d.state.SetInstanceSession(spec.InstanceID, "")
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		return fmt.Errorf("session lost: no resumable session (instance blocked)")
+	case outcomeTurnFailed:
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", failedKind+":"+failedErr, failedRetry)
+		st := "failed"
+		switch failedKind {
+		case "rate_limited":
+			st = "rate_limited"
+		case "auth_required":
+			st = "auth_required"
+		}
+		d.Log.Warn("turn failed", "instance", spec.InstanceID,
+			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
+		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
+	case outcomeNoFailureQueued:
+		// No failure recorded (a shutdown cancel, a supervisor shutdown
+		// refusal, or a turn cut off between events). Roll back the session
+		// id the turn claimed optimistically; the work stays queued for the
+		// control plane's re-send.
+		_ = d.state.SetInstanceSession(spec.InstanceID, row.SessionID)
+		if submitErr != nil {
+			d.Log.Info("turn interrupted; no failure recorded, work stays queued",
+				"instance", spec.InstanceID, "error", submitErr.Error())
+			return submitErr
+		}
+		d.Log.Warn("turn ended without a completion event; no failure recorded, work stays queued",
+			"instance", spec.InstanceID)
+		return context.Canceled
+	case outcomeDeferred:
+		// Defense-in-depth: the session core serializes prompt turns, but if
+		// the supervisor sees a live endpoint, defer — the command stays
+		// queued and is re-sent (NOT acked).
+		return ErrDeferred
+	case outcomeLaunchRefused:
+		// A pagnet-owned safety ceiling (active turns, owned processes,
+		// circuit) or host process pressure refused the endpoint launch
+		// (§32/§33/§54). A clean OPERATIONAL condition, not a runtime
+		// failure and never a silent retry: no process was spawned, and the
+		// distinct kind lets the control plane and operator see the host
+		// protecting itself.
+		kind := string(refusedKind)
+		d.Log.Warn("turn launch refused by process supervisor",
+			"instance", spec.InstanceID, "kind", kind, "error", submitErr.Error())
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", kind+":"+submitErr.Error(), nil)
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		return fmt.Errorf("turn launch refused: %s: %v", kind, submitErr)
+	case outcomeProcessError:
+		// Session-core / driver-level failure (spawn/IO), no turn events
+		// were produced.
+		d.Log.Warn("turn failed (session core error)",
+			"instance", spec.InstanceID, "error", submitErr.Error())
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", "process_error:"+submitErr.Error(), nil)
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		return fmt.Errorf("turn failed: process_error: %v", submitErr)
+	default: // outcomeCompleted
+		// Completed: the persistent endpoint STAYS ALIVE (the instance goes
+		// idle, not hibernated) — the PID is stable across turns. An
+		// explicit hibernate (a separate operation) stops the endpoint,
+		// preserving the session for a later wake.
+		_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+			"instanceId": spec.InstanceID, "status": "idle",
+		})
+		d.Log.Info("turn completed; persistent endpoint kept alive (idle)",
+			"instance", spec.InstanceID, "session", sessionID,
+			"duration", time.Since(started).Round(time.Second))
+	}
+	return nil
+}
+
+// sessionInteractionToAdapter converts a session-core interaction
+// observation to the adapter-shaped one the host-protocol sendInteraction
+// expects (the two are structurally identical; the session core is the
+// vendor-agnostic source of the normalized fields).
+func sessionInteractionToAdapter(ie *session.InteractionEvent) *agentruntime.InteractionEvent {
+	if ie == nil {
+		return nil
+	}
+	return &agentruntime.InteractionEvent{
+		NativeInteractionID: ie.NativeInteractionID,
+		Kind:                ie.Kind,
+		Summary:             ie.Summary,
+		NativePayload:       ie.NativePayload,
+		Resolved:            ie.Resolved,
+		Decision:            ie.Decision,
+		Answer:              ie.Answer,
+	}
 }
 
 // --- attach sessions (§35) ---------------------------------------------------

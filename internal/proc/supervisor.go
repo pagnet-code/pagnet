@@ -61,13 +61,23 @@ const (
 	// attach feature; isolated session via Setsid, survives turns and
 	// detaches).
 	ClassPTY
+	// ClassEndpoint is a long-lived persistent runtime endpoint (the
+	// runtime-lifecycle refactor): one per instance, isolated process
+	// group via Setpgid (no PTY), NOT subject to the per-turn semaphore.
+	// It survives logical turns and is hibernated/woken by the session
+	// core, never killed by a turn ending.
+	ClassEndpoint
 )
 
 func (c Class) String() string {
-	if c == ClassPTY {
+	switch c {
+	case ClassPTY:
 		return "pty"
+	case ClassEndpoint:
+		return "endpoint"
+	default:
+		return "turn"
 	}
-	return "turn"
 }
 
 // Key identifies one managed process: (AgentInstance, Turn). PTY
@@ -254,6 +264,24 @@ type Lifecycle interface {
 	PID(instanceID string) *int
 }
 
+// EndpointLifecycle is the process-supervision surface for PERSISTENT
+// runtime endpoints (the runtime-lifecycle refactor): long-lived, one per
+// instance, process-group isolated, hibernated/woken by the session core
+// rather than killed by a turn ending. The Supervisor implements it;
+// persistent runtime drivers hold it (type-asserted from a Lifecycle,
+// which the Supervisor always satisfies).
+type EndpointLifecycle interface {
+	// Launch starts (or reconciles an already-started) managed process.
+	Launch(ctx context.Context, req LaunchRequest) (*Handle, error)
+	// StopEndpoint terminates the instance's live endpoint (no-op when
+	// none). It runs the standard TERM → grace → KILL sequence on the
+	// endpoint's process group.
+	StopEndpoint(instanceID string)
+	// EndpointPID is the instance's live endpoint process id (nil when
+	// no endpoint is live).
+	EndpointPID(instanceID string) *int
+}
+
 // Supervisor is the central turn-process supervisor (§20): one registry,
 // one launch gate, one cleanup path, one set of counters.
 type Supervisor struct {
@@ -266,11 +294,12 @@ type Supervisor struct {
 	processLimitFn     func() int
 	userProcessCountFn func() (int, error)
 
-	mu           sync.Mutex
-	turns        map[Key]*managedTurn
-	byInstance   map[string]*managedTurn
-	ptyByInst    map[string]*managedTurn
-	shuttingDown bool
+	mu             sync.Mutex
+	turns          map[Key]*managedTurn
+	byInstance     map[string]*managedTurn
+	ptyByInst      map[string]*managedTurn
+	endpointByInst map[string]*managedTurn
+	shuttingDown   bool
 
 	sem chan struct{} // global turn-launch semaphore (§29)
 
@@ -360,6 +389,7 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 		turns:              map[Key]*managedTurn{},
 		byInstance:         map[string]*managedTurn{},
 		ptyByInst:          map[string]*managedTurn{},
+		endpointByInst:     map[string]*managedTurn{},
 		sem:                make(chan struct{}, cfg.MaxActiveTurns),
 		stopped:            make(chan struct{}),
 		monitorDone:        make(chan struct{}),
@@ -437,6 +467,17 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 			return nil, fmt.Errorf("%w: instance %s already has a live PTY session",
 				ErrInstanceBusy, key.InstanceID)
 		}
+	case ClassEndpoint:
+		// One live endpoint per instance (exclusivity). Endpoints are
+		// long-lived: they do NOT take a turn-semaphore token (that would
+		// cap resident endpoints at MaxActiveTurns, which is a per-TURN
+		// ceiling, not a residency ceiling — addendum §20).
+		if _, ok := s.endpointByInst[key.InstanceID]; ok {
+			s.mu.Unlock()
+			s.refusedLimit.Add(1)
+			return nil, fmt.Errorf("%w: instance %s already has a live endpoint",
+				ErrInstanceBusy, key.InstanceID)
+		}
 	}
 	t := &managedTurn{
 		s:         s,
@@ -450,10 +491,13 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		termDone:  make(chan struct{}),
 	}
 	s.turns[key] = t
-	if req.Class == ClassTurn {
+	switch req.Class {
+	case ClassTurn:
 		s.byInstance[key.InstanceID] = t
-	} else {
+	case ClassPTY:
 		s.ptyByInst[key.InstanceID] = t
+	case ClassEndpoint:
+		s.endpointByInst[key.InstanceID] = t
 	}
 	s.mu.Unlock()
 
@@ -598,13 +642,18 @@ func (s *Supervisor) unregister(t *managedTurn) {
 	if cur, ok := s.turns[t.Key]; ok && cur == t {
 		delete(s.turns, t.Key)
 	}
-	if t.Class == ClassTurn {
+	switch t.Class {
+	case ClassTurn:
 		if cur, ok := s.byInstance[t.InstanceID]; ok && cur == t {
 			delete(s.byInstance, t.InstanceID)
 		}
-	} else {
+	case ClassPTY:
 		if cur, ok := s.ptyByInst[t.InstanceID]; ok && cur == t {
 			delete(s.ptyByInst, t.InstanceID)
+		}
+	case ClassEndpoint:
+		if cur, ok := s.endpointByInst[t.InstanceID]; ok && cur == t {
+			delete(s.endpointByInst, t.InstanceID)
 		}
 	}
 	s.mu.Unlock()
@@ -995,6 +1044,31 @@ func (s *Supervisor) StopPTY(instanceID string) {
 	}
 }
 
+// StopEndpoint terminates the instance's live persistent endpoint (no-op
+// when none). It runs the standard TERM → grace → KILL sequence on the
+// endpoint's process group; the owner's reap follows independently.
+func (s *Supervisor) StopEndpoint(instanceID string) {
+	s.mu.Lock()
+	t := s.endpointByInst[instanceID]
+	s.mu.Unlock()
+	if t != nil {
+		t.Terminate("stopped")
+	}
+}
+
+// EndpointPID reports the instance's live endpoint process id (nil when no
+// endpoint is live).
+func (s *Supervisor) EndpointPID(instanceID string) *int {
+	s.mu.Lock()
+	t := s.endpointByInst[instanceID]
+	s.mu.Unlock()
+	if t == nil || t.pid.Load() == 0 {
+		return nil
+	}
+	p := int(t.pid.Load())
+	return &p
+}
+
 // --- guards ------------------------------------------------------------------
 
 // pressureCheck refuses the launch when the user's process count is at
@@ -1228,6 +1302,7 @@ func (s *Supervisor) Stopped() <-chan struct{} { return s.stopped }
 type Stats struct {
 	ActiveTurns         int
 	ActivePTYs          int
+	ActiveEndpoints     int
 	ActiveProcessGroups int
 	LaunchTotal         int64
 	LaunchFailedTotal   int64
@@ -1246,6 +1321,7 @@ func (s *Supervisor) Stats() Stats {
 	st := Stats{
 		ActiveTurns:         len(s.byInstance),
 		ActivePTYs:          len(s.ptyByInst),
+		ActiveEndpoints:     len(s.endpointByInst),
 		ActiveProcessGroups: len(s.turns),
 	}
 	s.mu.Unlock()

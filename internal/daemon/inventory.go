@@ -124,6 +124,25 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 			out = append(out, ri)
 		}
 	}
+	// Phase 1 (runtime-lifecycle refactor): the fake PERSISTENT runtime is
+	// driven through the session core (not the adapter map). Report it with
+	// the SAME shape as the other runtimes when the debug session driver is
+	// registered — the server never sees it in non-debug builds (the driver
+	// is registered only in debug mode). Additive: the wire shape is
+	// unchanged.
+	if d.sessions != nil {
+		if drv := d.sessions.DriverFor(domain.RuntimeFakePersistent); drv != nil {
+			if pf, ok := drv.(*agentruntime.PersistentFake); ok {
+				if p, ok := pf.BinaryPath(); ok {
+					out = append(out, transport.RuntimeInstallation{
+						Runtime: string(domain.RuntimeFakePersistent),
+						Path:    p,
+						Version: d.runtimeVersion(p),
+					})
+				}
+			}
+		}
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Runtime < out[j].Runtime })
 	return out
 }

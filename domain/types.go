@@ -274,15 +274,23 @@ const (
 	RuntimeOpenCode   RuntimeName = "opencode"
 	RuntimeGeneric    RuntimeName = "generic"
 	RuntimeFake       RuntimeName = "fake"
+	// RuntimeFakePersistent is the deterministic FAKE PERSISTENT runtime
+	// (runtime-lifecycle refactor, Phase 1): one long-lived endpoint
+	// process that services many logical submits. It is a debug/test-only
+	// reference implementation of the persistent model — NOT a real agent
+	// runtime, and it does NOT count toward the "no usable runtime"
+	// production gate (the same way RuntimeFake does not).
+	RuntimeFakePersistent RuntimeName = "fake-persistent"
 )
 
 // Short aliases accepted in CLI/config (e.g. --runtime qwen).
 var runtimeAliases = map[string]RuntimeName{
-	"claude":   RuntimeClaudeCode,
-	"qwen":     RuntimeQwenCode,
-	"opencode": RuntimeOpenCode,
-	"generic":  RuntimeGeneric,
-	"fake":     RuntimeFake,
+	"claude":          RuntimeClaudeCode,
+	"qwen":            RuntimeQwenCode,
+	"opencode":        RuntimeOpenCode,
+	"generic":         RuntimeGeneric,
+	"fake":            RuntimeFake,
+	"fake-persistent": RuntimeFakePersistent,
 }
 
 // CanonicalRuntime resolves aliases to canonical runtime names.
