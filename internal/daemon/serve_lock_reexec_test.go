@@ -109,14 +109,16 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("timeout: the child never acquired the serve lock")
 		}
+		// The child's marker write is not atomic (WriteFile truncates
+		// before writing): a successful read can land mid-write with
+		// empty/partial content — keep polling until the pid parses.
 		if b, err := os.ReadFile(filepath.Join(dir, "acquired")); err == nil {
-			acquiredPID, _ = strconv.Atoi(strings.TrimSpace(string(b)))
-			break
+			if pid, aerr := strconv.Atoi(strings.TrimSpace(string(b))); aerr == nil && pid > 0 {
+				acquiredPID = pid
+				break
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
-	}
-	if acquiredPID == 0 {
-		t.Fatal("acquired marker holds no pid")
 	}
 
 	// 2. Probe the lock every 2ms for the child's ENTIRE remaining
@@ -180,9 +182,14 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("timeout: the post-exec image never adopted the serve lock")
 		}
+		// Same mid-write window as the acquired marker: poll until the
+		// pid parses (a zero adopted pid would fail the comparison below
+		// with a misleading message).
 		if b, err := os.ReadFile(adoptedPath); err == nil {
-			adoptedPID, _ = strconv.Atoi(strings.TrimSpace(string(b)))
-			adopted = true
+			if pid, aerr := strconv.Atoi(strings.TrimSpace(string(b))); aerr == nil && pid > 0 {
+				adoptedPID = pid
+				adopted = true
+			}
 		}
 	}
 	if adoptedPID != acquiredPID {

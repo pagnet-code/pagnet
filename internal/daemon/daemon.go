@@ -422,11 +422,12 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		domain.RuntimeClaudeCode: agentruntime.NewClaude(""),
 		domain.RuntimeOpenCode:   agentruntime.NewOpenCode(""),
 	}
-	// The fake runtime is a deterministic test/demo stand-in, NOT a real
-	// agent runtime: it is registered ONLY in debug mode (PAGNET_DEBUG /
-	// --debug), so a production daemon never offers it. Debug mode is how
-	// `make demo` and the E2E suite drive fake agents.
-	var sessions *session.Manager
+	// The session core (runtime-lifecycle refactor, Phase 1): the
+	// vendor-agnostic persistent-session orchestrator. It is ALWAYS
+	// created (not debug-only) so the real persistent drivers (Qwen Dual
+	// Output, Phase 4) can be registered in production. The fake
+	// persistent driver is debug-only (like the process-per-turn Fake).
+	sessions := session.NewManager()
 	var persistentFake *agentruntime.PersistentFake
 	if cfg.Debug {
 		fake := agentruntime.NewFake("")
@@ -438,7 +439,6 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		// driven through the session core (Manager + Driver), not the
 		// legacy process-per-turn Adapter path. Like the process-per-turn
 		// Fake it is debug-only and NOT a real agent runtime.
-		sessions = session.NewManager()
 		persistentFake = agentruntime.NewPersistentFake("")
 		persistentFake.Env = cfg.RuntimeEnv
 		// Phase 3 (terminal session unification): the fake persistent
@@ -450,6 +450,19 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		// (invariant I1).
 		persistentFake.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		sessions.RegisterDriver(persistentFake)
+	}
+	// The Qwen Dual Output persistent driver (runtime-lifecycle refactor,
+	// Phase 4 / Wave A): ONE long-lived qwen TUI per instance, driven
+	// through the session core. It is registered when the qwen binary is
+	// resolvable (binary presence only — no --version subprocess at boot).
+	// The legacy process-per-turn Qwen adapter stays in the adapter map
+	// (coexistence, Wave A); the daemon routes a qwen instance to the
+	// persistent path when a session driver is registered for it.
+	qwenPersistent := agentruntime.NewQwenPersistent("")
+	qwenPersistent.Env = cfg.RuntimeEnv
+	qwenPersistentRegistered := qwenPersistent.Available()
+	if qwenPersistentRegistered {
+		sessions.RegisterDriver(qwenPersistent)
 	}
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
 	// registry/launch-gate/cleanup path for every turn process and PTY
@@ -469,6 +482,11 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// central supervisor (the LifecycleSetter seam).
 	if persistentFake != nil {
 		persistentFake.SetLifecycle(sup)
+	}
+	// The Qwen Dual Output driver owns its long-lived endpoint process
+	// through the supervisor's ClassEndpoint path (the same seam).
+	if qwenPersistentRegistered {
+		qwenPersistent.SetLifecycle(sup)
 	}
 	// Bounded helper-command executor (§37) for git/version/worktree probes.
 	helper := proc.NewHelper(0)
@@ -1973,6 +1991,9 @@ func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 			if pf, ok := drv.(*agentruntime.PersistentFake); ok {
 				return pf.Available()
 			}
+			if qp, ok := drv.(*agentruntime.QwenPersistent); ok {
+				return qp.Available()
+			}
 			return true
 		}
 	}
@@ -2719,6 +2740,14 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID, ev.Type == session.EventSessionResumed)
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+			// Phase 3 (A5/G8): the ACTIVATION site. The human-plane view
+			// onto the endpoint's PTY is ensured the moment the endpoint
+			// is live, not after the turn settles: its read loop is the
+			// PTY's only reader while no human is attached, and without a
+			// reader a native TUI blocks on tty writes once the PTY
+			// buffer fills — the model turn then never starts (no user
+			// event, no message_start; the e2e cold-start deadline).
+			d.ensureEndpointView(row)
 		case session.EventSessionLost:
 			sessionLost = true
 		case session.EventTurnStarted:
@@ -2746,11 +2775,6 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		}
 	}
 	<-submitDone
-
-	// Phase 3 (A5/G8): the endpoint was (re)activated by this turn — the
-	// human-plane view onto its PTY is ensured at the activation site
-	// (no-op unless the endpoint owns a PTY and is live).
-	d.ensureEndpointView(row)
 
 	attemptedSession := sessionID
 	if attemptedSession == "" {
@@ -2885,6 +2909,9 @@ func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *s
 	sess := d.sessions.Session(spec.InstanceID, domain.RuntimeName(row.Runtime), spec.Workspace)
 	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
 	d.sessions.SetLaunchEnv(sess, spec.Env)
+	// The launch model (Phase 4 / B9): fixed at spawn; a change restarts
+	// the endpoint on the next EnsureActive (preserving the session).
+	d.sessions.SetModel(sess, spec.Model)
 	return sess
 }
 

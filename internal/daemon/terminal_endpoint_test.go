@@ -36,7 +36,13 @@ package daemon
 //     hibernation; an attached human does; the last detach hibernates;
 //  8. activeWorkCount (A7) counts the live endpoint (a re-exec would
 //     orphan it) while terminal.activeCount excludes the view;
-//  9. concurrent attachEndpoint calls reconcile to exactly one view.
+//  9. concurrent attachEndpoint calls reconcile to exactly one view;
+// 10. the view exists DURING an in-flight turn (A5/G8 placement): the
+//     view's read loop is the PTY's only reader while no human is
+//     attached, so a turn parked on a native interaction must have a
+//     live view from activation — without a reader a native TUI blocks
+//     on tty writes once the PTY buffer fills and the model turn never
+//     starts.
 //
 // Linux-gated: the TUI human plane depends on the endpoint owning its
 // controlling terminal (Setsid+Setctty, the ClassEndpoint PTY path),
@@ -56,6 +62,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -960,5 +967,94 @@ func TestDaemon_AttachEndpointConcurrent(t *testing.T) {
 	}
 	if d.terminal.get(instanceID) != first {
 		t.Fatal("the map does not hold the single created view")
+	}
+}
+
+// 10. The view exists DURING an in-flight turn (A5/G8): the turn parks on
+// a scripted native interaction (the endpoint is live, the turn is
+// mid-flight), and while no human is attached the endpoint's PTY must
+// still have a reader — the view. Its read loop drains the TUI's
+// rendering; without it a native TUI (Ink) blocks on tty writes once the
+// PTY buffer fills and the model call never fires (no user event, no
+// message_start). Regression: the view was once ensured only after the
+// turn settled, leaving the PTY un-read for the whole turn.
+func TestDaemon_EndpointViewExistsDuringTurn(t *testing.T) {
+	d := newPersistentTestDaemon(t)
+	client, server := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+
+	// The turn parks on a scripted native interaction: the observation
+	// window in which the view must exist.
+	pf, ok := d.sessions.DriverFor(domain.RuntimeFakePersistent).(*agentruntime.PersistentFake)
+	if !ok {
+		t.Fatal("expected the PersistentFake driver to be registered (debug mode)")
+	}
+	pf.Env = []string{"PAGNET_FAKE_INTERACTION=question"}
+
+	instanceID := domain.NewID().String()
+	driveLaunch(t, d, server, transport.LaunchAgentPayload{
+		CommandID: "cmd-evd-launch", InstanceID: instanceID,
+		Runtime: string(domain.RuntimeFakePersistent), Kind: "representative",
+	})
+
+	// Fire the deliver ASYNC: it blocks on the interaction, so its ack
+	// will not arrive until the interaction is answered.
+	env, err := transport.NewEnvelope(transport.MsgDeliverNetworkEvent, transport.NetworkEventPayload{
+		CommandID: "cmd-evd-deliver", InstanceID: instanceID,
+		Kind: "task", Body: "needs an answer",
+	})
+	if err != nil {
+		t.Fatalf("build deliver envelope: %v", err)
+	}
+	d.handleCommand(nil, env)
+
+	// Wait for the turn to park on the interaction (the endpoint is live
+	// and the turn is in flight).
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.sessions.HasPendingInteraction(instanceID) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !d.sessions.HasPendingInteraction(instanceID) {
+		t.Fatal("turn did not park on the interaction")
+	}
+
+	// A5/G8: the view exists from the ACTIVATION — while the turn is in
+	// flight and no human is attached.
+	if view := d.terminal.get(instanceID); view == nil || !view.endpointView {
+		row, _, _ := d.state.GetInstance(instanceID)
+		t.Fatalf("no endpoint view while the turn is in flight (the view is ensured at activation, A5/G8); status=%q endpointPid=%v",
+			row.Status, d.sup.EndpointPID(instanceID))
+	}
+	// And the view is actively draining the TUI: the parked interaction's
+	// rendering is in the ring (with no reader it would sit in the PTY
+	// buffer).
+	waitForRing(t, d, instanceID, []string{"? fake question (simulated)"}, 10*time.Second)
+
+	// Answer the interaction; the turn completes and the deliver acks.
+	nativeID := readInteractionNativeID(t, server, instanceID)
+	ievents := make(chan session.SessionEvent, 16)
+	idone := make(chan struct{})
+	var ierr error
+	go func() {
+		defer close(idone)
+		_, ierr = d.sessions.Submit(context.Background(), d.sessions.GetSession(instanceID), session.SubmitRequest{
+			Kind: session.SubmitInteraction, InteractionID: nativeID,
+			Decision: "resolved", Answer: "yes",
+		}, ievents)
+	}()
+	for range ievents {
+	}
+	<-idone
+	if ierr != nil {
+		t.Fatalf("interaction answer: %v", ierr)
+	}
+	_, ack := readUntilAck(t, server, "cmd-evd-deliver")
+	if errMsg, _ := ack["error"].(string); errMsg != "" {
+		t.Fatalf("deliver failed after the interaction was answered: %s", errMsg)
 	}
 }

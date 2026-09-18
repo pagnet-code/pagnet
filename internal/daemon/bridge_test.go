@@ -279,6 +279,46 @@ func TestBridgeBoundedPending(t *testing.T) {
 	}
 }
 
+// TestBridgeAuthenticatedConnSurvivesIdle: the read deadline bounds the
+// AUTH phase only. A managed agent keeps ONE bridge connection for the
+// endpoint's whole lifetime and is legitimately quiet on it for minutes
+// at a time (the model works on non-bridge tools between network calls),
+// so an authenticated connection must survive idle gaps longer than the
+// deadline — with the absolute deadline in force, the next tool call hits
+// a severed connection and fails with EOF, bricking the agent's network
+// surface for the rest of the endpoint's life. Resource bounds for
+// authenticated connections come from the connection caps, not a timer.
+func TestBridgeAuthenticatedConnSurvivesIdle(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+
+	prev := atomic.LoadInt64(&bridgeConnReadTimeoutNs)
+	atomic.StoreInt64(&bridgeConnReadTimeoutNs, int64(300*time.Millisecond))
+	t.Cleanup(func() { atomic.StoreInt64(&bridgeConnReadTimeoutNs, prev) })
+
+	c := bridgeDial(t, sock)
+	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
+		t.Fatalf("auth = %v, want auth_ok", resp)
+	}
+	// Go quiet longer than the (shortened) read deadline.
+	time.Sleep(900 * time.Millisecond)
+	// The connection must still be alive: the tool call gets a proper
+	// correlated reply (a relay error, since no host connection is set),
+	// not EOF.
+	c.write(t, map[string]any{"id": "1", "tool": "network_whoami", "args": map[string]any{}})
+	line, err := readLine(c.r)
+	if err != nil {
+		t.Fatalf("authenticated bridge connection was severed while idle: %v", err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("bad response %q: %v", line, err)
+	}
+	if resp["id"] != "1" || resp["ok"] == nil {
+		t.Fatalf("response = %v, want a correlated reply", resp)
+	}
+}
+
 // TestBridgeReadDeadlineCutsSlowLoris (external audit F-010): a
 // connection that connects but never sends its auth must be cut off by the
 // read deadline instead of holding a goroutine + socket descriptor

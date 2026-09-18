@@ -118,6 +118,20 @@ type LaunchRequest struct {
 	// plane. A nil PTYSize on a ClassEndpoint keeps the pre-Phase-3
 	// shape (no PTY, no controlling terminal).
 	PTYSize *pty.Winsize
+	// PTYStdio (ClassEndpoint only, requires a non-nil PTYSize) selects
+	// the stdio-to-tty launch shape (Phase 4, Qwen Dual Output): the
+	// child's stdin/stdout/stderr ARE the PTY slave — the runtime's TUI
+	// renders to the PTY (stdout) and reads human input from it (stdin).
+	// The machine plane must then be out-of-band (sidecar FILES, never
+	// pipes): a driver that sets PTYStdio must NOT wire Cmd.Stdin/Stdout
+	// to pipes (the supervisor overwrites them with the slave).
+	//
+	// This is the OPPOSITE of the Phase-3 pipes shape (PTYSize set,
+	// PTYStdio false): there the child's stdio stays the machine pipes
+	// and the PTY slave is an extra controlling-tty fd. The two shapes
+	// share the same session-leader topology (Setsid, pgid == pid) and
+	// the same single-handle / single-registry-entry guarantee.
+	PTYStdio bool
 	// Marker is the full ownership-marker env pair (e.g.
 	// "PAGNET_TURN_ID=<id>") that is ALREADY in Cmd.Env; it is stored in
 	// the ownership record as the restart-reconciliation proof (§42).
@@ -639,38 +653,56 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 	case ClassEndpoint:
 		if req.PTYSize != nil {
 			// PTY-owning endpoint (Phase 3 terminal session unification,
-			// topology A1): the endpoint OWNS its TUI PTY — the PTY slave
-			// is its CONTROLLING terminal (the human plane) while
-			// Cmd.Stdin/Stdout stay the machine plane (the JSONL control
-			// channel — untouched).
+			// topology A1): the endpoint OWNS its TUI PTY. The pair is
+			// opened HERE and cmd.Start() is called directly — never
+			// pty.StartWithAttrs/StartWithSize (gotcha G1): creack/pty's
+			// StartWith* OVERWRITE c.SysProcAttr (dropping the Pdeathsig
+			// backstop) and leave Ctty = 0, which is only valid when the
+			// slave is wired to fd 0. Two launch shapes share this path:
 			//
-			// The pair is opened HERE and cmd.Start() is called directly —
-			// never pty.StartWithAttrs/StartWithSize (gotcha G1): with fd
-			// 0 = the machine pipe, the controlling terminal must be set
-			// with Ctty = the slave fd. creack/pty's StartWith* leave
-			// Ctty = 0 (valid only because they wire the slave to fd 0)
-			// and OVERWRITE c.SysProcAttr; Ctty: 0 here would point at
-			// the machine pipe, which is not a tty — TIOCSCTTY fails and
-			// the launch dies.
+			//   - pipes (PTYStdio false, Phase 3): the child's stdio stays
+			//     the MACHINE plane (the JSONL control channel — untouched)
+			//     and the PTY slave is an EXTRA controlling-tty fd (the
+			//     human plane). The slave must be a valid fd in the CHILD:
+			//     Go validates Ctty against the child's fd list, and the
+			//     kernel's TIOCSCTTY needs an open fd. os.File fds are
+			//     CLOEXEC, so the slave is passed as the LAST extra file
+			//     (child fd 3 + any caller extras) and Ctty points at that
+			//     child fd. Ctty = 0 here would point at the machine pipe,
+			//     which is not a tty — TIOCSCTTY fails and the launch dies.
 			//
-			// The slave must be a valid fd in the CHILD: Go validates
-			// Ctty against the child's fd list, and the kernel's
-			// TIOCSCTTY needs an open fd. os.File fds are CLOEXEC, so the
-			// slave is passed as the LAST extra file (child fd 3 + any
-			// caller extras) and Ctty points at that child fd.
+			//   - stdio-to-tty (PTYStdio true, Phase 4 / Qwen Dual Output):
+			//     the child's stdin/stdout/stderr ARE the PTY slave — the
+			//     TUI renders to the PTY (stdout) and reads human input
+			//     from it (stdin). The machine plane is out-of-band
+			//     (sidecar files), never pipes. The slave is wired to
+			//     child fd 0, so Ctty = 0 (the slave) is CORRECT here —
+			//     the G1 hazard does not apply because fd 0 IS the tty.
 			ws := req.PTYSize
 			master, slave, openErr := pty.Open()
 			if openErr != nil {
 				startErr = openErr
 			} else {
 				_ = pty.Setsize(master, ws)
-				ctty := 3 + len(req.Cmd.ExtraFiles)
-				req.Cmd.ExtraFiles = append(req.Cmd.ExtraFiles, slave)
-				req.Cmd.SysProcAttr = SessionAttrsFor(ctty)
-				startErr = req.Cmd.Start()
-				// The parent keeps only the master; the child holds the
-				// slave as its controlling terminal (inherited extra fd).
-				_ = slave.Close()
+				if req.PTYStdio {
+					req.Cmd.Stdin = slave
+					req.Cmd.Stdout = slave
+					req.Cmd.Stderr = slave
+					req.Cmd.SysProcAttr = SessionAttrsFor(0)
+					startErr = req.Cmd.Start()
+					// The parent keeps only the master; the child holds
+					// the slave as its stdio + controlling terminal.
+					_ = slave.Close()
+				} else {
+					ctty := 3 + len(req.Cmd.ExtraFiles)
+					req.Cmd.ExtraFiles = append(req.Cmd.ExtraFiles, slave)
+					req.Cmd.SysProcAttr = SessionAttrsFor(ctty)
+					startErr = req.Cmd.Start()
+					// The parent keeps only the master; the child holds
+					// the slave as its controlling terminal (inherited
+					// extra fd).
+					_ = slave.Close()
+				}
 				if startErr == nil {
 					t.ptyMaster.Store(master)
 				} else {

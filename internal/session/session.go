@@ -226,6 +226,14 @@ type RuntimeSession struct {
 	NativeID string
 	// Workspace is the absolute path the session runs in.
 	Workspace string
+	// Model is the resolved model for the session's endpoint ("" = the
+	// driver's own default, then the user's). It is a LAUNCH parameter:
+	// the driver reads it when it starts the endpoint process, and the
+	// core is vendor-agnostic (it never interprets it). Like Env, it is
+	// FIXED AT LAUNCH — the Manager detects a changed Model on the next
+	// EnsureActive and restarts the endpoint (preserving the session) so
+	// the new model takes effect.
+	Model string
 	// Endpoint is the current live endpoint (nil when inactive/hibernated).
 	Endpoint *RuntimeEndpoint
 	// State is the lifecycle phase.
@@ -317,6 +325,12 @@ type RuntimeEndpoint struct {
 	// launch env changed and the endpoint must be restarted to pick it
 	// up (see RuntimeSession.Env for the launch-env semantics).
 	LaunchEnv []string
+	// LaunchModel is the model the endpoint process was spawned with (a
+	// copy of the session's Model at activation time). The Manager
+	// compares a later turn's Model against it: a difference means the
+	// launch model changed and the endpoint must be restarted to pick it
+	// up (see RuntimeSession.Model for the launch-model semantics).
+	LaunchModel string
 }
 
 // BusyPolicy is how a submit is handled when the session is already busy

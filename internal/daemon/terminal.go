@@ -160,6 +160,11 @@ func (tm *terminalManager) liveLoop() {
 		if s == nil || s.f == nil {
 			// No live PTY yet (or a starting session whose master is not
 			// open): the byte has nowhere to go (external audit F-002).
+			// Log the drop: a silently lost keystroke is undiagnosable
+			// from the client side (the send succeeded, the TUI never
+			// saw it).
+			tm.d.Log.Warn("terminal live message dropped (no live PTY)",
+				"instance", m.instance, "resize", m.isResize, "bytes", len(m.data))
 			continue
 		}
 		if m.isResize {

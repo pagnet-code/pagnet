@@ -263,3 +263,114 @@ func TestEndpointWithoutPTYUnchanged(t *testing.T) {
 	terminateAndReap(t, h)
 	waitGroupGone(t, pid)
 }
+
+// readMasterUntil accumulates RAW bytes from the PTY master until a line
+// containing want is seen (or the deadline elapses). It returns everything
+// read. The PTY line discipline echoes typed input, so the collected text
+// includes both the echo and the child's own output — the caller asserts on
+// the child's specific marker, not the raw echo. Raw reads (not bufio) so
+// no line is lost to a reader's read-ahead buffer.
+func readMasterUntil(t *testing.T, master *os.File, want string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var sb strings.Builder
+	buf := make([]byte, 4096)
+	for time.Now().Before(deadline) {
+		_ = master.SetReadDeadline(deadline)
+		n, err := master.Read(buf)
+		if n > 0 {
+			sb.Write(buf[:n])
+		}
+		if strings.Contains(sb.String(), want) {
+			return sb.String()
+		}
+		if err != nil {
+			// Deadline or EOF: stop collecting (the caller asserts on what
+			// was read; a missing marker is a test failure, not a hang).
+			break
+		}
+	}
+	return sb.String()
+}
+
+// TestEndpointPTYStdioToTTY: a ClassEndpoint launched with PTYSize AND
+// PTYStdio wires the child's stdin/stdout/stderr to the PTY slave (Phase 4,
+// Qwen Dual Output — the TUI renders to the PTY and reads human input from
+// it; the machine plane is out-of-band files, never pipes). The tests prove
+// the topology on process facts (Linux: /proc):
+//
+//   - the child's stdout IS the PTY slave (a write to stdout arrives at the
+//     master);
+//   - the child's stdin IS the PTY slave (a line written to the master is
+//     read by the child on fd 0 and echoed back to the master);
+//   - the child is its own session AND group leader (sid == pid,
+//     pgid == pid) — the group-kill math (pgid == leader pid) holds;
+//   - one handle, one registry entry (the master is exposed on the handle);
+//   - Stop of a stdio-to-tty endpoint reclaims the whole process group.
+func TestEndpointPTYStdioToTTY(t *testing.T) {
+	s := newTestSupervisor(t, Config{MaxActiveTurns: 4, TermGrace: 2 * time.Second, MonitorInterval: time.Hour})
+	ctx := context.Background()
+	cmd := exec.Command("sh", "-c", `
+		echo stdio-marker
+		read -r line
+		echo "from-stdin:$line"
+		sleep 3600
+	`)
+	h, err := s.Launch(ctx, LaunchRequest{
+		InstanceID: "ep-stdio", TurnID: "endpoint", Runtime: "test",
+		Class: ClassEndpoint, Cmd: cmd,
+		PTYSize:  &pty.Winsize{Rows: 24, Cols: 80},
+		PTYStdio: true,
+	})
+	if err != nil {
+		t.Fatalf("launch stdio-to-tty endpoint: %v", err)
+	}
+	pid := waitForPID(t, h)
+
+	// One handle, one registry entry: the master is exposed on the
+	// endpoint handle.
+	master := h.PTY()
+	if master == nil {
+		t.Fatal("PTY master is nil on a stdio-to-tty endpoint handle")
+	}
+	if n := s.EndpointCount(); n != 1 {
+		t.Fatalf("EndpointCount = %d, want 1", n)
+	}
+
+	// The child is its own session AND group leader (Setsid): the
+	// group-kill math (pgid == leader pid) holds for the TERM → grace →
+	// KILL sequence.
+	sid, pgid := procSessionGroup(t, pid)
+	if sid != pid {
+		t.Fatalf("child sid %d != pid %d (Setsid failed)", sid, pid)
+	}
+	if pgid != pid {
+		t.Fatalf("child pgid %d != pid %d (the group-kill math breaks)", pgid, pid)
+	}
+	if h.PGID() != pid {
+		t.Fatalf("handle pgid %d != pid %d", h.PGID(), pid)
+	}
+
+	// The child's stdout IS the PTY slave: the marker written to stdout
+	// arrives at the master.
+	if got := readMasterUntil(t, master, "stdio-marker", 10*time.Second); !strings.Contains(got, "stdio-marker") {
+		t.Fatalf("stdout marker not seen at the master (stdout must be the PTY slave); master saw: %q", got)
+	}
+
+	// The child's stdin IS the PTY slave: a line written to the master is
+	// read by the child on fd 0 and echoed back to the master. (The PTY
+	// line discipline also echoes the typed line — readMasterUntil skips
+	// past it to the child's own output.)
+	if _, err := master.Write([]byte("hello-stdio\n")); err != nil {
+		t.Fatalf("write to master: %v", err)
+	}
+	if got := readMasterUntil(t, master, "from-stdin:hello-stdio", 10*time.Second); !strings.Contains(got, "from-stdin:hello-stdio") {
+		t.Fatalf("stdin echo not seen at the master (stdin must be the PTY slave); master saw: %q", got)
+	}
+
+	terminateAndReap(t, h)
+	waitGroupGone(t, pid)
+	if n := s.EndpointCount(); n != 0 {
+		t.Fatalf("EndpointCount after reap = %d, want 0", n)
+	}
+}

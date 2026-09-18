@@ -13,6 +13,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -109,11 +110,16 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 				Path:    p,
 				Version: d.runtimeVersion(p),
 			}
-			// Phase 5: report the adapter's OBSERVED native-interaction
-			// capability flags (the persisted compatibility matrix, plan
-			// §8.6). A non-implementer reports no capabilities (the
-			// conservative "cannot observe" default).
-			if obs, ok := a.(agentruntime.InteractionObserver); ok {
+			// Phase 4: a session-driven runtime's capabilities come from
+			// the SESSION DRIVER (not the legacy adapter) when one is
+			// registered (the persistent path is the active one).
+			if caps := d.sessionDriverCapabilities(name); caps != nil {
+				ri.Capabilities = caps
+			} else if obs, ok := a.(agentruntime.InteractionObserver); ok {
+				// Phase 5: report the adapter's OBSERVED native-interaction
+				// capability flags (the persisted compatibility matrix,
+				// plan §8.6). A non-implementer reports no capabilities
+				// (the conservative "cannot observe" default).
 				ri.Capabilities = &transport.RuntimeCapabilities{
 					ObserveInteractions: obs.ObserveInteractions(),
 					NativeInteractiveUI: obs.NativeInteractiveUI(),
@@ -171,6 +177,42 @@ func remoteResolveMap(obs agentruntime.InteractionObserver) map[string]bool {
 		}
 	}
 	return m
+}
+
+// sessionDriverCapabilities returns the session driver's capabilities (as
+// the transport shape) when a session driver is registered for the runtime
+// (Phase 4: the persistent path is the active one, so its capability set —
+// not the legacy adapter's — is what the control plane should see). It
+// returns nil when no session driver is registered (the caller falls back
+// to the adapter's capabilities).
+func (d *Daemon) sessionDriverCapabilities(rn domain.RuntimeName) *transport.RuntimeCapabilities {
+	if d.sessions == nil {
+		return nil
+	}
+	drv := d.sessions.DriverFor(rn)
+	if drv == nil {
+		return nil
+	}
+	caps := drv.Capabilities()
+	remoteResolve := map[string]bool{}
+	if rr, ok := drv.(session.RemoteResolvable); ok {
+		// A per-kind remote-resolution policy (e.g. Qwen: can_use_tool
+		// kinds are remotely resolvable, ask_user_question is human-only).
+		for _, k := range interactionKinds {
+			remoteResolve[k] = rr.SupportsRemoteResolve(k)
+		}
+	} else if caps.RemoteInteractionResolve {
+		// The driver remote-resolves every kind (no per-kind policy).
+		for _, k := range interactionKinds {
+			remoteResolve[k] = true
+		}
+	}
+	return &transport.RuntimeCapabilities{
+		ObserveInteractions: caps.NativeInteractionObserve,
+		NativeInteractiveUI: caps.NativeTUI,
+		DeferredInteraction: map[string]bool{},
+		RemoteResolve:       remoteResolve,
+	}
 }
 
 // runtimeVersion probes a runtime CLI's version (abuse addendum Part B

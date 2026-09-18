@@ -215,6 +215,16 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		return
 	}
 	d.Log.Info("bridge authenticated", "instance", row.InstanceID)
+	// The read deadline above bounds the AUTH phase only (slow-loris). A
+	// managed agent keeps ONE bridge connection for the endpoint's whole
+	// lifetime and is legitimately quiet on it for minutes at a time —
+	// the model works on non-bridge tools between network calls. The
+	// deadline is absolute since Accept, so it must be cleared here:
+	// left in force, it severs the connection 30s after auth and the
+	// next tool call fails with EOF, bricking the agent's network
+	// surface for the rest of the endpoint's life. Resource bounds for
+	// authenticated connections come from the caps above, not a timer.
+	_ = c.SetReadDeadline(time.Time{})
 
 	// Tool-call loop until the client disconnects.
 	for {

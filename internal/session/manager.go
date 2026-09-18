@@ -108,6 +108,20 @@ func (m *Manager) SetLaunchEnv(sess *RuntimeSession, env []string) {
 	m.mu.Unlock()
 }
 
+// SetModel sets the session's launch model (the turn spec's resolved model,
+// Phase 4 / B9). It is called by the daemon before each Submit so the
+// endpoint (re)activation uses the current model. See RuntimeSession.Model
+// for the launch-model semantics (fixed at spawn; a change restarts the
+// endpoint on the next EnsureActive, preserving the session).
+func (m *Manager) SetModel(sess *RuntimeSession, model string) {
+	if sess == nil {
+		return
+	}
+	m.mu.Lock()
+	sess.Model = model
+	m.mu.Unlock()
+}
+
 // GetSession returns the session for an instance (nil when none).
 func (m *Manager) GetSession(instanceID string) *RuntimeSession {
 	m.mu.Lock()
@@ -168,34 +182,37 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	st := sess.State
 	ep := sess.Endpoint
 	wantEnv := sess.Env
+	wantModel := sess.Model
 	pending := len(sess.PendingInteractions) > 0
 	m.mu.Unlock()
 	if st.Live() {
 		d := m.driverLocked(sess.Runtime)
 		live := d == nil || d.Live(sess.InstanceID)
-		// Launch-env change (Phase 2 / R8): the endpoint's environment is
-		// FIXED AT SPAWN. When the session's current env differs from the
-		// env the live endpoint was launched with, the endpoint must be
-		// RESTARTED (stopped + re-activated) so the new env takes effect —
-		// the session is preserved (a materialised session resumes the
-		// same native session on re-activation). The one exception is a
+		// Launch-env / launch-model change (Phase 2 / R8, Phase 4 / B9):
+		// the endpoint's environment AND model are FIXED AT SPAWN. When
+		// the session's current env or model differs from what the live
+		// endpoint was launched with, the endpoint must be RESTARTED
+		// (stopped + re-activated) so the new value takes effect — the
+		// session is preserved (a materialised session resumes the same
+		// native session on re-activation). The one exception is a
 		// session with an unresolved interaction: restarting it would lose
 		// the in-flight interaction (plan §20: never hibernate a session
-		// with an unresolved interaction), so the env change is DEFERRED —
-		// the live endpoint is returned and the change is applied at the
-		// next restart opportunity.
-		staleEnv := live && ep != nil && !sameEnv(wantEnv, ep.LaunchEnv)
-		if live && !staleEnv {
+		// with an unresolved interaction), so the change is DEFERRED —
+		// the live endpoint is returned and it is applied at the next
+		// restart opportunity.
+		staleLaunch := live && ep != nil &&
+			(!sameEnv(wantEnv, ep.LaunchEnv) || wantModel != ep.LaunchModel)
+		if live && !staleLaunch {
 			return ep, nil
 		}
-		if staleEnv && pending {
+		if staleLaunch && pending {
 			return ep, nil
 		}
-		if staleEnv {
+		if staleLaunch {
 			// Stop the (still-live) endpoint, preserving the session —
 			// the driver's hibernate is the graceful stop (the runtime
 			// persists its native session state on the way out). Then fall
-			// through to re-activation with the new env.
+			// through to re-activation with the new env/model.
 			if err := d.Hibernate(ctx, sess); err != nil {
 				return nil, err
 			}
@@ -245,10 +262,11 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	sess.Endpoint = ep
 	sess.State = StateIdle
 	sess.LastActivity = m.now()
-	// Record the env the endpoint was actually launched with, so a later
-	// turn's env can be compared against it (the launch-env-change
-	// restart above).
+	// Record the env AND model the endpoint was actually launched with,
+	// so a later turn's env/model can be compared against it (the
+	// launch-change restart above).
 	ep.LaunchEnv = append([]string(nil), sess.Env...)
+	ep.LaunchModel = sess.Model
 	m.mu.Unlock()
 	return ep, nil
 }
