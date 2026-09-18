@@ -100,6 +100,53 @@ func networkCmd() *cobra.Command {
 				return nil
 			},
 		},
+		&cobra.Command{
+			Use:   "rename <name> <new-name>",
+			Short: "Rename a network (id, name, or slug)",
+			Args:  cobra.ExactArgs(2),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				c, err := newCLI("")
+				if err != nil {
+					return err
+				}
+				id, label, err := c.resolveNetwork(args[0])
+				if err != nil {
+					return err
+				}
+				if err := c.put("/api/v1/networks/"+id, map[string]any{"name": args[1]}); err != nil {
+					return err
+				}
+				fmt.Printf("network %q renamed to %q (%s)\n", label, args[1], id)
+				return nil
+			},
+		},
+		&cobra.Command{
+			Use:   "delete <name>",
+			Short: "Delete a network and its agents, tasks, and messages",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				c, err := newCLI("")
+				if err != nil {
+					return err
+				}
+				id, label, err := c.resolveNetwork(args[0])
+				if err != nil {
+					return err
+				}
+				if err := c.del("/api/v1/networks/" + id); err != nil {
+					return err
+				}
+				// If the deleted network was the saved default, clear it so
+				// the next command does not resolve a dead network.
+				if c.cfg.CurrentNetwork == id {
+					if err := config.SaveCurrentNetwork(c.stateDir, ""); err != nil {
+						return err
+					}
+				}
+				fmt.Printf("network %q deleted (%s)\n", label, id)
+				return nil
+			},
+		},
 	)
 	return cmd
 }

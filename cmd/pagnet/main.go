@@ -159,6 +159,7 @@ func main() {
 		// spec §55 command surface
 		agentsCmd(),
 		hostsCmd(),
+		hostCmd(),
 		networksCmd(),
 		tasksCmd(),
 		inboxCmd(),
