@@ -1024,8 +1024,21 @@ func TestDaemon_EndpointViewExistsDuringTurn(t *testing.T) {
 	}
 
 	// A5/G8: the view exists from the ACTIVATION — while the turn is in
-	// flight and no human is attached.
-	if view := d.terminal.get(instanceID); view == nil || !view.endpointView {
+	// flight and no human is attached. The view is ensured when the
+	// daemon's turn event loop processes the activation event, which runs
+	// concurrently with the parked turn — poll for it (the loop is at most
+	// a few scheduler hops behind; a one-shot check races the scheduler
+	// on loaded CI VMs and has gone red there).
+	viewOK := false
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if view := d.terminal.get(instanceID); view != nil && view.endpointView {
+			viewOK = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !viewOK {
 		row, _, _ := d.state.GetInstance(instanceID)
 		t.Fatalf("no endpoint view while the turn is in flight (the view is ensured at activation, A5/G8); status=%q endpointPid=%v",
 			row.Status, d.sup.EndpointPID(instanceID))
