@@ -13,7 +13,8 @@ import (
 )
 
 // TestEnrollServerFlagGiven: --server given (the flag value is set) → the
-// full enroll flow runs against the stub.
+// full enroll flow runs against the stub (the --token short-circuit supplies
+// the user bearer; no browser, no paste).
 func TestEnrollServerFlagGiven(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
@@ -24,18 +25,11 @@ func TestEnrollServerFlagGiven(t *testing.T) {
 	serverURL = ts.URL
 	t.Cleanup(func() { serverURL = prevServer })
 	prevToken := userToken
-	userToken = ""
+	userToken = "pagt_testtoken123"
 	t.Cleanup(func() { userToken = prevToken })
 
-	prevBrowser := openBrowserFn
-	openBrowserFn = func(string) error { return nil }
-	t.Cleanup(func() { openBrowserFn = prevBrowser })
-	prevTTY := hasTTYFn
-	hasTTYFn = func() bool { return true }
-	t.Cleanup(func() { hasTTYFn = prevTTY })
-
 	dir := t.TempDir()
-	if err := enrollHostForeground(dir, "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	if n := ts.enrollCallCount(); n != 1 {
@@ -56,22 +50,15 @@ func TestEnrollServerFromState(t *testing.T) {
 	serverURL = ""
 	t.Cleanup(func() { serverURL = prevServer })
 	prevToken := userToken
-	userToken = ""
+	userToken = "pagt_testtoken123"
 	t.Cleanup(func() { userToken = prevToken })
-
-	prevBrowser := openBrowserFn
-	openBrowserFn = func(string) error { return nil }
-	t.Cleanup(func() { openBrowserFn = prevBrowser })
-	prevTTY := hasTTYFn
-	hasTTYFn = func() bool { return true }
-	t.Cleanup(func() { hasTTYFn = prevTTY })
 
 	dir := t.TempDir()
 	// Partial state: the server URL is stored, but no credential yet.
 	if err := mergeConfigFile(dir, map[string]any{"serverUrl": ts.URL}); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
-	if err := enrollHostForeground(dir, "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	if n := ts.enrollCallCount(); n != 1 {
@@ -102,7 +89,7 @@ func TestResolveEnrollServerPrompt(t *testing.T) {
 	}
 	t.Cleanup(func() { askLineFn = prevAsk })
 
-	got, err := resolveEnrollServer(t.TempDir())
+	got, err := resolveEnrollServer(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("resolveEnrollServer: %v", err)
 	}
@@ -136,7 +123,7 @@ func TestResolveEnrollServerPromptEmptyThenAnswer(t *testing.T) {
 	}
 	t.Cleanup(func() { askLineFn = prevAsk })
 
-	got, err := resolveEnrollServer(t.TempDir())
+	got, err := resolveEnrollServer(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("resolveEnrollServer: %v", err)
 	}
@@ -168,7 +155,7 @@ func TestResolveEnrollServerPromptEmptyTwice(t *testing.T) {
 	}
 	t.Cleanup(func() { askLineFn = prevAsk })
 
-	_, err := resolveEnrollServer(t.TempDir())
+	_, err := resolveEnrollServer(t.TempDir(), "")
 	if err == nil || !strings.Contains(err.Error(), "no control plane URL entered") {
 		t.Fatalf("error = %v, want the 'no control plane URL entered' message", err)
 	}
@@ -193,11 +180,11 @@ func TestResolveEnrollServerNoTTY(t *testing.T) {
 	hasTTYFn = func() bool { return false }
 	t.Cleanup(func() { hasTTYFn = prevTTY })
 
-	_, err := resolveEnrollServer(t.TempDir())
+	_, err := resolveEnrollServer(t.TempDir(), "")
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
-	want := "no control plane URL stored — run 'pagnet enroll --server <url>' first (or set --server / $PAGNET_SERVER)"
+	want := "no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>'"
 	if err.Error() != want {
 		t.Fatalf("error = %q,\nwant    %q", err.Error(), want)
 	}

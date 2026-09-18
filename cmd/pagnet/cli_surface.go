@@ -20,8 +20,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
-
-	"github.com/pagnet-code/pagnet/internal/config"
 )
 
 // --- §55 list verbs: agents / hosts / networks / tasks ----------------------
@@ -506,12 +504,8 @@ func doctorCmd() *cobra.Command {
 				home, _ := os.UserHomeDir()
 				stateDir = filepath.Join(home, ".pagnet")
 			}
-			cfg, _ := config.LoadDaemon(stateDir)
-			server := serverURL
-			if root != nil && root.PersistentFlags().Lookup("server") != nil &&
-				!root.PersistentFlags().Changed("server") && cfg.ServerURL != "" {
-				server = cfg.ServerURL
-			}
+			cfg, account, _ := loadAccountConfig(stateDir)
+			server := resolveServerURL(cfg)
 			if server == "" {
 				check("server reachable", false, "no control plane URL — set --server / $PAGNET_SERVER")
 				fmt.Println("\ndiagnosis failed: no control plane URL configured")
@@ -541,7 +535,7 @@ func doctorCmd() *cobra.Command {
 			// and never authenticate the CLI.
 			restToken := userToken
 			if restToken == "" {
-				restToken = loadUserToken(stateDir, server)
+				restToken = loadUserToken(accountConfigDir(stateDir, account), account, server)
 			}
 			if restToken != "" {
 				req2, _ := http.NewRequest(http.MethodGet, server+"/api/v1/hosts", nil)

@@ -315,11 +315,11 @@ func TestSaveLoadUserTokenFileFallback(t *testing.T) {
 	dir := t.TempDir()
 	server := "https://control.example/"
 
-	if err := saveUserToken(dir, server, "pagt_secret123"); err != nil {
+	if err := saveUserToken(dir, "", server, "pagt_secret123"); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	// The token round-trips through the file store.
-	if got := loadUserToken(dir, server); got != "pagt_secret123" {
+	if got := loadUserToken(dir, "", server); got != "pagt_secret123" {
 		t.Fatalf("load = %q, want pagt_secret123", got)
 	}
 	// The state file is 0600.
@@ -352,7 +352,7 @@ func TestEnsureUserTokenNoStoredTokenOIDC(t *testing.T) {
 	t.Cleanup(func() { openBrowserFn = prevBrowser })
 
 	dir := t.TempDir()
-	tok, err := ensureUserToken(dir, base, false, true)
+	tok, err := ensureUserToken(dir, "", base, false, true)
 	if err != nil {
 		t.Fatalf("ensureUserToken: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestEnsureUserTokenNoStoredTokenOIDC(t *testing.T) {
 		t.Fatalf("token = %q, want the minted token", tok)
 	}
 	// The token was stored for the next run (no re-login needed).
-	if got := loadUserToken(dir, base); got != "pagt_testtoken123" {
+	if got := loadUserToken(dir, "", base); got != "pagt_testtoken123" {
 		t.Fatalf("stored token = %q, want pagt_testtoken123", got)
 	}
 }
@@ -374,10 +374,10 @@ func TestEnsureUserTokenStoredValid(t *testing.T) {
 	base := ts.URL + "/"
 
 	dir := t.TempDir()
-	if err := saveUserToken(dir, base, "pagt_testtoken123"); err != nil {
+	if err := saveUserToken(dir, "", base, "pagt_testtoken123"); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	tok, err := ensureUserToken(dir, base, false, true)
+	tok, err := ensureUserToken(dir, "", base, false, true)
 	if err != nil {
 		t.Fatalf("ensureUserToken: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 
 	dir := t.TempDir()
 	// A stored token the server no longer accepts.
-	if err := saveUserToken(dir, base, "pagt_revoked"); err != nil {
+	if err := saveUserToken(dir, "", base, "pagt_revoked"); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	// The cliCtx base has NO trailing slash (as newCLI builds it); the
@@ -426,7 +426,7 @@ func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 		t.Errorf("device-config calls = %d, want 1 (re-login once)", n)
 	}
 	// The new token replaced the revoked one in the store.
-	if got := loadUserToken(dir, base); got != "pagt_testtoken123" {
+	if got := loadUserToken(dir, "", base); got != "pagt_testtoken123" {
 		t.Fatalf("stored token = %q, want the minted token", got)
 	}
 }
@@ -444,7 +444,7 @@ func TestEnsureUserTokenTokenMode(t *testing.T) {
 	openBrowserFn = func(string) error { browserCalled = true; return nil }
 	t.Cleanup(func() { openBrowserFn = prev })
 
-	_, err := ensureUserToken(t.TempDir(), base, false, true)
+	_, err := ensureUserToken(t.TempDir(), "", base, false, true)
 	if err == nil || !strings.Contains(err.Error(), "token mode") {
 		t.Fatalf("token-mode error = %v, want the exact 'token mode' message", err)
 	}
@@ -464,7 +464,7 @@ func TestEnsureUserTokenNoTTY(t *testing.T) {
 	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
 	base := ts.URL + "/"
 
-	_, err := ensureUserToken(t.TempDir(), base, false, false)
+	_, err := ensureUserToken(t.TempDir(), "", base, false, false)
 	if err == nil || !strings.Contains(err.Error(), "interactive terminal") {
 		t.Fatalf("no-TTY error = %v, want a clear 'interactive terminal' message", err)
 	}
@@ -488,7 +488,7 @@ func TestEnsureUserTokenNoBrowserHeadless(t *testing.T) {
 	t.Cleanup(func() { openBrowserFn = prevBrowser })
 
 	dir := t.TempDir()
-	tok, err := ensureUserToken(dir, base, true, false)
+	tok, err := ensureUserToken(dir, "", base, true, false)
 	if err != nil {
 		t.Fatalf("ensureUserToken (headless --no-browser): %v", err)
 	}
@@ -512,21 +512,14 @@ func TestEnrollWithoutToken(t *testing.T) {
 	prevServer := serverURL
 	serverURL = ts.URL
 	t.Cleanup(func() { serverURL = prevServer })
-	// No explicit user token (the flow mints one).
+	// The --token short-circuit supplies the user bearer (no browser, no
+	// paste); the flow still mints + consumes the enrollment token.
 	prevToken := userToken
-	userToken = ""
+	userToken = "pagt_testtoken123"
 	t.Cleanup(func() { userToken = prevToken })
 
-	prevBrowser := openBrowserFn
-	openBrowserFn = func(string) error { return nil }
-	t.Cleanup(func() { openBrowserFn = prevBrowser })
-	// enrollHostForeground reads the TTY seam for the sign-in flow.
-	prevTTY := hasTTYFn
-	hasTTYFn = func() bool { return true }
-	t.Cleanup(func() { hasTTYFn = prevTTY })
-
 	dir := t.TempDir()
-	if err := enrollHostForeground(dir, "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	// The minted enrollment token was consumed exactly once.
@@ -548,7 +541,7 @@ func TestEnrollWithoutToken(t *testing.T) {
 		t.Errorf("serverUrl = %q, want %q", cfg.ServerURL, ts.URL)
 	}
 	// The user token from the sign-in flow was stored too.
-	if got := loadUserToken(dir, ts.URL+"/"); got != "pagt_testtoken123" {
+	if got := loadUserToken(dir, "", ts.URL+"/"); got != "pagt_testtoken123" {
 		t.Errorf("stored user token = %q, want pagt_testtoken123", got)
 	}
 }
@@ -587,7 +580,7 @@ func TestNewCLITokenShortCircuit(t *testing.T) {
 // INSIDE ensureUserToken so a future caller passing an empty base cannot
 // reintroduce it.
 func TestEnsureUserTokenEmptyBase(t *testing.T) {
-	_, err := ensureUserToken(t.TempDir(), "", false, false)
+	_, err := ensureUserToken(t.TempDir(), "", "", false, false)
 	if err == nil {
 		t.Fatal("expected an error for an empty base")
 	}

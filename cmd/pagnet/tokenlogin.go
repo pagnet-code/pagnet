@@ -211,8 +211,11 @@ type pastedLoginResult struct {
 // local format check → (legacy: /auth/me verify | pgn_: one exchange for
 // the derived credential) → store the bearer + non-secret metadata. The
 // pasted root token is never persisted (governance §19) and never printed.
-func loginWithPastedToken(stateDir, base string, client *http.Client, pasted string) (*pastedLoginResult, error) {
+// stateDir is the account's config dir; account scopes the keyring key so
+// two accounts on the same server keep separate credentials.
+func loginWithPastedToken(stateDir, account, server string, client *http.Client, pasted string) (*pastedLoginResult, error) {
 	pasted = strings.TrimSpace(pasted)
+	base := strings.TrimSuffix(server, "/") + "/"
 	kind, err := parsePagnetTokenFormat(pasted)
 	if err != nil {
 		return nil, err
@@ -229,7 +232,7 @@ func loginWithPastedToken(stateDir, base string, client *http.Client, pasted str
 		if !ok {
 			return nil, errors.New("the control plane rejected that API token")
 		}
-		if err := saveCredential(stateDir, base, pasted, credentialMeta{Kind: kind}); err != nil {
+		if err := saveCredential(stateDir, account, server, pasted, credentialMeta{Kind: kind}); err != nil {
 			return nil, err
 		}
 		res.Summary = "verified the legacy API token (pagt_…); it stays the CLI bearer."
@@ -249,7 +252,7 @@ func loginWithPastedToken(stateDir, base string, client *http.Client, pasted str
 		OrganizationID: ex.OrganizationID,
 		SourceID:       ex.SourceID,
 	}
-	if err := saveCredential(stateDir, base, ex.derived(), meta); err != nil {
+	if err := saveCredential(stateDir, account, server, ex.derived(), meta); err != nil {
 		return nil, err
 	}
 	res.Role, res.NetworkScope, res.Networks = ex.Role, ex.NetworkScope, ex.Networks
@@ -324,17 +327,18 @@ func (m credentialMeta) fileFields() map[string]any {
 	}
 }
 
-// saveCredential stores the CLI bearer (keyring-preferred, 0600 state-file
-// fallback — governance §19) plus its non-secret metadata, clearing the
-// metadata keys the new login does not carry.
-func saveCredential(stateDir, server, bearer string, meta credentialMeta) error {
+// saveCredential stores the CLI bearer (keyring-preferred, 0600 account
+// config-file fallback — governance §19) plus its non-secret metadata,
+// clearing the metadata keys the new login does not carry. stateDir is the
+// account's config dir; account scopes the keyring key.
+func saveCredential(stateDir, account, server, bearer string, meta credentialMeta) error {
 	fields := meta.fileFields()
 	if server != "" {
 		fields["serverUrl"] = strings.TrimSuffix(server, "/")
 	}
 	if kr, err := openKeyringFn(); err == nil {
 		if err := kr.Set(keyring.Item{
-			Key:   credentialKey(server),
+			Key:   credentialKey(account, server),
 			Data:  []byte(bearer),
 			Label: "Pagnet client credential",
 		}); err == nil {

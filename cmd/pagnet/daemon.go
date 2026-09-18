@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -74,6 +75,15 @@ func registerDaemonFlags(cmd *cobra.Command) {
 		"disable worker self-update (default on; also PAGNET_AUTO_UPDATE=0 or state-file autoUpdate: false)")
 }
 
+// needsEnroll reports whether the host needs (re-)enrollment before the
+// daemon can start: no stored host credential + identity yet. An
+// already-enrolled host (credential + hostId present) starts WITHOUT a user
+// login — a `pagnet logout` (which removes only the user credential) must
+// not break an enrolled host.
+func needsEnroll(cfg config.Daemon) bool {
+	return cfg.Credential == "" || cfg.HostID == ""
+}
+
 // runDaemon is the `pagnet serve` foreground body: state-dir config,
 // daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
@@ -90,22 +100,34 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	cfg, err := config.LoadDaemon(daemonStateDir)
+	root := machineStateDir(daemonStateDir)
+	cfg, account, err := loadAccountConfig(root)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if cfg.ServerURL == "" || cfg.Credential == "" {
-		// First run on this machine: connect the host in the FOREGROUND
-		// (the sign-in URL must print before the daemon starts). The
-		// daemon itself only needs the host credential — a missing user
-		// token never blocks daemon start.
-		if err := enrollHostForeground(cfg.StateDir, "", nil, ""); err != nil {
+	// First run on this machine: the host is NOT enrolled (no credential +
+	// host id). Connect it in the FOREGROUND — the token-first paste must
+	// run before the daemon starts. An already-enrolled host starts WITHOUT
+	// a user login (logout must not break an enrolled host).
+	if needsEnroll(cfg) {
+		if err := enrollHostForeground(root, account, "", nil, ""); err != nil {
 			return err
 		}
-		cfg, err = config.LoadDaemon(daemonStateDir)
+		cfg, _, err = loadAccountConfig(root)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
+	}
+	// §3 Safe control-plane switching: the host credential in the account
+	// config is tied to the serverUrl in the SAME file. If the resolved
+	// server differs from the stored one, the stored credential is stale
+	// (for the old server) and must NOT be sent to the new server.
+	if err := ensureServerSwitch(root, account, &cfg); err != nil {
+		return err
+	}
+	server := resolveServerURL(cfg)
+	if server == "" {
+		return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}
 
 	// Export the state dir into the process environment so the session-driven
@@ -118,7 +140,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}
 
 	d, err := daemon.New(daemon.Config{
-		ServerURL:    cfg.ServerURL,
+		ServerURL:    server,
 		Credential:   cfg.Credential,
 		HostID:       cfg.HostID,
 		StateDir:     cfg.StateDir,
@@ -145,7 +167,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	log.Info("pagnet serve starting",
-		"server", cfg.ServerURL, "state_dir", cfg.StateDir,
+		"server", server, "state_dir", cfg.StateDir,
 		"allowed_roots", cfg.AllowedRoots)
 	if err := d.Run(ctx); err != nil {
 		return err
@@ -169,12 +191,13 @@ func runDetach(cmd *cobra.Command) error {
 		}
 		stateDir = filepath.Join(home, ".pagnet")
 	}
-	// First run on this machine: connect the host in the FOREGROUND
-	// before detaching — the sign-in URL must print, and the sign-in
-	// flow never runs inside the detached child. (A config load failure
-	// is not fatal here: the child reports it.)
-	if cfg, err := config.LoadDaemon(stateDir); err == nil && (cfg.ServerURL == "" || cfg.Credential == "") {
-		if err := enrollHostForeground(stateDir, "", nil, ""); err != nil {
+	// First run on this machine: the host is NOT enrolled (no credential +
+	// host id). Connect it in the FOREGROUND before detaching — the
+	// token-first paste must run before the child starts, and the paste
+	// never runs inside the detached child. (A config load failure is not
+	// fatal here: the child reports it.)
+	if cfg, account, err := loadAccountConfig(stateDir); err == nil && needsEnroll(cfg) {
+		if err := enrollHostForeground(stateDir, account, "", nil, ""); err != nil {
 			return err
 		}
 	}

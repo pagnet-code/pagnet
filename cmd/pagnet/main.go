@@ -20,7 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/domain"
-	"github.com/pagnet-code/pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/accounts"
 )
 
 var serverURL string
@@ -29,6 +29,34 @@ var serverURL string
 // it rides on the enroll payload so the Hosts page shows a real build
 // identity from the first heartbeat.
 var version = "dev"
+
+// defaultServerURL is the build-time default control plane (ldflags,
+// -X main.defaultServerURL=...). The STANDARD PRODUCTION BUILD DEFAULT is
+// https://app.pagnet.dev (stamped by the release build); development builds
+// stamp a different default only when explicitly configured (empty = no
+// default, the CLI requires --server / $PAGNET_SERVER / stored config). It
+// is the LAST resort in the server URL precedence (after --server,
+// $PAGNET_SERVER, and the stored account config).
+var defaultServerURL = ""
+
+// accountFlag is the --account global flag: an explicit account-context
+// override for this invocation (scripts). Empty = the current account.
+var accountFlag string
+
+// silent is the --silent global flag: no banners/progress/success prose;
+// errors still go to stderr and the exit status stays meaningful.
+var silent bool
+
+// nonInteractive is the --non-interactive global flag: never prompt, never
+// open a browser, never wait for a human; fail immediately when required
+// information is missing. It is distinct from --silent (which only quiets
+// success output).
+var nonInteractive bool
+
+// jsonOut is the --json global flag: emit machine-readable JSON for
+// commands that return useful data (list/status/account ops) instead of
+// the human table/prose.
+var jsonOut bool
 
 // userToken is the user/admin bearer token for REST calls (--token or
 // $PAGNET_TOKEN); when both are empty the token stored by `pagnet login`
@@ -69,13 +97,30 @@ func main() {
 			if detach {
 				return runDetach(cmd)
 			}
-			return cmd.Help()
+			// Bare `pagnet` on a TTY: a tiny contextual status (fresh /
+			// stopped / running). Non-TTY: no decorative UI (a hint only).
+			return runBareStatus(cmd)
 		},
 	}
-	root.PersistentFlags().StringVar(&serverURL, "server",
-		envOrDefault("PAGNET_SERVER", ""),
-		"control plane URL ($PAGNET_SERVER — set it when you run your own control panel)")
+	// --server is the EXPLICIT control-plane flag only (precedence 1). Its
+	// default is empty: $PAGNET_SERVER (precedence 2) and the stored account
+	// config (precedence 3) are applied by resolveServerURL, NOT folded into
+	// the flag default — folding them made the stored config silently
+	// override $PAGNET_SERVER (the stale-dev-control-plane bug).
+	root.PersistentFlags().StringVar(&serverURL, "server", "",
+		"control plane URL (precedence: --server > $PAGNET_SERVER > stored account config > build default)")
 	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
+	// --account selects the account context for this invocation (scripts);
+	// empty = the current account.
+	root.PersistentFlags().StringVar(&accountFlag, "account", "", "account context for this invocation (default: the current account)")
+	// --silent: no banners/progress/success prose; errors still go to stderr
+	// and the exit status stays meaningful.
+	root.PersistentFlags().BoolVar(&silent, "silent", false, "no banners/progress/success prose (errors and exit status unchanged)")
+	// --non-interactive: never prompt, never open a browser, never wait for a
+	// human; fail immediately when required information is missing.
+	root.PersistentFlags().BoolVar(&nonInteractive, "non-interactive", false, "never prompt or open a browser; fail fast when input is missing")
+	// --json: machine-readable output for commands that return useful data.
+	root.PersistentFlags().BoolVar(&jsonOut, "json", false, "emit JSON instead of the human-readable output (where supported)")
 	// --insecure-remote-http opts into plain HTTP for a non-loopback
 	// control plane / release URL (development only). Off by default; a
 	// non-loopback remote must otherwise be HTTPS. The PAGNET_INSECURE_
@@ -92,6 +137,7 @@ func main() {
 
 	root.AddCommand(
 		loginCmd(),
+		accountCmd(),
 		enrollCmd(),
 		unenrollCmd(),
 		workerCmd(),
@@ -157,25 +203,32 @@ func enrollCmd() *cobra.Command {
 		Short: "Connect this host: signs you in (first run) and consumes an enrollment token",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if stateDir == "" {
-				home, err := os.UserHomeDir()
-				if err != nil {
-					return err
-				}
-				stateDir = filepath.Join(home, ".pagnet")
-			}
-			if token == "" {
-				// No enrollment token: sign in (the browser opens on
-				// first run), mint a one-time token for this host, and
-				// enroll with it. With --token the scripted/CI path is
-				// unchanged (no sign-in at all).
-				if err := enrollHostForeground(stateDir, name, roots, rootsMode); err != nil {
-					return err
-				}
-			} else if err := doEnroll(serverURL, token, name, roots, rootsMode, stateDir); err != nil {
+			root := machineStateDir(stateDir)
+			if _, err := accounts.MigrateLegacy(root); err != nil {
 				return err
 			}
-			fmt.Println("run `pagnet -d` to connect this host")
+			account := accounts.ActiveAccount(root, accountFlag)
+			if token == "" {
+				// No enrollment token: token-first sign-in (the hidden
+				// paste), mint a one-time token for this host, and enroll
+				// with it. With --token the scripted/CI path is unchanged
+				// (no sign-in at all).
+				if err := enrollHostForeground(root, account, name, roots, rootsMode); err != nil {
+					return err
+				}
+			} else {
+				cfg, _, _ := loadAccountConfig(root)
+				server := resolveServerURL(cfg)
+				if server == "" {
+					return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
+				}
+				if err := doEnroll(server, token, name, roots, rootsMode, accountConfigDir(root, account)); err != nil {
+					return err
+				}
+			}
+			if !silent {
+				fmt.Println("run `pagnet -d` to connect this host")
+			}
 			return nil
 		},
 	}
@@ -188,9 +241,10 @@ func enrollCmd() *cobra.Command {
 }
 
 // doEnroll consumes a one-time enrollment token against the control plane
-// and stores the host credential + identity in stateDir (config.yaml,
-// mode 0600). Shared by `pagnet enroll` and `pagnet worker` (first run).
-func doEnroll(server, token, name string, roots []string, rootsMode string, stateDir string) error {
+// and stores the host credential + identity in accDir (the account's
+// config.yaml, mode 0600). Shared by `pagnet enroll` and `pagnet worker`
+// (first run).
+func doEnroll(server, token, name string, roots []string, rootsMode string, accDir string) error {
 	if server == "" {
 		return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
 	}
@@ -246,7 +300,7 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, stat
 		savedMode = mode
 	}
 
-	if err := mergeConfigFile(stateDir, map[string]any{
+	if err := mergeConfigFile(accDir, map[string]any{
 		"serverUrl":    strings.TrimSuffix(server, "/"),
 		"credential":   resp.Credential,
 		"hostId":       resp.Host.ID,
@@ -256,39 +310,15 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, stat
 	}); err != nil {
 		return err
 	}
-	fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)
-	fmt.Printf("credential stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
-	fmt.Printf("roots mode: %s\n", savedMode)
-	if len(savedRoots) > 0 {
-		fmt.Printf("allowed roots: %v\n", savedRoots)
+	if !silent {
+		fmt.Printf("host %s registered (%s)\n", name, resp.Host.ID)
+		fmt.Printf("credential stored in %s (mode 0600)\n", filepath.Join(accDir, "config.yaml"))
+		fmt.Printf("roots mode: %s\n", savedMode)
+		if len(savedRoots) > 0 {
+			fmt.Printf("allowed roots: %v\n", savedRoots)
+		}
 	}
 	return nil
-}
-
-// userTokenForEnroll returns a validated user bearer for the self-enroll
-// flow: an explicit --token / $PAGNET_TOKEN wins (the short-circuit — no
-// sign-in flow, zero device-endpoint calls), otherwise the shared sign-in
-// helper (stored token, or the first-run sign-in). The token is stored so
-// later CLI commands are authenticated.
-func userTokenForEnroll(stateDir, base string) (string, error) {
-	if !strings.HasSuffix(base, "/") {
-		base += "/"
-	}
-	if userToken != "" {
-		client := &http.Client{Timeout: 60 * time.Second}
-		ok, err := bearerMe(client, base, userToken)
-		if err != nil {
-			return "", err
-		}
-		if !ok {
-			return "", errors.New("the server rejected the token")
-		}
-		if err := saveUserToken(stateDir, base, userToken); err != nil {
-			return "", err
-		}
-		return userToken, nil
-	}
-	return ensureUserToken(stateDir, base, os.Getenv("PAGNET_NO_BROWSER") == "1", hasTTYFn())
 }
 
 // mintEnrollmentToken mints a one-time host enrollment token for hostName
@@ -328,24 +358,16 @@ func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string
 }
 
 // resolveEnrollServer resolves the control-plane URL for the first-run
-// enroll flow, in order:
-//
-//  1. the --server flag (or its default source, $PAGNET_SERVER);
-//  2. the state config's ServerURL (partial state: URL present, credential
-//     missing) — LoadDaemon already folds in the env files' PAGNET_SERVER;
-//  3. an interactive prompt (empty answer → one re-prompt, then error);
-//  4. a clean error (non-interactive).
-//
-// A guessed/built-in default is deliberately NOT a source: a fresh machine
-// must not silently probe a URL the user never gave.
-func resolveEnrollServer(stateDir string) (string, error) {
-	if serverURL != "" {
-		return strings.TrimSuffix(serverURL, "/"), nil
+// enroll flow: the full precedence (--server > $PAGNET_SERVER > stored
+// account config > build default, via resolveServerURL), then an interactive
+// prompt (a dev build has no default), then a clean error (non-interactive).
+func resolveEnrollServer(root, account string) (string, error) {
+	if cfg, _, err := loadAccountConfig(root); err == nil {
+		if s := resolveServerURL(cfg); s != "" {
+			return s, nil
+		}
 	}
-	if cfg, err := config.LoadDaemon(stateDir); err == nil && cfg.ServerURL != "" {
-		return strings.TrimSuffix(cfg.ServerURL, "/"), nil
-	}
-	if hasTTYFn() {
+	if interactiveMode() {
 		for attempt := 0; attempt < 2; attempt++ {
 			line, err := askLineFn("control plane URL: ")
 			if err != nil {
@@ -357,23 +379,23 @@ func resolveEnrollServer(stateDir string) (string, error) {
 		}
 		return "", errors.New("no control plane URL entered — set --server / $PAGNET_SERVER or re-run and enter the URL")
 	}
-	return "", errors.New("no control plane URL stored — run 'pagnet enroll --server <url>' first (or set --server / $PAGNET_SERVER)")
+	return "", errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>'")
 }
 
 // enrollHostForeground runs the first-run host connection in the
-// FOREGROUND: resolve the control-plane URL, sign in (the browser opens on
-// first run), mint a one-time enrollment token for this host, and complete
-// the enrollment with it. Shared by `pagnet enroll` (without --token) and
-// `pagnet serve` / `pagnet -d` (which must finish it before the daemon
-// starts / detaches — the sign-in URL prints first, and the sign-in flow
-// never runs inside the detached child).
-func enrollHostForeground(stateDir, name string, roots []string, rootsMode string) error {
-	server, err := resolveEnrollServer(stateDir)
+// FOREGROUND: resolve the control-plane URL, authenticate the user
+// token-first (the hidden paste — never a browser), mint a one-time
+// enrollment token for this host, and complete the enrollment with it.
+// Shared by `pagnet enroll` (without --token) and `pagnet serve` /
+// `pagnet -d` (which must finish it before the daemon starts / detaches —
+// the paste prompt runs in the foreground, never inside the detached child).
+func enrollHostForeground(root, account, name string, roots []string, rootsMode string) error {
+	server, err := resolveEnrollServer(root, account)
 	if err != nil {
 		return err
 	}
 	base := server + "/"
-	userTok, err := userTokenForEnroll(stateDir, base)
+	userTok, err := userCredentialForServe(root, account, server)
 	if err != nil {
 		return err
 	}
@@ -388,7 +410,7 @@ func enrollHostForeground(stateDir, name string, roots []string, rootsMode strin
 	if err != nil {
 		return err
 	}
-	return doEnroll(server, minted, hostName, roots, rootsMode, stateDir)
+	return doEnroll(server, minted, hostName, roots, rootsMode, accountConfigDir(root, account))
 }
 
 // apiPostJSON posts a JSON body and decodes the response into out.

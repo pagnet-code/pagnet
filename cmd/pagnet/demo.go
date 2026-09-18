@@ -34,17 +34,14 @@ func demoCmd() *cobra.Command {
 			}
 			// Standalone admin client: no host login required. The admin
 			// bearer token authenticates the REST calls; empty means dev
-			// loopback auto-admin.
-			if serverURL == "" {
-				// No --server / $PAGNET_SERVER: on an already-connected
-				// machine the stored control plane applies (same rule as
-				// login / the REST commands).
-				serverURL = storedServerURL("")
-			}
-			if serverURL == "" {
+			// loopback auto-admin. Server precedence: --server > $PAGNET_
+			// SERVER > stored account config > build default.
+			cfg, _, _ := loadAccountConfig(machineStateDir(""))
+			server := resolveServerURL(cfg)
+			if server == "" {
 				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 			}
-			c := &cliCtx{base: serverURL, token: adminToken}
+			c := &cliCtx{base: server, token: adminToken}
 			return runDemo(c, network, webURL)
 		},
 	}

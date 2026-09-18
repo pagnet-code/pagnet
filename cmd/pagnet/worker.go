@@ -140,7 +140,8 @@ func workerCmd() *cobra.Command {
 				if !ok {
 					return errors.New("--user-token was rejected by the server")
 				}
-				if err := saveUserToken(stateDir, cfg.ServerURL, userTok); err != nil {
+				// Workers keep a FLAT config (no account contexts): account "".
+				if err := saveUserToken(stateDir, "", cfg.ServerURL, userTok); err != nil {
 					return err
 				}
 			}

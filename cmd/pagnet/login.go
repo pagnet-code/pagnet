@@ -39,7 +39,7 @@ import (
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
-	"github.com/pagnet-code/pagnet/internal/config"
+	"github.com/pagnet-code/pagnet/internal/accounts"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
@@ -70,33 +70,24 @@ safe path: argv and the environment can leak into shell history, process
 listings, and CI logs.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if stateDir == "" {
-				home, err := os.UserHomeDir()
-				if err != nil {
-					return err
-				}
-				stateDir = filepath.Join(home, ".pagnet")
+			root := machineStateDir(stateDir)
+			if _, err := accounts.MigrateLegacy(root); err != nil {
+				return err
 			}
-			base := serverURL
-			if base == "" {
-				// No --server / $PAGNET_SERVER: the logged-in server
-				// applies (same rule as the REST commands).
-				if cfg, err := config.LoadDaemon(stateDir); err == nil && cfg.ServerURL != "" {
-					base = cfg.ServerURL
-				}
-			}
-			if base == "" {
+			account := accounts.ActiveAccount(root, accountFlag)
+			accDir := accountConfigDir(root, account)
+			cfg, _, _ := loadAccountConfig(root)
+			server := resolveServerURL(cfg)
+			if server == "" {
 				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 			}
 			// HTTPS-required-for-non-loopback (client-hardening wave 2):
 			// login speaks raw HTTP to the control plane, so it checks the
 			// policy itself (it does not go through newCLI).
-			if err := netpolicy.Check(base, insecureRemoteHTTP); err != nil {
+			if err := netpolicy.Check(server, insecureRemoteHTTP); err != nil {
 				return err
 			}
-			if !strings.HasSuffix(base, "/") {
-				base += "/"
-			}
+			base := server + "/"
 			client := &http.Client{Timeout: 60 * time.Second}
 
 			// Which auth mode is the server running? (public endpoint)
@@ -157,7 +148,7 @@ listings, and CI logs.`,
 					}
 				}
 				if pasted != "" {
-					res, err := loginWithPastedToken(stateDir, base, client, pasted)
+					res, err := loginWithPastedToken(accDir, account, server, client, pasted)
 					if err != nil {
 						return err
 					}
@@ -169,7 +160,7 @@ listings, and CI logs.`,
 					// Reuse the shared helper: it validates a stored token
 					// first (idempotent re-login) and runs the sign-in flow
 					// otherwise. It persists the token itself.
-					apiToken, err := ensureUserToken(stateDir, base, noBrowser, hasTTYFn())
+					apiToken, err := ensureUserToken(accDir, account, base, noBrowser, hasTTYFn())
 					if err != nil {
 						return err
 					}
@@ -200,11 +191,11 @@ listings, and CI logs.`,
 			}
 
 			if !saved {
-				if err := saveUserToken(stateDir, base, token); err != nil {
+				if err := saveUserToken(accDir, account, server, token); err != nil {
 					return err
 				}
 			}
-			fmt.Printf("token stored in %s (mode 0600)\n", filepath.Join(stateDir, "config.yaml"))
+			fmt.Printf("token stored in %s (mode 0600)\n", filepath.Join(accDir, "config.yaml"))
 			fmt.Println("override per call with --token or $PAGNET_TOKEN")
 			return nil
 		},
@@ -235,10 +226,17 @@ func bearerMe(client *http.Client, base, token string) (bool, error) {
 
 // --- token storage (user bearer in the shared state file) ---------------------
 
-// credentialKey is the OS-keyring key for a server's user token (scoped per
-// server so different control planes keep separate credentials).
-func credentialKey(server string) string {
-	return "pagnet-token-" + strings.TrimSuffix(server, "/")
+// credentialKey is the OS-keyring key for an account's user token. It is
+// scoped per (account, server) so two accounts on the same control plane
+// keep separate credentials and never overwrite each other. The default
+// account keeps the legacy server-scoped key so existing keyring entries
+// survive the account migration untouched.
+func credentialKey(account, server string) string {
+	s := strings.TrimSuffix(server, "/")
+	if account == "" || account == accounts.DefaultAccount {
+		return "pagnet-token-" + s
+	}
+	return "pagnet-token-" + account + "-" + s
 }
 
 // openKeyringFn opens the OS keyring (a test seam: replace it to force the
@@ -249,11 +247,13 @@ var openKeyringFn = func() (keyring.Keyring, error) {
 }
 
 // loadUserToken reads the stored user bearer ("" when absent). The OS keyring
-// is preferred when available; the 0600 state file is the fallback.
-func loadUserToken(stateDir, server string) string {
+// is preferred when available; the 0600 account config file is the fallback.
+// stateDir is the account's config dir (or a worker dir); account scopes the
+// keyring key ("" = server-scoped, for workers/legacy).
+func loadUserToken(stateDir, account, server string) string {
 	if server != "" {
 		if kr, err := openKeyringFn(); err == nil {
-			if item, err := kr.Get(credentialKey(server)); err == nil {
+			if item, err := kr.Get(credentialKey(account, server)); err == nil {
 				return string(item.Data)
 			}
 		}
@@ -313,10 +313,10 @@ func mergeConfigFile(stateDir string, fields map[string]any) error {
 // flows (token / local / oidc — a legacy-shaped API token). The derived-
 // credential metadata of a previous token-first login is cleared (those
 // flows carry none). Storage itself is saveCredential: OS keyring preferred,
-// 0600 state file fallback; the server URL (non-secret) is always kept in
-// the file.
-func saveUserToken(stateDir, server, token string) error {
-	return saveCredential(stateDir, server, token, credentialMeta{})
+// 0600 account config file fallback; the server URL (non-secret) is always
+// kept in the file.
+func saveUserToken(stateDir, account, server, token string) error {
+	return saveCredential(stateDir, account, server, token, credentialMeta{})
 }
 
 // --- prompts ------------------------------------------------------------------
@@ -685,11 +685,11 @@ func serverAuthMode(base string) (string, error) {
 	return s.Mode, nil
 }
 
-// storedServerURL returns the control plane URL from the daemon state config
-// ("" when absent or unreadable) — the fallback for commands on an already
-// connected machine when --server / $PAGNET_SERVER is empty.
+// storedServerURL returns the control plane URL from the active account's
+// config ("" when absent or unreadable) — the fallback for commands on an
+// already connected machine when --server / $PAGNET_SERVER is empty.
 func storedServerURL(stateDir string) string {
-	if cfg, err := config.LoadDaemon(stateDir); err == nil {
+	if cfg, _, err := loadAccountConfig(stateDir); err == nil {
 		return cfg.ServerURL
 	}
 	return ""
@@ -712,7 +712,7 @@ func storedServerURL(stateDir string) string {
 // user signs in from another device). Callers holding an explicit
 // --token / $PAGNET_TOKEN must not call this at all: the short-circuit
 // happens before any endpoint is touched.
-func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string, error) {
+func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool) (string, error) {
 	if base == "" {
 		return "", errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}
@@ -722,7 +722,7 @@ func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string
 	client := &http.Client{Timeout: 60 * time.Second}
 
 	// 1. A stored token that still validates is the one to use.
-	if tok := loadUserToken(stateDir, base); tok != "" {
+	if tok := loadUserToken(stateDir, account, base); tok != "" {
 		if ok, err := bearerMe(client, base, tok); err == nil && ok {
 			return tok, nil
 		}
@@ -743,7 +743,7 @@ func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string
 		if err != nil {
 			return "", err
 		}
-		if err := saveUserToken(stateDir, base, tok); err != nil {
+		if err := saveUserToken(stateDir, account, base, tok); err != nil {
 			return "", err
 		}
 		fmt.Printf("signed in; token stored in %s\n", stateDir)
@@ -765,7 +765,7 @@ func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string
 		if err != nil {
 			return "", err
 		}
-		if err := saveUserToken(stateDir, base, tok); err != nil {
+		if err := saveUserToken(stateDir, account, base, tok); err != nil {
 			return "", err
 		}
 		fmt.Printf("signed in; token stored in %s\n", stateDir)

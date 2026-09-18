@@ -23,6 +23,9 @@ type cliCtx struct {
 	base     string
 	stateDir string
 	cfg      config.Daemon
+	// account is the active account name ("" for a worker's flat dir). It
+	// scopes the user credential (keyring key + account config dir).
+	account string
 	// token is the user/admin bearer for REST calls. NEVER the host
 	// credential (cfg.Credential): host identities are WSS-only and the
 	// REST API rejects them (403 host_identity).
@@ -55,19 +58,21 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 		}
 	}
 	c.stateDir = stateDirOverride
-	cfg, err := config.LoadDaemon(c.stateDir)
+	// Account-aware config load: the one-time legacy migration, then the
+	// ACTIVE account's config (serverUrl, credential, hostId, ...) with the
+	// machine-wide state dir as cfg.StateDir. A worker dir loads its flat
+	// config (account "").
+	cfg, account, err := loadAccountConfig(c.stateDir)
 	if err != nil {
 		return nil, err
 	}
-	// An explicit --server flag wins over the saved config; otherwise the
-	// logged-in server applies (the old code always overwrote the flag
-	// with the saved value, silently ignoring --server).
-	serverExplicit := root != nil &&
-		root.PersistentFlags().Lookup("server") != nil &&
-		root.PersistentFlags().Changed("server")
-	if !serverExplicit && cfg.ServerURL != "" {
-		c.base = cfg.ServerURL
-	}
+	c.cfg = cfg
+	c.account = account
+	// Server precedence: --server > $PAGNET_SERVER > stored account config
+	// > build default (resolveServerURL; cfg.ServerURL already carries env
+	// over file). The old code folded the stored config over $PAGNET_SERVER
+	// — the stale-dev-control-plane bug.
+	c.base = resolveServerURL(cfg)
 	if c.base == "" {
 		return nil, errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}
@@ -77,17 +82,14 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if err := netpolicy.Check(c.base, insecureRemoteHTTP); err != nil {
 		return nil, err
 	}
-	c.cfg = cfg
 	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no
-	// auth endpoint is called at all), then the shared sign-in helper,
-	// which validates the stored token or runs the sign-in flow per the
-	// server's auth mode (first run: the browser opens, the command
-	// continues without a re-run).
+	// auth endpoint is called at all), then the account's stored
+	// credential, else the sign-in flow (interactive) / fail (non-interactive).
 	if c.token = userToken; c.token == "" {
 		c.reauth = true
 		c.noBrowser = os.Getenv("PAGNET_NO_BROWSER") == "1"
-		c.interactive = hasTTYFn()
-		tok, err := ensureUserToken(c.stateDir, c.base, c.noBrowser, c.interactive)
+		c.interactive = interactiveMode()
+		tok, err := ensureUserToken(c.stateDir, account, c.base, c.noBrowser, c.interactive)
 		if err != nil {
 			return nil, err
 		}
@@ -135,7 +137,7 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 		// API error.
 		if c.reauth && !c.retried {
 			c.retried = true
-			tok, err := ensureUserToken(c.stateDir, c.base, c.noBrowser, c.interactive)
+			tok, err := ensureUserToken(c.stateDir, c.account, c.base, c.noBrowser, c.interactive)
 			if err == nil {
 				c.token = tok
 				return c.do(method, path, body, out)

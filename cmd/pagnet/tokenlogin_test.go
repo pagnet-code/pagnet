@@ -182,7 +182,7 @@ func TestLoginWithPastedAccountToken(t *testing.T) {
 	srv.setExchange(0, fmt.Sprintf(`{"credential":"%s","role":"","expiresAt":"2027-01-01T00:00:00Z","sourceId":"K4T9M7QZaB1c3d5f"}`, testDerivedCred))
 
 	dir := t.TempDir()
-	res, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), "  "+testAccountToken+"\n")
+	res, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), "  "+testAccountToken+"\n")
 	if err != nil {
 		t.Fatalf("paste login: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestLoginWithPastedAccessToken(t *testing.T) {
 	srv.setExchange(0, fmt.Sprintf(`{"credential":"%s","role":"operator","networkScope":"selected","networks":["Production","Staging"],"expiresAt":"2026-10-16T00:00:00Z","organizationId":"org-7"}`, testDerivedCred))
 
 	dir := t.TempDir()
-	res, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), testAccessToken)
+	res, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testAccessToken)
 	if err != nil {
 		t.Fatalf("paste login: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestLoginWithPastedLegacyToken(t *testing.T) {
 	srv.setValidBearer(testLegacyToken)
 
 	dir := t.TempDir()
-	res, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
+	res, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
 	if err != nil {
 		t.Fatalf("paste login: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestLoginWithPastedLegacyTokenRejected(t *testing.T) {
 	srv.setValidBearer("pagt_someother")
 
 	dir := t.TempDir()
-	_, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
+	_, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
 	if err == nil || !strings.Contains(err.Error(), "rejected") {
 		t.Fatalf("err = %v, want the clean rejection message", err)
 	}
@@ -322,7 +322,7 @@ func TestLoginWithPastedTokenExchangeRejected(t *testing.T) {
 	srv.setExchange(http.StatusUnauthorized, "")
 
 	dir := t.TempDir()
-	_, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), testAccountToken)
+	_, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testAccountToken)
 	if err == nil {
 		t.Fatal("want the generic rejection error")
 	}
@@ -342,7 +342,7 @@ func TestLoginWithPastedTokenFormatErrorNoRoundTrip(t *testing.T) {
 	srv := newStubTokenServer(t)
 
 	dir := t.TempDir()
-	_, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), "pgn_totallywrong_abc")
+	_, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), "pgn_totallywrong_abc")
 	if err == nil || !strings.Contains(err.Error(), "unrecognized Pagnet Token") {
 		t.Fatalf("err = %v, want the prefix-naming format error", err)
 	}
@@ -366,7 +366,7 @@ func TestLoginWithPastedTokenNoDerivedCredential(t *testing.T) {
 	srv.setExchange(0, `{"kind":"account"}`) // no credential at all
 
 	dir := t.TempDir()
-	_, err := loginWithPastedToken(dir, srv.ts.URL+"/", srv.ts.Client(), testAccountToken)
+	_, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testAccountToken)
 	if err == nil || !strings.Contains(err.Error(), "no client credential") {
 		t.Fatalf("err = %v, want the clean empty-credential error", err)
 	}
@@ -382,7 +382,7 @@ func TestSaveCredentialClearsStaleMetadata(t *testing.T) {
 	dir := t.TempDir()
 
 	// A token-first login stores kind + role + networks.
-	if err := saveCredential(dir, "https://cp.example/", testDerivedCred, credentialMeta{
+	if err := saveCredential(dir, "", "https://cp.example/", testDerivedCred, credentialMeta{
 		Kind: credentialKindAccess, Role: "operator", Networks: []string{"Production"},
 	}); err != nil {
 		t.Fatalf("saveCredential: %v", err)
@@ -394,7 +394,7 @@ func TestSaveCredentialClearsStaleMetadata(t *testing.T) {
 
 	// A later mode-based login (saveUserToken) must CLEAR the metadata —
 	// it carries none, and stale metadata would misrepresent the bearer.
-	if err := saveUserToken(dir, "https://cp.example/", "pagt_fresh"); err != nil {
+	if err := saveUserToken(dir, "", "https://cp.example/", "pagt_fresh"); err != nil {
 		t.Fatalf("saveUserToken: %v", err)
 	}
 	fc = stateFile(t, dir)

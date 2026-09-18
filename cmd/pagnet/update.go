@@ -46,11 +46,10 @@ func updateCmd() *cobra.Command {
 // pagnet executable this command runs from) with the latest release,
 // then print how to restart the daemon so the new version takes effect.
 func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
-	if serverURL == "" {
-		// No --server / $PAGNET_SERVER: on an already-connected machine the
-		// stored control plane applies (same rule as login / the REST commands).
-		serverURL = storedServerURL(stateDir)
-	}
+	// Server precedence: --server > $PAGNET_SERVER > stored account config
+	// > build default (resolveServerURL; the param carries the --server flag).
+	cfg, _, _ := loadAccountConfig(machineStateDir(stateDir))
+	serverURL = resolveServerURL(cfg)
 	if serverURL == "" {
 		return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
 	}

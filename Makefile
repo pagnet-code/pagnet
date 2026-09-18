@@ -10,6 +10,14 @@ RELEASE_DIR := dist
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
 
+# defaultServerURL is the build-time default control plane (ldflags,
+# -X main.defaultServerURL=...). DEV builds leave it EMPTY (the CLI then
+# requires --server / $PAGNET_SERVER / the stored account config); a dev may
+# stamp a different default explicitly (e.g. make build
+# DEFAULT_SERVER_URL=http://localhost:8443). The release target always stamps
+# the STANDARD PRODUCTION default (https://app.pagnet.dev).
+DEFAULT_SERVER_URL ?=
+
 .PHONY: build install test test-race fmt vet tidy demo release release-sign clean
 
 ## build: compile the Go binaries into bin/
@@ -17,12 +25,12 @@ RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
 ## pagnet-fake-runtime is local test infrastructure, never shipped)
 build:
 	mkdir -p $(BIN)
-	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(BIN)/pagnet ./cmd/pagnet
+	$(GO) build -ldflags "-X main.version=$(VERSION) -X main.defaultServerURL=$(DEFAULT_SERVER_URL)" -o $(BIN)/pagnet ./cmd/pagnet
 	$(GO) build -o $(BIN)/pagnet-fake-runtime ./cmd/pagnet-fake-runtime
 
 ## install: go-install the pagnet binary into GOPATH/bin
 install:
-	$(GO) install -ldflags "-X main.version=$(VERSION)" ./cmd/pagnet
+	$(GO) install -ldflags "-X main.version=$(VERSION) -X main.defaultServerURL=$(DEFAULT_SERVER_URL)" ./cmd/pagnet
 
 test:
 	$(GO) test ./...
@@ -66,7 +74,7 @@ release:
 	@for t in $(RELEASE_TARGETS); do \
 		os=$${t%/*}; arch=$${t#*/}; \
 		tmp=$$(mktemp -d); \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
+		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION) -X main.defaultServerURL=https://app.pagnet.dev" -o $$tmp/pagnet ./cmd/pagnet || rm -rf $$tmp; \
 		cp LICENSE README.md $$tmp/; \
 		tar -C $$tmp -czf $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz pagnet LICENSE README.md || rm -rf $$tmp; \
 		cp $(RELEASE_DIR)/pagnet-$(VERSION)-$$os-$$arch.tar.gz $(RELEASE_DIR)/pagnet-latest-$$os-$$arch.tar.gz || rm -rf $$tmp; \
