@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -229,6 +230,54 @@ type Adapter interface {
 	// Env are set the same way as for a turn. The caller owns the returned
 	// command (it is started under a PTY by the daemon).
 	InteractiveCmd(spec TurnSpec) (*exec.Cmd, error)
+}
+
+// --- shared adapter helpers ----------------------------------------------------
+
+// readStoredSession loads the last captured runtime session id, "" if none.
+// The process-per-turn adapters (claude-code, opencode) persist the exact
+// captured id so a later resume passes it back to the CLI.
+func readStoredSession(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var s struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(b, &s); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(s.SessionID), nil
+}
+
+// writeStoredSession persists the captured runtime session id (0600,
+// atomic — session ids are local state, never world-readable).
+func writeStoredSession(path, id string) error {
+	b, _ := json.Marshal(struct {
+		SessionID string `json:"sessionId"`
+	}{SessionID: id})
+	return atomicWriteFile(path, append(b, '\n'), 0o600)
+}
+
+// intPtr is the token-usage pointer helper (nil when the runtime reports
+// nothing / zero).
+func intPtr(n int) *int {
+	if n == 0 {
+		return nil
+	}
+	return &n
+}
+
+// firstNonEmpty returns the first non-blank text, or a placeholder when
+// none (a failure message must never be empty).
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return "runtime exited without output"
 }
 
 // InteractionObserver is the native-interaction capability model (plan

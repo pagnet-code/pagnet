@@ -97,22 +97,28 @@ func (d *Daemon) stateID() string {
 }
 
 // detectRuntimes reports every runtime this daemon can actually drive,
-// resolving each CLI binary with the SAME lookup the adapter uses at
-// launch — the canonical runtime name is not the binary name (qwen-code →
-// `qwen`), so probing names directly would report runtimes we cannot run
-// (or miss ones we can).
+// resolving each CLI binary with the SAME lookup the driver/adapter uses
+// at launch — the canonical runtime name is not the binary name (qwen-code
+// → `qwen`), so probing names directly would report runtimes we cannot run
+// (or miss ones we can). Process-per-turn runtimes are reported from the
+// adapter map; session-driven runtimes (qwen-code since Wave B — its
+// legacy adapter was removed; the debug fake-persistent driver) are
+// reported from the SESSION DRIVER, which resolves the binary and whose
+// capability set is the one the control plane sees.
 func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
+	reported := make(map[domain.RuntimeName]bool, len(d.adapters))
 	out := make([]transport.RuntimeInstallation, 0, len(d.adapters))
 	for name, a := range d.adapters {
 		if p, ok := a.BinaryPath(); ok {
+			reported[name] = true
 			ri := transport.RuntimeInstallation{
 				Runtime: string(name),
 				Path:    p,
 				Version: d.runtimeVersion(p),
 			}
-			// Phase 4: a session-driven runtime's capabilities come from
-			// the SESSION DRIVER (not the legacy adapter) when one is
-			// registered (the persistent path is the active one).
+			// A session driver registered for an adapter-mapped runtime
+			// reports its (session driver's) capabilities — the persistent
+			// path is the active one.
 			if caps := d.sessionDriverCapabilities(name); caps != nil {
 				ri.Capabilities = caps
 			} else if obs, ok := a.(agentruntime.InteractionObserver); ok {
@@ -130,23 +136,34 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 			out = append(out, ri)
 		}
 	}
-	// Phase 1 (runtime-lifecycle refactor): the fake PERSISTENT runtime is
-	// driven through the session core (not the adapter map). Report it with
-	// the SAME shape as the other runtimes when the debug session driver is
-	// registered — the server never sees it in non-debug builds (the driver
-	// is registered only in debug mode). Additive: the wire shape is
-	// unchanged.
+	// Session-driven runtimes (runtime-lifecycle refactor): reported from
+	// the SESSION DRIVER when not already reported via the adapter map —
+	// the driver resolves the binary with the same lookup it uses at
+	// launch. The debug fake-persistent driver is reported the same way
+	// (it is registered only in debug mode, so the server never sees it in
+	// non-debug builds). Additive: the wire shape is unchanged.
 	if d.sessions != nil {
-		if drv := d.sessions.DriverFor(domain.RuntimeFakePersistent); drv != nil {
-			if pf, ok := drv.(*agentruntime.PersistentFake); ok {
-				if p, ok := pf.BinaryPath(); ok {
-					out = append(out, transport.RuntimeInstallation{
-						Runtime: string(domain.RuntimeFakePersistent),
-						Path:    p,
-						Version: d.runtimeVersion(p),
-					})
-				}
+		for name, drv := range d.sessions.Drivers() {
+			if reported[name] {
+				continue
 			}
+			bp, ok := drv.(interface{ BinaryPath() (string, bool) })
+			if !ok {
+				continue
+			}
+			p, ok := bp.BinaryPath()
+			if !ok {
+				continue
+			}
+			ri := transport.RuntimeInstallation{
+				Runtime: string(name),
+				Path:    p,
+				Version: d.runtimeVersion(p),
+			}
+			if caps := d.sessionDriverCapabilities(name); caps != nil {
+				ri.Capabilities = caps
+			}
+			out = append(out, ri)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Runtime < out[j].Runtime })

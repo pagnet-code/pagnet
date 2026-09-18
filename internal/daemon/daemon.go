@@ -415,10 +415,12 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if cfg.HostID != "" {
 		_ = st.KVSet("host_id", cfg.HostID)
 	}
-	// Real runtimes are always registered: the daemon reports whichever of
-	// these it can actually drive (detectRuntimes resolves each binary).
+	// Process-per-turn runtimes are always registered: the daemon reports
+	// whichever of these it can actually drive (detectRuntimes resolves
+	// each binary). qwen-code is NOT here (Wave B): it is session-driven
+	// (the Qwen Dual Output persistent driver below) — its legacy
+	// process-per-turn adapter was removed.
 	adapters := map[domain.RuntimeName]agentruntime.Adapter{
-		domain.RuntimeQwenCode:   agentruntime.NewQwen(""),
 		domain.RuntimeClaudeCode: agentruntime.NewClaude(""),
 		domain.RuntimeOpenCode:   agentruntime.NewOpenCode(""),
 	}
@@ -451,13 +453,14 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		persistentFake.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		sessions.RegisterDriver(persistentFake)
 	}
-	// The Qwen Dual Output persistent driver (runtime-lifecycle refactor,
-	// Phase 4 / Wave A): ONE long-lived qwen TUI per instance, driven
+	// The Qwen Dual Output persistent driver (runtime-lifecycle
+	// refactor, Phase 4): ONE long-lived qwen TUI per instance, driven
 	// through the session core. It is registered when the qwen binary is
-	// resolvable (binary presence only — no --version subprocess at boot).
-	// The legacy process-per-turn Qwen adapter stays in the adapter map
-	// (coexistence, Wave A); the daemon routes a qwen instance to the
-	// persistent path when a session driver is registered for it.
+	// resolvable (binary presence only — no --version subprocess at
+	// boot). Wave B removed the legacy process-per-turn Qwen adapter:
+	// qwen-code is session-driven whenever the binary resolves (the
+	// daemon routes a qwen instance to the persistent path when a
+	// session driver is registered for it).
 	qwenPersistent := agentruntime.NewQwenPersistent("")
 	qwenPersistent.Env = cfg.RuntimeEnv
 	qwenPersistentRegistered := qwenPersistent.Available()
@@ -1785,11 +1788,14 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		// No runtime requested: pick the first available REAL runtime.
 		// The fake runtime is debug-only and is never auto-selected, so a
 		// production daemon (no fake) still launches on its real runtimes
-		// instead of hard-failing on an empty default.
+		// instead of hard-failing on an empty default. Availability is
+		// the same check the explicit-runtime path below uses (an
+		// adapter present AND Available, or a registered session driver
+		// — qwen-code is session-driven since Wave B).
 		for _, name := range []domain.RuntimeName{
 			domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
 		} {
-			if ad, ok := d.adapters[name]; ok && ad.Available() {
+			if d.runtimeAvailable(name) {
 				rn = name
 				break
 			}
@@ -1970,7 +1976,8 @@ func (d *Daemon) sessionDriverFor(row *InstanceRow) session.Driver {
 
 // runtimeSupported reports whether rn is drivable on this host: a
 // process-per-turn runtime via its adapter, or a session-driven runtime
-// (Phase 1: fake-persistent) via a registered session driver.
+// (qwen-code since Wave B; fake-persistent in debug) via a registered
+// session driver.
 func (d *Daemon) runtimeSupported(rn domain.RuntimeName) bool {
 	if _, ok := d.adapters[rn]; ok {
 		return true
@@ -1980,7 +1987,7 @@ func (d *Daemon) runtimeSupported(rn domain.RuntimeName) bool {
 
 // runtimeAvailable reports whether rn is installed and usable: a
 // process-per-turn runtime via its adapter's availability check, a
-// session-driven runtime (Phase 1: fake-persistent) via its driver. A
+// session-driven runtime (qwen-code, fake-persistent) via its driver. A
 // session driver without an availability check is assumed available.
 func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 	if ad, ok := d.adapters[rn]; ok {
@@ -2408,10 +2415,11 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	// Phase 1 (runtime-lifecycle refactor): a PERSISTENT runtime is driven
 	// through the session core — one long-lived endpoint that services many
 	// logical submits (EnsureActive + Submit + consume normalized events) —
-	// not the legacy process-per-turn Adapter path. The five real vendors
-	// and the process-per-turn Fake keep the legacy path below (their
-	// migration is Phase 2). The session core serializes prompt turns per
-	// instance (promptLock), so no separate active-turn guard is needed.
+	// not the legacy process-per-turn Adapter path. qwen-code is
+	// session-driven (Wave B: its legacy adapter was removed); the
+	// process-per-turn claude-code / opencode / Fake keep the legacy path
+	// below. The session core serializes prompt turns per instance
+	// (promptLock), so no separate active-turn guard is needed.
 	//
 	// This is checked BEFORE the adapter lookup: a session-driven runtime
 	// has NO adapter (it lives in the session core), so the adapter lookup

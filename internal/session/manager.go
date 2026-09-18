@@ -69,6 +69,22 @@ func (m *Manager) DriverFor(runtime domain.RuntimeName) Driver {
 	return m.drivers[runtime]
 }
 
+// Drivers returns a snapshot of the registered drivers (runtime name →
+// driver). The Manager is the source of truth for which runtimes are
+// session-driven; callers that report or probe session-driven runtimes
+// (the daemon's inventory) enumerate from here instead of a hardcoded
+// list. The returned map is a copy — mutating it does not affect the
+// Manager.
+func (m *Manager) Drivers() map[domain.RuntimeName]Driver {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[domain.RuntimeName]Driver, len(m.drivers))
+	for k, v := range m.drivers {
+		out[k] = v
+	}
+	return out
+}
+
 // Session returns the session for an instance, creating it (inactive) when
 // absent. The runtime and workspace are stamped on creation; a later call
 // with the same instance returns the existing session unchanged.

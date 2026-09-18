@@ -394,3 +394,25 @@ func TestClaude_StopKillsProcess(t *testing.T) {
 		t.Fatal("StartTurn did not return after Stop")
 	}
 }
+
+// TestStoredSessionRoundTrip covers the SHARED session-persistence helper
+// (readStoredSession / writeStoredSession — used by the process-per-turn
+// adapters): the exact captured id round-trips and the file is 0600
+// (session ids are local state).
+func TestStoredSessionRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.json")
+	if id, err := readStoredSession(path); id != "" || err == nil {
+		t.Fatalf("missing file: id=%q err=%v, want empty + error", id, err)
+	}
+	if err := writeStoredSession(path, "abc-123"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := readStoredSession(path)
+	if err != nil || id != "abc-123" {
+		t.Fatalf("round trip = %q, %v; want abc-123", id, err)
+	}
+	fi, _ := os.Stat(path)
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("session file mode = %v, want 0600 (session ids are local state)", fi.Mode())
+	}
+}

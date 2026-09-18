@@ -23,9 +23,10 @@ package runtime
 // per-kind remote-resolution policy), so the daemon drives it through the
 // session core exactly the way it drives the other persistent runtimes.
 //
-// The legacy process-per-turn Qwen adapter (qwen.go, StartTurn) stays in
-// place for coexistence (Wave A); Wave B removes it after equivalence is
-// proven. The two share the binary/model/MCP-config resolution helpers.
+// Wave B removed the legacy process-per-turn Qwen adapter (qwen.go,
+// StartTurn) after equivalence was proven: this driver is the ONLY qwen
+// path (the daemon registers it whenever the binary resolves and routes
+// every qwen instance to it).
 //
 // Key invariants (brief B1–B11, doc §5–§8):
 //   - B1: the child's stdio is the PTY slave (PTYStdio); the machine plane
@@ -99,8 +100,7 @@ const qwenStateFile = "session.json"
 // QwenPersistent is the Qwen Dual Output persistent driver.
 type QwenPersistent struct {
 	// Binary is the path to the qwen executable. When empty it is resolved
-	// from PATH / next to the current executable (same resolution as the
-	// legacy Qwen adapter).
+	// from PATH / next to the current executable.
 	Binary string
 	// Model overrides the model for managed endpoints (empty = the
 	// session's launch model, then the PAGNET_QWEN_MODEL env, then the
@@ -128,9 +128,9 @@ func NewQwenPersistent(binary string) *QwenPersistent {
 // process supervisor; standalone use falls back to a private one).
 func (q *QwenPersistent) SetLifecycle(l proc.Lifecycle) { q.life.SetLifecycle(l) }
 
-// Name is the canonical runtime name (shared with the legacy adapter — the
-// daemon routes a qwen instance to the persistent path when a session
-// driver is registered for it).
+// Name is the canonical runtime name (the daemon registers this driver
+// when the qwen binary resolves and routes every qwen instance to the
+// persistent path — Wave B removed the legacy process-per-turn adapter).
 func (q *QwenPersistent) Name() domain.RuntimeName { return domain.RuntimeQwenCode }
 
 // Capabilities is the probed capability set (B8 — honest advertisement).
@@ -922,8 +922,8 @@ func (q *QwenPersistent) stateDir() string {
 	return filepath.Join(home, ".local", "state", "pagnet")
 }
 
-// binary resolves the qwen CLI path (same resolution as the legacy Qwen
-// adapter).
+// binary resolves the qwen CLI path: the explicit field, then PATH, then
+// next to the current executable.
 func (q *QwenPersistent) binary() (string, error) {
 	if q.Binary != "" {
 		if _, err := os.Stat(q.Binary); err == nil {

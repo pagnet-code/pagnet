@@ -33,6 +33,17 @@ package runtime
 //     accumulated from assistant.message.usage (per turn; there is no
 //     result.usage / duration_ms).
 //
+// Provider errors can be dressed as success (Phase I): the provider can
+// return a 429/quota/auth failure as the model's "final answer" (the
+// error text IS the response). At machine-turn completion the step's
+// final text-only answer text is scanned with the strict classifier
+// (LooksLikeProviderError) — a match ends the turn as a CLASSIFIED
+// turn.failed (kind + provider-supplied retry time), not a completion.
+// Ordinary task output (even text mentioning "authentication" or
+// "connection refused") never matches the strict list. Human turns are
+// not classified (not on the machine stream — the same condition the B6
+// submit correlation uses).
+//
 // It is robust to unknown content_block/delta types (thinking blocks, etc.)
 // — they are opaque and never a failure (B4).
 //
@@ -42,9 +53,11 @@ package runtime
 // goroutines. All access is under s.mu.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,9 +115,10 @@ type qwenTurnState struct {
 	// interaction (ask_user_question) stays in flight until the human
 	// answers (the answer is a tool_result user event starting the next
 	// step).
-	messageOpen      bool // inside message_start..message_stop
-	stepTextFinalize bool // a text-only assistant finalize in this step
-	stepToolUse      bool // a tool_use assistant finalize in this step
+	messageOpen      bool   // inside message_start..message_stop
+	stepTextFinalize bool   // a text-only assistant finalize in this step
+	stepToolUse      bool   // a tool_use assistant finalize in this step
+	stepFinalText    string // the step's accumulated final text-only answer text
 
 	// machine submit correlation (B6)
 	machineTurnID   string
@@ -318,11 +332,28 @@ func (s *qwenTurnState) processSystem(ev qwenDOEvent) []session.SessionEvent {
 		return nil
 	case "continue_turn_failed":
 		// The turn's continuation failed — a terminal failure for the
-		// in-flight machine turn (B4).
+		// in-flight machine turn (B4). The event's data may carry the
+		// failure text (the provider error that killed the
+		// continuation): when it carries a strong provider-error
+		// signature, classify it (kind + provider-supplied retry time);
+		// otherwise it is a process-level failure (the text is not
+		// established as a provider error — keep the generic kind and
+		// the same error string).
 		if s.turnActive && s.turnIsMachine {
 			turnID := s.machineTurnID
 			sid := s.sessionID
 			s.endTurnLocked()
+			if text := qwenSystemErrorText(ev.Data); text != "" && LooksLikeProviderError(text) {
+				kind, retryAt := ClassifyProviderError(text)
+				return []session.SessionEvent{{
+					Type:        session.EventTurnFailed,
+					SessionID:   sid,
+					TurnID:      turnID,
+					FailureKind: string(kind),
+					Error:       trunc(text),
+					RetryAt:     retryAt,
+				}}
+			}
 			return []session.SessionEvent{{
 				Type:        session.EventTurnFailed,
 				SessionID:   sid,
@@ -421,6 +452,47 @@ func gateQwenHandshake(hs qwenDOHandshake) error {
 	return nil
 }
 
+// qwenSystemErrorText extracts the failure text a system event's data
+// carries (the continue_turn_failed data shape is not part of the
+// versioned protocol — the bridge reports the failure message under a
+// text field). A bare JSON string is accepted as the text itself; an
+// object is probed for the usual text fields. It returns "" when the
+// data is absent, unparseable, or carries no recognizable text field —
+// the caller then keeps the generic failure (never a guess).
+func qwenSystemErrorText(data json.RawMessage) string {
+	if len(data) == 0 {
+		return ""
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err == nil {
+			return strings.TrimSpace(s)
+		}
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return ""
+	}
+	for _, key := range []string{"error", "message", "text", "reason"} {
+		raw, ok := obj[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			if t := strings.TrimSpace(s); t != "" {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
 // --- user / assistant / stream events ---------------------------------------
 
 func (s *qwenTurnState) processUser(ev qwenDOEvent) []session.SessionEvent {
@@ -434,11 +506,13 @@ func (s *qwenTurnState) processUser(ev qwenDOEvent) []session.SessionEvent {
 	// continues; no normalized event. The boundary also ends the previous
 	// step's tool-use context (its message_start..message_stop window is
 	// over): the next step's final answer must not be shadowed by the
-	// previous step's tool_use (the step's own message_start normally
-	// resets the flags; this covers streams that omit it).
+	// previous step's tool_use or its intro text (the step's own
+	// message_start normally resets the flags; this covers streams that
+	// omit it).
 	for _, c := range msg.Content {
 		if c.Type == "tool_result" {
 			s.stepToolUse = false
+			s.stepFinalText = ""
 			return nil
 		}
 	}
@@ -497,6 +571,7 @@ func (s *qwenTurnState) processStreamEvent(ev qwenDOEvent) []session.SessionEven
 		s.messageOpen = true
 		s.stepTextFinalize = false
 		s.stepToolUse = false
+		s.stepFinalText = ""
 		return nil
 	case "content_block_delta":
 		// Only text_delta is a transcript chunk. Other delta types
@@ -575,6 +650,20 @@ func (s *qwenTurnState) processAssistant(ev qwenDOEvent) []session.SessionEvent 
 		return nil
 	}
 	s.stepTextFinalize = true
+	// Accumulate the step's final text-only answer text (provider-error
+	// classification at turn end scans it — see completeStepLocked). A
+	// step's text-only block groups are its final answer; a step that
+	// later carries a tool_use does not complete (its text is dropped at
+	// the next step boundary).
+	for _, c := range msg.Content {
+		if c.Type == "text" && c.Text != "" {
+			if s.stepFinalText == "" {
+				s.stepFinalText = c.Text
+			} else {
+				s.stepFinalText += " " + c.Text
+			}
+		}
+	}
 	if !s.messageOpen && !s.stepToolUse {
 		return s.completeStepLocked()
 	}
@@ -584,12 +673,19 @@ func (s *qwenTurnState) processAssistant(ev qwenDOEvent) []session.SessionEvent 
 // completeStepLocked completes the in-flight turn on a step that closed
 // with a text-only final answer (the caller holds s.mu and has
 // established stepTextFinalize && !stepToolUse). A machine turn emits
-// turn.completed with the accumulated usage; a human turn ends without a
-// normalized event (not part of the machine stream).
+// turn.completed with the accumulated usage — UNLESS the step's final
+// text-only answer text carries a strong provider-error signature
+// (Phase I: a 429/quota/auth failure dressed as the model's "final
+// answer"), in which case the turn ends as a CLASSIFIED turn.failed
+// (kind + provider-supplied retry time). A human turn ends without a
+// normalized event (not part of the machine stream — human turns are
+// never classified).
 func (s *qwenTurnState) completeStepLocked() []session.SessionEvent {
 	s.messageOpen = false
 	s.stepTextFinalize = false
 	s.stepToolUse = false
+	finalText := s.stepFinalText
+	s.stepFinalText = ""
 	if !s.turnActive {
 		return nil
 	}
@@ -599,6 +695,21 @@ func (s *qwenTurnState) completeStepLocked() []session.SessionEvent {
 		model := s.inModel
 		in, out, cached := s.inInput, s.inOutput, s.inCached
 		s.endTurnLocked()
+		// Providers can surface a 429/quota/auth error inside a
+		// "successful" turn (the error text IS the final answer). Only
+		// text with a strong provider-error signature counts as a
+		// failure — ordinary task results must not be (Phase I).
+		if LooksLikeProviderError(finalText) {
+			kind, retryAt := ClassifyProviderError(finalText)
+			return []session.SessionEvent{{
+				Type:        session.EventTurnFailed,
+				SessionID:   sid,
+				TurnID:      turnID,
+				FailureKind: string(kind),
+				Error:       trunc(finalText),
+				RetryAt:     retryAt,
+			}}
+		}
 		return []session.SessionEvent{{
 			Type:         session.EventTurnCompleted,
 			SessionID:    sid,
@@ -622,6 +733,7 @@ func (s *qwenTurnState) endTurnLocked() {
 	s.stallWarned = false
 	s.inInput, s.inOutput, s.inCached = 0, 0, 0
 	s.inModel = ""
+	s.stepFinalText = ""
 }
 
 // --- interaction / permission protocol (doc §6) -----------------------------

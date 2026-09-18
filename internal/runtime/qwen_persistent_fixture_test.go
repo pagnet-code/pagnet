@@ -11,10 +11,12 @@ package runtime
 //
 // They cover: the handshake gate (pass / fail), cold start, resume, resume
 // mismatch, the turn lifecycle (submit-accepted → deltas → message_stop →
-// assistant finalize), the tool_result user boundary, continue_turn_failed,
-// retry / model_fallback notes, interactions (started / resolved, dedup,
-// ask_user_question kind), the submit correlation deadline, the in-flight
-// stall warning, and unknown-event tolerance.
+// assistant finalize), the tool_result user boundary, continue_turn_failed
+// (generic + provider-error classified), retry / model_fallback notes,
+// provider-error classification at turn end (rate_limited + retry time,
+// auth_required, and the ordinary-text guard), interactions (started /
+// resolved, dedup, ask_user_question kind), the submit correlation
+// deadline, the in-flight stall warning, and unknown-event tolerance.
 
 import (
 	"encoding/json"
@@ -156,6 +158,21 @@ func assistantToolUseLine(t *testing.T, sid, model string, in, out, cached int) 
 	msg := qwenDOMessage{
 		Role:    "assistant",
 		Content: []qwenDOContent{{Type: "tool_use", Text: "run_shell_command"}},
+		Usage:   qwenDOUsage{InputTokens: in, OutputTokens: out, CacheRead: cached},
+		Model:   model,
+	}
+	m, _ := json.Marshal(msg)
+	return marshalLine(t, qwenDOEvent{Type: "assistant", SessionID: sid, Message: m})
+}
+
+// assistantTextLine builds an assistant (finalized message) line with an
+// explicit final-answer text (assistantLine's text is the neutral
+// "response").
+func assistantTextLine(t *testing.T, sid, model, text string, in, out, cached int) string {
+	t.Helper()
+	msg := qwenDOMessage{
+		Role:    "assistant",
+		Content: []qwenDOContent{{Type: "text", Text: text}},
 		Usage:   qwenDOUsage{InputTokens: in, OutputTokens: out, CacheRead: cached},
 		Model:   model,
 	}
@@ -510,6 +527,165 @@ func TestQwenDO_RetryAndModelFallbackNotes(t *testing.T) {
 	assertEventTypes(t, evs, session.EventTurnOutput)
 	if evs[0].Output != "[qwen] model_fallback" {
 		t.Fatalf("output = %q, want [qwen] model_fallback", evs[0].Output)
+	}
+}
+
+// --- provider-error classification (Phase I) ---------------------------------
+
+// TestQwenDO_FinalTextRateLimitedIsTurnFailed: the provider can return a
+// 429 as the model's "final answer" (the error text IS the response). The
+// machine turn must end as a CLASSIFIED failure (rate_limited + the
+// provider-supplied retry time), not a completion. This sequence is the
+// observed 0.24.0 order: the finalize PRECEDES message_stop, so the turn
+// completes at the message_stop case.
+func TestQwenDO_FinalTextRateLimitedIsTurnFailed(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	feedLines(t, s, messageStartLine(t, fixtureSID))
+	feedLines(t, s, streamDeltaLine(t, fixtureSID, "Error: 429"))
+	const providerErr = "Error: 429 Too Many Requests. retry after: 120 seconds"
+	// The finalize does not end the turn (the step is still open).
+	evs := feedLines(t, s, assistantTextLine(t, fixtureSID, "test-model", providerErr, 10, 20, 5))
+	assertEventTypes(t, evs)
+	// The step closes: the turn ends — as a classified provider failure.
+	evs = feedLines(t, s, messageStopLine(t, fixtureSID))
+	assertEventTypes(t, evs, session.EventTurnFailed)
+	if evs[0].TurnID != "turn-1" {
+		t.Fatalf("turn id = %q, want turn-1", evs[0].TurnID)
+	}
+	if evs[0].FailureKind != "rate_limited" {
+		t.Fatalf("failure kind = %q, want rate_limited", evs[0].FailureKind)
+	}
+	if evs[0].Error != providerErr {
+		t.Fatalf("failure error = %q, want the provider text", evs[0].Error)
+	}
+	if evs[0].RetryAt == nil {
+		t.Fatal("retryAt is nil, want the provider-supplied retry time")
+	}
+	ts, err := time.Parse(time.RFC3339, *evs[0].RetryAt)
+	if err != nil {
+		t.Fatalf("retryAt %q does not parse as RFC3339: %v", *evs[0].RetryAt, err)
+	}
+	// The provider said 120 seconds; the classifier anchors it to the
+	// wall clock. Assert a sane window, not an exact timestamp.
+	delta := time.Until(ts)
+	if delta < 60*time.Second || delta > 300*time.Second {
+		t.Fatalf("retryAt = %s (%s from now), want ≈120s in the future", *evs[0].RetryAt, delta)
+	}
+}
+
+// TestQwenDO_FinalTextAuthErrorIsTurnFailed: an auth failure signature
+// from the strict list (invalid_api_key) in the final text is a CLASSIFIED
+// failure (auth_required). The text carries no retry time → RetryAt nil
+// (the control plane never invents one). This sequence is the
+// stop-before-finalize order: the turn completes at the assistant finalize
+// (the !messageOpen path).
+func TestQwenDO_FinalTextAuthErrorIsTurnFailed(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	feedLines(t, s, messageStartLine(t, fixtureSID))
+	feedLines(t, s, messageStopLine(t, fixtureSID))
+	const providerErr = "Error: invalid_api_key — the API key was not recognized"
+	evs := feedLines(t, s, assistantTextLine(t, fixtureSID, "test-model", providerErr, 10, 20, 5))
+	assertEventTypes(t, evs, session.EventTurnFailed)
+	if evs[0].TurnID != "turn-1" {
+		t.Fatalf("turn id = %q, want turn-1", evs[0].TurnID)
+	}
+	if evs[0].FailureKind != "auth_required" {
+		t.Fatalf("failure kind = %q, want auth_required", evs[0].FailureKind)
+	}
+	if evs[0].RetryAt != nil {
+		t.Fatalf("retryAt = %v, want nil (no retry time in the text)", *evs[0].RetryAt)
+	}
+}
+
+// TestQwenDO_OrdinaryFinalTextIsNotMisclassified: a plain task result —
+// including text with LOOSE provider-ish phrases ("authentication",
+// "connection refused") that the strict classifier deliberately excludes —
+// must STILL complete the turn. Ordinary output is never classified as a
+// failure (Phase I). The sequence reuses the shape of the happy-path
+// finalize test (stop before the finalize).
+func TestQwenDO_OrdinaryFinalTextIsNotMisclassified(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	feedLines(t, s, messageStopLine(t, fixtureSID))
+	const answer = "Done: I fixed the authentication bug and the connection refused case in the test suite."
+	evs := feedLines(t, s, assistantTextLine(t, fixtureSID, "test-model", answer, 10, 20, 5))
+	assertEventTypes(t, evs, session.EventTurnCompleted)
+	if evs[0].TurnID != "turn-1" {
+		t.Fatalf("turn id = %q, want turn-1", evs[0].TurnID)
+	}
+	if evs[0].InputTokens == nil || *evs[0].InputTokens != 10 {
+		t.Fatalf("input tokens = %v, want 10", evs[0].InputTokens)
+	}
+	if evs[0].OutputTokens == nil || *evs[0].OutputTokens != 20 {
+		t.Fatalf("output tokens = %v, want 20", evs[0].OutputTokens)
+	}
+}
+
+// TestQwenDO_ContinueTurnFailedProviderErrorIsClassified: the
+// continue_turn_failed data carries the provider error that killed the
+// continuation (a 429 with a retry time) — the terminal failure is
+// CLASSIFIED (rate_limited + the provider-supplied retry time), not a
+// generic process_error.
+func TestQwenDO_ContinueTurnFailedProviderErrorIsClassified(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	line := marshalLine(t, qwenDOEvent{
+		Type: "system", Subtype: "continue_turn_failed", SessionID: fixtureSID,
+		Data: json.RawMessage(`{"error":"429 Too Many Requests. retry after: 60 seconds"}`),
+	})
+	evs := feedLines(t, s, line)
+	assertEventTypes(t, evs, session.EventTurnFailed)
+	if evs[0].TurnID != "turn-1" {
+		t.Fatalf("turn id = %q, want turn-1", evs[0].TurnID)
+	}
+	if evs[0].FailureKind != "rate_limited" {
+		t.Fatalf("failure kind = %q, want rate_limited", evs[0].FailureKind)
+	}
+	if evs[0].RetryAt == nil {
+		t.Fatal("retryAt is nil, want the provider-supplied retry time")
+	}
+	ts, err := time.Parse(time.RFC3339, *evs[0].RetryAt)
+	if err != nil {
+		t.Fatalf("retryAt %q does not parse as RFC3339: %v", *evs[0].RetryAt, err)
+	}
+	delta := time.Until(ts)
+	if delta < 30*time.Second || delta > 180*time.Second {
+		t.Fatalf("retryAt = %s (%s from now), want ≈60s in the future", *evs[0].RetryAt, delta)
+	}
+}
+
+// TestQwenDO_ContinueTurnFailedNonProviderTextStaysProcessError: data that
+// is NOT a provider error (no strict signature) keeps today's generic
+// process_error with the same error string.
+func TestQwenDO_ContinueTurnFailedNonProviderTextStaysProcessError(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	line := marshalLine(t, qwenDOEvent{
+		Type: "system", Subtype: "continue_turn_failed", SessionID: fixtureSID,
+		Data: json.RawMessage(`{"error":"internal bridge fault"}`),
+	})
+	evs := feedLines(t, s, line)
+	assertEventTypes(t, evs, session.EventTurnFailed)
+	if evs[0].FailureKind != "process_error" {
+		t.Fatalf("failure kind = %q, want process_error", evs[0].FailureKind)
+	}
+	if evs[0].Error != "qwen continue_turn_failed" {
+		t.Fatalf("error = %q, want the generic string", evs[0].Error)
+	}
+	if evs[0].RetryAt != nil {
+		t.Fatalf("retryAt = %v, want nil", *evs[0].RetryAt)
 	}
 }
 
