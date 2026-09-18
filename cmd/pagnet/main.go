@@ -194,7 +194,7 @@ func versionCmd() *cobra.Command {
 
 // enrollCmd implements `pagnet enroll` (formerly `pagnet login`): consumes
 // a one-time enrollment token against the control plane and stores the host
-// credential + identity in the daemon state dir (config.yaml, mode 0600).
+// credential + identity in the active account's config (mode 0600).
 // User sign-in lives in `pagnet login`.
 func enrollCmd() *cobra.Command {
 	var token, name, stateDir, rootsMode string

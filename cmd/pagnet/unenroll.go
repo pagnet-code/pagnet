@@ -50,7 +50,7 @@ func unenrollCmd() *cobra.Command {
 					return fmt.Errorf("unenroll: %w", err)
 				}
 			}
-			if err := clearHostState(c.stateDir); err != nil {
+			if err := clearHostState(c.stateDir, c.account); err != nil {
 				return err
 			}
 			fmt.Println("done. local credential + identity cleared (user login kept)")
@@ -64,25 +64,58 @@ func unenrollCmd() *cobra.Command {
 }
 
 // clearHostState removes the host credential + identity from the state
-// file, keeping everything else (the user login token, the server URL).
-func clearHostState(stateDir string) error {
-	path := filepath.Join(stateDir, "config.yaml")
-	var fc map[string]any
-	if b, err := os.ReadFile(path); err == nil {
-		if err := yaml.Unmarshal(b, &fc); err != nil {
-			return fmt.Errorf("existing %s is not a mapping: %w", path, err)
+// files the enrollment wrote, keeping everything else (the user login
+// token, the server URL, the current network). The account model stores
+// the identity in the ACTIVE ACCOUNT's config; the machine-wide flat
+// config.yaml is swept too when it still carries identity (an orphaned
+// pre-accounts file). A worker dir (account "") uses its flat config.
+func clearHostState(root, account string) error {
+	// accountConfigDir returns the account's directory (the state dir
+	// itself for a worker); the config file lives inside it.
+	paths := []string{filepath.Join(accountConfigDir(root, account), "config.yaml")}
+	if account != "" {
+		paths = append(paths, filepath.Join(root, "config.yaml"))
+	}
+	for _, path := range paths {
+		if err := clearHostFields(path); err != nil {
+			return err
 		}
 	}
-	if fc == nil {
-		return nil // nothing to clear
+	return nil
+}
+
+// clearHostFields deletes the host identity keys from one config file,
+// rewriting it only when something was present.
+func clearHostFields(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	delete(fc, "credential")
-	delete(fc, "hostId")
-	b, err := yaml.Marshal(fc)
+	var fc map[string]any
+	if err := yaml.Unmarshal(b, &fc); err != nil {
+		return fmt.Errorf("existing %s is not a mapping: %w", path, err)
+	}
+	if fc == nil {
+		return nil
+	}
+	changed := false
+	for _, k := range []string{"credential", "hostId", "hostName", "allowedRoots", "rootsMode"} {
+		if _, ok := fc[k]; ok {
+			delete(fc, k)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	b, err = yaml.Marshal(fc)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	return os.WriteFile(path, b, 0o600)
