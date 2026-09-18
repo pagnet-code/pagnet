@@ -23,7 +23,9 @@ permissions:
 jobs:
   release:
     name: build + publish (${{ startsWith(github.ref, 'refs/tags/v') && 'tagged' || 'dev' }})
-    runs-on: ubuntu-latest
+    # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
+    # runner billing is broken, so CI runs on the org's own infrastructure.
+    runs-on: [self-hosted, self-hosted-linux, owl-deploy]
     steps:
       - uses: actions/checkout@v4
         with:
