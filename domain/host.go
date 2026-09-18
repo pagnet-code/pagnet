@@ -1,6 +1,50 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+// Host ownership scopes (hosts.ownership_scope /
+// enrollment_tokens.ownership_scope). Ownership is a scope INSIDE the
+// tenant — the tenant stays the hard isolation boundary; ownership decides
+// responsibility/visibility within it.
+const (
+	// OwnershipScopePersonal: the host belongs to one user
+	// (OwnerUserID is set).
+	OwnershipScopePersonal = "personal"
+	// OwnershipScopeOrganization: the host is tenant-wide (OwnerUserID is
+	// NULL).
+	OwnershipScopeOrganization = "organization"
+)
+
+// ValidOwnershipScope reports whether scope is a known host ownership
+// scope.
+func ValidOwnershipScope(scope string) bool {
+	return scope == OwnershipScopePersonal || scope == OwnershipScopeOrganization
+}
+
+// ValidateOwnershipInvariant enforces the ownership invariant:
+// PERSONAL requires an owner, ORGANIZATION requires none. Application
+// validation runs this before every write; the DB CHECK constraint is the
+// backstop.
+func ValidateOwnershipInvariant(scope string, ownerUserID *ID) error {
+	switch scope {
+	case OwnershipScopePersonal:
+		if ownerUserID == nil {
+			return errors.New("personal ownership requires an owner")
+		}
+	case OwnershipScopeOrganization:
+		if ownerUserID != nil {
+			return errors.New("organization ownership requires no owner")
+		}
+	default:
+		return fmt.Errorf("unknown ownership scope %q (want %q or %q)",
+			scope, OwnershipScopePersonal, OwnershipScopeOrganization)
+	}
+	return nil
+}
 
 // Host is a physical or virtual machine running the pagnet daemon. A host
 // is NOT a network: it may run agents belonging to different networks.
@@ -23,6 +67,17 @@ type Host struct {
 	// (allow_all by default: any absolute, existing path; allow_list:
 	// only paths under one of the host's allowed roots).
 	RootsMode string
+
+	// OwnershipScope is the host's ownership inside the tenant
+	// ("personal" | "organization").
+	OwnershipScope string
+	// OwnerUserID is the owning user for PERSONAL hosts; nil for
+	// ORGANIZATION hosts.
+	OwnerUserID *ID
+	// EnrolledByUserID is the audit trail: who minted the enrollment
+	// token that created this host (may differ from the owner — an admin
+	// can provision a host for another user or for the organization).
+	EnrolledByUserID *ID
 
 	LastHeartbeatAt *time.Time
 	CreatedAt       time.Time
@@ -82,6 +137,17 @@ type EnrollmentToken struct {
 	AllowedRoots []string
 	ExpiresAt    time.Time
 	UsedAt       *time.Time
+
+	// OwnershipScope is the intended ownership the enrolled host gets
+	// ("personal" | "organization"; empty/legacy = "organization").
+	OwnershipScope string
+	// OwnerUserID is the intended owner for PERSONAL tokens; nil for
+	// ORGANIZATION tokens.
+	OwnerUserID *ID
+	// MintedByUserID is the audit trail: who minted this token (never the
+	// owner by inference — the token actor is not automatically the
+	// owner).
+	MintedByUserID *ID
 }
 
 // HostMetrics is the per-heartbeat machine telemetry reported by the daemon.

@@ -195,7 +195,7 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, stat
 		return errors.New("no control plane URL — set --server / $PAGNET_SERVER")
 	}
 	if token == "" {
-		return errors.New("--token is required (create one in the web UI: Hosts → Add a worker)")
+		return errors.New("--token is required (create one in the web UI: Hosts → Connect host)")
 	}
 	if name == "" {
 		name, _ = os.Hostname()
@@ -292,7 +292,7 @@ func userTokenForEnroll(stateDir, base string) (string, error) {
 }
 
 // mintEnrollmentToken mints a one-time host enrollment token for hostName
-// with the user's bearer (the same API the web console's "Add a worker"
+// with the user's bearer (the same API the web console's "Connect host"
 // uses) and returns its plaintext (shown exactly once).
 func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string, error) {
 	body, _ := json.Marshal(map[string]any{

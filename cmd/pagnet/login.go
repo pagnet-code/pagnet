@@ -130,7 +130,11 @@ listings, and CI logs.`,
 				}
 				fmt.Println("admin token verified.")
 
-			case "local", "oidc":
+			case "local", "accounts", "oidc":
+				// "accounts" is the canonical name of the DB-user auth
+				// mode (renamed from "local", which reads like localhost);
+				// "local" stays accepted for servers that predate the
+				// rename.
 				// AUTH-3 token-first paste login (governance §17,
 				// token-first §11/§35): the interactive path is the hidden
 				// paste prompt — the token never lands in argv or shell
@@ -697,9 +701,10 @@ func storedServerURL(stateDir string) string {
 //   - a stored token that still validates (GET /auth/me) is returned as-is —
 //     zero auth-endpoint chatter beyond /auth/me;
 //   - absent or rejected: the server's auth mode decides —
-//     oidc  → the sign-in flow (browser; noBrowser prints the URL and polls),
-//     local → username/password prompts (interactive only),
-//     token → clean error: the admin token cannot be minted by a flow.
+//     oidc     → the sign-in flow (browser; noBrowser prints the URL and polls),
+//     accounts → username/password prompts (interactive only; "local" is the
+//     pre-rename name of the same mode, still accepted),
+//     token    → clean error: the admin token cannot be minted by a flow.
 //
 // Non-interactive runs (no TTY) never hang or open a browser: without
 // noBrowser they fail with the exact missing piece; with noBrowser the oidc
@@ -743,7 +748,9 @@ func ensureUserToken(stateDir, base string, noBrowser, interactive bool) (string
 		}
 		fmt.Printf("signed in; token stored in %s\n", stateDir)
 		return tok, nil
-	case "local":
+	case "local", "accounts":
+		// "accounts" is the canonical name of the DB-user auth mode;
+		// "local" is the pre-rename name, still accepted.
 		if !interactive {
 			return "", errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first (or set --token / $PAGNET_TOKEN)")
 		}
