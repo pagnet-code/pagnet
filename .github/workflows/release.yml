@@ -41,9 +41,30 @@ jobs:
       # Cross-compiles the unified pagnet binary for
       # linux/{amd64,arm64} and darwin/{amd64,arm64} into dist/
       # (one executable + LICENSE + README per tarball), plus the stable
-      # pagnet-latest-<os>-<arch>.tar.gz copies.
+      # pagnet-latest-<os>-<arch>.tar.gz copies. All four targets build
+      # with CGO_ENABLED=0 (see the Makefile release target) — the
+      # dependency graph must stay cross-compilable.
       - name: Build release tarballs
         run: make release
+
+      # ARCHITECTURE PROOF: `file` on the four release binaries. The
+      # release contract is four native artifacts (linux/{amd64,arm64},
+      # darwin/{amd64,arm64}); a wrong-arch or CGO-linked binary is a
+      # release defect, so the matrix is proven, not assumed.
+      - name: Verify release artifacts (file)
+        run: |
+          set -e
+          command -v file >/dev/null || sudo apt-get install -y file
+          for t in "linux/amd64:ELF 64-bit.*x86-64" "linux/arm64:ELF 64-bit.*aarch64" "darwin/amd64:Mach-O 64-bit.*x86_64" "darwin/arm64:Mach-O 64-bit.*arm64"; do
+            os_arch=${t%%:*}; want=${t#*:}
+            os=${os_arch%/*}; arch=${os_arch#*/}
+            d=$(mktemp -d)
+            tar -C "$d" -xzf "dist/pagnet-latest-$os-$arch.tar.gz" pagnet
+            out=$(file -b "$d/pagnet")
+            echo "$os/$arch => $out"
+            echo "$out" | grep -qE "$want" || { echo "UNEXPECTED ARTIFACT TYPE for $os/$arch"; rm -rf "$d"; exit 1; }
+            rm -rf "$d"
+          done
 
       # Sign the release manifest (the trust anchor for the client's
       # auto-update). The manifest is signed with the Ed25519 key from the

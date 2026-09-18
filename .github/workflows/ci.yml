@@ -13,6 +13,9 @@ jobs:
   go:
     # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
     # runner billing is broken, so CI runs on the org's own infrastructure.
+    # SECURITY (public repo): the self-hosted runner never executes FORK-PR
+    # (untrusted) code — same-repo PRs and pushes run, fork PRs skip.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, self-hosted-linux, owl-deploy]
     steps:
       - uses: actions/checkout@v4
