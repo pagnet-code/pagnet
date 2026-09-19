@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -771,19 +772,20 @@ func membersAddCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			body := map[string]any{"principalId": p.pID()}
-			if len(perms) > 0 {
-				body["permissions"] = perms
+			// Set the membership to active with the given permissions
+			// (idempotent upsert: adds the participant when not a member yet,
+			// updates the permissions when already one). The server returns
+			// the resulting membership (PascalCase domain fields).
+			body := map[string]any{"permissions": perms}
+			var m struct {
+				State       string   `json:"State"`
+				Permissions []string `json:"Permissions"`
 			}
-			endpoint := "services"
-			if p.pKind() != "service" {
-				endpoint = "agents"
-			}
-			if err := c.post("/api/v1/networks/"+netID+"/"+endpoint, body, nil); err != nil {
+			if err := c.do(http.MethodPut, "/api/v1/networks/"+netID+"/members/"+p.pID(), body, &m); err != nil {
 				return err
 			}
 			if jsonOut {
-				return printJSON(map[string]any{"added": p.pName(), "network": netID, "permissions": perms})
+				return printJSON(map[string]any{"added": p.pName(), "network": netID, "state": m.State, "permissions": m.Permissions})
 			}
 			fmt.Printf("%s added to network %s", p.pName(), label)
 			if len(perms) > 0 {
