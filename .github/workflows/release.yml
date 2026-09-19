@@ -104,10 +104,12 @@ jobs:
           base="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           # A regular (non-prerelease) release is the "Latest" one GitHub
           # shows; target_commitish pins the tag if it does not exist yet.
+          # jq object values are simple expressions only — the body is
+          # composed in the shell and passed with --arg.
           rel=$(api -X POST "${base}/releases" \
             -H "Content-Type: application/json" \
-            -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" \
-                 '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: false, prerelease: false, body: "pagnet " + $tag}')")
+            -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" --arg body "pagnet ${GITHUB_REF_NAME}" \
+                 '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: false, prerelease: false, body: $body}')")
           upload=$(echo "$rel" | jq -r .upload_url)
           # nullglob: an unmatched manifest glob expands to nothing, so an
           # unsigned release uploads only the tarballs.
@@ -139,8 +141,8 @@ jobs:
           fi
           rel=$(api -X POST "${base}/releases" \
             -H "Content-Type: application/json" \
-            -d "$(jq -cn --arg sha "${GITHUB_SHA}" \
-                 '{tag_name: "dev", name: "dev", target_commitish: $sha, draft: false, prerelease: true, body: "Rolling dev build (" + $sha[0:7] + ")"}')")
+            -d "$(jq -cn --arg sha "${GITHUB_SHA}" --arg body "Rolling dev build (${GITHUB_SHA::7})" \
+                 '{tag_name: "dev", name: "dev", target_commitish: $sha, draft: false, prerelease: true, body: $body}')")
           upload=$(echo "$rel" | jq -r .upload_url)
           shopt -s nullglob
           for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
