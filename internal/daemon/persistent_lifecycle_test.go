@@ -21,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -143,6 +144,50 @@ func driveCommand(t *testing.T, d *Daemon, server *websocket.Conn, msgType strin
 		t.Fatalf("%s failed: %s", msgType, errMsg)
 	}
 	return envs
+}
+
+// setupActiveNetCrypto activates networkID on d (creating the first epoch in
+// d's local keyring) and announces the network's E2EE lifecycle as ACTIVE
+// under that epoch, so the daemon will encrypt/decrypt content for
+// networkID (plan §12 / D6 always-encrypted). It returns the announced state.
+// Reusable by any test that needs a real, decryptable network delivery.
+func setupActiveNetCrypto(t *testing.T, d *Daemon, tenantID, networkID string) NetworkCryptoState {
+	t.Helper()
+	res, err := d.doCryptoActivate(transport.CryptoActivatePayload{
+		TenantID: tenantID, NetworkID: networkID,
+	})
+	if err != nil {
+		t.Fatalf("activate %s: %v", networkID, err)
+	}
+	act, ok := res.(*transport.CryptoActivateResult)
+	if !ok {
+		t.Fatalf("activate result type = %T", res)
+	}
+	st := NetworkCryptoState{
+		NetworkID: networkID,
+		TenantID:  tenantID,
+		Status:    "active",
+		EpochID:   act.EpochID,
+	}
+	d.cryptoManager().SetNetworkCrypto(networkID, st)
+	return st
+}
+
+// encryptForDelivery encrypts a delivery's plaintext for networkID under the
+// announced epoch using the daemon's REAL encrypt path, returning the
+// envelope + AAD a delivery must carry (plan §12 / D6). The AAD is relayed
+// verbatim by the server, so the recipient decrypts with the SAME aad.
+func (d *Daemon) encryptForDelivery(t *testing.T, networkID, objectType, objectID, sender, recipient, plaintext string) (e2ee.EncryptedPayloadV1, e2ee.AAD) {
+	t.Helper()
+	st, err := d.contentCryptoReady(networkID)
+	if err != nil {
+		t.Fatalf("contentCryptoReady(%s): %v", networkID, err)
+	}
+	env, aad, err := d.encryptProtected(st, objectType, objectID, sender, recipient, plaintext)
+	if err != nil {
+		t.Fatalf("encrypt delivery: %v", err)
+	}
+	return env, aad
 }
 
 // D3: the daemon's REAL command flow for a fake-persistent instance:

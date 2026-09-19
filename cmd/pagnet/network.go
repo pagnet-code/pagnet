@@ -51,6 +51,7 @@ func networkCmd() *cobra.Command {
 	}
 	cmd.AddCommand(
 		create,
+		networkMembersCmd(),
 		&cobra.Command{
 			Use:   "use <name>",
 			Short: "Set the default network (id, name, or slug)",

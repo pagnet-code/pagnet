@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,6 +14,45 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+// ErrNetworkCryptoNotReady is the clear, user-facing error state for a
+// content operation on a network whose crypto is not active (plan D6:
+// networks are ALWAYS encrypted). "provisioning" is the pre-activation
+// window (the network is being secured), "degraded" and "unknown" fail
+// closed the same way. There is NO plaintext fallback path: the content
+// stays durable server-side and the operation is retried once the network
+// reports active (the host.network_crypto re-push on every reconnect).
+var ErrNetworkCryptoNotReady = errors.New("network is being secured — encryption is not active yet; content operations are unavailable (no plaintext mode)")
+
+// cryptoNotReadyError wraps the not-ready state with the network id and
+// the announced status (public-safe operational metadata, never key
+// material).
+func cryptoNotReadyError(networkID, status string) error {
+	if status == "" {
+		return fmt.Errorf("%w (%s: crypto state not yet announced)", ErrNetworkCryptoNotReady, networkID)
+	}
+	return fmt.Errorf("%w (%s: status %q)", ErrNetworkCryptoNotReady, networkID, status)
+}
+
+// contentCryptoReady returns the network's crypto state when it is ACTIVE
+// with an announced epoch (the only state in which content may be
+// encrypted), or a clear not-ready error otherwise. Plan D6: the
+// standard/plaintext branch is GONE — every network is encrypted, and a
+// provisioning (or degraded, or unannounced) network refuses content.
+func (d *Daemon) contentCryptoReady(networkID string) (NetworkCryptoState, error) {
+	if networkID == "" {
+		return NetworkCryptoState{}, cryptoNotReadyError("", "")
+	}
+	st, ok := d.cryptoManager().NetworkCrypto(networkID)
+	if !ok || st.Status != "active" || st.EpochID == "" {
+		status := ""
+		if ok {
+			status = st.Status
+		}
+		return NetworkCryptoState{}, cryptoNotReadyError(networkID, status)
+	}
+	return st, nil
+}
+
 // handleNetworkCrypto caches the server-announced E2EE lifecycle state for a
 // network (host.network_crypto, LIVE). It is the daemon's input for the
 // customer-side encryption decision: whether to encrypt (status=active) and
@@ -23,11 +63,18 @@ func (d *Daemon) handleNetworkCrypto(env transport.Envelope) {
 	if err := env.DecodePayload(&p); err != nil || p.NetworkID == "" {
 		return
 	}
-	d.cryptoManager().SetNetworkCrypto(p.NetworkID, NetworkCryptoState{
+	st := NetworkCryptoState{
 		TenantID: p.TenantID,
 		Status:   p.Status,
 		EpochID:  p.EpochID,
-	})
+	}
+	d.cryptoManager().SetNetworkCrypto(p.NetworkID, st)
+	// Persist the announced state in the daemon's local DB: the CLI
+	// reuses the host's crypto path for client-side encryption (pagnet
+	// invoke / event publish) and needs the announced status + epoch +
+	// tenant from the same state dir (the in-memory cache dies with the
+	// daemon process).
+	_ = d.state.SaveNetworkCrypto(p.NetworkID, st)
 }
 
 // errKeyEpochUnavailable is the clean availability error for a send that
@@ -69,9 +116,14 @@ func uuidV7Time(id uuid.UUID) (time.Time, bool) {
 // single clock source, so the AAD's time and the ID's time agree). The AAD is
 // the GCM associated-data: tampering with ANY bound field makes decryption
 // fail.
+//
+// ProtocolVersion is the CONTENT protocol version — transport.ProtocolVersion
+// (= 2) for all V2 objects (the V2 cutover moves every content path to 2;
+// the SDK and the daemon MUST agree, and the committed e2ee vectors carry
+// the binding). The AAD VERSION (serialization) stays e2ee.AADVersion=1.
 func buildAAD(tenantID, networkID, objectType, objectID, sender, recipient, epochID string) (e2ee.AAD, error) {
 	aad := e2ee.AAD{
-		ProtocolVersion: e2ee.AADVersion,
+		ProtocolVersion: transport.ProtocolVersion,
 		TenantID:        tenantID,
 		NetworkID:       networkID,
 		ObjectType:      objectType,
@@ -155,12 +207,19 @@ type encryptedField struct {
 	AAD      e2ee.AAD                `json:"aad"`
 }
 
-// encryptToolArgs rewrites a tool call's protected fields into encryptedField
-// values when the instance's network is an active private network. It returns
-// the (possibly rewritten) args, or an error message ("" on success). For
-// standard networks — or when the daemon has not yet received the network's
-// crypto state — the args are returned unchanged (byte-identical standard
-// behavior).
+// encryptToolArgs rewrites a tool call's protected fields into encrypted
+// values. It returns the (possibly rewritten) args, or an error message
+// ("" on success).
+//
+// Plan D6 (V2 cutover): networks are ALWAYS encrypted — the standard/
+// plaintext branch is GONE. A tool call that carries protected CONTENT on a
+// network whose crypto is not active (provisioning / degraded / not yet
+// announced) is refused with the clear not-ready error; the content never
+// crosses the boundary in plaintext. The failure is clean (the bridge
+// answers the agent with the error; the work stays with the agent to
+// retry), never a silent plaintext fallback. Tools that carry NO protected
+// content (metadata-only: whoami, discover, register_capabilities, search,
+// ...) are unaffected — they may run on a provisioning network.
 //
 // The mapping (plan §12):
 //   - network_ask / network_reply / control_ask / control_reply: body ->
@@ -169,38 +228,37 @@ type encryptedField struct {
 //     acceptanceCriteria -> one task envelope (the criteria ride inside).
 //   - network_task_update: reason -> task envelope (the blocked reason).
 //   - network_publish_artifact: label -> artifact envelope.
+//   - network_event_publish: payload -> event_payload envelope (V2).
+//   - network_invoke: input -> invocation_input envelope (V2).
 func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMessage) (json.RawMessage, string) {
 	if row.NetworkID == "" {
 		return args, ""
-	}
-	st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID)
-	if !ok || st.Status != "active" || st.EpochID == "" {
-		return args, "" // standard / unknown / not-yet-announced: plaintext
 	}
 	var m map[string]any
 	if err := json.Unmarshal(args, &m); err != nil {
 		return args, "" // unparseable: relay as-is (the server validates)
 	}
-	sender := row.AgentName
-	if sender == "" {
-		sender = row.InstanceID
-	}
+	// The protected field(s) this tool call carries, extracted first: a
+	// tool call with NO protected content is metadata-only and runs on any
+	// network state; one WITH content requires the crypto to be active.
+	var (
+		plainContent string
+		setEncrypted func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string)
+	)
 	switch tool {
 	case "network_ask", "network_reply", "control_ask", "control_reply":
-		body, _ := m["body"].(string)
-		if body == "" {
-			return args, ""
+		plainContent, _ = m["body"].(string)
+		if plainContent == "" {
+			return args, "" // no content in this call: nothing to protect
 		}
 		threadID, _ := m["threadId"].(string)
-		id := newObjectID()
-		env, aad, err := d.encryptProtected(st, e2ee.ObjectTypeMessage, id, sender, threadID, body)
-		if err != nil {
-			return nil, err.Error()
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
+			delete(m, "body")
+			m["messageId"] = objectID
+			m["envelope"] = env
+			m["aad"] = aad
+			_ = threadID
 		}
-		delete(m, "body")
-		m["messageId"] = id
-		m["envelope"] = env
-		m["aad"] = aad
 	case "network_delegate", "control_delegate":
 		objective, _ := m["objective"].(string)
 		if objective == "" {
@@ -229,17 +287,15 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 				plain += "\n\nAcceptance criteria:\n" + sb
 			}
 		}
-		id := newObjectID()
-		env, aad, err := d.encryptProtected(st, e2ee.ObjectTypeTask, id, sender, "", plain)
-		if err != nil {
-			return nil, err.Error()
+		plainContent = plain
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
+			delete(m, "objective")
+			delete(m, "title")
+			delete(m, "acceptanceCriteria")
+			m["taskId"] = objectID
+			m["envelope"] = env
+			m["aad"] = aad
 		}
-		delete(m, "objective")
-		delete(m, "title")
-		delete(m, "acceptanceCriteria")
-		m["taskId"] = id
-		m["envelope"] = env
-		m["aad"] = aad
 	case "network_task_update":
 		reason, _ := m["reason"].(string)
 		if reason == "" {
@@ -249,30 +305,104 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 		if taskID == "" {
 			return args, ""
 		}
-		env, aad, err := d.encryptProtected(st, e2ee.ObjectTypeTask, taskID, sender, "", reason)
-		if err != nil {
-			return nil, err.Error()
+		plainContent = reason
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, _ string) {
+			delete(m, "reason")
+			m["reasonEnvelope"] = env
+			m["reasonAAD"] = aad
+			_ = taskID
 		}
-		delete(m, "reason")
-		m["reasonEnvelope"] = env
-		m["reasonAAD"] = aad
 	case "network_publish_artifact":
 		label, _ := m["label"].(string)
 		if label == "" {
 			return args, ""
 		}
-		id := newObjectID()
-		env, aad, err := d.encryptProtected(st, e2ee.ObjectTypeArtifact, id, sender, "", label)
-		if err != nil {
-			return nil, err.Error()
+		plainContent = label
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
+			delete(m, "label")
+			m["artifactId"] = objectID
+			m["labelEnvelope"] = env
+			m["labelAAD"] = aad
 		}
-		delete(m, "label")
-		m["artifactId"] = id
-		m["labelEnvelope"] = env
-		m["labelAAD"] = aad
+	case "network_event_publish":
+		payloadRaw, hasPayload := m["payload"]
+		if !hasPayload {
+			return args, ""
+		}
+		payloadBytes, err := json.Marshal(payloadRaw)
+		if err != nil || len(payloadBytes) == 0 {
+			return args, ""
+		}
+		plainContent = string(payloadBytes)
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
+			delete(m, "payload")
+			m["eventId"] = objectID
+			m["envelope"] = env
+			m["aad"] = aad
+		}
+	case "network_invoke":
+		inputRaw, hasInput := m["input"]
+		if !hasInput {
+			return args, ""
+		}
+		inputBytes, err := json.Marshal(inputRaw)
+		if err != nil || len(inputBytes) == 0 {
+			return args, ""
+		}
+		plainContent = string(inputBytes)
+		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
+			delete(m, "input")
+			m["inputObjectID"] = objectID
+			m["envelope"] = env
+			m["aad"] = aad
+		}
 	default:
-		return args, ""
+		return args, "" // metadata-only tool: no protected content
 	}
+
+	// The call carries content: the network crypto MUST be active (D6 —
+	// no plaintext path). Provisioning networks refuse with the clear
+	// "being secured" state.
+	st, err := d.contentCryptoReady(row.NetworkID)
+	if err != nil {
+		return nil, err.Error()
+	}
+	sender := row.AgentName
+	if sender == "" {
+		sender = row.InstanceID
+	}
+	var (
+		objectType string
+		objectID   = newObjectID()
+		recipient  string
+	)
+	switch tool {
+	case "network_ask", "network_reply", "control_ask", "control_reply":
+		objectType = e2ee.ObjectTypeMessage
+		recipient, _ = m["threadId"].(string)
+	case "network_delegate", "control_delegate":
+		objectType = e2ee.ObjectTypeTask
+	case "network_task_update":
+		objectType = e2ee.ObjectTypeTask
+		objectID, _ = m["taskId"].(string)
+	case "network_publish_artifact":
+		objectType = e2ee.ObjectTypeArtifact
+	case "network_event_publish":
+		objectType = e2ee.ObjectTypeEventPayload
+		if t, _ := m["target"].(string); t != "" {
+			recipient = t
+		}
+	case "network_invoke":
+		objectType = e2ee.ObjectTypeInvocationInput
+		if t, _ := m["capability"].(string); t != "" {
+			recipient = t
+		}
+	}
+	env, aad, err := d.encryptProtected(st, objectType, objectID, sender, recipient, plainContent)
+	if err != nil {
+		return nil, err.Error()
+	}
+	setEncrypted(env, aad, objectID)
 	out, err := json.Marshal(m)
 	if err != nil {
 		return args, ""
@@ -281,23 +411,28 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 }
 
 // sendRuntimeOutput emits one non-PTY turn output chunk (host.runtime_output).
-// On an active private network the chunk payload is encrypted into an envelope
-// (object_type=runtime_output, the per-turn stream id as object id) and the
-// server stores ciphertext only; consumers decrypt at the edge (CLI attach in
-// p9, browser in p10). Standard networks — or an unknown/not-yet-announced
-// crypto state — are byte-identical (plaintext output). A runtime-output
-// encryption failure drops the chunk (observational, at-most-once) rather than
-// failing the turn: the protected deliverables (messages/tasks) are durably
-// encrypted separately.
+// Plan D6 (V2 cutover): networks are ALWAYS encrypted — there is NO plaintext
+// output path. On an active network the chunk payload is encrypted into an
+// envelope (object_type=runtime_output, the per-turn stream id as object id)
+// and the server stores ciphertext only; consumers decrypt at the edge (CLI
+// attach, browser console). A network whose crypto is not active (provisioning
+// / degraded / not yet announced) drops the chunk with a warning (observational,
+// at-most-once, never a plaintext fallback): the protected deliverables
+// (messages/tasks/events) are durably encrypted separately, so the turn's
+// outcome is unaffected by a dropped stream chunk.
 func (d *Daemon) sendRuntimeOutput(conn *websocket.Conn, row *InstanceRow, streamID, output string) {
-	plaintext := map[string]any{"instanceId": row.InstanceID, "output": output}
 	if row.NetworkID == "" || streamID == "" {
-		_ = d.send(conn, transport.MsgRuntimeOutput, plaintext)
+		_ = d.send(conn, transport.MsgRuntimeOutput, map[string]any{
+			"instanceId": row.InstanceID, "output": output,
+		})
 		return
 	}
-	st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID)
-	if !ok || st.Status != "active" || st.EpochID == "" {
-		_ = d.send(conn, transport.MsgRuntimeOutput, plaintext)
+	st, err := d.contentCryptoReady(row.NetworkID)
+	if err != nil {
+		// The chunk is DROPPED — never sent in plaintext (D6). The turn
+		// itself is unaffected; the durable, protected outputs are separate.
+		d.Log.Warn("runtime output dropped: network crypto not active (no plaintext path)",
+			"instance", row.InstanceID, "network", row.NetworkID, "err", err)
 		return
 	}
 	sender := row.AgentName

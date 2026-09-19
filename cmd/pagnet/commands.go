@@ -14,7 +14,7 @@ import (
 func listCmd() *cobra.Command {
 	var network string
 	cmd := &cobra.Command{
-		Use:   "list <networks|hosts|agents|tasks|messages|instances>",
+		Use:   "list <networks|hosts|agents|tasks|messages|instances|services|events|subscriptions>",
 		Short: "List objects in the control plane",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -57,7 +57,7 @@ func runList(c *cliCtx, target, network string) error {
 			rows = append(rows, []string{h.Name, h.Status, orDash(h.OS) + "/" + orDash(h.Arch), h.ID})
 		}
 		printTable([]string{"NAME", "STATUS", "OS", "ID"}, rows)
-	case "agents", "tasks", "messages", "instances":
+	case "agents", "tasks", "messages", "instances", "services", "events", "subscriptions":
 		netID, _, err := c.resolveNetwork(network)
 		if err != nil {
 			return err
@@ -121,9 +121,94 @@ func runList(c *cliCtx, target, network string) error {
 				return err
 			}
 			printTable([]string{"AGENT", "INSTANCE", "STATUS", "HOST", "RUNTIME", "LAST ACTIVITY"}, rows)
+		case "services":
+			all, err := c.fetchParticipants(netID)
+			if err != nil {
+				return err
+			}
+			services := make([]v2Participant, 0, len(all))
+			for _, p := range all {
+				if p.pKind() == "service" {
+					services = append(services, p)
+				}
+			}
+			if jsonOut {
+				return printJSON(services)
+			}
+			if len(services) == 0 {
+				fmt.Println("no services in this network yet")
+				return nil
+			}
+			rows := make([][]string, 0, len(services))
+			for _, s := range services {
+				rows = append(rows, participantRow(s))
+			}
+			printTable(participantHeaders, rows)
+		case "events":
+			var out []struct {
+				ID           string  `json:"id"`
+				IDLegacy     string  `json:"ID"`
+				Type         string  `json:"type"`
+				TypeLegacy   string  `json:"Type"`
+				Target       *string `json:"targetPrincipalId"`
+				TargetLegacy *string `json:"TargetAgentName"`
+				Time         *string `json:"createdAt"`
+				TimeLegacy   *string `json:"Timestamp"`
+			}
+			if err := c.get("/api/v1/networks/"+netID+"/events?limit=100", &out); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(out)
+			}
+			if len(out) == 0 {
+				fmt.Println("no events in this network yet")
+				return nil
+			}
+			rows := make([][]string, 0, len(out))
+			for _, e := range out {
+				id := e.ID
+				if id == "" {
+					id = e.IDLegacy
+				}
+				typ := e.Type
+				if typ == "" {
+					typ = e.TypeLegacy
+				}
+				var target, ts string
+				if e.Target != nil {
+					target = *e.Target
+				} else if e.TargetLegacy != nil {
+					target = *e.TargetLegacy
+				}
+				if e.Time != nil {
+					ts = *e.Time
+				} else if e.TimeLegacy != nil {
+					ts = *e.TimeLegacy
+				}
+				rows = append(rows, []string{id, typ, orDash(target), orDash(ts)})
+			}
+			printTable([]string{"ID", "TYPE", "TARGET", "TIME"}, rows)
+		case "subscriptions":
+			var subs []v2Subscription
+			if err := c.get("/api/v1/networks/"+netID+"/subscriptions", &subs); err != nil {
+				return err
+			}
+			if jsonOut {
+				return printJSON(subs)
+			}
+			if len(subs) == 0 {
+				fmt.Println("no subscriptions in this network")
+				return nil
+			}
+			rows := make([][]string, 0, len(subs))
+			for _, s := range subs {
+				rows = append(rows, []string{s.sID(), s.Pattern, orDash(s.Mode)})
+			}
+			printTable([]string{"ID", "PATTERN", "MODE"}, rows)
 		}
 	default:
-		return fmt.Errorf("unknown list target %q (networks|hosts|agents|tasks|messages|instances)", target)
+		return fmt.Errorf("unknown list target %q (networks|hosts|agents|tasks|messages|instances|services|events|subscriptions)", target)
 	}
 	return nil
 }
@@ -217,14 +302,36 @@ func statusCmd() *cobra.Command {
 			}
 			if len(rows) == 0 {
 				fmt.Println("no agent instances in this network yet")
-				return nil
+			} else {
+				fmt.Println("\ninstances:")
+				printTable([]string{"AGENT", "INSTANCE", "STATUS", "HOST", "RUNTIME", "LAST ACTIVITY"}, rows)
 			}
-			fmt.Println("\ninstances:")
-			printTable([]string{"AGENT", "INSTANCE", "STATUS", "HOST", "RUNTIME", "LAST ACTIVITY"}, rows)
+
+			// V2 memberships (D10): the network's agents + services with
+			// their endpoints, permissions, and offered capabilities.
+			members, err := c.fetchParticipants(netID)
+			if err != nil {
+				return err
+			}
+			if len(members) > 0 {
+				fmt.Println("\nmembers:")
+				mrows := make([][]string, 0, len(members))
+				for _, m := range members {
+					mrows = append(mrows, participantRow(m))
+				}
+				printTable(participantHeaders, mrows)
+			}
+			services := 0
+			for _, m := range members {
+				if m.pKind() == "service" {
+					services++
+				}
+			}
+			fmt.Printf("\nservices: %d of %d members\n", services, len(members))
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&network, "network", "n", "", "network for the instance list (default: the saved/only network)")
+	cmd.Flags().StringVarP(&network, "network", "n", "", "network for the instance/member lists (default: the saved/only network)")
 	return cmd
 }
 

@@ -554,6 +554,7 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 		// clients — see the server's MsgAgentHibernated handler).
 		"reason": "process_exited",
 	})
+	tm.d.reportEndpointStatus(nil, s.instanceID) // offline (hibernated)
 	tm.d.Log.Info("pty exited; instance hibernated (session preserved)",
 		"instance", s.instanceID, "wait", waitErr)
 }

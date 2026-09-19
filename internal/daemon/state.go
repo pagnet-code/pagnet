@@ -6,11 +6,14 @@ package daemon
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 // State is the daemon's local persistent state (SQLite). It survives daemon
@@ -55,7 +58,9 @@ func OpenState(path string) (*State, error) {
 			model         TEXT NOT NULL DEFAULT '',
 			instruction   TEXT NOT NULL DEFAULT '',
 			agent_md_path TEXT NOT NULL DEFAULT '',
-			config_fingerprint TEXT NOT NULL DEFAULT ''
+			config_fingerprint TEXT NOT NULL DEFAULT '',
+			agent_principal_id TEXT NOT NULL DEFAULT '',
+			capabilities TEXT NOT NULL DEFAULT ''
 		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
@@ -76,6 +81,8 @@ func OpenState(path string) (*State, error) {
 		`ALTER TABLE instances ADD COLUMN instruction TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN agent_md_path TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE instances ADD COLUMN config_fingerprint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN agent_principal_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE instances ADD COLUMN capabilities TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := db.Exec(col); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()
@@ -163,6 +170,16 @@ type InstanceRow struct {
 	// the instance's last PTY was started with. "" = the instance never
 	// had a PTY (never stale).
 	ConfigFingerprint string
+	// AgentPrincipalID is the agent principal this instance runs (V2,
+	// from the launch command): the daemon reports it in every
+	// host.endpoint_status and resolves the instance's network
+	// operations against it (bridge relay).
+	AgentPrincipalID string
+	// Capabilities is the instance's self-declared capability set (V2):
+	// what the agent declared through network_register_capabilities
+	// (version 1). The daemon carries it in host.endpoint_status so the
+	// control plane can upsert endpoint_capabilities. Nil = none declared.
+	Capabilities []domain.Capability
 }
 
 // UpsertInstance records/updates a local instance.
@@ -170,9 +187,15 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 	if r.UpdatedAt == "" {
 		r.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	caps := ""
+	if len(r.Capabilities) > 0 {
+		if b, err := json.Marshal(r.Capabilities); err == nil {
+			caps = string(b)
+		}
+	}
 	_, err := s.db.Exec(`
-		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id, kind, model, instruction, agent_md_path, config_fingerprint)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO instances (instance_id, definition_id, runtime, workspace, profile, status, session_id, pid, updated_at, access, agent_name, network_id, kind, model, instruction, agent_md_path, config_fingerprint, agent_principal_id, capabilities)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (instance_id) DO UPDATE SET
 			definition_id = excluded.definition_id,
 			runtime = excluded.runtime,
@@ -189,9 +212,12 @@ func (s *State) UpsertInstance(r InstanceRow) error {
 			model = excluded.model,
 			instruction = excluded.instruction,
 			agent_md_path = excluded.agent_md_path,
-			config_fingerprint = excluded.config_fingerprint`,
+			config_fingerprint = excluded.config_fingerprint,
+			agent_principal_id = excluded.agent_principal_id,
+			capabilities = excluded.capabilities`,
 		r.InstanceID, r.DefinitionID, r.Runtime, r.Workspace, r.Profile, r.Status, r.SessionID, r.PID, r.UpdatedAt,
-		r.Access, r.AgentName, r.NetworkID, r.Kind, r.Model, r.Instruction, r.AgentMDPath, r.ConfigFingerprint)
+		r.Access, r.AgentName, r.NetworkID, r.Kind, r.Model, r.Instruction, r.AgentMDPath, r.ConfigFingerprint,
+		r.AgentPrincipalID, caps)
 	return err
 }
 
@@ -206,6 +232,26 @@ func (s *State) SetInstanceStatus(instanceID, status, sessionID string) error {
 	_, err := s.db.Exec(`
 		UPDATE instances SET status=?, updated_at=? WHERE instance_id=?`,
 		status, time.Now().UTC().Format(time.RFC3339), instanceID)
+	return err
+}
+
+// SetInstanceCapabilities updates ONLY the instance's self-declared
+// capability set (the agent's network_register_capabilities declaration,
+// version 1), leaving every other column (status, session, principal, ...)
+// untouched. A full UpsertInstance here would clobber concurrent status
+// writes (the row the bridge holds was loaded at auth time), so this is a
+// targeted single-column update.
+func (s *State) SetInstanceCapabilities(instanceID string, caps []domain.Capability) error {
+	capsJSON := ""
+	if len(caps) > 0 {
+		if b, err := json.Marshal(caps); err == nil {
+			capsJSON = string(b)
+		}
+	}
+	_, err := s.db.Exec(`
+		UPDATE instances SET capabilities = ?, updated_at = ?
+		WHERE instance_id = ?`,
+		capsJSON, time.Now().UTC().Format(time.RFC3339), instanceID)
 	return err
 }
 
@@ -227,42 +273,55 @@ func (s *State) SetInstanceConfigFingerprint(instanceID, fingerprint string) err
 	return err
 }
 
-// GetInstance fetches a local instance row.
-func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
-	row := s.db.QueryRow(`
+// instanceSelectCols is the shared column list of GetInstance /
+// ListInstances (the new V2 columns default to empty on old rows).
+const instanceSelectCols = `
 		SELECT instance_id, definition_id, runtime, workspace, profile, status,
 		       COALESCE(session_id,''), pid, updated_at,
 		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
 		       COALESCE(kind,'worker'), COALESCE(model,''), COALESCE(instruction,''), COALESCE(agent_md_path,''),
-		       COALESCE(config_fingerprint,'')
-		FROM instances WHERE instance_id = ?`, instanceID)
-	var r InstanceRow
+		       COALESCE(config_fingerprint,''), COALESCE(agent_principal_id,''), COALESCE(capabilities,'')`
+
+// scanInstanceRow scans one instance row (instanceSelectCols order).
+func scanInstanceRow(row interface {
+	Scan(dest ...any) error
+}, r *InstanceRow) error {
 	var pid sql.NullInt64
-	err := row.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace, &r.Profile,
+	var capsJSON string
+	if err := row.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace, &r.Profile,
 		&r.Status, &r.SessionID, &pid, &r.UpdatedAt, &r.Access, &r.AgentName, &r.NetworkID, &r.Kind,
-		&r.Model, &r.Instruction, &r.AgentMDPath, &r.ConfigFingerprint)
-	if err == sql.ErrNoRows {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
+		&r.Model, &r.Instruction, &r.AgentMDPath, &r.ConfigFingerprint, &r.AgentPrincipalID, &capsJSON); err != nil {
+		return err
 	}
 	if pid.Valid {
 		v := int(pid.Int64)
 		r.PID = &v
+	}
+	if capsJSON != "" {
+		var caps []domain.Capability
+		if err := json.Unmarshal([]byte(capsJSON), &caps); err == nil {
+			r.Capabilities = caps
+		}
+	}
+	return nil
+}
+
+// GetInstance fetches a local instance row.
+func (s *State) GetInstance(instanceID string) (*InstanceRow, bool, error) {
+	row := s.db.QueryRow(instanceSelectCols+`
+		FROM instances WHERE instance_id = ?`, instanceID)
+	var r InstanceRow
+	if err := scanInstanceRow(row, &r); err == sql.ErrNoRows {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, false, err
 	}
 	return &r, true, nil
 }
 
 // ListInstances returns all locally known instances.
 func (s *State) ListInstances() ([]InstanceRow, error) {
-	rows, err := s.db.Query(`
-		SELECT instance_id, definition_id, runtime, workspace, profile, status,
-		       COALESCE(session_id,''), pid, updated_at,
-		       COALESCE(access,'read_write'), COALESCE(agent_name,''), COALESCE(network_id,''),
-		       COALESCE(kind,'worker'), COALESCE(model,''), COALESCE(instruction,''), COALESCE(agent_md_path,''),
-		       COALESCE(config_fingerprint,'')
-		FROM instances ORDER BY instance_id`)
+	rows, err := s.db.Query(instanceSelectCols + ` FROM instances ORDER BY instance_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -270,16 +329,8 @@ func (s *State) ListInstances() ([]InstanceRow, error) {
 	var out []InstanceRow
 	for rows.Next() {
 		var r InstanceRow
-		var pid sql.NullInt64
-		if err := rows.Scan(&r.InstanceID, &r.DefinitionID, &r.Runtime, &r.Workspace,
-			&r.Profile, &r.Status, &r.SessionID, &pid, &r.UpdatedAt,
-			&r.Access, &r.AgentName, &r.NetworkID, &r.Kind, &r.Model, &r.Instruction, &r.AgentMDPath,
-			&r.ConfigFingerprint); err != nil {
+		if err := scanInstanceRow(rows, &r); err != nil {
 			return nil, err
-		}
-		if pid.Valid {
-			v := int(pid.Int64)
-			r.PID = &v
 		}
 		out = append(out, r)
 	}
@@ -330,4 +381,39 @@ func (s *State) KVSet(key, value string) error {
 		INSERT INTO kv (key, value) VALUES (?,?)
 		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
+}
+
+// NetworkCryptoKVKey is the KV key under which the daemon persists the
+// server-announced E2EE lifecycle state for a network (host.network_crypto,
+// plan §12 / D6). Persisting it (in addition to the in-memory cache) is what
+// lets the CLI reuse the host's crypto path for client-side encryption
+// (pagnet invoke / event publish): the CLI reads the announced status +
+// epoch + tenant id and the network keyring from the same state dir.
+func NetworkCryptoKVKey(networkID string) string { return "netcrypto:" + networkID }
+
+// SaveNetworkCrypto persists the announced E2EE lifecycle state for a
+// network (idempotent — a re-push overwrites). The row's shape is
+// NetworkCryptoState's JSON tags (the CLI reads it back).
+func (s *State) SaveNetworkCrypto(networkID string, st NetworkCryptoState) error {
+	st.NetworkID = networkID
+	b, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	return s.KVSet(NetworkCryptoKVKey(networkID), string(b))
+}
+
+// LoadNetworkCrypto returns the persisted announced E2EE lifecycle state
+// for a network (ok=false when the daemon has never received one for it).
+func (s *State) LoadNetworkCrypto(networkID string) (NetworkCryptoState, bool) {
+	v, ok := s.KVGet(NetworkCryptoKVKey(networkID))
+	if !ok {
+		return NetworkCryptoState{}, false
+	}
+	var st NetworkCryptoState
+	if err := json.Unmarshal([]byte(v), &st); err != nil {
+		return NetworkCryptoState{}, false
+	}
+	st.NetworkID = networkID
+	return st, true
 }

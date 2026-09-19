@@ -49,6 +49,12 @@ var ErrUnenrolled = errors.New("host unenrolled from the control plane — the c
 // host — reconnecting would only fight it forever, so the daemon stops.
 var ErrSuperseded = errors.New("superseded by a newer daemon connection — another daemon now owns this host; stop this one")
 
+// ErrOutdated means the control plane speaks a protocol version this daemon
+// does not support (protocol.upgrade_required / a newer envelope). A v1
+// daemon against a v2 server would misparse the wire, so the only correct
+// move is to stop and surface the user-facing message.
+var ErrOutdated = errors.New("control plane requires a newer protocol — update the pagnet client")
+
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
 	ServerURL    string
@@ -158,6 +164,11 @@ type Daemon struct {
 	// the connection with CloseCodeSuperseded (a newer daemon owns the
 	// host now) so Run exits instead of reconnecting.
 	superseded bool
+
+	// outdated is set by the read loop on protocol.upgrade_required (or a
+	// newer envelope version) so Run exits with the user-facing "update"
+	// message instead of reconnecting.
+	outdated bool
 
 	// serveLockFile is the open <StateDir>/serve.lock file (acquired in
 	// Run via acquireServeLock, held for the daemon's lifetime). It is
@@ -285,6 +296,15 @@ type Daemon struct {
 	// same id, which ends once the ack lands.
 	seenMu sync.Mutex
 	seen   map[string]time.Time
+
+	// deliveredEvents is the ONE-wake-per-event dedup for v2 event
+	// deliveries (keyed by the event delivery row id = the ack idempotency
+	// key). A redelivery with the same deliveryID acks without re-running
+	// the trigger turn, so a flaky re-send never fires two turns for one
+	// event. Same timestamped TTL hygiene as seen (maintainState evicts
+	// stale entries).
+	deliveredMu     sync.Mutex
+	deliveredEvents map[string]time.Time
 
 	// Auto-update state (P6): latestVersion is the release version the
 	// control plane last advertised (host.latest_version); updating
@@ -507,6 +527,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		bridgeConnsInst: map[string]int{},
 		instQueues:      map[string]*instQueue{},
 		seen:            map[string]time.Time{},
+		deliveredEvents: map[string]time.Time{},
 		turnCtx:         turnCtx,
 		turnCancel:      turnCancel,
 		repoLocks:       map[string]*sync.Mutex{},
@@ -787,6 +808,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 				"pagnet: a newer daemon took over this host — this daemon is stopping")
 			return ErrSuperseded
 		}
+		if d.outdated {
+			// The control plane requires a protocol this daemon cannot
+			// speak. Reconnecting would just re-receive the upgrade notice
+			// forever — stop with the user-facing message.
+			d.Log.Error("stopping: protocol upgrade required", "err", ErrOutdated)
+			fmt.Fprintln(os.Stderr,
+				"pagnet: "+transport.UpgradeRequiredMessage)
+			return ErrOutdated
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -876,6 +906,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	// triggers the server's reconnect wake re-evaluation (pending commands
 	// are re-sent; we deduplicate locally by CommandID).
 	d.sendInventory(conn)
+	// V2: re-sync endpoint liveness for every tracked instance. The
+	// host.endpoint_status reports are live / at-most-once, so a daemon
+	// restart (or a reconnect) drops the prior connection's reports —
+	// re-reporting them now converges the control plane's derived
+	// PrincipalEndpoint rows with the daemon's actual instance state.
+	d.reportAllEndpointStatuses(conn)
 	if d.PrimaryWorkspace != "" {
 		// Single-directory worker: register the directory itself even
 		// when it is not a git repository (gitWorkspaceReport degrades
@@ -937,6 +973,27 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		if err := json.Unmarshal(raw, &env); err != nil {
 			d.Log.Warn("bad envelope from server", "err", err)
 			continue
+		}
+		if env.ProtocolVersion > transport.ProtocolVersion {
+			// Protocol v2 gate (V2 cutover): the control plane speaks a
+			// protocol this daemon does not support. The server sent
+			// protocol.upgrade_required (or a newer envelope) — stopping is
+			// the only correct move (a v1 daemon against a v2 server would
+			// misparse the wire). Surface the user-facing message, not a
+			// silent retry loop.
+			d.outdated = true
+			d.Log.Error("protocol upgrade required — stopping", "required", env.ProtocolVersion, "have", transport.ProtocolVersion)
+			fmt.Fprintln(os.Stderr, "pagnet: "+transport.UpgradeRequiredMessage)
+			return ErrOutdated
+		}
+		if env.Type == transport.MsgUpgradeRequired {
+			// protocol.upgrade_required/v1: the server's explicit "your
+			// client is outdated" notice. Same outcome as a newer envelope
+			// version: stop with the user-facing message.
+			d.outdated = true
+			d.Log.Error("protocol upgrade required — stopping")
+			fmt.Fprintln(os.Stderr, "pagnet: "+transport.UpgradeRequiredMessage)
+			return ErrOutdated
 		}
 		if env.Type == transport.MsgHostUnenrolled {
 			// The control plane removed this host (deleted or unenrolled).
@@ -1427,6 +1484,16 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoRotate(p) })
 		})
 
+	case transport.MsgCryptoShareEndpoint:
+		var p transport.CryptoShareEndpointPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() {
+			d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoShareEndpoint(p) })
+		})
+
 	// Browser key-session commands (plan §13, p10). Same durable + idempotent,
 	// network-scoped, per-network-queue posture as the other crypto commands
 	// (the WSS read loop only enqueues — it never blocks on local
@@ -1876,18 +1943,19 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		kind = "worker"
 	}
 	row := InstanceRow{
-		InstanceID:   p.InstanceID,
-		DefinitionID: p.DefinitionID,
-		Runtime:      string(rn),
-		Workspace:    wsPath,
-		Profile:      p.Profile,
-		Status:       "idle",
-		Access:       access,
-		AgentName:    p.AgentName,
-		NetworkID:    p.NetworkID,
-		Kind:         kind,
-		Model:        p.Model,
-		Instruction:  p.AgentMD,
+		InstanceID:       p.InstanceID,
+		DefinitionID:     p.DefinitionID,
+		Runtime:          string(rn),
+		Workspace:        wsPath,
+		Profile:          p.Profile,
+		Status:           "idle",
+		Access:           access,
+		AgentName:        p.AgentName,
+		NetworkID:        p.NetworkID,
+		Kind:             kind,
+		Model:            p.Model,
+		Instruction:      p.AgentMD,
+		AgentPrincipalID: p.AgentPrincipalID,
 	}
 	// Standing instruction (AGENT.md): materialize it in the daemon state
 	// dir (NEVER the workspace) and record its path on the row so it
@@ -1920,6 +1988,10 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	d.Log.Info(msg,
 		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": p.InstanceID})
+	// V2: report the managed agent's endpoint liveness (online — it is now
+	// idle and can accept work), carrying the agent principal + declared
+	// capabilities (the control plane derives the PrincipalEndpoint row).
+	d.reportEndpointStatus(conn, p.InstanceID)
 
 	// North-star §15: a launch has an initial mission. The daemon runs it
 	// as the FIRST turn of a fresh instance — the adapter translates it
@@ -2040,6 +2112,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	_ = d.send(conn, transport.MsgAgentStopped, map[string]any{
 		"instanceId": instanceID, "reason": "stopped_by_command",
 	})
+	d.reportEndpointStatus(conn, instanceID) // offline
 	d.finishQueue(instanceID)
 	return nil
 }
@@ -2107,6 +2180,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 		return err
 	}
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": instanceID})
+	d.reportEndpointStatus(conn, instanceID) // back online (idle)
 	return nil
 }
 
@@ -2229,6 +2303,7 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 		"instanceId": instanceID, "sessionId": row.SessionID,
 		"reason": reason,
 	})
+	d.reportEndpointStatus(conn, instanceID) // offline (hibernated)
 	d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
 		"instance", instanceID, "session", row.SessionID, "reason", reason)
 	return nil
@@ -2252,22 +2327,35 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 		d.Log.Debug("instance busy; delivery stays queued", "instance", p.InstanceID)
 		return ErrDeferred
 	}
+	// V2 event delivery (deterministic TRIGGER TURN, plan §46): a delivery
+	// that carries the v2 event identity (EventID / EventType) is an event,
+	// NOT a legacy message/task/notice. It routes to the trigger-turn path:
+	// the turn input carries ONLY the event type + trusted routing metadata
+	// (eventID / deliveryID / network) + the instruction to fetch the
+	// payload via the network_event_get MCP tool. The RAW payload is DATA,
+	// never inlined into the prompt (prompt-injection-safe).
+	if p.EventID != "" || p.EventType != "" {
+		return d.doDeliverEvent(conn, row, p)
+	}
+
 	kind := p.Kind
 	if kind == "" {
 		kind = "notice"
 	}
-	// E2EE (plan §12): an encrypted delivery carries the protected text as an
-	// envelope (ciphertext) + the verbatim AAD. Decrypt it JUST BEFORE the
-	// turn input so the plaintext never crossed the cloud boundary. The
-	// network id is the instance's (workers) or the payload's (representatives
-	// are network-NULL). A decrypt failure fails the turn clean (the work
-	// stays durable server-side for re-delivery) — never a silent plaintext
-	// fallback.
+	// The delivery's network: the instance's (workers) or the payload's
+	// (representatives are network-NULL on the row but carry it on the
+	// payload).
+	netID := row.NetworkID
+	if netID == "" {
+		netID = p.NetworkID
+	}
+	// E2EE (plan §12) + plan D6 (always-encrypted): an encrypted delivery
+	// carries the protected text as an envelope (ciphertext) + the verbatim
+	// AAD; decrypt it JUST BEFORE the turn input so the plaintext never
+	// crossed the cloud boundary. A decrypt failure fails the turn clean
+	// (the work stays durable server-side for re-delivery) — never a
+	// silent plaintext fallback.
 	if p.Envelope != nil && p.AAD != nil {
-		netID := row.NetworkID
-		if netID == "" {
-			netID = p.NetworkID
-		}
 		plain, err := d.decryptProtected(netID, *p.Envelope, *p.AAD)
 		if err != nil {
 			return fmt.Errorf("decrypt delivery: %w", err)
@@ -2277,6 +2365,14 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 		// plaintext already contains them), so the separate criteria list is
 		// left empty to avoid double-rendering.
 		p.AcceptanceCriteria = nil
+	} else if netID != "" && deliveryHasContent(p) {
+		// D6: every network is ALWAYS encrypted — there is no plaintext
+		// path. A network-bound delivery carrying content WITHOUT an
+		// envelope is refused: the content must be encrypted server-side
+		// before it is delivered. Failing closed keeps the work durable
+		// server-side (no plaintext ever reaches the agent).
+		return fmt.Errorf("network %s is always encrypted: delivery for %s carried content without an envelope (no plaintext path)",
+			netID, p.InstanceID)
 	}
 	// The turn input is a self-describing XML envelope (contract.go):
 	// routing attributes + the immediate action for this delivery kind,
@@ -2285,6 +2381,14 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	input := deliveryInput(row, p)
 	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
 	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, kind))
+}
+
+// deliveryHasContent reports whether a (pre-decryption) legacy delivery
+// carries protected content that MUST be encrypted on an always-encrypted
+// network: a non-empty body, acceptance criteria, or a task reference. An
+// empty envelope-less delivery (a no-op notice) has no content to protect.
+func deliveryHasContent(p transport.NetworkEventPayload) bool {
+	return strings.TrimSpace(p.Body) != "" || len(p.AcceptanceCriteria) > 0 || p.TaskID != ""
 }
 
 func dashOr(s string) string {
@@ -2460,6 +2564,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
+	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
 	events := make(chan agentruntime.TurnEvent, 16)
 	turnDone := make(chan error, 1)
 	go func() {
@@ -2550,6 +2655,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case failedKind != "":
 		// The turn consumed no work: fail the command so a delivery's
@@ -2569,6 +2675,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case errors.Is(turnErr, context.Canceled):
 		// The daemon is shutting down (Close cancels d.turnCtx, spec §90)
@@ -2617,6 +2724,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+turnErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, turnErr)
 	case turnErr != nil:
 		// Adapter-level failure (spawn/IO), no turn events were produced.
@@ -2625,6 +2733,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", turnErr)
 	case !completed:
 		// The adapter exited cleanly but the turn produced NEITHER a
@@ -2650,6 +2759,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "idle",
 			})
+			d.reportEndpointStatus(conn, spec.InstanceID) // online (idle)
 			d.Log.Info("turn completed; instance kept awake (attach/pty active)",
 				"instance", spec.InstanceID, "duration", time.Since(started).Round(time.Second))
 			return nil
@@ -2665,6 +2775,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "blocked",
 			})
+			d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 			d.Log.Info("turn completed; non-deferrable interaction pending — instance stays waiting",
 				"instance", spec.InstanceID, "duration", time.Since(started).Round(time.Second))
 			return nil
@@ -2677,6 +2788,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
 			"reason": "turn_completed",
 		})
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (hibernated)
 		d.Log.Info("turn completed; instance hibernated",
 			"instance", spec.InstanceID, "session", sessionID,
 			"duration", time.Since(started).Round(time.Second))
@@ -2703,6 +2815,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
+	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
 
 	// E2EE (plan §12): the per-turn runtime-output stream id (object id for
 	// the encrypted output chunks). Minted only when the instance's network
@@ -2804,6 +2917,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case outcomeTurnFailed:
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
@@ -2818,6 +2932,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case outcomeNoFailureQueued:
 		// No failure recorded (a shutdown cancel, a supervisor shutdown
@@ -2851,6 +2966,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+submitErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, submitErr)
 	case outcomeProcessError:
 		// Session-core / driver-level failure (spawn/IO), no turn events
@@ -2860,6 +2976,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+submitErr.Error(), nil)
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", submitErr)
 	default: // outcomeCompleted
 		// Completed: the persistent endpoint STAYS ALIVE (the instance goes
@@ -2870,6 +2987,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 			"instanceId": spec.InstanceID, "status": "idle",
 		})
+		d.reportEndpointStatus(conn, spec.InstanceID) // online (idle)
 		d.Log.Info("turn completed; persistent endpoint kept alive (idle)",
 			"instance", spec.InstanceID, "session", sessionID,
 			"duration", time.Since(started).Round(time.Second))
@@ -3067,6 +3185,7 @@ drain:
 			// restarts (cold start). Same handling as the turn path.
 			_ = d.state.SetInstanceSession(row.InstanceID, "")
 			_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
+			d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
 			d.Log.Warn("attach activation lost the session; instance blocked",
 				"instance", row.InstanceID)
 			return fmt.Errorf("session lost: no resumable session (instance blocked)")
@@ -3083,6 +3202,7 @@ drain:
 	_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 		"instanceId": row.InstanceID, "status": "idle",
 	})
+	d.reportEndpointStatus(conn, row.InstanceID) // online (attach woke it)
 	d.Log.Info("attach activated endpoint (session-driven)", "instance", row.InstanceID,
 		"session", sessionID)
 	d.ensureEndpointView(row)
@@ -3224,6 +3344,7 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 			// instance must NOT be torn down by this hibernation.
 			"reason": "attach_closed",
 		})
+		d.reportEndpointStatus(conn, p.InstanceID) // offline (hibernated)
 		d.Log.Info("last attach closed; instance hibernated", "instance", p.InstanceID)
 	}
 	return nil
@@ -3259,6 +3380,7 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 			// The stop endpoint already told its clients "stopped".
 			"reason": "stopped",
 		})
+		d.reportEndpointStatus(conn, p.InstanceID) // offline (hibernated)
 		d.Log.Info("terminal stopped; instance hibernated", "instance", p.InstanceID)
 	}
 	return nil

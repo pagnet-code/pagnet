@@ -168,6 +168,17 @@ func main() {
 		openCmd(),
 		initCmd(),
 		doctorCmd(),
+		// V2 cutover command surface (plan D10): participants, capabilities,
+		// events. (agentsCmd is the V2 list: agents + live endpoints.)
+		servicesCmd(),
+		serviceCmd(),
+		searchCmd(),
+		invokeCmd(),
+		eventCmd(),
+		subscribeCmd(),
+		subscriptionsCmd(),
+		unsubscribeCmd(),
+		recipeCmd(),
 		// internal (hidden): daemon-spawned MCP bridge entrypoints
 		mcpCmd(),
 	)

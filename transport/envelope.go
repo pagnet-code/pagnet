@@ -218,6 +218,15 @@ const (
 	// customer-side to read history; the control plane only records the new
 	// epoch id.
 	MsgCryptoRotate = "host.crypto_rotate"
+	// MsgCryptoShareEndpoint: endpoint crypto enrollment (plan D6): the
+	// crypto-authority host wraps the network's current epoch key under an
+	// SDK endpoint's X25519 public key (HPKE base, info
+	// e2ee.EnrollmentInfo, no AAD, plaintext = the raw 32-byte epoch key)
+	// and reports the wrapped package in the ack's result field; the
+	// control plane relays it byte-for-byte to the endpoint as
+	// endpoint.crypto_key_package (the server never sees key material).
+	// The ack result is CryptoShareEndpointResult.
+	MsgCryptoShareEndpoint = "host.crypto_share_endpoint"
 
 	// Browser key-session commands (plan §13, p10). These are the
 	// request/response crypto operations a browser (or any non-daemon
@@ -395,6 +404,12 @@ type LaunchAgentPayload struct {
 	// runtimes have it appended to a fresh session's first turn (exactly
 	// how the coordination contract reaches them).
 	AgentMD string `json:"agentMd,omitempty"`
+	// AgentPrincipalID is the agent principal this instance runs (V2:
+	// the managed_agent PrincipalEndpoint is derived from the daemon's
+	// host.endpoint_status reports, and the daemon resolves every
+	// network operation of the instance against this principal).
+	// Additive (V2 cutover, W2 sends it); empty on pre-V2 launches.
+	AgentPrincipalID string `json:"agentPrincipalId,omitempty"`
 }
 
 // WakeAgentPayload wakes a hibernated instance: the daemon resumes the
@@ -444,7 +459,10 @@ type LatestVersionPayload struct {
 type NetworkCryptoPayload struct {
 	TenantID  string `json:"tenantId"`
 	NetworkID string `json:"networkId"`
-	// Status: standard | activating | active.
+	// Status: provisioning | active | degraded (V2, plan D6: networks are
+	// ALWAYS encrypted — "provisioning" is the pre-activation state, a
+	// content-free window, and "degraded" fails closed like it). Any
+	// status other than "active" refuses content operations.
 	Status  string `json:"status"`
 	EpochID string `json:"epochId,omitempty"`
 }
@@ -730,6 +748,12 @@ type AgentRequestPayload struct {
 	InstanceID string          `json:"instanceId"`
 	Tool       string          `json:"tool"` // fixed network_* tool name (PROTOCOL §6)
 	Args       json.RawMessage `json:"args"`
+	// PrincipalID is the instance's agent principal (V2): the daemon maps
+	// the bridge-authenticated instance to its principal from the launch
+	// context; the control plane authorizes the tool call against that
+	// principal's memberships. Additive (V2 cutover); empty on pre-V2
+	// launches.
+	PrincipalID string `json:"principalId,omitempty"`
 }
 
 // AgentResponsePayload answers one AgentRequest. RequestID is the
@@ -914,6 +938,38 @@ type CryptoProveResult struct {
 // newly minted epoch.
 type CryptoRotateResult struct {
 	EpochID string `json:"epochId"`
+}
+
+// CryptoShareEndpointPayload asks the crypto-authority host to wrap the
+// network's current epoch key under the endpoint's X25519 public key
+// (plan D6, endpoint crypto enrollment). EndpointPublicKey is base64
+// (32 bytes); the server stores it on the participant_endpoints row and
+// relays nothing else from this command.
+type CryptoShareEndpointPayload struct {
+	CommandID string `json:"commandId"`
+	TenantID  string `json:"tenantId"`
+	NetworkID string `json:"networkId"`
+	// EndpointPublicKey is the enrolling endpoint's X25519 public key
+	// (base64, 32 bytes) — the HPKE wrap target.
+	EndpointPublicKey string `json:"endpointPublicKey"`
+	// EpochID is the epoch to wrap (the network's current epoch; the
+	// daemon fails clean when it does not hold that epoch).
+	EpochID string `json:"epochId"`
+}
+
+// CryptoShareEndpointResult is the ack result of
+// host.crypto_share_endpoint: the wrapped epoch key for the endpoint. The
+// control plane relays WrappedKey to the endpoint as
+// endpoint.crypto_key_package {networkId, epochId, wrappedKey} — the wire
+// shape the SDK unwraps with e2ee.HPKEUnwrap(key, enc, EnrollmentInfo,
+// nil, ciphertext).
+type CryptoShareEndpointResult struct {
+	// EpochID is the epoch the wrapped key belongs to (echoed).
+	EpochID string `json:"epochId"`
+	// WrappedKey is the HPKE base-mode wrap (X25519/HKDF-SHA256/
+	// AES-256-GCM): Enc = encapsulated (ephemeral) key, Ciphertext = the
+	// sealed 32-byte epoch key.
+	WrappedKey CryptoHPKEWrap `json:"wrappedKey"`
 }
 
 // --- browser key-session commands (plan §13, p10) ----------------------------
@@ -1210,4 +1266,10 @@ type EndpointStatusPayload struct {
 	// InstanceID is the managed instance behind the endpoint.
 	InstanceID string `json:"instanceId"`
 	Online     bool   `json:"online"`
+	// Capabilities is the instance's self-declared capability set (V2):
+	// what the agent declared through network_register_capabilities
+	// (version 1). The control plane upserts endpoint_capabilities from
+	// it (idempotent — the report carries the CURRENT full declaration).
+	// Nil when the instance declared nothing yet.
+	Capabilities []domain.Capability `json:"capabilities,omitempty"`
 }

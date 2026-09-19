@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "suite": {
+    "kem": "X25519_HKDF_SHA256",
+    "kdf": "HKDF_SHA256",
+    "aead": "AES256GCM"
+  },
+  "mode": "base",
+  "info": "pagnet/endpoint-enrollment/epoch-wrap/v1",
+  "aad": null,
+  "example": {
+    "endpoint_public": "63e082ffe750682dcc75b76b61a24e48fa7eed8e7cdc7dd414b1410cbeb9df44",
+    "endpoint_private": "c03a43899c52c4fa58bb4e8bffd430f76b7960ae0ef1e0340853d7bf5afe5c3c",
+    "epoch_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+  }
+}

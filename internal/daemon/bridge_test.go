@@ -273,7 +273,7 @@ func TestBridgeBoundedPending(t *testing.T) {
 	}
 	d.pendingMu.Unlock()
 
-	_, errMsg := d.relayToServer("inst-1", "network_whoami", nil)
+	_, errMsg := d.relayToServer("inst-1", "", "network_whoami", nil)
 	if errMsg == "" || !strings.Contains(errMsg, "in-flight") {
 		t.Fatalf("relayToServer = %q, want the bounded-pending error", errMsg)
 	}

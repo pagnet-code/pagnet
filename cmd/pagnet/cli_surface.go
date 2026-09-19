@@ -43,9 +43,8 @@ func simpleListCmd(use, target, short string) *cobra.Command {
 	return cmd
 }
 
-func agentsCmd() *cobra.Command {
-	return simpleListCmd("agents", "agents", "List agents in the network (§55 `pagnet agents`)")
-}
+// agentsCmd moved to v2network.go (V2 cutover D10): it now lists the
+// network's agents with their live endpoints + capabilities.
 
 func hostsCmd() *cobra.Command {
 	return simpleListCmd("hosts", "hosts", "List hosts (§55 `pagnet hosts`)")

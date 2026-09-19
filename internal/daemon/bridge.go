@@ -8,9 +8,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -248,11 +250,33 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		if req.Args == nil {
 			req.Args = json.RawMessage("{}")
 		}
-		// E2EE (plan §12): on an active private network the daemon encrypts
-		// the tool call's protected fields before they cross the cloud
-		// boundary (the server stores/relays the opaque envelope + verbatim
-		// AAD and routes on metadata without decrypting). Standard networks
-		// are byte-identical (encryptToolArgs returns the args unchanged).
+		// V2: network_register_capabilities is handled LOCALLY by the daemon
+		// (not relayed to the server): the agent's self-declared capability
+		// set (version 1) is persisted on the instance row and reported via
+		// host.endpoint_status, from which the control plane upserts
+		// endpoint_capabilities. It carries no protected content (metadata),
+		// so it runs on any network state.
+		if req.Tool == "network_register_capabilities" {
+			result, errMsg := d.registerInstanceCapabilities(row, req.Args)
+			resp := map[string]any{"id": req.ID}
+			if errMsg == "" {
+				resp["ok"] = true
+				resp["result"] = result
+			} else {
+				resp["ok"] = false
+				resp["error"] = errMsg
+			}
+			if _, err := writeBridge(c, resp); err != nil {
+				return
+			}
+			continue
+		}
+		// E2EE (plan §12) + D6 (always-encrypted): the daemon encrypts the
+		// tool call's protected fields before they cross the cloud boundary
+		// (the server stores/relays the opaque envelope + verbatim AAD and
+		// routes on metadata without decrypting). A call that carries content
+		// on a network whose crypto is not active is refused (no plaintext
+		// path); metadata-only calls pass through unchanged.
 		encArgs, encErr := d.encryptToolArgs(row, req.Tool, req.Args)
 		if encErr != "" {
 			resp := map[string]any{"id": req.ID, "ok": false, "error": encErr}
@@ -261,7 +285,7 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 			}
 			continue
 		}
-		result, errMsg := d.relayToServer(row.InstanceID, req.Tool, encArgs)
+		result, errMsg := d.relayToServer(row.InstanceID, row.AgentPrincipalID, req.Tool, encArgs)
 		resp := map[string]any{"id": req.ID}
 		if errMsg == "" {
 			resp["ok"] = true
@@ -277,8 +301,11 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 }
 
 // relayToServer forwards one tool call over the host connection and waits
-// for the correlated agent.response.
-func (d *Daemon) relayToServer(instanceID, tool string, args json.RawMessage) (json.RawMessage, string) {
+// for the correlated agent.response. principalID is the instance's agent
+// principal (V2): the daemon resolves EVERY network operation against it,
+// so the control plane authorizes and routes on the PRINCIPAL (representative
+// re-authorization, plan §17-18), not on the instance.
+func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.RawMessage) (json.RawMessage, string) {
 	d.connMu.Lock()
 	conn := d.curConn
 	d.connMu.Unlock()
@@ -286,9 +313,10 @@ func (d *Daemon) relayToServer(instanceID, tool string, args json.RawMessage) (j
 		return nil, "control plane not connected; retry shortly"
 	}
 	env, err := transport.NewEnvelope(transport.MsgAgentRequest, transport.AgentRequestPayload{
-		InstanceID: instanceID,
-		Tool:       tool,
-		Args:       args,
+		InstanceID:  instanceID,
+		PrincipalID: principalID,
+		Tool:        tool,
+		Args:        args,
 	})
 	if err != nil {
 		return nil, err.Error()
@@ -352,6 +380,71 @@ func (d *Daemon) deliverAgentResponse(env transport.Envelope) {
 	if ok {
 		ch <- p
 	}
+}
+
+// registerInstanceCapabilities handles the agent's network_register_
+// capabilities declaration (V2, version 1). It is the daemon's LOCAL
+// interception of that tool: the declared set is persisted on the instance
+// row (targeted single-column update, so concurrent status writes are not
+// clobbered) and re-reported via host.endpoint_status, from which the
+// control plane upserts endpoint_capabilities. It is NOT relayed to the
+// server as an agent.request — the endpoint_status report IS the
+// registration path. The declared set REPLACES the prior declaration (the
+// agent re-declares its full set; the report carries the current full set).
+//
+// Returns the result JSON (the registered set) or an error message.
+func (d *Daemon) registerInstanceCapabilities(row *InstanceRow, args json.RawMessage) (json.RawMessage, string) {
+	var m struct {
+		Capabilities []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(args, &m); err != nil {
+		return nil, "register_capabilities: could not parse args (need {\"capabilities\":[...]})"
+	}
+	if len(m.Capabilities) == 0 {
+		return nil, "register_capabilities: 'capabilities' must be a non-empty array"
+	}
+	caps := make([]domain.Capability, 0, len(m.Capabilities))
+	seen := make(map[string]bool, len(m.Capabilities))
+	for _, c := range m.Capabilities {
+		id := strings.TrimSpace(c.ID)
+		if id == "" {
+			return nil, "register_capabilities: every capability needs a non-empty 'id'"
+		}
+		if seen[id] {
+			continue // de-duplicate by id (the first declaration wins)
+		}
+		seen[id] = true
+		name := strings.TrimSpace(c.Name)
+		if name == "" {
+			name = id
+		}
+		caps = append(caps, domain.Capability{
+			ID:          id,
+			Version:     1,
+			Name:        name,
+			Description: c.Description,
+		})
+	}
+	if err := d.state.SetInstanceCapabilities(row.InstanceID, caps); err != nil {
+		return nil, "register_capabilities: persist failed: " + err.Error()
+	}
+	// Re-report the endpoint status carrying the updated capability set
+	// (reportEndpointStatus re-reads the row, so it picks up the new caps).
+	// The conn is nil: d.send routes to the live host connection.
+	d.reportEndpointStatus(nil, row.InstanceID)
+	d.Log.Info("capabilities registered", "instance", row.InstanceID, "count", len(caps))
+	out, err := json.Marshal(map[string]any{
+		"registered": caps,
+		"count":      len(caps),
+	})
+	if err != nil {
+		return nil, "register_capabilities: encode failed: " + err.Error()
+	}
+	return out, ""
 }
 
 // readLine reads one newline-terminated line, bounded to bridgeMaxLine.

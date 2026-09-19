@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -42,11 +43,14 @@ type cryptoManager struct {
 
 // NetworkCryptoState is the daemon's cached view of one network's E2EE
 // lifecycle state (from the control plane's host.network_crypto signal).
+// The JSON tags are the persisted KV shape (State.LoadNetworkCrypto): the
+// CLI reads the same rows for client-side encryption (pagnet invoke /
+// event publish), so the tags are a contract, not a detail.
 type NetworkCryptoState struct {
-	NetworkID string
-	TenantID  string
-	Status    string // standard | activating | active
-	EpochID   string // the announced current epoch ("" until active)
+	NetworkID string `json:"networkId,omitempty"`
+	TenantID  string `json:"tenantId"`
+	Status    string `json:"status"`  // standard | activating | active
+	EpochID   string `json:"epochId"` // the announced current epoch ("" until active)
 }
 
 // cryptoManager returns the daemon's crypto manager, creating it on first use.
@@ -254,4 +258,47 @@ func (d *Daemon) doCryptoRotate(p transport.CryptoRotatePayload) (any, error) {
 		return nil, err
 	}
 	return &transport.CryptoRotateResult{EpochID: epoch.ID}, nil
+}
+
+// doCryptoShareEndpoint is endpoint crypto enrollment (plan D6): the
+// crypto-authority host wraps the network's CURRENT epoch key under an
+// enrolling SDK endpoint's X25519 public key and returns the wrap. The
+// control plane relays the wrappedKey to the endpoint as
+// endpoint.crypto_key_package {networkId, epochId, wrappedKey}, and the
+// endpoint unwraps it with e2ee.HPKEUnwrap(priv, enc, EnrollmentInfo, nil,
+// ciphertext) — the EXACT inverse of WrapEpochKeyForEndpoint (same suite,
+// same info context, no AAD, 32-byte key plaintext).
+//
+// This host must be the network's crypto authority (it holds the keyring).
+// It fails clean when it does not hold the requested epoch (a non-authority
+// host, or an epoch it never installed) — the control plane then routes the
+// enrollment to a host that does.
+func (d *Daemon) doCryptoShareEndpoint(p transport.CryptoShareEndpointPayload) (any, error) {
+	kr, err := crypto.LoadKeyring(d.StateDir, p.NetworkID)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: load keyring for %s: %w", p.NetworkID, err)
+	}
+	epoch, ok := kr.EpochByID(p.EpochID)
+	if !ok {
+		return nil, fmt.Errorf("crypto: epoch %s not in local keyring (this host cannot share it)", p.EpochID)
+	}
+	key, err := epoch.KeyArray()
+	if err != nil {
+		return nil, fmt.Errorf("crypto: epoch %s key: %w", p.EpochID, err)
+	}
+	endpointPub, err := base64.StdEncoding.DecodeString(p.EndpointPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: decode endpoint x25519 public key: %w", err)
+	}
+	enc, ct, err := e2ee.WrapEpochKeyForEndpoint(endpointPub, key[:])
+	if err != nil {
+		return nil, fmt.Errorf("crypto: wrap epoch key for endpoint: %w", err)
+	}
+	return &transport.CryptoShareEndpointResult{
+		EpochID: p.EpochID,
+		WrappedKey: transport.CryptoHPKEWrap{
+			Enc:        enc,
+			Ciphertext: ct,
+		},
+	}, nil
 }

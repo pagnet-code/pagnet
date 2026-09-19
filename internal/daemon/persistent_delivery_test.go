@@ -38,6 +38,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -549,14 +550,23 @@ func TestDaemon_PersistentEndpointEnvInjection(t *testing.T) {
 	d.connMu.Unlock()
 
 	instanceID := domain.NewID().String()
+	networkID := domain.NewID().String()
 	driveLaunch(t, d, server, transport.LaunchAgentPayload{
 		CommandID: "cmd-env-launch", InstanceID: instanceID,
 		Runtime: string(domain.RuntimeFakePersistent), Kind: "representative",
-		AgentName: "env-agent", NetworkID: "net-env",
+		AgentName: "env-agent", NetworkID: networkID,
 	})
+	// D6 (always-encrypted): the network's crypto is active, so the task's
+	// content crosses ONLY as an envelope (the daemon decrypts it just
+	// before the turn). This exercises the real always-encrypted delivery
+	// path in the persistent flow.
+	setupActiveNetCrypto(t, d, "tenant-env", networkID)
+	taskID := domain.NewID().String()
+	encEnv, aad := d.encryptForDelivery(t, networkID, e2ee.ObjectTypeTask, taskID, "env-agent", "", "first")
 	driveDeliver(t, d, server, transport.NetworkEventPayload{
 		CommandID: "cmd-env-deliver", InstanceID: instanceID,
-		Kind: "task", Body: "first",
+		Kind: "task", TaskID: taskID,
+		Envelope: &encEnv, AAD: &aad,
 	})
 	pid := d.sup.EndpointPID(instanceID)
 	if pid == nil {
@@ -571,8 +581,8 @@ func TestDaemon_PersistentEndpointEnvInjection(t *testing.T) {
 	if env["PAGNET_AGENT_NAME"] != "env-agent" {
 		t.Fatalf("PAGNET_AGENT_NAME = %q, want %q", env["PAGNET_AGENT_NAME"], "env-agent")
 	}
-	if env["PAGNET_NETWORK_ID"] != "net-env" {
-		t.Fatalf("PAGNET_NETWORK_ID = %q, want %q", env["PAGNET_NETWORK_ID"], "net-env")
+	if env["PAGNET_NETWORK_ID"] != networkID {
+		t.Fatalf("PAGNET_NETWORK_ID = %q, want %q", env["PAGNET_NETWORK_ID"], networkID)
 	}
 	// The MCP bridge config and coordination contract are present (non-
 	// empty): the agent can reach the network and read its standing rules.

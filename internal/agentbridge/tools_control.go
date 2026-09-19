@@ -23,15 +23,15 @@ import (
 // §8–9) to s, each call relayed over br.
 func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	s.AddTool(mcp.NewTool("control_whoami",
-		mcp.WithDescription("My pagnet identity: this representative instance, its definition, the current turn context, and my network grants."),
+		mcp.WithDescription("My pagnet identity: the representative PRINCIPAL I run (its id, name, kind) plus the instance provenance (this instance id, the current turn context), and my network memberships with the permissions each allows."),
 	), br.Handle("control_whoami", map[string]any{}))
 
 	s.AddTool(mcp.NewTool("control_list_networks",
-		mcp.WithDescription("The networks I have grants on, with the permissions each grant allows (observe/communicate/delegate/operate)."),
+		mcp.WithDescription("The networks I belong to, with the permissions my membership in each allows (observe/communicate/delegate/operate)."),
 	), br.Handle("control_list_networks", map[string]any{}))
 
 	s.AddTool(mcp.NewTool("control_use_network",
-		mcp.WithDescription("Switch the current conversation's active network to one I am granted. Only from channel/web turns; a network-triggered turn is pinned to its network."),
+		mcp.WithDescription("Switch the current conversation's active network to one I am a member of. Only from channel/web turns; a network-triggered turn is pinned to its network."),
 		mcp.WithString("networkId", mcp.Required(), mcp.Description("the network to activate for this conversation")),
 	), br.Handle("control_use_network", map[string]any{"networkId": "string"}))
 
@@ -74,7 +74,7 @@ func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	), br.Handle("control_list_blocked", map[string]any{"networkId": "string"}))
 
 	s.AddTool(mcp.NewTool("control_ask",
-		mcp.WithDescription("Ask an agent in the network on the human's behalf. The recipient is woken if hibernated. Requires the communicate grant."),
+		mcp.WithDescription("Ask an agent in the network on the human's behalf. The recipient is woken if hibernated. Requires the communicate permission (the server re-authorizes each call against the representative's membership)."),
 		mcp.WithString("body", mcp.Required(), mcp.Description("the message text")),
 		mcp.WithString("toAgent", mcp.Description("recipient agent name")),
 		mcp.WithString("toInstance", mcp.Description("recipient instance id (takes precedence)")),
@@ -90,7 +90,7 @@ func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	}))
 
 	s.AddTool(mcp.NewTool("control_reply",
-		mcp.WithDescription("Reply within an existing network thread. Requires the communicate grant."),
+		mcp.WithDescription("Reply within an existing network thread. Requires the communicate permission."),
 		mcp.WithString("threadId", mcp.Required(), mcp.Description("the thread to reply in")),
 		mcp.WithString("body", mcp.Required(), mcp.Description("the reply text")),
 	), br.Handle("control_reply", map[string]any{
@@ -98,7 +98,7 @@ func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	}))
 
 	s.AddTool(mcp.NewTool("control_delegate",
-		mcp.WithDescription("Create and delegate a durable task in the network on the human's behalf. Requires the delegate grant."),
+		mcp.WithDescription("Create and delegate a durable task in the network on the human's behalf. Requires the delegate permission."),
 		mcp.WithString("objective", mcp.Required(), mcp.Description("what to achieve")),
 		mcp.WithString("title", mcp.Description("short title (defaults to the objective)")),
 		mcp.WithArray("acceptanceCriteria", mcp.Description("how done is verified"), mcp.WithStringItems()),
@@ -113,7 +113,7 @@ func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	}))
 
 	s.AddTool(mcp.NewTool("control_wake_agent",
-		mcp.WithDescription("Wake a hibernated agent in the network. Requires the operate grant."),
+		mcp.WithDescription("Wake a hibernated agent in the network. Requires the operate permission."),
 		mcp.WithString("toAgent", mcp.Description("agent name to wake")),
 		mcp.WithString("toInstance", mcp.Description("instance id to wake (takes precedence)")),
 		mcp.WithString("reason", mcp.Description("why (default explicit)")),
@@ -123,7 +123,7 @@ func RegisterControlTools(s *server.MCPServer, br *Bridge) {
 	}))
 
 	s.AddTool(mcp.NewTool("control_launch_agent",
-		mcp.WithDescription("Launch a worker instance for a network agent definition. Requires the operate grant."),
+		mcp.WithDescription("Launch a worker instance for a network agent definition. Requires the operate permission."),
 		mcp.WithString("agentName", mcp.Description("agent definition name")),
 		mcp.WithString("definitionId", mcp.Description("agent definition id (takes precedence)")),
 		mcp.WithString("hostId", mcp.Description("host to launch on (default: an online host)")),
