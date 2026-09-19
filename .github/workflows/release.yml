@@ -110,13 +110,17 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" --arg body "pagnet ${GITHUB_REF_NAME}" \
                  '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: false, prerelease: false, body: $body}')")
+          # The API's upload_url is a TEMPLATE (.../assets{?name,label}):
+          # substitute the template part — appending ?name= to it yields a
+          # malformed URL (400).
           upload=$(echo "$rel" | jq -r .upload_url)
+          upload_base="${upload%%{*}"
           # nullglob: an unmatched manifest glob expands to nothing, so an
           # unsigned release uploads only the tarballs.
           shopt -s nullglob
           for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
             # -L: the asset upload URL redirects to the storage backend.
-            api -L "${upload}?name=$(basename "$f")" \
+            api -L "${upload_base}?name=$(basename "$f")" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${f}" -o /dev/null
           done
@@ -143,10 +147,13 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$(jq -cn --arg sha "${GITHUB_SHA}" --arg body "Rolling dev build (${GITHUB_SHA::7})" \
                  '{tag_name: "dev", name: "dev", target_commitish: $sha, draft: false, prerelease: true, body: $body}')")
+          # upload_url is a template — substitute, don't append (see the
+          # tag lane).
           upload=$(echo "$rel" | jq -r .upload_url)
+          upload_base="${upload%%{*}"
           shopt -s nullglob
           for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
-            api -L "${upload}?name=$(basename "$f")" \
+            api -L "${upload_base}?name=$(basename "$f")" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${f}" -o /dev/null
           done
