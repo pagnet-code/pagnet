@@ -2,30 +2,25 @@ package domain
 
 import "time"
 
-// RepresentativeGrant grants a representative agent access to one network
-// with a fixed permission set. A representative can NEVER exceed the
-// permissions of the human who owns it: effective authority is
-// human access ∩ representative grant. Grants are enforced server-side.
+// UserRepresentative binds a human user to the agent principal that
+// represents them across the networks the user grants it.
+//
+// A representative is NOT a distinct principal kind: it is a regular agent
+// principal plus this binding plus ordinary NetworkMemberships. Its
+// effective authority in a network is the intersection of its owner's
+// authority and the membership's permissions (computed — there is no
+// separate grant table).
 //
 // A representative may summarize information from several networks TO THE
-// HUMAN, but worker-agent traffic remains network-isolated: a grant never
-// turns the representative into an implicit cross-network relay.
-type RepresentativeGrant struct {
-	ID               ID
-	RepresentativeID ID // agent_definitions.id where kind = 'representative'
-	NetworkID        ID
-	Permissions      []string // observe | communicate | delegate | operate
-	CreatedAt        time.Time
-}
-
-// Has reports whether the grant includes permission p.
-func (g RepresentativeGrant) Has(p string) bool { return HasPermission(g.Permissions, p) }
-
-// NetworkGrantRef pairs a network with the grants a representative holds on
-// it (for UI/API listing).
-type NetworkGrantRef struct {
-	NetworkID   ID
-	NetworkSlug string
-	NetworkName string
-	Permissions []string
+// HUMAN, but worker-agent traffic remains network-isolated: it is never an
+// implicit cross-network relay.
+type UserRepresentative struct {
+	ID     ID
+	UserID ID
+	// AgentPrincipalID is the agent principal that represents the user.
+	AgentPrincipalID ID
+	// IsDefault marks the user's default representative (at most one per
+	// user).
+	IsDefault bool
+	CreatedAt time.Time
 }

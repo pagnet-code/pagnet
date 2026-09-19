@@ -6,22 +6,23 @@ import (
 	"time"
 )
 
-// Host ownership scopes (hosts.ownership_scope /
-// enrollment_tokens.ownership_scope). Ownership is a scope INSIDE the
-// tenant — the tenant stays the hard isolation boundary; ownership decides
-// responsibility/visibility within it.
+// OwnershipScope is the ownership scope INSIDE the tenant
+// (hosts.ownership_scope / enrollment_tokens.ownership_scope /
+// principals.ownership_scope). The tenant stays the hard isolation
+// boundary; ownership decides responsibility/visibility within it.
+type OwnershipScope string
+
 const (
-	// OwnershipScopePersonal: the host belongs to one user
+	// OwnershipScopePersonal: the entity belongs to one user
 	// (OwnerUserID is set).
-	OwnershipScopePersonal = "personal"
-	// OwnershipScopeOrganization: the host is tenant-wide (OwnerUserID is
-	// NULL).
-	OwnershipScopeOrganization = "organization"
+	OwnershipScopePersonal OwnershipScope = "personal"
+	// OwnershipScopeOrganization: the entity is tenant-wide (OwnerUserID
+	// is NULL).
+	OwnershipScopeOrganization OwnershipScope = "organization"
 )
 
-// ValidOwnershipScope reports whether scope is a known host ownership
-// scope.
-func ValidOwnershipScope(scope string) bool {
+// ValidOwnershipScope reports whether scope is a known ownership scope.
+func ValidOwnershipScope(scope OwnershipScope) bool {
 	return scope == OwnershipScopePersonal || scope == OwnershipScopeOrganization
 }
 
@@ -29,7 +30,7 @@ func ValidOwnershipScope(scope string) bool {
 // PERSONAL requires an owner, ORGANIZATION requires none. Application
 // validation runs this before every write; the DB CHECK constraint is the
 // backstop.
-func ValidateOwnershipInvariant(scope string, ownerUserID *ID) error {
+func ValidateOwnershipInvariant(scope OwnershipScope, ownerUserID *ID) error {
 	switch scope {
 	case OwnershipScopePersonal:
 		if ownerUserID == nil {
@@ -70,7 +71,7 @@ type Host struct {
 
 	// OwnershipScope is the host's ownership inside the tenant
 	// ("personal" | "organization").
-	OwnershipScope string
+	OwnershipScope OwnershipScope
 	// OwnerUserID is the owning user for PERSONAL hosts; nil for
 	// ORGANIZATION hosts.
 	OwnerUserID *ID
@@ -140,7 +141,7 @@ type EnrollmentToken struct {
 
 	// OwnershipScope is the intended ownership the enrolled host gets
 	// ("personal" | "organization"; empty/legacy = "organization").
-	OwnershipScope string
+	OwnershipScope OwnershipScope
 	// OwnerUserID is the intended owner for PERSONAL tokens; nil for
 	// ORGANIZATION tokens.
 	OwnerUserID *ID

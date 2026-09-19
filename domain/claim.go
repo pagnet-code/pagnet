@@ -9,13 +9,16 @@ import (
 // accidentally taking ownership of the same work. They are NOT security
 // permissions.
 type Claim struct {
-	ID              ID
-	NetworkID       ID
-	ScopeType       ClaimScopeType
-	Scope           string // e.g. "src/compiler/**", task id, "github.com/xemahq/dsl"
-	ResourceID      *ID
+	ID         ID
+	NetworkID  ID
+	ScopeType  ClaimScopeType
+	Scope      string // e.g. "src/compiler/**", task id, "github.com/xemahq/dsl"
+	ResourceID *ID
+	// OwnerPrincipalID is the principal holding the claim (canonical).
+	OwnerPrincipalID *ID
+	// OwnerInstanceID is the instance that took the claim (execution
+	// provenance; nil when the owner is not a managed instance).
 	OwnerInstanceID *ID
-	OwnerAgentName  string
 	TaskID          *ID
 	TTLSeconds      int
 	ExpiresAt       time.Time

@@ -53,6 +53,27 @@ var VectorsV1 = []TestVectorV1{
 		AADCanonical:          `{"protocol_version":1,"tenant_id":"01900000-0000-7000-8000-000000000001","network_id":"01900000-0000-7000-8000-000000000002","object_type":"message","object_id":"01900000-0000-7000-8000-000000000003","sender":"agent-coder","recipient":"agent-reviewer","created_at":"2026-09-14T00:00:00Z","key_epoch_id":"01900000-0000-7000-8000-000000000004"}`,
 		EnvelopeCanonicalJSON: `{"version":1,"cipher_suite":"AES-256-GCM","key_epoch_id":"01900000-0000-7000-8000-000000000004","nonce":"AAECAwQFBgcICQoL","ciphertext":"zNbAptx5NXFsP1vK6x6hstAQlk1+SZfVo3hbPsJfbjPT","wrapped_content_key":"Dw4NDAsKCQgHBgUExFHTPz+yycmDtts0VPfnbhkXbRO7LIcTLjDUhE53zlWWGDzxXuZOK4K/fkBK9gTy","aad_version":1}`,
 	},
+	// Protocol v2 object type: event_payload (the event delivery path).
+	{
+		EpochKeyHex:  "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+		CEKHex:       "0f0e0d0c0b0a0908070605040302010011223344556677889900aabbccddeeff",
+		NonceHex:     "0a0b0c0d0e0f101112131415",
+		NonceWrapHex: "1514131211100f0e0d0c0b0a",
+		PlaintextHex: "6576656e74207061796c6f616420766563746f72", // "event payload vector"
+		AAD: AAD{
+			ProtocolVersion: 1,
+			TenantID:        "01900000-0000-7000-8000-000000000011",
+			NetworkID:       "01900000-0000-7000-8000-000000000012",
+			ObjectType:      "event_payload",
+			ObjectID:        "01900000-0000-7000-8000-000000000013",
+			Sender:          "agent-planner",
+			Recipient:       "agent-coordinator",
+			CreatedAt:       "2026-09-19T00:00:00Z",
+			KeyEpochID:      "01900000-0000-7000-8000-000000000014",
+		},
+		AADCanonical:          `{"protocol_version":1,"tenant_id":"01900000-0000-7000-8000-000000000011","network_id":"01900000-0000-7000-8000-000000000012","object_type":"event_payload","object_id":"01900000-0000-7000-8000-000000000013","sender":"agent-planner","recipient":"agent-coordinator","created_at":"2026-09-19T00:00:00Z","key_epoch_id":"01900000-0000-7000-8000-000000000014"}`,
+		EnvelopeCanonicalJSON: `{"version":1,"cipher_suite":"AES-256-GCM","key_epoch_id":"01900000-0000-7000-8000-000000000014","nonce":"CgsMDQ4PEBESExQV","ciphertext":"UrrxH5nNgoy5BlABhWcaRLAP8FVGR8xT9QPr619SrpQw0kly","wrapped_content_key":"FRQTEhEQDw4NDAsKCbCy40ZVksUo2WlFtvVLC5oyCLIzmigyvt4ri7m37zEhlphNjwQX8IItmtrQI9WA","aad_version":1}`,
+	},
 }
 
 // Reconstruct encryptCore inputs from a committed vector.

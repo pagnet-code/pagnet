@@ -18,9 +18,9 @@ func ResourceGroupSlug(canonicalKey string) string {
 	return "repo/" + canonicalKey
 }
 
-// GroupMember links an agent definition to a group.
+// GroupMember links a principal to a group.
 type GroupMember struct {
-	GroupID           ID
-	AgentDefinitionID ID
-	JoinedAt          time.Time
+	GroupID     ID
+	PrincipalID ID
+	JoinedAt    time.Time
 }

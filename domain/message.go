@@ -8,11 +8,13 @@ import (
 
 // Thread is a conversation context for messages.
 type Thread struct {
-	ID                  ID
-	NetworkID           ID
-	CreatedByInstanceID *ID
-	Subject             string
-	CreatedAt           time.Time
+	ID        ID
+	NetworkID ID
+	// CreatedByPrincipalID is the principal that started the thread
+	// (nil for system-created threads).
+	CreatedByPrincipalID *ID
+	Subject              string
+	CreatedAt            time.Time
 }
 
 // Message part kinds.
@@ -51,15 +53,22 @@ func ArtifactPart(artifactID ID) MessagePart {
 // Message is a durable communication event between agents.
 //
 // Message = communication. Work delegation is a Task, never a message.
+//
+// The principals are the canonical sender/recipient; the instance ids are
+// optional execution provenance (which endpoint actually sent/received).
 type Message struct {
-	ID                  ID
-	NetworkID           ID
-	ThreadID            ID
-	Kind                MessageKind
-	SenderInstanceID    *ID
-	SenderAgentName     string
+	ID                   ID
+	NetworkID            ID
+	ThreadID             ID
+	Kind                 MessageKind
+	SenderPrincipalID    *ID
+	RecipientPrincipalID *ID
+	// SenderInstanceID is the instance that sent the message (execution
+	// provenance; nil when the sender is not a managed instance).
+	SenderInstanceID *ID
+	// RecipientInstanceID is the instance the message was addressed to
+	// (execution provenance; nil when addressed to a principal/group).
 	RecipientInstanceID *ID
-	RecipientAgentName  string
 	RecipientGroupID    *ID
 	ResourceID          *ID
 	TaskID              *ID

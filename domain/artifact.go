@@ -5,9 +5,17 @@ import "time"
 // Artifact is a durable reference produced by work (PR URL, commit SHA,
 // package version, test report, document URL, file reference, JSON result).
 type Artifact struct {
-	ID                    ID
-	NetworkID             ID
-	TaskID                *ID
+	ID        ID
+	NetworkID ID
+	TaskID    *ID
+	// PublishedByPrincipalID is the principal that published the artifact
+	// (canonical).
+	PublishedByPrincipalID *ID
+	// PublishedByEndpointID is the endpoint that published it (execution
+	// provenance; nil when unknown).
+	PublishedByEndpointID *ID
+	// PublishedByInstanceID is the instance that published it (execution
+	// provenance; nil when the publisher is not a managed instance).
 	PublishedByInstanceID *ID
 	Type                  ArtifactType
 	URI                   string

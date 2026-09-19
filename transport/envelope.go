@@ -1,4 +1,5 @@
-// Package transport defines the pagnet host protocol wire format.
+// Package transport defines the pagnet host + endpoint protocol wire
+// format.
 //
 // This is the public protocol contract shared with pagnet-server.
 //
@@ -6,6 +7,11 @@
 // Artifact, ...) are defined in the domain package and NEVER shaped around
 // this wire format. Future transports (REST, A2A, Matrix, NATS) serialize
 // the same domain objects.
+//
+// Protocol v2 (the V2 cutover) covers both the host connection (daemons)
+// and the endpoint connection (SDK participants). A peer that speaks an
+// unsupported version is answered with protocol.upgrade_required and
+// closed — never silently misinterpreted.
 package transport
 
 import (
@@ -19,8 +25,12 @@ import (
 	"github.com/pagnet-code/pagnet/e2ee"
 )
 
-// ProtocolVersion is the current host-protocol envelope version.
-const ProtocolVersion = 1
+// ProtocolVersion is the current protocol envelope version. V2 is the V2
+// architecture cutover: principals/endpoints/memberships replace the v1
+// agent-kind + grant model, and the endpoint WS (SDK participants) is new.
+// A peer that sends any other version must be answered with
+// protocol.upgrade_required (UpgradeRequiredPayload) and then closed.
+const ProtocolVersion = 2
 
 // Envelope is the single versioned wrapper for every daemon/control-plane
 // command and event on the host connection. Domain fields never appear at
@@ -70,6 +80,32 @@ func (e Envelope) WithContext(ctx context.Context) Envelope {
 // DecodePayload unmarshals the envelope payload into v.
 func (e Envelope) DecodePayload(v any) error {
 	return json.Unmarshal(e.Payload, v)
+}
+
+// IsVersionSupported reports whether the envelope was sent with the current
+// protocol version. A peer that sends an unsupported version must be
+// answered with protocol.upgrade_required (UpgradeRequiredPayload) and then
+// closed — its messages must never be interpreted (v1 and v2 share the
+// envelope shape but NOT the type vocabulary).
+func (e Envelope) IsVersionSupported() bool {
+	return e.ProtocolVersion == ProtocolVersion
+}
+
+// MsgUpgradeRequired is sent to a peer whose protocol version is not
+// supported. The receiver must stop and surface the user-facing message;
+// the sender closes the connection immediately after.
+const MsgUpgradeRequired = "protocol.upgrade_required"
+
+// UpgradeRequiredMessage is the user-facing message for a v1 peer.
+const UpgradeRequiredMessage = "Pagnet client is outdated. Please update."
+
+// UpgradeRequiredPayload tells a peer which protocol version is required
+// and how to say it to the user.
+type UpgradeRequiredPayload struct {
+	// Required is the protocol version the server speaks.
+	Required int `json:"required"`
+	// Message is the user-facing explanation.
+	Message string `json:"message"`
 }
 
 // Message types: control plane -> host. Commands are STRUCTURED only; the
@@ -254,6 +290,60 @@ const (
 // MsgAgentResponse is control plane -> host: the result of an
 // MsgAgentRequest, correlated by RequestID (the request envelope's id).
 const MsgAgentResponse = "agent.response"
+
+// MsgEndpointStatus is host -> control plane: the daemon reports a managed
+// agent's endpoint liveness (the managed_agent PrincipalEndpoint row is
+// derived from these reports + the instance state). Live (at-most-once):
+// a missed report is corrected by the next one and by heartbeats.
+const MsgEndpointStatus = "host.endpoint_status"
+
+// Message types: the endpoint WS (SDK participants, path /wss/endpoints,
+// bearer principal credential). The endpoint is the generic live-presence
+// unit of a principal; the control plane routes deliveries and invocations
+// to ONE eligible endpoint per operation.
+//
+// The connection lifecycle is: connect (auth) -> endpoint.register ->
+// endpoint.auth_ok -> live (deliveries/invocations/heartbeats) ->
+// endpoint.disconnect (graceful) or drop.
+const (
+	// MsgEndpointRegister is c->s: the endpoint registers on (re)connect
+	// with its crypto identity, SDK version and advertised capabilities.
+	// On first use with an ACTIVATION credential the server issues the
+	// durable endpoint credential (returned in endpoint.auth_ok).
+	MsgEndpointRegister = "endpoint.register"
+	// MsgEndpointAuthOK is s->c: the registration was accepted; carries
+	// the endpoint's identity, its networks and (only on activation) the
+	// durable credential.
+	MsgEndpointAuthOK = "endpoint.auth_ok"
+	// MsgEndpointMessageDeliver is s->c: one durable message for the
+	// endpoint's principal (encrypted parts, AAD-bound).
+	MsgEndpointMessageDeliver = "endpoint.message_deliver"
+	// MsgEndpointMessageAcked is c->s: the message was processed.
+	MsgEndpointMessageAcked = "endpoint.message_acked"
+	// MsgEndpointEventDeliver is s->c: one event delivery for a
+	// subscription (encrypted payload, AAD-bound). Durable: the delivery
+	// row survives disconnects; the live push is an optimization.
+	MsgEndpointEventDeliver = "endpoint.event_deliver"
+	// MsgEndpointEventAck is c->s: the delivery was processed.
+	MsgEndpointEventAck = "endpoint.event_ack"
+	// MsgEndpointInvocationDispatch is s->c: one capability invocation
+	// for the endpoint's principal (encrypted input, AAD-bound).
+	MsgEndpointInvocationDispatch = "endpoint.invocation_dispatch"
+	// MsgEndpointInvocationAccept is c->s: the endpoint accepted the
+	// invocation (it will produce a result).
+	MsgEndpointInvocationAccept = "endpoint.invocation_accept"
+	// MsgEndpointInvocationResult is c->s: the invocation's outcome
+	// (encrypted output OR error, AAD-bound).
+	MsgEndpointInvocationResult = "endpoint.invocation_result"
+	// MsgEndpointHeartbeat is c->s: liveness + load (inflight). The
+	// control plane answers with MsgEndpointHeartbeatAck.
+	MsgEndpointHeartbeat = "endpoint.heartbeat"
+	// MsgEndpointHeartbeatAck is s->c: the heartbeat was received.
+	MsgEndpointHeartbeatAck = "endpoint.heartbeat_ack"
+	// MsgEndpointDisconnect is c->s: graceful shutdown (the endpoint is
+	// going away on purpose; pending work stays durable).
+	MsgEndpointDisconnect = "endpoint.disconnect"
+)
 
 // LaunchAgentPayload is a structured launch command (never shell).
 type LaunchAgentPayload struct {
@@ -449,6 +539,23 @@ type NetworkEventPayload struct {
 	// reconstructs the AAD from these server-relayed fields and decrypts; if
 	// the server altered any bound field, GCM authentication fails.
 	AAD *e2ee.AAD `json:"aad,omitempty"`
+
+	// --- protocol v2 (event delivery to managed agents) ---
+	//
+	// These fields carry the v2 event-delivery identity. The v1 fields
+	// above stay for the existing daemon delivery path; the daemon-side
+	// meaning change (deterministic trigger turn) is a later wave.
+	// EventID is the network event this delivery carries.
+	EventID string `json:"eventId,omitempty"`
+	// DeliveryID is the event delivery row id (the ack idempotency key).
+	DeliveryID string `json:"deliveryId,omitempty"`
+	// EventType is the event's dot-separated type.
+	EventType string `json:"eventType,omitempty"`
+	// TargetPrincipalID is the event's target principal (the managed
+	// agent's principal).
+	TargetPrincipalID string `json:"targetPrincipalId,omitempty"`
+	// DeliveryMode: deliver | wake (domain.EventDeliveryMode).
+	DeliveryMode string `json:"deliveryMode,omitempty"`
 }
 
 // HeartbeatPayload carries host liveness + machine metrics.
@@ -950,4 +1057,157 @@ type CryptoSessionEndPayload struct {
 	TenantID  string `json:"tenantId"`
 	NetworkID string `json:"networkId"`
 	SessionID string `json:"sessionId"`
+}
+
+// --- protocol v2: endpoint WS (SDK participants) ---------------------------
+//
+// These are the payloads of the endpoint connection (path /wss/endpoints,
+// bearer principal credential). The control plane is a zero-knowledge relay
+// for the encrypted parts: Envelope + AAD cross byte-for-byte, and the
+// server never reads the ciphertext (it may read key_epoch_id for routing).
+
+// EndpointRegisterPayload is the endpoint's registration on (re)connect.
+// PublicKey is the endpoint's X25519 public key (base64) — its crypto
+// identity for network enrollment (rotation-capable). Capabilities are the
+// endpoint's self-declared capability descriptors (merged with the
+// principal's configured descriptors for discovery).
+type EndpointRegisterPayload struct {
+	// EndpointName is an operator-friendly name for the endpoint ("" =
+	// none; display only, not identity).
+	EndpointName string              `json:"endpointName,omitempty"`
+	PublicKey    string              `json:"publicKey"`
+	SDKVersion   string              `json:"sdkVersion"`
+	Region       string              `json:"region,omitempty"`
+	Capabilities []domain.Capability `json:"capabilities"`
+}
+
+// EndpointAuthOKPayload is the server's registration acceptance.
+type EndpointAuthOKPayload struct {
+	PrincipalID string `json:"principalId"`
+	EndpointID  string `json:"endpointId"`
+	// NetworkIDs are the networks the principal is an active member of.
+	NetworkIDs []string `json:"networkIds"`
+	// Credential is the durable endpoint credential — returned ONLY on
+	// first use with an activation credential (the one-time durable
+	// secret; the client stores it and presents it on later connects).
+	Credential string `json:"credential,omitempty"`
+	// ProtocolVersion is the protocol version the server speaks.
+	ProtocolVersion int `json:"protocolVersion"`
+}
+
+// EndpointMessageDeliverPayload is one durable message for the endpoint's
+// principal. The message parts cross as the encrypted envelope (object
+// type message); the plaintext fields are routing metadata only.
+type EndpointMessageDeliverPayload struct {
+	MessageID string `json:"messageId"`
+	NetworkID string `json:"networkId"`
+	ThreadID  string `json:"threadId"`
+	// Kind: ASK | REPLY | NOTICE | STATUS (domain.MessageKind).
+	Kind string `json:"kind"`
+	// SenderPrincipalID is the message's sender principal.
+	SenderPrincipalID string `json:"senderPrincipalId"`
+	// Envelope is the E2EE envelope for the encrypted message parts.
+	Envelope *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	// AAD is the associated-data the Envelope was bound to, relayed
+	// verbatim (the AAD server obligation, PROTOCOL §3).
+	AAD *e2ee.AAD `json:"aad,omitempty"`
+}
+
+// EndpointMessageAckedPayload acknowledges one delivered message.
+type EndpointMessageAckedPayload struct {
+	MessageID string `json:"messageId"`
+}
+
+// EndpointEventDeliverPayload is one event delivery for a subscription of
+// the endpoint's principal. The event payload crosses as the encrypted
+// envelope (object type event_payload); the plaintext fields are routing
+// metadata only (matching is metadata-only — never the payload).
+type EndpointEventDeliverPayload struct {
+	EventID    string `json:"eventId"`
+	DeliveryID string `json:"deliveryId"`
+	NetworkID  string `json:"networkId"`
+	EventType  string `json:"eventType"`
+	// ProducerPrincipalID is the event's producer principal ("" when the
+	// event has none, e.g. system events).
+	ProducerPrincipalID string `json:"producerPrincipalId,omitempty"`
+	// Envelope is the E2EE envelope for the encrypted event payload.
+	Envelope *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	// AAD is the associated-data the Envelope was bound to, relayed
+	// verbatim (the AAD server obligation, PROTOCOL §3).
+	AAD *e2ee.AAD `json:"aad,omitempty"`
+}
+
+// EndpointEventAckPayload acknowledges one event delivery.
+type EndpointEventAckPayload struct {
+	DeliveryID string `json:"deliveryId"`
+	EventID    string `json:"eventId"`
+}
+
+// EndpointInvocationDispatchPayload is one capability invocation for the
+// endpoint's principal. The input crosses as the encrypted envelope
+// (object type invocation_input); the plaintext fields are routing
+// metadata only.
+type EndpointInvocationDispatchPayload struct {
+	InvocationID      string `json:"invocationId"`
+	NetworkID         string `json:"networkId"`
+	CapabilityID      string `json:"capabilityId"`
+	CapabilityVersion int    `json:"capabilityVersion"`
+	IdempotencyKey    string `json:"idempotencyKey"`
+	CorrelationID     string `json:"correlationId,omitempty"`
+	CausationID       string `json:"causationId,omitempty"`
+	// Envelope is the E2EE envelope for the encrypted invocation input.
+	Envelope *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	// AAD is the associated-data the Envelope was bound to, relayed
+	// verbatim (the AAD server obligation, PROTOCOL §3).
+	AAD *e2ee.AAD `json:"aad,omitempty"`
+}
+
+// EndpointInvocationAcceptPayload acknowledges that the endpoint accepted
+// the invocation (it will produce a result).
+type EndpointInvocationAcceptPayload struct {
+	InvocationID string `json:"invocationId"`
+}
+
+// EndpointInvocationResultPayload is the invocation's outcome. Envelope
+// carries the encrypted output (object type invocation_output) when OK, or
+// the encrypted error detail (object type invocation_error) when not.
+type EndpointInvocationResultPayload struct {
+	InvocationID string `json:"invocationId"`
+	OK           bool   `json:"ok"`
+	// Envelope is the E2EE envelope for the encrypted output or error.
+	Envelope *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	// AAD is the associated-data the Envelope was bound to, relayed
+	// verbatim (the AAD server obligation, PROTOCOL §3).
+	AAD *e2ee.AAD `json:"aad,omitempty"`
+	// PublicResultCode is the public-safe outcome code (stable code only —
+	// never protected content).
+	PublicResultCode string `json:"publicResultCode,omitempty"`
+	// UsageMetadata is the public-safe usage accounting (tokens, duration,
+	// ...).
+	UsageMetadata map[string]any `json:"usageMetadata,omitempty"`
+}
+
+// EndpointHeartbeatPayload is the endpoint's liveness + load report.
+type EndpointHeartbeatPayload struct {
+	// Inflight is the number of deliveries/invocations accepted but not
+	// yet finished (the control plane's load signal for selection).
+	Inflight int `json:"inflight"`
+}
+
+// EndpointHeartbeatAckPayload is the server's heartbeat acknowledgement
+// (no fields).
+type EndpointHeartbeatAckPayload struct{}
+
+// EndpointDisconnectPayload is the endpoint's graceful shutdown notice
+// (no fields; pending work stays durable).
+type EndpointDisconnectPayload struct{}
+
+// EndpointStatusPayload is the daemon's managed-agent endpoint liveness
+// report (host.endpoint_status).
+type EndpointStatusPayload struct {
+	// AgentPrincipalID is the managed agent's principal.
+	AgentPrincipalID string `json:"agentPrincipalId"`
+	// InstanceID is the managed instance behind the endpoint.
+	InstanceID string `json:"instanceId"`
+	Online     bool   `json:"online"`
 }

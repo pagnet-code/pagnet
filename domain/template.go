@@ -4,9 +4,9 @@ import "time"
 
 // Template is a user-saved launch preset (addendum §23–§27): optional
 // defaults that prefill the Launch Agent form (runtime, mission,
-// capabilities, workspace access). Built-in templates are the existing
-// profiles (profiles.go) and are not stored; user templates live in the
-// templates table and are freely editable.
+// capabilities, workspace access). Templates live in the templates table
+// and are freely editable; they are the seed for new agent definitions
+// (AgentDefinition.TemplateID).
 type Template struct {
 	ID          ID
 	Name        string

@@ -5,62 +5,41 @@ import (
 	"time"
 )
 
-// Capability is a verb describing what an agent can generally do. In v1 it
-// is routing/discovery metadata, not a permission system. It carries enough
-// metadata to be exported later as an external agent "skill" (A2A alignment).
-//
-// Capability ("can implement") is deliberately kept separate from
-// Responsibility ("implements on github.com/xemahq/dsl").
-type Capability struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+// AgentExecutionMode selects how an agent's work is executed.
+type AgentExecutionMode string
+
+const (
+	// ExecutionModeManaged: pagnet launches and supervises the runtime on
+	// a host (the managed-agent model).
+	ExecutionModeManaged AgentExecutionMode = "managed"
+	// ExecutionModeExternal: the agent runs outside pagnet's hosts and
+	// participates through its own endpoints (no pagnet runtime required).
+	ExecutionModeExternal AgentExecutionMode = "external"
+)
+
+// Valid reports whether m is a known execution mode.
+func (m AgentExecutionMode) Valid() bool {
+	return m == ExecutionModeManaged || m == ExecutionModeExternal
 }
 
-var capabilityDescriptions = map[string]string{
-	CapAnswer:      "Answers questions about code, design and behavior.",
-	CapAnalyze:     "Analyzes code, architecture and change impact.",
-	CapImplement:   "Implements code changes.",
-	CapTest:        "Writes and runs tests.",
-	CapReview:      "Reviews code and pull requests.",
-	CapRelease:     "Prepares and executes releases.",
-	CapStandardize: "Standardizes code and conventions across repositories.",
-	CapCoordinate:  "Coordinates work across agents.",
-	CapDelegate:    "Delegates work to other agents.",
-}
-
-// Cap builds a Capability from a verb name with its default description.
-func Cap(name string) Capability {
-	return Capability{ID: name, Name: name, Description: capabilityDescriptions[name]}
-}
-
-// CapabilityNames extracts the names from a capability list.
-func CapabilityNames(caps []Capability) []string {
-	out := make([]string, 0, len(caps))
-	for _, c := range caps {
-		out = append(out, c.Name)
-	}
-	return out
-}
-
-// AgentDefinition is a persistent logical identity describing an agent role.
-// It survives process restarts and is the stable external identity: future
-// protocol adapters expose the definition (e.g. "dsl-coder"), never a
-// transient instance/PID.
-//
-// Kind invariants (enforced by CHECK constraint):
-//   - worker:         NetworkID != nil
-//   - representative: NetworkID == nil, OwnerUserID != nil (tenant/user-
-//     scoped; network access only through RepresentativeGrant)
-//   - system:         NetworkID != nil
+// AgentDefinition is the agent-specific configuration bound to an agent
+// principal. Canonical identity (name, description, ownership, visibility)
+// lives on the Principal; network access lives on NetworkMembership; the
+// capability surface lives on the capability descriptors + endpoints.
+// Nothing here is network-scoped: one definition serves every network the
+// principal is a member of.
 type AgentDefinition struct {
-	ID   ID
-	Kind AgentKind
-	// NetworkID is nil for representatives (multi-network via grants).
-	NetworkID   *ID
-	Name        string // unique per network (workers) / per owner (reps)
-	OwnerUserID *ID
-	Description string
+	ID          ID
+	PrincipalID ID
+	// OwnerUserID is the user who owns the agent (personal agents); nil
+	// for organization-owned agents.
+	OwnerUserID   *ID
+	ExecutionMode AgentExecutionMode
+	// DefaultRuntime is the runtime for managed instances.
+	DefaultRuntime RuntimeName
+	// DefaultModel is the model for managed instances ("" = the runtime's
+	// own default). A launch may override it per-launch.
+	DefaultModel string
 	// Mission is the initial instruction for a launched agent (north-star
 	// §15): it becomes the runtime's first turn on a fresh launch. Editing
 	// it changes FUTURE launches — a running/resumed session is untouched.
@@ -72,13 +51,9 @@ type AgentDefinition struct {
 	// fresh session's first turn (exactly how the coordination contract
 	// reaches them). "" = none.
 	Instruction string
-	// DefaultRuntime is the runtime for managed instances.
-	DefaultRuntime RuntimeName
-	// DefaultModel is the model for managed instances ("" = the runtime's
-	// own default). A launch may override it per-launch.
-	DefaultModel string
-	Profile      string
-	Capabilities []Capability
+	// TemplateID is the agent template this definition was created from
+	// (nil when created without a template).
+	TemplateID *ID
 	// ExecutionSettings: maxConcurrentTurns (default 1), transcript level
 	// (metadata|network|full, default network), execution_policy
 	// (cold|warm, default cold), etc.
@@ -119,15 +94,29 @@ func DefaultExecutionSettings() map[string]any {
 	}
 }
 
+// WorkspaceAccess describes how an agent may use its workspace. In v2 this
+// is enforced by the daemon/runtime configuration, not by prompts.
+type WorkspaceAccess string
+
+const (
+	WorkspaceAccessReadOnly  WorkspaceAccess = "read-only"
+	WorkspaceAccessReadWrite WorkspaceAccess = "read-write"
+)
+
 // AgentInstance is a schedulable execution identity bound to a definition,
 // host, runtime and (optional) workspace. It is NOT the same thing as a
 // process: an instance can be hibernated (process gone, session preserved)
 // and still be fully registered and wakeable.
+//
+// An instance is NOT network identity: the principal is. The instance's
+// live presence is a managed_agent PrincipalEndpoint.
 type AgentInstance struct {
 	ID           ID
 	NetworkID    ID
 	DefinitionID ID
-	HostID       ID
+	// PrincipalID is the agent principal this instance executes for.
+	PrincipalID ID
+	HostID      ID
 	// ReplicaSlot is the explicit instance slot within the
 	// (definition, host) pair. Slot 0 is the instance that launch
 	// manages — launch is idempotent per (definition, host, slot 0) and
@@ -144,17 +133,11 @@ type AgentInstance struct {
 	PID                 *int
 	RuntimeSessionID    *string
 	CurrentTaskID       *ID
-	// SelfCapabilities are capabilities THIS instance declared about itself
-	// (network_register_capabilities), scoped to the launch/mission. They
-	// merge with the definition's user-set Capabilities in discovery and
-	// never replace them; the agent can read but never mutate the
-	// definition's set.
-	SelfCapabilities []Capability
-	Metadata         map[string]any
-	StartedAt        *time.Time
-	StoppedAt        *time.Time
-	LastActivityAt   time.Time
-	CreatedAt        time.Time
+	Metadata            map[string]any
+	StartedAt           *time.Time
+	StoppedAt           *time.Time
+	LastActivityAt      time.Time
+	CreatedAt           time.Time
 	// CurrentContext is the current turn's delivery context (representatives):
 	// {conversationId, triggerSource: channel|network|web|api,
 	// triggerNetworkId, initiatorUserId, sourceRef}. Set when a turn is
@@ -181,16 +164,16 @@ func (i AgentInstance) ParseContext() RepContext {
 	return c
 }
 
-// Responsibility maps an Agent Definition to a Resource and the actions it is
+// Responsibility maps a principal to a Resource and the actions it is
 // expected to handle. resource_id nil = any resource in the network.
 type Responsibility struct {
-	ID                ID
-	NetworkID         ID
-	AgentDefinitionID ID
-	ResourceID        *ID
-	Actions           []string
-	Priority          int
-	CreatedAt         time.Time
+	ID          ID
+	NetworkID   ID
+	PrincipalID ID
+	ResourceID  *ID
+	Actions     []string
+	Priority    int
+	CreatedAt   time.Time
 }
 
 // Candidate is a routing result from deterministic discovery: an agent

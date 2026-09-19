@@ -6,50 +6,40 @@ import (
 	"testing"
 )
 
-// TestPrivacyModeWireFormat verifies the PrivacyMode field marshals to the
-// server's wire name ("privacyMode") with the documented values, so the
-// control plane and daemon agree on the contract.
-func TestPrivacyModeWireFormat(t *testing.T) {
+// TestNetworkWireFormat pins the Network wire shape after the V2 cutover:
+// the user-facing privacy mode is gone (networks are always encrypted; the
+// crypto lifecycle is server-internal state), and the remaining fields keep
+// their names.
+func TestNetworkWireFormat(t *testing.T) {
 	n := Network{
 		ID:          MustParseID("01900000-0000-7000-8000-0000000000c1"),
 		TenantID:    MustParseID("01900000-0000-7000-8000-0000000000c2"),
 		Slug:        "priv",
 		Name:        "Priv",
-		PrivacyMode: PrivacyModePrivateE2EE,
+		Description: "A network",
 	}
 	b, err := json.Marshal(n)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if !strings.Contains(string(b), `"privacyMode":"private_e2ee"`) {
-		t.Fatalf("marshaled network %s does not carry privacyMode=private_e2ee", b)
+	if strings.Contains(string(b), "privacyMode") {
+		t.Fatalf("marshaled network %s still carries privacyMode (removed in V2)", b)
+	}
+	for _, key := range []string{`"ID":"01900000-0000-7000-8000-0000000000c1"`, `"Slug":"priv"`, `"Name":"Priv"`} {
+		if !strings.Contains(string(b), key) {
+			t.Fatalf("marshaled network %s does not carry %s", b, key)
+		}
 	}
 
-	// Round-trip: the server's wire value unmarshals into the typed field.
+	// Round-trip: a legacy wire payload that still carries privacyMode
+	// unmarshals cleanly (the unknown field is ignored) — old server
+	// responses stay parseable during the cutover.
 	var got Network
-	if err := json.Unmarshal([]byte(`{"privacyMode":"private_e2ee"}`), &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	legacy := `{"ID":"01900000-0000-7000-8000-0000000000c1","privacyMode":"private_e2ee"}`
+	if err := json.Unmarshal([]byte(legacy), &got); err != nil {
+		t.Fatalf("unmarshal legacy network: %v", err)
 	}
-	if got.PrivacyMode != PrivacyModePrivateE2EE {
-		t.Fatalf("PrivacyMode = %q, want private_e2ee", got.PrivacyMode)
-	}
-	if !got.PrivacyMode.Valid() {
-		t.Fatal("private_e2ee should be a valid mode")
-	}
-}
-
-// TestPrivacyModeValid verifies the Valid() helper.
-func TestPrivacyModeValid(t *testing.T) {
-	if !PrivacyModeStandard.Valid() {
-		t.Error("standard should be valid")
-	}
-	if !PrivacyModePrivateE2EE.Valid() {
-		t.Error("private_e2ee should be valid")
-	}
-	if PrivacyMode("bogus").Valid() {
-		t.Error("bogus should not be valid")
-	}
-	if PrivacyMode("").Valid() {
-		t.Error("empty should not be valid")
+	if got.ID != MustParseID("01900000-0000-7000-8000-0000000000c1") {
+		t.Fatalf("ID = %q, want the legacy value", got.ID)
 	}
 }

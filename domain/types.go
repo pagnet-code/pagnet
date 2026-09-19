@@ -122,42 +122,6 @@ func (s AgentStatus) Availability(hostOnline, sessionResumable bool) AgentAvaila
 	}
 }
 
-// AgentKind distinguishes worker agents (single-network) from
-// representatives (tenant/user-scoped, multi-network via grants) and system
-// agents.
-type AgentKind string
-
-const (
-	AgentKindWorker         AgentKind = "worker"
-	AgentKindRepresentative AgentKind = "representative"
-	AgentKindSystem         AgentKind = "system"
-)
-
-func (k AgentKind) Valid() bool {
-	return k == AgentKindWorker || k == AgentKindRepresentative || k == AgentKindSystem
-}
-
-// Channel permission levels for representative_network_grants.
-// Effective authority is always: human access ∩ representative grant.
-const (
-	PermObserve     = "observe"     // read agents/tasks/status/messages/history
-	PermCommunicate = "communicate" // ask/reply/message agents
-	PermDelegate    = "delegate"    // create/delegate tasks
-	PermOperate     = "operate"     // launch/wake/stop/restart agents
-)
-
-// GrantPermissions is the default full grant set.
-var GrantPermissions = []string{PermObserve, PermCommunicate, PermDelegate, PermOperate}
-
-func HasPermission(perms []string, p string) bool {
-	for _, x := range perms {
-		if x == p {
-			return true
-		}
-	}
-	return false
-}
-
 // Wake reasons.
 const (
 	WakeReasonMessage       = "message"
@@ -300,19 +264,6 @@ func CanonicalRuntime(name string) RuntimeName {
 	}
 	return RuntimeName(name)
 }
-
-// Capabilities are routing metadata (v1: not a permission system).
-const (
-	CapAnswer      = "answer"
-	CapAnalyze     = "analyze"
-	CapImplement   = "implement"
-	CapTest        = "test"
-	CapReview      = "review"
-	CapRelease     = "release"
-	CapStandardize = "standardize"
-	CapCoordinate  = "coordinate"
-	CapDelegate    = "delegate"
-)
 
 // Event types. pagnet Events are domain observations of the agent network;
 // OpenTelemetry handles infrastructure telemetry separately.
