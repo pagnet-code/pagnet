@@ -3,10 +3,7 @@ package sdk
 import (
 	"context"
 	"errors"
-	"fmt"
 	"reflect"
-	"sync"
-	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -34,11 +31,7 @@ import (
 type Agent struct {
 	client *Client
 	name   string
-
-	mu              sync.Mutex
-	networkID       string
-	pendingPatterns []string // OnEvent patterns not yet subscribed server-side
-	subscribed      map[string]bool
+	subs   *eventSubs
 }
 
 // OnMessage registers the message handler. Messages are ALWAYS acked
@@ -67,9 +60,7 @@ func (a *Agent) OnEvent(pattern string, h func(ctx context.Context, e *Event) er
 	a.client.handlerMu.Lock()
 	a.client.eventHandlers[pattern] = eventHandler{pattern: pattern, fn: h}
 	a.client.handlerMu.Unlock()
-	a.mu.Lock()
-	a.pendingPatterns = append(a.pendingPatterns, pattern)
-	a.mu.Unlock()
+	a.subs.addPattern(pattern)
 }
 
 // Handle registers a capability handler (see Service.Handle).
@@ -92,9 +83,7 @@ func (a *Agent) Capability(cap Capability) error {
 // subscriptions, Send, Invoke, PublishEvent, and Subscribe when the
 // argument does not name one).
 func (a *Agent) SetNetwork(networkID string) {
-	a.mu.Lock()
-	a.networkID = networkID
-	a.mu.Unlock()
+	a.subs.setNetwork(networkID)
 }
 
 // Send sends a message in the agent's network (m.NetworkID wins when set).
@@ -171,80 +160,14 @@ func (a *Agent) Run(ctx context.Context) error {
 // network resolves the agent's default network: the pinned one, else the
 // principal's single active membership.
 func (a *Agent) network(ctx context.Context) (string, error) {
-	a.mu.Lock()
-	nid := a.networkID
-	a.mu.Unlock()
-	if nid != "" {
-		return nid, nil
-	}
-	id := a.client.cachedIdentity()
-	if id == nil {
-		var err error
-		id, err = a.client.WhoAmI(ctx)
-		if err != nil {
-			return "", fmt.Errorf("sdk: agent %s: resolve network: %w", a.name, err)
-		}
-	}
-	var active []Membership
-	for _, m := range id.Memberships {
-		if m.Active() {
-			active = append(active, m)
-		}
-	}
-	switch len(active) {
-	case 1:
-		return active[0].NetworkID, nil
-	case 0:
-		return "", fmt.Errorf("sdk: agent %s: the principal has no active network membership (SetNetwork to pin one)", a.name)
-	default:
-		return "", fmt.Errorf("sdk: agent %s: the principal has %d active memberships — SetNetwork to pick one", a.name, len(active))
-	}
+	return a.subs.network(ctx)
 }
 
 // ensureSubscriptions reconciles the agent's OnEvent patterns with the
 // server's subscription list (the server is the source of truth): patterns
 // already subscribed server-side are left alone; missing ones are created.
 // Runs at Run and after every (re)connect.
-func (a *Agent) ensureSubscriptions() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	nid, err := a.network(ctx)
-	if err != nil {
-		return // no resolvable network yet: retry on the next (re)connect
-	}
-	a.mu.Lock()
-	pending := make([]string, len(a.pendingPatterns))
-	copy(pending, a.pendingPatterns)
-	a.mu.Unlock()
-	if len(pending) == 0 {
-		return
-	}
-	subs, err := a.client.rest.listSubscriptions(ctx, nid)
-	if err != nil {
-		return // transient: retry on the next (re)connect
-	}
-	have := make(map[string]bool, len(subs))
-	for _, s := range subs {
-		have[s.EventPattern] = true
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	remaining := a.pendingPatterns[:0]
-	for _, p := range a.pendingPatterns {
-		if have[p] || a.subscribed[p] {
-			continue
-		}
-		if _, err := a.client.rest.createSubscription(ctx, nid, restSubscriptionRequest{
-			EventPattern: p,
-			DeliveryMode: "deliver",
-		}); err == nil {
-			a.subscribed[p] = true
-		} else {
-			remaining = append(remaining, p)
-		}
-	}
-	a.pendingPatterns = remaining
-}
+func (a *Agent) ensureSubscriptions() { a.subs.reconcile() }
 
 // TextPart builds a text message part (re-export of domain.TextPart for
 // handler ergonomics).

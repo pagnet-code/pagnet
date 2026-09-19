@@ -628,7 +628,7 @@ func (c *Client) awaitInvocation(ctx context.Context, networkID, invocationID st
 // capability invocations). The name is the endpoint's display name (it
 // rides in endpoint.register; identity is the principal's, not the name's).
 func (c *Client) Service(name string) *Service {
-	s := &Service{client: c, name: name}
+	s := &Service{client: c, name: name, subs: &eventSubs{client: c, kind: "service", name: name, subscribed: map[string]bool{}}}
 	c.participantMu.Lock()
 	c.services = append(c.services, s)
 	c.participantMu.Unlock()
@@ -645,7 +645,7 @@ func (c *Client) Service(name string) *Service {
 // resolved at Run: SetNetwork pins it, otherwise the principal's single
 // active membership is used.
 func (c *Client) Agent(name string) *Agent {
-	a := &Agent{client: c, name: name, subscribed: map[string]bool{}}
+	a := &Agent{client: c, name: name, subs: &eventSubs{client: c, kind: "agent", name: name, subscribed: map[string]bool{}}}
 	c.participantMu.Lock()
 	c.agents = append(c.agents, a)
 	c.participantMu.Unlock()
@@ -892,15 +892,20 @@ func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 	return nil
 }
 
-// onLive runs per-connection hooks after auth_ok: resume agent
+// onLive runs per-connection hooks after auth_ok: resume participant
 // subscriptions (server is the source of truth) and re-send invocation
 // results whose send failed on the dead session.
 func (c *Client) onLive() {
 	c.flushPendingResults()
 	c.participantMu.Lock()
+	services := make([]*Service, len(c.services))
+	copy(services, c.services)
 	agents := make([]*Agent, len(c.agents))
 	copy(agents, c.agents)
 	c.participantMu.Unlock()
+	for _, s := range services {
+		go s.ensureSubscriptions()
+	}
 	for _, a := range agents {
 		go a.ensureSubscriptions()
 	}

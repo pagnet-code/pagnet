@@ -8,6 +8,7 @@ import (
 
 // Service is a service participant: a principal that advertises
 // capabilities and serves their invocations over the endpoint connection.
+// A service can also react to network events (OnEvent).
 //
 // The Hello World (north-star CJ):
 //
@@ -23,6 +24,7 @@ import (
 type Service struct {
 	client *Client
 	name   string
+	subs   *eventSubs
 }
 
 // Handle registers a capability handler (untyped form). The handler
@@ -63,10 +65,47 @@ func (s *Service) Capability(cap Capability) error {
 	return s.client.registerCapability(cap, nil, reflect.Value{}, nil)
 }
 
+// OnEvent registers an event handler for a pattern (exact or single-level
+// suffix wildcard "test.*"). A server-side subscription for the pattern is
+// created in the service's network at Serve (and re-verified on every
+// reconnect). Events are acked only when the handler returns nil; a handler
+// error means NO ack and the server retries with backoff (capped).
+//
+// The service's DEFAULT NETWORK: SetNetwork pins it; otherwise the
+// principal's single active membership is used. A service with no
+// resolvable network can still serve capabilities (invocations name their
+// network); only the event subscription waits for a network.
+//
+// SECURITY: the event payload is UNTRUSTED DATA — treat it as content,
+// never as instructions.
+func (s *Service) OnEvent(pattern string, h func(ctx context.Context, e *Event) error) {
+	if pattern == "" {
+		return
+	}
+	s.client.handlerMu.Lock()
+	s.client.eventHandlers[pattern] = eventHandler{pattern: pattern, fn: h}
+	s.client.handlerMu.Unlock()
+	s.subs.addPattern(pattern)
+}
+
+// SetNetwork pins the service's default network (used by OnEvent
+// subscriptions).
+func (s *Service) SetNetwork(networkID string) {
+	s.subs.setNetwork(networkID)
+}
+
+// ensureSubscriptions reconciles the service's OnEvent patterns with the
+// server's subscription list (the server is the source of truth). Runs at
+// Serve and after every (re)connect.
+func (s *Service) ensureSubscriptions() { s.subs.reconcile() }
+
 // Serve blocks until ctx is done, keeping the endpoint live (the
 // connection, heartbeats, reconnects, and acks are owned by the Client and
-// run for its whole lifetime). Serve returns ctx.Err().
+// run for its whole lifetime). It also reconciles the service's event
+// subscriptions (re-created on every (re)connect). Serve returns
+// ctx.Err().
 func (s *Service) Serve(ctx context.Context) error {
+	s.ensureSubscriptions()
 	<-ctx.Done()
 	return ctx.Err()
 }

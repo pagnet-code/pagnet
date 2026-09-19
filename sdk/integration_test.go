@@ -223,6 +223,54 @@ func TestEventDeliveryDedupAck(t *testing.T) {
 	}
 }
 
+// --- requirement 1 + 2 (service surface): service event delivery ---------------
+
+// TestServiceEventDelivery proves that a SERVICE (not only an agent) reacts
+// to network events (north-star §104; the recipes event-subscriber bundle):
+// OnEvent + Serve creates the server-side subscription, the handler runs
+// exactly once, the delivery is acked, and a redelivered event is re-acked
+// WITHOUT re-dispatching.
+func TestServiceEventDelivery(t *testing.T) {
+	fs := newFakeServer(t)
+	net := fs.createNetwork("net", true)
+	pid, cred := fs.createPrincipal("service", "subsvc", net)
+
+	client := mustConnect(t, fs, cred, t.TempDir())
+	waitForCryptoReady(t, fs, pid)
+	var runs atomic.Int32
+	svc := client.Service("subsvc")
+	svc.OnEvent("test.*", func(ctx context.Context, e *Event) error {
+		runs.Add(1)
+		return nil
+	})
+	svcCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = svc.Serve(svcCtx) }()
+
+	waitFor(t, 5*time.Second, "subscription created", func() bool { return fs.subscriptionCount(net) >= 1 })
+
+	eventID, deliveryIDs := fs.publishPlainEvent(net, "test.created", pid, `{"x":1}`)
+	if len(deliveryIDs) != 1 {
+		t.Fatalf("got %d deliveries, want 1", len(deliveryIDs))
+	}
+	did := deliveryIDs[0]
+	waitFor(t, 5*time.Second, "service event handler", func() bool { return runs.Load() == 1 })
+	waitFor(t, 5*time.Second, "service event ack", func() bool { return fs.deliveryState(eventID, did) == "acknowledged" })
+
+	// Redeliver the SAME delivery (uncertain-ack retry): re-acked, NOT
+	// re-dispatched.
+	if err := fs.redeliverEvent(eventID, did); err != nil {
+		t.Fatalf("redeliverEvent: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := runs.Load(); n != 1 {
+		t.Fatalf("handler ran %d times after redelivery, want 1 (dedup)", n)
+	}
+	if st := fs.deliveryState(eventID, did); st != "acknowledged" {
+		t.Fatalf("delivery state after redelivery = %q, want acknowledged", st)
+	}
+}
+
 // --- requirement 2: invocation dispatch → accept → complete (sync) ----------------
 
 // TestInvocationSync proves the synchronous invocation lifecycle (requirement
