@@ -83,7 +83,9 @@ release:
 	@ls -1 $(RELEASE_DIR)/pagnet-*.tar.gz
 
 ## release-sign: sign the release manifest for VERSION from the tarballs in
-## RELEASE_DIR and create the pagnet-release-manifest-latest.json copy.
+## RELEASE_DIR (the versioned pagnet-$(VERSION)-* tarballs AND the stable
+## pagnet-latest-* copies, which install.sh verifies by name) and create
+## the pagnet-release-manifest-latest.json copy.
 ## Requires PAGNET_RELEASE_SIGNING_KEY (the base64 Ed25519 seed — a GitHub
 ## repo secret; never committed). The manifest is the trust anchor for the
 ## client's auto-update: the updater verifies its Ed25519 signature against

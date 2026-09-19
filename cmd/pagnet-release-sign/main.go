@@ -1,9 +1,17 @@
 // pagnet-release-sign signs a release manifest for the pagnet release
 // pipeline. It scans a directory for the release version's tarballs
-// (pagnet-<version>-<os>-<arch>.tar.gz), computes each one's sha256, builds
-// the canonical manifest, signs it with the Ed25519 private key (from
+// (pagnet-<version>-<os>-<arch>.tar.gz) and the stable
+// pagnet-latest-<os>-<arch>.tar.gz copies `make release` lays down
+// alongside them, computes each one's sha256, builds the canonical
+// manifest, signs it with the Ed25519 private key (from
 // $PAGNET_RELEASE_SIGNING_KEY, the base64 seed), and writes
 // pagnet-release-manifest-<version>.json.
+//
+// Both consumers must be able to verify what they download: the auto-updater
+// (internal/release) looks up the VERSIONED tarball name, the curl|bash
+// installer (install.sh) downloads the stable LATEST-named tarball and
+// checks its sha256 against the manifest — so the manifest lists both, and
+// each latest copy must be byte-identical to its versioned twin.
 //
 // The manifest is the trust anchor for the client's auto-update: the
 // updater verifies this signature against the public key pinned in
@@ -59,30 +67,10 @@ func main() {
 		fatalf("PAGNET_RELEASE_SIGNING_KEY must decode to %d bytes, got %d", ed25519.SeedSize, len(seed))
 	}
 
-	// Collect the version's tarballs: pagnet-<version>-<os>-<arch>.tar.gz.
-	// The pagnet-latest-* copies are excluded (they are byte-identical to
-	// the versioned tarballs and are not manifest assets).
-	entries, err := os.ReadDir(dir)
+	assets, err := collectAssets(dir, version)
 	if err != nil {
-		fatalf("read dir: %v", err)
+		fatalf("%v", err)
 	}
-	prefix := "pagnet-" + version + "-"
-	var assets []release.Asset
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tar.gz") {
-			continue
-		}
-		sum, err := sha256File(filepath.Join(dir, name))
-		if err != nil {
-			fatalf("sha256 %s: %v", name, err)
-		}
-		assets = append(assets, release.Asset{Name: name, SHA256: sum})
-	}
-	if len(assets) == 0 {
-		fatalf("no tarballs matching %s*.tar.gz in %s", prefix, dir)
-	}
-	sort.Slice(assets, func(i, j int) bool { return assets[i].Name < assets[j].Name })
 
 	m := release.Manifest{
 		Version: version,
@@ -104,6 +92,63 @@ func main() {
 		fatalf("write: %v", err)
 	}
 	fmt.Printf("signed manifest for %s (%d assets) -> %s\n", version, len(assets), out)
+}
+
+// collectAssets returns the manifest's asset list for version from dir:
+// every versioned tarball (pagnet-<version>-<os>-<arch>.tar.gz) AND, when
+// present, the stable pagnet-latest-<os>-<arch>.tar.gz copies. Both are
+// listed because both consumers must verify what they download: the
+// auto-updater looks up the versioned name, the installer downloads the
+// stable latest name (install.sh). A latest copy is admitted only as the
+// byte-identical twin of a versioned tarball in this release — a stale or
+// tampered latest copy would otherwise be signed (and then trusted) by
+// the manual install path.
+func collectAssets(dir, version string) ([]release.Asset, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read dir: %w", err)
+	}
+	prefix := "pagnet-" + version + "-"
+	var assets []release.Asset
+	bySuffix := make(map[string]release.Asset) // "os-arch.tar.gz" -> versioned asset
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tar.gz") {
+			continue
+		}
+		sum, err := sha256File(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("sha256 %s: %w", name, err)
+		}
+		asset := release.Asset{Name: name, SHA256: sum}
+		assets = append(assets, asset)
+		bySuffix[strings.TrimPrefix(name, prefix)] = asset
+	}
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("no tarballs matching %s*.tar.gz in %s", prefix, dir)
+	}
+	const latestPrefix = "pagnet-latest-"
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, latestPrefix) || !strings.HasSuffix(name, ".tar.gz") {
+			continue
+		}
+		suffix := strings.TrimPrefix(name, latestPrefix)
+		twin, ok := bySuffix[suffix]
+		if !ok {
+			return nil, fmt.Errorf("latest copy %s has no versioned twin %s%s.tar.gz", name, prefix, suffix)
+		}
+		sum, err := sha256File(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("sha256 %s: %w", name, err)
+		}
+		if sum != twin.SHA256 {
+			return nil, fmt.Errorf("latest copy %s differs from its versioned twin %s — refusing to sign", name, twin.Name)
+		}
+		assets = append(assets, release.Asset{Name: name, SHA256: sum})
+	}
+	sort.Slice(assets, func(i, j int) bool { return assets[i].Name < assets[j].Name })
+	return assets, nil
 }
 
 func sha256File(path string) (string, error) {

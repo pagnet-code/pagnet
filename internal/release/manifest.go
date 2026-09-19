@@ -300,7 +300,9 @@ func DownloadVerified(serverURL, version, dst string, flagInsecure bool) error {
 // policy, fetches and verifies the stable pagnet-release-manifest-latest
 // manifest, resolves the version from it, then downloads and verifies the
 // versioned platform tarball. The latest manifest is a copy of the current
-// version's manifest, so its assets name the versioned tarballs.
+// version's manifest, whose assets name both the versioned tarballs (the
+// lookup here) and the stable pagnet-latest-* copies (the lookup install.sh
+// does for the manual install path).
 func DownloadLatestVerified(serverURL, dst string, flagInsecure bool) error {
 	if err := netpolicy.Check(serverURL, flagInsecure); err != nil {
 		return err
