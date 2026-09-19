@@ -186,7 +186,9 @@ func newFakeServer(t *testing.T) *fakeServer {
 		fs.epochKey[i] = byte(i)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/endpoints/ws", fs.wsHandler)
+	// The endpoint WS is registered OUTSIDE /api/v1 (it authenticates with
+	// the principal credential, not the user token) — the real server's path.
+	mux.HandleFunc("/wss/endpoints", fs.wsHandler)
 	mux.HandleFunc("/api/v1/", fs.restHandler)
 	fs.ts = httptest.NewServer(mux)
 	t.Cleanup(fs.ts.Close)
@@ -895,6 +897,9 @@ func (fs *fakeServer) restHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleWhoAmI mirrors the real server: {"principal": Principal,
+// "memberships": [NetworkMembership], "endpoints": [...]} — the domain types
+// marshal with PascalCase field names (no json tags).
 func (fs *fakeServer) handleWhoAmI(w http.ResponseWriter, principalID string, writeJSON func(int, any)) {
 	fs.mu.Lock()
 	p := fs.principals[principalID]
@@ -902,9 +907,9 @@ func (fs *fakeServer) handleWhoAmI(w http.ResponseWriter, principalID string, wr
 	if p != nil {
 		for n := range p.memberships {
 			memberships = append(memberships, map[string]any{
-				"networkId":   n,
-				"state":       "active",
-				"permissions": []string{"discover", "communicate", "invoke", "event_publish", "event_subscribe"},
+				"NetworkID":   n,
+				"State":       "active",
+				"Permissions": []string{"discover", "communicate", "invoke", "event_publish", "event_subscribe"},
 			})
 		}
 	}
@@ -914,15 +919,20 @@ func (fs *fakeServer) handleWhoAmI(w http.ResponseWriter, principalID string, wr
 	}
 	fs.mu.Unlock()
 	writeJSON(http.StatusOK, map[string]any{
-		"principalId": principalID,
-		"tenantId":    fakeTenantID,
-		"kind":        kind,
-		"name":        name,
-		"visibility":  "private",
+		"principal": map[string]any{
+			"ID":             principalID,
+			"OwningTenantID": fakeTenantID,
+			"Kind":           kind,
+			"Name":           name,
+			"Visibility":     "private",
+		},
 		"memberships": memberships,
+		"endpoints":   []map[string]any{},
 	})
 }
 
+// handleNetworks mirrors the real server: a BARE ARRAY of networkResponse
+// (domain.Network PascalCase + a camelCase "crypto" block).
 func (fs *fakeServer) handleNetworks(w http.ResponseWriter, principalID string, writeJSON func(int, any)) {
 	fs.mu.Lock()
 	p := fs.principals[principalID]
@@ -930,21 +940,32 @@ func (fs *fakeServer) handleNetworks(w http.ResponseWriter, principalID string, 
 	if p != nil {
 		for n := range p.memberships {
 			if net, ok := fs.networks[n]; ok {
-				nets = append(nets, map[string]any{"id": net.id, "name": net.name, "slug": net.name})
+				entry := map[string]any{"ID": net.id, "Name": net.name, "Slug": net.name, "Description": ""}
+				if net.cryptoActive {
+					entry["crypto"] = map[string]any{"status": "active", "epochId": fs.epochID}
+				} else {
+					entry["crypto"] = map[string]any{"status": "provisioning"}
+				}
+				nets = append(nets, entry)
 			}
 		}
 	}
 	fs.mu.Unlock()
-	writeJSON(http.StatusOK, map[string]any{"networks": nets})
+	writeJSON(http.StatusOK, nets)
 }
 
+// handleCreateMessage mirrors the real server: the protected content crosses
+// as a top-level "envelope" + "aad" pair; the response is the full
+// domain.Message (PascalCase ID).
 func (fs *fakeServer) handleCreateMessage(w http.ResponseWriter, principalID, networkPath string, body []byte, writeJSON func(int, any)) {
 	var req struct {
-		ID                   string       `json:"id"`
-		ThreadID             string       `json:"threadId"`
-		RecipientPrincipalID string       `json:"recipientPrincipalId"`
-		Kind                 string       `json:"kind"`
-		Parts                fakeEncField `json:"parts"`
+		ID                   string                  `json:"id"`
+		ThreadID             string                  `json:"threadId"`
+		RecipientPrincipalID string                  `json:"recipientPrincipalId"`
+		RecipientGroup       string                  `json:"recipientGroup"`
+		Kind                 string                  `json:"kind"`
+		Envelope             e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD                  e2ee.AAD                `json:"aad"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -955,21 +976,25 @@ func (fs *fakeServer) handleCreateMessage(w http.ResponseWriter, principalID, ne
 	m := &fakeMessage{
 		id: req.ID, networkID: networkID, threadID: req.ThreadID, kind: req.Kind,
 		sender: principalID, recipient: req.RecipientPrincipalID,
-		envelope: req.Parts.Envelope, aad: req.Parts.AAD,
+		envelope: req.Envelope, aad: req.AAD,
 	}
 	fs.messages[m.id] = m
 	fs.mu.Unlock()
 	if epID := fs.endpointForPrincipal(req.RecipientPrincipalID); epID != "" {
 		_ = fs.pushMessageDelivery(epID, m)
 	}
-	writeJSON(http.StatusOK, map[string]any{"id": m.id})
+	writeJSON(http.StatusCreated, map[string]any{"ID": m.id})
 }
 
+// handleCreateEvent mirrors the real server: the payload crosses as a
+// top-level "envelope" + "aad" pair; the client object id rides in "eventId"
+// (adopted by the server). The response is {"event": Event, "deliveries": n}.
 func (fs *fakeServer) handleCreateEvent(w http.ResponseWriter, principalID, networkPath string, body []byte, writeJSON func(int, any)) {
 	var req struct {
-		ID      string       `json:"id"`
-		Type    string       `json:"type"`
-		Payload fakeEncField `json:"payload"`
+		Type     string                  `json:"type"`
+		EventID  string                  `json:"eventId"`
+		Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD      e2ee.AAD                `json:"aad"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -978,8 +1003,8 @@ func (fs *fakeServer) handleCreateEvent(w http.ResponseWriter, principalID, netw
 	networkID := networkIDFromPath(networkPath)
 	fs.mu.Lock()
 	ev := &fakeEvent{
-		id: req.ID, networkID: networkID, eventType: req.Type, producer: principalID,
-		envelope: req.Payload.Envelope, aad: req.Payload.AAD,
+		id: req.EventID, networkID: networkID, eventType: req.Type, producer: principalID,
+		envelope: req.Envelope, aad: req.AAD,
 		deliveries: map[string]*fakeDelivery{},
 	}
 	fs.events[ev.id] = ev
@@ -1004,7 +1029,10 @@ func (fs *fakeServer) handleCreateEvent(w http.ResponseWriter, principalID, netw
 		}
 		_ = fs.pushEventDelivery(epID, ev, ev.deliveries[did])
 	}
-	writeJSON(http.StatusOK, map[string]any{"id": ev.id})
+	writeJSON(http.StatusCreated, map[string]any{
+		"event":      map[string]any{"ID": ev.id},
+		"deliveries": len(deliveryIDs),
+	})
 }
 
 func (fs *fakeServer) handleCreateSubscription(w http.ResponseWriter, principalID, networkPath string, body []byte, writeJSON func(int, any)) {
@@ -1022,20 +1050,23 @@ func (fs *fakeServer) handleCreateSubscription(w http.ResponseWriter, principalI
 		id: id, networkID: networkID, subscriber: principalID, pattern: req.EventPattern, enabled: true,
 	}
 	fs.mu.Unlock()
-	writeJSON(http.StatusOK, map[string]any{"id": id})
+	// The real server returns the bare domain.EventSubscription (PascalCase).
+	writeJSON(http.StatusCreated, map[string]any{"ID": id, "EventPattern": req.EventPattern, "Enabled": true})
 }
 
+// handleListSubscriptions mirrors the real server: a BARE ARRAY of
+// domain.EventSubscription (PascalCase).
 func (fs *fakeServer) handleListSubscriptions(w http.ResponseWriter, principalID, networkPath string, writeJSON func(int, any)) {
 	networkID := networkIDFromPath(networkPath)
 	fs.mu.Lock()
 	subs := []map[string]any{}
 	for _, s := range fs.subscriptions {
 		if s.networkID == networkID && s.subscriber == principalID {
-			subs = append(subs, map[string]any{"id": s.id, "eventPattern": s.pattern, "enabled": s.enabled})
+			subs = append(subs, map[string]any{"ID": s.id, "EventPattern": s.pattern, "Enabled": s.enabled})
 		}
 	}
 	fs.mu.Unlock()
-	writeJSON(http.StatusOK, map[string]any{"subscriptions": subs})
+	writeJSON(http.StatusOK, subs)
 }
 
 func (fs *fakeServer) handleDeleteSubscription(w http.ResponseWriter, principalID, path string, writeJSON func(int, any)) {
@@ -1051,17 +1082,22 @@ func (fs *fakeServer) handleDeleteSubscription(w http.ResponseWriter, principalI
 		delete(fs.subscriptions, subID)
 	}
 	fs.mu.Unlock()
-	writeJSON(http.StatusOK, map[string]any{"ok": true})
+	// The real server returns 204 No Content.
+	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleCreateInvocation mirrors the real server: the input crosses as a
+// top-level "envelope" + "aad" pair; the client object id rides in
+// "invocationId" (adopted by the server). The response is the invocationView.
 func (fs *fakeServer) handleCreateInvocation(w http.ResponseWriter, principalID, networkPath string, body []byte, writeJSON func(int, any)) {
 	var req struct {
-		ID                string       `json:"id"`
-		TargetPrincipalID string       `json:"targetPrincipalId"`
-		CapabilityID      string       `json:"capabilityId"`
-		CapabilityVersion int          `json:"capabilityVersion"`
-		Input             fakeEncField `json:"input"`
-		IdempotencyKey    string       `json:"idempotencyKey"`
+		TargetPrincipalID string                  `json:"targetPrincipalId"`
+		CapabilityID      string                  `json:"capabilityId"`
+		CapabilityVersion int                     `json:"capabilityVersion"`
+		Envelope          e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD               e2ee.AAD                `json:"aad"`
+		InvocationID      string                  `json:"invocationId"`
+		IdempotencyKey    string                  `json:"idempotencyKey"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1070,10 +1106,10 @@ func (fs *fakeServer) handleCreateInvocation(w http.ResponseWriter, principalID,
 	networkID := networkIDFromPath(networkPath)
 	fs.mu.Lock()
 	inv := &fakeInvocation{
-		id: req.ID, networkID: networkID, caller: principalID, target: req.TargetPrincipalID,
+		id: req.InvocationID, networkID: networkID, caller: principalID, target: req.TargetPrincipalID,
 		capability: req.CapabilityID, version: req.CapabilityVersion, state: "pending",
 		idempotencyKey: req.IdempotencyKey,
-		input:          &fakeEncField{Envelope: req.Input.Envelope, AAD: req.Input.AAD},
+		input:          &fakeEncField{Envelope: req.Envelope, AAD: req.AAD},
 		createdAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	fs.invocations[inv.id] = inv
@@ -1081,7 +1117,7 @@ func (fs *fakeServer) handleCreateInvocation(w http.ResponseWriter, principalID,
 	if epID := fs.endpointForPrincipal(req.TargetPrincipalID); epID != "" {
 		_ = fs.pushInvocationDispatch(epID, inv)
 	}
-	writeJSON(http.StatusOK, fs.invocationRecord(inv))
+	writeJSON(http.StatusCreated, fs.invocationView(inv))
 }
 
 func (fs *fakeServer) handleGetInvocation(w http.ResponseWriter, principalID, path string, writeJSON func(int, any)) {
@@ -1099,45 +1135,47 @@ func (fs *fakeServer) handleGetInvocation(w http.ResponseWriter, principalID, pa
 		writeJSON(http.StatusNotFound, map[string]any{"error": "unknown invocation"})
 		return
 	}
-	writeJSON(http.StatusOK, fs.invocationRecord(inv))
+	writeJSON(http.StatusOK, fs.invocationView(inv))
 }
 
-// invocationRecord builds the public invocation record (the durable
-// server-side state the caller polls). It acquires fs.mu (callers must NOT
+// invocationView builds the invocationView wire shape (the real server's
+// response): {"invocation": CapabilityInvocation (PascalCase), "input"/
+// "output"/"error": {envelope, aad}}. It acquires fs.mu (callers must NOT
 // hold it) so the record is a consistent snapshot — invocations are mutated
 // concurrently by the WS result handler and cancelInvocation.
-func (fs *fakeServer) invocationRecord(inv *fakeInvocation) map[string]any {
+func (fs *fakeServer) invocationView(inv *fakeInvocation) map[string]any {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	rec := map[string]any{
-		"id":                inv.id,
-		"networkId":         inv.networkID,
-		"callerPrincipalId": inv.caller,
-		"targetPrincipalId": inv.target,
-		"capabilityId":      inv.capability,
-		"capabilityVersion": inv.version,
-		"state":             inv.state,
-		"createdAt":         inv.createdAt,
+	invocation := map[string]any{
+		"ID":                inv.id,
+		"NetworkID":         inv.networkID,
+		"CallerPrincipalID": inv.caller,
+		"TargetPrincipalID": inv.target,
+		"CapabilityID":      inv.capability,
+		"CapabilityVersion": inv.version,
+		"State":             inv.state,
+		"CreatedAt":         inv.createdAt,
 	}
 	if inv.idempotencyKey != "" {
-		rec["idempotencyKey"] = inv.idempotencyKey
-	}
-	if inv.input != nil {
-		rec["protectedInput"] = inv.input
-	}
-	if inv.output != nil {
-		rec["protectedOutput"] = inv.output
-	}
-	if inv.errDetail != nil {
-		rec["protectedError"] = inv.errDetail
+		invocation["IdempotencyKey"] = inv.idempotencyKey
 	}
 	if inv.publicResultCode != "" {
-		rec["publicResultCode"] = inv.publicResultCode
+		invocation["PublicResultCode"] = inv.publicResultCode
 	}
 	if inv.completedAt != "" {
-		rec["completedAt"] = inv.completedAt
+		invocation["CompletedAt"] = inv.completedAt
 	}
-	return rec
+	out := map[string]any{"invocation": invocation}
+	if inv.input != nil {
+		out["input"] = inv.input
+	}
+	if inv.output != nil {
+		out["output"] = inv.output
+	}
+	if inv.errDetail != nil {
+		out["error"] = inv.errDetail
+	}
+	return out
 }
 
 func (fs *fakeServer) handleSearch(w http.ResponseWriter, principalID, networkPath string, q url.Values, writeJSON func(int, any)) {
@@ -1167,22 +1205,20 @@ func (fs *fakeServer) handleSearch(w http.ResponseWriter, principalID, networkPa
 		if query == "" && kind == "" && capability == "" {
 			reasons = append(reasons, "network_member")
 		}
-		state := "available"
-		if fs.endpointOfPrincipalLocked(p.id) != "" {
-			state = "connected"
-		}
-		caps := p.capabilities
-		if caps == nil {
-			caps = []domain.Capability{}
-		}
+		online := fs.endpointOfPrincipalLocked(p.id) != ""
 		results = append(results, map[string]any{
-			"principalId":  p.id,
-			"kind":         p.kind,
-			"name":         p.name,
-			"visibility":   "private",
-			"capabilities": caps,
-			"matchReasons": reasons,
-			"state":        state,
+			// The real server returns the embedded domain.Principal
+			// (PascalCase) + MatchReasons + HasOnlineEndpoint. It does NOT
+			// return the principal's capabilities in a search hit.
+			"ID":                p.id,
+			"Kind":              p.kind,
+			"Name":              p.name,
+			"Description":       "",
+			"Visibility":        "private",
+			"ProviderName":      "",
+			"ProviderURL":       "",
+			"MatchReasons":      reasons,
+			"HasOnlineEndpoint": online,
 		})
 	}
 	fs.mu.Unlock()

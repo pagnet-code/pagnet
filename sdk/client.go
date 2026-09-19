@@ -370,13 +370,14 @@ func (c *Client) PublishEvent(ctx context.Context, networkID string, ev Event) (
 		return "", err
 	}
 	req := restEventRequest{
-		ID:                id,
 		Type:              ev.Type,
 		SchemaVersion:     ev.SchemaVersion,
 		TargetPrincipalID: ev.TargetPrincipalID,
 		ResourceID:        ev.ResourceID,
 		CapabilityID:      ev.CapabilityID,
-		Payload:           encryptedField{Envelope: env, AAD: aad},
+		Envelope:          env,
+		AAD:               aad,
+		EventID:           id,
 		CorrelationID:     ev.CorrelationID,
 		CausationID:       ev.CausationID,
 	}
@@ -451,10 +452,10 @@ func (c *Client) Send(ctx context.Context, m OutgoingMessage) (string, error) {
 		ID:                   id,
 		ThreadID:             m.ThreadID,
 		RecipientPrincipalID: m.RecipientPrincipalID,
-		RecipientGroupID:     m.RecipientGroupID,
+		RecipientGroup:       m.RecipientGroupID,
 		Kind:                 kind,
-		Parts:                encryptedField{Envelope: env, AAD: aad},
-		Metadata:             m.Metadata,
+		Envelope:             env,
+		AAD:                  aad,
 	}
 	return c.rest.sendMessage(ctx, m.NetworkID, req)
 }
@@ -500,11 +501,12 @@ func (c *Client) Invoke(ctx context.Context, in Invocation) (*Invocation, error)
 		return nil, err
 	}
 	req := restInvocationRequest{
-		ID:                id,
 		TargetPrincipalID: in.TargetPrincipalID,
 		CapabilityID:      in.CapabilityID,
 		CapabilityVersion: in.CapabilityVersion,
-		Input:             encryptedField{Envelope: env, AAD: aad},
+		Envelope:          env,
+		AAD:               aad,
+		InvocationID:      id,
 		IdempotencyKey:    in.IdempotencyKey,
 		CorrelationID:     in.CorrelationID,
 		CausationID:       in.CausationID,
@@ -666,13 +668,14 @@ func (c *Client) Network(_ context.Context, networkID string) *Network {
 // --- connection supervision --------------------------------------------------------
 
 // wsURL builds the endpoint WebSocket URL from the server base URL
-// (http→ws, https→wss), path /api/v1/endpoints/ws (the endpoint analogue
-// of the daemon's /api/v1/hosts/ws).
+// (http→ws, https→wss), path /wss/endpoints (the endpoint WS is registered
+// OUTSIDE the /api/v1 middleware — it authenticates with the principal
+// credential, not the user token).
 func (c *Client) wsURL() string {
 	base := c.cfg.serverBase()
 	u, err := url.Parse(base)
 	if err != nil {
-		return base + "/api/v1/endpoints/ws"
+		return base + "/wss/endpoints"
 	}
 	switch u.Scheme {
 	case "https":
@@ -680,7 +683,7 @@ func (c *Client) wsURL() string {
 	case "http":
 		u.Scheme = "ws"
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/api/v1/endpoints/ws"
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/wss/endpoints"
 	return u.String()
 }
 

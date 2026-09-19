@@ -97,20 +97,27 @@ func (r *restClient) do(ctx context.Context, method, path string, body, out any)
 }
 
 // --- identity -----------------------------------------------------------------
+//
+// GET /auth/principal/me returns {"principal": Principal, "memberships":
+// [NetworkMembership], "endpoints": [PrincipalEndpoint]} — the domain types
+// marshal with their Go (PascalCase) field names (no json tags). The
+// principal's tenant is OwningTenantID (the AAD routing metadata).
 
 type restIdentity struct {
-	PrincipalID  string `json:"principalId"`
-	TenantID     string `json:"tenantId"`
-	Kind         string `json:"kind"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	Visibility   string `json:"visibility"`
-	ProviderName string `json:"providerName"`
-	ProviderURL  string `json:"providerUrl"`
-	Memberships  []struct {
-		NetworkID   string   `json:"networkId"`
-		State       string   `json:"state"`
-		Permissions []string `json:"permissions"`
+	Principal struct {
+		ID             string `json:"ID"`
+		OwningTenantID string `json:"OwningTenantID"`
+		Kind           string `json:"Kind"`
+		Name           string `json:"Name"`
+		Description    string `json:"Description"`
+		Visibility     string `json:"Visibility"`
+		ProviderName   string `json:"ProviderName"`
+		ProviderURL    string `json:"ProviderURL"`
+	} `json:"principal"`
+	Memberships []struct {
+		NetworkID   string   `json:"NetworkID"`
+		State       string   `json:"State"`
+		Permissions []string `json:"Permissions"`
 	} `json:"memberships"`
 }
 
@@ -120,14 +127,14 @@ func (r *restClient) whoAmI(ctx context.Context) (*Identity, error) {
 		return nil, err
 	}
 	out := &Identity{
-		PrincipalID:  id.PrincipalID,
-		TenantID:     id.TenantID,
-		Kind:         id.Kind,
-		Name:         id.Name,
-		Description:  id.Description,
-		Visibility:   id.Visibility,
-		ProviderName: id.ProviderName,
-		ProviderURL:  id.ProviderURL,
+		PrincipalID:  id.Principal.ID,
+		TenantID:     id.Principal.OwningTenantID,
+		Kind:         id.Principal.Kind,
+		Name:         id.Principal.Name,
+		Description:  id.Principal.Description,
+		Visibility:   id.Principal.Visibility,
+		ProviderName: id.Principal.ProviderName,
+		ProviderURL:  id.Principal.ProviderURL,
 	}
 	for _, m := range id.Memberships {
 		out.Memberships = append(out.Memberships, Membership{
@@ -140,23 +147,25 @@ func (r *restClient) whoAmI(ctx context.Context) (*Identity, error) {
 }
 
 // --- networks -------------------------------------------------------------------
+//
+// GET /networks returns a BARE ARRAY of networkResponse: the domain.Network
+// fields (PascalCase) plus a camelCase "crypto" lifecycle block. A principal
+// sees only the networks it is an ACTIVE member of.
 
 type restNetwork struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Slug        string `json:"slug"`
-	Description string `json:"description"`
+	ID          string `json:"ID"`
+	Name        string `json:"Name"`
+	Slug        string `json:"Slug"`
+	Description string `json:"Description"`
 }
 
 func (r *restClient) networks(ctx context.Context) ([]NetworkInfo, error) {
-	var page struct {
-		Networks []restNetwork `json:"networks"`
-	}
-	if err := r.do(ctx, http.MethodGet, "/networks", nil, &page); err != nil {
+	var nets []restNetwork
+	if err := r.do(ctx, http.MethodGet, "/networks", nil, &nets); err != nil {
 		return nil, err
 	}
-	out := make([]NetworkInfo, 0, len(page.Networks))
-	for _, n := range page.Networks {
+	out := make([]NetworkInfo, 0, len(nets))
+	for _, n := range nets {
 		out = append(out, NetworkInfo{
 			ID:          n.ID,
 			Name:        n.Name,
@@ -168,20 +177,24 @@ func (r *restClient) networks(ctx context.Context) ([]NetworkInfo, error) {
 }
 
 // --- messages ---------------------------------------------------------------------
+//
+// POST /networks/{id}/messages: the protected content crosses as a top-level
+// "envelope" + "aad" pair (the server relays both verbatim; it never reads
+// the ciphertext). The response is the full domain.Message (PascalCase ID).
 
 type restMessageRequest struct {
-	ID                   string         `json:"id"`
-	ThreadID             string         `json:"threadId,omitempty"`
-	RecipientPrincipalID string         `json:"recipientPrincipalId,omitempty"`
-	RecipientGroupID     string         `json:"recipientGroupId,omitempty"`
-	Kind                 string         `json:"kind"`
-	Parts                encryptedField `json:"parts"`
-	Metadata             map[string]any `json:"metadata,omitempty"`
+	ID                   string                  `json:"id"`
+	ThreadID             string                  `json:"threadId,omitempty"`
+	RecipientPrincipalID string                  `json:"recipientPrincipalId,omitempty"`
+	RecipientGroup       string                  `json:"recipientGroup,omitempty"`
+	Kind                 string                  `json:"kind"`
+	Envelope             e2ee.EncryptedPayloadV1 `json:"envelope"`
+	AAD                  e2ee.AAD                `json:"aad"`
 }
 
 func (r *restClient) sendMessage(ctx context.Context, networkID string, req restMessageRequest) (string, error) {
 	var out struct {
-		ID string `json:"id"`
+		ID string `json:"ID"`
 	}
 	if err := r.do(ctx, http.MethodPost, "/networks/"+networkID+"/messages", req, &out); err != nil {
 		return "", err
@@ -190,27 +203,35 @@ func (r *restClient) sendMessage(ctx context.Context, networkID string, req rest
 }
 
 // --- events ------------------------------------------------------------------------
+//
+// POST /networks/{id}/events: the payload crosses as a top-level "envelope" +
+// "aad" pair. The client-generated object id rides in "eventId" (the AAD
+// binds it) and the server adopts it. The response is
+// {"event": Event, "deliveries": n} — the event id is event.ID (PascalCase).
 
 type restEventRequest struct {
-	ID                string         `json:"id"`
-	Type              string         `json:"type"`
-	SchemaVersion     int            `json:"schemaVersion"`
-	TargetPrincipalID string         `json:"targetPrincipalId,omitempty"`
-	ResourceID        string         `json:"resourceId,omitempty"`
-	CapabilityID      string         `json:"capabilityId,omitempty"`
-	Payload           encryptedField `json:"payload"`
-	CorrelationID     string         `json:"correlationId,omitempty"`
-	CausationID       string         `json:"causationId,omitempty"`
+	Type              string                  `json:"type"`
+	SchemaVersion     int                     `json:"schemaVersion,omitempty"`
+	TargetPrincipalID string                  `json:"targetPrincipalId,omitempty"`
+	ResourceID        string                  `json:"resourceId,omitempty"`
+	CapabilityID      string                  `json:"capabilityId,omitempty"`
+	Envelope          e2ee.EncryptedPayloadV1 `json:"envelope"`
+	AAD               e2ee.AAD                `json:"aad"`
+	EventID           string                  `json:"eventId"`
+	CorrelationID     string                  `json:"correlationId,omitempty"`
+	CausationID       string                  `json:"causationId,omitempty"`
 }
 
 func (r *restClient) publishEvent(ctx context.Context, networkID string, req restEventRequest) (string, error) {
 	var out struct {
-		ID string `json:"id"`
+		Event struct {
+			ID string `json:"ID"`
+		} `json:"event"`
 	}
 	if err := r.do(ctx, http.MethodPost, "/networks/"+networkID+"/events", req, &out); err != nil {
 		return "", err
 	}
-	return out.ID, nil
+	return out.Event.ID, nil
 }
 
 // --- subscriptions --------------------------------------------------------------------
@@ -225,30 +246,29 @@ type restSubscriptionRequest struct {
 	Enabled             *bool  `json:"enabled,omitempty"`
 }
 
+// restSubscription is one EventSubscription (PascalCase domain fields).
 type restSubscription struct {
-	ID           string `json:"id"`
-	EventPattern string `json:"eventPattern"`
-	Enabled      bool   `json:"enabled"`
+	ID           string `json:"ID"`
+	EventPattern string `json:"EventPattern"`
+	Enabled      bool   `json:"Enabled"`
 }
 
 func (r *restClient) createSubscription(ctx context.Context, networkID string, req restSubscriptionRequest) (string, error) {
-	var out struct {
-		ID string `json:"id"`
-	}
+	var out restSubscription
 	if err := r.do(ctx, http.MethodPost, "/networks/"+networkID+"/subscriptions", req, &out); err != nil {
 		return "", err
 	}
 	return out.ID, nil
 }
 
+// listSubscriptions returns the principal's subscriptions in the network
+// (GET returns a BARE ARRAY of EventSubscription).
 func (r *restClient) listSubscriptions(ctx context.Context, networkID string) ([]restSubscription, error) {
-	var page struct {
-		Subscriptions []restSubscription `json:"subscriptions"`
-	}
-	if err := r.do(ctx, http.MethodGet, "/networks/"+networkID+"/subscriptions", nil, &page); err != nil {
+	var subs []restSubscription
+	if err := r.do(ctx, http.MethodGet, "/networks/"+networkID+"/subscriptions", nil, &subs); err != nil {
 		return nil, err
 	}
-	return page.Subscriptions, nil
+	return subs, nil
 }
 
 func (r *restClient) deleteSubscription(ctx context.Context, networkID, subID string) error {
@@ -256,68 +276,122 @@ func (r *restClient) deleteSubscription(ctx context.Context, networkID, subID st
 }
 
 // --- invocations -----------------------------------------------------------------------
+//
+// POST /networks/{id}/invocations: the input crosses as a top-level
+// "envelope" + "aad" pair; the client-generated object id rides in
+// "invocationId" (the AAD binds it) and the server adopts it. Both POST and
+// GET return the invocationView: {"invocation": CapabilityInvocation,
+// "input"/"output"/"error": {envelope, aad}} — the record is PascalCase and
+// the protected fields are top-level wrapper keys.
 
 type restInvocationRequest struct {
-	ID                string         `json:"id"`
-	TargetPrincipalID string         `json:"targetPrincipalId"`
-	CapabilityID      string         `json:"capabilityId"`
-	CapabilityVersion int            `json:"capabilityVersion"`
-	Input             encryptedField `json:"input"`
-	IdempotencyKey    string         `json:"idempotencyKey,omitempty"`
-	CorrelationID     string         `json:"correlationId,omitempty"`
-	CausationID       string         `json:"causationId,omitempty"`
+	TargetPrincipalID string                  `json:"targetPrincipalId"`
+	CapabilityID      string                  `json:"capabilityId"`
+	CapabilityVersion int                     `json:"capabilityVersion"`
+	Envelope          e2ee.EncryptedPayloadV1 `json:"envelope"`
+	AAD               e2ee.AAD                `json:"aad"`
+	InvocationID      string                  `json:"invocationId"`
+	IdempotencyKey    string                  `json:"idempotencyKey,omitempty"`
+	CorrelationID     string                  `json:"correlationId,omitempty"`
+	CausationID       string                  `json:"causationId,omitempty"`
 }
 
-// restInvocation is the invocation record (the durable server-side state).
+// restInvocation is the invocation record flattened from the invocationView
+// (the durable server-side state + the protected fields).
 type restInvocation struct {
-	ID                string          `json:"id"`
-	NetworkID         string          `json:"networkId"`
-	CallerPrincipalID string          `json:"callerPrincipalId"`
-	TargetPrincipalID string          `json:"targetPrincipalId"`
-	CapabilityID      string          `json:"capabilityId"`
-	CapabilityVersion int             `json:"capabilityVersion"`
-	State             string          `json:"state"`
-	IdempotencyKey    string          `json:"idempotencyKey,omitempty"`
-	CorrelationID     string          `json:"correlationId,omitempty"`
-	CausationID       string          `json:"causationId,omitempty"`
-	ProtectedInput    *encryptedField `json:"protectedInput,omitempty"`
-	ProtectedOutput   *encryptedField `json:"protectedOutput,omitempty"`
-	ProtectedError    *encryptedField `json:"protectedError,omitempty"`
-	PublicResultCode  string          `json:"publicResultCode,omitempty"`
-	UsageMetadata     map[string]any  `json:"usageMetadata,omitempty"`
-	CreatedAt         string          `json:"createdAt"`
-	CompletedAt       string          `json:"completedAt,omitempty"`
+	ID                string
+	NetworkID         string
+	CallerPrincipalID string
+	TargetPrincipalID string
+	CapabilityID      string
+	CapabilityVersion int
+	State             string
+	IdempotencyKey    string
+	ProtectedInput    *encryptedField
+	ProtectedOutput   *encryptedField
+	ProtectedError    *encryptedField
+	PublicResultCode  string
+	UsageMetadata     map[string]any
+	CreatedAt         string
+	CompletedAt       *time.Time
+}
+
+// restInvocationResponse is the invocationView wire shape.
+type restInvocationResponse struct {
+	Invocation struct {
+		ID                string         `json:"ID"`
+		NetworkID         string         `json:"NetworkID"`
+		CallerPrincipalID string         `json:"CallerPrincipalID"`
+		TargetPrincipalID string         `json:"TargetPrincipalID"`
+		CapabilityID      string         `json:"CapabilityID"`
+		CapabilityVersion int            `json:"CapabilityVersion"`
+		State             string         `json:"State"`
+		IdempotencyKey    string         `json:"IdempotencyKey"`
+		PublicResultCode  string         `json:"PublicResultCode"`
+		UsageMetadata     map[string]any `json:"UsageMetadata"`
+		CreatedAt         string         `json:"CreatedAt"`
+		CompletedAt       *time.Time     `json:"CompletedAt"`
+	} `json:"invocation"`
+	Input  *encryptedField `json:"input"`
+	Output *encryptedField `json:"output"`
+	Error  *encryptedField `json:"error"`
+}
+
+func (r *restInvocationResponse) flatten() *restInvocation {
+	return &restInvocation{
+		ID:                r.Invocation.ID,
+		NetworkID:         r.Invocation.NetworkID,
+		CallerPrincipalID: r.Invocation.CallerPrincipalID,
+		TargetPrincipalID: r.Invocation.TargetPrincipalID,
+		CapabilityID:      r.Invocation.CapabilityID,
+		CapabilityVersion: r.Invocation.CapabilityVersion,
+		State:             r.Invocation.State,
+		IdempotencyKey:    r.Invocation.IdempotencyKey,
+		ProtectedInput:    r.Input,
+		ProtectedOutput:   r.Output,
+		ProtectedError:    r.Error,
+		PublicResultCode:  r.Invocation.PublicResultCode,
+		UsageMetadata:     r.Invocation.UsageMetadata,
+		CreatedAt:         r.Invocation.CreatedAt,
+		CompletedAt:       r.Invocation.CompletedAt,
+	}
 }
 
 func (r *restClient) createInvocation(ctx context.Context, networkID string, req restInvocationRequest) (*restInvocation, error) {
-	var out restInvocation
+	var out restInvocationResponse
 	if err := r.do(ctx, http.MethodPost, "/networks/"+networkID+"/invocations", req, &out); err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return out.flatten(), nil
 }
 
 func (r *restClient) getInvocation(ctx context.Context, networkID, invocationID string) (*restInvocation, error) {
-	var out restInvocation
+	var out restInvocationResponse
 	if err := r.do(ctx, http.MethodGet, "/networks/"+networkID+"/invocations/"+invocationID, nil, &out); err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return out.flatten(), nil
 }
 
 // --- search -------------------------------------------------------------------------------
+//
+// GET /networks/{id}/search returns {"results": [SearchResult], "cursor":
+// string}. Each result is the embedded domain.Principal (PascalCase) plus
+// MatchReasons []string, RankBucket, and HasOnlineEndpoint. (The server does
+// not currently return the principal's capabilities in a search hit — the
+// caller invokes by explicit capability id.)
 
 type restSearchResult struct {
-	PrincipalID  string       `json:"principalId"`
-	Kind         string       `json:"kind"`
-	Name         string       `json:"name"`
-	Description  string       `json:"description"`
-	Visibility   string       `json:"visibility"`
-	ProviderName string       `json:"providerName"`
-	ProviderURL  string       `json:"providerUrl"`
-	Capabilities []Capability `json:"capabilities"`
-	MatchReasons []string     `json:"matchReasons"`
-	State        string       `json:"state"`
+	ID                string       `json:"ID"`
+	Kind              string       `json:"Kind"`
+	Name              string       `json:"Name"`
+	Description       string       `json:"Description"`
+	Visibility        string       `json:"Visibility"`
+	ProviderName      string       `json:"ProviderName"`
+	ProviderURL       string       `json:"ProviderURL"`
+	Capabilities      []Capability `json:"Capabilities"`
+	MatchReasons      []string     `json:"MatchReasons"`
+	HasOnlineEndpoint bool         `json:"HasOnlineEndpoint"`
 }
 
 func (r *restClient) search(ctx context.Context, networkID string, q Query) ([]SearchResult, string, error) {
@@ -350,8 +424,12 @@ func (r *restClient) search(ctx context.Context, networkID string, q Query) ([]S
 	}
 	out := make([]SearchResult, 0, len(page.Results))
 	for _, res := range page.Results {
+		state := ""
+		if res.HasOnlineEndpoint {
+			state = "connected"
+		}
 		out = append(out, SearchResult{
-			PrincipalID:  res.PrincipalID,
+			PrincipalID:  res.ID,
 			Kind:         res.Kind,
 			Name:         res.Name,
 			Description:  res.Description,
@@ -360,7 +438,7 @@ func (r *restClient) search(ctx context.Context, networkID string, q Query) ([]S
 			ProviderURL:  res.ProviderURL,
 			Capabilities: res.Capabilities,
 			MatchReasons: res.MatchReasons,
-			State:        res.State,
+			State:        state,
 		})
 	}
 	return out, page.Cursor, nil
