@@ -340,7 +340,7 @@ func serviceCreateCmd() *cobra.Command {
 				// The one-time activation credential (returned ONCE, D3).
 				ActivationCredential struct {
 					Credential string `json:"credential"`
-					ExpiresAt    string `json:"expiresAt"`
+					ExpiresAt  string `json:"expiresAt"`
 				} `json:"activationCredential"`
 			}
 			if err := c.post("/api/v1/services", body, &created); err != nil {

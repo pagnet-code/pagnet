@@ -326,8 +326,8 @@ type Daemon struct {
 	// network-NULL instances (representatives). Set when control_use_network
 	// succeeds; used by encryptToolArgs to determine the target network for
 	// a rep's control tool with no explicit networkId.
-	repNetworkMu  sync.Mutex
-	repNetworks   map[string]string
+	repNetworkMu sync.Mutex
+	repNetworks  map[string]string
 }
 
 // Bounded dedup retention (spec §91 "bounded period").
