@@ -76,6 +76,10 @@ var insecureRemoteHTTP bool
 // config's server URL.
 var root *cobra.Command
 
+// versionFlag is the root-level --version flag: `pagnet --version` is an
+// alias of `pagnet version` and prints the identical line (plan §7).
+var versionFlag bool
+
 // envOrDefault is the CLI's env-var contract: a flag default that reads
 // the environment first, so zero-flag runs work (e.g. PAGNET_SERVER,
 // PAGNET_ENROLL_TOKEN, PAGNET_TOKEN).
@@ -87,13 +91,29 @@ func envOrDefault(key, def string) string {
 }
 
 func main() {
-	root = &cobra.Command{
+	root = newRootCmd()
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// newRootCmd builds the command tree. It is a function rather than inline in
+// main so the root surface itself (e.g. the `version` / `--version` parity) is
+// testable without spawning the binary.
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
 		Use:           "pagnet",
 		Short:         "pagnet CLI — control plane for AI coding agent networks",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// `pagnet --version` is the same command as `pagnet version`
+			// (plan §7): one build identity, two spellings, identical bytes.
+			if versionFlag {
+				printVersion(cmd.OutOrStdout())
+				return nil
+			}
 			if detach {
 				return runDetach(cmd)
 			}
@@ -133,6 +153,11 @@ func main() {
 	// subcommands keep their own flag surfaces.
 	root.Flags().BoolVarP(&detach, "detach", "d", false,
 		"start the pagnet service detached (log to <state-dir>/pagnetd.log, print the pid)")
+	// --version is the ROOT spelling of `pagnet version` (plan §7). It is a
+	// plain bool rather than cobra's built-in version flag so the output is
+	// the one `pagnet version` prints — the built-in template would add a
+	// "version" word and the two spellings would disagree.
+	root.Flags().BoolVar(&versionFlag, "version", false, "print the pagnet version (same as `pagnet version`)")
 	registerDaemonFlags(root)
 
 	root.AddCommand(
@@ -183,10 +208,7 @@ func main() {
 		// internal (hidden): daemon-spawned MCP bridge entrypoints
 		mcpCmd(),
 	)
-
-	if err := root.Execute(); err != nil {
-		os.Exit(1)
-	}
+	return root
 }
 
 // versionCmd prints the build version stamped at release-build time
@@ -199,9 +221,15 @@ func versionCmd() *cobra.Command {
 		Short: "Print the pagnet version",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintln(cmd.OutOrStdout(), "pagnet", version)
+			printVersion(cmd.OutOrStdout())
 		},
 	}
+}
+
+// printVersion is the ONE version renderer: `pagnet version` and
+// `pagnet --version` must not be able to disagree (plan §7).
+func printVersion(w io.Writer) {
+	fmt.Fprintln(w, "pagnet", version)
 }
 
 // enrollCmd implements `pagnet enroll` (formerly `pagnet login`): consumes
