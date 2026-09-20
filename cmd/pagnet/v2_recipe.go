@@ -290,21 +290,23 @@ func applyRecipe(c *cliCtx, netID string, m *recipeManifest) (*recipeApplied, er
 		if len(caps) > 0 {
 			body["capabilities"] = caps
 		}
+		// Same response shape as `pagnet service create`: the principal is
+		// nested under "principal" (its id marshals as "ID") and the
+		// activation credential is an object carrying its expiry.
 		var created struct {
-			ID                   string `json:"id"`
-			IDLegacy             string `json:"ID"`
-			ActivationCredential string `json:"activationCredential"`
+			Principal struct {
+				ID string `json:"ID"`
+			} `json:"principal"`
+			ActivationCredential struct {
+				Credential string `json:"credential"`
+			} `json:"activationCredential"`
 		}
 		if err := c.post("/api/v1/services", body, &created); err != nil {
 			return nil, fmt.Errorf("create service: %w", err)
 		}
-		id := created.ID
-		if id == "" {
-			id = created.IDLegacy
-		}
-		out.ID = id
-		out.ActivationCredential = created.ActivationCredential
-		if err := c.post("/api/v1/networks/"+netID+"/services", map[string]any{"principalId": id}, nil); err != nil {
+		out.ID = created.Principal.ID
+		out.ActivationCredential = created.ActivationCredential.Credential
+		if err := c.post("/api/v1/networks/"+netID+"/services", map[string]any{"principalId": out.ID}, nil); err != nil {
 			return nil, fmt.Errorf("add service to network: %w", err)
 		}
 	}

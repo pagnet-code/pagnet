@@ -376,8 +376,11 @@ func TestRecipeApplyFailFastNoNetwork(t *testing.T) {
 // one-time activation credential is printed.
 func TestRecipeApplyNonInteractiveApplies(t *testing.T) {
 	ts := newStubV2Server(t, map[string]string{
-		"/api/v1/networks":                     `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
-		"/api/v1/services":                     `{"id":"svc-1","name":"svc-echo","activationCredential":"pgn_epd_v1_test"}`,
+		"/api/v1/networks": `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+		// The real POST /services shape (api_services.go): the principal is
+		// nested under "principal" and marshals domain.Principal's exported
+		// field names, and the activation credential is an object.
+		"/api/v1/services":                     `{"principal":{"ID":"svc-1","Name":"svc-echo"},"activationCredential":{"credential":"pgn_epd_v1_test","expiresAt":"2026-01-01T00:00:00Z"}}`,
 		"/api/v1/networks/net-1/services":      `{}`,
 		"/api/v1/networks/net-1/subscriptions": `{"id":"sub-9"}`,
 	})
