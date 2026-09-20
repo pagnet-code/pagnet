@@ -216,6 +216,34 @@ func (fs *fakeServer) createPrincipal(kind, name string, networkIDs ...string) (
 	return id, cred
 }
 
+// createEndpointPrincipal registers a principal that ALREADY owns a durable
+// endpoint credential (pgn_epd_v1_) — the shape a manually created
+// restricted credential has after `pagnet agent credential create`: it is
+// presented directly and never passes through an activation exchange. No
+// activation credential exists for it, so an SDK that assumed one would fail.
+func (fs *fakeServer) createEndpointPrincipal(kind, name string, networkIDs ...string) (string, string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	id := uuid.New().String()
+	p := &fakePrincipal{id: id, kind: kind, name: name, memberships: map[string]bool{}}
+	for _, n := range networkIDs {
+		p.memberships[n] = true
+	}
+	fs.principals[id] = p
+	cred := "pgn_epd_v1_" + id
+	fs.endpointCreds[cred] = id
+	return id, cred
+}
+
+// endpointCredentialCount is how many durable endpoint credentials the
+// server currently knows about (a session that performed no activation must
+// not add one).
+func (fs *fakeServer) endpointCredentialCount() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return len(fs.endpointCreds)
+}
+
 // createNetwork registers a network and returns its id.
 func (fs *fakeServer) createNetwork(name string, cryptoActive bool) string {
 	fs.mu.Lock()

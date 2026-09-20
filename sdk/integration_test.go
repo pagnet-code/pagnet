@@ -7,6 +7,7 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -127,6 +128,89 @@ func TestConnectActivationExchange(t *testing.T) {
 	// The identity key is stable across connects (not regenerated).
 	if readDurableCredential(t, stateDir, pid) != durable {
 		t.Fatal("durable credential changed across connects")
+	}
+}
+
+// credPrefix names a credential without echoing the whole of it.
+func credPrefix(cred string) string {
+	if len(cred) > 20 {
+		return cred[:20] + "…"
+	}
+	return cred
+}
+
+// readIdentityKey reads the persisted X25519 identity private key (the stable
+// crypto identity: it must survive reconnects unchanged).
+func readIdentityKey(t *testing.T, stateDir, principalID string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(stateDir, "principals", principalID, "identity.key"))
+	if err != nil {
+		t.Fatalf("read identity key: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// --- requirement 10b: a PRE-EXISTING endpoint credential, presented directly ----
+
+// TestConnectPreExistingEndpointCredential proves the other half of the
+// credential engine: a restricted pgn_epd_ credential created out of band
+// (the CLI's `credential create`, never an activation) authenticates on its
+// own. The SDK must not assume auth_ok carried a credential: it keeps
+// presenting the one it was given, stores it under the principal id the
+// server reported, and reuses it (with the same identity key) on the next
+// connect instead of minting a second identity.
+func TestConnectPreExistingEndpointCredential(t *testing.T) {
+	fs := newFakeServer(t)
+	net := fs.createNetwork("net", true)
+	pid, epdCred := fs.createEndpointPrincipal("agent", "atlas", net)
+	if !strings.HasPrefix(epdCred, "pgn_epd_v1_") {
+		t.Fatalf("fixture credential %q is not a durable endpoint credential", epdCred)
+	}
+	stateDir := t.TempDir()
+
+	c1 := mustConnect(t, fs, epdCred, stateDir)
+	waitForCryptoReady(t, fs, pid)
+	if c1.PrincipalID() != pid {
+		t.Fatalf("PrincipalID = %q, want %q", c1.PrincipalID(), pid)
+	}
+	// Nothing was swapped in: auth_ok carried no credential, so the presented
+	// one is still the stored one, byte for byte.
+	if got := readDurableCredential(t, stateDir, pid); got != epdCred {
+		t.Fatalf("stored credential = %q, want the presented %q", credPrefix(got), credPrefix(epdCred))
+	}
+	// No activation happened, so the server issued no new credential.
+	if n := fs.endpointCredentialCount(); n != 1 {
+		t.Errorf("the server holds %d endpoint credentials, want 1 (no credential rotation)", n)
+	}
+	// The presented credential is indexed to the principal, so a later
+	// Connect resolves the identity before auth_ok.
+	kr, err := newKeyring(stateDir)
+	if err != nil {
+		t.Fatalf("newKeyring: %v", err)
+	}
+	if got, err := kr.principalForCredential(epdCred); err != nil || got != pid {
+		t.Errorf("credential index = %q (err %v), want %q", got, err, pid)
+	}
+	identity := readIdentityKey(t, stateDir, pid)
+	if err := c1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Second connect with the same credential: the stored identity key is
+	// reused, not regenerated (the credential is durable, not one-time).
+	c2 := mustConnect(t, fs, epdCred, stateDir)
+	waitForCryptoReady(t, fs, pid)
+	if c2.PrincipalID() != pid {
+		t.Fatalf("second connect PrincipalID = %q, want %q", c2.PrincipalID(), pid)
+	}
+	if got := readIdentityKey(t, stateDir, pid); got != identity {
+		t.Error("the identity key was regenerated — a durable credential must keep its identity")
+	}
+	if got := readDurableCredential(t, stateDir, pid); got != epdCred {
+		t.Errorf("stored credential changed to %q across connects", credPrefix(got))
+	}
+	if err := c2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 
