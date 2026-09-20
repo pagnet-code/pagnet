@@ -158,6 +158,7 @@ func main() {
 		demoCmd(),
 		// spec §55 command surface
 		agentsCmd(),
+		agentCmd(),
 		hostsCmd(),
 		hostCmd(),
 		networksCmd(),

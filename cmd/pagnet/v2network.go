@@ -272,14 +272,15 @@ func servicesCmd() *cobra.Command {
 	return cmd
 }
 
-// serviceCmd groups `service create` and `service connect` (the service
-// onboarding path: create → one-time activation credential → connect).
+// serviceCmd groups `service create`, `service connect`, and the credential
+// surface (the service onboarding path: create → one-time activation
+// credential → connect; plan §9 adds manual restricted credentials).
 func serviceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "service",
-		Short: "Create and connect services (onboarding)",
+		Short: "Create and connect services (onboarding) and manage their credentials",
 	}
-	cmd.AddCommand(serviceCreateCmd(), serviceConnectCmd())
+	cmd.AddCommand(serviceCreateCmd(), serviceConnectCmd(), credentialParentCmd(principalService))
 	return cmd
 }
 
