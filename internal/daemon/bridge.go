@@ -314,12 +314,60 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	}
 }
 
+// toolArgsWire renames the agent-facing bridge tool arguments onto the control
+// plane's agent-command field names. The bridge surface (and the MCP tools that
+// mirror it) advertise the short names an agent naturally writes; the server
+// validates its own contract strictly, so a tool whose advertised names differ
+// from it can never be satisfied — the call fails "… required" before doing any
+// work.
+//
+// Only the tools that actually differ are listed; every other tool already
+// speaks the server's field names.
+var toolArgsWire = map[string]map[string]string{
+	"network_event_publish": {"type": "eventType", "target": "targetPrincipalId"},
+	"network_subscribe":     {"pattern": "eventPattern", "mode": "deliveryMode"},
+}
+
+// wireArgs applies toolArgsWire to one relayed call.
+//
+// It runs AFTER encryptToolArgs on purpose: the AAD binds the tool's own
+// argument (network_event_publish's recipient comes from "target"), so the
+// encryption layer must see the agent-facing names, and only the bytes that
+// cross the cloud boundary are renamed.
+func wireArgs(tool string, args json.RawMessage) json.RawMessage {
+	renames, ok := toolArgsWire[tool]
+	if !ok || len(args) == 0 {
+		return args
+	}
+	var m map[string]any
+	if err := json.Unmarshal(args, &m); err != nil {
+		return args // not a JSON object: relay unchanged, the server validates
+	}
+	changed := false
+	for from, to := range renames {
+		if v, ok := m[from]; ok {
+			delete(m, from)
+			m[to] = v
+			changed = true
+		}
+	}
+	if !changed {
+		return args
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return args
+	}
+	return raw
+}
+
 // relayToServer forwards one tool call over the host connection and waits
 // for the correlated agent.response. principalID is the instance's agent
 // principal (V2): the daemon resolves EVERY network operation against it,
 // so the control plane authorizes and routes on the PRINCIPAL (representative
 // re-authorization, plan §17-18), not on the instance.
 func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.RawMessage) (json.RawMessage, string) {
+	args = wireArgs(tool, args)
 	d.connMu.Lock()
 	conn := d.curConn
 	d.connMu.Unlock()
