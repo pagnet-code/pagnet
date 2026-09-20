@@ -848,14 +848,29 @@ func (c *Client) capabilities() []Capability {
 	return out
 }
 
-// sendRegister re-sends endpoint.register on the live connection (an
-// idempotent upsert): capability changes after the initial register must
-// reach the server without a full reconnect.
+// sendRegister publishes the current capability set to the server. The
+// control plane accepts exactly ONE endpoint.register per connection (a
+// second register on the same connection is a protocol violation it closes),
+// so a capability change after the initial register cannot be pushed as a
+// same-connection re-register. Instead this triggers a clean reconnect: the
+// supervisor dials a fresh connection, whose single register carries the
+// updated capability set (and re-enrolls crypto for the new endpoint row).
+// The reconnect is SDK-initiated (graceful), not a server-side close.
 func (c *Client) sendRegister() error {
 	if !c.connected.Load() {
 		return nil // the next (re)connect carries it
 	}
-	return c.send(transport.MsgEndpointRegister, c.registerPayload())
+	c.connMu.Lock()
+	pc := c.cur
+	c.connMu.Unlock()
+	if pc == nil {
+		return nil
+	}
+	// Closing the socket makes the read loop return; the supervisor's
+	// connectOnce returns and the loop dials a fresh connection that
+	// registers with the updated capabilities.
+	_ = pc.ws.Close()
+	return nil
 }
 
 // handleAuthOK processes endpoint.auth_ok: identity, the activation →
