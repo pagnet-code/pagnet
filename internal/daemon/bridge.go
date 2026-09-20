@@ -286,6 +286,20 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 			continue
 		}
 		result, errMsg := d.relayToServer(row.InstanceID, row.AgentPrincipalID, req.Tool, encArgs)
+		// Track the rep's active network: the daemon needs it to encrypt a
+		// rep's control tool with no explicit networkId (the server resolves
+		// the network from the rep context, but the daemon must encrypt under
+		// the same network's crypto). Any control tool that names a network
+		// explicitly updates the tracking (control_use_network, control_ask
+		// with networkId, ...).
+		if errMsg == "" && row.NetworkID == "" {
+			var nu struct {
+				NetworkID string `json:"networkId"`
+			}
+			if json.Unmarshal(req.Args, &nu) == nil && nu.NetworkID != "" {
+				d.setRepNetwork(row.InstanceID, nu.NetworkID)
+			}
+		}
 		resp := map[string]any{"id": req.ID}
 		if errMsg == "" {
 			resp["ok"] = true

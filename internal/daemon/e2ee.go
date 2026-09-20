@@ -207,6 +207,21 @@ type encryptedField struct {
 	AAD      e2ee.AAD                `json:"aad"`
 }
 
+// setRepNetwork stores the active network for a rep instance (set when
+// control_use_network succeeds).
+func (d *Daemon) setRepNetwork(instanceID, networkID string) {
+	d.repNetworkMu.Lock()
+	defer d.repNetworkMu.Unlock()
+	d.repNetworks[instanceID] = networkID
+}
+
+// getRepNetwork returns the active network for a rep instance ("" if not set).
+func (d *Daemon) getRepNetwork(instanceID string) string {
+	d.repNetworkMu.Lock()
+	defer d.repNetworkMu.Unlock()
+	return d.repNetworks[instanceID]
+}
+
 // encryptToolArgs rewrites a tool call's protected fields into encrypted
 // values. It returns the (possibly rewritten) args, or an error message
 // ("" on success).
@@ -246,13 +261,17 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 	}
 	// The effective network for the crypto decision: the instance's own
 	// network, or — for a network-NULL instance (a representative) driving a
-	// control tool — the target network the call names explicitly. Without
-	// this a rep's control_ask/control_reply/control_delegate would skip
+	// control tool — the target network the call names explicitly, or the
+	// rep's active network (set by control_use_network). Without this a
+	// rep's control_ask/control_reply/control_delegate would skip
 	// encryption (row.NetworkID is empty) and send a plaintext body that the
 	// active target network rejects (private_network_plaintext_rejected).
 	networkID := row.NetworkID
 	if networkID == "" {
 		networkID, _ = m["networkId"].(string)
+	}
+	if networkID == "" {
+		networkID = d.getRepNetwork(row.InstanceID)
 	}
 	if networkID == "" {
 		return args, ""

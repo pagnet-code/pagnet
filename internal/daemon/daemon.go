@@ -321,6 +321,13 @@ type Daemon struct {
 	// enrollment round-trip — see crypto.go).
 	cryptoMu  sync.Mutex
 	cryptoMgr *cryptoManager
+
+	// repNetworkMu guards repNetworks: the per-instance active network for
+	// network-NULL instances (representatives). Set when control_use_network
+	// succeeds; used by encryptToolArgs to determine the target network for
+	// a rep's control tool with no explicit networkId.
+	repNetworkMu  sync.Mutex
+	repNetworks   map[string]string
 }
 
 // Bounded dedup retention (spec §91 "bounded period").
@@ -534,6 +541,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		sup:             sup,
 		helper:          helper,
 		sessions:        sessions,
+		repNetworks:     map[string]string{},
 	}
 	d.terminal = newTerminalManager(d)
 	// Crash/restart reconciliation (§39): a hard crash may have left a
