@@ -63,6 +63,17 @@ type CapabilityInvocation struct {
 	// ProtectedError is the encrypted error detail for a failed invocation
 	// (object type invocation_error).
 	ProtectedError json.RawMessage
+	// InputAAD / OutputAAD / ErrorAAD are the associated-data the matching
+	// protected_* envelope was bound to, persisted VERBATIM as supplied by
+	// the encrypting party (the caller for the input, the serving endpoint
+	// for the output/error).
+	//
+	// They are not derivable: the AAD is the GCM associated-data, so a single
+	// differing field (e.g. tenant_id) makes the ciphertext undecryptable.
+	// The control plane's obligation is to store and relay them unchanged.
+	InputAAD  json.RawMessage
+	OutputAAD json.RawMessage
+	ErrorAAD  json.RawMessage
 	// PublicResultCode is the public-safe outcome code (stable code only —
 	// never protected content).
 	PublicResultCode string
