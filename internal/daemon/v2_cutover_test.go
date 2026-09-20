@@ -671,6 +671,71 @@ func TestDaemon_ActiveNetworkEncryptsContent(t *testing.T) {
 	}
 }
 
+// A network-NULL instance (a representative) names a TARGET network it may or
+// may not hold an active membership in — the daemon cannot see the
+// membership, so it must NOT fail closed on the target's crypto state (that
+// would mask the control plane's "no active membership" rejection, which the
+// server evaluates before its content gate). Instead: encrypt when it can,
+// otherwise pass the args through unchanged and let the control plane return
+// the correct error. A worker (network-scoped) keeps the fail-closed refusal.
+func TestDaemon_RepDefersCryptoDecisionToControlPlane(t *testing.T) {
+	d := newTestDaemon(t)
+
+	// rep = network-NULL instance; the target network's crypto is NOT ready
+	// (unannounced). The content tool must PASS THROUGH (no refusal) so the
+	// control plane can answer with the membership rejection, not a
+	// "being secured" mask.
+	rep := &InstanceRow{InstanceID: "rep-1", NetworkID: "", AgentName: "relay-rep"}
+	in := []byte(`{"networkId":"net-b","toAgent":"relay-a","body":"relay 84: the attempt"}`)
+	out, errMsg := d.encryptToolArgs(rep, "control_ask", in)
+	if errMsg != "" {
+		t.Fatalf("rep content tool on a not-ready target network was refused: %q", errMsg)
+	}
+	var outMap map[string]any
+	if err := json.Unmarshal(out, &outMap); err != nil {
+		t.Fatal(err)
+	}
+	if outMap["body"] != "relay 84: the attempt" {
+		t.Fatalf("rep args were rewritten without encryption: %s", out)
+	}
+	if _, ok := outMap["envelope"]; ok {
+		t.Fatalf("rep args carry an envelope though the target crypto is not ready: %s", out)
+	}
+
+	// Same call, but the target network's crypto IS active (and the keyring
+	// is loaded): the rep encrypts, so the control plane accepts it.
+	networkID := domain.NewID().String()
+	setupActiveNetCrypto(t, d, "tenant-t", networkID)
+	inActive := []byte(`{"networkId":"` + networkID + `","toAgent":"relay-a","body":"relay 84: ok"}`)
+	outActive, errMsg := d.encryptToolArgs(rep, "control_ask", inActive)
+	if errMsg != "" {
+		t.Fatalf("rep content tool on an active target network was refused: %q", errMsg)
+	}
+	var ask struct {
+		MessageID string                  `json:"messageId"`
+		Envelope  e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD       e2ee.AAD                `json:"aad"`
+	}
+	if err := json.Unmarshal(outActive, &ask); err != nil {
+		t.Fatal(err)
+	}
+	if ask.MessageID == "" || ask.Envelope.KeyEpochID == "" {
+		t.Fatalf("active target: rep args missing messageId/envelope: %s", outActive)
+	}
+	plain, err := d.decryptProtected(networkID, ask.Envelope, ask.AAD)
+	if err != nil || plain != "relay 84: ok" {
+		t.Fatalf("rep round-trip = %q (err %v), want \"relay 84: ok\"", plain, err)
+	}
+
+	// Contrast: a WORKER (network-scoped) on a not-ready network is still
+	// refused (the pinned fail-closed behavior is unchanged).
+	worker := &InstanceRow{InstanceID: "w-1", NetworkID: "net-notready", AgentName: "worker"}
+	if _, errMsg := d.encryptToolArgs(worker, "network_ask",
+		[]byte(`{"toAgent":"x","body":"hi"}`)); errMsg == "" {
+		t.Fatal("worker content tool on a not-ready network was not refused")
+	}
+}
+
 // A LEGACY (v1-style) delivery that carries content without an envelope is
 // REFUSED on a network-scoped instance — there is no plaintext path (the v1
 // delivery shape is rejected; the work stays durable server-side).

@@ -221,6 +221,15 @@ type encryptedField struct {
 // content (metadata-only: whoami, discover, register_capabilities, search,
 // ...) are unaffected — they may run on a provisioning network.
 //
+// The refusal applies to network-SCOPED instances (workers): the instance
+// is a member of its network by construction, so a not-ready crypto state
+// is unambiguous and the daemon fails closed. A network-NULL instance (a
+// representative) names a TARGET network whose membership the daemon cannot
+// see; refusing there would mask the control plane's "no active membership"
+// rejection (which the server evaluates BEFORE its content gate). A rep
+// therefore only encrypts when it can and otherwise defers to the control
+// plane, which always refuses plaintext content (D6 holds end to end).
+//
 // The mapping (plan §12):
 //   - network_ask / network_reply / control_ask / control_reply: body ->
 //     message (recipient = threadId when set, else empty).
@@ -373,9 +382,30 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 	// The call carries content: the network crypto MUST be active (D6 —
 	// no plaintext path). Provisioning networks refuse with the clear
 	// "being secured" state.
+	//
+	// WHO may refuse is the question. A network-SCOPED instance (a worker)
+	// is a member of its network by construction (it was launched there), so
+	// a not-ready crypto state is unambiguous: the daemon fails closed and
+	// the agent sees the clear "being secured" state.
+	//
+	// A network-NULL instance (a representative) names a TARGET network it
+	// may or may not hold an active membership in — and the daemon does not
+	// know the membership; that is the control plane's decision
+	// (requirePermission), which runs BEFORE the content gate
+	// (networkCryptoGateMessage) on the server. If the daemon refused here on
+	// a not-ready crypto state, it would mask the server's "no active
+	// membership in that network" rejection with a "being secured" error. So
+	// a network-NULL instance only encrypts when it CAN; otherwise the args
+	// pass through unchanged and the control plane returns the correct error
+	// (the membership rejection, or the content gate when there IS a
+	// membership). The control plane always refuses plaintext content — it
+	// never persists or delivers it — so D6 holds end to end.
 	st, err := d.contentCryptoReady(networkID)
 	if err != nil {
-		return nil, err.Error()
+		if row.NetworkID != "" {
+			return nil, err.Error() // worker: fail closed (pinned behavior)
+		}
+		return args, "" // rep: defer to the control plane
 	}
 	sender := row.AgentName
 	if sender == "" {
@@ -410,7 +440,14 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 	}
 	env, aad, err := d.encryptProtected(st, objectType, objectID, sender, recipient, plainContent)
 	if err != nil {
-		return nil, err.Error()
+		if row.NetworkID != "" {
+			return nil, err.Error() // worker: fail closed (pinned behavior)
+		}
+		// Rep: the announced epoch is not in the local keyring yet (an
+		// enrollment in flight). Defer to the control plane the same way as
+		// the not-ready case above — it refuses the plaintext, so nothing is
+		// persisted unencrypted.
+		return args, ""
 	}
 	setEncrypted(env, aad, objectID)
 	out, err := json.Marshal(m)
