@@ -324,25 +324,35 @@ func serviceCreateCmd() *cobra.Command {
 			if len(caps) > 0 {
 				body["capabilities"] = caps
 			}
+			// The server answers {principal: {ID, Name, …}, activationCredential:
+			// {credential, expiresAt}}. The credential is an OBJECT (it carries
+			// its expiry) and the principal's fields are nested under "principal"
+			// — domain.Principal marshals its exported field names, so the id is
+			// "ID", not "id". Decoding this as a flat {id, name} plus a string
+			// credential failed the POST outright:
+			// "cannot unmarshal object into Go struct field .activationCredential
+			// of type string".
 			var created struct {
-				ID       string `json:"id"`
-				IDLegacy string `json:"ID"`
-				Name     string `json:"name"`
+				Principal struct {
+					ID   string `json:"ID"`
+					Name string `json:"Name"`
+				} `json:"principal"`
 				// The one-time activation credential (returned ONCE, D3).
-				ActivationCredential string `json:"activationCredential"`
+				ActivationCredential struct {
+					Credential string `json:"credential"`
+					ExpiresAt    string `json:"expiresAt"`
+				} `json:"activationCredential"`
 			}
 			if err := c.post("/api/v1/services", body, &created); err != nil {
 				return err
 			}
-			id := created.ID
-			if id == "" {
-				id = created.IDLegacy
-			}
+			id := created.Principal.ID
 			if jsonOut {
-				return printJSON(map[string]any{"id": id, "name": created.Name, "activationCredential": created.ActivationCredential})
+				return printJSON(map[string]any{"id": id, "name": created.Principal.Name,
+					"activationCredential": created.ActivationCredential.Credential})
 			}
 			if !silent {
-				fmt.Printf("service:  %s (%s)\n", orDash(created.Name), id)
+				fmt.Printf("service:  %s (%s)\n", orDash(created.Principal.Name), id)
 			}
 			// Join the resolved network when one is given (the service is
 			// created tenant-wide; membership is a separate step).
@@ -358,16 +368,16 @@ func serviceCreateCmd() *cobra.Command {
 					fmt.Printf("joined:   network %s\n", netID)
 				}
 			}
-			if created.ActivationCredential == "" {
+			if created.ActivationCredential.Credential == "" {
 				if !silent {
 					fmt.Println("activation credential: not returned by the server (re-create to obtain one)")
 				}
 				return nil
 			}
 			// The one-time rule: printed ONCE here, never stored.
-			fmt.Printf("\nactivation credential (one-time — save it now, it is shown only once):\n  %s\n\n", created.ActivationCredential)
+			fmt.Printf("\nactivation credential (one-time — save it now, it is shown only once):\n  %s\n\n", created.ActivationCredential.Credential)
 			if !silent {
-				fmt.Println("connect the service with: pagnet service connect " + orDash(created.Name))
+				fmt.Println("connect the service with: pagnet service connect " + orDash(created.Principal.Name))
 			}
 			return nil
 		},
@@ -468,6 +478,21 @@ type searchResult struct {
 	State        string   `json:"state,omitempty"`
 }
 
+// searchPage is the control plane's search envelope. BOTH search endpoints
+// (GET /networks/{id}/search and GET /services/search) answer
+// {results, cursor} and nothing else.
+//
+// The CLI used to treat "decoded, but empty" as a decode failure and retry the
+// request into a bare []searchResult. The server never answers with a bare
+// array, so that fallback fired on exactly the case it could not handle: a
+// legitimate zero-result search. It reported
+// "json: cannot unmarshal object into Go value of type []main.searchResult"
+// instead of "nothing found".
+type searchPage struct {
+	Results []searchResult `json:"results"`
+	Cursor  string         `json:"cursor"`
+}
+
 func searchCmd() *cobra.Command {
 	var (
 		network    string
@@ -503,9 +528,11 @@ func searchCmd() *cobra.Command {
 				if cursor != "" {
 					path += "&cursor=" + urlQueryEscape(cursor)
 				}
-				if err := c.get(path, &results); err != nil {
+				var page searchPage
+				if err := c.get(path, &page); err != nil {
 					return err
 				}
+				results, next = page.Results, page.Cursor
 			} else {
 				netID, _, err := c.resolveNetwork(network)
 				if err != nil {
@@ -521,18 +548,11 @@ func searchCmd() *cobra.Command {
 				if cursor != "" {
 					path += "&cursor=" + urlQueryEscape(cursor)
 				}
-				var page struct {
-					Results []searchResult `json:"results"`
-					Cursor  string         `json:"cursor"`
+				var page searchPage
+				if err := c.get(path, &page); err != nil {
+					return err
 				}
-				if err := c.get(path, &page); err == nil && len(page.Results) > 0 {
-					results, next = page.Results, page.Cursor
-				} else {
-					// Bare-array response shape.
-					if err := c.get(path, &results); err != nil {
-						return err
-					}
-				}
+				results, next = page.Results, page.Cursor
 			}
 			if jsonOut {
 				return printJSON(map[string]any{"results": results, "cursor": next})
