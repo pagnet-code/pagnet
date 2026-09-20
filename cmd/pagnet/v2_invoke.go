@@ -106,9 +106,15 @@ func invokeCmd() *cobra.Command {
 			body := map[string]any{
 				"targetPrincipalId": target.pID(),
 				"capabilityId":      args[1],
-				"inputObjectID":     objectID,
-				"envelope":          env,
-				"aad":               aad,
+				// The client-generated object id that the AAD binds, under the
+				// name the control plane decodes ("invocationId" — same contract
+				// as sdk/rest.go's restInvocationRequest). The control plane
+				// rejects unknown body fields, so the previous "inputObjectID"
+				// key made the WHOLE body fail to decode and the handler answered
+				// the misleading "targetPrincipalId and capabilityId required".
+				"invocationId": objectID,
+				"envelope":     env,
+				"aad":          aad,
 			}
 			if idempotencyKey != "" {
 				body["idempotencyKey"] = idempotencyKey
