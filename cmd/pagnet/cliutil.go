@@ -144,10 +144,15 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 			}
 			return err // the exact missing piece (e.g. no interactive terminal)
 		}
-		return fmt.Errorf("http 401: %s (run `pagnet login` or set --token / $PAGNET_TOKEN to a user/admin bearer)", string(raw))
+		return fmt.Errorf("%w (run `pagnet login` or set --token / $PAGNET_TOKEN to a user/admin bearer)",
+			&httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)})
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, string(raw))
+		// httpFailure.Error() renders exactly "http <status>: <body>" — the
+		// text every REST command printed before — but it keeps the status and
+		// the server's error CODE readable, so a credential failure can be
+		// translated where one is in scope (plan §7).
+		return &httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)}
 	}
 	if out != nil && len(raw) > 0 {
 		return json.Unmarshal(raw, out)

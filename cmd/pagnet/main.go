@@ -336,6 +336,11 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, accD
 // mintEnrollmentToken mints a one-time host enrollment token for hostName
 // with the user's bearer (the same API the web console's "Connect host"
 // uses) and returns its plaintext (shown exactly once).
+//
+// A non-201 is returned as an *httpFailure carrying the status and the
+// server's error CODE, so the caller can translate a known auth failure into
+// product text. The body travels with it for the non-auth path only and is
+// never rendered to a human by that caller (plan §7).
 func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string, error) {
 	body, _ := json.Marshal(map[string]any{
 		"name":         hostName,
@@ -358,7 +363,8 @@ func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string
 		return "", err
 	}
 	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("create enrollment token: http %d: %s", resp.StatusCode, string(raw))
+		return "", fmt.Errorf("create enrollment token: %w",
+			&httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)})
 	}
 	var out struct {
 		Token string `json:"token"`
@@ -401,16 +407,21 @@ func resolveEnrollServer(root, account string) (string, error) {
 // Shared by `pagnet enroll` (without --token) and `pagnet serve` /
 // `pagnet -d` (which must finish it before the daemon starts / detaches —
 // the paste prompt runs in the foreground, never inside the detached child).
+//
+// Minting an enrollment token is an ACCOUNT-AUTHORITY operation (governance
+// §33/§56): a delegated credential is refused 403
+// account_authority_required. That failure is translated into product text
+// and re-prompts a human; it exits only when nobody is there to ask
+// (--non-interactive / no TTY), when the bearer came from an explicit
+// --token / $PAGNET_TOKEN (a prompt cannot fix a flag the operator set), or
+// when the human stops trying. Printing the server's JSON body and dying —
+// what this did before — is the 2026-09-20 incident (plan §7).
 func enrollHostForeground(root, account, name string, roots []string, rootsMode string) error {
 	server, err := resolveEnrollServer(root, account)
 	if err != nil {
 		return err
 	}
 	base := server + "/"
-	userTok, err := userCredentialForServe(root, account, server)
-	if err != nil {
-		return err
-	}
 	hostName := name
 	if hostName == "" {
 		hostName, _ = os.Hostname()
@@ -418,11 +429,24 @@ func enrollHostForeground(root, account, name string, roots []string, rootsMode 
 			hostName = "pagnet-host"
 		}
 	}
-	minted, err := mintEnrollmentToken(base, userTok, hostName, roots)
-	if err != nil {
-		return err
+	accDir := accountConfigDir(root, account)
+	for attempt := 0; ; attempt++ {
+		userTok, err := userCredentialForServeFresh(root, account, server, attempt > 0)
+		if err != nil {
+			return err
+		}
+		minted, err := mintEnrollmentToken(base, userTok, hostName, roots)
+		if err == nil {
+			return doEnroll(server, minted, hostName, roots, rootsMode, accDir)
+		}
+		failure := translateAuthFailure(err, credentialClassOf(accDir, userTok))
+		if !failure.Reprompt || userToken != "" || !interactiveMode() || attempt >= maxAuthReprompts {
+			return failure.Err
+		}
+		// Product text on stderr (where the hidden paste prompt also writes),
+		// then a fresh paste — the stored credential is not handed back.
+		fmt.Fprintln(os.Stderr, failure.Err)
 	}
-	return doEnroll(server, minted, hostName, roots, rootsMode, accountConfigDir(root, account))
 }
 
 // apiPostJSON posts a JSON body and decodes the response into out.

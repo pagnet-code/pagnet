@@ -392,16 +392,23 @@ func TestSaveCredentialClearsStaleMetadata(t *testing.T) {
 		t.Fatalf("precondition: credentialRole = %v", fc["credentialRole"])
 	}
 
-	// A later mode-based login (saveUserToken) must CLEAR the metadata —
-	// it carries none, and stale metadata would misrepresent the bearer.
+	// A later mode-based login (saveUserToken) must CLEAR the restriction
+	// metadata — it carries none, and stale metadata would misrepresent the
+	// bearer.
 	if err := saveUserToken(dir, "", "https://cp.example/", "pagt_fresh"); err != nil {
 		t.Fatalf("saveUserToken: %v", err)
 	}
 	fc = stateFile(t, dir)
-	for _, key := range []string{"credentialKind", "credentialRole", "credentialNetworks", "credentialExpiresAt", "credentialOrganizationId", "credentialSourceId", "credentialNetworkScope"} {
+	for _, key := range []string{"credentialRole", "credentialNetworks", "credentialExpiresAt", "credentialOrganizationId", "credentialSourceId", "credentialSourceKind", "credentialNetworkScope"} {
 		if _, ok := fc[key]; ok {
 			t.Errorf("stale metadata key %q survived the re-login: %v", key, fc)
 		}
+	}
+	// credentialKind is NOT optional metadata: it is the class the newly
+	// stored bearer's own prefix proves, so it is re-recorded (never left at
+	// the previous login's value, never dropped).
+	if fc["credentialKind"] != credentialKindAPI {
+		t.Errorf("credentialKind = %v, want %q (verified from the pagt_ bearer just stored)", fc["credentialKind"], credentialKindAPI)
 	}
 	// Unrelated keys survive the merge (enroll shares this file).
 	if fc["serverUrl"] != "https://cp.example" {

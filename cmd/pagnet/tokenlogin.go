@@ -46,7 +46,48 @@ const (
 	credentialKindAccount = "account"
 	credentialKindAccess  = "access"
 	credentialKindAPI     = "api" // legacy pagt_ (pre-AUTH-1 API token)
+	// credentialKindClient is a derived client credential whose own prefix
+	// proves no class the CLI can read — only the server knows what it can
+	// do. It is recorded rather than guessed (plan §7).
+	credentialKindClient = "client"
 )
+
+// verifiedCredentialKind is the credential class the bearer's OWN prefix
+// proves ("" when its prefix proves nothing). It is the authority for what
+// the CLI stores: a credential may be described by where it came from (the
+// pasted root), but the CLI may never claim a class the bearer contradicts.
+// That is the mislabeled state that broke `pagnet serve` — a pgn_pat_ sitting
+// in config.yaml under credentialKind: account hid the mismatch locally
+// while the server answered 403 account_authority_required (plan §7).
+func verifiedCredentialKind(bearer string) string {
+	switch {
+	case strings.HasPrefix(bearer, tokenPrefixAccount):
+		return credentialKindAccount
+	case strings.HasPrefix(bearer, tokenPrefixAccess):
+		return credentialKindAccess
+	case strings.HasPrefix(bearer, tokenPrefixLegacy):
+		return credentialKindAPI
+	default:
+		return ""
+	}
+}
+
+// credentialClassLabel names a credential class the way the human surface
+// does (plan §7: product text, never a wire value).
+func credentialClassLabel(kind string) string {
+	switch kind {
+	case credentialKindAccount:
+		return "your Pagnet Token"
+	case credentialKindAccess:
+		return "an Access Token"
+	case credentialKindAPI:
+		return "a legacy API token"
+	case credentialKindClient:
+		return "a derived client credential"
+	default:
+		return "a restricted credential"
+	}
+}
 
 // tokenExchangePath is the token-login exchange endpoint (POST, JSON
 // {"token": ...} → derived client credential). The spec authorizes the
@@ -232,7 +273,7 @@ func loginWithPastedToken(stateDir, account, server string, client *http.Client,
 		if !ok {
 			return nil, errors.New("the control plane rejected that API token")
 		}
-		if err := saveCredential(stateDir, account, server, pasted, credentialMeta{Kind: kind}); err != nil {
+		if err := saveCredential(stateDir, account, server, pasted, credentialMeta{Kind: kind, SourceKind: kind}); err != nil {
 			return nil, err
 		}
 		res.Summary = "verified the legacy API token (pagt_…); it stays the CLI bearer."
@@ -243,8 +284,13 @@ func loginWithPastedToken(stateDir, account, server string, client *http.Client,
 	if err != nil {
 		return nil, err
 	}
+	// The stored bearer is the DERIVED credential, not the pasted root. Its
+	// class is therefore whatever ITS own prefix proves; the root's class is
+	// recorded separately as the provenance. Labelling a derived credential
+	// with the root's class is exactly the mislabel that hid the incident
+	// (plan §7), and saveCredential refuses it.
 	meta := credentialMeta{
-		Kind:           kind,
+		SourceKind:     kind,
 		Role:           ex.Role,
 		NetworkScope:   ex.NetworkScope,
 		Networks:       ex.Networks,
@@ -291,9 +337,14 @@ func (r *pastedLoginResult) summary() string {
 
 // credentialMeta is the non-secret description of the stored bearer, kept
 // so later commands can render the account-vs-access distinction and the
-// expiry (governance §18-19). Every field is optional except Kind.
+// expiry (governance §18-19).
+//
+// Kind is the class of the BEARER being stored; SourceKind is the class of the
+// credential it was derived from (the pasted root). saveCredential owns Kind —
+// callers describe provenance, and the class is read off the material.
 type credentialMeta struct {
 	Kind           string
+	SourceKind     string
 	Role           string
 	NetworkScope   string
 	Networks       []string
@@ -318,6 +369,7 @@ func (m credentialMeta) fileFields() map[string]any {
 	}
 	return map[string]any{
 		"credentialKind":           orNil(m.Kind),
+		"credentialSourceKind":     orNil(m.SourceKind),
 		"credentialRole":           orNil(m.Role),
 		"credentialNetworkScope":   orNil(m.NetworkScope),
 		"credentialNetworks":       nets,
@@ -331,7 +383,28 @@ func (m credentialMeta) fileFields() map[string]any {
 // config-file fallback — governance §19) plus its non-secret metadata,
 // clearing the metadata keys the new login does not carry. stateDir is the
 // account's config dir; account scopes the keyring key.
+//
+// The recorded credentialKind is always the class the stored bearer's own
+// prefix proves. A caller that claims a different class is broken and fails
+// loudly here: "a pgn_pat_ persisted under credentialKind: account" was the
+// state that made `pagnet serve` fail with a 403 the local config described
+// as an account login, and it is now unrepresentable (plan §7).
 func saveCredential(stateDir, account, server, bearer string, meta credentialMeta) error {
+	if verified := verifiedCredentialKind(bearer); verified != "" {
+		if meta.Kind != "" && meta.Kind != verified {
+			return fmt.Errorf("credential mismatch: the bearer being stored is %s, so it cannot be recorded as %s",
+				credentialClassLabel(verified), credentialClassLabel(meta.Kind))
+		}
+		meta.Kind = verified
+	} else if meta.Kind == "" {
+		// A derived client credential carries no class its prefix proves;
+		// the provenance (the class it was exchanged from) is the honest
+		// label, and credentialKindClient is the fallback.
+		meta.Kind = meta.SourceKind
+		if meta.Kind == "" {
+			meta.Kind = credentialKindClient
+		}
+	}
 	fields := meta.fileFields()
 	if server != "" {
 		fields["serverUrl"] = strings.TrimSuffix(server, "/")

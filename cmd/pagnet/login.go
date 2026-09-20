@@ -720,9 +720,14 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 		base += "/"
 	}
 	client := &http.Client{Timeout: 60 * time.Second}
+	// The credential slot is the account's config dir (see
+	// authenticateUserFresh): stateDir is the machine dir for every REST
+	// command, and the account migration has already moved the credential out
+	// of it.
+	accDir := accountConfigDir(stateDir, account)
 
 	// 1. A stored token that still validates is the one to use.
-	if tok := loadUserToken(stateDir, account, base); tok != "" {
+	if tok := loadUserToken(accDir, account, base); tok != "" {
 		if ok, err := bearerMe(client, base, tok); err == nil && ok {
 			return tok, nil
 		}
@@ -743,10 +748,10 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 		if err != nil {
 			return "", err
 		}
-		if err := saveUserToken(stateDir, account, base, tok); err != nil {
+		if err := saveUserToken(accDir, account, base, tok); err != nil {
 			return "", err
 		}
-		fmt.Printf("signed in; token stored in %s\n", stateDir)
+		fmt.Printf("signed in; token stored in %s\n", accDir)
 		return tok, nil
 	case "local", "accounts":
 		// "accounts" is the canonical name of the DB-user auth mode;
@@ -765,10 +770,10 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 		if err != nil {
 			return "", err
 		}
-		if err := saveUserToken(stateDir, account, base, tok); err != nil {
+		if err := saveUserToken(accDir, account, base, tok); err != nil {
 			return "", err
 		}
-		fmt.Printf("signed in; token stored in %s\n", stateDir)
+		fmt.Printf("signed in; token stored in %s\n", accDir)
 		return tok, nil
 	case "token":
 		return "", errors.New("the server is in token mode: the admin token cannot be minted by a sign-in flow — set --token / $PAGNET_TOKEN to the admin token (the server prints it once at startup when PAGNET_ADMIN_TOKEN is unset)")
