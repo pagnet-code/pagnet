@@ -46,6 +46,20 @@ const (
 // (/api/v1/agents/{id}/credentials, /api/v1/services/{id}/credentials).
 func (k principalKind) restResource() string { return string(k) + "s" }
 
+// article is the indefinite article for a noun, because the kind name is
+// interpolated into generated help text and prose ("an agent", "a service").
+func article(noun string) string {
+	if noun == "" {
+		return "a"
+	}
+	switch noun[:1] {
+	case "a", "e", "i", "o", "u":
+		return "an"
+	default:
+		return "a"
+	}
+}
+
 // credentialCollection is the credential endpoint for one principal id. The
 // id space is whatever that surface addresses (definition id for agents,
 // principal id for services).
@@ -235,8 +249,9 @@ func (c *cliCtx) resolvePrincipalRef(kind principalKind, arg string) (principalR
 				return principalRef{}, fmt.Errorf("service %q not found", arg)
 			}
 			if det.Principal.Kind != string(principalService) {
-				return principalRef{}, fmt.Errorf("%q is a %s, but `pagnet service credential` manages services",
-					arg, orDash(det.Principal.Kind))
+				found := orDash(det.Principal.Kind)
+				return principalRef{}, fmt.Errorf("%q is %s %s, but `pagnet service credential` manages services",
+					arg, article(found), found)
 			}
 			return principalRef{Kind: kind, ID: det.Principal.ID, Name: det.Principal.Name}, nil
 		}
@@ -310,7 +325,7 @@ func credentialCreateCmd(kind principalKind) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "create <" + string(kind) + "-id-or-name>",
-		Short: fmt.Sprintf("Create a credential for a %s (prints the secret once)", kind),
+		Short: fmt.Sprintf("Create a credential for %s %s (prints the secret once)", article(string(kind)), kind),
 		Long: `Create a credential the ` + string(kind) + ` can authenticate with.
 
 The credential is the durable endpoint credential the Go SDK presents
@@ -550,7 +565,7 @@ func parseExpiry(v string) (string, error) {
 func credentialListCmd(kind principalKind) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list <" + string(kind) + "-id-or-name>",
-		Short: fmt.Sprintf("List a %s's credentials (metadata only — never the secret)", kind),
+		Short: fmt.Sprintf("List %s %s's credentials (metadata only — never the secret)", article(string(kind)), kind),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := newCLI("")
