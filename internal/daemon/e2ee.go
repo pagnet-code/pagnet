@@ -231,12 +231,22 @@ type encryptedField struct {
 //   - network_event_publish: payload -> event_payload envelope (V2).
 //   - network_invoke: input -> invocation_input envelope (V2).
 func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMessage) (json.RawMessage, string) {
-	if row.NetworkID == "" {
-		return args, ""
-	}
 	var m map[string]any
 	if err := json.Unmarshal(args, &m); err != nil {
 		return args, "" // unparseable: relay as-is (the server validates)
+	}
+	// The effective network for the crypto decision: the instance's own
+	// network, or — for a network-NULL instance (a representative) driving a
+	// control tool — the target network the call names explicitly. Without
+	// this a rep's control_ask/control_reply/control_delegate would skip
+	// encryption (row.NetworkID is empty) and send a plaintext body that the
+	// active target network rejects (private_network_plaintext_rejected).
+	networkID := row.NetworkID
+	if networkID == "" {
+		networkID, _ = m["networkId"].(string)
+	}
+	if networkID == "" {
+		return args, ""
 	}
 	// The protected field(s) this tool call carries, extracted first: a
 	// tool call with NO protected content is metadata-only and runs on any
@@ -363,7 +373,7 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 	// The call carries content: the network crypto MUST be active (D6 —
 	// no plaintext path). Provisioning networks refuse with the clear
 	// "being secured" state.
-	st, err := d.contentCryptoReady(row.NetworkID)
+	st, err := d.contentCryptoReady(networkID)
 	if err != nil {
 		return nil, err.Error()
 	}
