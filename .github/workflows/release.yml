@@ -111,6 +111,20 @@ jobs:
           set -euo pipefail
           api() { curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"; }
           base="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # RERUN-SAFE: if a release already exists for this tag (a rerun of
+          # a run that failed after creation, or a manual republish), reuse
+          # it and replace same-named assets instead of POSTing a duplicate
+          # (the API answers 409/422 for an existing tag).
+          rel=$(api "${base}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null || true)
+          rel_id=$(echo "${rel}" | jq -r '.id // empty' 2>/dev/null || true)
+          shopt -s nullglob
+          if [ -n "${rel_id}" ]; then
+            echo "reusing existing release ${rel_id} for ${GITHUB_REF_NAME}"
+            for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
+              aid=$(api "${base}/releases/${rel_id}/assets" | jq -r --arg n "$(basename "$f")" '.[] | select(.name == $n) | .id' | head -1)
+              if [ -n "${aid}" ]; then api -X DELETE "${base}/releases/assets/${aid}" >/dev/null; fi
+            done
+          else
           # A regular (non-prerelease) release is the "Latest" one GitHub
           # shows; target_commitish pins the tag if it does not exist yet.
           # jq object values are simple expressions only — the body is
@@ -119,14 +133,14 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" --arg body "pagnet ${GITHUB_REF_NAME}" \
                  '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: false, prerelease: false, body: $body}')")
-          # The API's upload_url is a TEMPLATE (.../assets{?name,label}):
-          # substitute the template part — appending ?name= to it yields a
-          # malformed URL (400).
-          upload=$(echo "$rel" | jq -r .upload_url)
-          upload_base="${upload%%{*}"
+          rel_id=$(echo "$rel" | jq -r .id)
+          fi
+          # Uploads go to uploads.github.com (not the API host). The API's
+          # upload_url is a template for this same path; composing it
+          # directly keeps both branches on one code path.
+          upload_base="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets"
           # nullglob: an unmatched manifest glob expands to nothing, so an
           # unsigned release uploads only the tarballs.
-          shopt -s nullglob
           for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
             # -L: the asset upload URL redirects to the storage backend.
             api -L "${upload_base}?name=$(basename "$f")" \
