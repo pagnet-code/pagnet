@@ -14,7 +14,7 @@ import (
 func listCmd() *cobra.Command {
 	var network string
 	cmd := &cobra.Command{
-		Use:   "list <networks|hosts|agents|tasks|messages|instances|services|events|subscriptions>",
+		Use:   "list <networks|hosts|agents|tasks|messages|instances|services|events>",
 		Short: "List objects in the control plane",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -57,7 +57,7 @@ func runList(c *cliCtx, target, network string) error {
 			rows = append(rows, []string{h.Name, h.Status, orDash(h.OS) + "/" + orDash(h.Arch), h.ID})
 		}
 		printTable([]string{"NAME", "STATUS", "OS", "ID"}, rows)
-	case "agents", "tasks", "messages", "instances", "services", "events", "subscriptions":
+	case "agents", "tasks", "messages", "instances", "services", "events":
 		netID, _, err := c.resolveNetwork(network)
 		if err != nil {
 			return err
@@ -189,26 +189,16 @@ func runList(c *cliCtx, target, network string) error {
 				rows = append(rows, []string{id, typ, orDash(target), orDash(ts)})
 			}
 			printTable([]string{"ID", "TYPE", "TARGET", "TIME"}, rows)
-		case "subscriptions":
-			var subs []v2Subscription
-			if err := c.get("/api/v1/networks/"+netID+"/subscriptions", &subs); err != nil {
-				return err
-			}
-			if jsonOut {
-				return printJSON(subs)
-			}
-			if len(subs) == 0 {
-				fmt.Println("no subscriptions in this network")
-				return nil
-			}
-			rows := make([][]string, 0, len(subs))
-			for _, s := range subs {
-				rows = append(rows, []string{s.sID(), s.Pattern, orDash(s.Mode)})
-			}
-			printTable([]string{"ID", "PATTERN", "MODE"}, rows)
 		}
+	case "subscriptions":
+		// Subscriptions are the subscriber's own surface: the control plane
+		// answers a user actor 404 (anti-enumeration — the SDK is the
+		// subscription manager), and the standalone `pagnet subscriptions`
+		// acts with the endpoint credential. The redirect is local — no
+		// round trip on a route this bearer cannot use.
+		return fmt.Errorf("subscriptions are the agent's or service's own surface — list them with `pagnet subscriptions`, which acts with the endpoint credential")
 	default:
-		return fmt.Errorf("unknown list target %q (networks|hosts|agents|tasks|messages|instances|services|events|subscriptions)", target)
+		return fmt.Errorf("unknown list target %q (networks|hosts|agents|tasks|messages|instances|services|events)", target)
 	}
 	return nil
 }

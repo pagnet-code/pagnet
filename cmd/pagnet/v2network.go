@@ -619,12 +619,32 @@ func (s v2Subscription) sID() string {
 
 func subscribeCmd() *cobra.Command {
 	var network string
+	var actor principalActorOptions
 	cmd := &cobra.Command{
 		Use:   "subscribe <pattern>",
-		Short: "Subscribe to a network event pattern (dot-separated, * wildcards)",
-		Args:  cobra.ExactArgs(1),
+		Short: "Subscribe to a network event pattern (dot-separated, * wildcards; needs the agent's or service's endpoint credential)",
+		Long: `Subscribe the calling agent or service to a network event pattern.
+
+Subscriptions are the subscriber's own surface: the control plane answers a
+signed-in user 404 (anti-enumeration — the SDK is the subscription manager), so
+this command is acted on by the agent or service itself and needs its endpoint
+credential:
+
+  pagnet subscribe build.* --credential ` + tokenPrefixEndpoint + `...
+  pagnet subscribe build.* --as <agent-or-service-id>
+
+With no flag the credential comes from $` + sdk.EnvCredential + `, then from the endpoint credential
+already stored on this host. pagnet service credential create <service> (or
+pagnet agent credential create <agent>) prints one once.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newCLI("")
+			// There is no user-bearer path here to fall back on: a human actor
+			// is answered 404 by design, so the CLI says so locally (naming the
+			// credential that works) instead of spending a round trip on a 404
+			// that explains nothing. The credential is still proven before any
+			// request, and a principal actor's genuine 404 — a network it is
+			// not a member of — is surfaced as the server's own answer.
+			c, err := newPrincipalCLI("", actor)
 			if err != nil {
 				return err
 			}
@@ -646,6 +666,7 @@ func subscribeCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
+	actor.register(cmd)
 	return cmd
 }
 
@@ -710,12 +731,32 @@ pagnet agent credential create <agent>) prints one once.`,
 
 func unsubscribeCmd() *cobra.Command {
 	var network string
+	var actor principalActorOptions
 	cmd := &cobra.Command{
 		Use:   "unsubscribe <subscription-id>",
-		Short: "Cancel an event subscription",
-		Args:  cobra.ExactArgs(1),
+		Short: "Cancel an event subscription (needs the agent's or service's endpoint credential)",
+		Long: `Cancel one of the calling agent or service's event subscriptions.
+
+Subscriptions are the subscriber's own surface: the control plane answers a
+signed-in user 404 (anti-enumeration — the SDK is the subscription manager), so
+this command is acted on by the agent or service itself and needs its endpoint
+credential:
+
+  pagnet unsubscribe <subscription-id> --credential ` + tokenPrefixEndpoint + `...
+  pagnet unsubscribe <subscription-id> --as <agent-or-service-id>
+
+With no flag the credential comes from $` + sdk.EnvCredential + `, then from the endpoint credential
+already stored on this host. pagnet service credential create <service> (or
+pagnet agent credential create <agent>) prints one once.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newCLI("")
+			// There is no user-bearer path here to fall back on: a human actor
+			// is answered 404 by design, so the CLI says so locally (naming the
+			// credential that works) instead of spending a round trip on a 404
+			// that explains nothing. The credential is still proven before any
+			// request, and a principal actor's genuine 404 — a network it is
+			// not a member of — is surfaced as the server's own answer.
+			c, err := newPrincipalCLI("", actor)
 			if err != nil {
 				return err
 			}
@@ -733,6 +774,7 @@ func unsubscribeCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
+	actor.register(cmd)
 	return cmd
 }
 
