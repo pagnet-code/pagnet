@@ -28,8 +28,9 @@ const (
 	testServiceID  = "01900000-0000-7000-8000-0000000000b1"
 	testCredID     = "01900000-0000-7000-8000-0000000000c1"
 	// testCredSecret is a well-formed durable endpoint credential (the class
-	// the SDK presents).
-	testCredSecret = "pgn_epd_v1_Qz9Xk2WeRt5Yu8Io_zyxwvutsrqponmlkjihgfedcba9876543210ZYXWVUT"
+	// the SDK presents): the control plane's 43-char lookup + 43-char secret
+	// shape.
+	testCredSecret = "pgn_epd_v1_Qz9Xk2WeRt5Yu8Iozyxwvutsrqponmlkjihgfedcba987_6543210ZYXWVUTzyxwvutsrqponmlkjihgfedcbaQz9"
 )
 
 // credMembership is the network view both surfaces resolve through: one agent

@@ -164,6 +164,25 @@ func isBase64URL(s string) bool {
 	return len(s) > 0
 }
 
+// checkPrincipalCredentialShape validates the "<lookup-id>_<secret>" tail of
+// a pgn_act_ / pgn_epd_ credential. The control plane's principal-credential
+// engine (pagnet-server internal/store, mintPrincipalCredential) mints a
+// 32-byte lookup id and a 32-byte secret — 43 base64url characters EACH —
+// which is WIDER than the token-first credentials' 12-byte (16-char) lookup,
+// so checkTokenShape does not apply to principal credentials. POSITIONAL,
+// exactly like the server's parser (parsePrincipalCredential): base64url
+// contains "_", so the lengths are fixed by the version in the prefix.
+func checkPrincipalCredentialShape(rest string) error {
+	const lookupLen, secretLen = 43, 43
+	if len(rest) != lookupLen+1+secretLen || rest[lookupLen] != '_' {
+		return errors.New("expected a 43-char lookup id, \"_\", and a 43-char secret (base64url)")
+	}
+	if !isBase64URL(rest[:lookupLen]) || !isBase64URL(rest[lookupLen+1:]) {
+		return errors.New("expected base64url characters (A-Za-z0-9-_)")
+	}
+	return nil
+}
+
 // --- the hidden paste prompt --------------------------------------------------
 
 // askPagnetToken reads the pasted Pagnet Token with echo off (governance

@@ -42,14 +42,15 @@ const (
 	principalTenantID = "tenant-1"
 )
 
-// testEndpointCred is a well-formed durable endpoint credential: the server's
-// positional shape (16-char base64url lookup id, "_", 43-char base64url
-// secret) after the pgn_epd_v1_ prefix.
-var testEndpointCred = tokenPrefixEndpoint + strings.Repeat("k", 16) + "_" + strings.Repeat("s", 43)
+// testEndpointCred is a well-formed durable endpoint credential: the
+// control plane's positional shape (43-char base64url lookup id, "_",
+// 43-char base64url secret — mintPrincipalCredential mints 32 bytes for
+// EACH half) after the pgn_epd_v1_ prefix.
+var testEndpointCred = tokenPrefixEndpoint + strings.Repeat("k", 43) + "_" + strings.Repeat("s", 43)
 
 // testActivationCred is the one-time credential of the same shape. It must be
 // rejected on this surface: it is consumed by the endpoint's first connect.
-var testActivationCred = tokenPrefixPrincipalActivation + strings.Repeat("a", 16) + "_" + strings.Repeat("z", 43)
+var testActivationCred = tokenPrefixPrincipalActivation + strings.Repeat("a", 43) + "_" + strings.Repeat("z", 43)
 
 // callCount counts what reached a fake control plane — the local-validation
 // tests only mean something if the answer is zero.
@@ -288,7 +289,7 @@ func TestInvokeAsPrincipalWithCredential(t *testing.T) {
 	stateDir, epochID, key := activePrincipalHost(t, home)
 	// The stored credential must NOT be what is used here: --credential wins,
 	// and it is a different secret.
-	storeEndpointCredential(t, stateDir, "01a0c000-0000-7000-8000-000000000001", "pgn_epd_v1_"+strings.Repeat("d", 16)+"_"+strings.Repeat("d", 43))
+	storeEndpointCredential(t, stateDir, "01a0c000-0000-7000-8000-000000000001", "pgn_epd_v1_"+strings.Repeat("d", 43)+"_"+strings.Repeat("d", 43))
 
 	srv := newPrincipalInvokeServer(t, key, epochID)
 	principalEnv(t, srv.srv, home)
@@ -441,8 +442,8 @@ func TestInvokeUsesStoredEndpointCredential(t *testing.T) {
 		principalA = "01a0c000-0000-7000-8000-00000000000a"
 		principalB = "01a0c000-0000-7000-8000-00000000000b"
 	)
-	credA := tokenPrefixEndpoint + strings.Repeat("a", 16) + "_" + strings.Repeat("1", 43)
-	credB := tokenPrefixEndpoint + strings.Repeat("b", 16) + "_" + strings.Repeat("2", 43)
+	credA := tokenPrefixEndpoint + strings.Repeat("a", 43) + "_" + strings.Repeat("1", 43)
+	credB := tokenPrefixEndpoint + strings.Repeat("b", 43) + "_" + strings.Repeat("2", 43)
 
 	t.Run("the only stored credential is used", func(t *testing.T) {
 		home := t.TempDir()
@@ -725,7 +726,7 @@ func TestSubscriptionsUsesStoredEndpointCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	const principalA = "01a0c000-0000-7000-8000-00000000000a"
-	credA := tokenPrefixEndpoint + strings.Repeat("a", 16) + "_" + strings.Repeat("1", 43)
+	credA := tokenPrefixEndpoint + strings.Repeat("a", 43) + "_" + strings.Repeat("1", 43)
 	storeEndpointCredential(t, stateDir, principalA, credA)
 
 	ts := subscriptionStub(t)

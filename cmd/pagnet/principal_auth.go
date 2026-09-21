@@ -184,7 +184,9 @@ func noPrincipalCredentialError(storeDir string) error {
 // live secret.
 func validateEndpointCredential(bearer string) error {
 	if strings.HasPrefix(bearer, tokenPrefixEndpoint) {
-		if err := checkTokenShape(bearer[len(tokenPrefixEndpoint):]); err != nil {
+		// Principal credentials carry the control plane's wider 43-char
+		// lookup id (not the token-first 16-char one).
+		if err := checkPrincipalCredentialShape(bearer[len(tokenPrefixEndpoint):]); err != nil {
 			return fmt.Errorf("malformed endpoint credential (%s...): %v", tokenPrefixEndpoint, err)
 		}
 		return nil
