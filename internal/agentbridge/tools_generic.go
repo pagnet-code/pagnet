@@ -37,12 +37,15 @@ func RegisterGenericTools(s *server.MCPServer, br *Bridge) {
 
 	// network_invoke: call a capability (its input is E2EE to the owner).
 	s.AddTool(mcp.NewTool("network_invoke",
-		mcp.WithDescription("Invoke a capability (a versioned verb offered by an agent or service). The input is encrypted end-to-end to the capability's owner; the result is returned to you. Pass idempotencyKey to make a retried call safe (not re-executed)."+peerDescription),
+		mcp.WithDescription("Invoke a capability (a versioned verb offered by an agent or service). The input is encrypted end-to-end to the capability's owner; the result is returned to you. Address the call with toAgent (an agent name) or toPrincipalId (a principal id) — at least one is required. Pass idempotencyKey to make a retried call safe (not re-executed)."+peerDescription),
 		mcp.WithString("capability", mcp.Required(), mcp.Description("the capability id to invoke (e.g. documents.extract)")),
+		mcp.WithString("toAgent", mcp.Description("target agent name (at least one of toAgent / toPrincipalId is required)")),
+		mcp.WithString("toPrincipalId", mcp.Description("target principal id (at least one of toAgent / toPrincipalId is required)")),
 		mcp.WithObject("input", mcp.Required(), mcp.Description("the invocation input — a JSON object; shape defined by the capability's input schema"), allowAnyKeys),
 		mcp.WithString("idempotencyKey", mcp.Description("optional idempotency key (a retried call with the same key is not re-executed)")),
 	), br.Handle("network_invoke", map[string]any{
-		"capability": "string", "input": "object", "idempotencyKey": "string",
+		"capability": "string", "toAgent": "string", "toPrincipalId": "string",
+		"input": "object", "idempotencyKey": "string",
 	}))
 
 	// network_event_publish: publish a typed network event (payload E2EE).

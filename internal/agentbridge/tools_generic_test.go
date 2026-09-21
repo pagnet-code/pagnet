@@ -153,8 +153,8 @@ func TestGenericTools_RelayArgs(t *testing.T) {
 		},
 		{
 			"network_invoke",
-			map[string]any{"capability": "documents.extract", "input": map[string]any{"uri": "https://example.com/a.pdf", "pages": []any{float64(1), float64(2)}}, "idempotencyKey": "idem-1", "bogus": true},
-			map[string]any{"capability": "documents.extract", "input": map[string]any{"uri": "https://example.com/a.pdf", "pages": []any{float64(1), float64(2)}}, "idempotencyKey": "idem-1"},
+			map[string]any{"capability": "documents.extract", "toAgent": "docs-svc", "toPrincipalId": "prin-1", "input": map[string]any{"uri": "https://example.com/a.pdf", "pages": []any{float64(1), float64(2)}}, "idempotencyKey": "idem-1", "bogus": true},
+			map[string]any{"capability": "documents.extract", "toAgent": "docs-svc", "toPrincipalId": "prin-1", "input": map[string]any{"uri": "https://example.com/a.pdf", "pages": []any{float64(1), float64(2)}}, "idempotencyKey": "idem-1"},
 		},
 		{
 			"network_event_publish",

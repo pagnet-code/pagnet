@@ -460,13 +460,21 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 		}
 	case "network_invoke":
 		objectType = e2ee.ObjectTypeInvocationInput
-		// The AGENT-FACING name is read on purpose (wireArgs renames it onto
-		// the control plane's "capabilityId" afterwards): the AAD must bind
-		// what the agent actually asked for, so the encryption layer always
-		// sees the tool's own argument names and only the bytes crossing the
-		// cloud boundary are renamed — the same ordering that makes
+		// The AAD's recipient names the ADDRESSED principal — the same
+		// binding the CLI and SDK use (their AAD recipient is the target
+		// principal id). When the call names no principal id, fall back to
+		// the capability id the agent asked for. The AGENT-FACING name is
+		// read on purpose (wireArgs renames it onto the control plane's
+		// "capabilityId" afterwards): the AAD must bind what the agent
+		// actually asked for, so the encryption layer always sees the
+		// tool's own argument names and only the bytes crossing the cloud
+		// boundary are renamed — the same ordering that makes
 		// network_event_publish bind its recipient from "target".
-		if t, _ := m["capability"].(string); t != "" {
+		// ("toPrincipalId" is already the wire name; wireArgs passes it
+		// through unchanged.)
+		if t, _ := m["toPrincipalId"].(string); t != "" {
+			recipient = t
+		} else if t, _ := m["capability"].(string); t != "" {
 			recipient = t
 		}
 	}

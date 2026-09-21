@@ -686,6 +686,32 @@ func TestDaemon_ActiveNetworkEncryptsContent(t *testing.T) {
 	if !strings.Contains(plain, "https://example.com/a.pdf") {
 		t.Fatalf("invoke input round-trip = %q", plain)
 	}
+
+	// network_invoke that ADDRESSES a principal: the AAD's recipient names
+	// the addressed principal (the CLI/SDK binding), not the capability —
+	// and the round trip still holds against the re-bound AAD.
+	out, errMsg = d.encryptToolArgs(row, "network_invoke",
+		[]byte(`{"capability":"documents.extract","toPrincipalId":"prin-addr","input":{"uri":"https://example.com/b.pdf"}}`))
+	if errMsg != "" {
+		t.Fatalf("active network: addressed invoke refused: %q", errMsg)
+	}
+	var invAddr struct {
+		Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD      e2ee.AAD                `json:"aad"`
+	}
+	if err := json.Unmarshal(out, &invAddr); err != nil {
+		t.Fatal(err)
+	}
+	if invAddr.AAD.Recipient != "prin-addr" {
+		t.Fatalf("addressed invoke AAD.Recipient = %q, want the addressed principal prin-addr", invAddr.AAD.Recipient)
+	}
+	plain, err = d.decryptProtected(networkID, invAddr.Envelope, invAddr.AAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plain, "https://example.com/b.pdf") {
+		t.Fatalf("addressed invoke input round-trip = %q", plain)
+	}
 }
 
 // A network-NULL instance (a representative) names a TARGET network it may or
