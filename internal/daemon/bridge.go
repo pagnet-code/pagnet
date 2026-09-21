@@ -326,6 +326,13 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 var toolArgsWire = map[string]map[string]string{
 	"network_event_publish": {"type": "eventType", "target": "targetPrincipalId"},
 	"network_subscribe":     {"pattern": "eventPattern", "mode": "deliveryMode"},
+	// network_invoke: the agent-facing tool advertises the short "capability"
+	// name (tools_generic.go); the control plane's toolInvoke decodes
+	// "capabilityId" and answers "capabilityId required" when it is absent.
+	// Its decode is a plain json.Unmarshal (NOT the strict decodeBody the REST
+	// API uses), so the agent-facing name is silently dropped rather than
+	// rejected — the call can never reach the invoke.
+	"network_invoke": {"capability": "capabilityId"},
 }
 
 // wireArgs applies toolArgsWire to one relayed call.

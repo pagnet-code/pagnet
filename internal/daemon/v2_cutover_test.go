@@ -652,15 +652,32 @@ func TestDaemon_ActiveNetworkEncryptsContent(t *testing.T) {
 		t.Fatalf("active network: invoke refused: %q", errMsg)
 	}
 	var inv struct {
-		InputObjectID string                  `json:"inputObjectID"`
-		Envelope      e2ee.EncryptedPayloadV1 `json:"envelope"`
-		AAD           e2ee.AAD                `json:"aad"`
+		InvocationID string                  `json:"invocationId"`
+		Envelope     e2ee.EncryptedPayloadV1 `json:"envelope"`
+		AAD          e2ee.AAD                `json:"aad"`
 	}
 	if err := json.Unmarshal(out, &inv); err != nil {
 		t.Fatal(err)
 	}
 	if inv.AAD.Recipient != "documents.extract" || inv.AAD.ObjectType != e2ee.ObjectTypeInvocationInput {
 		t.Fatalf("invoke AAD = %+v, want recipient documents.extract / type %s", inv.AAD, e2ee.ObjectTypeInvocationInput)
+	}
+	// The client-minted object id travels under the name the control plane
+	// decodes, and it is the id the AAD binds (the two must agree or the
+	// target decrypts against a different object id than the one protected).
+	if inv.InvocationID == "" {
+		t.Fatalf("invoke args carry no invocationId (the field the control plane decodes): %s", out)
+	}
+	if inv.AAD.ObjectID != inv.InvocationID {
+		t.Fatalf("invoke AAD.ObjectID = %q, want the invocationId %q", inv.AAD.ObjectID, inv.InvocationID)
+	}
+	var invMap map[string]any
+	_ = json.Unmarshal(out, &invMap)
+	if _, ok := invMap["inputObjectID"]; ok {
+		t.Error(`the invoke args still emit "inputObjectID" — the control plane drops unknown fields and mints its own invocation id`)
+	}
+	if _, ok := invMap["input"]; ok {
+		t.Error("the plaintext input survived the rewrite")
 	}
 	plain, err = d.decryptProtected(networkID, inv.Envelope, inv.AAD)
 	if err != nil {

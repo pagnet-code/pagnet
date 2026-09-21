@@ -390,7 +390,14 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 		plainContent = string(inputBytes)
 		setEncrypted = func(env e2ee.EncryptedPayloadV1, aad e2ee.AAD, objectID string) {
 			delete(m, "input")
-			m["inputObjectID"] = objectID
+			// The client-minted object id the AAD binds travels under the
+			// name the control plane decodes ("invocationId" —
+			// agent_requests.go toolInvoke), the same contract the CLI's REST
+			// path and sdk/rest.go use. The agent-command decode is LENIENT,
+			// so a foreign key is silently DROPPED rather than rejected: the
+			// server then mints its own invocation id and the AAD's bound
+			// object id no longer matches the row it protects.
+			m["invocationId"] = objectID
 			m["envelope"] = env
 			m["aad"] = aad
 		}
@@ -453,6 +460,12 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 		}
 	case "network_invoke":
 		objectType = e2ee.ObjectTypeInvocationInput
+		// The AGENT-FACING name is read on purpose (wireArgs renames it onto
+		// the control plane's "capabilityId" afterwards): the AAD must bind
+		// what the agent actually asked for, so the encryption layer always
+		// sees the tool's own argument names and only the bytes crossing the
+		// cloud boundary are renamed — the same ordering that makes
+		// network_event_publish bind its recipient from "target".
 		if t, _ := m["capability"].(string); t != "" {
 			recipient = t
 		}
