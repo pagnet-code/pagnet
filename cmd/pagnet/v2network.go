@@ -651,12 +651,32 @@ func subscribeCmd() *cobra.Command {
 
 func subscriptionsCmd() *cobra.Command {
 	var network string
+	var actor principalActorOptions
 	cmd := &cobra.Command{
 		Use:   "subscriptions",
-		Short: "List event subscriptions in the network",
-		Args:  cobra.NoArgs,
+		Short: "List the event subscriptions your agent or service holds in this network (needs its endpoint credential)",
+		Long: `List the event subscriptions the calling agent or service owns in this network.
+
+Subscriptions are the subscriber's own surface: the control plane answers a
+signed-in user 404 (anti-enumeration — the SDK is the subscription manager), so
+this command is acted on by the agent or service itself and needs its endpoint
+credential:
+
+  pagnet subscriptions --credential ` + tokenPrefixEndpoint + `...
+  pagnet subscriptions --as <agent-or-service-id>
+
+With no flag the credential comes from $` + sdk.EnvCredential + `, then from the endpoint credential
+already stored on this host. pagnet service credential create <service> (or
+pagnet agent credential create <agent>) prints one once.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c, err := newCLI("")
+			// There is no user-bearer path here to fall back on: a human actor
+			// is answered 404 by design, so the CLI says so locally (naming the
+			// credential that works) instead of spending a round trip on a 404
+			// that explains nothing. The credential is still proven before any
+			// request, and a principal actor's genuine 404 — a network it is
+			// not a member of — is surfaced as the server's own answer.
+			c, err := newPrincipalCLI("", actor)
 			if err != nil {
 				return err
 			}
@@ -672,7 +692,7 @@ func subscriptionsCmd() *cobra.Command {
 				return printJSON(subs)
 			}
 			if len(subs) == 0 {
-				fmt.Println("no subscriptions in this network")
+				fmt.Println("no subscriptions for this agent or service in this network")
 				return nil
 			}
 			rows := make([][]string, 0, len(subs))
@@ -684,6 +704,7 @@ func subscriptionsCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
+	actor.register(cmd)
 	return cmd
 }
 

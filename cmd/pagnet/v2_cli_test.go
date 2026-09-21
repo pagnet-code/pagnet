@@ -37,6 +37,7 @@ type stubV2Server struct {
 	ts        *httptest.Server
 	responses map[string]string
 	calls     []string
+	bearers   []string
 }
 
 func newStubV2Server(t *testing.T, responses map[string]string) *stubV2Server {
@@ -46,6 +47,7 @@ func newStubV2Server(t *testing.T, responses map[string]string) *stubV2Server {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
 		s.calls = append(s.calls, r.Method+" "+r.URL.Path+" "+string(body))
+		s.bearers = append(s.bearers, r.Header.Get("Authorization"))
 		resp, ok := s.responses[r.URL.Path]
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -58,6 +60,26 @@ func newStubV2Server(t *testing.T, responses map[string]string) *stubV2Server {
 	}))
 	t.Cleanup(s.ts.Close)
 	return s
+}
+
+// allBearers is the Authorization header of every request that arrived, in
+// order — the principal-actor tests assert that a human bearer never appears.
+func (s *stubV2Server) allBearers() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.bearers))
+	copy(out, s.bearers)
+	return out
+}
+
+// callLog is the recorded "METHOD path body" of every request, for failure
+// messages.
+func (s *stubV2Server) callLog() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.calls))
+	copy(out, s.calls)
+	return out
 }
 
 func (s *stubV2Server) hasCall(substr string) bool {
@@ -238,7 +260,8 @@ func TestSearchCmdJSONGolden(t *testing.T) {
 }
 
 // TestSubscriptionsCmdJSONGolden: `pagnet subscriptions --json` renders the
-// subscription list exactly.
+// subscription list exactly. The route is the subscriber's own (a user actor
+// is answered 404), so the command acts as the agent or service.
 func TestSubscriptionsCmdJSONGolden(t *testing.T) {
 	ts := newStubV2Server(t, map[string]string{
 		"/api/v1/networks":                     `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
@@ -248,7 +271,7 @@ func TestSubscriptionsCmdJSONGolden(t *testing.T) {
 	jsonOut = true
 
 	cmd := subscriptionsCmd()
-	cmd.SetArgs(nil)
+	cmd.SetArgs([]string{"--credential", testEndpointCred})
 	out, err := captureStdoutErr(t, func() error { return cmd.Execute() })
 	if err != nil {
 		t.Fatalf("subscriptions: %v", err)

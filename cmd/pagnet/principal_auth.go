@@ -171,9 +171,10 @@ var errNoPrincipalCredential = errors.New("no agent or service credential is ava
 // suggests the human credential that cannot work here.
 func noPrincipalCredentialError(storeDir string) error {
 	return fmt.Errorf("%w — invocations and subscriptions are made by an agent or a service, "+
-		"never by the signed-in user. Create the endpoint credential with `pagnet service credential create <service>` "+
-		"(or `pagnet agent credential create <agent>`), then pass it with --credential or $%s "+
-		"(this host stores credentials under %s/principals/)", errNoPrincipalCredential, sdk.EnvCredential, storeDir)
+		"never by the signed-in user. Create that participant's endpoint credential (%s...) with "+
+		"`pagnet service credential create <service>` (or `pagnet agent credential create <agent>`), "+
+		"then pass it with --credential or $%s (this host stores credentials under %s/principals/)",
+		errNoPrincipalCredential, tokenPrefixEndpoint, sdk.EnvCredential, storeDir)
 }
 
 // validateEndpointCredential proves a bearer is a durable principal endpoint

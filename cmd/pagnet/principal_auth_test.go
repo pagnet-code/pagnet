@@ -407,6 +407,7 @@ func TestEndpointCredentialValidatedLocally(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := newStubV2Server(t, map[string]string{})
 			cliEnv(t, ts.ts)
+			t.Setenv("PAGNET_STATE_DIR", "")
 			userToken = "test-token"
 			t.Setenv("PAGNET_CREDENTIAL", "")
 
@@ -562,6 +563,186 @@ func TestPrincipalCredentialRejectionText(t *testing.T) {
 	for _, gone := range []string{"pagnet login", "PAGNET_TOKEN", "http 401"} {
 		if strings.Contains(msg, gone) {
 			t.Errorf("the human-bearer advice leaked into a principal-actor error (%s): %q", gone, msg)
+		}
+	}
+}
+
+// --- pagnet subscriptions (W10 G0(4)) -------------------------------------------
+
+// subscriptionStub is a control plane exposing only what `pagnet
+// subscriptions` calls: network resolution and the subscriber's own list.
+func subscriptionStub(t *testing.T) *stubV2Server {
+	t.Helper()
+	return newStubV2Server(t, map[string]string{
+		"/api/v1/networks":                     `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+		"/api/v1/networks/net-1/subscriptions": `[{"id":"sub-1","eventPattern":"build.*","mode":"push"}]`,
+	})
+}
+
+// TestSubscriptionsAsPrincipal: `pagnet subscriptions` acts as the subscriber.
+// Every request carries the endpoint credential (the human's bearer must never
+// appear) and the list is read from the subscriber's own route.
+func TestSubscriptionsAsPrincipal(t *testing.T) {
+	ts := subscriptionStub(t)
+	cliEnv(t, ts.ts)
+	t.Setenv("PAGNET_STATE_DIR", "")
+	userToken = "test-token" // a signed-in human exists on this host
+	t.Setenv("PAGNET_CREDENTIAL", "")
+
+	cmd := subscriptionsCmd()
+	cmd.SetArgs([]string{"--credential", testEndpointCred})
+	out, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("subscriptions as the principal: %v", err)
+	}
+	if !strings.Contains(out, "sub-1") || !strings.Contains(out, "build.*") {
+		t.Errorf("output = %q, want the subscription table", out)
+	}
+	bearers := ts.allBearers()
+	if len(bearers) == 0 {
+		t.Fatal("the fake control plane saw no requests")
+	}
+	for i, b := range bearers {
+		if b != "Bearer "+testEndpointCred {
+			t.Errorf("request %d bearer = %q, want the endpoint credential", i, b)
+		}
+	}
+	if !ts.hasCall("GET /api/v1/networks/net-1/subscriptions ") {
+		t.Errorf("the subscription list was not read from the subscriber's route; calls: %v", ts.callLog())
+	}
+}
+
+// TestSubscriptionsUserBearerFailsLocally: a signed-in human running `pagnet
+// subscriptions` is answered LOCALLY, with no round trip. The control plane
+// answers a user actor 404 (anti-enumeration), which explains nothing — so the
+// CLI names the credential that works instead of spending a request on it.
+func TestSubscriptionsUserBearerFailsLocally(t *testing.T) {
+	ts := subscriptionStub(t)
+	cliEnv(t, ts.ts)
+	t.Setenv("PAGNET_STATE_DIR", "")
+	userToken = "test-token"
+	t.Setenv("PAGNET_CREDENTIAL", "")
+
+	cmd := subscriptionsCmd()
+	cmd.SetArgs(nil)
+	_, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err == nil {
+		t.Fatal("subscriptions succeeded with no principal credential at all")
+	}
+	msg := err.Error()
+	for _, want := range []string{"made by an agent or a service", "never by the signed-in user",
+		tokenPrefixEndpoint, "credential create"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error = %q, want it to contain %q", msg, want)
+		}
+	}
+	if strings.Contains(msg, "http 404") || strings.Contains(msg, "not_found") {
+		t.Errorf("a bare 404 leaked through as the product answer: %q", msg)
+	}
+	if n := callCount(t, ts); n != 0 {
+		t.Errorf("%d request(s) reached the control plane for a caller that cannot use it", n)
+	}
+}
+
+// TestSubscriptionsCredentialValidatedLocally: the shared credential
+// acceptance path proves the class BEFORE any round trip on this command too —
+// a human credential handed to --credential never reaches the route.
+func TestSubscriptionsCredentialValidatedLocally(t *testing.T) {
+	cases := []struct {
+		name string
+		give string
+		want []string
+	}{
+		{"pagnet token", testAccountToken, []string{"your Pagnet Token", "agent or a service"}},
+		{"activation credential", testActivationCred, []string{"one-time activation credential"}},
+		{"not a credential", "hunter2", []string{"not an agent or service endpoint credential"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := subscriptionStub(t)
+			cliEnv(t, ts.ts)
+			t.Setenv("PAGNET_STATE_DIR", "")
+			userToken = "test-token"
+			t.Setenv("PAGNET_CREDENTIAL", "")
+
+			cmd := subscriptionsCmd()
+			cmd.SetArgs([]string{"--credential", tc.give})
+			_, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+			if err == nil {
+				t.Fatalf("a %s was accepted as a principal credential", tc.name)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q, want it to name %q", err, want)
+				}
+			}
+			if strings.Contains(err.Error(), tc.give) {
+				t.Errorf("the error echoes the credential: %v", err)
+			}
+			if n := callCount(t, ts); n != 0 {
+				t.Errorf("%d request(s) reached the control plane with an invalid credential", n)
+			}
+		})
+	}
+}
+
+// TestSubscriptionsPrincipalFourOhFourIsServers: when a REAL principal actor is
+// answered 404 (a network it is not a member of), the control plane's own
+// answer is surfaced — the local pre-check must not swallow genuine server
+// decisions.
+func TestSubscriptionsPrincipalFourOhFourIsServers(t *testing.T) {
+	ts := newStubV2Server(t, map[string]string{
+		"/api/v1/networks": `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+		// /subscriptions is absent: the stub answers 404 like the control plane
+		// does for a network the caller has no scope on.
+	})
+	cliEnv(t, ts.ts)
+	t.Setenv("PAGNET_STATE_DIR", "")
+	cliEnv(t, ts.ts)
+	t.Setenv("PAGNET_CREDENTIAL", "")
+
+	cmd := subscriptionsCmd()
+	cmd.SetArgs([]string{"--credential", testEndpointCred})
+	_, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err == nil {
+		t.Fatal("a 404 from the control plane was reported as success")
+	}
+	if !strings.Contains(err.Error(), "http 404") {
+		t.Errorf("error = %q, want the control plane's own 404", err)
+	}
+	if !ts.hasCall("GET /api/v1/networks/net-1/subscriptions ") {
+		t.Errorf("the request was not made; calls: %v", ts.callLog())
+	}
+}
+
+// TestSubscriptionsUsesStoredEndpointCredential: the same store lookup invoke
+// uses drives this command — the only stored credential wins, and the table is
+// printed for that principal.
+func TestSubscriptionsUsesStoredEndpointCredential(t *testing.T) {
+	home := t.TempDir()
+	stateDir := filepath.Join(home, ".pagnet")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const principalA = "01a0c000-0000-7000-8000-00000000000a"
+	credA := tokenPrefixEndpoint + strings.Repeat("a", 16) + "_" + strings.Repeat("1", 43)
+	storeEndpointCredential(t, stateDir, principalA, credA)
+
+	ts := subscriptionStub(t)
+	principalEnv(t, ts.ts, home)
+
+	cmd := subscriptionsCmd()
+	cmd.SetArgs(nil)
+	if _, err := captureStdoutErr(t, func() error { return cmd.Execute() }); err != nil {
+		t.Fatalf("subscriptions with the stored credential: %v", err)
+	}
+	bearers := ts.allBearers()
+	if len(bearers) == 0 {
+		t.Fatal("no request was made")
+	}
+	for i, b := range bearers {
+		if b != "Bearer "+credA {
+			t.Errorf("request %d bearer = %q, want the stored endpoint credential", i, b)
 		}
 	}
 }
