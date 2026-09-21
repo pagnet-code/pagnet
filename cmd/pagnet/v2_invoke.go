@@ -406,11 +406,17 @@ func eventWatchCmd() *cobra.Command {
 				}
 			}
 			// The existing control-plane SSE stream (ticket-authenticated):
-			// POST a one-shot ticket, then open the stream.
+			// POST a one-shot ticket, then open the stream. The mint route is
+			// /api/v1/stream/ticket (server.go registers p.Post("/stream/ticket",
+			// handleStreamTicket)) — NOT /events/stream/ticket, which is only
+			// the SSE GET path (/api/v1/events/stream) and never existed as a
+			// mint endpoint. The ticket is minted for the caller's TENANT
+			// ("stream:<tenantID>"), so the user bearer that mints it is the
+			// right auth for a tenant-scoped stream.
 			var ticket struct {
 				Ticket string `json:"ticket"`
 			}
-			if err := c.post("/api/v1/events/stream/ticket", map[string]any{}, &ticket); err != nil {
+			if err := c.post("/api/v1/stream/ticket", map[string]any{}, &ticket); err != nil {
 				return err
 			}
 			if ticket.Ticket == "" {

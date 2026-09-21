@@ -801,6 +801,88 @@ func TestInvokeEndToEnd(t *testing.T) {
 	}
 }
 
+// --- event watch (the SSE ticket round trip) -------------------------------------
+
+// TestEventWatchTicketRoundTrip pins the two paths the watcher needs, because
+// they are NOT the same path: the ticket is minted at POST /api/v1/stream/ticket
+// (server.go: p.Post("/stream/ticket", handleStreamTicket)) while the stream is
+// the GET /api/v1/events/stream the ticket is replayed on. The old client minted
+// at /api/v1/events/stream/ticket, which the control plane never registers, so
+// every `pagnet event watch` died on a 404 before opening a stream.
+func TestEventWatchTicketRoundTrip(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		seen     []string
+		gotQuery string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		if r.URL.Path == "/api/v1/events/stream" {
+			gotQuery = r.URL.Query().Get("ticket")
+		}
+		mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/stream/ticket":
+			// The server's standard ticket response (mintTicketJSON).
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"ticket":"tkt-1","ttlSeconds":60,"singleUse":true}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/events/stream":
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"ID\":\"ev-1\",\"EventType\":\"build.completed\",\"NetworkID\":\"net-1\",\"Timestamp\":\"2026-09-21T10:00:00Z\"}\n\n")
+			fmt.Fprint(w, "data: {\"ID\":\"ev-2\",\"EventType\":\"stream.heartbeat\"}\n\n")
+			http.NewResponseController(w).Flush()
+			// Returning closes the body: the watcher sees EOF and stops, which
+			// is how a live tail ends.
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cliEnv(t, srv)
+
+	cmd := eventCmd()
+	cmd.SetArgs([]string{"watch"})
+	out, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err == nil || !strings.Contains(err.Error(), "event stream closed") {
+		t.Fatalf("watch ended with %v, want the stream-closed error once the server stops", err)
+	}
+	// The rendered event survived the filters; the heartbeat did not.
+	if !strings.Contains(out, "build.completed") || !strings.Contains(out, "ev-1") {
+		t.Errorf("watch printed %q, want the build.completed line for ev-1", out)
+	}
+	if strings.Contains(out, "stream.heartbeat") {
+		t.Errorf("the liveness heartbeat was rendered as an event: %q", out)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var minted, streamed bool
+	for _, s := range seen {
+		switch s {
+		case "POST /api/v1/stream/ticket":
+			minted = true
+		case "GET /api/v1/events/stream":
+			streamed = true
+		}
+	}
+	if !minted {
+		t.Errorf("the ticket was not minted at the registered path; calls: %v", seen)
+	}
+	if !streamed {
+		t.Errorf("the SSE stream was never opened at GET /api/v1/events/stream; calls: %v", seen)
+	}
+	if gotQuery != "tkt-1" {
+		t.Errorf("the stream was opened with ticket %q, want the minted tkt-1", gotQuery)
+	}
+	for _, s := range seen {
+		if strings.Contains(s, "/events/stream/ticket") {
+			t.Errorf("the client minted at the unregistered path %s", s)
+		}
+	}
+}
+
 // --- matchPattern (event watch --type) --------------------------------------------
 
 func TestMatchPattern(t *testing.T) {
