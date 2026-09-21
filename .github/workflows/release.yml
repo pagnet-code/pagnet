@@ -26,6 +26,10 @@ jobs:
     # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
     # runner billing is broken, so CI runs on the org's own infrastructure.
     runs-on: [self-hosted, self-hosted-linux, owl-deploy]
+    env:
+      # Empty on non-tag refs (dev lane keeps `git describe`); on a v* tag
+      # this becomes the make-override that pins VERSION to the tag name.
+      RELEASE_VERSION_FLAG: ${{ startsWith(github.ref, 'refs/tags/v') && format('VERSION={0}', github.ref_name) || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +49,12 @@ jobs:
       # with CGO_ENABLED=0 (see the Makefile release target) — the
       # dependency graph must stay cross-compilable.
       - name: Build release tarballs
-        run: make release
+        # The tag lane must NOT take its version from `git describe`: the
+        # rolling dev tag can land on the very same commit as a version tag
+        # (both lanes fire on one release push), and describe then resolves
+        # "dev" — which mislabeled the v0.3.0 assets on 2026-09-21. The tag
+        # name IS the version there, so pass it explicitly.
+        run: make release $RELEASE_VERSION_FLAG
 
       # ARCHITECTURE PROOF: `file` on the four release binaries. The
       # release contract is four native artifacts (linux/{amd64,arm64},
@@ -81,7 +90,7 @@ jobs:
             echo "::warning::PAGNET_RELEASE_SIGNING_KEY is not set — publishing an UNSIGNED release. Clients will refuse auto-updates (and manual updates) until the key is set and a signed release is published. This is the intended safe state, not a failure."
             exit 0
           fi
-          make release-sign
+          make release-sign $RELEASE_VERSION_FLAG
 
       - name: List artifacts
         run: |
