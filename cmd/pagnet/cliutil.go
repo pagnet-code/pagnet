@@ -30,6 +30,13 @@ type cliCtx struct {
 	// credential (cfg.Credential): host identities are WSS-only and the
 	// REST API rejects them (403 host_identity).
 	token string
+	// principal marks a bearer that is a PRINCIPAL endpoint credential
+	// (pgn_epd_) rather than a human's: the caller acts as an agent or a
+	// service on the principal-only surfaces (invocations, subscriptions).
+	// It changes nothing about authorization — the server decides that — it
+	// only keeps the human-bearer advice ("run `pagnet login`") out of an
+	// error a human credential could not have answered anyway.
+	principal bool
 	// reauth enables the one-shot 401 recovery in do(): re-run the
 	// sign-in flow once and retry the call. Set by newCLI; direct
 	// constructions (e.g. doctor) keep the plain 401 error.
@@ -40,10 +47,12 @@ type cliCtx struct {
 	retried     bool
 }
 
-// newCLI loads the daemon state config (same file `pagnet enroll` /
-// `pagnet login` write) and applies --server if given. stateDirOverride
-// passes --state-dir straight through ("" = default ~/.pagnet).
-func newCLI(stateDirOverride string) (*cliCtx, error) {
+// newCLIContext resolves everything an authenticated REST call needs EXCEPT
+// the bearer: the state dir, the account config, the control-plane URL, and
+// the HTTPS policy check. newCLI (the user bearer) and newPrincipalCLI (a
+// principal credential) are the two ways that bearer is chosen; everything
+// else is identical, so the two surfaces cannot drift on server resolution.
+func newCLIContext(stateDirOverride string) (*cliCtx, error) {
 	c := &cliCtx{base: serverURL}
 	if stateDirOverride == "" {
 		home, _ := os.UserHomeDir()
@@ -82,6 +91,17 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if err := netpolicy.Check(c.base, insecureRemoteHTTP); err != nil {
 		return nil, err
 	}
+	return c, nil
+}
+
+// newCLI loads the daemon state config (same file `pagnet enroll` /
+// `pagnet login` write) and applies --server if given, then resolves the
+// USER bearer (see newCLIContext for the shared part).
+func newCLI(stateDirOverride string) (*cliCtx, error) {
+	c, err := newCLIContext(stateDirOverride)
+	if err != nil {
+		return nil, err
+	}
 	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no
 	// auth endpoint is called at all), then the account's stored
 	// credential, else the sign-in flow (interactive) / fail (non-interactive).
@@ -89,7 +109,7 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 		c.reauth = true
 		c.noBrowser = os.Getenv("PAGNET_NO_BROWSER") == "1"
 		c.interactive = interactiveMode()
-		tok, err := ensureUserToken(c.stateDir, account, c.base, c.noBrowser, c.interactive)
+		tok, err := ensureUserToken(c.stateDir, c.account, c.base, c.noBrowser, c.interactive)
 		if err != nil {
 			return nil, err
 		}
@@ -132,6 +152,13 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 		return err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
+		// A principal endpoint credential that got revoked/expired/replaced:
+		// the human-bearer advice below is wrong on this surface (a human
+		// credential cannot use the route), so it is answered with the text
+		// that names the credential that can — and never with a sign-in loop.
+		if c.principal {
+			return principalCredentialFailure(&httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)})
+		}
 		// A stored token that got revoked/expired: re-run the sign-in
 		// flow once and retry the original call once, then fail with the
 		// API error.
@@ -152,7 +179,14 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 		// text every REST command printed before — but it keeps the status and
 		// the server's error CODE readable, so a credential failure can be
 		// translated where one is in scope (plan §7).
-		return &httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)}
+		hf := &httpFailure{status: resp.StatusCode, code: apiErrorCode(raw), body: string(raw)}
+		if c.principal {
+			// Only a KNOWN credential failure is rewritten; a 403
+			// network_scope, a 404, or a validation message keeps the
+			// server's own reason (auth_common.go's untranslated rule).
+			return principalCredentialFailure(hf)
+		}
+		return hf
 	}
 	if out != nil && len(raw) > 0 {
 		return json.Unmarshal(raw, out)

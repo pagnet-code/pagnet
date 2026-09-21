@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/sdk"
 )
 
 // --- pagnet invoke --------------------------------------------------------------
@@ -68,13 +70,27 @@ func invokeCmd() *cobra.Command {
 		idempotencyKey string
 		asynchronous   bool
 		waitTimeout    time.Duration
+		actor          principalActorOptions
 	)
 	cmd := &cobra.Command{
 		Use:   "invoke <agent-or-service> <capability> [--input file|-]",
 		Short: "Invoke a network capability (the input is encrypted end-to-end on this host)",
-		Args:  cobra.ExactArgs(2),
+		Long: `Call a capability an agent or a service offers. The input is encrypted on
+this host and only the target decrypts it.
+
+An invocation is made BY an agent or a service — the control plane refuses a
+signed-in user, because the record's caller must be a network participant. This
+host makes the call as one when it holds that participant's credential:
+
+  pagnet invoke docs-svc documents.extract --input in.json
+  pagnet invoke docs-svc documents.extract --credential ` + tokenPrefixEndpoint + `... --async
+
+Without --credential the credential comes from $` + sdk.EnvCredential + `, then from the endpoint
+credential already stored on this host. pagnet service credential create
+<service> (or pagnet agent credential create <agent>) prints one once.`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newCLI("")
+			c, err := invokeCLI(actor)
 			if err != nil {
 				return err
 			}
@@ -120,7 +136,10 @@ func invokeCmd() *cobra.Command {
 				body["idempotencyKey"] = idempotencyKey
 			}
 			var rec invocationRecord
-			if err := c.post("/api/v1/networks/"+netID+"/invocations", body, &rec); err != nil {
+			// userCallerFailure renders the control plane's refusal of a human
+			// caller as product text; every other failure (and everything a
+			// principal actor gets) keeps the server's own reason.
+			if err := userCallerFailure(c.post("/api/v1/networks/"+netID+"/invocations", body, &rec)); err != nil {
 				return err
 			}
 			if jsonOut {
@@ -178,7 +197,33 @@ func invokeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "idempotency key (a retried call with the same key is not re-executed)")
 	cmd.Flags().BoolVar(&asynchronous, "async", false, "return after the invocation is queued (do not wait for the result)")
 	cmd.Flags().DurationVar(&waitTimeout, "timeout", 120*time.Second, "how long to wait for the result (sync mode)")
+	actor.register(cmd)
 	return cmd
+}
+
+// invokeCLI resolves the bearer `pagnet invoke` acts with.
+//
+// An invocation is made BY a principal (api_invocations.go refuses a user
+// actor with 400), so the CLI prefers an actor that can actually succeed: an
+// explicit --credential / $PAGNET_CREDENTIAL, or the endpoint credential this
+// host already stores for a principal. With nothing stored, the signed-in
+// user's bearer is the only bearer available — the call still goes out (the
+// server is the authority on who may invoke) and its refusal is translated by
+// userCallerFailure into the text that names the credential that works.
+func invokeCLI(opts principalActorOptions) (*cliCtx, error) {
+	if opts.credential != "" || opts.as != "" || os.Getenv(sdk.EnvCredential) != "" {
+		// The operator named a principal actor: that IS the intent, so a
+		// problem with it is reported, never traded for a human bearer.
+		return newPrincipalCLI("", opts)
+	}
+	c, err := newPrincipalCLI("", opts)
+	if err == nil {
+		return c, nil
+	}
+	if !errors.Is(err, errNoPrincipalCredential) {
+		return nil, err // malformed credential / ambiguous store / unknown --as
+	}
+	return newCLI("")
 }
 
 // pollInvocation waits for the invocation to leave the pending/dispatched

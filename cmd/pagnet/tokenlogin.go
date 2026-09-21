@@ -42,6 +42,13 @@ const (
 	tokenPrefixAccount = "pgn_acc_v1_"
 	tokenPrefixAccess  = "pgn_pat_v1_"
 	tokenPrefixLegacy  = "pagt_"
+	// tokenPrefixPrincipalActivation / tokenPrefixEndpoint are the PRINCIPAL
+	// credentials (governance §7-8): the one-time activation credential and
+	// the durable endpoint credential. They authenticate AS an agent or a
+	// service — never as the human who created them — which is what the
+	// principal-only surfaces (invocations, subscriptions) require.
+	tokenPrefixPrincipalActivation = "pgn_act_v1_"
+	tokenPrefixEndpoint            = "pgn_epd_v1_"
 
 	credentialKindAccount = "account"
 	credentialKindAccess  = "access"

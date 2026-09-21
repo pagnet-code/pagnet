@@ -254,6 +254,76 @@ func (k *keyring) CredentialForPrincipal(principalID string) (string, error) {
 	return string(b), nil
 }
 
+// storedPrincipalIDs lists the principals whose durable endpoint credential
+// the keyring holds: a principal directory that actually carries a
+// credential file (an identity key with no credential is not connectable, so
+// it is not an actor). "networks" is the shared epoch-key directory, not a
+// principal.
+func (k *keyring) storedPrincipalIDs() ([]string, error) {
+	entries, err := os.ReadDir(k.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sdk: read principal store: %w", err)
+	}
+	var ids []string
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "networks" {
+			continue
+		}
+		if _, err := os.Stat(k.credentialPath(e.Name())); err != nil {
+			continue // no credential stored for this principal
+		}
+		ids = append(ids, e.Name())
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// StoredCredential returns the durable endpoint credential the SDK stored for
+// principalID under stateDir ("" when the store holds none for it).
+//
+// It is the ONE read window onto the SDK's per-principal credential store for
+// a caller outside the SDK — the CLI's principal-actor commands (`pagnet
+// invoke`, `pagnet subscriptions`) run as the principal whose endpoint
+// credential this host already holds instead of asking the operator to paste
+// the secret again. The layout is the SDK's business (see the package docs);
+// reaching past this function duplicates it.
+func StoredCredential(stateDir, principalID string) (string, error) {
+	if stateDir == "" {
+		return "", errors.New("sdk: StoredCredential requires a state dir")
+	}
+	k, err := newKeyring(stateDir)
+	if err != nil {
+		return "", err
+	}
+	return k.CredentialForPrincipal(principalID)
+}
+
+// StoredPrincipalIDs lists the principal ids whose durable endpoint
+// credential the SDK holds under stateDir (newest first — the ids are
+// UUIDv7, so they are time-sortable). An empty store is an empty list, not an
+// error: "this host holds no principal credential" is an ordinary state.
+func StoredPrincipalIDs(stateDir string) ([]string, error) {
+	if stateDir == "" {
+		return nil, errors.New("sdk: StoredPrincipalIDs requires a state dir")
+	}
+	k, err := newKeyring(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := k.storedPrincipalIDs()
+	if err != nil {
+		return nil, err
+	}
+	// Newest first: when a host holds exactly one credential it is the one
+	// most recently connected here, and the ambiguity message lists the
+	// choices in the order the operator would recognise.
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	return ids, nil
+}
+
 // CredentialForCredential resolves a (possibly consumed) credential to the
 // stored durable credential of the same principal ("" when unknown). This
 // is the fallback that makes "second connect after activation" work even

@@ -98,6 +98,65 @@ func TestKeyringCredentialLookup(t *testing.T) {
 	}
 }
 
+// TestStoredPrincipalReadWindow pins the exported read window the CLI's
+// principal-actor commands use: the credential for one principal, and the list
+// of principals the store can actually ACT as (a directory with an identity key
+// but no credential is not an actor, and "networks" is the shared epoch-key
+// directory rather than a principal).
+func TestStoredPrincipalReadWindow(t *testing.T) {
+	dir := t.TempDir()
+
+	// An empty store is an ordinary state, not an error.
+	ids, err := StoredPrincipalIDs(dir)
+	if err != nil {
+		t.Fatalf("StoredPrincipalIDs on an empty store: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("empty store lists %v, want none", ids)
+	}
+	if cred, err := StoredCredential(dir, "p1"); err != nil || cred != "" {
+		t.Fatalf("StoredCredential = %q (%v), want empty for an unknown principal", cred, err)
+	}
+
+	kr, err := newKeyring(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priv, _ := newIdentityKey()
+	if err := kr.PersistIdentity("p1", "pgn_epd_v1_c1", priv); err != nil {
+		t.Fatal(err)
+	}
+	if err := kr.PersistIdentity("p2", "pgn_epd_v1_c2", priv); err != nil {
+		t.Fatal(err)
+	}
+	// A principal with an identity key but no stored credential cannot act, so
+	// it must not be offered as a choice.
+	if err := os.MkdirAll(filepath.Dir(kr.identityPath("p3")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(kr.identityPath("p3"), priv); err != nil {
+		t.Fatal(err)
+	}
+	// The shared epoch directory must never look like a principal.
+	if err := kr.StoreEpoch("net-1", "e1", [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := StoredPrincipalIDs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "p2" || got[1] != "p1" {
+		t.Fatalf("StoredPrincipalIDs = %v, want [p2 p1] (newest first, no credential-less principal, no networks dir)", got)
+	}
+	if cred, err := StoredCredential(dir, "p2"); err != nil || cred != "pgn_epd_v1_c2" {
+		t.Fatalf("StoredCredential(p2) = %q (%v), want pgn_epd_v1_c2", cred, err)
+	}
+	if cred, err := StoredCredential(dir, "p3"); err != nil || cred != "" {
+		t.Fatalf("StoredCredential(p3) = %q (%v), want empty", cred, err)
+	}
+}
+
 func TestKeyringEpochStoreAndActive(t *testing.T) {
 	kr := newTestKeyring(t)
 	var old, newer [32]byte

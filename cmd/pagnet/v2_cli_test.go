@@ -674,10 +674,11 @@ func TestInvokeEndToEnd(t *testing.T) {
 	db.Close()
 
 	type observed struct {
-		input  string
-		aad    e2ee.AAD
-		target string
-		capID  string
+		input    string
+		aad      e2ee.AAD
+		target   string
+		capID    string
+		invokeID string
 	}
 	var (
 		mu      sync.Mutex
@@ -697,7 +698,7 @@ func TestInvokeEndToEnd(t *testing.T) {
 			var body struct {
 				Target   string                  `json:"targetPrincipalId"`
 				CapID    string                  `json:"capabilityId"`
-				ObjectID string                  `json:"inputObjectID"`
+				ObjectID string                  `json:"invocationId"`
 				Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
 				AAD      e2ee.AAD                `json:"aad"`
 			}
@@ -731,7 +732,7 @@ func TestInvokeEndToEnd(t *testing.T) {
 			settled = fmt.Sprintf(`{"id":"inv-1","state":"completed","outputEnvelope":%s,"outputAAD":%s}`,
 				mustJSON(t, resEnv), mustJSON(t, outAAD))
 			mu.Lock()
-			obs = observed{input: string(plain), aad: body.AAD, target: body.Target, capID: body.CapID}
+			obs = observed{input: string(plain), aad: body.AAD, target: body.Target, capID: body.CapID, invokeID: body.ObjectID}
 			mu.Unlock()
 			fmt.Fprint(w, `{"id":"inv-1","state":"completed"}`)
 		case "/api/v1/networks/" + netID + "/invocations/inv-1":
@@ -773,7 +774,7 @@ func TestInvokeEndToEnd(t *testing.T) {
 		t.Fatalf("invoke: %v", err)
 	}
 	mu.Lock()
-	gotInput, gotAAD, gotTarget, gotCap := obs.input, obs.aad, obs.target, obs.capID
+	gotInput, gotAAD, gotTarget, gotCap, gotInvokeID := obs.input, obs.aad, obs.target, obs.capID, obs.invokeID
 	mu.Unlock()
 	if gotInput != `{"text":"hello there"}` {
 		t.Errorf("server-decrypted input = %q, want the compacted input", gotInput)
@@ -784,6 +785,15 @@ func TestInvokeEndToEnd(t *testing.T) {
 	if gotAAD.ObjectType != e2ee.ObjectTypeInvocationInput || gotAAD.Recipient != "agent-atlas" ||
 		gotAAD.ProtocolVersion != transport.ProtocolVersion {
 		t.Errorf("invocation AAD = %+v, want invocation_input to agent-atlas on protocol v2", gotAAD)
+	}
+	// The client-minted object id travels under "invocationId" — the name the
+	// control plane decodes (its strict decodeBody would otherwise reject the
+	// whole body) — and it is the id the AAD binds.
+	if gotInvokeID == "" {
+		t.Error("the request carries no invocationId under the name the control plane decodes")
+	}
+	if gotAAD.ObjectID != gotInvokeID {
+		t.Errorf("AAD.ObjectID = %q, want the invocationId %q", gotAAD.ObjectID, gotInvokeID)
 	}
 	want := "{\n  \"ok\": true,\n  \"text\": \"hello\"\n}\n"
 	if out != want {

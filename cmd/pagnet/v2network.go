@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/sdk"
 )
 
 // --- V2 wire shapes (D2) ------------------------------------------------------
@@ -463,7 +464,14 @@ func serviceQuickstart(name, serverURL string) string {
   type echoIn struct{ Text string }
   type echoOut struct{ Text string }
 
-Then call it from the network: pagnet invoke ` + name + ` ` + name + `.echo --input input.json`
+Then call it from the network. An invocation is made BY an agent or a service,
+so the caller presents that participant's own endpoint credential (the control
+plane refuses a signed-in user):
+
+  pagnet invoke ` + name + ` ` + name + `.echo --input input.json --credential ` + tokenPrefixEndpoint + `...
+
+With no --credential the caller uses $` + sdk.EnvCredential + `, or the endpoint credential it
+already stores on this host.`
 }
 
 // --- pagnet search (D10) -------------------------------------------------------
