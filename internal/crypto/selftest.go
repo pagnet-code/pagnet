@@ -20,8 +20,11 @@ var selfTestPlaintext = []byte("pagnet-e2ee-selftest-v1")
 // (in-memory echoed) ciphertext decrypts correctly. The server-side echo is a
 // follow-up; this validates the local encrypt/decrypt path end to end.
 //
-// A Private Network's state must not be flipped to private_e2ee until this
-// succeeds.
+// A network's crypto must not be reported active (the state that lets content
+// operations run) until this succeeds — the activation ack carries
+// selfTestOk, and the control plane flips the network to "active" only when it
+// is true. V2 networks are ALWAYS encrypted (plan D6): there is no
+// plaintext/privacy-mode state left to flip.
 func SelfTest(kr *Keyring, tenantID, hostID string, now time.Time) error {
 	epoch, err := kr.ActiveEpoch()
 	if err != nil {
