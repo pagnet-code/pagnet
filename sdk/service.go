@@ -51,6 +51,15 @@ func (s *Service) Handle(capabilityID string, h CapHandler) error {
 //	svc.HandleT("hello.say", func(ctx context.Context, in HelloInput) (HelloOutput, error) {
 //	    return HelloOutput{Text: "hello " + in.Text}, nil
 //	})
+//
+// SYNC-ONLY: a typed handler's signature carries no *Invocation, so it
+// cannot call Accept/Complete. Returning (nil, ErrAsync) from a typed
+// handler is a SILENT DEAD END — dispatch leaves the invocation in-flight
+// (the same as the untyped form) but no one can ever call Complete for it,
+// so the invocation strands until the server's TTL expires and the caller
+// times out. If the work may outlive the request, use the untyped Handle
+// form instead: its handler receives *Invocation, can defer with
+// (nil, ErrAsync), and later calls inv.Complete/inv.CompleteError.
 func (s *Service) HandleT[I any, O any](capabilityID string, h func(ctx context.Context, in I) (O, error)) error {
 	if h == nil {
 		return errors.New("sdk: handler is required")

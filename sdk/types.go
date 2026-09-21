@@ -26,7 +26,10 @@ type MessagePart = domain.MessagePart
 // handler does its work in the background, and completes it later with
 // (*Invocation).Complete(ctx, result) — or CompleteError for a failure.
 // The handler must return (nil, ErrAsync); any other value with ErrAsync is
-// ignored. Async invocations survive an SDK reconnect within the server's
+// ignored. Only the untyped Handle form can defer: its handler receives the
+// *Invocation used to complete the work — a typed HandleT handler never
+// receives one, so an ErrAsync from it strands the invocation (see HandleT).
+// Async invocations survive an SDK reconnect within the server's
 // invocation TTL (the in-flight registry is connection-independent).
 var ErrAsync = errors.New("sdk: async invocation: complete later with Invocation.Complete")
 
