@@ -164,8 +164,11 @@ listings, and CI logs.`,
 				if status.Mode == "oidc" {
 					// Reuse the shared helper: it validates a stored token
 					// first (idempotent re-login) and runs the sign-in flow
-					// otherwise. It persists the token itself.
-					apiToken, err := ensureUserToken(accDir, account, base, noBrowser, hasTTYFn())
+					// otherwise. It persists the token itself. It takes the
+					// MACHINE state dir (not accDir): it applies
+					// accountConfigDir internally, exactly like the REST
+					// commands' newCLI does.
+					apiToken, err := ensureUserToken(root, account, base, noBrowser, hasTTYFn())
 					if err != nil {
 						return err
 					}
