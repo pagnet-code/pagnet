@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "direction": "go_to_ts",
+  "suite": "X25519_HKDF_SHA256/HKDF_SHA256/AES_256_GCM",
+  "info": "pagnet/browser-session/cek-unwrap/v1",
+  "network_id": "01900000-0000-7000-8000-000000000002",
+  "session_id": "01900000-0000-7000-8000-000000000005",
+  "object_id": "01900000-0000-7000-8000-000000000003",
+  "session_aad_b64": "MDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAyADAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwNQAwMTkwMDAwMC0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDM=",
+  "recipient_pub_b64": "PMOoQciZOjMjbsTO2txq4Xa5Y+mT3K1Hg3jOs31LgSc=",
+  "recipient_priv_b64": "lW8AVL0xA4YatirnVnBGhY9rFVL/ohR3K2hK0i/1YEY=",
+  "wrapped_cek_enc_b64": "U7iogTYfZ2y1gI6xPzvTEV5LBvpDZhZU6SNBnhZE9DM=",
+  "wrapped_cek_ct_b64": "yKgGXXwX1P5Z8EUfw7dcVmY7ioioVDyeiPCbMgXMI4t3lLxRuXqn9u4eMAUuvV98",
+  "envelope": {
+    "version": 1,
+    "cipher_suite": "AES-256-GCM",
+    "key_epoch_id": "01900000-0000-7000-8000-000000000004",
+    "nonce": "qbjLXDQE3Vo7hJBq",
+    "ciphertext": "5iT8TcrV/N6th9u6bDNm4h+0UyBvwmJUyqpQDHDFbSOaBupO/su6heVYP2/G/ufZeekX",
+    "wrapped_content_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "aad_version": 1
+  },
+  "payload_aad": {
+    "protocol_version": 1,
+    "tenant_id": "01900000-0000-7000-8000-000000000001",
+    "network_id": "01900000-0000-7000-8000-000000000002",
+    "object_type": "message",
+    "object_id": "01900000-0000-7000-8000-000000000003",
+    "sender": "alpha",
+    "recipient": "human",
+    "created_at": "2026-09-22T00:00:00Z",
+    "key_epoch_id": "01900000-0000-7000-8000-000000000004"
+  },
+  "plaintext": "interop-go-to-ts-payload-0123456789"
+}

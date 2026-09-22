@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "direction": "ts_to_go",
+  "suite": "X25519_HKDF_SHA256/HKDF_SHA256/AES_256_GCM",
+  "info": "pagnet/browser-session/cek-wrap/v1",
+  "network_id": "01900000-0000-7000-8000-000000000002",
+  "session_id": "01900000-0000-7000-8000-000000000005",
+  "object_id": "01900000-0000-7000-8000-000000000003",
+  "session_aad_b64": "MDE5MDAwMDAtMDAwMC03MDAwLTgwMDAtMDAwMDAwMDAwMDAyADAxOTAwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwNQAwMTkwMDAwMC0wMDAwLTcwMDAtODAwMC0wMDAwMDAwMDAwMDM=",
+  "recipient_pub_b64": "IokeP2lGNtkELGdKcwsS/gyCaokr+3LKXNZ04+nXER8=",
+  "recipient_priv_b64": "OM+zIuZ14EQu36Plmt9eG+Ms2NbLRNlhxKGtHYLSJno=",
+  "enc_b64": "okpbEGhJqBaOpdpyAs4+Iswyv9qekWgnMC34WWmvM08=",
+  "ct_b64": "8szcJmFNsJsRRerUOqLh+vWm+x+z7YtCWUzDrv5+ScNsfV2USm5QCIXHq/RVXmrV",
+  "cek_hex": "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+}
