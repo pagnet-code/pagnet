@@ -145,27 +145,28 @@ func TestAuthenticateUserNonInteractiveNoPrompt(t *testing.T) {
 }
 
 // TestUserCredentialForServeTokenShortCircuit (§9.2): an explicit --token /
-// $PAGNET_TOKEN is validated and stored directly (no paste, no browser).
+// $PAGNET_TOKEN goes through the same paste-login path (one exchange, no
+// interactive paste, no browser) and stores the derived credential.
 func TestUserCredentialForServeTokenShortCircuit(t *testing.T) {
 	withFileFallback(t)
 	srv := newStubTokenServer(t)
-	srv.setValidBearer(testLegacyToken)
+	srv.setExchange(0, fmt.Sprintf(`{"credential":"%s"}`, testDerivedCred))
 
 	dir := t.TempDir()
 	withNoPromptSeams(t)
 	prevToken := userToken
-	userToken = testLegacyToken
+	userToken = testAccountToken
 	t.Cleanup(func() { userToken = prevToken })
 
 	tok, err := userCredentialForServe(dir, "", srv.ts.URL)
 	if err != nil {
 		t.Fatalf("userCredentialForServe (--token): %v", err)
 	}
-	if tok != testLegacyToken {
-		t.Fatalf("returned = %q, want the explicit token", tok)
+	if tok != testDerivedCred {
+		t.Fatalf("returned = %q, want the derived credential", tok)
 	}
-	if got := loadUserTokenFile(dir); got != testLegacyToken {
-		t.Fatalf("stored = %q, want the explicit token", got)
+	if got := loadUserTokenFile(dir); got != testDerivedCred {
+		t.Fatalf("stored = %q, want the derived credential", got)
 	}
 }
 

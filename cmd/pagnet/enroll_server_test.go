@@ -18,14 +18,14 @@ import (
 func TestEnrollServerFlagGiven(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 
 	t.Setenv("PAGNET_SERVER", "")
 	prevServer := serverURL
 	serverURL = ts.URL
 	t.Cleanup(func() { serverURL = prevServer })
 	prevToken := userToken
-	userToken = "pagt_testtoken123"
+	userToken = testAccountToken
 	t.Cleanup(func() { userToken = prevToken })
 
 	dir := t.TempDir()
@@ -43,14 +43,14 @@ func TestEnrollServerFlagGiven(t *testing.T) {
 func TestEnrollServerFromState(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 
 	t.Setenv("PAGNET_SERVER", "")
 	prevServer := serverURL
 	serverURL = ""
 	t.Cleanup(func() { serverURL = prevServer })
 	prevToken := userToken
-	userToken = "pagt_testtoken123"
+	userToken = testAccountToken
 	t.Cleanup(func() { userToken = prevToken })
 
 	dir := t.TempDir()
@@ -169,7 +169,7 @@ func TestResolveEnrollServerPromptEmptyTwice(t *testing.T) {
 func TestResolveEnrollServerNoTTY(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 
 	t.Setenv("PAGNET_SERVER", "")
 	prevServer := serverURL

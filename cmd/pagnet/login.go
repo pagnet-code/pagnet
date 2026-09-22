@@ -5,18 +5,21 @@ package main
 //
 //   - paste (interactive, local/oidc servers): hidden-input paste of a
 //     Pagnet Token — Account/Access tokens are exchanged once for a
-//     derived client credential (see tokenlogin.go); legacy pagt_
-//     tokens are verified and kept as-is;
+//     derived client credential (see tokenlogin.go);
 //   - token:  --token <admin token> (validated against /auth/me)
-//   - local:  --username/--password → the server mints a revocable API
-//     token (the CLI never keeps browser session cookies)
+//   - local:  --username/--password → the server mints the account-session
+//     client credential (the CLI never keeps browser session cookies)
 //   - oidc:   RFC 8628 device flow — the CLI shows a user code, the user
-//     authorizes in a browser, and the server issues an API token.
+//     authorizes in a browser, and the server mints the account-session
+//     client credential.
 //
-// The resulting bearer is stored via the OS keyring when available, else
-// in the state dir's config.yaml (mode 0600, "token" key) and used by
-// every command unless --token or $PAGNET_TOKEN overrides it. Host
-// enrollment lives in `pagnet enroll`.
+// Every normal human sign-in converges on the same stored credential
+// class: the account-session client credential (a pgn_pat_v1_ credential
+// the server persists with authority_class='account_session'). The
+// resulting bearer is stored via the OS keyring when available, else in
+// the state dir's config.yaml (mode 0600, "token" key) and used by every
+// command unless --token or $PAGNET_TOKEN overrides it. Host enrollment
+// lives in `pagnet enroll`.
 
 import (
 	"bytes"
@@ -48,7 +51,6 @@ func loginCmd() *cobra.Command {
 		token     string
 		username  string
 		password  string
-		label     string
 		stateDir  string
 		noBrowser bool
 	)
@@ -58,12 +60,15 @@ func loginCmd() *cobra.Command {
 		Long: `Sign in to the control plane and store the credential every command uses.
 
 Token-first (production) servers: pagnet login prompts for your Pagnet
-Token with echo off — paste an Account Token (pgn_acc_v1_…), an Access
-Token (pgn_pat_v1_…), or a legacy API token (pagt_…). An Account/Access
-Token is exchanged ONCE for a revocable derived client credential: only
-the derived credential is stored (OS keyring, 0600 file fallback), never
-the pasted token itself. Press Enter at the prompt to use the server's
-other sign-in mode instead (browser/OIDC, or username/password).
+Token with echo off — paste an Account Token (pgn_acc_v1_…) or an Access
+Token (pgn_pat_v1_…). An Account/Access Token is exchanged ONCE for a
+revocable derived client credential: only the derived credential is
+stored (OS keyring, 0600 file fallback), never the pasted token itself.
+Press Enter at the prompt to use the server's other sign-in mode instead
+(browser/OIDC, or username/password).
+
+Every sign-in method converges on the same stored credential: the
+account-session client credential the server mints for you.
 
 --token / $PAGNET_TOKEN stay available for scripted use but are the less
 safe path: argv and the environment can leak into shell history, process
@@ -179,12 +184,12 @@ listings, and CI logs.`,
 						return err
 					}
 				}
-				apiToken, err := loginLocalAPIToken(client, base, username, password, label)
+				apiToken, err := loginLocalAPIToken(client, base, username, password)
 				if err != nil {
 					return err
 				}
 				token = apiToken
-				fmt.Println("signed in; a new API token was created for the CLI.")
+				fmt.Println("signed in; the account-session credential was created for the CLI.")
 
 			default:
 				return fmt.Errorf("unknown server auth mode %q", status.Mode)
@@ -200,10 +205,9 @@ listings, and CI logs.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet/legacy token (local/oidc modes) — less safe than the paste prompt (shell history / process listings)")
+	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet Token (local/oidc modes) — less safe than the paste prompt (shell history / process listings)")
 	cmd.Flags().StringVar(&username, "username", "", "username (local mode)")
 	cmd.Flags().StringVar(&password, "password", "", "password (local mode; prompted when omitted)")
-	cmd.Flags().StringVar(&label, "label", "cli", "API token label (local mode)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "state dir for the stored token (default ~/.pagnet)")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "oidc: only print the verification URL, do not open it")
 	return cmd
@@ -309,12 +313,12 @@ func mergeConfigFile(stateDir string, fields map[string]any) error {
 	return os.WriteFile(path, b, 0o600)
 }
 
-// saveUserToken stores the user bearer produced by the mode-based sign-in
-// flows (token / local / oidc — a legacy-shaped API token). The derived-
-// credential metadata of a previous token-first login is cleared (those
-// flows carry none). Storage itself is saveCredential: OS keyring preferred,
-// 0600 account config file fallback; the server URL (non-secret) is always
-// kept in the file.
+// saveUserToken stores a user bearer that carries no derived-credential
+// metadata of its own (token mode's admin token, a worker's --user-token,
+// or a sign-in flow whose response reports no restriction metadata). The
+// metadata of a previous token-first login is cleared. Storage itself is
+// saveCredential: OS keyring preferred, 0600 account config file fallback;
+// the server URL (non-secret) is always kept in the file.
 func saveUserToken(stateDir, account, server, token string) error {
 	return saveCredential(stateDir, account, server, token, credentialMeta{})
 }
@@ -375,14 +379,17 @@ func askPassword(prompt string) (string, error) {
 	return strings.TrimRight(line, "\r\n"), err
 }
 
-// --- local mode: password → API token ----------------------------------------
+// --- local mode: password → account-session credential ------------------------
 
 // loginLocalAPIToken performs the CLI half of local-mode login: a throwaway
-// browser session is created (username/password), used exactly once to mint
-// a revocable API token, then logged out. The CLI stores only the token.
-func loginLocalAPIToken(client *http.Client, base, username, password, label string) (string, error) {
-	// 1. POST /auth/login → Set-Cookie: pagnet_session + pagnet_csrf.
-	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+// browser session is created (username/password, cli:true), the server mints
+// the account-session client credential in the login response itself, and the
+// session is logged out immediately — it was only a carrier for the mint and
+// must not be left alive. The CLI stores only the credential.
+func loginLocalAPIToken(client *http.Client, base, username, password string) (string, error) {
+	// 1. POST /auth/login (cli:true) → Set-Cookie: pagnet_session +
+	//    pagnet_csrf, and the minted account-session credential.
+	body, _ := json.Marshal(map[string]any{"username": username, "password": password, "cli": true})
 	resp, err := client.Post(base+"api/v1/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
@@ -403,37 +410,22 @@ func loginLocalAPIToken(client *http.Client, base, username, password, label str
 	if session == "" || csrf == "" {
 		return "", errors.New("login response did not set session cookies")
 	}
-
-	// 2. POST /tokens (session cookie + double-submit CSRF) → pagt_ token.
-	tokenBody, _ := json.Marshal(map[string]string{"label": label})
-	req, _ := http.NewRequest(http.MethodPost, base+"api/v1/tokens", bytes.NewReader(tokenBody))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Cookie", "pagnet_session="+session+"; pagnet_csrf="+csrf)
-	req.Header.Set("X-CSRF-Token", csrf)
-	tokResp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("create API token: %w", err)
-	}
-	defer tokResp.Body.Close()
-	if tokResp.StatusCode != http.StatusCreated {
-		return "", apiError(tokResp, "could not create the API token")
-	}
 	var created struct {
-		Token string `json:"token"`
+		Credential string `json:"credential"`
 	}
-	if err := json.NewDecoder(tokResp.Body).Decode(&created); err != nil ||
-		!strings.HasPrefix(created.Token, "pagt_") {
-		return "", errors.New("unexpected API token response")
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil ||
+		!strings.HasPrefix(created.Credential, tokenPrefixAccess) {
+		return "", errors.New("login response did not return the account-session credential")
 	}
 
-	// 3. The throwaway session has served its purpose.
+	// 2. The throwaway session has served its purpose.
 	logout, _ := http.NewRequest(http.MethodPost, base+"api/v1/auth/logout", nil)
 	logout.Header.Set("Cookie", "pagnet_session="+session+"; pagnet_csrf="+csrf)
 	logout.Header.Set("X-CSRF-Token", csrf)
 	if r, err := client.Do(logout); err == nil {
 		r.Body.Close()
 	}
-	return created.Token, nil
+	return created.Credential, nil
 }
 
 // --- oidc mode: RFC 8628 device flow (client-mediated) -------------------------
@@ -441,7 +433,8 @@ func loginLocalAPIToken(client *http.Client, base, username, password, label str
 // The CLI is the OIDC client's public device: it runs the Device
 // Authorization Grant against the identity provider directly. The control
 // plane only (a) hands out the IdP endpoints + client id (device-config) and
-// (b) validates the resulting ID token and mints an API token (device/token).
+// (b) validates the resulting ID token and mints the account-session client
+// credential (device/token).
 
 // deviceConfig is the control plane's device-config response (all strings).
 type deviceConfig struct {
@@ -479,33 +472,34 @@ func pkceChallenge(verifier string) string {
 }
 
 // loginOIDCDeviceFlow performs the client-mediated RFC 8628 device flow and
-// returns the minted pagnet API token. noBrowser (or $PAGNET_NO_BROWSER=1)
-// skips the browser-open attempt (the URL + code are always printed).
-func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
+// returns the minted account-session client credential. noBrowser (or
+// $PAGNET_NO_BROWSER=1) skips the browser-open attempt (the URL + code are
+// always printed).
+func loginOIDCDeviceFlow(base string, noBrowser bool) (mintedCredential, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
 	// 1. Device config from the control plane (public endpoint).
 	var cfg deviceConfig
 	resp, err := client.Get(base + "api/v1/auth/oidc/device-config")
 	if err != nil {
-		return "", fmt.Errorf("device flow: %w", err)
+		return mintedCredential{}, fmt.Errorf("device flow: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", apiError(resp, "could not fetch the device config (is the server in oidc mode?)")
+		return mintedCredential{}, apiError(resp, "could not fetch the device config (is the server in oidc mode?)")
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
 		resp.Body.Close()
-		return "", fmt.Errorf("device flow: %w", err)
+		return mintedCredential{}, fmt.Errorf("device flow: %w", err)
 	}
 	resp.Body.Close()
 	if cfg.DeviceAuthorizationEndpoint == "" || cfg.TokenEndpoint == "" || cfg.ClientID == "" {
-		return "", errors.New("device flow: the server returned an incomplete device config")
+		return mintedCredential{}, errors.New("device flow: the server returned an incomplete device config")
 	}
 
 	// 2. Start the device flow at the IdP (with PKCE, RFC 9126).
 	verifier, err := pkceVerifier()
 	if err != nil {
-		return "", err
+		return mintedCredential{}, err
 	}
 	authForm := url.Values{}
 	authForm.Set("client_id", cfg.ClientID)
@@ -516,11 +510,11 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 	authForm.Set("code_challenge_method", "S256")
 	daResp, err := postForm(client, cfg.DeviceAuthorizationEndpoint, authForm)
 	if err != nil {
-		return "", fmt.Errorf("device flow: %w", err)
+		return mintedCredential{}, fmt.Errorf("device flow: %w", err)
 	}
 	defer daResp.Body.Close()
 	if daResp.StatusCode != http.StatusOK {
-		return "", apiError(daResp, "could not start the device flow at the identity provider")
+		return mintedCredential{}, apiError(daResp, "could not start the device flow at the identity provider")
 	}
 	var da struct {
 		DeviceCode              string `json:"device_code"`
@@ -531,7 +525,7 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 		Interval                int    `json:"interval"`
 	}
 	if err := json.NewDecoder(daResp.Body).Decode(&da); err != nil || da.DeviceCode == "" {
-		return "", errors.New("device flow: unexpected device-authorization response")
+		return mintedCredential{}, errors.New("device flow: unexpected device-authorization response")
 	}
 
 	// 3. Show the verification URL + code; best-effort open a browser.
@@ -573,7 +567,7 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 		pollForm.Set("code_verifier", verifier)
 		r, err := postForm(client, cfg.TokenEndpoint, pollForm)
 		if err != nil {
-			return "", fmt.Errorf("device flow: %w", err)
+			return mintedCredential{}, fmt.Errorf("device flow: %w", err)
 		}
 		switch {
 		case r.StatusCode == http.StatusOK:
@@ -582,11 +576,12 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 			}
 			if err := json.NewDecoder(r.Body).Decode(&ts); err != nil || ts.IDToken == "" {
 				r.Body.Close()
-				return "", errors.New("device flow: the identity provider returned no ID token")
+				return mintedCredential{}, errors.New("device flow: the identity provider returned no ID token")
 			}
 			r.Body.Close()
 			fmt.Println(" done")
-			// 5. Exchange the ID token for a pagnet API token.
+			// 5. Exchange the ID token for the account-session client
+			//    credential.
 			return exchangeIDToken(client, base, ts.IDToken)
 		case r.StatusCode == http.StatusBadRequest:
 			var e struct {
@@ -601,44 +596,62 @@ func loginOIDCDeviceFlow(base string, noBrowser bool) (string, error) {
 				interval += 5 * time.Second // the IdP asked us to slow down
 			case "expired_token":
 				fmt.Println()
-				return "", errors.New("device flow expired before you signed in; run the command again")
+				return mintedCredential{}, errors.New("device flow expired before you signed in; run the command again")
 			case "access_denied":
 				fmt.Println()
-				return "", errors.New("you denied the login in the browser; run the command again")
+				return mintedCredential{}, errors.New("you denied the login in the browser; run the command again")
 			default:
 				fmt.Println()
-				return "", fmt.Errorf("device flow: the identity provider rejected the device code (%s)", e.Error)
+				return mintedCredential{}, fmt.Errorf("device flow: the identity provider rejected the device code (%s)", e.Error)
 			}
 		default:
 			raw, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
 			r.Body.Close()
-			return "", fmt.Errorf("device flow: identity provider http %d: %s", r.StatusCode, raw)
+			return mintedCredential{}, fmt.Errorf("device flow: identity provider http %d: %s", r.StatusCode, raw)
 		}
 		time.Sleep(interval)
 	}
 	fmt.Println()
-	return "", errors.New("timed out waiting for browser authorization")
+	return mintedCredential{}, errors.New("timed out waiting for browser authorization")
+}
+
+// mintedCredential is the result of the OIDC device flow: the account-session
+// client credential the server minted (pgn_pat_v1_) plus the server-reported
+// restriction metadata. The stored record's class is verified from the
+// credential's own prefix at save time.
+type mintedCredential struct {
+	credential   string
+	role         string
+	networkScope string
+}
+
+// meta renders the server-reported restriction metadata for saveCredential.
+func (m mintedCredential) meta() credentialMeta {
+	return credentialMeta{Role: m.role, NetworkScope: m.networkScope}
 }
 
 // exchangeIDToken posts the ID token to the control plane and returns the
-// minted pagnet API token.
-func exchangeIDToken(client *http.Client, base, idToken string) (string, error) {
+// minted account-session client credential + its restriction metadata.
+func exchangeIDToken(client *http.Client, base, idToken string) (mintedCredential, error) {
 	body, _ := json.Marshal(map[string]string{"idToken": idToken})
 	resp, err := client.Post(base+"api/v1/auth/oidc/device/token", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("device flow: %w", err)
+		return mintedCredential{}, fmt.Errorf("device flow: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", apiError(resp, "could not exchange the ID token for an API token")
+		return mintedCredential{}, apiError(resp, "could not exchange the ID token for the client credential")
 	}
 	var ok struct {
-		Token string `json:"token"`
+		Credential   string `json:"credential"`
+		Role         string `json:"role"`
+		NetworkScope string `json:"networkScope"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil || !strings.HasPrefix(ok.Token, "pagt_") {
-		return "", errors.New("device flow: unexpected token-exchange response")
+	if err := json.NewDecoder(resp.Body).Decode(&ok); err != nil ||
+		!strings.HasPrefix(ok.Credential, tokenPrefixAccess) {
+		return mintedCredential{}, errors.New("device flow: unexpected token-exchange response")
 	}
-	return ok.Token, nil
+	return mintedCredential{credential: ok.Credential, role: ok.Role, networkScope: ok.NetworkScope}, nil
 }
 
 // postForm POSTs form-encoded data and returns the response (the caller owns
@@ -744,15 +757,15 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 		if !interactive && !noBrowser {
 			return "", errors.New("no stored credentials and no interactive terminal; run `pagnet login` in a terminal first (or set --token / $PAGNET_TOKEN)")
 		}
-		tok, err := loginOIDCDeviceFlow(base, noBrowser)
+		cred, err := loginOIDCDeviceFlow(base, noBrowser)
 		if err != nil {
 			return "", err
 		}
-		if err := saveUserToken(accDir, account, base, tok); err != nil {
+		if err := saveCredential(accDir, account, base, cred.credential, cred.meta()); err != nil {
 			return "", err
 		}
 		fmt.Printf("signed in; token stored in %s\n", accDir)
-		return tok, nil
+		return cred.credential, nil
 	case "local", "accounts":
 		// "accounts" is the canonical name of the DB-user auth mode;
 		// "local" is the pre-rename name, still accepted.
@@ -766,7 +779,7 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 		if password, err = askPassword("password: "); err != nil {
 			return "", err
 		}
-		tok, err := loginLocalAPIToken(client, base, username, password, "cli")
+		tok, err := loginLocalAPIToken(client, base, username, password)
 		if err != nil {
 			return "", err
 		}

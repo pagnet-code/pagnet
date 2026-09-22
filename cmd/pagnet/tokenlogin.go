@@ -5,19 +5,17 @@ package main
 // docs/2026-09-15_access-token-governance.md §7-8/§17-19).
 //
 // The interactive path of `pagnet login` is the hidden paste prompt: the
-// user pastes a Pagnet Token (Account Token pgn_acc_v1_…, Access Token
-// pgn_pat_v1_…, or a legacy API token pagt_…) with echo off — the token
-// never lives in argv, shell history, or process listings. The format is
-// validated locally BEFORE any round-trip; a malformed paste names the
-// expected prefixes and never leaves the machine.
+// user pastes a Pagnet Token (Account Token pgn_acc_v1_… or Access Token
+// pgn_pat_v1_…) with echo off — the token never lives in argv, shell
+// history, or process listings. The format is validated locally BEFORE any
+// round-trip; a malformed paste names the expected prefixes and never leaves
+// the machine.
 //
 // An Account/Access Token is exchanged ONCE for a revocable derived client
 // credential (governance §17-18: "server creates derived client/session
 // credential"); only the derived credential is stored (keyring-preferred,
 // 0600 file fallback — governance §19) and sent on later requests. The root
-// Account Token is never persisted and never re-sent. A legacy pagt_ token
-// keeps its current semantics (dual support): it is already a long-lived
-// revocable API token, so it is verified against /auth/me and stored as-is.
+// Account Token is never persisted and never re-sent.
 //
 // The exchange endpoint path and response schema are NOT fixed by the spec
 // (governance §77 names only the operation "exchange Pagnet Token for
@@ -41,7 +39,6 @@ import (
 const (
 	tokenPrefixAccount = "pgn_acc_v1_"
 	tokenPrefixAccess  = "pgn_pat_v1_"
-	tokenPrefixLegacy  = "pagt_"
 	// tokenPrefixPrincipalActivation / tokenPrefixEndpoint are the PRINCIPAL
 	// credentials (governance §7-8): the one-time activation credential and
 	// the durable endpoint credential. They authenticate AS an agent or a
@@ -52,7 +49,6 @@ const (
 
 	credentialKindAccount = "account"
 	credentialKindAccess  = "access"
-	credentialKindAPI     = "api" // legacy pagt_ (pre-AUTH-1 API token)
 	// credentialKindClient is a derived client credential whose own prefix
 	// proves no class the CLI can read — only the server knows what it can
 	// do. It is recorded rather than guessed (plan §7).
@@ -72,8 +68,6 @@ func verifiedCredentialKind(bearer string) string {
 		return credentialKindAccount
 	case strings.HasPrefix(bearer, tokenPrefixAccess):
 		return credentialKindAccess
-	case strings.HasPrefix(bearer, tokenPrefixLegacy):
-		return credentialKindAPI
 	default:
 		return ""
 	}
@@ -87,8 +81,6 @@ func credentialClassLabel(kind string) string {
 		return "your Pagnet Token"
 	case credentialKindAccess:
 		return "an Access Token"
-	case credentialKindAPI:
-		return "a legacy API token"
 	case credentialKindClient:
 		return "a derived client credential"
 	default:
@@ -121,16 +113,9 @@ func parsePagnetTokenFormat(s string) (string, error) {
 			return "", fmt.Errorf("malformed Access Token (%s...): %v", tokenPrefixAccess, err)
 		}
 		return credentialKindAccess, nil
-	case strings.HasPrefix(s, tokenPrefixLegacy):
-		// Legacy dual support: the client has always asserted the pagt_
-		// prefix; its internal shape is the server's business.
-		if len(s) <= len(tokenPrefixLegacy) {
-			return "", errors.New("malformed legacy API token: no secret after the prefix")
-		}
-		return credentialKindAPI, nil
 	default:
-		return "", fmt.Errorf("unrecognized Pagnet Token — expected an Account Token (%s<lookup-id>_<secret>), an Access Token (%s<lookup-id>_<secret>), or a legacy API token (%s...)",
-			tokenPrefixAccount, tokenPrefixAccess, tokenPrefixLegacy)
+		return "", fmt.Errorf("unrecognized Pagnet Token — expected an Account Token (%s<lookup-id>_<secret>) or an Access Token (%s<lookup-id>_<secret>)",
+			tokenPrefixAccount, tokenPrefixAccess)
 	}
 }
 
@@ -275,11 +260,11 @@ type pastedLoginResult struct {
 }
 
 // loginWithPastedToken runs the paste/scripted login for one credential:
-// local format check → (legacy: /auth/me verify | pgn_: one exchange for
-// the derived credential) → store the bearer + non-secret metadata. The
-// pasted root token is never persisted (governance §19) and never printed.
-// stateDir is the account's config dir; account scopes the keyring key so
-// two accounts on the same server keep separate credentials.
+// local format check → one exchange for the derived credential → store the
+// bearer + non-secret metadata. The pasted root token is never persisted
+// (governance §19) and never printed. stateDir is the account's config dir;
+// account scopes the keyring key so two accounts on the same server keep
+// separate credentials.
 func loginWithPastedToken(stateDir, account, server string, client *http.Client, pasted string) (*pastedLoginResult, error) {
 	pasted = strings.TrimSpace(pasted)
 	base := strings.TrimSuffix(server, "/") + "/"
@@ -288,23 +273,6 @@ func loginWithPastedToken(stateDir, account, server string, client *http.Client,
 		return nil, err
 	}
 	res := &pastedLoginResult{Kind: kind}
-
-	if kind == credentialKindAPI {
-		// Legacy dual support: a pagt_ token is already a long-lived
-		// revocable API token — verify it and keep using it as-is.
-		ok, err := bearerMe(client, base, pasted)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, errors.New("the control plane rejected that API token")
-		}
-		if err := saveCredential(stateDir, account, server, pasted, credentialMeta{Kind: kind, SourceKind: kind}); err != nil {
-			return nil, err
-		}
-		res.Summary = "verified the legacy API token (pagt_…); it stays the CLI bearer."
-		return res, nil
-	}
 
 	ex, err := exchangePagnetToken(client, base, pasted)
 	if err != nil {

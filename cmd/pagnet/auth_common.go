@@ -210,7 +210,7 @@ func translateAuthFailure(err error, class string) authFailure {
 		// The incident's exact failure. A delegated credential cannot mint
 		// credentials (governance §33/§56), so name the class in hand and
 		// point at the credential that works.
-		if class == credentialKindAccess || class == credentialKindAPI {
+		if class == credentialKindAccess {
 			return authFailure{
 				Translated: true,
 				Reprompt:   true,

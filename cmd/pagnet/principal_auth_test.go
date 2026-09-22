@@ -399,7 +399,9 @@ func TestEndpointCredentialValidatedLocally(t *testing.T) {
 	}{
 		{"account token", testAccountToken, []string{"your Pagnet Token", tokenPrefixEndpoint, "credential create"}},
 		{"access token", testAccessToken, []string{"an Access Token", tokenPrefixEndpoint}},
-		{"legacy api token", testLegacyToken, []string{"a legacy API token", tokenPrefixEndpoint}},
+		// The removed legacy pagt_ class is no longer a recognized credential:
+		// it is rejected as an unknown credential (no server round-trip).
+		{"legacy api token (removed)", testLegacyToken, []string{"not an agent or service endpoint credential", "credential create"}},
 		{"activation credential", testActivationCred, []string{"one-time activation credential", "endpoint credential"}},
 		{"malformed endpoint credential", tokenPrefixEndpoint + "tooshort", []string{"malformed endpoint credential"}},
 		{"not a credential at all", "hunter2", []string{"not an agent or service endpoint credential", "credential create"}},

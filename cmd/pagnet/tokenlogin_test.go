@@ -4,8 +4,9 @@ package main
 // credential): local format validation with no server round-trip, the
 // one-shot exchange against a fake control plane (net/http/httptest only),
 // the storage contract (derived credential stored, root token never,
-// metadata overwritten on re-login, 0600), legacy pagt_ dual support,
-// generic rejection handling, and the never-hang non-interactive prompt.
+// metadata overwritten on re-login, 0600), rejection of the removed legacy
+// pagt_ class, generic rejection handling, and the never-hang
+// non-interactive prompt.
 
 import (
 	"encoding/json"
@@ -135,7 +136,9 @@ func TestParsePagnetTokenFormat(t *testing.T) {
 	}{
 		{"account", testAccountToken, credentialKindAccount, ""},
 		{"access", testAccessToken, credentialKindAccess, ""},
-		{"legacy", testLegacyToken, credentialKindAPI, ""},
+		// The legacy pagt_ class is no longer a Pagnet Token: it is rejected
+		// as an unknown format (no server round-trip).
+		{"legacy prefix rejected", testLegacyToken, "", "unrecognized Pagnet Token"},
 		{"wrong prefix", "pgn_api_v1_K4T9M7QZaB1c3d5f_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", "", "unrecognized Pagnet Token"},
 		{"no prefix", "hunter2", "", "unrecognized Pagnet Token"},
 		{"empty", "", "", "unrecognized Pagnet Token"},
@@ -149,7 +152,6 @@ func TestParsePagnetTokenFormat(t *testing.T) {
 		{"separator not at the fixed position", "pgn_acc_v1_K4T9M7QZaB1c3d5fX_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", "", "malformed Account Token"},
 		{"tail too long", "pgn_acc_v1_K4T9M7QZaB1c3d5f_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGX", "", "malformed Account Token"},
 		{"bad charset", "pgn_acc_v1_K4T9M7QZaB1c3d5f_abcdefghijklmnopqrstuvwxyz0123456789ABCD.EF", "", "base64url"},
-		{"legacy empty secret", "pagt_", "", "malformed legacy API token"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,45 +271,35 @@ func TestLoginWithPastedAccessToken(t *testing.T) {
 	}
 }
 
-// --- paste login: legacy pagt_ dual support --------------------------------------
+// --- paste login: the removed legacy pagt_ class is rejected ----------------------
 
-func TestLoginWithPastedLegacyToken(t *testing.T) {
-	withFileFallback(t)
-	srv := newStubTokenServer(t)
-	srv.setValidBearer(testLegacyToken)
-
-	dir := t.TempDir()
-	res, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
-	if err != nil {
-		t.Fatalf("paste login: %v", err)
-	}
-	// Legacy tokens are verified against /auth/me and NEVER exchanged (no
-	// derived-credential story exists for them).
-	ex, me := srv.hits()
-	if ex != 0 || me != 1 {
-		t.Fatalf("hits: exchange=%d me=%d, want 0/1 (legacy: verify, no exchange)", ex, me)
-	}
-	if got := loadUserTokenFile(dir); got != testLegacyToken {
-		t.Fatalf("stored bearer = %q, want the legacy token as-is", got)
-	}
-	fc := stateFile(t, dir)
-	if fc["credentialKind"] != credentialKindAPI {
-		t.Errorf("credentialKind = %v, want api", fc["credentialKind"])
-	}
-	if !strings.Contains(res.Summary, "legacy API token") {
-		t.Errorf("summary = %q, want the legacy wording", res.Summary)
-	}
-}
-
+// TestLoginWithPastedLegacyTokenRejected: a pasted pagt_ token is no longer a
+// Pagnet Token. It is rejected as an unknown format BEFORE any round-trip
+// (the same local-format discipline as any malformed paste), and nothing is
+// stored.
 func TestLoginWithPastedLegacyTokenRejected(t *testing.T) {
 	withFileFallback(t)
 	srv := newStubTokenServer(t)
-	srv.setValidBearer("pagt_someother")
 
 	dir := t.TempDir()
 	_, err := loginWithPastedToken(dir, "", srv.ts.URL+"/", srv.ts.Client(), testLegacyToken)
-	if err == nil || !strings.Contains(err.Error(), "rejected") {
-		t.Fatalf("err = %v, want the clean rejection message", err)
+	if err == nil || !strings.Contains(err.Error(), "unrecognized Pagnet Token") {
+		t.Fatalf("err = %v, want the unknown-format rejection", err)
+	}
+	// The expected prefixes must be named so the user knows what to paste.
+	for _, want := range []string{"pgn_acc_v1_", "pgn_pat_v1_"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name %s: %v", want, err)
+		}
+	}
+	// The pasted material must never be echoed back.
+	if strings.Contains(err.Error(), testLegacyToken) {
+		t.Errorf("the error echoed the pasted credential: %v", err)
+	}
+	// No server round-trip: the rejection is local.
+	ex, me := srv.hits()
+	if ex != 0 || me != 0 {
+		t.Fatalf("a rejected paste must not touch the server (exchange=%d me=%d)", ex, me)
 	}
 	if got := loadUserTokenFile(dir); got != "" {
 		t.Errorf("nothing must be stored on rejection, got %q", got)
@@ -347,7 +339,7 @@ func TestLoginWithPastedTokenFormatErrorNoRoundTrip(t *testing.T) {
 		t.Fatalf("err = %v, want the prefix-naming format error", err)
 	}
 	// The expected prefixes must be named so the user knows what to paste.
-	for _, want := range []string{"pgn_acc_v1_", "pgn_pat_v1_", "pagt_"} {
+	for _, want := range []string{"pgn_acc_v1_", "pgn_pat_v1_"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error must name %s: %v", want, err)
 		}
@@ -395,7 +387,7 @@ func TestSaveCredentialClearsStaleMetadata(t *testing.T) {
 	// A later mode-based login (saveUserToken) must CLEAR the restriction
 	// metadata — it carries none, and stale metadata would misrepresent the
 	// bearer.
-	if err := saveUserToken(dir, "", "https://cp.example/", "pagt_fresh"); err != nil {
+	if err := saveUserToken(dir, "", "https://cp.example/", testDeviceCredential); err != nil {
 		t.Fatalf("saveUserToken: %v", err)
 	}
 	fc = stateFile(t, dir)
@@ -407,8 +399,8 @@ func TestSaveCredentialClearsStaleMetadata(t *testing.T) {
 	// credentialKind is NOT optional metadata: it is the class the newly
 	// stored bearer's own prefix proves, so it is re-recorded (never left at
 	// the previous login's value, never dropped).
-	if fc["credentialKind"] != credentialKindAPI {
-		t.Errorf("credentialKind = %v, want %q (verified from the pagt_ bearer just stored)", fc["credentialKind"], credentialKindAPI)
+	if fc["credentialKind"] != credentialKindAccess {
+		t.Errorf("credentialKind = %v, want %q (verified from the pgn_pat_ bearer just stored)", fc["credentialKind"], credentialKindAccess)
 	}
 	// Unrelated keys survive the merge (enroll shares this file).
 	if fc["serverUrl"] != "https://cp.example" {

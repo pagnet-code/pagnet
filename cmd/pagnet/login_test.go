@@ -8,6 +8,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,11 @@ import (
 
 	"github.com/pagnet-code/pagnet/internal/config"
 )
+
+// testDeviceCredential is the account-session client credential the stub
+// control plane mints for the OIDC device flow (pgn_pat_v1_ prefix, as the
+// real server does for every normal human sign-in).
+const testDeviceCredential = "pgn_pat_v1_D3v1c3L00k1d1d_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI"
 
 // --- stubs --------------------------------------------------------------------
 
@@ -106,8 +112,8 @@ func newStubIdP(t *testing.T, pollResponses []string) *stubIdP {
 // stubPagnetServer is an in-process control plane for the sign-in flow: it
 // reports the auth mode, serves device-config (pointing at the IdP), validates
 // bearers against /auth/me and the API endpoints, exchanges any non-empty
-// id_token for a pagt_ token, and (for the self-enroll test) mints + consumes
-// a one-time enrollment token.
+// id_token for the account-session client credential, and (for the
+// self-enroll test) mints + consumes a one-time enrollment token.
 type stubPagnetServer struct {
 	URL  string
 	mode string
@@ -160,7 +166,12 @@ func newStubPagnetServer(t *testing.T, idp *stubIdP, mode string, validTokens ..
 				fmt.Fprint(w, `{"error":{"code":"bad_request","message":"idToken required"}}`)
 				return
 			}
-			fmt.Fprint(w, `{"token":"pagt_testtoken123","user":{"id":"u1","username":"user-1"}}`)
+			fmt.Fprintf(w, `{"credential":"%s","user":{"id":"u1","username":"user-1"},"role":"admin","networkScope":"all"}`,
+				testDeviceCredential)
+		case "/" + tokenExchangePath:
+			// The paste-login exchange: a pasted root token is exchanged once
+			// for the account-session client credential.
+			fmt.Fprintf(w, `{"credential":"%s","role":"admin","networkScope":"all"}`, testDeviceCredential)
 		case "/api/v1/hosts/enrollment-tokens":
 			if !valid(r) {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -228,7 +239,7 @@ func withFileFallback(t *testing.T) {
 
 func TestLoginOIDCDeviceFlow(t *testing.T) {
 	idp := newStubIdP(t, []string{"pending", "slow_down", "success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	// Suppress the browser-open (headless test).
@@ -236,12 +247,16 @@ func TestLoginOIDCDeviceFlow(t *testing.T) {
 	openBrowserFn = func(string) error { return nil }
 	t.Cleanup(func() { openBrowserFn = prev })
 
-	token, err := loginOIDCDeviceFlow(base, false)
+	cred, err := loginOIDCDeviceFlow(base, false)
 	if err != nil {
 		t.Fatalf("device flow: %v", err)
 	}
-	if token != "pagt_testtoken123" {
-		t.Fatalf("token = %q, want pagt_testtoken123", token)
+	if cred.credential != testDeviceCredential {
+		t.Fatalf("credential = %q, want the minted account-session credential", cred.credential)
+	}
+	// The server-reported restriction metadata is carried through.
+	if cred.role != "admin" || cred.networkScope != "all" {
+		t.Errorf("metadata = %q/%q, want admin/all", cred.role, cred.networkScope)
 	}
 	// The IdP saw the full pending -> slow_down -> success sequence.
 	idp.mu.Lock()
@@ -265,7 +280,7 @@ func TestLoginOIDCDeviceFlow(t *testing.T) {
 
 func TestLoginOIDCDeviceFlowExpired(t *testing.T) {
 	idp := newStubIdP(t, []string{"expired"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	prev := openBrowserFn
@@ -280,7 +295,7 @@ func TestLoginOIDCDeviceFlowExpired(t *testing.T) {
 
 func TestLoginOIDCDeviceFlowNoBrowser(t *testing.T) {
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	// PAGNET_NO_BROWSER=1 must suppress the browser-open attempt.
@@ -308,6 +323,107 @@ func TestLoginOIDCDeviceFlowNoBrowser(t *testing.T) {
 	}
 }
 
+// --- local mode: password → account-session credential -------------------------
+
+// stubLoginServer is a fake control plane for the password flow: it serves
+// /auth/login (recording the request body, setting the session cookies, and
+// returning the minted credential) and /auth/logout (counting hits).
+type stubLoginServer struct {
+	ts *httptest.Server
+
+	mu         sync.Mutex
+	loginBody  string
+	logoutHits int
+	loginCred  string // credential in the login response ("" = none)
+}
+
+func newStubLoginServer(t *testing.T, cred string) *stubLoginServer {
+	t.Helper()
+	s := &stubLoginServer{loginCred: cred}
+	s.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/login":
+			b, _ := io.ReadAll(r.Body)
+			s.mu.Lock()
+			s.loginBody = string(b)
+			cred := s.loginCred
+			s.mu.Unlock()
+			http.SetCookie(w, &http.Cookie{Name: "pagnet_session", Value: "sess-1"})
+			http.SetCookie(w, &http.Cookie{Name: "pagnet_csrf", Value: "csrf-1"})
+			fmt.Fprintf(w, `{"user":{"id":"u1","username":"user-1"},"credential":"%s"}`, cred)
+		case "/api/v1/auth/logout":
+			s.mu.Lock()
+			s.logoutHits++
+			s.mu.Unlock()
+			fmt.Fprint(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.ts.Close)
+	return s
+}
+
+func (s *stubLoginServer) loginRequestBody() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loginBody
+}
+
+func (s *stubLoginServer) logoutHitCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.logoutHits
+}
+
+// TestLoginLocalAPIToken: the password flow sends cli:true, the server mints
+// the account-session credential in the login response, the CLI logs out the
+// carrier session, and returns the credential.
+func TestLoginLocalAPIToken(t *testing.T) {
+	srv := newStubLoginServer(t, testDeviceCredential)
+
+	cred, err := loginLocalAPIToken(srv.ts.Client(), srv.ts.URL+"/", "user-1", "hunter2")
+	if err != nil {
+		t.Fatalf("loginLocalAPIToken: %v", err)
+	}
+	if cred != testDeviceCredential {
+		t.Fatalf("credential = %q, want the minted account-session credential", cred)
+	}
+	// The request carried username/password and the cli:true flag (the server
+	// mints the credential in the login response when cli is set).
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(srv.loginRequestBody()), &sent); err != nil {
+		t.Fatalf("login body not JSON: %v", err)
+	}
+	if sent["username"] != "user-1" || sent["password"] != "hunter2" {
+		t.Errorf("login body = %v, want username/password", sent)
+	}
+	if sent["cli"] != true {
+		t.Errorf("login body cli = %v, want true", sent)
+	}
+	// The carrier session was logged out (not left alive).
+	if n := srv.logoutHitCount(); n != 1 {
+		t.Errorf("logout hits = %d, want 1 (the carrier session must not be left alive)", n)
+	}
+}
+
+// TestLoginLocalAPITokenNoCredential: a login response without the credential
+// (or with the wrong prefix) fails cleanly — nothing is returned.
+func TestLoginLocalAPITokenNoCredential(t *testing.T) {
+	// No credential at all.
+	srv := newStubLoginServer(t, "")
+	if _, err := loginLocalAPIToken(srv.ts.Client(), srv.ts.URL+"/", "user-1", "hunter2"); err == nil {
+		t.Fatal("want a clean failure when the login response has no credential")
+	}
+
+	// A credential with the wrong prefix (not the account-session class).
+	srv = newStubLoginServer(t, "pagt_wrongprefix123")
+	if _, err := loginLocalAPIToken(srv.ts.Client(), srv.ts.URL+"/", "user-1", "hunter2"); err == nil {
+		t.Fatal("want a clean failure when the credential has the wrong prefix")
+	}
+}
+
 // --- credential storage -------------------------------------------------------
 
 func TestSaveLoadUserTokenFileFallback(t *testing.T) {
@@ -315,12 +431,12 @@ func TestSaveLoadUserTokenFileFallback(t *testing.T) {
 	dir := t.TempDir()
 	server := "https://control.example/"
 
-	if err := saveUserToken(dir, "", server, "pagt_secret123"); err != nil {
+	if err := saveUserToken(dir, "", server, testDeviceCredential); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	// The token round-trips through the file store.
-	if got := loadUserToken(dir, "", server); got != "pagt_secret123" {
-		t.Fatalf("load = %q, want pagt_secret123", got)
+	if got := loadUserToken(dir, "", server); got != testDeviceCredential {
+		t.Fatalf("load = %q, want the stored credential", got)
 	}
 	// The state file is 0600.
 	info, err := os.Stat(filepath.Join(dir, "config.yaml"))
@@ -344,7 +460,7 @@ func TestSaveLoadUserTokenFileFallback(t *testing.T) {
 func TestEnsureUserTokenNoStoredTokenOIDC(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	prevBrowser := openBrowserFn
@@ -356,12 +472,12 @@ func TestEnsureUserTokenNoStoredTokenOIDC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureUserToken: %v", err)
 	}
-	if tok != "pagt_testtoken123" {
-		t.Fatalf("token = %q, want the minted token", tok)
+	if tok != testDeviceCredential {
+		t.Fatalf("token = %q, want the minted credential", tok)
 	}
 	// The token was stored for the next run (no re-login needed).
-	if got := loadUserToken(dir, "", base); got != "pagt_testtoken123" {
-		t.Fatalf("stored token = %q, want pagt_testtoken123", got)
+	if got := loadUserToken(dir, "", base); got != testDeviceCredential {
+		t.Fatalf("stored token = %q, want the minted credential", got)
 	}
 }
 
@@ -370,18 +486,18 @@ func TestEnsureUserTokenNoStoredTokenOIDC(t *testing.T) {
 func TestEnsureUserTokenStoredValid(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	dir := t.TempDir()
-	if err := saveUserToken(dir, "", base, "pagt_testtoken123"); err != nil {
+	if err := saveUserToken(dir, "", base, testDeviceCredential); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	tok, err := ensureUserToken(dir, "", base, false, true)
 	if err != nil {
 		t.Fatalf("ensureUserToken: %v", err)
 	}
-	if tok != "pagt_testtoken123" {
+	if tok != testDeviceCredential {
 		t.Fatalf("token = %q, want the stored token", tok)
 	}
 	if n := ts.deviceConfigCallCount(); n != 0 {
@@ -395,7 +511,7 @@ func TestEnsureUserTokenStoredValid(t *testing.T) {
 func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	prevBrowser := openBrowserFn
@@ -403,8 +519,8 @@ func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 	t.Cleanup(func() { openBrowserFn = prevBrowser })
 
 	dir := t.TempDir()
-	// A stored token the server no longer accepts.
-	if err := saveUserToken(dir, "", base, "pagt_revoked"); err != nil {
+	// A stored credential the server no longer accepts.
+	if err := saveUserToken(dir, "", base, "pgn_pat_v1_r3v0k3dCred1d_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI"); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	// The cliCtx base has NO trailing slash (as newCLI builds it); the
@@ -412,7 +528,7 @@ func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 	c := &cliCtx{
 		base:        ts.URL,
 		stateDir:    dir,
-		token:       "pagt_revoked",
+		token:       "pgn_pat_v1_r3v0k3dCred1d_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI",
 		reauth:      true,
 		noBrowser:   false,
 		interactive: true,
@@ -425,9 +541,9 @@ func TestEnsureUserTokenStored401Reauth(t *testing.T) {
 	if n := ts.deviceConfigCallCount(); n != 1 {
 		t.Errorf("device-config calls = %d, want 1 (re-login once)", n)
 	}
-	// The new token replaced the revoked one in the store.
-	if got := loadUserToken(dir, "", base); got != "pagt_testtoken123" {
-		t.Fatalf("stored token = %q, want the minted token", got)
+	// The new credential replaced the revoked one in the store.
+	if got := loadUserToken(dir, "", base); got != testDeviceCredential {
+		t.Fatalf("stored token = %q, want the minted credential", got)
 	}
 }
 
@@ -461,7 +577,7 @@ func TestEnsureUserTokenTokenMode(t *testing.T) {
 func TestEnsureUserTokenNoTTY(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	_, err := ensureUserToken(t.TempDir(), "", base, false, false)
@@ -480,7 +596,7 @@ func TestEnsureUserTokenNoTTY(t *testing.T) {
 func TestEnsureUserTokenNoBrowserHeadless(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 	base := ts.URL + "/"
 
 	prevBrowser := openBrowserFn
@@ -492,8 +608,8 @@ func TestEnsureUserTokenNoBrowserHeadless(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureUserToken (headless --no-browser): %v", err)
 	}
-	if tok != "pagt_testtoken123" {
-		t.Fatalf("token = %q, want the minted token", tok)
+	if tok != testDeviceCredential {
+		t.Fatalf("token = %q, want the minted credential", tok)
 	}
 }
 
@@ -504,7 +620,7 @@ func TestEnsureUserTokenNoBrowserHeadless(t *testing.T) {
 func TestEnrollWithoutToken(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 
 	// The state file's serverUrl must win the config load (env wins over
 	// file; an ambient PAGNET_SERVER would shadow it).
@@ -513,9 +629,10 @@ func TestEnrollWithoutToken(t *testing.T) {
 	serverURL = ts.URL
 	t.Cleanup(func() { serverURL = prevServer })
 	// The --token short-circuit supplies the user bearer (no browser, no
-	// paste); the flow still mints + consumes the enrollment token.
+	// paste); the pasted root is exchanged once and the flow still mints +
+	// consumes the enrollment token.
 	prevToken := userToken
-	userToken = "pagt_testtoken123"
+	userToken = testAccountToken
 	t.Cleanup(func() { userToken = prevToken })
 
 	dir := t.TempDir()
@@ -540,9 +657,9 @@ func TestEnrollWithoutToken(t *testing.T) {
 	if cfg.ServerURL != ts.URL {
 		t.Errorf("serverUrl = %q, want %q", cfg.ServerURL, ts.URL)
 	}
-	// The user token from the sign-in flow was stored too.
-	if got := loadUserToken(dir, "", ts.URL+"/"); got != "pagt_testtoken123" {
-		t.Errorf("stored user token = %q, want pagt_testtoken123", got)
+	// The user credential from the sign-in flow was stored too.
+	if got := loadUserToken(dir, "", ts.URL+"/"); got != testDeviceCredential {
+		t.Errorf("stored user token = %q, want the minted credential", got)
 	}
 }
 
@@ -551,20 +668,20 @@ func TestEnrollWithoutToken(t *testing.T) {
 func TestNewCLITokenShortCircuit(t *testing.T) {
 	withFileFallback(t)
 	idp := newStubIdP(t, []string{"success"})
-	ts := newStubPagnetServer(t, idp, "oidc", "pagt_testtoken123")
+	ts := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
 
 	prevServer := serverURL
 	serverURL = ts.URL
 	t.Cleanup(func() { serverURL = prevServer })
 	prevToken := userToken
-	userToken = "pagt_testtoken123"
+	userToken = testDeviceCredential
 	t.Cleanup(func() { userToken = prevToken })
 
 	c, err := newCLI(t.TempDir())
 	if err != nil {
 		t.Fatalf("newCLI: %v", err)
 	}
-	if c.token != "pagt_testtoken123" {
+	if c.token != testDeviceCredential {
 		t.Fatalf("c.token = %q, want the --token value", c.token)
 	}
 	// The short-circuit: zero device-endpoint calls.

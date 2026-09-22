@@ -192,7 +192,7 @@ func validateEndpointCredential(bearer string) error {
 		return nil
 	}
 	switch verifiedCredentialKind(bearer) {
-	case credentialKindAccount, credentialKindAccess, credentialKindAPI:
+	case credentialKindAccount, credentialKindAccess:
 		return fmt.Errorf("that is %s — a human credential, and this call is made by an agent or a service, "+
 			"never by the signed-in user. Pass that agent's or service's endpoint credential (%s...), printed once by "+
 			"`pagnet service credential create <service>` or `pagnet agent credential create <agent>`",

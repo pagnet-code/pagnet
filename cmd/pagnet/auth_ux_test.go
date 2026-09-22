@@ -45,16 +45,6 @@ func TestTranslateAuthFailureKnownCodes(t *testing.T) {
 			},
 		},
 		{
-			name:         "legacy api token on an account-authority operation",
-			status:       http.StatusForbidden,
-			code:         errCodeAccountAuthority,
-			class:        credentialKindAPI,
-			wantReprompt: true,
-			wantFragments: []string{
-				"This is a legacy API token. Use your Pagnet Token (" + why + ").",
-			},
-		},
-		{
 			name:          "derived client credential on an account-authority operation",
 			status:        http.StatusForbidden,
 			code:          errCodeAccountAuthority,
@@ -453,7 +443,7 @@ func TestVerifiedCredentialKind(t *testing.T) {
 	cases := map[string]string{
 		testAccountToken: credentialKindAccount,
 		testAccessToken:  credentialKindAccess,
-		testLegacyToken:  credentialKindAPI,
+		testLegacyToken:  "", // pagt_ — the removed legacy class proves nothing
 		testDerivedCred:  "", // pgn_cli_ — the client must not guess
 		"":               "",
 		"host_whatever":  "",
