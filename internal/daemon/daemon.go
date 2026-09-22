@@ -1849,15 +1849,29 @@ func filepathAbs(p string) (string, error) {
 
 // --- command implementations -------------------------------------------------
 
+// launchDefinitionDoc is the plaintext inside an agent_definition E2EE
+// envelope. The console encrypts the mission AND the standing instruction
+// as ONE protected document under ONE envelope (bound to the definition id
+// via the AAD) — the definition is one protected object, so its protected
+// content is one document. The server stores that single envelope and
+// relays it verbatim in BOTH launch envelope fields; the key names below
+// are the FIXED wire contract with the console encryptor.
+type launchDefinitionDoc struct {
+	Mission     string `json:"mission"`
+	Instruction string `json:"instruction"`
+}
+
 // resolveLaunchContent resolves the launch's mission and standing
 // instruction from the (possibly encrypted) launch payload (W-H1). On an
 // active private network the server dispatches launches with the mission /
-// instruction as E2EE envelopes + verbatim AAD: the plaintext fields are
-// EMPTY and the daemon decrypts them locally (its network keyring, the
-// envelope's epoch key, GCM bound to the verbatim AAD). The contract is
-// that an envelope REPLACES its plaintext field — both set, or an envelope
-// without its AAD, is a control-plane bug and is refused. Any decryption
-// failure (missing keyring, unknown epoch, tampered AAD or ciphertext)
+// instruction as an E2EE envelope + verbatim AAD: the plaintext fields are
+// EMPTY and the daemon decrypts locally (its network keyring, the
+// envelope's epoch key, GCM bound to the verbatim AAD), then reads both
+// fields from the combined agent_definition document. The contract is that
+// an envelope REPLACES its plaintext fields — a plaintext field set
+// alongside an envelope, or an envelope without its AAD, is a control-plane
+// bug and is refused. Any decryption or document-parse failure (missing
+// keyring, unknown epoch, tampered AAD or ciphertext, non-JSON plaintext)
 // fails the launch clean: a silently-empty mission would launch an agent
 // with no objective, and a plaintext fallback would leak protected
 // content. No key material or plaintext is logged.
@@ -1878,21 +1892,21 @@ func (d *Daemon) resolveLaunchContent(p transport.LaunchAgentPayload) (mission, 
 	if p.InstructionEnvelope != nil && p.InstructionAAD == nil {
 		return "", "", fmt.Errorf("launch instruction envelope is missing its AAD")
 	}
-	if p.MissionEnvelope != nil {
-		plain, err := d.decryptProtected(p.NetworkID, *p.MissionEnvelope, *p.MissionAAD)
-		if err != nil {
-			return "", "", fmt.Errorf("launch mission decrypt: %w", err)
-		}
-		mission = plain
+	// One envelope carries both fields; the server relays it in both wire
+	// slots. Decrypt the available envelope once and read the document.
+	env, aad := p.MissionEnvelope, p.MissionAAD
+	if env == nil {
+		env, aad = p.InstructionEnvelope, p.InstructionAAD
 	}
-	if p.InstructionEnvelope != nil {
-		plain, err := d.decryptProtected(p.NetworkID, *p.InstructionEnvelope, *p.InstructionAAD)
-		if err != nil {
-			return "", "", fmt.Errorf("launch instruction decrypt: %w", err)
-		}
-		agentMD = plain
+	plain, err := d.decryptProtected(p.NetworkID, *env, *aad)
+	if err != nil {
+		return "", "", fmt.Errorf("launch definition decrypt: %w", err)
 	}
-	return mission, agentMD, nil
+	var doc launchDefinitionDoc
+	if err := json.Unmarshal([]byte(plain), &doc); err != nil {
+		return "", "", fmt.Errorf("launch definition content is not a valid agent_definition document: %w", err)
+	}
+	return doc.Mission, doc.Instruction, nil
 }
 
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {

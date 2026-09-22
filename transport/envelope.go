@@ -419,19 +419,26 @@ type LaunchAgentPayload struct {
 	// locally at launch (its network keyring, the envelope's epoch key,
 	// GCM bound to the verbatim AAD). The control plane relays both
 	// byte-for-byte and never reads the ciphertext.
-	// MissionEnvelope is the E2EE envelope for the encrypted mission. When
-	// set, Mission is empty: the daemon decrypts it and runs the plaintext
-	// as the first turn, exactly as a plaintext mission would be run.
+	// The definition is ONE protected object: its protected content is ONE
+	// combined JSON document {"mission": string, "instruction": string}
+	// under ONE envelope (the AAD binds the definition id). The server
+	// relays that single envelope in BOTH envelope field pairs below, so
+	// when an envelope is present the daemon decrypts it once and reads
+	// both fields from the document.
+	// MissionEnvelope is the E2EE envelope for the definition document.
+	// When set, Mission is empty: the daemon decrypts it, parses the
+	// document, and runs document.mission as the first turn, exactly as a
+	// plaintext mission would be run.
 	MissionEnvelope *e2ee.EncryptedPayloadV1 `json:"missionEnvelope,omitempty"`
 	// MissionAAD is the associated-data the MissionEnvelope was bound to,
 	// relayed verbatim from the sender (the AAD server obligation,
 	// PROTOCOL §3). If the server altered any bound field, GCM
 	// authentication fails and the launch is refused.
 	MissionAAD *e2ee.AAD `json:"missionAad,omitempty"`
-	// InstructionEnvelope is the E2EE envelope for the encrypted standing
-	// instruction (AGENT.md-style). When set, AgentMD is empty: the daemon
-	// decrypts it and materializes it exactly as a plaintext AgentMD would
-	// be materialized.
+	// InstructionEnvelope carries the SAME definition document envelope as
+	// MissionEnvelope (the server mirrors it here); the daemon decrypts
+	// document.instruction and materializes it exactly as a plaintext
+	// AgentMD would be materialized. When set, AgentMD is empty.
 	InstructionEnvelope *e2ee.EncryptedPayloadV1 `json:"instructionEnvelope,omitempty"`
 	// InstructionAAD is the associated-data the InstructionEnvelope was
 	// bound to, relayed verbatim (the AAD server obligation, PROTOCOL §3).

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os/exec"
 	"strings"
@@ -63,12 +64,18 @@ func newLaunchCryptoDaemon(t *testing.T, repo string) (*Daemon, string, string) 
 	return d, networkID, epoch.ID
 }
 
-// encryptLaunchContent mirrors the SERVER-side sender for the test: it
-// encrypts plaintext under the network's active epoch with an
-// agent_definition AAD (fresh CEK per object) and returns the envelope +
-// AAD the server would relay verbatim.
-func encryptLaunchContent(t *testing.T, d *Daemon, networkID, plaintext string) (e2ee.EncryptedPayloadV1, e2ee.AAD) {
+// encryptDefinition mirrors the CONSOLE-side sender for the test: the
+// mission + standing instruction are ONE protected document
+// {"mission","instruction"} encrypted under the network's active epoch
+// with an agent_definition AAD bound to a fresh object id (the definition
+// id). It returns the single envelope + AAD the server relays verbatim in
+// BOTH launch envelope fields.
+func encryptDefinition(t *testing.T, d *Daemon, networkID, mission, instruction string) (e2ee.EncryptedPayloadV1, e2ee.AAD) {
 	t.Helper()
+	doc, err := json.Marshal(map[string]string{"mission": mission, "instruction": instruction})
+	if err != nil {
+		t.Fatalf("marshal doc: %v", err)
+	}
 	kr, err := crypto.LoadKeyring(d.StateDir, networkID)
 	if err != nil {
 		t.Fatalf("LoadKeyring: %v", err)
@@ -85,7 +92,7 @@ func encryptLaunchContent(t *testing.T, d *Daemon, networkID, plaintext string) 
 	if err != nil {
 		t.Fatalf("buildAAD: %v", err)
 	}
-	env, err := e2ee.Encrypt([]byte(plaintext), key, aad)
+	env, err := e2ee.Encrypt(doc, key, aad)
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
@@ -93,24 +100,25 @@ func encryptLaunchContent(t *testing.T, d *Daemon, networkID, plaintext string) 
 }
 
 // TestResolveLaunchContent_EnvelopeRoundTrip is the W-H1 focused unit
-// test: a mission + standing instruction encrypted with the e2ee package
-// (fresh CEK, epoch key from a test keyring, canonical AAD) round-trip
-// through the daemon's launch decrypt helper.
+// test: the mission + standing instruction encrypted as ONE combined
+// agent_definition document (fresh CEK, epoch key from a test keyring,
+// canonical AAD) round-trip through the daemon's launch decrypt helper —
+// both fields recovered from the single envelope the server mirrors in
+// both wire slots.
 func TestResolveLaunchContent_EnvelopeRoundTrip(t *testing.T) {
 	repo := t.TempDir()
 	d, networkID, _ := newLaunchCryptoDaemon(t, repo)
 
 	mission := "ship the release notes"
 	instruction := "always run the test suite before committing"
-	mEnv, mAAD := encryptLaunchContent(t, d, networkID, mission)
-	iEnv, iAAD := encryptLaunchContent(t, d, networkID, instruction)
+	env, aad := encryptDefinition(t, d, networkID, mission, instruction)
 
 	missionPlain, agentMDPlain, err := d.resolveLaunchContent(transport.LaunchAgentPayload{
 		NetworkID:           networkID,
-		MissionEnvelope:     &mEnv,
-		MissionAAD:          &mAAD,
-		InstructionEnvelope: &iEnv,
-		InstructionAAD:      &iAAD,
+		MissionEnvelope:     &env,
+		MissionAAD:          &aad,
+		InstructionEnvelope: &env,
+		InstructionAAD:      &aad,
 	})
 	if err != nil {
 		t.Fatalf("resolveLaunchContent: %v", err)
@@ -144,13 +152,13 @@ func TestResolveLaunchContent_PlaintextPassesThrough(t *testing.T) {
 }
 
 // TestResolveLaunchContent_ContractViolations pins the fail-closed
-// contract: an envelope REPLACES its plaintext field. Both set, or an
-// envelope without its AAD, is a control-plane bug and is refused.
+// contract: an envelope REPLACES its plaintext fields. A plaintext field
+// set alongside its envelope, or an envelope without its AAD, is a
+// control-plane bug and is refused.
 func TestResolveLaunchContent_ContractViolations(t *testing.T) {
 	repo := t.TempDir()
 	d, networkID, _ := newLaunchCryptoDaemon(t, repo)
-	mEnv, mAAD := encryptLaunchContent(t, d, networkID, "mission")
-	iEnv, iAAD := encryptLaunchContent(t, d, networkID, "instruction")
+	env, aad := encryptDefinition(t, d, networkID, "mission", "instruction")
 
 	cases := []struct {
 		name string
@@ -160,26 +168,26 @@ func TestResolveLaunchContent_ContractViolations(t *testing.T) {
 			name: "plaintext mission AND mission envelope",
 			p: transport.LaunchAgentPayload{
 				NetworkID: networkID, Mission: "plain",
-				MissionEnvelope: &mEnv, MissionAAD: &mAAD,
+				MissionEnvelope: &env, MissionAAD: &aad,
 			},
 		},
 		{
 			name: "plaintext instruction AND instruction envelope",
 			p: transport.LaunchAgentPayload{
 				NetworkID: networkID, AgentMD: "plain",
-				InstructionEnvelope: &iEnv, InstructionAAD: &iAAD,
+				InstructionEnvelope: &env, InstructionAAD: &aad,
 			},
 		},
 		{
 			name: "mission envelope without its AAD",
 			p: transport.LaunchAgentPayload{
-				NetworkID: networkID, MissionEnvelope: &mEnv,
+				NetworkID: networkID, MissionEnvelope: &env,
 			},
 		},
 		{
 			name: "instruction envelope without its AAD",
 			p: transport.LaunchAgentPayload{
-				NetworkID: networkID, InstructionEnvelope: &iEnv,
+				NetworkID: networkID, InstructionEnvelope: &env,
 			},
 		},
 	}
@@ -197,16 +205,56 @@ func TestResolveLaunchContent_TamperedAAD_Fails(t *testing.T) {
 	repo := t.TempDir()
 	d, networkID, _ := newLaunchCryptoDaemon(t, repo)
 
-	mEnv, mAAD := encryptLaunchContent(t, d, networkID, "ship the release notes")
-	badAAD := mAAD
+	env, aad := encryptDefinition(t, d, networkID, "ship the release notes", "instruction")
+	badAAD := aad
 	badAAD.ObjectID = "tampered" // a bound field the server must relay verbatim
 
 	if _, _, err := d.resolveLaunchContent(transport.LaunchAgentPayload{
 		NetworkID:       networkID,
-		MissionEnvelope: &mEnv,
+		MissionEnvelope: &env,
 		MissionAAD:      &badAAD,
 	}); err == nil {
 		t.Fatal("tampered AAD accepted, want GCM authentication failure")
+	}
+}
+
+// TestResolveLaunchContent_MalformedDocument_Fails pins the parse gate:
+// an envelope whose plaintext is NOT the combined agent_definition JSON
+// (a buggy or hostile encryptor) fails the launch clean — the daemon never
+// guesses by treating the raw plaintext as the mission.
+func TestResolveLaunchContent_MalformedDocument_Fails(t *testing.T) {
+	repo := t.TempDir()
+	d, networkID, _ := newLaunchCryptoDaemon(t, repo)
+
+	// Encrypt RAW mission text (not the combined document) — the pre-fix
+	// wire shape. The daemon must refuse it, not launch with the raw text
+	// misread as the mission.
+	kr, err := crypto.LoadKeyring(d.StateDir, networkID)
+	if err != nil {
+		t.Fatalf("LoadKeyring: %v", err)
+	}
+	epoch, err := kr.ActiveEpoch()
+	if err != nil {
+		t.Fatalf("ActiveEpoch: %v", err)
+	}
+	key, err := epoch.KeyArray()
+	if err != nil {
+		t.Fatalf("KeyArray: %v", err)
+	}
+	aad, err := buildAAD("tenant-1", networkID, e2ee.ObjectTypeAgentDefinition, newObjectID(), "operator", "", epoch.ID)
+	if err != nil {
+		t.Fatalf("buildAAD: %v", err)
+	}
+	env, err := e2ee.Encrypt([]byte("raw mission, not a document"), key, aad)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	if _, _, err := d.resolveLaunchContent(transport.LaunchAgentPayload{
+		NetworkID:       networkID,
+		MissionEnvelope: &env,
+		MissionAAD:      &aad,
+	}); err == nil {
+		t.Fatal("non-document plaintext accepted, want clean parse failure")
 	}
 }
 
@@ -259,8 +307,7 @@ func TestDoLaunch_EnvelopeContentDecryptsAndRuns(t *testing.T) {
 
 	mission := "ship the release notes"
 	instruction := "always run the test suite before committing"
-	mEnv, mAAD := encryptLaunchContent(t, d, networkID, mission)
-	iEnv, iAAD := encryptLaunchContent(t, d, networkID, instruction)
+	env, aad := encryptDefinition(t, d, networkID, mission, instruction)
 
 	id := domain.NewID().String()
 	err := d.doLaunch(nil, transport.LaunchAgentPayload{
@@ -270,10 +317,10 @@ func TestDoLaunch_EnvelopeContentDecryptsAndRuns(t *testing.T) {
 		Access:              domain.AccessReadOnly,
 		Runtime:             string(domain.RuntimeFake),
 		NetworkID:           networkID,
-		MissionEnvelope:     &mEnv,
-		MissionAAD:          &mAAD,
-		InstructionEnvelope: &iEnv,
-		InstructionAAD:      &iAAD,
+		MissionEnvelope:     &env,
+		MissionAAD:          &aad,
+		InstructionEnvelope: &env,
+		InstructionAAD:      &aad,
 	})
 	if err != nil {
 		t.Fatalf("doLaunch: %v", err)
@@ -309,8 +356,8 @@ func TestDoLaunch_TamperedAAD_FailsClean(t *testing.T) {
 	repo := t.TempDir()
 	d, networkID, _ := newLaunchCryptoDaemon(t, repo)
 
-	mEnv, mAAD := encryptLaunchContent(t, d, networkID, "ship the release notes")
-	badAAD := mAAD
+	env, aad := encryptDefinition(t, d, networkID, "ship the release notes", "instruction")
+	badAAD := aad
 	badAAD.NetworkID = "other-network" // the server altered a bound field
 
 	id := domain.NewID().String()
@@ -321,7 +368,7 @@ func TestDoLaunch_TamperedAAD_FailsClean(t *testing.T) {
 		Access:        domain.AccessReadOnly,
 		Runtime:       string(domain.RuntimeFake),
 		NetworkID:     networkID,
-		MissionEnvelope: &mEnv,
+		MissionEnvelope: &env,
 		MissionAAD:      &badAAD,
 	})
 	if err == nil {
