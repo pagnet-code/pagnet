@@ -15,15 +15,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -109,7 +113,11 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	// host id). Connect it in the FOREGROUND — the token-first paste must
 	// run before the daemon starts. An already-enrolled host starts WITHOUT
 	// a user login (logout must not break an enrolled host).
-	if needsEnroll(cfg) {
+	//
+	// firstRun is the definitive first-run event: host registration happens
+	// exactly once, so it is the trigger for the console handoff (below).
+	firstRun := needsEnroll(cfg)
+	if firstRun {
 		if err := enrollHostForeground(root, account, "", nil, ""); err != nil {
 			return err
 		}
@@ -128,6 +136,18 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	server := resolveServerURL(cfg)
 	if server == "" {
 		return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
+	}
+
+	// First-run console handoff (BINDING 2026-09-22): the terminal's job is
+	// runtime; the browser's job is composition. On the definitive first-run
+	// event (host registration) print the next-steps block and open the
+	// console's /welcome page (only when interactive). On later runs print a
+	// one-line reminder when the account has zero networks. Both are best-
+	// effort: they must never break or delay serve startup.
+	if firstRun {
+		printFirstRunHandoff(server, cfg.HostID, cfg.HostName)
+	} else {
+		printZeroNetworksReminder(server, cfg.HostID, root, account)
 	}
 
 	// Export the state dir into the process environment so the session-driven
@@ -173,6 +193,86 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	return nil
+}
+
+// --- first-run console handoff (BINDING 2026-09-22) ---------------------------
+//
+// The terminal's job is runtime; the browser's job is composition. `pagnet
+// serve` completes the connection and then HANDS OFF to the console: no
+// interactive create/join flows in the CLI.
+
+// printFirstRunHandoff prints the first-run next-steps block and opens the
+// console's /welcome page (only when interactive). It runs after a
+// successful first-run host registration — the definitive first-run event.
+// The printed block respects --silent; the browser-open is gated by
+// interactivity (hasTTY / --non-interactive) and PAGNET_NO_BROWSER, mirroring
+// the OIDC device flow.
+func printFirstRunHandoff(server, hostID, hostName string) {
+	origin := strings.TrimSuffix(server, "/")
+	if !silent {
+		fmt.Printf("✓ signed in · host %q connected to %s\n\n", hostName, origin)
+		fmt.Println("  Next steps — in your browser:")
+		fmt.Printf("    %s/welcome      ← create your first network and add this host\n", origin)
+		fmt.Println("    docs.pagnet.dev/quickstart  ← then launch your first agent")
+	}
+	if interactiveMode() && os.Getenv("PAGNET_NO_BROWSER") != "1" {
+		if err := openBrowserFn(origin + "/welcome?host=" + hostID); err != nil {
+			fmt.Println("(could not open a browser — use the URL above)")
+		}
+	}
+}
+
+// printZeroNetworksReminder prints a one-line reminder when the account has
+// zero networks (a later run on an already-enrolled host). It checks the
+// networks list via the authenticated API; on ANY error or non-200 it prints
+// nothing — the reminder must never break or delay serve startup. It is
+// skipped entirely when networks exist.
+func printZeroNetworksReminder(server, hostID, root, account string) {
+	if silent {
+		return
+	}
+	bearer := loadUserToken(accountConfigDir(root, account), account, server)
+	if bearer == "" {
+		return
+	}
+	if countNetworks(server, bearer) != 0 {
+		return
+	}
+	origin := strings.TrimSuffix(server, "/")
+	fmt.Printf("no networks yet — create your first: %s/welcome?host=%s\n", origin, hostID)
+}
+
+// countNetworks returns the number of networks the user's account has, via
+// the authenticated GET /api/v1/networks. Any error (no bearer, network
+// failure, non-200, decode failure) returns -1 so the caller treats it as
+// "unknown" and prints nothing — the reminder must never break or delay
+// serve startup.
+func countNetworks(base, bearer string) int {
+	if bearer == "" {
+		return -1
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSuffix(base, "/")+"/api/v1/networks", nil)
+	if err != nil {
+		return -1
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return -1
+	}
+	var nets []struct {
+		ID string `json:"ID"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&nets); err != nil {
+		return -1
+	}
+	return len(nets)
 }
 
 // runDetach implements `pagnet -d`: re-exec this binary as

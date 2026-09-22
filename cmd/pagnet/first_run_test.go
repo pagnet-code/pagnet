@@ -7,9 +7,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -310,5 +313,169 @@ func TestSilentPreservesFailureExitStatus(t *testing.T) {
 		if err == nil {
 			t.Fatalf("silent=%v: doEnroll (bad token) = nil, want an error (exit status preserved)", s)
 		}
+	}
+}
+
+// --- first-run console handoff (BINDING 2026-09-22) ---------------------------
+//
+// The terminal's job is runtime; the browser's job is composition. `pagnet
+// serve` completes the connection and then HANDS OFF to the console: the
+// definitive first-run event (host registration) prints a next-steps block
+// and opens /welcome (only when interactive); later runs print a one-line
+// reminder when the account has zero networks.
+
+// TestFirstRunHandoffPrintsBlock: the registration path prints the
+// next-steps block with the correct /welcome URL and the quickstart link.
+// The zero-networks reminder is ABSENT on the registration run itself (the
+// full block covers it).
+func TestFirstRunHandoffPrintsBlock(t *testing.T) {
+	// Non-interactive (no TTY) + PAGNET_NO_BROWSER: no browser open.
+	prevTTY := hasTTYFn
+	hasTTYFn = func() bool { return false }
+	t.Cleanup(func() { hasTTYFn = prevTTY })
+	t.Setenv("PAGNET_NO_BROWSER", "1")
+
+	out := captureStdout(t, func() {
+		printFirstRunHandoff("https://cp.example/", "h1", "lince")
+	})
+	if !strings.Contains(out, `✓ signed in · host "lince" connected to https://cp.example`) {
+		t.Errorf("handoff missing the signed-in line: %q", out)
+	}
+	if !strings.Contains(out, "https://cp.example/welcome") {
+		t.Errorf("handoff missing the /welcome URL: %q", out)
+	}
+	if !strings.Contains(out, "docs.pagnet.dev/quickstart") {
+		t.Errorf("handoff missing the quickstart URL: %q", out)
+	}
+	// The reminder is absent on the registration run (the full block covers it).
+	if strings.Contains(out, "no networks yet") {
+		t.Errorf("reminder printed on the registration run: %q", out)
+	}
+}
+
+// TestFirstRunHandoffBrowserOpen: the browser is opened to /welcome?host=
+// when interactive and PAGNET_NO_BROWSER is unset; it is suppressed when
+// PAGNET_NO_BROWSER=1 (mirror TestLoginOIDCDeviceFlowNoBrowser).
+func TestFirstRunHandoffBrowserOpen(t *testing.T) {
+	prevTTY := hasTTYFn
+	hasTTYFn = func() bool { return true } // interactive
+	t.Cleanup(func() { hasTTYFn = prevTTY })
+
+	var gotURL string
+	prev := openBrowserFn
+	openBrowserFn = func(url string) error { gotURL = url; return nil }
+	t.Cleanup(func() { openBrowserFn = prev })
+
+	// Without PAGNET_NO_BROWSER: the browser-open is attempted with the
+	// correct /welcome?host= URL.
+	os.Unsetenv("PAGNET_NO_BROWSER")
+	printFirstRunHandoff("https://cp.example/", "h1", "lince")
+	if gotURL != "https://cp.example/welcome?host=h1" {
+		t.Errorf("browser URL = %q, want https://cp.example/welcome?host=h1", gotURL)
+	}
+
+	// PAGNET_NO_BROWSER=1 must suppress the browser-open attempt.
+	gotURL = ""
+	t.Setenv("PAGNET_NO_BROWSER", "1")
+	printFirstRunHandoff("https://cp.example/", "h1", "lince")
+	if gotURL != "" {
+		t.Errorf("browser was opened despite PAGNET_NO_BROWSER=1 (url %q)", gotURL)
+	}
+}
+
+// stubNetworksServer is a fake control plane for the zero-networks reminder:
+// it serves /api/v1/networks with a configurable list (count networks).
+type stubNetworksServer struct {
+	ts *httptest.Server
+}
+
+// newStubNetworksServer returns a fake control plane whose /api/v1/networks
+// responds with a JSON array of `count` networks.
+func newStubNetworksServer(t *testing.T, count int) *stubNetworksServer {
+	t.Helper()
+	nets := make([]map[string]string, 0, count)
+	for i := 0; i < count; i++ {
+		nets = append(nets, map[string]string{"ID": fmt.Sprintf("net-%d", i)})
+	}
+	s := &stubNetworksServer{}
+	s.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/networks" {
+			b, _ := json.Marshal(nets)
+			fmt.Fprint(w, string(b))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(s.ts.Close)
+	return s
+}
+
+// newStubErrorServer returns a fake control plane that answers every request
+// with 500 (to test the endpoint-error case: the reminder must be suppressed).
+func newStubErrorServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"error":{"code":"internal","message":"internal error"}}`)
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+// TestZeroNetworksReminder: the reminder appears EXACTLY when the networks
+// list is empty; it is suppressed when networks exist AND when the endpoint
+// errors (the reminder must never break or delay serve startup).
+func TestZeroNetworksReminder(t *testing.T) {
+	withFileFallback(t)
+	root := t.TempDir()
+	accDir := accountConfigDir(root, "default")
+	// Store a user bearer (so loadUserToken returns non-empty).
+	if err := os.MkdirAll(accDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveUserToken(accDir, "default", "https://cp.example", "user-bearer"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero networks: the reminder is printed with the correct /welcome?host= URL.
+	ts := newStubNetworksServer(t, 0)
+	out := captureStdout(t, func() {
+		printZeroNetworksReminder(ts.ts.URL, "h1", root, "default")
+	})
+	if want := "no networks yet — create your first: " + ts.ts.URL + "/welcome?host=h1"; !strings.Contains(out, want) {
+		t.Errorf("zero-networks reminder = %q, want %q", out, want)
+	}
+
+	// Networks exist: the reminder is suppressed.
+	ts2 := newStubNetworksServer(t, 1)
+	out = captureStdout(t, func() {
+		printZeroNetworksReminder(ts2.ts.URL, "h1", root, "default")
+	})
+	if strings.Contains(out, "no networks yet") {
+		t.Errorf("reminder printed despite networks existing: %q", out)
+	}
+
+	// Endpoint error (non-200): the reminder is suppressed.
+	ts3 := newStubErrorServer(t)
+	out = captureStdout(t, func() {
+		printZeroNetworksReminder(ts3.URL, "h1", root, "default")
+	})
+	if strings.Contains(out, "no networks yet") {
+		t.Errorf("reminder printed despite endpoint error: %q", out)
+	}
+}
+
+// TestZeroNetworksReminderNoBearer: with no stored user bearer, the reminder
+// is suppressed (it must never break or delay serve startup).
+func TestZeroNetworksReminderNoBearer(t *testing.T) {
+	withFileFallback(t)
+	root := t.TempDir() // no stored credential
+	ts := newStubNetworksServer(t, 0)
+	out := captureStdout(t, func() {
+		printZeroNetworksReminder(ts.ts.URL, "h1", root, "default")
+	})
+	if strings.Contains(out, "no networks yet") {
+		t.Errorf("reminder printed despite no bearer: %q", out)
 	}
 }
