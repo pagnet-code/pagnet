@@ -328,6 +328,65 @@ func TestEndpointStatusWireFormat(t *testing.T) {
 	}
 }
 
+// TestLaunchAgentPayloadEnvelopeWireNames pins the W-H1 cross-repo
+// contract: the encrypted launch-content fields marshal with the EXACT
+// wire names the server dispatches (and omit when absent, so pre-W-H1
+// launch payloads stay byte-identical).
+func TestLaunchAgentPayloadEnvelopeWireNames(t *testing.T) {
+	env := &e2ee.EncryptedPayloadV1{
+		Version:           e2ee.EnvelopeVersion,
+		CipherSuite:       e2ee.CipherSuiteAES256GCM,
+		KeyEpochID:        "epoch-1",
+		Nonce:             "AAECAwQFBgcICQoL",
+		Ciphertext:        "ct",
+		WrappedContentKey: "wrapped",
+		AADVersion:        e2ee.AADVersion,
+	}
+	aad := &e2ee.AAD{ProtocolVersion: 2, NetworkID: "net", ObjectType: "agent_definition", ObjectID: "obj", KeyEpochID: "epoch-1"}
+
+	// No envelopes: the fields are omitted (additive contract — a
+	// plaintext launch is byte-identical to pre-W-H1).
+	b, err := json.Marshal(LaunchAgentPayload{CommandID: "cmd-1", InstanceID: "i1", Mission: "plain"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, absent := range []string{`"missionEnvelope"`, `"missionAad"`, `"instructionEnvelope"`, `"instructionAad"`} {
+		if strings.Contains(string(b), absent) {
+			t.Fatalf("launch payload without envelopes %s must omit %s", b, absent)
+		}
+	}
+
+	p := LaunchAgentPayload{
+		CommandID:           "cmd-1",
+		InstanceID:          "i1",
+		MissionEnvelope:     env,
+		MissionAAD:          aad,
+		InstructionEnvelope: env,
+		InstructionAAD:      aad,
+	}
+	b, err = json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"missionEnvelope":`, `"missionAad":`, `"instructionEnvelope":`, `"instructionAad":`} {
+		if !strings.Contains(string(b), key) {
+			t.Fatalf("launch payload %s does not carry %s", b, key)
+		}
+	}
+
+	// Round-trip: the server's bytes decode into the same fields.
+	var got LaunchAgentPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.MissionEnvelope == nil || got.MissionAAD == nil || got.InstructionEnvelope == nil || got.InstructionAAD == nil {
+		t.Fatalf("round-trip lost envelope fields: %+v", got)
+	}
+	if got.MissionEnvelope.KeyEpochID != "epoch-1" || got.InstructionAAD.ObjectID != "obj" {
+		t.Fatalf("round-trip corrupted envelope content: %+v / %+v", got.MissionEnvelope, got.InstructionAAD)
+	}
+}
+
 // TestNetworkEventPayloadV2Fields pins the host.deliver_network_event
 // extension: the v2 event-delivery fields marshal with the camelCase wire
 // names and omit when empty (v1 payloads stay byte-identical).

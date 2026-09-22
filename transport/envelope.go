@@ -410,6 +410,32 @@ type LaunchAgentPayload struct {
 	// network operation of the instance against this principal).
 	// Additive (V2 cutover, W2 sends it); empty on pre-V2 launches.
 	AgentPrincipalID string `json:"agentPrincipalId,omitempty"`
+
+	// --- E2EE launch content (W-H1) ---
+	//
+	// On an active private network the mission / standing instruction are
+	// client-encrypted: the server dispatches them as envelope + verbatim
+	// AAD and the plaintext fields below are EMPTY. The daemon decrypts
+	// locally at launch (its network keyring, the envelope's epoch key,
+	// GCM bound to the verbatim AAD). The control plane relays both
+	// byte-for-byte and never reads the ciphertext.
+	// MissionEnvelope is the E2EE envelope for the encrypted mission. When
+	// set, Mission is empty: the daemon decrypts it and runs the plaintext
+	// as the first turn, exactly as a plaintext mission would be run.
+	MissionEnvelope *e2ee.EncryptedPayloadV1 `json:"missionEnvelope,omitempty"`
+	// MissionAAD is the associated-data the MissionEnvelope was bound to,
+	// relayed verbatim from the sender (the AAD server obligation,
+	// PROTOCOL §3). If the server altered any bound field, GCM
+	// authentication fails and the launch is refused.
+	MissionAAD *e2ee.AAD `json:"missionAad,omitempty"`
+	// InstructionEnvelope is the E2EE envelope for the encrypted standing
+	// instruction (AGENT.md-style). When set, AgentMD is empty: the daemon
+	// decrypts it and materializes it exactly as a plaintext AgentMD would
+	// be materialized.
+	InstructionEnvelope *e2ee.EncryptedPayloadV1 `json:"instructionEnvelope,omitempty"`
+	// InstructionAAD is the associated-data the InstructionEnvelope was
+	// bound to, relayed verbatim (the AAD server obligation, PROTOCOL §3).
+	InstructionAAD *e2ee.AAD `json:"instructionAad,omitempty"`
 }
 
 // WakeAgentPayload wakes a hibernated instance: the daemon resumes the

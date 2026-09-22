@@ -1849,6 +1849,52 @@ func filepathAbs(p string) (string, error) {
 
 // --- command implementations -------------------------------------------------
 
+// resolveLaunchContent resolves the launch's mission and standing
+// instruction from the (possibly encrypted) launch payload (W-H1). On an
+// active private network the server dispatches launches with the mission /
+// instruction as E2EE envelopes + verbatim AAD: the plaintext fields are
+// EMPTY and the daemon decrypts them locally (its network keyring, the
+// envelope's epoch key, GCM bound to the verbatim AAD). The contract is
+// that an envelope REPLACES its plaintext field — both set, or an envelope
+// without its AAD, is a control-plane bug and is refused. Any decryption
+// failure (missing keyring, unknown epoch, tampered AAD or ciphertext)
+// fails the launch clean: a silently-empty mission would launch an agent
+// with no objective, and a plaintext fallback would leak protected
+// content. No key material or plaintext is logged.
+func (d *Daemon) resolveLaunchContent(p transport.LaunchAgentPayload) (mission, agentMD string, err error) {
+	mission, agentMD = p.Mission, p.AgentMD
+	if p.MissionEnvelope == nil && p.InstructionEnvelope == nil {
+		return mission, agentMD, nil
+	}
+	if p.MissionEnvelope != nil && p.Mission != "" {
+		return "", "", fmt.Errorf("launch carries both a plaintext mission and a mission envelope")
+	}
+	if p.InstructionEnvelope != nil && p.AgentMD != "" {
+		return "", "", fmt.Errorf("launch carries both a plaintext instruction and an instruction envelope")
+	}
+	if p.MissionEnvelope != nil && p.MissionAAD == nil {
+		return "", "", fmt.Errorf("launch mission envelope is missing its AAD")
+	}
+	if p.InstructionEnvelope != nil && p.InstructionAAD == nil {
+		return "", "", fmt.Errorf("launch instruction envelope is missing its AAD")
+	}
+	if p.MissionEnvelope != nil {
+		plain, err := d.decryptProtected(p.NetworkID, *p.MissionEnvelope, *p.MissionAAD)
+		if err != nil {
+			return "", "", fmt.Errorf("launch mission decrypt: %w", err)
+		}
+		mission = plain
+	}
+	if p.InstructionEnvelope != nil {
+		plain, err := d.decryptProtected(p.NetworkID, *p.InstructionEnvelope, *p.InstructionAAD)
+		if err != nil {
+			return "", "", fmt.Errorf("launch instruction decrypt: %w", err)
+		}
+		agentMD = plain
+	}
+	return mission, agentMD, nil
+}
+
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
 	// Boundary check (SEC-407): the instance id is server-provided and
 	// becomes filesystem path components (representatives/, sessions/,
@@ -1858,6 +1904,17 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if _, err := domain.ParseID(p.InstanceID); err != nil {
 		return fmt.Errorf("launch command carries an invalid instance id")
 	}
+	// E2EE launch content (W-H1): on an active private network the mission
+	// / standing instruction cross the boundary only as envelope + verbatim
+	// AAD (the plaintext fields are empty). Decrypt them locally BEFORE any
+	// side effect — a launch whose content cannot be decrypted fails clean
+	// (no instance registered, no turn started, no plaintext fallback).
+	mission, agentMD, err := d.resolveLaunchContent(p)
+	if err != nil {
+		return err
+	}
+	p.Mission = mission
+	p.AgentMD = agentMD
 	rn := domain.CanonicalRuntime(p.Runtime)
 	if rn == "" {
 		// No runtime requested: pick the first available REAL runtime.
