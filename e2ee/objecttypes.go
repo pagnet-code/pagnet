@@ -16,6 +16,8 @@ package e2ee
 //     operational metadata and stay plaintext).
 //   - ObjectTypeAgentDefinition: an agent definition's free-form mission /
 //     instruction text.
+//   - ObjectTypeAgentTemplate: a network template's combined mission +
+//     instruction document (the template's protected content).
 //
 // Protocol v2 (the V2 cutover) adds the event + invocation object types:
 //
@@ -35,6 +37,7 @@ const (
 	ObjectTypeRuntimeOutput      = "runtime_output"
 	ObjectTypeArtifact           = "artifact"
 	ObjectTypeAgentDefinition    = "agent_definition"
+	ObjectTypeAgentTemplate      = "agent_template"
 
 	ObjectTypeEventPayload     = "event_payload"
 	ObjectTypeInvocationInput  = "invocation_input"
