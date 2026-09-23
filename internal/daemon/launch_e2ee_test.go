@@ -362,12 +362,12 @@ func TestDoLaunch_TamperedAAD_FailsClean(t *testing.T) {
 
 	id := domain.NewID().String()
 	err := d.doLaunch(nil, transport.LaunchAgentPayload{
-		InstanceID:    id,
-		WorkspacePath: repo,
-		AgentName:     "e2ee-bad",
-		Access:        domain.AccessReadOnly,
-		Runtime:       string(domain.RuntimeFake),
-		NetworkID:     networkID,
+		InstanceID:      id,
+		WorkspacePath:   repo,
+		AgentName:       "e2ee-bad",
+		Access:          domain.AccessReadOnly,
+		Runtime:         string(domain.RuntimeFake),
+		NetworkID:       networkID,
 		MissionEnvelope: &env,
 		MissionAAD:      &badAAD,
 	})

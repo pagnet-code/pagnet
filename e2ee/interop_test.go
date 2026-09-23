@@ -92,37 +92,37 @@ func openAESGCM(t *testing.T, cek, nonce, ct, aad []byte) []byte {
 // --- the Go -> TS fixtures (generated here, opened by the browser) ---------
 
 type interopHPKEFixture struct {
-	Version        int    `json:"version"`
-	Direction      string `json:"direction"`
-	Suite          string `json:"suite"`
-	Info           string `json:"info"`
-	NetworkID      string `json:"network_id"`
-	SessionID      string `json:"session_id"`
-	ObjectID       string `json:"object_id"`
-	SessionAADB64  string `json:"session_aad_b64"`
-	RecipientPub   string `json:"recipient_pub_b64"`
-	RecipientPriv  string `json:"recipient_priv_b64"`
-	Enc            string `json:"enc_b64"`
-	CT             string `json:"ct_b64"`
-	CEKHex         string `json:"cek_hex"`
+	Version       int    `json:"version"`
+	Direction     string `json:"direction"`
+	Suite         string `json:"suite"`
+	Info          string `json:"info"`
+	NetworkID     string `json:"network_id"`
+	SessionID     string `json:"session_id"`
+	ObjectID      string `json:"object_id"`
+	SessionAADB64 string `json:"session_aad_b64"`
+	RecipientPub  string `json:"recipient_pub_b64"`
+	RecipientPriv string `json:"recipient_priv_b64"`
+	Enc           string `json:"enc_b64"`
+	CT            string `json:"ct_b64"`
+	CEKHex        string `json:"cek_hex"`
 }
 
 type interopPayloadFixture struct {
-	Version        int                `json:"version"`
-	Direction      string             `json:"direction"`
-	Suite          string             `json:"suite"`
-	Info           string             `json:"info"`
-	NetworkID      string             `json:"network_id"`
-	SessionID      string             `json:"session_id"`
-	ObjectID       string             `json:"object_id"`
-	SessionAADB64  string             `json:"session_aad_b64"`
-	RecipientPub   string             `json:"recipient_pub_b64"`
-	RecipientPriv  string             `json:"recipient_priv_b64"`
-	WrappedCEKEnc  string             `json:"wrapped_cek_enc_b64"`
-	WrappedCEKCT   string             `json:"wrapped_cek_ct_b64"`
-	Envelope       EncryptedPayloadV1 `json:"envelope"`
-	PayloadAAD     AAD                `json:"payload_aad"`
-	Plaintext      string             `json:"plaintext"`
+	Version       int                `json:"version"`
+	Direction     string             `json:"direction"`
+	Suite         string             `json:"suite"`
+	Info          string             `json:"info"`
+	NetworkID     string             `json:"network_id"`
+	SessionID     string             `json:"session_id"`
+	ObjectID      string             `json:"object_id"`
+	SessionAADB64 string             `json:"session_aad_b64"`
+	RecipientPub  string             `json:"recipient_pub_b64"`
+	RecipientPriv string             `json:"recipient_priv_b64"`
+	WrappedCEKEnc string             `json:"wrapped_cek_enc_b64"`
+	WrappedCEKCT  string             `json:"wrapped_cek_ct_b64"`
+	Envelope      EncryptedPayloadV1 `json:"envelope"`
+	PayloadAAD    AAD                `json:"payload_aad"`
+	Plaintext     string             `json:"plaintext"`
 }
 
 func writeJSON(t *testing.T, path string, v any) {
@@ -174,7 +174,7 @@ func TestInteropGenerateGoFixtures(t *testing.T) {
 	}
 	writeJSON(t, hpkePath, interopHPKEFixture{
 		Version: 1, Direction: "go_to_ts", Suite: interopSuite,
-		Info: HPKEInfoCekUnwrap,
+		Info:      HPKEInfoCekUnwrap,
 		NetworkID: networkID, SessionID: sessionID, ObjectID: objectID,
 		SessionAADB64: b64(t, sessAAD),
 		RecipientPub:  b64(t, recvPub), RecipientPriv: b64(t, recvPriv),
@@ -219,7 +219,7 @@ func TestInteropGenerateGoFixtures(t *testing.T) {
 	}
 	writeJSON(t, payloadPath, interopPayloadFixture{
 		Version: 1, Direction: "go_to_ts", Suite: interopSuite,
-		Info: HPKEInfoCekUnwrap,
+		Info:      HPKEInfoCekUnwrap,
 		NetworkID: networkID, SessionID: sessionID, ObjectID: objectID,
 		SessionAADB64: b64(t, sessAAD),
 		RecipientPub:  b64(t, recvPub), RecipientPriv: b64(t, recvPriv),
