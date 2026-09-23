@@ -331,3 +331,65 @@ func TestWorkspaceAllowed_SymlinkEscape(t *testing.T) {
 		t.Fatal("a real subpath of the allowed root must be allowed")
 	}
 }
+
+// Regression: a terminal attach for a WORKING instance must not be queued
+// behind a long turn in the per-instance FIFO. The attach is observational
+// (it connects the human to the endpoint's own PTY; it does not drive a
+// turn), so it runs concurrently with the turn. Before the fix, the attach
+// was enqueued in the per-instance FIFO and waited for the in-flight turn to
+// finish before being processed — the user opening the terminal while the
+// agent works saw a blank screen until the turn ended (the "blue rectangle,
+// then black" symptom).
+//
+// The test occupies the per-instance FIFO with a long job (simulating the
+// in-flight turn) and dispatches an attach command for a working instance.
+// The ack must arrive quickly (readAck's 5 s deadline); if the attach were
+// queued behind the long job, it would time out.
+func TestAttachConcurrentForWorkingInstance(t *testing.T) {
+	d := newTestDaemon(t)
+	client, server := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+
+	// A working instance (a turn is in flight). qwen-code is session-driven
+	// with a native TUI, so doAttach takes the session-driven path and
+	// refuses quickly (no live endpoint → PTYMaster nil) — the ack is
+	// fast regardless of the attach outcome.
+	const instanceID = "inst-working"
+	if err := d.state.UpsertInstance(InstanceRow{
+		InstanceID: instanceID, DefinitionID: "def", Runtime: string(domain.RuntimeQwenCode),
+		Status: "working",
+	}); err != nil {
+		t.Fatalf("UpsertInstance: %v", err)
+	}
+
+	// Occupy the per-instance FIFO with a long job (simulating the in-flight
+	// turn). The attach must NOT be queued behind it.
+	longDone := make(chan struct{})
+	if !d.enqueueInstance(instanceID, func() { <-longDone }) {
+		t.Fatal("failed to occupy the per-instance FIFO")
+	}
+
+	// Dispatch the attach command. It must be processed concurrently (acked
+	// quickly), not blocked by the long job.
+	const commandID = "cmd-attach-1"
+	env, err := transport.NewEnvelope(transport.MsgAttachTerminal, transport.TerminalAttachPayload{
+		InstanceID: instanceID, CommandID: commandID,
+	})
+	if err != nil {
+		t.Fatalf("build attach envelope: %v", err)
+	}
+	d.handleCommand(nil, env)
+
+	// The ack must arrive quickly (before the long job finishes). readAck has
+	// a 5 s deadline; if the attach were queued behind the long job, it would
+	// time out.
+	ack := readAck(t, server)
+	if ack["commandId"] != commandID {
+		t.Fatalf("ack commandId = %v, want %s", ack["commandId"], commandID)
+	}
+
+	// Release the long job (cleanup).
+	close(longDone)
+}

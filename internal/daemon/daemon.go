@@ -1295,9 +1295,22 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
-		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
+		// The attach is observational for a WORKING instance (it connects the
+		// human to the endpoint's own PTY; it does not drive a turn). It must
+		// not be queued behind a long turn in the per-instance FIFO — the user
+		// opening the terminal while the agent works would otherwise wait for
+		// the turn to finish before seeing anything (the "blue rectangle, then
+		// black" symptom). When the instance is working, run the attach
+		// concurrently with the turn; otherwise (no turn in flight) the
+		// per-instance FIFO is free and the normal path applies.
+		job := func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
-		})
+		}
+		if row, ok, _ := d.state.GetInstance(p.InstanceID); ok && row.Status == "working" {
+			d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, job)
+		} else {
+			d.enqueueCommand(conn, p.InstanceID, p.CommandID, job)
+		}
 
 	case transport.MsgDetachTerminal:
 		var p transport.DetachTerminalPayload
@@ -1590,6 +1603,41 @@ func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID stri
 	if !d.enqueueInstance(instanceID, job) {
 		d.releaseClaim(commandID)
 	}
+}
+
+// enqueueCommandConcurrent applies the re-send dedup gate and runs the job in
+// a separate goroutine (NOT the per-instance FIFO). It is for commands that
+// are observational with respect to the instance's turn — the terminal attach
+// for a working instance: it connects the human to the endpoint's own PTY and
+// must not be queued behind a long turn (the user opening the terminal while
+// the agent works would otherwise wait for the turn to finish before seeing
+// anything). The dedup gate is kept (a re-send is re-acked, not re-run); the
+// job's claim lifecycle is owned by guarded (it releases the claim on defer /
+// lost ack), so no claim is leaked when the goroutine runs.
+func (d *Daemon) enqueueCommandConcurrent(conn *websocket.Conn, instanceID, commandID string, job func()) {
+	if commandID != "" {
+		if d.alreadyProcessed(commandID) {
+			d.reAckProcessed(conn, commandID)
+			return
+		}
+		d.seenMu.Lock()
+		if _, dup := d.seen[commandID]; dup {
+			d.seenMu.Unlock()
+			d.Log.Debug("duplicate command dropped at enqueue", "command", commandID)
+			return
+		}
+		d.seen[commandID] = time.Now()
+		if len(d.seen) > 1024 {
+			cutoff := time.Now().Add(-time.Hour)
+			for id, claimed := range d.seen {
+				if claimed.Before(cutoff) {
+					delete(d.seen, id)
+				}
+			}
+		}
+		d.seenMu.Unlock()
+	}
+	go job()
 }
 
 // reAckProcessed re-acks an already-processed command (a server re-send after
