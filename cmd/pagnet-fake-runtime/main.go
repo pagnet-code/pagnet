@@ -126,6 +126,15 @@ func main() {
 			plyArgValue(os.Args[1:], "--resume"))
 		return
 	}
+	if hasArg(os.Args[1:], "app-server") {
+		// Codex app-server mode: the driver launches the (fake) codex
+		// binary exactly as it launches the real one — `codex app-server
+		// --stdio [-c key=value ...]`. The fake speaks the JSON-RPC
+		// protocol on stdio and records its argv through
+		// PAGNET_FAKE_CODEX_ARGV_FILE for the MCP-override assertion.
+		runCodexAppServer()
+		return
+	}
 	var s spec
 	if err := json.NewDecoder(os.Stdin).Decode(&s); err != nil {
 		fmt.Fprintln(os.Stderr, "bad spec:", err)
