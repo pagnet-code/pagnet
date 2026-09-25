@@ -17,6 +17,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -32,6 +33,11 @@ func TestDetectRuntimes_UsesAdapterBinaryResolution(t *testing.T) {
 	d.adapters = map[domain.RuntimeName]agentruntime.Adapter{
 		domain.RuntimeQwenCode: stubAdapter{},
 	}
+	// Hermetic: this regression is about ADAPTER binary resolution. New
+	// registers session drivers for every resolvable runtime binary (qwen,
+	// codex, ...), which would otherwise leak into the inventory and make
+	// the assertion environment-dependent.
+	d.sessions = session.NewManager()
 	out := d.detectRuntimes()
 	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != "stub" {
 		t.Fatalf("detectRuntimes = %+v, want one qwen-code entry with the adapter-resolved path", out)

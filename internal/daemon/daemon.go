@@ -533,6 +533,16 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if qwenPersistentRegistered {
 		sessions.RegisterDriver(qwenPersistent)
 	}
+	// The Codex persistent driver (Wave 4): ONE long-lived
+	// `codex app-server --stdio` process per instance, driven over
+	// JSON-RPC through the session core. Registered when the codex
+	// binary is resolvable (binary presence only — same rule as qwen).
+	codexPersistent := agentruntime.NewCodexPersistent("")
+	codexPersistent.Env = cfg.RuntimeEnv
+	codexPersistentRegistered := codexPersistent.Available()
+	if codexPersistentRegistered {
+		sessions.RegisterDriver(codexPersistent)
+	}
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
 	// registry/launch-gate/cleanup path for every turn process and PTY
 	// session this daemon owns. Limits come from the daemon Config (set by
@@ -556,6 +566,12 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// through the supervisor's ClassEndpoint path (the same seam).
 	if qwenPersistentRegistered {
 		qwenPersistent.SetLifecycle(sup)
+	}
+	// The Codex persistent driver owns its long-lived app-server
+	// endpoint process through the supervisor's ClassEndpoint path
+	// (the same seam).
+	if codexPersistentRegistered {
+		codexPersistent.SetLifecycle(sup)
 	}
 	// Bounded helper-command executor (§37) for git/version/worktree probes.
 	helper := proc.NewHelper(0)
@@ -2125,6 +2141,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		// — qwen-code is session-driven since Wave B).
 		for _, name := range []domain.RuntimeName{
 			domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
+			domain.RuntimeCodex,
 		} {
 			if d.runtimeAvailable(name) {
 				rn = name
@@ -2132,7 +2149,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			}
 		}
 		if rn == "" {
-			return fmt.Errorf("no runtime available on this host (install qwen, claude, or opencode)")
+			return fmt.Errorf("no runtime available on this host (install qwen, claude, opencode, or codex)")
 		}
 	}
 	// The runtime must be drivable on this host (an adapter OR a registered
@@ -2367,6 +2384,9 @@ func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 			}
 			if qp, ok := drv.(*agentruntime.QwenPersistent); ok {
 				return qp.Available()
+			}
+			if cp, ok := drv.(*agentruntime.CodexPersistent); ok {
+				return cp.Available()
 			}
 			return true
 		}
