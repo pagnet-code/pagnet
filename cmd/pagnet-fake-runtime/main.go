@@ -503,7 +503,7 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 	} else {
 		fmt.Printf("\x1b[1;32mFAKE AGENT\x1b[0m (ui=%s) — session %s %s, turns: %d\r\n",
 			ui, prev.SessionID, status, prev.Turns)
-		fmt.Printf("initial size: %dx%d — unicode ok: äöü 日本語 🚀\r\n", cols, rows)
+		fmt.Printf("initial size: %dx%d — unicode ok: äöü ñçß 🚀\r\n", cols, rows)
 	}
 	fmt.Print(prompt)
 
@@ -617,7 +617,7 @@ func processFakeLine(s string, prev *session, save func(), prompt string, winsiz
 	case strings.HasPrefix(s, "echo "):
 		fmt.Printf("echo: %s\r\n%s", s[len("echo "):], prompt)
 	case s == "unicode":
-		fmt.Printf("unicode: äöü 日本語 emoji: 🚀 ✅\r\n%s", prompt)
+		fmt.Printf("unicode: äöü ñçß emoji: 🚀 ✅\r\n%s", prompt)
 	case s == "big":
 		// ~512 KiB of output: exercises the bounded ring buffer and the
 		// browser's scrollback under load (addendum §68 "large output").
