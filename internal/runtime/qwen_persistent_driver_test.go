@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -381,4 +382,102 @@ func TestQwenPersistent_WriteInput(t *testing.T) {
 	if cmd2.Type != "confirmation_response" || cmd2.RequestID != "req-1" || cmd2.Allowed == nil || !*cmd2.Allowed {
 		t.Fatalf("second line = %+v, want confirmation_response/req-1/true", cmd2)
 	}
+}
+
+// waitForInputLine polls the endpoint's input file until one line contains
+// want (or the deadline passes). The driver writes the submit line AFTER it
+// has registered the machine turn, so once the line is on disk the turn is
+// genuinely in flight — the deterministic sync point for "kill it mid-turn".
+func waitForInputLine(t *testing.T, path, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			b, _ := os.ReadFile(path)
+			t.Fatalf("input file %s never carried %q within %v; content=%q", path, want, timeout, b)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestQwenPersistent_EndpointDiesMidTurn is the stuck-instance regression.
+//
+// The endpoint PROCESS dies while a machine turn is in flight (a vendor
+// crash, SIGKILL, OOM, or a daemon-side interruption — the WHY does not
+// matter, the state machine must tolerate all of them). Both routeEvent (a
+// NORMAL terminal runtime event) and cleanupOnExit (the process died) close
+// the SAME turnDone channel, so without an explicit per-turn reason Submit's
+// `case <-done` cannot tell a settled turn from a cut-off one: it returned
+// nil, the Manager treated the submit as normally settled even though the
+// events stream carried NO terminal turn event, and the instance could stay
+// persisted as working with no live endpoint — permanently unattachable
+// ("endpoint is not active; attach refused").
+//
+// The driver must report session.ErrEndpointGone (the contract
+// persistent_fake.go already honors) so the Manager re-activates and retries
+// the logical submit instead of wedging.
+func TestQwenPersistent_EndpointDiesMidTurn(t *testing.T) {
+	q, workspace, stateDir, _, stubEnv := newQwenPersistentFixture(t, false)
+	sess := &session.RuntimeSession{
+		InstanceID: "inst-1",
+		Runtime:    domain.RuntimeQwenCode,
+		Workspace:  workspace,
+		Env:        stubEnv,
+	}
+	events := make(chan session.SessionEvent, 8)
+	if _, err := q.Activate(context.Background(), sess, events); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	pid := q.PID("inst-1")
+	if pid == nil {
+		t.Fatal("PID is nil after activation")
+	}
+
+	turnEvents := make(chan session.SessionEvent, 16)
+	submitErr := make(chan error, 1)
+	go func() {
+		submitErr <- q.Submit(context.Background(), sess, session.SubmitRequest{
+			TurnID: "die-1", Kind: session.SubmitPrompt, Input: "hello",
+		}, turnEvents)
+	}()
+
+	inputPath := filepath.Join(stateDir, "qwen", "inst-1", "input.jsonl")
+	waitForInputLine(t, inputPath, `"type":"submit"`, 10*time.Second)
+
+	// Kill the endpoint mid-turn. The stub never produced a terminal event.
+	if err := syscall.Kill(*pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL %d: %v", *pid, err)
+	}
+
+	select {
+	case err := <-submitErr:
+		if !errors.Is(err, session.ErrEndpointGone) {
+			t.Fatalf("Submit = %v, want session.ErrEndpointGone (a mid-turn endpoint death is NOT a settled turn and NOT a generic process error)", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Submit did not return after the endpoint died mid-turn")
+	}
+
+	// The turn was CUT OFF: its stream carries no terminal event (nothing
+	// may be fabricated for it).
+	select {
+	case ev := <-turnEvents:
+		t.Fatalf("the cut-off turn's stream carries %q; a mid-turn death must not produce a terminal event", ev.Type)
+	default:
+	}
+
+	// The endpoint record is gone (the reader's exit path dropped it), so a
+	// follow-up submit on the same record is refused as endpoint-gone too.
+	if q.Live("inst-1") {
+		t.Fatal("endpoint still live after the kill")
+	}
+	if err := q.Submit(context.Background(), sess, session.SubmitRequest{
+		TurnID: "die-2", Kind: session.SubmitPrompt, Input: "again",
+	}, make(chan session.SessionEvent, 4)); !errors.Is(err, session.ErrEndpointGone) {
+		t.Fatalf("Submit after the death = %v, want session.ErrEndpointGone", err)
+	}
+	_ = q.Stop("inst-1")
 }

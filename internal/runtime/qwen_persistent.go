@@ -288,6 +288,7 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 	}
 	e.currentTurnID = req.TurnID
 	e.currentTurnEvents = events
+	e.turnEndpointGone = false
 	e.turnDone = make(chan struct{})
 	done := e.turnDone
 	e.mu.Unlock()
@@ -313,6 +314,19 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 	}
 	select {
 	case <-done:
+		e.mu.Lock()
+		gone := e.turnEndpointGone
+		e.mu.Unlock()
+		if gone {
+			// The endpoint PROCESS DIED mid-turn (cleanupOnExit woke this
+			// turn; the events channel carries NO terminal turn event). This
+			// is NOT a settled turn and NOT a runtime turn failure: the turn
+			// consumed no work, so the Manager re-activates (resuming the
+			// materialised session) and retries the logical submit once.
+			// Reporting nil here is what wedged an instance as permanently
+			// working with no live endpoint.
+			return session.ErrEndpointGone
+		}
 		return nil
 	case <-ctx.Done():
 		e.state.clearMachineTurn()
@@ -397,6 +411,22 @@ type qwenEndpoint struct {
 	currentTurnID     string
 	currentTurnEvents chan<- session.SessionEvent
 	turnDone          chan struct{}
+	// turnEndpointGone distinguishes WHY turnDone was closed: false = the
+	// turn settled on a NORMAL terminal runtime event (routeEvent), true =
+	// the endpoint PROCESS DIED mid-turn (cleanupOnExit). Both paths close
+	// the same channel, so without this flag Submit's `case <-done` cannot
+	// tell a completed turn from a cut-off one — it would report a mid-turn
+	// death as success (nil), the Manager would treat the submit as
+	// settled, and the instance could stay persisted as working with no
+	// endpoint at all.
+	//
+	// It is written under mu BEFORE turnDone is closed and reset when a new
+	// turn is registered, so the woken Submit always reads the value that
+	// belongs to ITS turn. It is stable across the wake: cleanupOnExit
+	// drops the endpoint record before closing, so no new turn can be
+	// registered on a dying endpoint (Submit looks the record up first and
+	// returns ErrEndpointGone when it is gone).
+	turnEndpointGone bool
 
 	inputFile *os.File
 	inputMu   sync.Mutex
@@ -815,8 +845,11 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 // cleanupOnExit runs when the process exits: it reaps the process (single
 // Wait owner — this goroutine read all of the events file), drops the
 // endpoint record, and signals any waiting turn. The turn is "cut off" (no
-// terminal event) — the daemon keeps the work queued and the Manager
-// re-activates (resuming the materialised session) on the retry.
+// terminal event) — it is marked endpoint-gone so the blocked Submit returns
+// session.ErrEndpointGone and the Manager re-activates (resuming the
+// materialised session) and retries the logical submit. It must NOT look
+// like a settled turn: that is what left an instance persisted as working
+// with no endpoint.
 func (e *qwenEndpoint) cleanupOnExit() {
 	if e.h != nil {
 		e.h.Wait()
@@ -831,6 +864,12 @@ func (e *qwenEndpoint) cleanupOnExit() {
 	if e.currentTurnEvents != nil {
 		e.currentTurnEvents = nil
 		e.currentTurnID = ""
+		// The turn is being cut off by the process death, not settled by a
+		// terminal runtime event. Set the reason BEFORE closing turnDone so
+		// the woken Submit observes it. Guarded by currentTurnEvents: a turn
+		// that routeEvent already settled (nil currentTurnEvents, flag left
+		// false) must not be reclassified as endpoint-gone after the fact.
+		e.turnEndpointGone = true
 	}
 	if e.turnDone != nil {
 		close(e.turnDone)

@@ -2531,6 +2531,23 @@ func (d *Daemon) busy(instanceID string) bool {
 	return d.activeTurns[instanceID]
 }
 
+// turnInFlight reports whether a LOGICAL TURN is currently in flight for the
+// instance, whichever turn path owns it.
+//
+// d.busy alone is NOT enough: the legacy activeTurns map is set only by the
+// process-per-turn path (see the Phase 2 note in wakeInstance), so a
+// session-driven turn — the one that can outlive its endpoint mid-flight —
+// is invisible to it. For that path the session core's own StateBusy is the
+// authoritative signal ("a live endpoint services the session; a turn is in
+// flight"), and it is the state that must not be raced by a second endpoint.
+func (d *Daemon) turnInFlight(instanceID string) bool {
+	if d.busy(instanceID) {
+		return true
+	}
+	sess := d.sessions.GetSession(instanceID)
+	return sess != nil && sess.State == session.StateBusy
+}
+
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
 	contractPath, contractText, _ := d.writeContract(row)
 	// Standing instruction (AGENT.md): re-rendered per turn (idempotent),
@@ -3232,9 +3249,39 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 		// activation site — A5; ensure it idempotently).
 		d.ensureEndpointView(row)
 	case "working", "waking", "starting":
-		// A turn is driving the live endpoint: attach observationally
-		// (the view exists from the activation site; ensure idempotently).
-		d.ensureEndpointView(row)
+		switch {
+		case d.sessions.PTYMaster(row.InstanceID) != nil:
+			// A turn is driving the live endpoint: attach observationally
+			// (the view exists from the activation site; ensure
+			// idempotently).
+			d.ensureEndpointView(row)
+		case d.turnInFlight(row.InstanceID):
+			// A logical turn really IS in flight while the endpoint is
+			// momentarily not live — the narrow window in which the session
+			// core has observed the endpoint's mid-turn death and is
+			// re-activating it (EnsureActive + one retry). Launching an
+			// endpoint from here would race that retry with a SECOND
+			// runtime, so do not reconcile: the attach stays queued (the
+			// dispatcher re-sends it) and lands observationally on the
+			// endpoint the session core brings back.
+			d.Log.Info("attach deferred; turn in flight with the endpoint briefly down",
+				"instance", row.InstanceID, "status", row.Status)
+			return ErrDeferred
+		default:
+			// The persisted status says a turn is in flight but NO turn is
+			// in flight and NO endpoint is live: status and liveness
+			// disagree (the endpoint died mid-turn and the row was never
+			// settled, or a daemon restart left the persisted status behind —
+			// the process cannot survive it). Refusing here would strand the
+			// instance permanently unattachable. Reconcile through the SAME
+			// activation path a turn uses (resume when materialised) — never
+			// a second runtime.
+			d.Log.Warn("persisted status and endpoint liveness disagree; reconciling on attach",
+				"instance", row.InstanceID, "status", row.Status)
+			if err := d.activateSessionForAttach(conn, row); err != nil {
+				return err
+			}
+		}
 	default:
 		// "blocked"/"failed"/"stopped" are already refused by doAttach;
 		// any other status (e.g. "hibernating") is not attachable.

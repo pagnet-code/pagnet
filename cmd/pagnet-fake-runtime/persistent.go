@@ -46,6 +46,13 @@ package main
 //   - PAGNET_FAKE_INTERACTION_SUMMARY / _PAYLOAD / _ANSWER: shape the
 //     interaction.
 //   - PAGNET_FAKE_RATELIMIT / _RESUME_FAIL: failure simulation.
+//   - PAGNET_FAKE_DIE_MID_TURN=1: the endpoint CRASHES in the middle of the
+//     first turn its session services (a hard SIGKILL to itself right after
+//     turn.started — no terminal event, no session save). A marker file in
+//     the session dir records that the crash already happened, so the
+//     re-activated endpoint services the retry normally. It is the
+//     deterministic stand-in for a vendor crash / SIGKILL / OOM landing
+//     mid-turn.
 //
 // TUI (Phase 3 terminal session unification): when the endpoint OWNS a
 // controlling terminal (the daemon launches it with a PTY), a
@@ -436,6 +443,34 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	}
 }
 
+// dieMidTurnOnce simulates an endpoint that CRASHES in the middle of a turn
+// (PAGNET_FAKE_DIE_MID_TURN=1): the first turn its SESSION services kills
+// the process with a hard SIGKILL, right after turn.started — no terminal
+// event, no session save, no graceful shutdown. A marker file in the session
+// dir (which outlives the process, unlike memory) records that the crash
+// already happened, so the endpoint the session core re-activates for the
+// retry services the turn normally.
+//
+// It is the deterministic stand-in for the vendor crash / SIGKILL / OOM that
+// lands mid-turn: the ONE condition the session core must tolerate without
+// wedging the instance.
+func dieMidTurnOnce(sessionPath string) {
+	if os.Getenv("PAGNET_FAKE_DIE_MID_TURN") != "1" {
+		return
+	}
+	marker := filepath.Join(filepath.Dir(sessionPath), ".died-mid-turn")
+	if _, err := os.Stat(marker); err == nil {
+		return // this session already crashed once — service the turn
+	}
+	if err := os.WriteFile(marker, []byte("died mid-turn\n"), 0o600); err != nil {
+		// Fail loudly: without the marker the crash would repeat on every
+		// re-activation and the test would not be testing recovery.
+		fmt.Fprintln(os.Stderr, "die-mid-turn marker:", err)
+		return
+	}
+	_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+}
+
 // runPersistTurn runs one prompt turn: emits busy/started, blocks on a
 // scripted interaction (answered via interactionCh), emits output/completed
 // and idle, and persists the session (materialising it on the first
@@ -443,6 +478,10 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func(persistEvent), interactionCh <-chan persistCmd) {
 	emit(persistEvent{Event: "runtime.busy", TurnID: cmd.TurnID, SessionID: prev.SessionID})
 	emit(persistEvent{Event: "runtime.turn.started", TurnID: cmd.TurnID, SessionID: prev.SessionID})
+
+	// The turn is now genuinely in flight — this is where a real vendor
+	// process can die (see dieMidTurnOnce).
+	dieMidTurnOnce(sessionPath)
 
 	// Rate-limit simulation (deterministic for tests): a turn that fails as
 	// rate_limited never materialises the session.

@@ -196,6 +196,7 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 	}
 	e.currentTurnID = req.TurnID
 	e.currentTurnEvents = events
+	e.turnEndpointGone = false
 	e.turnDone = make(chan struct{})
 	done := e.turnDone
 	e.mu.Unlock()
@@ -209,6 +210,15 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 	}
 	select {
 	case <-done:
+		e.mu.Lock()
+		gone := e.turnEndpointGone
+		e.mu.Unlock()
+		if gone {
+			// The process DIED mid-turn (the reader's EOF path woke this
+			// turn; no terminal event was produced). Not a settled turn: the
+			// Manager re-activates and retries the logical submit once.
+			return session.ErrEndpointGone
+		}
 		return nil
 	case <-ctx.Done():
 		e.clearTurn()
@@ -309,6 +319,15 @@ type persistEndpoint struct {
 	currentTurnID     string
 	currentTurnEvents chan<- session.SessionEvent
 	turnDone          chan struct{}
+	// turnEndpointGone distinguishes WHY turnDone was closed: false = the
+	// turn settled on a NORMAL terminal event (routeTurnEvent), true = the
+	// endpoint PROCESS DIED mid-turn (the reader's EOF path). Both close the
+	// same channel, so without this flag Submit's `case <-done` cannot tell
+	// a completed turn from a cut-off one and would report a mid-turn death
+	// as a settled submit — which is what leaves an instance persisted as
+	// working with no endpoint. Kept in lockstep with QwenPersistent (see
+	// qwen_persistent.go); every persistent driver must carry it.
+	turnEndpointGone bool
 
 	stdinMu sync.Mutex
 }
@@ -542,11 +561,18 @@ func (e *persistEndpoint) readLoop() {
 	// that already launched a fresh endpoint is left untouched).
 	e.f.dropEndpointRef(e)
 	// Signal any in-flight turn so its Submit returns (the Manager settles
-	// the session).
+	// the session). The turn was CUT OFF by the process death, not settled
+	// by a terminal event — mark it endpoint-gone so Submit reports
+	// session.ErrEndpointGone and the Manager re-activates + retries the
+	// logical submit instead of wedging the instance.
 	e.mu.Lock()
 	if e.currentTurnEvents != nil {
 		e.currentTurnEvents = nil
 		e.currentTurnID = ""
+		// Set the reason BEFORE closing turnDone so the woken Submit
+		// observes it. Guarded by currentTurnEvents: a turn routeTurnEvent
+		// already settled must not be reclassified after the fact.
+		e.turnEndpointGone = true
 	}
 	if e.turnDone != nil {
 		close(e.turnDone)
