@@ -2340,7 +2340,9 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 	// tracks the legacy activeTurns map, which the persistent path does not
 	// set, so the session's own liveness is the authoritative check here.)
 	if d.sessionDriverFor(row) != nil {
-		if sess := d.sessions.GetSession(instanceID); sess != nil && sess.State.Live() {
+		// Locked read through the Manager (State is mutated under the
+		// Manager's mutex; a direct sess.State read here would race it).
+		if st, ok := d.sessions.State(instanceID); ok && st.Live() {
 			d.Log.Info("instance already live; wake is a no-op", "instance", instanceID)
 			return nil
 		}
@@ -2540,12 +2542,25 @@ func (d *Daemon) busy(instanceID string) bool {
 // is invisible to it. For that path the session core's own StateBusy is the
 // authoritative signal ("a live endpoint services the session; a turn is in
 // flight"), and it is the state that must not be raced by a second endpoint.
+//
+// The state is read through the Manager's LOCKED query (State), never by
+// dereferencing the *RuntimeSession: the field is mutated by the Manager
+// under its mutex, and an unlocked read from the daemon is a data race.
 func (d *Daemon) turnInFlight(instanceID string) bool {
 	if d.busy(instanceID) {
 		return true
 	}
-	sess := d.sessions.GetSession(instanceID)
-	return sess != nil && sess.State == session.StateBusy
+	st, ok := d.sessions.State(instanceID)
+	return ok && st == session.StateBusy
+}
+
+// sessionActivating reports whether the instance's session is currently
+// being activated (StateActivating) — the window in which the Manager is
+// running Driver.Activate for it. Read through the Manager's LOCKED query
+// (same race rationale as turnInFlight).
+func (d *Daemon) sessionActivating(instanceID string) bool {
+	st, ok := d.sessions.State(instanceID)
+	return ok && st == session.StateActivating
 }
 
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
@@ -3078,6 +3093,25 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
+	case outcomeTurnInterrupted:
+		// The runtime ACCEPTED the turn and its endpoint died before a
+		// terminal result: the outcome may be partially applied. Report the
+		// turn as failed with kind "interrupted" (the control plane settles
+		// the instance to the first-class "interrupted" state) and settle
+		// the instance to "interrupted" with the session PRESERVED (the
+		// Manager keeps the session and its native id — no cold start, no
+		// session deletion, no prompt replay). The work stays queued
+		// server-side (the command is acked with the error, exactly like
+		// rate_limited) and an explicit human retry (wake) is the ONLY
+		// re-run path: the control plane never auto re-delivers an
+		// interrupted turn (invariant).
+		d.Log.Warn("turn interrupted: endpoint died after the runtime accepted the turn",
+			"instance", spec.InstanceID, "error", submitErr.Error())
+		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
+			nil, nil, nil, "", "interrupted:the runtime stopped before this turn finished", nil)
+		_ = d.state.SetInstanceStatus(spec.InstanceID, string(domain.AgentStatusInterrupted), sessionID)
+		d.reportEndpointStatus(conn, spec.InstanceID) // offline (interrupted)
+		return fmt.Errorf("turn interrupted: %v", submitErr)
 	case outcomeNoFailureQueued:
 		// No failure recorded (a shutdown cancel, a supervisor shutdown
 		// refusal, or a turn cut off between events). Roll back the session
@@ -3230,9 +3264,14 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 			p.InstanceID, row.Runtime)
 	}
 	switch row.Status {
-	case "hibernated":
+	case "hibernated", "interrupted":
 		// Wake/resume: the session is materialised (or cold-started when
 		// it never was); a lost session blocks the instance (invariant F).
+		// "interrupted" is the same shape: the turn's endpoint died AFTER
+		// the runtime accepted the turn, the session and workspace are
+		// preserved, and the attach re-activates the endpoint (resuming
+		// by native id when materialised) — the human sees the preserved
+		// session and can retry explicitly.
 		if err := d.activateSessionForAttach(conn, row); err != nil {
 			return err
 		}
@@ -3265,6 +3304,18 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 			// dispatcher re-sends it) and lands observationally on the
 			// endpoint the session core brings back.
 			d.Log.Info("attach deferred; turn in flight with the endpoint briefly down",
+				"instance", row.InstanceID, "status", row.Status)
+			return ErrDeferred
+		case d.sessionActivating(row.InstanceID):
+			// The session core is ACTIVATING the endpoint right now
+			// (StateActivating): an attach that independently activated
+			// would race the in-flight activation. It does not — the
+			// Manager's per-instance activation lock makes a second
+			// EnsureActive join the first instead of launching a second
+			// runtime — but the attach still stays queued (the dispatcher
+			// re-sends it) and lands observationally on the endpoint the
+			// activation brings back.
+			d.Log.Info("attach deferred; endpoint activation in flight",
 				"instance", row.InstanceID, "status", row.Status)
 			return ErrDeferred
 		default:
@@ -3369,8 +3420,11 @@ drain:
 		return err
 	}
 	sessionID := row.SessionID
-	if sess.NativeID != "" {
-		sessionID = sess.NativeID
+	// Locked read through the Manager (NativeID is mutated by the Manager
+	// and the drivers under its mutex; a direct sess.NativeID read here
+	// would race it).
+	if id, ok := d.sessions.NativeID(row.InstanceID); ok && id != "" {
+		sessionID = id
 	}
 	_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
 	_ = d.send(conn, transport.MsgAgentStatus, map[string]any{

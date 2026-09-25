@@ -9,17 +9,20 @@ import (
 	"testing"
 )
 
-// fakeOpenCodeScript records the adapter's argv (one arg per line) and
-// exits 0 WITHOUT replaying any opencode output. The opencode CLI is not
+// fakeOpenCodeScript records the adapter's argv (one arg per line),
+// optionally replays canned NDJSON from OPENCODE_FAKE_OUT, and exits with
+// the optional OPENCODE_FAKE_EXIT code (default 0). The opencode CLI is not
 // installed on this host, so the tests exercise only the deterministic
-// adapter logic — binary resolution, arg construction, and the MCP config
-// rendering — never a faked opencode response.
+// adapter logic — binary resolution, arg construction, the MCP config
+// rendering, and the exit classification — never a faked opencode response.
 const fakeOpenCodeScript = `#!/usr/bin/env bash
 : > "$OPENCODE_FAKE_ARGS"
 while [ $# -gt 0 ]; do
   printf '%s\n' "$1" >> "$OPENCODE_FAKE_ARGS"
   shift
 done
+cat "$OPENCODE_FAKE_OUT" 2>/dev/null
+if [ -n "$OPENCODE_FAKE_EXIT" ]; then exit "$OPENCODE_FAKE_EXIT"; fi
 exit 0
 `
 
@@ -148,6 +151,73 @@ func TestOpenCode_ColdTurnNoResume(t *testing.T) {
 	}
 	if argHas(argv, "--model") {
 		t.Fatalf("no model set: must not pass --model: %v", argv)
+	}
+}
+
+// TestOpenCode_ProcessDiesMidTurnIsProcessError is the process-per-turn
+// regression (spec E): the CLI confirms the session (the turn started) and
+// streams partial output, then DIES — a hard SIGKILL, exit 137, no terminal
+// output. The turn must settle as a FAILED turn (process_error), never as a
+// completed one: that is what lets the daemon's legacy path mark the
+// instance failed/recoverable instead of stranding it `working` forever.
+// The captured session id is preserved (written when the session is
+// confirmed), so the explicit retry resumes by the exact stored id — the
+// existing resume semantics.
+func TestOpenCode_ProcessDiesMidTurnIsProcessError(t *testing.T) {
+	const sid = "ses_died_midturn"
+	out := `{"type":"step_start","timestamp":1,"sessionID":"` + sid + `"}
+{"type":"text","timestamp":2,"sessionID":"` + sid + `","part":{"type":"text","text":"partial"}}
+`
+	dir := t.TempDir()
+	script := filepath.Join(dir, "opencode")
+	if err := os.WriteFile(script, []byte(fakeOpenCodeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "out.ndjson")
+	if err := os.WriteFile(outPath, []byte(out), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := opencodeSpec(t.TempDir())
+	// The child (stub script) reads these from ITS environment; pass them
+	// as explicit injection pairs so they bypass the ChildEnv allowlist
+	// (external audit F-009). Exit 137 = the SIGKILL death code.
+	spec.Env = append(spec.Env,
+		"OPENCODE_FAKE_ARGS="+filepath.Join(dir, "args.txt"),
+		"OPENCODE_FAKE_OUT="+outPath,
+		"OPENCODE_FAKE_EXIT=137",
+	)
+
+	o := NewOpenCode(script)
+	events := make(chan TurnEvent, 64)
+	if err := o.StartTurn(context.Background(), spec, events); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	var evs []TurnEvent
+	for ev := range events {
+		evs = append(evs, ev)
+	}
+	var failed *TurnEvent
+	for i := range evs {
+		switch evs[i].Type {
+		case EventTurnCompleted:
+			t.Fatalf("a dead process must not complete the turn: %+v", evs)
+		case EventTurnFailed:
+			failed = &evs[i]
+		}
+	}
+	if failed == nil {
+		t.Fatalf("no turn.failed event after the process died mid-turn: %+v", evs)
+	}
+	if string(failed.FailureKind) != "process_error" {
+		t.Fatalf("failure kind = %q, want process_error (error: %q)", failed.FailureKind, failed.Error)
+	}
+	if !strings.Contains(failed.Error, "137") {
+		t.Fatalf("the process_error must carry the exit detail, got %q", failed.Error)
+	}
+	// The session is PRESERVED (captured when the session was confirmed,
+	// before the death): the explicit retry resumes by the exact stored id.
+	if id, err := readStoredSession(filepath.Join(spec.SessionDir, opencodeSessionFile)); err != nil || id != sid {
+		t.Fatalf("stored session = %q, %v; want %q preserved for the retry", id, err, sid)
 	}
 }
 

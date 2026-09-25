@@ -62,6 +62,9 @@ func (d *endpointDeathDriver) Activate(ctx context.Context, sess *RuntimeSession
 	d.mu.Lock()
 	d.activations++
 	resume := sess.NativeID != ""
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract); EnsureActive runs this under the per-instance
+	// activation lock, so the write is serialized with the NativeID query.
 	if !resume {
 		sess.NativeID = "native-mid-turn-death"
 	}

@@ -58,6 +58,18 @@ CWD="$(pwd)"
 cat > "$JSON_FILE" <<EOF
 {"type":"system","subtype":"session_start","session_id":"$SID","data":{"session_id":"$SID","cwd":"$CWD","protocol_version":2,"version":"0.23.4","supported_events":["system","user","assistant","stream_event","control_request","control_response"]}}
 EOF
+if [ -n "$QWEN_FAKE_ECHO_SUBMIT" ]; then
+  # Acceptance simulation: wait for the machine submit to reach the input
+  # file, then echo the user event for the submitted text (the qwen
+  # acceptance signal: the driver's submitDelivered / EventTurnStarted).
+  # Then stay alive; the test kills the process (mid-turn, post-acceptance).
+  while ! grep -q '"type":"submit"' "$INPUT_FILE" 2>/dev/null; do
+    sleep 0.05
+  done
+  TEXT=$(sed -n 's/.*"text":"\([^"]*\)".*/\1/p' "$INPUT_FILE" | tail -1)
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"%s"}]}}\n' "$TEXT" >> "$JSON_FILE"
+  sleep 3600
+fi
 sleep 3600
 `
 
@@ -403,7 +415,8 @@ func waitForInputLine(t *testing.T, path, want string, timeout time.Duration) {
 	}
 }
 
-// TestQwenPersistent_EndpointDiesMidTurn is the stuck-instance regression.
+// TestQwenPersistent_EndpointDiesBeforeAcceptance is the stuck-instance
+// regression, BEFORE-ACCEPTANCE half of the split contract.
 //
 // The endpoint PROCESS dies while a machine turn is in flight (a vendor
 // crash, SIGKILL, OOM, or a daemon-side interruption — the WHY does not
@@ -416,10 +429,14 @@ func waitForInputLine(t *testing.T, path, want string, timeout time.Duration) {
 // persisted as working with no live endpoint — permanently unattachable
 // ("endpoint is not active; attach refused").
 //
-// The driver must report session.ErrEndpointGone (the contract
-// persistent_fake.go already honors) so the Manager re-activates and retries
-// the logical submit instead of wedging.
-func TestQwenPersistent_EndpointDiesMidTurn(t *testing.T) {
+// In THIS case the runtime never ACCEPTED the turn: the stub never echoes
+// the `user` event for the submitted text (no submitDelivered, no
+// EventTurnStarted), so the turn consumed no work. The driver must report
+// session.ErrEndpointGone so the Manager re-activates and retries the
+// logical submit ONCE (the safe-retry contract). The AFTER-ACCEPTANCE half
+// (accepted, then died → session.ErrTurnInterrupted, never auto-retried) is
+// TestQwenPersistent_EndpointDiesAfterAcceptance.
+func TestQwenPersistent_EndpointDiesBeforeAcceptance(t *testing.T) {
 	q, workspace, stateDir, _, stubEnv := newQwenPersistentFixture(t, false)
 	sess := &session.RuntimeSession{
 		InstanceID: "inst-1",
@@ -478,6 +495,100 @@ func TestQwenPersistent_EndpointDiesMidTurn(t *testing.T) {
 		TurnID: "die-2", Kind: session.SubmitPrompt, Input: "again",
 	}, make(chan session.SessionEvent, 4)); !errors.Is(err, session.ErrEndpointGone) {
 		t.Fatalf("Submit after the death = %v, want session.ErrEndpointGone", err)
+	}
+	_ = q.Stop("inst-1")
+}
+
+// TestQwenPersistent_EndpointDiesAfterAcceptance is the AFTER-ACCEPTANCE
+// half of the split contract.
+//
+// The runtime ACCEPTS the turn (it echoes the `user` event for the
+// submitted text — the driver's submitDelivered signal, which also produces
+// EventTurnStarted) and its endpoint then dies before a terminal result.
+// The outcome may be PARTIALLY APPLIED (files edited, tools called, commits
+// made), so the driver must report session.ErrTurnInterrupted — NOT
+// ErrEndpointGone: the Manager must NEVER re-submit an accepted turn (a
+// second submit would duplicate work the runtime already started).
+//
+// The side effect is proven to happen EXACTLY ONCE: the input file carries
+// exactly one submit line (the accepted submit was never re-written).
+func TestQwenPersistent_EndpointDiesAfterAcceptance(t *testing.T) {
+	q, workspace, stateDir, _, stubEnv := newQwenPersistentFixture(t, false)
+	// The stub echoes the `user` event for the submitted text once the
+	// submit reaches the input file (the acceptance signal), then stays
+	// alive until the test kills it.
+	stubEnv = append(stubEnv, "QWEN_FAKE_ECHO_SUBMIT=1")
+	sess := &session.RuntimeSession{
+		InstanceID: "inst-1",
+		Runtime:    domain.RuntimeQwenCode,
+		Workspace:  workspace,
+		Env:        stubEnv,
+	}
+	events := make(chan session.SessionEvent, 8)
+	if _, err := q.Activate(context.Background(), sess, events); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	pid := q.PID("inst-1")
+	if pid == nil {
+		t.Fatal("PID is nil after activation")
+	}
+
+	turnEvents := make(chan session.SessionEvent, 16)
+	submitErr := make(chan error, 1)
+	go func() {
+		submitErr <- q.Submit(context.Background(), sess, session.SubmitRequest{
+			TurnID: "die-accepted", Kind: session.SubmitPrompt, Input: "hello",
+		}, turnEvents)
+	}()
+
+	// Wait for the ACCEPTANCE signal: the echoed user event reaches the
+	// state machine and produces EventTurnStarted on the turn stream.
+	select {
+	case ev := <-turnEvents:
+		if ev.Type != session.EventTurnStarted {
+			t.Fatalf("first turn event = %q, want %q (the acceptance signal)", ev.Type, session.EventTurnStarted)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("no EventTurnStarted (acceptance) within the deadline")
+	}
+
+	// The endpoint PROCESS dies mid-turn, AFTER acceptance.
+	if err := syscall.Kill(*pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL %d: %v", *pid, err)
+	}
+
+	select {
+	case err := <-submitErr:
+		if !errors.Is(err, session.ErrTurnInterrupted) {
+			t.Fatalf("Submit = %v, want session.ErrTurnInterrupted (an ACCEPTED turn whose endpoint died is NOT re-runnable)", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Submit did not return after the endpoint died post-acceptance")
+	}
+
+	// The turn was CUT OFF: its stream carries no terminal event (nothing
+	// may be fabricated for it) — only the acceptance event observed
+	// before the death.
+	select {
+	case ev := <-turnEvents:
+		t.Fatalf("the cut-off turn's stream carries %q after the acceptance; a mid-turn death must not produce a terminal event", ev.Type)
+	default:
+	}
+
+	// The side effect happened EXACTLY ONCE: the input file carries exactly
+	// one submit line (the accepted submit was never re-written).
+	inputPath := filepath.Join(stateDir, "qwen", "inst-1", "input.jsonl")
+	b, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatalf("read input file: %v", err)
+	}
+	if n := strings.Count(string(b), `"type":"submit"`); n != 1 {
+		t.Fatalf("submit reached the endpoint %d times, want exactly 1 (an accepted turn must never be re-submitted); input=%q", n, b)
+	}
+
+	// The endpoint record is gone (the reader's exit path dropped it).
+	if q.Live("inst-1") {
+		t.Fatal("endpoint still live after the kill")
 	}
 	_ = q.Stop("inst-1")
 }

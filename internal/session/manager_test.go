@@ -83,6 +83,9 @@ func (d *memDriver) Activate(ctx context.Context, sess *RuntimeSession, events c
 		// Mirror the Manager's gate (defense-in-depth).
 		return nil, ErrNotMaterialised
 	}
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract); EnsureActive runs this under the per-instance
+	// activation lock, so the write is serialized with the NativeID query.
 	if resume {
 		if fail || !d.stored[sess.NativeID] {
 			if events != nil {
@@ -561,6 +564,9 @@ func (d *interactionDriver) Capabilities() Capabilities {
 }
 
 func (d *interactionDriver) Activate(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent) (*RuntimeEndpoint, error) {
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract); EnsureActive runs this under the per-instance
+	// activation lock, so the write is serialized with the NativeID query.
 	d.mu.Lock()
 	if sess.NativeID == "" {
 		sess.NativeID = d.minted

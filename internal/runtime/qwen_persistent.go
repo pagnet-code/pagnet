@@ -241,6 +241,11 @@ func (q *QwenPersistent) Activate(ctx context.Context, sess *session.RuntimeSess
 		q.stopEndpoint(sess.InstanceID)
 		return nil, session.ErrSessionLost
 	}
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract). This write is serialized by the Manager's
+	// per-instance activation lock (EnsureActive holds it across this
+	// call), so the Manager's locked NativeID query — which takes the same
+	// lock — is race-free against it.
 	sess.NativeID = actEv.SessionID
 	return e.endpointInfo(sess), nil
 }
@@ -320,11 +325,30 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 		if gone {
 			// The endpoint PROCESS DIED mid-turn (cleanupOnExit woke this
 			// turn; the events channel carries NO terminal turn event). This
-			// is NOT a settled turn and NOT a runtime turn failure: the turn
-			// consumed no work, so the Manager re-activates (resuming the
-			// materialised session) and retries the logical submit once.
+			// is NOT a settled turn. Which error applies depends on the
+			// runtime's OWN acceptance signal — the echoed `user` event for
+			// the submitted text (submitDelivered, which also produced
+			// EventTurnStarted):
+			//
+			//   - NOT delivered: the runtime never accepted the turn — no
+			//     work was consumed. ErrEndpointGone: the Manager
+			//     re-activates (resuming the materialised session) and
+			//     retries the logical submit once.
+			//   - delivered: the runtime ACCEPTED the turn and died before
+			//     a terminal result — its outcome may be partially applied.
+			//     ErrTurnInterrupted: the Manager MUST NOT re-submit it.
+			//
+			// submitDelivered is safe to read here: the reader's best-effort
+			// final read (which can still set it) runs BEFORE cleanupOnExit
+			// closes turnDone, and a normally-settled turn already cleared
+			// it (routeEvent's terminal path) — and the gone flag is false
+			// on that path anyway.
+			//
 			// Reporting nil here is what wedged an instance as permanently
 			// working with no live endpoint.
+			if e.state.isSubmitDelivered() {
+				return session.ErrTurnInterrupted
+			}
 			return session.ErrEndpointGone
 		}
 		return nil
@@ -419,6 +443,11 @@ type qwenEndpoint struct {
 	// death as success (nil), the Manager would treat the submit as
 	// settled, and the instance could stay persisted as working with no
 	// endpoint at all.
+	//
+	// When true, Submit further consults the machine-turn state's
+	// submitDelivered (the echoed `user` event / EventTurnStarted signal)
+	// to classify the death: accepted → ErrTurnInterrupted (never
+	// auto-retried), not accepted → ErrEndpointGone (one safe retry).
 	//
 	// It is written under mu BEFORE turnDone is closed and reset when a new
 	// turn is registered, so the woken Submit always reads the value that
@@ -845,11 +874,13 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 // cleanupOnExit runs when the process exits: it reaps the process (single
 // Wait owner — this goroutine read all of the events file), drops the
 // endpoint record, and signals any waiting turn. The turn is "cut off" (no
-// terminal event) — it is marked endpoint-gone so the blocked Submit returns
-// session.ErrEndpointGone and the Manager re-activates (resuming the
-// materialised session) and retries the logical submit. It must NOT look
-// like a settled turn: that is what left an instance persisted as working
-// with no endpoint.
+// terminal event) — it is marked endpoint-gone so the blocked Submit
+// classifies the death from the machine-turn state's submitDelivered:
+// accepted → session.ErrTurnInterrupted (surfaced, never auto-retried),
+// not accepted → session.ErrEndpointGone (the Manager re-activates —
+// resuming the materialised session — and retries the logical submit once).
+// It must NOT look like a settled turn: that is what left an instance
+// persisted as working with no endpoint.
 func (e *qwenEndpoint) cleanupOnExit() {
 	if e.h != nil {
 		e.h.Wait()

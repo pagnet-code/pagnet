@@ -245,6 +245,72 @@ func TestClaude_AuthFailureClassified(t *testing.T) {
 	}
 }
 
+// TestClaude_ProcessDiesMidTurnIsProcessError is the process-per-turn
+// regression (spec E): the CLI confirms the session (init) and streams
+// partial output, then DIES — a hard SIGKILL, exit 137, no result line, no
+// stderr. The turn must settle as a FAILED turn (process_error), never as a
+// completed one: that is what lets the daemon's legacy path mark the
+// instance failed/recoverable instead of stranding it `working` forever.
+// The captured session id is preserved (written at init), so the explicit
+// retry resumes by the exact stored id — the existing resume semantics.
+func TestClaude_ProcessDiesMidTurnIsProcessError(t *testing.T) {
+	const sid = "66666666-2222-3333-4444-555555555555"
+	out := `{"type":"system","subtype":"init","session_id":"` + sid + `","model":"claude-sonnet-5"}
+{"type":"assistant","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":"partial"}]},"session_id":"` + sid + `"}
+`
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude")
+	if err := os.WriteFile(script, []byte(fakeClaudeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(dir, "out.ndjson")
+	if err := os.WriteFile(outPath, []byte(out), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := claudeSpec(t.TempDir())
+	// The child (stub script) reads these from ITS environment; pass them
+	// as explicit injection pairs so they bypass the ChildEnv allowlist
+	// (external audit F-009). Exit 137 = the SIGKILL death code.
+	spec.Env = append(spec.Env,
+		"CLAUDE_FAKE_OUT="+outPath,
+		"CLAUDE_FAKE_ARGS="+filepath.Join(dir, "args.txt"),
+		"CLAUDE_FAKE_EXIT=137",
+	)
+
+	c := NewClaude(script)
+	events := make(chan TurnEvent, 64)
+	if err := c.StartTurn(context.Background(), spec, events); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+	var evs []TurnEvent
+	for ev := range events {
+		evs = append(evs, ev)
+	}
+	var failed *TurnEvent
+	for i := range evs {
+		switch evs[i].Type {
+		case EventTurnCompleted:
+			t.Fatalf("a dead process must not complete the turn: %+v", evs)
+		case EventTurnFailed:
+			failed = &evs[i]
+		}
+	}
+	if failed == nil {
+		t.Fatalf("no turn.failed event after the process died mid-turn: %+v", evs)
+	}
+	if string(failed.FailureKind) != "process_error" {
+		t.Fatalf("failure kind = %q, want process_error (error: %q)", failed.FailureKind, failed.Error)
+	}
+	if !strings.Contains(failed.Error, "137") {
+		t.Fatalf("the process_error must carry the exit detail, got %q", failed.Error)
+	}
+	// The session is PRESERVED (captured at init, before the death): the
+	// explicit retry resumes by the exact stored id.
+	if id, err := readStoredSession(filepath.Join(spec.SessionDir, claudeSessionFile)); err != nil || id != sid {
+		t.Fatalf("stored session = %q, %v; want %q preserved for the retry", id, err, sid)
+	}
+}
+
 func TestClaude_RateLimitDressedAsSuccess(t *testing.T) {
 	const sid = "44444444-2222-3333-4444-555555555555"
 	text := "Quota exhausted: Your token-plan 1-week quota has been exhausted. The quota will reset at 09-07 07:45:00 UTC."

@@ -44,6 +44,12 @@ func (s HostStatus) Valid() bool {
 // A hibernated instance is HEALTHY: its runtime process is intentionally
 // gone, its session is preserved, and it is wakeable. Never treat it as a
 // failure. Hibernated ≠ offline: offline means the host is unreachable.
+//
+// An interrupted instance (AgentStatusInterrupted) is the same kind of
+// availability state for the crash case: its turn's endpoint died AFTER
+// the runtime accepted the turn, so the outcome may be partially applied.
+// The session and workspace are preserved and the work stays queued; only
+// an explicit human retry re-runs it (never an automatic re-delivery).
 type AgentStatus string
 
 const (
@@ -60,6 +66,15 @@ const (
 	AgentStatusStopped      AgentStatus = "stopped"
 	AgentStatusFailed       AgentStatus = "failed"
 	AgentStatusUnreachable  AgentStatus = "unreachable"
+	// AgentStatusInterrupted: the runtime ACCEPTED the in-flight turn and
+	// its endpoint died before a terminal result — the outcome may be
+	// partially applied (files edited, tools called, commits made). It is
+	// an availability state, not a terminal failure: the session and
+	// workspace are preserved, the work stays queued, and an explicit
+	// human retry (wake) is the only re-run path. It is deliberately NOT
+	// Active(): an interrupted instance is not a routing candidate until
+	// a human retries it.
+	AgentStatusInterrupted AgentStatus = "interrupted"
 )
 
 func (s AgentStatus) Valid() bool {
@@ -67,7 +82,8 @@ func (s AgentStatus) Valid() bool {
 	case AgentStatusStarting, AgentStatusIdle, AgentStatusWorking,
 		AgentStatusHibernating, AgentStatusHibernated, AgentStatusWaking,
 		AgentStatusRateLimited, AgentStatusAuthRequired, AgentStatusBlocked,
-		AgentStatusStopping, AgentStatusStopped, AgentStatusFailed, AgentStatusUnreachable:
+		AgentStatusStopping, AgentStatusStopped, AgentStatusFailed, AgentStatusUnreachable,
+		AgentStatusInterrupted:
 		return true
 	}
 	return false

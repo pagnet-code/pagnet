@@ -58,6 +58,13 @@ const (
 	RuntimeFailureProcessError    RuntimeFailureKind = "process_error"
 	RuntimeFailurePermissionError RuntimeFailureKind = "permission_error"
 	RuntimeFailureUnknown         RuntimeFailureKind = "unknown"
+	// RuntimeFailureInterrupted: the runtime ACCEPTED the turn and its
+	// endpoint died before a terminal result — the outcome may be
+	// partially applied. It is an availability state, not a terminal
+	// failure: the session and workspace are preserved, the work stays
+	// queued, and an explicit human retry is the only re-run path (it is
+	// never automatically re-delivered).
+	RuntimeFailureInterrupted RuntimeFailureKind = "interrupted"
 )
 
 // RuntimeFailure is a classified runtime failure. RetryAt is set ONLY when

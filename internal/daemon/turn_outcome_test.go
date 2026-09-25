@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/pagnet-code/pagnet/internal/proc"
+	"github.com/pagnet-code/pagnet/internal/session"
 )
 
 func TestClassifyTurnError_Taxonomy(t *testing.T) {
@@ -76,6 +77,12 @@ func TestClassifyTurnError_Taxonomy(t *testing.T) {
 			wantKind:    kindLimitRefused,
 		},
 		{
+			name:        "accepted-then-died turn: its OWN interrupted outcome (NOT process_error)",
+			submitErr:   session.ErrTurnInterrupted,
+			completed:   false,
+			wantOutcome: outcomeTurnInterrupted,
+		},
+		{
 			name:        "generic driver error: process_error",
 			submitErr:   errors.New("spawn failed"),
 			completed:   false,
@@ -119,6 +126,10 @@ func TestClassifyTurnError_OperationalNotProcessError(t *testing.T) {
 		proc.ErrHostPressure,
 		proc.ErrLimitRefused,
 		context.Canceled,
+		// An accepted-then-died turn must NEVER be collapsed into
+		// process_error (which would mark the instance failed instead of
+		// the recoverable "interrupted" state).
+		session.ErrTurnInterrupted,
 	} {
 		outcome, _ := classifyTurnError(err, false, false, "")
 		if outcome == outcomeProcessError {

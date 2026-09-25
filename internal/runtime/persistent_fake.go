@@ -153,6 +153,11 @@ func (f *PersistentFake) Activate(ctx context.Context, sess *session.RuntimeSess
 		f.stopEndpoint(sess.InstanceID)
 		return nil, session.ErrSessionLost
 	}
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract). This write is serialized by the Manager's
+	// per-instance activation lock (EnsureActive holds it across this
+	// call), so the Manager's locked NativeID query — which takes the same
+	// lock — is race-free against it.
 	sess.NativeID = actEv.SessionID
 	return e.endpointInfo(sess), nil
 }
@@ -197,6 +202,7 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 	e.currentTurnID = req.TurnID
 	e.currentTurnEvents = events
 	e.turnEndpointGone = false
+	e.turnAccepted = false
 	e.turnDone = make(chan struct{})
 	done := e.turnDone
 	e.mu.Unlock()
@@ -212,11 +218,24 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 	case <-done:
 		e.mu.Lock()
 		gone := e.turnEndpointGone
+		accepted := e.turnAccepted
 		e.mu.Unlock()
 		if gone {
 			// The process DIED mid-turn (the reader's EOF path woke this
-			// turn; no terminal event was produced). Not a settled turn: the
-			// Manager re-activates and retries the logical submit once.
+			// turn; no terminal event was produced). Not a settled turn.
+			// Classify from the runtime's OWN acceptance signal (turnAccepted,
+			// set when the process's runtime.turn.started was routed to this
+			// turn — the deterministic analogue of qwen's echoed `user`
+			// event):
+			//
+			//   - accepted: the runtime started working on the turn — its
+			//     outcome may be partially applied. ErrTurnInterrupted: the
+			//     Manager MUST NOT re-submit it.
+			//   - not accepted: no work was consumed. ErrEndpointGone: the
+			//     Manager re-activates and retries the logical submit once.
+			if accepted {
+				return session.ErrTurnInterrupted
+			}
 			return session.ErrEndpointGone
 		}
 		return nil
@@ -328,6 +347,15 @@ type persistEndpoint struct {
 	// working with no endpoint. Kept in lockstep with QwenPersistent (see
 	// qwen_persistent.go); every persistent driver must carry it.
 	turnEndpointGone bool
+	// turnAccepted is the fake's acceptance signal for the in-flight
+	// turn: set when the process's runtime.turn.started is routed to the
+	// current turn (the fake emits it the moment it starts working on the
+	// submit — the deterministic analogue of qwen's echoed `user` event).
+	// When the endpoint dies mid-turn, Submit classifies the death from
+	// it: accepted → session.ErrTurnInterrupted (never auto-retried),
+	// not accepted → session.ErrEndpointGone (one safe retry). Reset when
+	// a new turn is registered.
+	turnAccepted bool
 
 	stdinMu sync.Mutex
 }
@@ -562,9 +590,11 @@ func (e *persistEndpoint) readLoop() {
 	e.f.dropEndpointRef(e)
 	// Signal any in-flight turn so its Submit returns (the Manager settles
 	// the session). The turn was CUT OFF by the process death, not settled
-	// by a terminal event — mark it endpoint-gone so Submit reports
-	// session.ErrEndpointGone and the Manager re-activates + retries the
-	// logical submit instead of wedging the instance.
+	// by a terminal event — mark it endpoint-gone so Submit classifies the
+	// death from turnAccepted: accepted → session.ErrTurnInterrupted
+	// (surfaced, never auto-retried), not accepted →
+	// session.ErrEndpointGone (the Manager re-activates + retries the
+	// logical submit once).
 	e.mu.Lock()
 	if e.currentTurnEvents != nil {
 		e.currentTurnEvents = nil
@@ -598,6 +628,17 @@ func (e *persistEndpoint) routeTurnEvent(norm session.SessionEvent) {
 	// plane only ever sees events for the turn it submitted.
 	if norm.TurnID != "" && norm.TurnID != turnID {
 		return
+	}
+	// The process's runtime.turn.started is the acceptance signal for the
+	// machine turn: from this moment the runtime is working on the submit,
+	// so a mid-turn death is an INTERRUPTION (partially applied outcome),
+	// not an unaccepted endpoint death.
+	if norm.Type == session.EventTurnStarted {
+		e.mu.Lock()
+		if e.currentTurnEvents == ch {
+			e.turnAccepted = true
+		}
+		e.mu.Unlock()
 	}
 	ch <- norm
 	if isTerminalSessionEvent(norm.Type) {

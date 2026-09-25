@@ -38,6 +38,27 @@ var ErrBusy = errors.New("session busy")
 // instance failed.
 var ErrEndpointGone = errors.New("session endpoint gone")
 
+// ErrTurnInterrupted is returned by Submit when the endpoint died AFTER
+// the runtime ACCEPTED the turn (the submit was delivered and the runtime
+// started working on it) but BEFORE a terminal result arrived. It is the
+// opposite of ErrEndpointGone in the one way that matters:
+//
+//   - ErrEndpointGone: the runtime did NOT accept/start the turn — no
+//     work was consumed. The Manager MAY re-activate and retry the submit
+//     once (the turn is re-runnable from scratch).
+//   - ErrTurnInterrupted: the runtime DID accept/start the turn — its
+//     outcome may be PARTIALLY APPLIED (files edited, tools called,
+//     commits made). The Manager MUST NOT re-submit it: a second submit
+//     would duplicate work the runtime already started. The turn is
+//     surfaced to the caller as an interruption immediately; the session
+//     and workspace are preserved, and only an explicit human retry
+//     (wake) re-runs the work.
+//
+// Drivers decide which of the two applies from the runtime's OWN
+// acceptance signal (e.g. the echoed user event / turn-started marker),
+// never from the mere presence of a turn in flight.
+var ErrTurnInterrupted = errors.New("session turn interrupted: endpoint died after the turn was accepted")
+
 // Driver is the contract a persistent runtime integration implements. It is
 // the generic replacement for the process-per-turn Adapter.StartTurn path:
 // a Driver owns a LIVE endpoint per instance and services many logical

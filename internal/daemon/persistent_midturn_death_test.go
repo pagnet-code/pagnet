@@ -25,6 +25,8 @@ package daemon
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -62,9 +64,24 @@ func waitForNoEndpoint(t *testing.T, d *Daemon, instanceID string, timeout time.
 }
 
 // C. The daemon's REAL persistent-turn path with an endpoint that dies
-// mid-turn. The session core must notice (ErrEndpointGone), re-activate, and
-// retry the logical submit once. Whatever the outcome, the instance must
-// NEVER be left stranded `working` with no endpoint.
+// mid-turn, AFTER the runtime accepted the turn.
+//
+// The fake-persistent runtime emits runtime.turn.started (the acceptance
+// signal) and THEN hard-SIGKILLs itself (PAGNET_FAKE_DIE_MID_TURN=1) — the
+// deterministic stand-in for a vendor crash / OOM landing mid-turn on an
+// ALREADY-ACCEPTED turn. Under the split contract this is an INTERRUPTION,
+// not an endpoint-gone retry: the outcome may be partially applied, so the
+// turn is NEVER auto re-submitted. The daemon must:
+//
+//   - report the turn as failed with kind "interrupted" (NOT process_error,
+//     NOT a completed turn);
+//   - settle the instance to the first-class "interrupted" status (the
+//     session and workspace are preserved — no cold start, no session
+//     deletion);
+//   - leave NO live endpoint (the work stays queued server-side; an explicit
+//     human retry is the only re-run path — the control plane never auto
+//     re-delivers an interrupted turn);
+//   - NEVER strand the instance `working` with no endpoint.
 func TestDaemon_PersistentEndpointDiesMidTurn_NotStrandedWorking(t *testing.T) {
 	d := newPersistentTestDaemon(t)
 	client, server := newMemWS(t)
@@ -72,8 +89,8 @@ func TestDaemon_PersistentEndpointDiesMidTurn_NotStrandedWorking(t *testing.T) {
 	d.curConn = client
 	d.connMu.Unlock()
 
-	// The endpoint crashes (hard SIGKILL to itself, no terminal event, no
-	// session save) in the middle of the first turn its session services.
+	// The endpoint ACCEPTS the turn (turn.started) and then crashes (hard
+	// SIGKILL to itself, no terminal event, no session save).
 	setPersistentFakeEnv(t, d, []string{"PAGNET_FAKE_DIE_MID_TURN=1"})
 
 	instanceID := domain.NewID().String()
@@ -82,21 +99,44 @@ func TestDaemon_PersistentEndpointDiesMidTurn_NotStrandedWorking(t *testing.T) {
 		Runtime: string(domain.RuntimeFakePersistent), Kind: "representative",
 	})
 
-	// driveDeliver fails the test if the deliver acks an error, so this
-	// already proves the turn settled through the recovery rather than
-	// surfacing a crash as an instance failure.
-	envs := driveDeliver(t, d, server, transport.NetworkEventPayload{
+	// Drive the deliver manually (readUntilAck) — the turn is interrupted,
+	// so the command acks an ERROR (the work stays queued server-side,
+	// exactly like rate_limited). driveDeliver would fail the test on the
+	// error ack, which is no longer the expected outcome.
+	env, err := transport.NewEnvelope(transport.MsgDeliverNetworkEvent, transport.NetworkEventPayload{
 		CommandID: "cmd-mdt-deliver", InstanceID: instanceID,
 		Kind: "task", Body: "crash me once",
 	})
+	if err != nil {
+		t.Fatalf("build deliver envelope: %v", err)
+	}
+	d.handleCommand(nil, env)
+	envs, ack := readUntilAck(t, server, "cmd-mdt-deliver")
 
-	for _, env := range envs {
-		if env.Type == transport.MsgRuntimeTurnFailed {
-			t.Fatalf("the mid-turn crash surfaced a turn failure envelope: %+v", env)
+	// The turn was reported as failed with kind "interrupted" (the
+	// failDetail is "interrupted:<msg>" — sendTurn splits on the first ':').
+	var sawInterrupted bool
+	for _, e := range envs {
+		if e.Type != transport.MsgRuntimeTurnFailed {
+			continue
+		}
+		p := envelopePayload(t, e)
+		if kind, _ := p["kind"].(string); kind == "interrupted" {
+			sawInterrupted = true
 		}
 	}
-	if !hasEnvelopeType(envs, transport.MsgRuntimeTurnCompleted) {
-		t.Fatalf("the retried turn did not complete: %+v", envs)
+	if !sawInterrupted {
+		t.Fatalf("the interrupted turn did not surface a turn.failed with kind \"interrupted\": %+v", envs)
+	}
+	// The turn was CUT OFF: it must NOT have completed (nothing may be
+	// fabricated for it).
+	if hasEnvelopeType(envs, transport.MsgRuntimeTurnCompleted) {
+		t.Fatalf("an interrupted turn must not report completion: %+v", envs)
+	}
+	// The command acked an error (the work stays queued server-side — NOT
+	// deferred, NOT silently dropped).
+	if errMsg, _ := ack["error"].(string); errMsg == "" {
+		t.Fatalf("the interrupted deliver must ack an error (work stays queued); ack=%v", ack)
 	}
 
 	row, ok, err := d.state.GetInstance(instanceID)
@@ -108,11 +148,14 @@ func TestDaemon_PersistentEndpointDiesMidTurn_NotStrandedWorking(t *testing.T) {
 		t.Fatalf("instance stranded `working` after the endpoint died mid-turn (pid=%v pty=%v)",
 			d.sup.EndpointPID(instanceID), d.sessions.PTYMaster(instanceID))
 	}
-	if row.Status != "idle" {
-		t.Fatalf("status after the recovery = %q, want idle (the retry completed)", row.Status)
+	// The instance settles to the first-class "interrupted" status (the
+	// session and workspace are preserved).
+	if row.Status != "interrupted" {
+		t.Fatalf("status after the interruption = %q, want \"interrupted\"", row.Status)
 	}
+	// The session is PRESERVED (not deleted, not cold-started).
 	if row.SessionID == "" {
-		t.Fatal("no session id after the recovered turn")
+		t.Fatal("the interrupted turn deleted the session (want it preserved)")
 	}
 	if d.busy(instanceID) {
 		t.Fatal("the daemon still records a turn in flight after the turn settled")
@@ -120,12 +163,19 @@ func TestDaemon_PersistentEndpointDiesMidTurn_NotStrandedWorking(t *testing.T) {
 	if d.turnInFlight(instanceID) {
 		t.Fatal("the session core still reports Busy after the turn settled")
 	}
-	// The recovered endpoint is the ONE live endpoint (never a second one).
-	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
-		t.Fatalf("active endpoints after the recovery = %d, want 1", n)
+	// NO live endpoint: the work stays queued; an explicit human retry is
+	// the only re-run path (the control plane never auto re-delivers). Wait
+	// for the driver to fully observe the death so the check is
+	// deterministic.
+	waitForNoEndpoint(t, d, instanceID, 20*time.Second)
+	if n := d.sup.Stats().ActiveEndpoints; n != 0 {
+		t.Fatalf("active endpoints after the interruption = %d, want 0 (no auto re-activation)", n)
 	}
-	if d.sessions.PTYMaster(instanceID) == nil {
-		t.Fatal("the recovered instance has no live endpoint PTY")
+	// The crash happened exactly ONCE (the marker file is written once,
+	// guarded so a re-activated endpoint services the retry normally).
+	marker := filepath.Join(os.Getenv("PAGNET_STATE_DIR"), "sessions", instanceID, ".died-mid-turn")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected the die-mid-turn marker (proving a single crash) at %s: %v", marker, err)
 	}
 }
 

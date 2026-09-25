@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/pagnet-code/pagnet/internal/proc"
+	"github.com/pagnet-code/pagnet/internal/session"
 )
 
 // turnOutcome is the DECISION for a settled turn: what the daemon does with
@@ -46,6 +47,14 @@ const (
 	// outcomeTurnFailed: the turn failed at the runtime level (rate_limited,
 	// auth_required, ...).
 	outcomeTurnFailed
+	// outcomeTurnInterrupted: the runtime ACCEPTED the turn and its endpoint
+	// died before a terminal result (session.ErrTurnInterrupted) — the
+	// outcome may be partially applied. The turn is reported as a
+	// turn-failed with kind "interrupted" and the instance settles to the
+	// "interrupted" status: the session and workspace are preserved, the
+	// work stays queued, and an explicit human retry (wake) is the only
+	// re-run path. It is NEVER automatically re-delivered.
+	outcomeTurnInterrupted
 )
 
 // launchRefusedKind is the operational kind reported for a launch refusal
@@ -64,8 +73,13 @@ const (
 // cases mirrors the legacy process-per-turn path exactly:
 //
 //	sessionLost → turnFailed → shutdown-cancel → supervisor-shutdown →
-//	busy-defer → host-pressure → limit-refused → process-error →
-//	no-completion → completed.
+//	busy-defer → host-pressure → limit-refused → turn-interrupted →
+//	process-error → no-completion → completed.
+//
+// The turn-interrupted case (session.ErrTurnInterrupted) is checked BEFORE
+// the generic submitErr case: an accepted-then-died turn is its own
+// availability outcome (kind "interrupted", never auto re-delivered), not a
+// generic process_error (which would mark the instance failed).
 func classifyTurnError(submitErr error, completed, sessionLost bool, failedKind string) (turnOutcome, launchRefusedKind) {
 	switch {
 	case sessionLost:
@@ -95,6 +109,13 @@ func classifyTurnError(submitErr error, completed, sessionLost bool, failedKind 
 		// circuit) refused the launch: a clean operational condition,
 		// reported with its OWN kind.
 		return outcomeLaunchRefused, kindLimitRefused
+	case errors.Is(submitErr, session.ErrTurnInterrupted):
+		// The runtime ACCEPTED the turn and its endpoint died before a
+		// terminal result: the outcome may be partially applied. Its own
+		// availability outcome — reported with kind "interrupted", the
+		// instance settles to "interrupted", and the work stays queued for
+		// an explicit human retry (never an automatic re-delivery).
+		return outcomeTurnInterrupted, ""
 	case submitErr != nil:
 		// Adapter/driver-level failure (spawn/IO), no turn events produced.
 		return outcomeProcessError, ""

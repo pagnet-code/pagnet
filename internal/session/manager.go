@@ -24,26 +24,42 @@ import (
 //   - promptLocks[instanceID] serializes PROMPT turns per instance (one
 //     prompt turn in flight at a time). It is held across the prompt
 //     Driver.Submit (which blocks until the turn settles).
+//   - activationLocks[instanceID] serializes ACTIVATION per instance: at
+//     most ONE Driver.Activate (and the surrounding state reconciliation)
+//     per instance at a time. A second EnsureActive (e.g. an attach
+//     racing the turn's own EnsureActive) blocks here, then re-reads the
+//     state and reconciles to the live endpoint instead of activating a
+//     second time. Hibernate takes it too, so a hibernate can never race
+//     an in-flight activation. m.mu is never held across a Driver call.
 //   - INTERACTION submits do not take the promptLock: they must be
 //     deliverable while a prompt turn is blocked on a native interaction
 //     (the busy/idle + interaction round-trip). They serialize only on
 //     m.mu for state updates.
+//
+// Callers outside the package must read session state ONLY through the
+// locked queries (State, NativeID, HasPendingInteraction, PID) — never
+// by dereferencing the *RuntimeSession returned by GetSession/Session
+// while the Manager may be mutating it.
 type Manager struct {
 	mu          sync.Mutex
 	drivers     map[domain.RuntimeName]Driver
 	sessions    map[string]*RuntimeSession // keyed by instanceID
 	promptLocks map[string]*sync.Mutex     // keyed by instanceID
-	now         func() time.Time
+	// activationLocks: per-instance activation single-flight (see the
+	// concurrency model above).
+	activationLocks map[string]*sync.Mutex // keyed by instanceID
+	now             func() time.Time
 }
 
 // NewManager builds an empty Manager. Drivers are registered with
 // RegisterDriver before use.
 func NewManager() *Manager {
 	return &Manager{
-		drivers:     map[domain.RuntimeName]Driver{},
-		sessions:    map[string]*RuntimeSession{},
-		promptLocks: map[string]*sync.Mutex{},
-		now:         time.Now,
+		drivers:         map[domain.RuntimeName]Driver{},
+		sessions:        map[string]*RuntimeSession{},
+		promptLocks:     map[string]*sync.Mutex{},
+		activationLocks: map[string]*sync.Mutex{},
+		now:             time.Now,
 	}
 }
 
@@ -177,6 +193,56 @@ func (m *Manager) promptLock(instanceID string) *sync.Mutex {
 	return l
 }
 
+// activationLock returns (creating when needed) the per-instance
+// activation single-flight lock.
+func (m *Manager) activationLock(instanceID string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l, ok := m.activationLocks[instanceID]
+	if !ok {
+		l = &sync.Mutex{}
+		m.activationLocks[instanceID] = l
+	}
+	return l
+}
+
+// State returns the instance's session lifecycle state (locked read).
+// ok is false when the instance has no session. Callers (the daemon) use
+// this instead of reading RuntimeSession.State directly: the field is
+// mutated by the Manager under m.mu, so an unlocked read is a data race.
+func (m *Manager) State(instanceID string) (SessionState, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[instanceID]
+	if s == nil {
+		return StateInactive, false
+	}
+	return s.State, true
+}
+
+// NativeID returns the instance's session native id (locked read). ok is
+// false when the instance has no session.
+//
+// Unlike State (which only the Manager mutates, under m.mu), NativeID is
+// ALSO written by the Driver as the native exchange happens (the Driver
+// contract) — inside Activate, which the Manager runs under the
+// per-instance activation lock. This query takes that same lock (then
+// m.mu) so it is race-free against the driver's write: a concurrent
+// activation for the instance is either finished (the id is settled) or
+// in flight (this call waits for it), never observed mid-write.
+func (m *Manager) NativeID(instanceID string) (string, bool) {
+	lock := m.activationLock(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[instanceID]
+	if s == nil {
+		return "", false
+	}
+	return s.NativeID, true
+}
+
 // EnsureActive activates the session's endpoint when it is not already
 // live. It enforces the materialised resume gate. The events channel (when
 // non-nil) receives the activation events (session.started / resumed /
@@ -190,10 +256,23 @@ func (m *Manager) promptLock(instanceID string) *sync.Mutex {
 // on-disk state preserved) when materialised, cold-starting when not. An
 // endpoint death is never surfaced as a session loss or an instance
 // failure.
+//
+// Single-flight: the per-instance activation lock is held across the WHOLE
+// activate/reconcile operation (acquired before the state is read, so a
+// concurrent EnsureActive for the same instance blocks here and then
+// reconciles to the endpoint the first call produced — join semantics).
+// m.mu is released before Driver.Activate; the lock that bounds
+// concurrent activations is the per-instance one, not m.mu.
 func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent) (*RuntimeEndpoint, error) {
+	lock := m.activationLock(sess.InstanceID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	// Read the state AND the endpoint under the lock (the endpoint is
 	// mutated by activation/hibernation; a torn read would let a stale
-	// endpoint escape the liveness check below).
+	// endpoint escape the liveness check below). This read happens AFTER
+	// the activation lock is held, so it reflects any activation that
+	// finished just before this call acquired the lock.
 	m.mu.Lock()
 	st := sess.State
 	ep := sess.Endpoint
@@ -263,12 +342,14 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 		return nil, ErrNotMaterialised
 	}
 	m.setState(sess, StateActivating)
+	// The driver sets sess.NativeID as the native exchange happens (the
+	// Driver contract). That write is serialized by the per-instance
+	// activation lock this method holds, so the locked NativeID query
+	// (which takes the same lock) is race-free against it.
 	ep, err := d.Activate(ctx, sess, events)
 	if err != nil {
 		if errors.Is(err, ErrSessionLost) {
 			m.setState(sess, StateLost)
-		} else if errors.Is(err, ErrNotMaterialised) {
-			m.setState(sess, StateInactive)
 		} else {
 			m.setState(sess, StateInactive)
 		}
@@ -328,6 +409,11 @@ func (m *Manager) Submit(ctx context.Context, sess *RuntimeSession, req SubmitRe
 // consumed no work: re-activate (resuming the materialised session or
 // cold-starting) and retry the submit ONCE. A second ErrEndpointGone is
 // surfaced (the endpoint is not coming back on its own).
+//
+// An ErrTurnInterrupted is the opposite case: the runtime ACCEPTED the
+// turn and died mid-flight, so its outcome may be partially applied. It
+// is NEVER re-submitted — the session is settled (preserved, endpoint
+// dropped) and the error is surfaced immediately.
 func (m *Manager) submitPrompt(ctx context.Context, sess *RuntimeSession, req SubmitRequest, events chan SessionEvent) (*TurnResult, error) {
 	lock := m.promptLock(sess.InstanceID)
 	lock.Lock()
@@ -357,13 +443,22 @@ func (m *Manager) submitPrompt(ctx context.Context, sess *RuntimeSession, req Su
 			events <- ev
 		}
 		err := <-submitErr
+		// The runtime ACCEPTED the turn and its endpoint died before a
+		// terminal result: the outcome may be partially applied, so the
+		// turn is NOT re-runnable. Settle the session (preserved) and
+		// surface the interruption immediately — never retry it.
+		if errors.Is(err, ErrTurnInterrupted) {
+			m.settleInterrupted(sess)
+			return result, err
+		}
 		if !errors.Is(err, ErrEndpointGone) {
 			m.settlePrompt(sess, result)
 			return result, err
 		}
-		// The endpoint died after EnsureActive confirmed it live. Loop:
-		// EnsureActive re-probes liveness, drops the stale endpoint, and
-		// re-activates (resume or cold start).
+		// The endpoint died after EnsureActive confirmed it live (and
+		// the turn was never accepted). Loop: EnsureActive re-probes
+		// liveness, drops the stale endpoint, and re-activates (resume
+		// or cold start).
 	}
 	// Two ErrEndpointGone in a row: the endpoint is not coming back on its
 	// own. Settle and surface the error (the turn consumed no work).
@@ -417,12 +512,44 @@ func (m *Manager) settlePrompt(sess *RuntimeSession, result *TurnResult) {
 	}
 }
 
+// settleInterrupted records the post-interruption session state: the
+// endpoint is gone (it died mid-turn) and the session is inactive again.
+// The session is PRESERVED (invariant A4): no cold start, no deletion of
+// a materialised session's native id — the next explicit retry
+// re-activates and the driver resumes by native id. An UNMATERIALISED
+// session's minted native id is stale (nothing durable was exchanged), so
+// it is cleared and the re-activation cold-starts (mirroring
+// EnsureActive's death path). The Materialised flag is deliberately NOT
+// set: the Manager cannot know whether the dying runtime persisted its
+// native state, so it stays conservative.
+func (m *Manager) settleInterrupted(sess *RuntimeSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess.Endpoint = nil
+	sess.State = StateInactive
+	if !sess.Materialised {
+		sess.NativeID = ""
+	}
+	// A dead endpoint's pending interactions are stale: they cannot be
+	// resolved against a re-activated session.
+	sess.PendingInteractions = map[string]bool{}
+	sess.LastActivity = m.now()
+}
+
 // Hibernate stops the session's endpoint, preserving the session
 // (invariant F). It refuses to hibernate a busy session (a turn in
 // flight) or a session with an unresolved interaction (plan §20: never
 // hibernate busy / unresolved-interaction sessions) — the caller must
 // drain first.
+//
+// It takes the per-instance activation lock so a hibernate can never run
+// concurrently with an in-flight activation for the same instance (the
+// state read below then reflects the settled activation).
 func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
+	lock := m.activationLock(sess.InstanceID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	m.mu.Lock()
 	st := sess.State
 	pending := len(sess.PendingInteractions) > 0
@@ -491,18 +618,20 @@ func (m *Manager) PID(instanceID string) *int {
 	return d.PID(instanceID)
 }
 
-// Forget removes the instance's session state AND its prompt lock from the
-// Manager. The instance is gone for good (forgotten / restarted fresh):
-// there is nothing to preserve, and the next Session() call mints a fresh
-// session (no native id → cold start). It does NOT stop the endpoint — the
-// caller does that first via Stop — it only drops the in-memory state.
-// Dropping the prompt lock too is what bounds the Manager's maps: without
-// it, every forgotten instance would leak a session entry and a lock
-// forever (unbounded growth in a long-lived daemon).
+// Forget removes the instance's session state AND its prompt and
+// activation locks from the Manager. The instance is gone for good
+// (forgotten / restarted fresh): there is nothing to preserve, and the
+// next Session() call mints a fresh session (no native id → cold start).
+// It does NOT stop the endpoint — the caller does that first via Stop —
+// it only drops the in-memory state. Dropping the locks too is what
+// bounds the Manager's maps: without it, every forgotten instance would
+// leak a session entry and its locks forever (unbounded growth in a
+// long-lived daemon).
 func (m *Manager) Forget(instanceID string) {
 	m.mu.Lock()
 	delete(m.sessions, instanceID)
 	delete(m.promptLocks, instanceID)
+	delete(m.activationLocks, instanceID)
 	m.mu.Unlock()
 }
 
