@@ -45,12 +45,23 @@ type TurnSpec struct {
 	// default: its field, then its env). When set it takes precedence over
 	// both — the daemon resolves launch request > definition default.
 	Model string
-	// AgentMDPath is the daemon-managed standing-instruction file
-	// (AGENT.md-style) the runtime loads as extra system context ("" =
-	// none). Claude maps it to --append-system-prompt-file; runtimes
-	// without such a flag get the daemon append its text to a fresh
-	// session's first turn instead (they never read this path).
+	// AgentMDPath is the daemon-managed standing document file (the pagnet
+	// runtime/network overlay + the operator's standing agent instruction
+	// when set) the runtime loads as extra system context ("" = none).
+	// Claude maps it to --append-system-prompt-file; the persistent drivers
+	// and opencode receive the SAME text as StandingInstructions and use
+	// their native standing surfaces (they never read this path). The
+	// document is NEVER appended to a turn's input.
 	AgentMDPath string
+	// StandingInstructions is the text of the daemon-managed standing
+	// document (overlay + the operator's standing instruction when set) —
+	// the vendor-neutral standing context the runtime delivers through its
+	// NATIVE surface: qwen --append-system-prompt at endpoint launch,
+	// opencode's instance-scoped config, (later) codex
+	// developerInstructions. It is standing context, never a turn input.
+	// For persistent endpoints it is FIXED AT LAUNCH (the session core
+	// restarts the endpoint when it changes, like Env/Model).
+	StandingInstructions string
 	// Metadata carries runtime-agnostic extras (e.g. profile, transcript).
 	Metadata map[string]any
 	// Env is extra KEY=VALUE pairs for the spawned process (per-instance

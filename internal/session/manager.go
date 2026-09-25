@@ -154,6 +154,21 @@ func (m *Manager) SetModel(sess *RuntimeSession, model string) {
 	m.mu.Unlock()
 }
 
+// SetStandingInstructions sets the session's standing document (the turn
+// spec's StandingInstructions, instruction-model Wave 3). It is called by
+// the daemon before each Submit so the endpoint (re)activation uses the
+// current standing context. See RuntimeSession.StandingInstructions for the
+// launch semantics (fixed at spawn; a change restarts the endpoint on the
+// next EnsureActive, preserving the session).
+func (m *Manager) SetStandingInstructions(sess *RuntimeSession, text string) {
+	if sess == nil {
+		return
+	}
+	m.mu.Lock()
+	sess.StandingInstructions = text
+	m.mu.Unlock()
+}
+
 // GetSession returns the session for an instance (nil when none).
 func (m *Manager) GetSession(instanceID string) *RuntimeSession {
 	m.mu.Lock()
@@ -243,6 +258,25 @@ func (m *Manager) NativeID(instanceID string) (string, bool) {
 	return s.NativeID, true
 }
 
+// Materialised returns the instance's session materialised flag (locked
+// read). ok is false when the instance has no session. A session is
+// materialised once it has had its first real exchange — only then is its
+// native id resumable (the Materialised invariant, Codex R3). The daemon
+// consults it before persisting a session id on the instance row: a
+// cold-started, never-exchanged session has no durable state to resume,
+// and persisting its minted id would make a later daemon restart attempt a
+// resume that can only be lost (session.lost → blocked), bricking an
+// instance that never did any work.
+func (m *Manager) Materialised(instanceID string) (bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[instanceID]
+	if s == nil {
+		return false, false
+	}
+	return s.Materialised, true
+}
+
 // EnsureActive activates the session's endpoint when it is not already
 // live. It enforces the materialised resume gate. The events channel (when
 // non-nil) receives the activation events (session.started / resumed /
@@ -278,25 +312,28 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	ep := sess.Endpoint
 	wantEnv := sess.Env
 	wantModel := sess.Model
+	wantStanding := sess.StandingInstructions
 	pending := len(sess.PendingInteractions) > 0
 	m.mu.Unlock()
 	if st.Live() {
 		d := m.driverLocked(sess.Runtime)
 		live := d == nil || d.Live(sess.InstanceID)
-		// Launch-env / launch-model change (Phase 2 / R8, Phase 4 / B9):
-		// the endpoint's environment AND model are FIXED AT SPAWN. When
-		// the session's current env or model differs from what the live
-		// endpoint was launched with, the endpoint must be RESTARTED
-		// (stopped + re-activated) so the new value takes effect — the
-		// session is preserved (a materialised session resumes the same
-		// native session on re-activation). The one exception is a
+		// Launch-env / launch-model / standing-instruction change (Phase 2
+		// / R8, Phase 4 / B9, instruction-model Wave 3): the endpoint's
+		// environment, model AND standing context are FIXED AT SPAWN. When
+		// the session's current env, model or standing instructions differ
+		// from what the live endpoint was launched with, the endpoint must
+		// be RESTARTED (stopped + re-activated) so the new value takes
+		// effect — the session is preserved (a materialised session resumes
+		// the same native session on re-activation). The one exception is a
 		// session with an unresolved interaction: restarting it would lose
 		// the in-flight interaction (plan §20: never hibernate a session
 		// with an unresolved interaction), so the change is DEFERRED —
 		// the live endpoint is returned and it is applied at the next
 		// restart opportunity.
 		staleLaunch := live && ep != nil &&
-			(!sameEnv(wantEnv, ep.LaunchEnv) || wantModel != ep.LaunchModel)
+			(!sameEnv(wantEnv, ep.LaunchEnv) || wantModel != ep.LaunchModel ||
+				wantStanding != ep.LaunchStandingInstructions)
 		if live && !staleLaunch {
 			return ep, nil
 		}
@@ -307,14 +344,15 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 			// Stop the (still-live) endpoint, preserving the session —
 			// the driver's hibernate is the graceful stop (the runtime
 			// persists its native session state on the way out). Then fall
-			// through to re-activation with the new env/model.
+			// through to re-activation with the new env/model/standing
+			// context.
 			if err := d.Hibernate(ctx, sess); err != nil {
 				return nil, err
 			}
 		}
 		// The endpoint died unexpectedly (or was just stopped for a
-		// launch-env change): clear the stale reference and fall through
-		// to (re)activation. A MATERIALISED session keeps its native id
+		// launch-configuration change): clear the stale reference and fall
+		// through to (re)activation. A MATERIALISED session keeps its native id
 		// (the on-disk state survives) and resumes the same native
 		// session. An UNMATERIALISED session never had a real exchange, so
 		// its minted native id is stale (nothing durable to resume) —
@@ -359,11 +397,12 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	sess.Endpoint = ep
 	sess.State = StateIdle
 	sess.LastActivity = m.now()
-	// Record the env AND model the endpoint was actually launched with,
-	// so a later turn's env/model can be compared against it (the
-	// launch-change restart above).
+	// Record the env, model AND standing context the endpoint was actually
+	// launched with, so a later turn's values can be compared against them
+	// (the launch-change restart above).
 	ep.LaunchEnv = append([]string(nil), sess.Env...)
 	ep.LaunchModel = sess.Model
+	ep.LaunchStandingInstructions = sess.StandingInstructions
 	m.mu.Unlock()
 	return ep, nil
 }

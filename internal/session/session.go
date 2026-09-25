@@ -271,6 +271,22 @@ type RuntimeSession struct {
 	// stable instance the spec env is constant, so the restart is a
 	// correctness backstop for a config change, not a per-turn cost.
 	Env []string
+	// StandingInstructions is the instance's managed standing document
+	// (the pagnet runtime/network overlay + the operator's standing agent
+	// instruction when set): the vendor-neutral standing context the
+	// runtime delivers through its NATIVE surface (qwen
+	// --append-system-prompt at endpoint launch; opencode's instance
+	// config; the claude managed file). It is NEVER a turn input — the
+	// text defining who the agent is is standing context, not a chat
+	// message (instruction-model Wave 3).
+	//
+	// Like Env and Model it is FIXED AT LAUNCH: the driver reads it when
+	// it starts the endpoint process, and the Manager detects a change on
+	// the next EnsureActive and restarts the endpoint (preserving the
+	// session) so the new standing context takes effect — a standing
+	// instruction change is a launch-configuration change, never a
+	// per-submit update.
+	StandingInstructions string
 	// PendingInteractions are the native interaction ids that have been
 	// observed started but not yet resolved (plan §20: never hibernate a
 	// session with an unresolved interaction). The Manager maintains it
@@ -331,6 +347,13 @@ type RuntimeEndpoint struct {
 	// launch model changed and the endpoint must be restarted to pick it
 	// up (see RuntimeSession.Model for the launch-model semantics).
 	LaunchModel string
+	// LaunchStandingInstructions is the standing document the endpoint
+	// process was launched with (a copy of the session's
+	// StandingInstructions at activation time). The Manager compares a
+	// later turn's value against it: a difference means the standing
+	// context changed and the endpoint must be restarted to pick it up
+	// (see RuntimeSession.StandingInstructions for the semantics).
+	LaunchStandingInstructions string
 }
 
 // BusyPolicy is how a submit is handled when the session is already busy

@@ -162,8 +162,11 @@ type InstanceRow struct {
 	// Instruction is the standing instruction (AGENT.md-style) for this
 	// instance ("" = none).
 	Instruction string
-	// AgentMDPath is the daemon-state-dir file holding Instruction ("" =
-	// none); claude points --append-system-prompt-file at it.
+	// AgentMDPath is the daemon-state-dir file holding the instance's
+	// managed standing document (the pagnet overlay + the standing
+	// instruction when set); claude points --append-system-prompt-file at
+	// it, the other runtimes receive the same text through their native
+	// standing surfaces.
 	AgentMDPath string
 	// ConfigFingerprint is the fingerprint of the runtime-injected config
 	// (MCP bridge + identity env + daemon version, P6 configStale) that

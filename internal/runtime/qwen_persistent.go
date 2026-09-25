@@ -632,6 +632,18 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	if model := q.modelFor(sess); model != "" {
 		args = append(args, "-m", model)
 	}
+	// Standing context (instruction-model Wave 3): the managed standing
+	// document (the pagnet overlay + the operator's standing instruction
+	// when set) rides Qwen's NATIVE standing surface — --append-system-
+	// prompt, which APPENDS to Qwen's built-in system prompt (NOT
+	// --system-prompt, which would replace the vendor prompt). It is FIXED
+	// AT LAUNCH (session.RuntimeSession.StandingInstructions): the Manager
+	// restarts the endpoint when it changes. Qwen's native QWEN.md /
+	// AGENTS.md discovery keeps working — pagnet never writes into the
+	// workspace.
+	if sess.StandingInstructions != "" {
+		args = append(args, "--append-system-prompt", sess.StandingInstructions)
+	}
 	// Resume: always pass an explicit -r <id> (an empty -r opens a picker
 	// ⇒ hang; doc §5.2). Never --continue, never --fork-session.
 	if resuming {

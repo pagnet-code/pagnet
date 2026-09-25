@@ -2138,9 +2138,11 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	// The runtime must be drivable on this host (an adapter OR a registered
 	// session driver) and installed. A process-per-turn runtime is checked
 	// via its adapter; a session-driven runtime (Phase 1: fake-persistent)
-	// via its driver. The endpoint for a session-driven runtime launches
-	// LAZILY on the first turn (EnsureActive), not at launch time — launch
-	// only records/accepts the instance.
+	// via its driver. A session-driven runtime's endpoint is established
+	// at launch time when no initial task is given (plan 3C: the session
+	// is minted/resumed, the instance is idle/ready); with an initial
+	// task the first turn's EnsureActive establishes it. A
+	// process-per-turn runtime runs no process until the first turn.
 	if !d.runtimeSupported(rn) {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
@@ -2221,19 +2223,19 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		Instruction:      p.AgentMD,
 		AgentPrincipalID: p.AgentPrincipalID,
 	}
-	// Standing instruction (AGENT.md): materialize it in the daemon state
-	// dir (NEVER the workspace) and record its path on the row so it
-	// persists across turns. claude receives the path via
-	// --append-system-prompt-file; other runtimes have the text appended
-	// to a fresh session's first turn (turnSpecFor).
-	if p.AgentMD != "" {
-		path, _, err := d.writeAgentMD(&row)
-		if err != nil {
-			if lock != nil {
-				lock.Unlock()
-			}
-			return err
+	// The ONE managed standing document (the pagnet overlay + the
+	// operator's standing instruction when set): materialized in the
+	// daemon state dir (NEVER the workspace) and recorded on the row. It
+	// is the delivery vehicle for every runtime's standing context —
+	// claude --append-system-prompt-file, the persistent drivers' native
+	// launch surface, opencode's instance config — and is never a turn
+	// input (instruction-model Wave 3).
+	if path, _, err := d.writeStandingDocument(&row); err != nil {
+		if lock != nil {
+			lock.Unlock()
 		}
+		return err
+	} else {
 		row.AgentMDPath = path
 	}
 	if err := d.state.UpsertInstance(row); err != nil {
@@ -2245,9 +2247,19 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if lock != nil {
 		lock.Unlock()
 	}
+	// A session-driven runtime establishes its runtime/session at launch
+	// (the endpoint is activated below when no initial task is given); a
+	// process-per-turn runtime runs no process until work arrives.
+	sessionDriven := d.sessionDriverFor(&row) != nil
 	msg := "agent launched (idle, process-per-turn)"
 	if worktree {
 		msg = "agent launched (git worktree isolation, process-per-turn)"
+	}
+	if sessionDriven {
+		msg = "agent launched (session-driven, endpoint established)"
+		if worktree {
+			msg = "agent launched (git worktree isolation, session-driven, endpoint established)"
+		}
 	}
 	d.Log.Info(msg,
 		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
@@ -2261,6 +2273,9 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	// as the FIRST turn of a fresh instance — the adapter translates it
 	// into the runtime's mechanism (first prompt / session creation). A
 	// resumed session never receives it again (its context already has it).
+	// For a session-driven runtime the first turn's EnsureActive handles
+	// endpoint activation (the per-instance activation single-flight makes
+	// a separate launch-time activation impossible to double).
 	if p.Mission != "" {
 		row, ok, err := d.state.GetInstance(p.InstanceID)
 		if err != nil {
@@ -2269,6 +2284,22 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		if ok && row.SessionID == "" {
 			d.Log.Info("mission first turn", "instance", p.InstanceID, "chars", len(p.Mission))
 			return d.runTurn(conn, d.turnSpecFor(row, false, p.Mission, "mission"))
+		}
+		return nil
+	}
+	// Instruction-model Wave 3 (plan 3C): a session-driven launch with NO
+	// initial task establishes the runtime/session NOW — the endpoint is
+	// activated (the session is minted/resumed, the instance is idle/ready,
+	// a terminal attach works immediately) and NO first chat message is
+	// fabricated. Process-per-turn runtimes keep their model: no process
+	// until the first turn.
+	if sessionDriven {
+		row, ok, err := d.state.GetInstance(p.InstanceID)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return d.activateSessionIdle(conn, row)
 		}
 	}
 	return nil
@@ -2700,40 +2731,39 @@ func (d *Daemon) sessionActivating(instanceID string) bool {
 	return ok && st == session.StateActivating
 }
 
+// turnSpecFor renders the turn spec for the instance. The turn input is
+// EXACTLY the given input (the mission / delivery / wake / user text) —
+// nothing is appended: standing context (the pagnet overlay + the agent's
+// standing instruction) reaches the model through the runtime's native
+// standing surface, never as a chat message (instruction-model Wave 3).
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
-	contractPath, contractText, _ := d.writeContract(row)
-	// Standing instruction (AGENT.md): re-rendered per turn (idempotent),
-	// mirroring the coordination contract. claude receives the path via
-	// --append-system-prompt-file (every turn); other runtimes have the
-	// text appended to a fresh session's first turn (they have no such
-	// flag).
-	agentMDPath, agentMDText, _ := d.writeAgentMD(row)
-	if !resume {
-		// §23/§24: the coordination contract is standing instructions and
-		// must reach the model. A fresh session has no prior context, so
-		// it rides with the first turn; a resumed session already carries
-		// it in its context.
-		input = input + "\n\n" + contractText
-		// The standing instruction reaches non-claude runtimes the same
-		// way: appended to a fresh session's first turn. claude gets it
-		// natively via --append-system-prompt-file (spec.AgentMDPath), so
-		// it is NOT appended here (no double delivery).
-		if agentMDText != "" && row.Runtime != string(domain.RuntimeClaudeCode) {
-			input = input + "\n\n" + agentMDText
-		}
-	}
+	// The pagnet overlay is re-rendered per turn (idempotent) and stays on
+	// disk as an on-disk reference: the runtime is pointed at it with
+	// PAGNET_COORDINATION_CONTRACT so the agent can re-read it through its
+	// tools.
+	contractPath, _, _ := d.writeContract(row)
+	// The ONE managed standing document (overlay + the operator's standing
+	// instruction when set): the delivery vehicle for every runtime's
+	// standing context. claude reads the file (spec.AgentMDPath →
+	// --append-system-prompt-file); the persistent drivers receive the
+	// text (spec.StandingInstructions → the session's StandingInstructions
+	// → the native launch surface, e.g. qwen --append-system-prompt);
+	// opencode materializes the text into its instance-scoped config. It
+	// is NEVER appended to the turn input.
+	standingPath, standingText, _ := d.writeStandingDocument(row)
 	return agentruntime.TurnSpec{
-		TurnID:       domain.NewID().String(),
-		InstanceID:   row.InstanceID,
-		DefinitionID: row.DefinitionID,
-		Workspace:    row.Workspace,
-		SessionDir:   filepath.Join(d.StateDir, "sessions", row.InstanceID),
-		Resume:       resume,
-		Input:        input,
-		InputKind:    kind,
-		Model:        row.Model,
-		AgentMDPath:  agentMDPath,
-		Metadata:     map[string]any{"profile": row.Profile},
+		TurnID:               domain.NewID().String(),
+		InstanceID:           row.InstanceID,
+		DefinitionID:         row.DefinitionID,
+		Workspace:            row.Workspace,
+		SessionDir:           filepath.Join(d.StateDir, "sessions", row.InstanceID),
+		Resume:               resume,
+		Input:                input,
+		InputKind:            kind,
+		Model:                row.Model,
+		AgentMDPath:          standingPath,
+		StandingInstructions: standingText,
+		Metadata:             map[string]any{"profile": row.Profile},
 		Env: []string{
 			"PAGNET_INSTANCE_ID=" + row.InstanceID,
 			"PAGNET_AGENT_NAME=" + row.AgentName,
@@ -3134,7 +3164,18 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 		}, events)
 	}()
 
+	// The session id the turn runs in: the row's persisted id, or — when
+	// the endpoint was activated at launch (plan 3C: session established,
+	// no turn submitted) and the session was not yet materialised (the id
+	// was not persisted on the row) — the Manager's live native id. A
+	// session event on this stream (a (re)activation by THIS turn)
+	// overwrites it.
 	sessionID := row.SessionID
+	if sessionID == "" {
+		if id, ok := d.sessions.NativeID(spec.InstanceID); ok && id != "" {
+			sessionID = id
+		}
+	}
 	var failedKind, failedErr string
 	var failedRetry *string
 	var sessionLost, completed bool
@@ -3353,6 +3394,10 @@ func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *s
 	// The launch model (Phase 4 / B9): fixed at spawn; a change restarts
 	// the endpoint on the next EnsureActive (preserving the session).
 	d.sessions.SetModel(sess, spec.Model)
+	// The standing document (instruction-model Wave 3): fixed at spawn; a
+	// change restarts the endpoint on the next EnsureActive (preserving
+	// the session) so the new standing context takes effect.
+	d.sessions.SetStandingInstructions(sess, spec.StandingInstructions)
 	return sess
 }
 
@@ -3501,21 +3546,33 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 	return nil
 }
 
-// activateSessionForAttach (re)activates a session-driven instance's
-// endpoint so a terminal attach has a live PTY to view. It is the SAME
-// activation path a turn uses (prepareSession + EnsureActive) — no
-// separate wake machinery, no second process.
+// activateSessionIdle (re)activates a session-driven instance's endpoint
+// and settles it IDLE (no turn submitted): the runtime/session is
+// established and the instance is ready (a terminal attach works
+// immediately). It is the SAME activation path a turn uses
+// (prepareSession + EnsureActive) — no separate wake machinery, no second
+// process. The terminal-attach wake and a launch with no initial task
+// (instruction-model Wave 3, plan 3C: establish the session, show it
+// idle/ready, do NOT fabricate a first chat message) share it.
 //
 // Outcomes:
 //   - success: the session events are reported (started/resumed), the
 //     instance is idle (a live endpoint, no turn in flight), and the view
-//     is ensured at this activation site (A5/G8).
+//     is ensured at this activation site (A5/G8). The session id is
+//     persisted on the row only when the session is MATERIALISED (it has
+//     had a real exchange — the Materialised invariant, Codex R3): a
+//     cold-started, never-exchanged session has no durable state to
+//     resume, and persisting its minted id would make a later daemon
+//     restart attempt a resume that can only be lost (session.lost →
+//     blocked), bricking an instance that never did any work. An
+//     unmaterialised session cold-starts again after a restart — the
+//     correct behavior.
 //   - ErrSessionLost: the stored session is unrecoverable — drop the local
 //     reference and BLOCK the instance until a human explicitly restarts
 //     (invariant F: never a silent fresh session).
-//   - any other error: the attach is refused (the instance status is left
-//     for the turn/hibernate paths to settle).
-func (d *Daemon) activateSessionForAttach(conn *websocket.Conn, row *InstanceRow) error {
+//   - any other error: the activation is refused (the instance status is
+//     left for the turn/hibernate paths to settle).
+func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) error {
 	spec := d.turnSpecFor(row, row.SessionID != "", "", "terminal")
 	sess := d.prepareSession(row, spec)
 	events := make(chan session.SessionEvent, 16)
@@ -3531,7 +3588,16 @@ drain:
 			case session.EventSessionStarted, session.EventSessionResumed:
 				d.reportSession(conn, row.InstanceID, ev.SessionID,
 					ev.Type == session.EventSessionResumed)
-				_ = d.state.SetInstanceStatus(row.InstanceID, "working", ev.SessionID)
+				// A resumed session is materialised by definition (the
+				// resume gate): persist its id. A cold start is not yet
+				// materialised (no real exchange): keep the status
+				// transition but do NOT persist the minted id (the
+				// Materialised invariant — see the doc above).
+				persistID := ""
+				if ev.Type == session.EventSessionResumed {
+					persistID = ev.SessionID
+				}
+				_ = d.state.SetInstanceStatus(row.InstanceID, "working", persistID)
 			case session.EventSessionLost:
 				// Surfaced via the error below (invariant F).
 			}
@@ -3548,30 +3614,42 @@ drain:
 			_ = d.state.SetInstanceSession(row.InstanceID, "")
 			_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
 			d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
-			d.Log.Warn("attach activation lost the session; instance blocked",
+			d.Log.Warn("activation lost the session; instance blocked",
 				"instance", row.InstanceID)
 			return fmt.Errorf("session lost: no resumable session (instance blocked)")
 		}
-		d.Log.Warn("attach activation failed", "instance", row.InstanceID,
+		d.Log.Warn("session activation failed", "instance", row.InstanceID,
 			"error", err.Error())
 		return err
 	}
-	sessionID := row.SessionID
-	// Locked read through the Manager (NativeID is mutated by the Manager
-	// and the drivers under its mutex; a direct sess.NativeID read here
-	// would race it).
-	if id, ok := d.sessions.NativeID(row.InstanceID); ok && id != "" {
-		sessionID = id
+	// Persist the session id on the row only when the session is
+	// MATERIALISED (see the doc above).
+	sessionID := ""
+	if mat, ok := d.sessions.Materialised(row.InstanceID); ok && mat {
+		// Locked read through the Manager (NativeID is mutated by the
+		// Manager and the drivers under its mutex; a direct sess.NativeID
+		// read here would race it).
+		if id, ok := d.sessions.NativeID(row.InstanceID); ok && id != "" {
+			sessionID = id
+		}
 	}
 	_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
 	_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 		"instanceId": row.InstanceID, "status": "idle",
 	})
-	d.reportEndpointStatus(conn, row.InstanceID) // online (attach woke it)
-	d.Log.Info("attach activated endpoint (session-driven)", "instance", row.InstanceID,
-		"session", sessionID)
+	d.reportEndpointStatus(conn, row.InstanceID) // online (idle)
+	d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
+		"instance", row.InstanceID, "session", sessionID)
 	d.ensureEndpointView(row)
 	return nil
+}
+
+// activateSessionForAttach (re)activates a session-driven instance's
+// endpoint so a terminal attach has a live PTY to view. It is the shared
+// idle-activation path (activateSessionIdle): prepareSession + EnsureActive
+// — no separate wake machinery, no second process.
+func (d *Daemon) activateSessionForAttach(conn *websocket.Conn, row *InstanceRow) error {
+	return d.activateSessionIdle(conn, row)
 }
 
 // --- attach sessions (§35) ---------------------------------------------------

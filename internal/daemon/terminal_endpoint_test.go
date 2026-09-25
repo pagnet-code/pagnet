@@ -229,8 +229,11 @@ func sawHibernatedReason(t *testing.T, envs []transport.Envelope, instanceID, re
 // notuiDriver is a session-driven test double WITHOUT a native TUI: it
 // proves the attach capability gate refuses an honest "no terminal surface"
 // (never a spawned stand-in process) for a session-driven runtime whose
-// Capabilities lack NativeTUI. Its lifecycle methods are never reached by
-// the test (the refusal happens before any activation).
+// Capabilities lack NativeTUI. Its Activate establishes a PROCESS-LESS
+// endpoint (instruction-model Wave 3: a session-driven launch establishes
+// the session at launch) — no real process is ever spawned, so the
+// supervisor registry stays empty and the attach refusal is what the test
+// exercises.
 type notuiDriver struct{}
 
 func (notuiDriver) Name() domain.RuntimeName { return "test-notui" }
@@ -245,7 +248,18 @@ func (notuiDriver) Capabilities() session.Capabilities {
 }
 
 func (notuiDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
-	return nil, errors.New("notui test double: never activated")
+	// A process-less endpoint: the launch's idle activation succeeds
+	// without a real process (no native session is minted — nothing is
+	// exchanged, so the Materialised invariant keeps the id unpersisted).
+	return &session.RuntimeEndpoint{
+		ID:        "ep-" + sess.InstanceID,
+		Runtime:   sess.Runtime,
+		Ownership: session.OwnershipPagnet,
+		Lease:     session.LeaseClaimed,
+		Healthy:   true,
+		Transport: "none",
+		StartedAt: time.Now(),
+	}, nil
 }
 
 func (notuiDriver) Submit(ctx context.Context, sess *session.RuntimeSession, req session.SubmitRequest, events chan<- session.SessionEvent) error {
@@ -466,6 +480,12 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 		if err := d.state.SetInstanceStatus(instanceID, status, ""); err != nil {
 			t.Fatalf("set status %s: %v", status, err)
 		}
+		// The launch established the session-driven endpoint (instruction-
+		// model Wave 3) — its view exists from the activation (A5); a
+		// refused attach must change NOTHING: no second process, no
+		// attach bookkeeping, no new/changed terminal session.
+		before := d.sup.Stats().ActiveEndpoints
+		viewBefore := d.terminal.get(instanceID)
 		attachEnv, err := transport.NewEnvelope(transport.MsgAttachTerminal, transport.TerminalAttachPayload{
 			CommandID: "cmd-tar-attach-" + status, InstanceID: instanceID,
 		})
@@ -478,14 +498,14 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 		if !strings.Contains(errMsg, "attach refused") {
 			t.Fatalf("status %s: attach ack error = %q, want a refusal", status, errMsg)
 		}
-		if n := d.sup.Stats().ActiveEndpoints; n != 0 {
-			t.Fatalf("status %s: a process was spawned by a refused attach", status)
+		if n := d.sup.Stats().ActiveEndpoints; n != before {
+			t.Fatalf("status %s: a process was spawned by a refused attach (endpoints %d -> %d)", status, before, n)
 		}
 		if d.attached(instanceID) {
 			t.Fatalf("status %s: a refused attach was recorded", status)
 		}
-		if d.terminal.get(instanceID) != nil {
-			t.Fatalf("status %s: a terminal session exists after a refused attach", status)
+		if view := d.terminal.get(instanceID); view != viewBefore {
+			t.Fatalf("status %s: a refused attach changed the terminal session", status)
 		}
 	}
 
@@ -497,6 +517,10 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 		CommandID: "cmd-tar-notui-launch", InstanceID: instanceID,
 		Runtime: "test-notui", Kind: "representative",
 	})
+	// The no-TUI launch established a PROCESS-LESS endpoint (the double
+	// spawns nothing); the loop above's fake-persistent endpoints are the
+	// only live processes. A no-TUI refusal must spawn no NEW one.
+	before := d.sup.Stats().ActiveEndpoints
 	attachEnv, err := transport.NewEnvelope(transport.MsgAttachTerminal, transport.TerminalAttachPayload{
 		CommandID: "cmd-tar-notui-attach", InstanceID: instanceID,
 	})
@@ -509,8 +533,8 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 	if !strings.Contains(errMsg, "no terminal surface") {
 		t.Fatalf("no-TUI attach ack error = %q, want the capability-gate refusal", errMsg)
 	}
-	if n := d.sup.Stats().ActiveEndpoints; n != 0 {
-		t.Fatal("a process was spawned by a no-TUI refusal")
+	if n := d.sup.Stats().ActiveEndpoints; n != before {
+		t.Fatalf("a process was spawned by a no-TUI refusal (endpoints %d -> %d)", before, n)
 	}
 	if d.attached(instanceID) {
 		t.Fatal("a no-TUI refusal was recorded as an attach")

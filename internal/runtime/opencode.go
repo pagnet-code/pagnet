@@ -39,11 +39,17 @@ import (
 // EventSessionLost — never a silent fresh session (§74/§88).
 //
 // User config is never touched and no file is written into the workspace.
-// MCP injection (the PAGNET_MCP_CONFIG the daemon renders per instance) is
-// materialized as an opencode config in the instance's SessionDir (managed
-// state, NEVER the workspace) and pointed at with OPENCODE_CONFIG: opencode
-// has no inline --mcp-config flag — its MCP servers come from config, so the
-// daemon's MCP bridge is written as a local stdio server there.
+// The instance-scoped opencode config (the PAGNET_MCP_CONFIG the daemon
+// renders per instance, plus the standing document) is materialized in the
+// instance's SessionDir (managed state, NEVER the workspace) and pointed at
+// with OPENCODE_CONFIG: opencode has no inline --mcp-config flag — its MCP
+// servers come from config, so the daemon's MCP bridge is written as a
+// local stdio server there. The standing instructions (the pagnet overlay
+// + the operator's standing instruction when set) ride the config's
+// `instructions` surface — opencode's native standing-instruction class
+// (additive context, the same class as AGENTS.md; it does NOT replace the
+// system prompt) — as a file in the SessionDir, never the project's
+// AGENTS.md.
 //
 // Model selection: OpenCode.Model (explicit) or the PAGNET_OPENCODE_MODEL
 // environment; when empty the user's own default model applies. The model
@@ -159,14 +165,18 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	// The prompt is a positional argument (opencode run [message..]).
 	args = append(args, spec.Input)
 
-	// Materialize the MCP bridge as an opencode config in the managed state
+	// Materialize the instance-scoped opencode config in the managed state
 	// dir (NEVER the workspace) and point OPENCODE_CONFIG at it: opencode
-	// has no inline --mcp-config flag, its MCP servers come from config. A
+	// has no inline --mcp-config flag (its MCP servers come from config),
+	// and the standing document rides the config's `instructions` surface
+	// (the native standing-instruction class — additive context, never a
+	// first-message concatenation, never the project's AGENTS.md). A
 	// failure here is visible — the turn does not run silently without its
 	// network tools.
 	extraEnv := append([]string{}, o.Env...)
-	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
-		cfgPath, err := writeOpenCodeMCPConfig(spec.SessionDir, mcpJSON)
+	mcpJSON := pagnetMCPConfig(spec.Env)
+	if mcpJSON != "" || strings.TrimSpace(spec.StandingInstructions) != "" {
+		cfgPath, err := writeOpenCodeConfig(spec.SessionDir, mcpJSON, spec.StandingInstructions)
 		if err != nil {
 			return err
 		}
@@ -373,11 +383,13 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 			args = append(args, "--session", stored)
 		}
 	}
-	// Same MCP bridge injection as a turn: the interactive TUI gets its
-	// network tools from the daemon's MCP bridge via the config.
+	// Same instance-scoped config as a turn: the interactive TUI gets its
+	// network tools from the daemon's MCP bridge and its standing context
+	// from the config's `instructions` surface.
 	extraEnv := append([]string{}, o.Env...)
-	if mcpJSON := pagnetMCPConfig(spec.Env); mcpJSON != "" {
-		cfgPath, err := writeOpenCodeMCPConfig(spec.SessionDir, mcpJSON)
+	mcpJSON := pagnetMCPConfig(spec.Env)
+	if mcpJSON != "" || strings.TrimSpace(spec.StandingInstructions) != "" {
+		cfgPath, err := writeOpenCodeConfig(spec.SessionDir, mcpJSON, spec.StandingInstructions)
 		if err != nil {
 			return nil, err
 		}
@@ -389,43 +401,70 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// writeOpenCodeMCPConfig materializes the daemon-rendered PAGNET_MCP_CONFIG
-// ({"mcpServers": {...}}) as an opencode config in the instance's SessionDir
-// (managed state, never the workspace) and returns the config path. opencode
-// has no inline --mcp-config flag — its MCP servers come from config — so the
-// daemon's MCP bridge is written as a local stdio server
-// ({"mcp": {name: {type:"local", command:[...], environment:{...}}}}) and
-// pointed at with OPENCODE_CONFIG.
-func writeOpenCodeMCPConfig(sessionDir, mcpJSON string) (string, error) {
-	var src struct {
-		MCPServers map[string]struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			Env     map[string]string `json:"env"`
-		} `json:"mcpServers"`
-	}
-	if err := json.Unmarshal([]byte(mcpJSON), &src); err != nil {
-		return "", fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
-	}
-	if len(src.MCPServers) == 0 {
-		return "", fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
-	}
-	mcp := map[string]any{}
-	for name, s := range src.MCPServers {
-		if s.Command == "" {
-			return "", fmt.Errorf("PAGNET_MCP_CONFIG server %q has no command", name)
+// writeOpenCodeConfig materializes the instance-scoped opencode config in
+// the instance's SessionDir (managed state, never the workspace) and
+// returns the config path ("" when there is nothing to materialize). It
+// carries the two pagnet-managed surfaces:
+//
+//   - mcp: the daemon-rendered PAGNET_MCP_CONFIG ({"mcpServers": {...}})
+//     as a local stdio server — opencode has no inline --mcp-config flag,
+//     so its MCP servers come from config.
+//   - instructions: the standing document (the pagnet overlay + the
+//     operator's standing instruction when set) as an instruction file —
+//     opencode's native standing-instruction surface (the same class as
+//     AGENTS.md: additive standing context, NOT a system-prompt
+//     replacement). The file is written into the SessionDir (standing.md)
+//     and referenced by absolute path; the project's AGENTS.md is never
+//     touched.
+//
+// The config is pointed at with OPENCODE_CONFIG — instance-scoped, so the
+// user's own opencode config is untouched.
+func writeOpenCodeConfig(sessionDir, mcpJSON, standingInstructions string) (string, error) {
+	cfg := map[string]any{}
+	if mcpJSON != "" {
+		var src struct {
+			MCPServers map[string]struct {
+				Command string            `json:"command"`
+				Args    []string          `json:"args"`
+				Env     map[string]string `json:"env"`
+			} `json:"mcpServers"`
 		}
-		entry := map[string]any{
-			"type":    "local",
-			"command": append([]string{s.Command}, s.Args...),
-			"enabled": true,
+		if err := json.Unmarshal([]byte(mcpJSON), &src); err != nil {
+			return "", fmt.Errorf("invalid PAGNET_MCP_CONFIG: %w", err)
 		}
-		if len(s.Env) > 0 {
-			entry["environment"] = s.Env
+		if len(src.MCPServers) == 0 {
+			return "", fmt.Errorf("PAGNET_MCP_CONFIG has no mcpServers")
 		}
-		mcp[name] = entry
+		mcp := map[string]any{}
+		for name, s := range src.MCPServers {
+			if s.Command == "" {
+				return "", fmt.Errorf("PAGNET_MCP_CONFIG server %q has no command", name)
+			}
+			entry := map[string]any{
+				"type":    "local",
+				"command": append([]string{s.Command}, s.Args...),
+				"enabled": true,
+			}
+			if len(s.Env) > 0 {
+				entry["environment"] = s.Env
+			}
+			mcp[name] = entry
+		}
+		cfg["mcp"] = mcp
 	}
-	cfg := map[string]any{"mcp": mcp}
+	if strings.TrimSpace(standingInstructions) != "" {
+		if err := os.MkdirAll(sessionDir, 0o700); err != nil { // SEC-415: runtime state
+			return "", err
+		}
+		standingPath := filepath.Join(sessionDir, "standing.md")
+		if err := os.WriteFile(standingPath, []byte(standingInstructions), 0o600); err != nil {
+			return "", err
+		}
+		cfg["instructions"] = []string{standingPath}
+	}
+	if len(cfg) == 0 {
+		return "", nil
+	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err

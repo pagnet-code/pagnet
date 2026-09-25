@@ -198,6 +198,61 @@ func TestQwenPersistent_LaunchAndInputFile(t *testing.T) {
 	}
 }
 
+// TestQwenPersistent_StandingInstructionsArgv verifies the standing-context
+// delivery (instruction-model Wave 3): the session's StandingInstructions
+// (the pagnet overlay + the operator's standing instruction) ride Qwen's
+// NATIVE standing surface — --append-system-prompt at endpoint launch
+// (APPENDS to Qwen's built-in system prompt; --system-prompt is never used,
+// it would replace the vendor prompt) — and are NEVER part of a submitted
+// turn.
+func TestQwenPersistent_StandingInstructionsArgv(t *testing.T) {
+	// Single line: the stub records argv one line per arg.
+	const standing = "PAGNET COORDINATION CONTRACT — You are a persistent member of a pagnet network. AGENT INSTRUCTIONS — You are the code explorer. Do not modify code."
+	q, workspace, _, argsPath, stubEnv := newQwenPersistentFixture(t, false)
+	sess := &session.RuntimeSession{
+		InstanceID:           "inst-1",
+		Runtime:              domain.RuntimeQwenCode,
+		Workspace:            workspace,
+		Env:                  stubEnv,
+		StandingInstructions: standing,
+	}
+	if _, err := q.Activate(context.Background(), sess, make(chan session.SessionEvent, 8)); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	// The launch argv carries the standing document on the native surface.
+	argv := readArgv(t, argsPath)
+	if got := qwenArgAfter(argv, "--append-system-prompt"); got != standing {
+		t.Fatalf("--append-system-prompt = %q, want the standing document (argv %v)", got, argv)
+	}
+	// The vendor prompt is APPENDED to, never replaced.
+	if qwenArgAfter(argv, "--system-prompt") != "" {
+		t.Fatalf("--system-prompt in the argv (it would replace Qwen's built-in prompt): %v", argv)
+	}
+	if err := q.Stop("inst-1"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// No standing context: the flag is absent (the vendor prompt stands
+	// alone).
+	q2, workspace2, _, argsPath2, stubEnv2 := newQwenPersistentFixture(t, false)
+	sess2 := &session.RuntimeSession{
+		InstanceID: "inst-2",
+		Runtime:    domain.RuntimeQwenCode,
+		Workspace:  workspace2,
+		Env:        stubEnv2,
+	}
+	if _, err := q2.Activate(context.Background(), sess2, make(chan session.SessionEvent, 8)); err != nil {
+		t.Fatalf("Activate (no standing): %v", err)
+	}
+	argv2 := readArgv(t, argsPath2)
+	if qwenArgAfter(argv2, "--append-system-prompt") != "" {
+		t.Fatalf("--append-system-prompt in the argv without standing instructions: %v", argv2)
+	}
+	if err := q2.Stop("inst-2"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 // TestQwenPersistent_ResumeArgv verifies the resume launch: a materialised
 // session with a stored (valid UUID) id is relaunched with -r <id>, and the
 // handshake re-bases onto the SAME session (session.resumed).

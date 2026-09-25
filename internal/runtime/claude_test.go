@@ -140,6 +140,41 @@ func TestClaude_ColdTurn(t *testing.T) {
 	}
 }
 
+// TestClaude_StandingDocumentFlag verifies the standing-context delivery
+// (instruction-model Wave 3): the daemon-managed standing document (the
+// pagnet overlay + the operator's standing instruction, folded) is loaded
+// through Claude's native surface — --append-system-prompt-file pointing
+// at the managed file — every turn, and is NEVER part of the turn prompt.
+func TestClaude_StandingDocumentFlag(t *testing.T) {
+	const sid = "cccc1111-2222-3333-4444-555566667777"
+	const standing = "PAGNET COORDINATION CONTRACT\n\nYou are a persistent member of a pagnet network.\n\nAGENT INSTRUCTIONS\n\nYou are the code explorer. Do not modify code.\n"
+	dir := t.TempDir()
+	spec := claudeSpec(dir)
+	// The daemon-managed standing document (managed state, never the
+	// workspace): overlay + the operator's instruction, folded.
+	docPath := filepath.Join(dir, "managed-standing.md")
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, []byte(standing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec.AgentMDPath = docPath
+	out := `{"type":"system","subtype":"init","session_id":"` + sid + `","model":"claude-sonnet-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"OK","session_id":"` + sid + `"}
+`
+	_, argv := runClaudeStub(t, spec, out, nil)
+	// The flag points at the managed document (every turn — the file is
+	// re-applied so the standing context persists across the session).
+	if got := argAfter(argv, "--append-system-prompt-file"); got != docPath {
+		t.Fatalf("--append-system-prompt-file = %q, want the managed standing document %q (argv %v)", got, docPath, argv)
+	}
+	// The managed file carries the folded content (overlay + instruction).
+	if b, err := os.ReadFile(docPath); err != nil || string(b) != standing {
+		t.Fatalf("managed document = %q, %v; want the folded overlay + instruction", b, err)
+	}
+}
+
 func TestClaude_ResumeExactID(t *testing.T) {
 	const sid = "aaaa1111-2222-3333-4444-555566667777"
 	dir := t.TempDir()

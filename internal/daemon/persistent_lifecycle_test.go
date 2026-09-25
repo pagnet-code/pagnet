@@ -220,17 +220,19 @@ func TestDaemon_PersistentLaunchTurnCompletes(t *testing.T) {
 
 	instanceID := domain.NewID().String()
 
-	// Launch: the instance is recorded/accepted (NO process spawned at
-	// launch time — the endpoint launches lazily on the first turn).
+	// Launch: the instance is recorded/accepted, and (instruction-model
+	// Wave 3, plan 3C) the session-driven endpoint is ESTABLISHED at
+	// launch — the runtime/session exists and idles; no turn is submitted
+	// (no mission was sent with the launch).
 	driveLaunch(t, d, server, transport.LaunchAgentPayload{
 		CommandID:  "cmd-launch-1",
 		InstanceID: instanceID,
 		Runtime:    string(domain.RuntimeFakePersistent),
 		Kind:       "representative",
 	})
-	// No endpoint process at launch time (lazy launch).
-	if n := d.sup.Stats().ActiveEndpoints; n != 0 {
-		t.Fatalf("expected 0 active endpoints at launch (lazy), got %d", n)
+	// One endpoint process at launch time (session established, idle).
+	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
+		t.Fatalf("expected 1 active endpoint at launch (session established), got %d", n)
 	}
 	row, ok, err := d.state.GetInstance(instanceID)
 	if err != nil || !ok {
@@ -240,8 +242,8 @@ func TestDaemon_PersistentLaunchTurnCompletes(t *testing.T) {
 		t.Fatalf("status after launch = %q, want idle", row.Status)
 	}
 
-	// Deliver a turn: the endpoint launches (EnsureActive) and the turn
-	// completes through runTurnPersistent.
+	// Deliver a turn: the turn completes through runTurnPersistent on the
+	// already-established endpoint.
 	envs := driveDeliver(t, d, server, transport.NetworkEventPayload{
 		CommandID:  "cmd-deliver-1",
 		InstanceID: instanceID,
@@ -290,6 +292,79 @@ func TestDaemon_PersistentLaunchTurnCompletes(t *testing.T) {
 		t.Fatal("session id not set after the turn")
 	}
 	t.Logf("persistent turn completed; endpoint pid=%v session=%s", d.sup.EndpointPID(instanceID), row.SessionID)
+}
+
+// Instruction-model Wave 3 (plan 3C): a session-driven launch with NO
+// initial task establishes the runtime/session at launch — the endpoint
+// is activated (the session is minted, the instance is idle/ready) and NO
+// first chat message is fabricated (no turn is submitted). The minted
+// (never-exchanged) session id is NOT persisted on the row (the
+// Materialised invariant): a daemon restart would attempt a resume that
+// can only be lost. The first REAL exchange (a delivered turn)
+// materialises the session and persists its id — in the SAME session.
+func TestDaemon_PersistentLaunchEmptyMissionEstablishesSession(t *testing.T) {
+	d := newPersistentTestDaemon(t)
+	client, server := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+
+	instanceID := domain.NewID().String()
+	envs := driveLaunch(t, d, server, transport.LaunchAgentPayload{
+		CommandID:  "cmd-launch-empty",
+		InstanceID: instanceID,
+		Runtime:    string(domain.RuntimeFakePersistent),
+		Kind:       "worker",
+	})
+
+	// The endpoint is established at launch (one live process).
+	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
+		t.Fatalf("expected 1 active endpoint at launch, got %d", n)
+	}
+	// NO turn was submitted (no first chat message is fabricated).
+	if hasEnvelopeType(envs, transport.MsgRuntimeTurnStarted) {
+		t.Fatalf("launch with no mission must not submit a turn: %+v", envs)
+	}
+	// The instance is idle/ready (the launch reports the idle status).
+	if !hasEnvelopeType(envs, transport.MsgAgentStatus) {
+		t.Fatalf("launch did not report the agent status: %+v", envs)
+	}
+	row, ok, err := d.state.GetInstance(instanceID)
+	if err != nil || !ok {
+		t.Fatalf("instance not registered after launch: ok=%v err=%v", ok, err)
+	}
+	if row.Status != "idle" {
+		t.Fatalf("status after launch = %q, want idle", row.Status)
+	}
+	// The minted (never-exchanged) session id is NOT persisted (the
+	// Materialised invariant).
+	if row.SessionID != "" {
+		t.Fatalf("unmaterialised session id persisted on the row: %q", row.SessionID)
+	}
+
+	// The first real exchange materialises the session: the turn completes
+	// on the SAME (already-established) endpoint and the session id is
+	// persisted.
+	driveDeliver(t, d, server, transport.NetworkEventPayload{
+		CommandID:  "cmd-deliver-empty",
+		InstanceID: instanceID,
+		Kind:       "task",
+		Body:       "first real work",
+	})
+	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
+		t.Fatalf("expected the SAME 1 active endpoint after the turn, got %d", n)
+	}
+	row, ok, err = d.state.GetInstance(instanceID)
+	if err != nil || !ok {
+		t.Fatalf("instance missing after the turn: ok=%v err=%v", ok, err)
+	}
+	if row.Status != "idle" {
+		t.Fatalf("status after the turn = %q, want idle", row.Status)
+	}
+	if row.SessionID == "" {
+		t.Fatal("materialised session id not persisted after the first exchange")
+	}
+	t.Logf("empty-mission launch established the session; first exchange materialised it: %s", row.SessionID)
 }
 
 // D2: doStop kills the persistent endpoint process (assert the process is

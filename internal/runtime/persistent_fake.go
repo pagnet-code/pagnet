@@ -324,9 +324,15 @@ type persistEndpoint struct {
 	instanceID string
 	sessionDir string
 	h          *proc.Handle // set once at launch, never nilled (immutable)
-	stdin      io.WriteCloser
-	stdout     io.ReadCloser
-	stderr     *bytes.Buffer
+	// standingInstructions is the standing document the endpoint was
+	// launched with (a copy of the session's StandingInstructions at
+	// activation time — the reference implementation of the persistent
+	// model's native standing surface; the real vendors deliver it through
+	// their own launch args/config).
+	standingInstructions string
+	stdin                io.WriteCloser
+	stdout               io.ReadCloser
+	stderr               *bytes.Buffer
 	// activationCh carries the process's first (activation) event; closed
 	// by the reader after it is delivered.
 	activationCh chan session.SessionEvent
@@ -531,15 +537,16 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		return nil, err
 	}
 	e := &persistEndpoint{
-		f:            f,
-		instanceID:   sess.InstanceID,
-		sessionDir:   sessionDir,
-		h:            h,
-		stdin:        stdin,
-		stdout:       stdout,
-		stderr:       stderr,
-		activationCh: make(chan session.SessionEvent, 1),
-		readerDone:   make(chan struct{}),
+		f:                  f,
+		instanceID:         sess.InstanceID,
+		sessionDir:         sessionDir,
+		h:                  h,
+		standingInstructions: sess.StandingInstructions,
+		stdin:              stdin,
+		stdout:             stdout,
+		stderr:             stderr,
+		activationCh:       make(chan session.SessionEvent, 1),
+		readerDone:         make(chan struct{}),
 	}
 	go e.readLoop()
 	f.mu.Lock()

@@ -871,6 +871,84 @@ func TestManager_EnvChangeRestartsEndpoint(t *testing.T) {
 	}
 }
 
+// Instruction-model Wave 3 (plan 3F): the standing document is a
+// LAUNCH-CONFIGURATION value (like env and model). When it changes while
+// the endpoint is live, the Manager RESTARTS the endpoint so the new
+// standing context takes effect on the native surface — the session is
+// preserved (a materialised session resumes the same native session; the
+// endpoint is a NEW process).
+func TestManager_StandingChangeRestartsEndpoint(t *testing.T) {
+	d := newMemDriver()
+	m := newTestManager(t, d)
+	sess := m.Session("inst-standing", domain.RuntimeFake, "/tmp/ws")
+
+	// Turn 1 with standing A (cold start).
+	m.SetStandingInstructions(sess, "standing A")
+	events := make(chan SessionEvent, 16)
+	done := make(chan *TurnResult, 1)
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t1", Kind: SubmitPrompt, Input: "one"}, events)
+		done <- r
+	}()
+	for range events {
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 1 not completed: %+v", res)
+	}
+	sessionID := sess.NativeID
+	if sessionID == "" {
+		t.Fatal("no native session id after turn 1")
+	}
+	pid1 := d.PID("inst-standing")
+	if pid1 == nil {
+		t.Fatal("no live endpoint after turn 1")
+	}
+	if ep := sess.Endpoint; ep == nil || ep.LaunchStandingInstructions != "standing A" {
+		t.Fatalf("endpoint launch standing not recorded: %+v", sess.Endpoint)
+	}
+
+	// Turn 2 with a CHANGED standing document: the endpoint must be
+	// restarted (new process) and the SAME session resumed.
+	m.SetStandingInstructions(sess, "standing B")
+	events = make(chan SessionEvent, 16)
+	done = make(chan *TurnResult, 1)
+	var resumed bool
+	go func() {
+		r, _ := m.Submit(context.Background(), sess, SubmitRequest{TurnID: "t2", Kind: SubmitPrompt, Input: "two"}, events)
+		done <- r
+	}()
+	for ev := range events {
+		if ev.Type == EventSessionResumed && ev.SessionID == sessionID {
+			resumed = true
+		}
+	}
+	if res := <-done; !res.Completed {
+		t.Fatalf("turn 2 not completed: %+v", res)
+	}
+	if n := d.activatedCount(); n != 2 {
+		t.Fatalf("driver activated = %d, want 2 (the standing change restarts the endpoint)", n)
+	}
+	if n := d.hibernatedCount(); n != 1 {
+		t.Fatalf("driver hibernated = %d, want 1 (the restart stops the old endpoint)", n)
+	}
+	pid2 := d.PID("inst-standing")
+	if pid2 == nil {
+		t.Fatal("no live endpoint after turn 2")
+	}
+	if *pid2 == *pid1 {
+		t.Fatalf("the standing change did not restart the endpoint (pid %d unchanged)", *pid1)
+	}
+	if !resumed {
+		t.Fatal("the restart did not resume the same native session")
+	}
+	if sess.NativeID != sessionID {
+		t.Fatalf("native session id changed across the restart: %q != %q", sess.NativeID, sessionID)
+	}
+	if ep := sess.Endpoint; ep == nil || ep.LaunchStandingInstructions != "standing B" {
+		t.Fatalf("restarted endpoint launch standing = %+v, want the new document", sess.Endpoint)
+	}
+}
+
 // Phase 2 (deliverable 3 / R8 + plan §20): a launch-env change on a
 // session with an UNRESOLVED interaction is DEFERRED — restarting the
 // endpoint would lose the in-flight interaction (never hibernate an

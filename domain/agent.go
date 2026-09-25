@@ -40,16 +40,21 @@ type AgentDefinition struct {
 	// DefaultModel is the model for managed instances ("" = the runtime's
 	// own default). A launch may override it per-launch.
 	DefaultModel string
-	// Mission is the initial instruction for a launched agent (north-star
-	// §15): it becomes the runtime's first turn on a fresh launch. Editing
-	// it changes FUTURE launches — a running/resumed session is untouched.
+	// Mission is the optional INITIAL TASK for a launched agent
+	// (north-star §15): it becomes the runtime's first turn — a real
+	// user/turn message — on a fresh launch. A launch with no mission
+	// establishes the runtime/session and idles; no first chat message is
+	// fabricated. Editing it changes FUTURE launches — a running/resumed
+	// session is untouched.
 	Mission string
-	// Instruction is the standing AGENT.md-style instruction for the agent:
-	// always-on context, unlike Mission (the one-shot first turn). It
-	// reaches the runtime WITHOUT writing into the user's workspace —
-	// claude via --append-system-prompt-file, other runtimes appended to a
-	// fresh session's first turn (exactly how the coordination contract
-	// reaches them). "" = none.
+	// Instruction is the STANDING agent instruction: always-on context
+	// defining who the agent is, unlike Mission (the optional one-shot
+	// first turn). It is standing context, never a chat message: the
+	// daemon folds it into the one managed standing document (with the
+	// pagnet runtime/network overlay) that each runtime delivers through
+	// its native surface — claude --append-system-prompt-file, qwen
+	// --append-system-prompt, opencode's instance config — WITHOUT writing
+	// into the user's workspace. "" = none.
 	Instruction string
 	// TemplateID is the agent template this definition was created from
 	// (nil when created without a template).

@@ -278,6 +278,64 @@ func TestOpenCode_MCPConfigRendering(t *testing.T) {
 	}
 }
 
+// TestOpenCode_StandingInstructionsConfig: the standing document (the
+// pagnet overlay + the operator's standing instruction) rides the
+// instance-scoped opencode config's `instructions` surface (instruction-
+// model Wave 3) — opencode's native standing-instruction class (additive
+// context, the same class as AGENTS.md; NOT a system-prompt replacement).
+// The file is materialized in the SessionDir (managed state, never the
+// workspace) and referenced by absolute path; the project's AGENTS.md is
+// never touched.
+func TestOpenCode_StandingInstructionsConfig(t *testing.T) {
+	const mcp = `{"mcpServers":{"pagnet":{"command":"/usr/local/bin/pagnet","args":["mcp","worker","--socket","/s/pagnetd.sock"],"env":{"PAGNET_INSTANCE_ID":"inst-1","PAGNET_NETWORK_ID":"net-1"}}}}`
+	const standing = "PAGNET COORDINATION CONTRACT\n\nYou are a persistent member of a pagnet network.\n\nAGENT INSTRUCTIONS\n\nYou are the code explorer. Do not modify code.\n"
+	spec := opencodeSpec(t.TempDir())
+	spec.Env = []string{"PAGNET_MCP_CONFIG=" + mcp}
+	spec.StandingInstructions = standing
+	runOpenCodeStub(t, spec, nil)
+
+	cfgPath := filepath.Join(spec.SessionDir, "opencode.json")
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("opencode config not written to the SessionDir: %v", err)
+	}
+	var cfg struct {
+		MCP          map[string]any `json:"mcp"`
+		Instructions []string       `json:"instructions"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("opencode config is not valid JSON: %v: %s", err, b)
+	}
+	if len(cfg.Instructions) != 1 {
+		t.Fatalf("instructions = %v, want exactly the managed standing document: %s", cfg.Instructions, b)
+	}
+	standingPath := cfg.Instructions[0]
+	if !filepath.IsAbs(standingPath) {
+		t.Fatalf("instructions path = %q, want an absolute path", standingPath)
+	}
+	sb, err := os.ReadFile(standingPath)
+	if err != nil {
+		t.Fatalf("standing document not materialized at %s: %v", standingPath, err)
+	}
+	if string(sb) != standing {
+		t.Fatalf("standing document = %q, want the folded overlay + instruction", sb)
+	}
+	// The MCP bridge is still there (the two surfaces coexist).
+	if _, ok := cfg.MCP["pagnet"]; !ok {
+		t.Fatalf("config missing the pagnet MCP server: %s", b)
+	}
+	// The standing document lives in the managed SessionDir, and nothing
+	// is written into the workspace (the project's AGENTS.md stays clean).
+	if dir := filepath.Dir(standingPath); dir != spec.SessionDir {
+		t.Fatalf("standing document dir = %q, want the managed SessionDir %q", dir, spec.SessionDir)
+	}
+	for _, e := range mustReadDir(t, spec.Workspace) {
+		if e.Name() == "AGENTS.md" || e.Name() == "opencode.json" || e.Name() == ".opencode" {
+			t.Fatalf("adapter wrote %s into the workspace (must stay in the SessionDir)", e.Name())
+		}
+	}
+}
+
 // TestOpenCode_InvalidMCPConfigFailsLoudly: a malformed PAGNET_MCP_CONFIG
 // fails the turn before spawning (a turn that cannot inject its network
 // tools does not run silently without them).

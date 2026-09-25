@@ -10,9 +10,10 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// The coordination contract is kind-aware and must reach the model:
-// fresh sessions get it appended to the first turn; resumed sessions
-// already carry it in context.
+// The coordination contract (the pagnet overlay) is kind-aware and is
+// STANDING context: it reaches the model through the runtime's native
+// standing surface (folded into the managed standing document), never
+// appended to a turn's input (instruction-model Wave 3).
 
 func TestContractKindAware(t *testing.T) {
 	d := newTestDaemon(t)
@@ -74,37 +75,102 @@ func TestContractKindAware(t *testing.T) {
 	}
 }
 
-func TestTurnSpecContractInjection(t *testing.T) {
+func TestTurnSpecInputIsExactlyTheInput(t *testing.T) {
 	d := newTestDaemon(t)
 	instID := domain.NewID().String()
 	row := &InstanceRow{
 		InstanceID: instID, AgentName: "coder-1", NetworkID: "net-1",
 		Kind: "worker", Workspace: "/tmp/ws",
+		Instruction: "You are the code explorer. Do not modify code.",
 	}
 
-	// Fresh session: the contract rides with the first turn.
+	// Fresh session: the input is EXACTLY the mission — the standing
+	// context (overlay + instruction) is never appended (instruction-model
+	// Wave 3).
 	fresh := d.turnSpecFor(row, false, "review the auth code", "mission")
-	if !strings.Contains(fresh.Input, "review the auth code") {
-		t.Fatalf("fresh input lost the mission: %q", fresh.Input)
+	if fresh.Input != "review the auth code" {
+		t.Fatalf("fresh input = %q, want EXACTLY the mission (no standing context appended)", fresh.Input)
 	}
-	if !strings.Contains(fresh.Input, "PAGNET COORDINATION CONTRACT") {
-		t.Fatalf("fresh input missing the contract: %q", fresh.Input)
-	}
-	if !strings.HasSuffix(fresh.Input, "  instance: "+instID+"\n") {
-		t.Fatalf("fresh input must end with the contract, got tail: %q", fresh.Input[len(fresh.Input)-80:])
-	}
-	if !strings.Contains(fresh.Input, "network_register_capabilities") {
-		t.Fatalf("fresh input missing capability instruction: %q", fresh.Input)
-	}
-	env := strings.Join(fresh.Env, "\n")
-	if !strings.Contains(env, "PAGNET_COORDINATION_CONTRACT="+filepath.Join(d.StateDir, "contracts", instID+".md")) {
-		t.Fatalf("fresh env missing contract path: %s", env)
+	if strings.Contains(fresh.Input, "PAGNET COORDINATION CONTRACT") ||
+		strings.Contains(fresh.Input, "code explorer") {
+		t.Fatalf("fresh input leaked standing context: %q", fresh.Input)
 	}
 
-	// Resumed session: the context already carries the contract.
+	// Resumed session: the input is exactly the user message.
 	resumed := d.turnSpecFor(row, true, "continue", "delivery")
 	if resumed.Input != "continue" {
-		t.Fatalf("resumed input = %q, want unchanged (no contract appended)", resumed.Input)
+		t.Fatalf("resumed input = %q, want unchanged", resumed.Input)
+	}
+
+	// The standing context is carried on the spec's native surfaces:
+	// the managed standing document (path + text) = overlay + instruction.
+	if fresh.AgentMDPath != filepath.Join(d.StateDir, "agentmd", instID+".md") {
+		t.Fatalf("AgentMDPath = %q, want the managed standing document", fresh.AgentMDPath)
+	}
+	if !strings.Contains(fresh.StandingInstructions, "PAGNET COORDINATION CONTRACT") {
+		t.Fatalf("standing document missing the overlay: %q", fresh.StandingInstructions)
+	}
+	if !strings.Contains(fresh.StandingInstructions, "AGENT INSTRUCTIONS") ||
+		!strings.Contains(fresh.StandingInstructions, "You are the code explorer. Do not modify code.") {
+		t.Fatalf("standing document missing the operator instruction: %q", fresh.StandingInstructions)
+	}
+	// The on-disk reference (the agent can re-read it via tools) is still
+	// pointed at by the env var.
+	env := strings.Join(fresh.Env, "\n")
+	if !strings.Contains(env, "PAGNET_COORDINATION_CONTRACT="+filepath.Join(d.StateDir, "contracts", instID+".md")) {
+		t.Fatalf("env missing contract path: %s", env)
+	}
+}
+
+// The managed standing document is the ONE delivery vehicle: overlay +
+// the operator's instruction when set (separated clearly), in the daemon
+// state dir (never the workspace), 0600.
+func TestStandingDocument(t *testing.T) {
+	d := newTestDaemon(t)
+	instID := domain.NewID().String()
+	row := &InstanceRow{
+		InstanceID: instID, AgentName: "coder-1", NetworkID: "net-1",
+		Kind: "worker",
+	}
+
+	// No operator instruction: the document is the overlay alone.
+	path, text, err := d.writeStandingDocument(row)
+	if err != nil {
+		t.Fatalf("writeStandingDocument: %v", err)
+	}
+	if path != filepath.Join(d.StateDir, "agentmd", instID+".md") {
+		t.Fatalf("path = %q, want the daemon state dir (never the workspace)", path)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat standing document: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if strings.Contains(text, "AGENT INSTRUCTIONS") {
+		t.Fatalf("no instruction set: the document must not carry an instruction section: %q", text)
+	}
+	if !strings.Contains(text, "PAGNET COORDINATION CONTRACT") {
+		t.Fatalf("document missing the overlay: %q", text)
+	}
+	if onDisk, _ := os.ReadFile(path); string(onDisk) != text {
+		t.Fatal("on-disk document differs from the returned text")
+	}
+
+	// With an operator instruction: overlay + clearly separated section.
+	row.Instruction = "You are the code explorer.\nDo not modify code."
+	_, text, err = d.writeStandingDocument(row)
+	if err != nil {
+		t.Fatalf("writeStandingDocument (with instruction): %v", err)
+	}
+	overlayIdx := strings.Index(text, "PAGNET COORDINATION CONTRACT")
+	instrIdx := strings.Index(text, "AGENT INSTRUCTIONS")
+	if overlayIdx != 0 || instrIdx < overlayIdx {
+		t.Fatalf("document must be overlay THEN instruction section: %q", text)
+	}
+	if !strings.Contains(text, "You are the code explorer.\nDo not modify code.") {
+		t.Fatalf("document missing the operator instruction: %q", text)
 	}
 }
 
