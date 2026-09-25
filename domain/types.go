@@ -252,8 +252,13 @@ const (
 	RuntimeClaudeCode RuntimeName = "claude-code"
 	RuntimeQwenCode   RuntimeName = "qwen-code"
 	RuntimeOpenCode   RuntimeName = "opencode"
-	RuntimeGeneric    RuntimeName = "generic"
-	RuntimeFake       RuntimeName = "fake"
+	// RuntimeCodex is the Codex persistent runtime (Wave 4): one long-lived
+	// `codex app-server --stdio` process per instance, driven over
+	// JSON-RPC (thread/start + turn/start). It is session-driven (the
+	// persistent session core), like qwen-code — NOT process-per-turn.
+	RuntimeCodex   RuntimeName = "codex"
+	RuntimeGeneric RuntimeName = "generic"
+	RuntimeFake    RuntimeName = "fake"
 	// RuntimeFakePersistent is the deterministic FAKE PERSISTENT runtime
 	// (runtime-lifecycle refactor, Phase 1): one long-lived endpoint
 	// process that services many logical submits. It is a debug/test-only
@@ -268,6 +273,7 @@ var runtimeAliases = map[string]RuntimeName{
 	"claude":          RuntimeClaudeCode,
 	"qwen":            RuntimeQwenCode,
 	"opencode":        RuntimeOpenCode,
+	"codex":           RuntimeCodex,
 	"generic":         RuntimeGeneric,
 	"fake":            RuntimeFake,
 	"fake-persistent": RuntimeFakePersistent,
