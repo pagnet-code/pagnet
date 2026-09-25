@@ -537,16 +537,16 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		return nil, err
 	}
 	e := &persistEndpoint{
-		f:                  f,
-		instanceID:         sess.InstanceID,
-		sessionDir:         sessionDir,
-		h:                  h,
+		f:                    f,
+		instanceID:           sess.InstanceID,
+		sessionDir:           sessionDir,
+		h:                    h,
 		standingInstructions: sess.StandingInstructions,
-		stdin:              stdin,
-		stdout:             stdout,
-		stderr:             stderr,
-		activationCh:       make(chan session.SessionEvent, 1),
-		readerDone:         make(chan struct{}),
+		stdin:                stdin,
+		stdout:               stdout,
+		stderr:               stderr,
+		activationCh:         make(chan session.SessionEvent, 1),
+		readerDone:           make(chan struct{}),
 	}
 	go e.readLoop()
 	f.mu.Lock()

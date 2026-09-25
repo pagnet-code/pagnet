@@ -325,7 +325,9 @@ func (d *gatedActivationDriver) Submit(ctx context.Context, sess *RuntimeSession
 	return nil
 }
 
-func (d *gatedActivationDriver) Hibernate(ctx context.Context, sess *RuntimeSession) error { return nil }
+func (d *gatedActivationDriver) Hibernate(ctx context.Context, sess *RuntimeSession) error {
+	return nil
+}
 
 func (d *gatedActivationDriver) Stop(instanceID string) error { return nil }
 
