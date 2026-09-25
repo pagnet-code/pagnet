@@ -51,6 +51,14 @@ const (
 	bridgeMaxPending = 128
 )
 
+// errConnInterrupted is the EXACT concise, honest error an agent sees when a
+// relay (or any agent-visible operation) fails because the control-plane
+// connection is down — either there is no live connection yet, or a write to
+// it failed (timeout / broken pipe). The agent gets a stable, actionable
+// message, never a raw `i/o timeout` / deadline stack. Internal logs keep
+// the detail; this is the agent-facing string only.
+const errConnInterrupted = "Pagnet connection to the control plane was interrupted; reconnecting"
+
 // bridgeConnReadTimeoutNs (external audit F-010): read deadline after
 // Accept, in nanoseconds. A connection that connects but never sends its
 // auth (slow-loris) must not hold a goroutine and a socket descriptor
@@ -379,7 +387,9 @@ func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.R
 	conn := d.curConn
 	d.connMu.Unlock()
 	if conn == nil {
-		return nil, "control plane not connected; retry shortly"
+		// No live connection: the control plane is down (or still
+		// reconnecting). Concise, honest, agent-facing message.
+		return nil, errConnInterrupted
 	}
 	env, err := transport.NewEnvelope(transport.MsgAgentRequest, transport.AgentRequestPayload{
 		InstanceID:  instanceID,
@@ -417,7 +427,12 @@ func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.R
 		return nil, err.Error()
 	}
 	if err := d.write(conn, raw); err != nil {
-		return nil, "send to control plane failed: " + err.Error()
+		// The write failed (timeout / broken pipe): the connection is
+		// poisoned and d.write has already invalidated it (the reconnect
+		// loop takes over). The agent gets the concise message, not the raw
+		// i/o timeout; the detail stays in the log.
+		d.Log.Warn("bridge relay write failed", "instance", instanceID, "tool", tool, "err", err)
+		return nil, errConnInterrupted
 	}
 	select {
 	case resp := <-respCh:

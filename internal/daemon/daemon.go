@@ -246,6 +246,14 @@ type Daemon struct {
 	// acks, and bridge relay all share the connection, so writes serialize.
 	writeMu sync.Mutex
 
+	// Transport liveness + bounded write (WAVE 2, daemon network
+	// resilience). Initialized from the ws* constants in newDaemon;
+	// overridable by tests, which shorten them to avoid real-second
+	// deadlines.
+	pingEvery    time.Duration
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
 	// Pending agent.request -> waiting bridge-socket client.
 	pendingMu sync.Mutex
 	pending   map[string]chan transport.AgentResponsePayload
@@ -343,6 +351,37 @@ const (
 	processedRetention = 30 * 24 * time.Hour
 	// maintenanceEvery: how often stale claims are evicted + SQLite pruned.
 	maintenanceEvery = time.Hour
+)
+
+// Transport liveness + bounded write for the single host connection
+// (WAVE 2, daemon network resilience). The daemon keeps ONE websocket to
+// the control plane; these bound how long a stalled or silently-dead
+// connection (NAT drop, host sleep, partition with no RST) can hold the
+// daemon before it is invalidated and the reconnect loop takes over. The
+// values are the PRODUCTION defaults; the Daemon fields (pingEvery /
+// readTimeout / writeTimeout) are initialized from them and are
+// overridable by tests, which shorten them to avoid real-second deadlines.
+const (
+	// wsPingEvery: how often the daemon sends a websocket PING frame on
+	// the host connection (transport liveness). The control plane's
+	// gorilla read pump answers PONG automatically at the protocol level
+	// (no server-side handler, no new control-plane message). This is
+	// TRANSPORT liveness, distinct from the application-level host
+	// heartbeat (control-plane liveness) — the two coexist; neither
+	// replaces the other.
+	wsPingEvery = 30 * time.Second
+	// wsReadTimeout: how long the host read loop may wait for ANY frame
+	// (data or the server's PONG) before declaring the connection dead.
+	// The PONG handler resets the read deadline, so a healthy connection
+	// never hits it. Mirrors the control plane's own hostReadTimeout
+	// (90s) for symmetry; it must exceed wsPingEvery so a healthy
+	// connection's PONGs refresh the deadline before it expires.
+	wsReadTimeout = 90 * time.Second
+	// wsWriteTimeout: bounds a single write to the host connection. A
+	// stalled peer must not stall the command workers / heartbeats / the
+	// bridge relay; a bounded write fails fast, the failed connection is
+	// invalidated, and the reconnect loop takes over.
+	wsWriteTimeout = 10 * time.Second
 )
 
 // instQueue is a single-consumer FIFO for one instance's commands.
@@ -542,6 +581,9 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		helper:          helper,
 		sessions:        sessions,
 		repNetworks:     map[string]string{},
+		pingEvery:       wsPingEvery,
+		readTimeout:     wsReadTimeout,
+		writeTimeout:    wsWriteTimeout,
 	}
 	d.terminal = newTerminalManager(d)
 	// Crash/restart reconciliation (§39): a hard crash may have left a
@@ -910,6 +952,20 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	}()
 	d.Log.Info("connected to control plane")
 
+	// Transport liveness (WAVE 2): the daemon sends a websocket PING every
+	// pingEvery (ticker below); the control plane's gorilla read pump
+	// answers PONG automatically at the protocol level (no server-side
+	// handler, no new control-plane message). Each PONG proves the
+	// connection is alive, so the PONG handler refreshes the read deadline
+	// — a healthy connection never hits the read timeout, while a
+	// silently-dead one (NAT drop, host sleep, partition with no RST) does.
+	// This is TRANSPORT liveness, separate from the application-level host
+	// heartbeat (control-plane liveness); the two coexist.
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(d.readTimeout))
+		return nil
+	})
+
 	// Announce inventory on (re)connect: runtimes + workspaces, and it
 	// triggers the server's reconnect wake re-evaluation (pending commands
 	// are re-sent; we deduplicate locally by CommandID).
@@ -931,6 +987,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	defer heartbeat.Stop()
 	maint := time.NewTicker(maintenanceEvery)
 	defer maint.Stop()
+	// Transport liveness PING ticker (WAVE 2): fires every pingEvery and
+	// sends a websocket PING frame on THIS connection (the control plane
+	// answers PONG at the protocol level). It exits with the connection,
+	// like the heartbeat, so no stale PINGs outlive the conn.
+	ping := time.NewTicker(d.pingEvery)
+	defer ping.Stop()
 	// Exits when THIS connection ends (not only on daemon shutdown) — a
 	// goroutine that only watches ctx would survive every reconnect as a
 	// dormant leak capturing the dead conn.
@@ -947,6 +1009,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				d.sendHeartbeat(conn)
 			case <-maint.C:
 				d.maintainState()
+			case <-ping.C:
+				d.pingConn(conn)
 			}
 		}
 	}()
@@ -964,8 +1028,23 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			return ctx.Err()
 		default:
 		}
+		// Transport liveness (WAVE 2): bound how long the read may wait for
+		// ANY frame (data or the server's PONG). The PONG handler above
+		// refreshes this deadline on every PONG, so a healthy connection
+		// never times out; a silently-dead one (NAT drop, host sleep,
+		// partition with no RST) does, and is closed so the reconnect loop
+		// in Run takes over.
+		_ = conn.SetReadDeadline(time.Now().Add(d.readTimeout))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
+			if isNetTimeout(err) {
+				// No frame (data or PONG) within readTimeout: the connection
+				// is dead. Return so connectAndRun tears down and the
+				// reconnect loop in Run dials a fresh connection.
+				d.Log.Warn("host connection read timeout (no data from control plane); reconnecting",
+					"timeout", d.readTimeout)
+				return err
+			}
 			var closeErr *websocket.CloseError
 			if errors.As(err, &closeErr) && closeErr.Code == transport.CloseCodeSuperseded {
 				// The control plane closed this connection because a
@@ -1127,19 +1206,77 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 // write serializes a raw write to the host connection (single-writer rule).
 // A nil conn (disconnected with no live connection yet) is a clean error —
 // the caller's command stays un-acked and the server re-sends it.
+//
+// A FAILED write (a timeout OR any other error — a broken pipe poisons the
+// connection just as much as a timeout) invalidates the connection: the
+// socket is half-dead / buffered and must not be reused.
+// invalidateCurrentConnection clears curConn (compare-and-clear) and closes
+// the failed conn, which unblocks the read loop so the reconnect loop in Run
+// takes over.
 func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
 	if conn == nil {
 		return errors.New("no host connection")
 	}
 	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
 	// A stalled peer must not stall the command workers (or heartbeats /
 	// the bridge relay): with an unbounded write, one clogged socket can
 	// freeze a per-instance FIFO for minutes — a stop then lands past any
 	// UI/CLI deadline. A bounded write fails fast instead; the failed ack
 	// leaves the command un-acked, so the server's re-send takes over.
-	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return conn.WriteMessage(websocket.TextMessage, raw)
+	_ = conn.SetWriteDeadline(time.Now().Add(d.writeTimeout))
+	err := conn.WriteMessage(websocket.TextMessage, raw)
+	d.writeMu.Unlock()
+	if err != nil {
+		// Released writeMu before invalidating so no writeMu→connMu nesting
+		// (invalidate takes connMu on its own); a concurrent write to the
+		// poisoned conn fails too and invalidates idempotently.
+		d.invalidateCurrentConnection(conn)
+	}
+	return err
+}
+
+// pingConn sends a websocket PING frame on the host connection (transport
+// liveness, WAVE 2). It is serialized with every other write (single-writer
+// rule) and bounded by the same write deadline. A failed PING write means the
+// connection is dead; invalidate it so the reconnect loop takes over.
+func (d *Daemon) pingConn(conn *websocket.Conn) {
+	d.writeMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(d.writeTimeout))
+	err := conn.WriteMessage(websocket.PingMessage, nil)
+	d.writeMu.Unlock()
+	if err != nil {
+		d.invalidateCurrentConnection(conn)
+	}
+}
+
+// invalidateCurrentConnection clears d.curConn IF (and only if) it is still
+// the failed connection (compare-and-clear: a newer connection must never be
+// clobbered), closes the failed connection, and logs ONE line. It is called
+// from the write path when a write to the host connection fails. Closing the
+// conn unblocks the read loop (its pending ReadMessage returns an error), so
+// connectAndRun tears down and the reconnect loop in Run dials a fresh
+// connection. The failed conn is closed even when a newer connection has
+// already taken over — it is poisoned and must not linger (the newer conn is
+// a different object and is unaffected).
+func (d *Daemon) invalidateCurrentConnection(failed *websocket.Conn) {
+	d.connMu.Lock()
+	isCurrent := d.curConn == failed
+	if isCurrent {
+		d.curConn = nil
+	}
+	d.connMu.Unlock()
+	_ = failed.Close()
+	if isCurrent {
+		d.Log.Warn("host connection lost on write; invalidating and reconnecting",
+			"server", d.ServerURL)
+	}
+}
+
+// isNetTimeout reports whether err is a network timeout (a read or write
+// deadline expiring), as opposed to a close / EOF / protocol error.
+func isNetTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // sendAck reports the command outcome. The error is the WRITE error: a
