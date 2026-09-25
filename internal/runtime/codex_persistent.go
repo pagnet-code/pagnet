@@ -246,6 +246,22 @@ func (c *CodexPersistent) Submit(ctx context.Context, sess *session.RuntimeSessi
 			// answer.
 			return nil
 		}
+		// Route the resolution events onto the in-flight turn's stream
+		// BEFORE sending the JSON-RPC response. At this moment the app-
+		// server is still BLOCKED waiting for the resolution, so the turn
+		// is provably in flight (currentTurnEvents is non-nil) and the
+		// interaction.resolved event lands on the turn stream in the
+		// correct order (the resolution, then the terminal events the app-
+		// server emits after processing it). Routing AFTER respondRPC
+		// would let a fast app-server complete the turn first, settle
+		// currentTurnEvents to nil, and silently drop the resolved event.
+		// When the process is already dead, cleanupOnExit has nilled
+		// currentTurnEvents (that is what closes stdin and makes the write
+		// below fail), so routeEvent drops the event — no resolved event is
+		// ever routed for a dead runtime.
+		for _, ev := range evs {
+			e.routeEvent(ev)
+		}
 		id, err := strconv.ParseInt(req.InteractionID, 10, 64)
 		var werr error
 		if err == nil {
@@ -265,9 +281,6 @@ func (c *CodexPersistent) Submit(ctx context.Context, sess *session.RuntimeSessi
 			// closed — the process is dead. Report it as endpoint-gone so
 			// the Manager re-activates instead of failing the instance.
 			return session.ErrEndpointGone
-		}
-		for _, ev := range evs {
-			e.routeEvent(ev)
 		}
 		return nil
 	}
@@ -428,6 +441,17 @@ type codexEndpoint struct {
 	// QwenPersistent / PersistentFake: every persistent driver carries it.
 	turnEndpointGone bool
 
+	// turnSenders counts routeEvent calls that have captured the current
+	// turn's channel and have not yet completed their send. The turn's
+	// settlement (the three paths that close turnDone) waits for this to
+	// drain before closing turnDone, so the Manager's close of the turn
+	// channel — which happens only after the prompt's Submit returns,
+	// which happens only after turnDone is closed — can never race an
+	// in-flight send on that channel. turnCond is signaled when the count
+	// reaches zero.
+	turnSenders int
+	turnCond    *sync.Cond
+
 	stdinMu sync.Mutex
 }
 
@@ -474,10 +498,16 @@ func (e *codexEndpoint) endpointInfo(sess *session.RuntimeSession) *session.Runt
 
 // clearTurn resets the in-flight turn state (on a submit failure or ctx
 // cancel). It does not close the events channel (the Manager owns that).
+// Before closing turnDone it waits for any in-flight routeEvent send on the
+// turn's channel to drain, so the Manager's close of that channel (after the
+// prompt's Submit returns) can never race a send.
 func (e *codexEndpoint) clearTurn() {
 	e.mu.Lock()
 	e.currentTurnEvents = nil
 	e.currentTurnID = ""
+	for e.turnSenders > 0 {
+		e.turnCond.Wait()
+	}
 	if e.turnDone != nil {
 		close(e.turnDone)
 		e.turnDone = nil
@@ -584,6 +614,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		readerDone:   make(chan struct{}),
 		pending:      map[int64]*codexRPCWaiter{},
 	}
+	e.turnCond = sync.NewCond(&e.mu)
 	go e.readLoop()
 	c.mu.Lock()
 	c.endpoints[sess.InstanceID] = e
@@ -767,33 +798,65 @@ func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
 	}
 	ch := e.currentTurnEvents
 	turnID := e.currentTurnID
-	e.mu.Unlock()
-	if ch == nil {
-		return
-	}
 	// A turn NOT initiated by the current machine submit (an external
 	// turn) carries a different (or empty) turn id. Its events are NOT
 	// part of this submit's stream — forwarding them would cross the
 	// streams (a double turn.completed for one submit, an attribution
 	// anomaly). The machine plane only ever sees events for the turn it
 	// submitted.
-	if ev.TurnID != "" && ev.TurnID != turnID {
+	willSend := ch != nil && (ev.TurnID == "" || ev.TurnID == turnID)
+	// Claim an in-flight-send slot BEFORE sending (under the same lock
+	// that read ch), so the turn's settlement — which waits for this
+	// count to drain before closing turnDone — cannot miss this send.
+	// Without it, a send that captured ch just before the turn settled
+	// would race the Manager's close of the turn channel.
+	if willSend {
+		e.turnSenders++
+	}
+	e.mu.Unlock()
+	if !willSend {
 		return
 	}
 	ch <- ev
+	e.mu.Lock()
+	e.turnSenders--
+	if e.turnSenders == 0 {
+		e.turnCond.Broadcast()
+	}
+	e.mu.Unlock()
 	if isTerminalSessionEvent(ev.Type) {
-		e.mu.Lock()
-		if e.currentTurnEvents == ch {
-			e.currentTurnEvents = nil
-			e.currentTurnID = ""
-			if e.turnDone != nil {
-				close(e.turnDone)
-				e.turnDone = nil
-			}
-		}
-		e.mu.Unlock()
+		e.settleTurn(ch)
 		e.state.clearMachineTurn()
 	}
+}
+
+// settleTurn settles the turn whose channel is ch (a no-op when ch is no
+// longer the current turn's channel — the turn was replaced or already
+// settled). It waits for every in-flight routeEvent send on ch to drain
+// BEFORE closing turnDone. Because the Manager closes the turn channel
+// only after the prompt's Submit returns, and the prompt's Submit returns
+// only after turnDone is closed, this ordering guarantees a send on the
+// turn channel can never race the Manager's close of it. Callers must NOT
+// hold e.mu.
+func (e *codexEndpoint) settleTurn(ch chan<- session.SessionEvent) {
+	e.mu.Lock()
+	if e.currentTurnEvents != ch {
+		e.mu.Unlock()
+		return
+	}
+	// Mark the turn settled: no NEW routeEvent will capture this channel
+	// (it reads currentTurnEvents, now nil). Only senders that captured
+	// ch before this point remain in flight.
+	e.currentTurnEvents = nil
+	e.currentTurnID = ""
+	for e.turnSenders > 0 {
+		e.turnCond.Wait()
+	}
+	if e.turnDone != nil {
+		close(e.turnDone)
+		e.turnDone = nil
+	}
+	e.mu.Unlock()
 }
 
 // cleanupOnExit runs when the process exits: it reaps the process
@@ -836,6 +899,12 @@ func (e *codexEndpoint) cleanupOnExit() {
 		// flag left false) must not be reclassified as endpoint-gone
 		// after the fact.
 		e.turnEndpointGone = true
+	}
+	// Wait for any in-flight routeEvent send on the turn's channel to
+	// drain before closing turnDone, so the Manager's close of that
+	// channel (after the prompt's Submit returns) can never race a send.
+	for e.turnSenders > 0 {
+		e.turnCond.Wait()
 	}
 	if e.turnDone != nil {
 		close(e.turnDone)
