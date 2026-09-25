@@ -99,11 +99,12 @@ uses it thereafter.
 ## Coding agents
 
 Coding agents are a first-class use case, not the definition. Pagnet runs agent
-runtimes (Claude Code, Qwen Code, OpenCode, and other CLI agents) on your
-machines — hibernating when idle, waking on demand — visible, discoverable, and
+runtimes (Qwen Code, Claude Code, OpenCode, and Codex) on your machines —
+hibernating when idle, waking on demand — visible, discoverable, and
 coordinated through one control plane. Launch one with
 `pagnet run . --runtime <runtime>` inside a Git repository (or from the web
-console), and attach a live terminal with `pagnet attach <agent>`.
+console); where the runtime has a native TUI (Claude Code, Qwen Code, and
+OpenCode) you can attach a live terminal with `pagnet attach <agent>`.
 
 ## Self-hosting
 
