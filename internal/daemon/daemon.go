@@ -1448,22 +1448,22 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
 			return
 		}
-		// The attach is observational for a WORKING instance (it connects the
-		// human to the endpoint's own PTY; it does not drive a turn). It must
-		// not be queued behind a long turn in the per-instance FIFO — the user
-		// opening the terminal while the agent works would otherwise wait for
-		// the turn to finish before seeing anything (the "blue rectangle, then
-		// black" symptom). When the instance is working, run the attach
-		// concurrently with the turn; otherwise (no turn in flight) the
-		// per-instance FIFO is free and the normal path applies.
+		// The attach is observational (it connects the human to the
+		// endpoint's own PTY; it does not drive a turn), so it ALWAYS runs
+		// concurrently with the instance's turn — never queued behind it in
+		// the per-instance FIFO. The user opening the terminal while the
+		// agent works, or while a launch-time activation is still settling,
+		// must not wait for the turn/activation to finish before seeing
+		// anything (the "blue rectangle, then black" symptom); a slow or
+		// stuck FIFO job must not be able to starve the terminal. The
+		// Manager's per-instance activation lock keeps a concurrent attach
+		// safe: it joins an in-flight activation (single-flight) instead of
+		// racing a second endpoint, and doAttach defers (ErrDeferred) when a
+		// turn is genuinely in flight with the endpoint briefly down.
 		job := func() {
 			d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
 		}
-		if row, ok, _ := d.state.GetInstance(p.InstanceID); ok && row.Status == "working" {
-			d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, job)
-		} else {
-			d.enqueueCommand(conn, p.InstanceID, p.CommandID, job)
-		}
+		d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, job)
 
 	case transport.MsgDetachTerminal:
 		var p transport.DetachTerminalPayload
@@ -2310,13 +2310,25 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	// a terminal attach works immediately) and NO first chat message is
 	// fabricated. Process-per-turn runtimes keep their model: no process
 	// until the first turn.
+	//
+	// The activation runs OFF the per-instance FIFO. It is a slow operation
+	// (process launch + handshake) and a slow or wedged activation must not
+	// occupy the instance's command queue: it would starve every later
+	// command for the instance — the terminal attach first (the "blue
+	// rectangle, then black" symptom) and message delivery with it. The
+	// instance is already registered idle and the launch acks now; the
+	// activation settles on its own (a concurrent attach/turn joins it via
+	// the Manager's per-instance activation lock, single-flight) and if it
+	// fails the next attach/turn re-attempts through the idle re-activation
+	// path. d.send routes on the live connection, so the captured conn going
+	// stale mid-activation is harmless.
 	if sessionDriven {
 		row, ok, err := d.state.GetInstance(p.InstanceID)
 		if err != nil {
 			return err
 		}
 		if ok {
-			return d.activateSessionIdle(conn, row)
+			go d.activateSessionIdle(conn, row)
 		}
 	}
 	return nil
@@ -3653,11 +3665,20 @@ drain:
 			sessionID = id
 		}
 	}
-	_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
-	_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
-		"instanceId": row.InstanceID, "status": "idle",
-	})
-	d.reportEndpointStatus(conn, row.InstanceID) // online (idle)
+	// Settle the instance to idle — but ONLY if no turn has started while the
+	// activation was settling. This path now runs off the per-instance FIFO
+	// (the launch-time activation is backgrounded, and a concurrent attach
+	// joins it), so a deliver may have begun a turn in the meantime; the
+	// turn owns the status then and an unconditional "idle" write would
+	// clobber its "working". The endpoint view is ensured regardless
+	// (observational + idempotent).
+	if !d.turnInFlight(row.InstanceID) {
+		_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
+		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+			"instanceId": row.InstanceID, "status": "idle",
+		})
+	}
+	d.reportEndpointStatus(conn, row.InstanceID) // online (idle or working)
 	d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
 		"instance", row.InstanceID, "session", sessionID)
 	d.ensureEndpointView(row)

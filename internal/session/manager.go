@@ -181,7 +181,20 @@ func (m *Manager) GetSession(instanceID string) *RuntimeSession {
 // is called at turn start so a daemon restart (fresh in-memory Manager) can
 // resume the session the control plane stored. It is a no-op when the
 // session is already live (the in-memory state is authoritative then).
+//
+// The native id is owned by the per-instance ACTIVATION lock, not m.mu: the
+// driver reads/writes sess.NativeID inside Driver.Activate, which EnsureActive
+// runs while holding the activation lock (m.mu is released across the driver
+// call). A write here under m.mu alone would race a concurrent in-flight
+// activation's read of the same field (the launch-time activation now runs
+// off the per-instance FIFO, so a turn's restore and the activation are
+// genuinely concurrent). Taking the activation lock serializes this write
+// with the driver's access; it also makes a turn's restore wait for an
+// in-flight activation to settle, which is the correct ordering.
 func (m *Manager) RestoreNativeState(instanceID, nativeID string) {
+	lock := m.activationLock(instanceID)
+	lock.Lock()
+	defer lock.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.sessions[instanceID]

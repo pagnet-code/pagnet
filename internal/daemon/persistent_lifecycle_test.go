@@ -14,7 +14,9 @@ package daemon
 // turn through the supervisor's ClassEndpoint path — not a test double.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -22,7 +24,9 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -112,6 +116,23 @@ func driveLaunch(t *testing.T, d *Daemon, server *websocket.Conn, p transport.La
 		t.Fatalf("launch failed: %s", errMsg)
 	}
 	return envs
+}
+
+// waitForEndpointLive polls until the instance's session-driven endpoint is
+// live. The launch-time activation runs off the per-instance FIFO (the
+// launch acks before the activation settles), so a test that asserts
+// endpoint state after driveLaunch must wait for the background activation
+// to complete first.
+func waitForEndpointLive(t *testing.T, d *Daemon, instanceID string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if pid := d.sup.EndpointPID(instanceID); pid != nil && proc.ProcessAlive(*pid) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("endpoint for %s never became live", instanceID)
 }
 
 // driveDeliver drives a deliver command through the daemon's real command
@@ -316,6 +337,9 @@ func TestDaemon_PersistentLaunchEmptyMissionEstablishesSession(t *testing.T) {
 		Runtime:    string(domain.RuntimeFakePersistent),
 		Kind:       "worker",
 	})
+	// The launch acks before the background activation settles; wait for the
+	// endpoint to come up before asserting endpoint state.
+	waitForEndpointLive(t, d, instanceID)
 
 	// The endpoint is established at launch (one live process).
 	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
@@ -325,9 +349,10 @@ func TestDaemon_PersistentLaunchEmptyMissionEstablishesSession(t *testing.T) {
 	if hasEnvelopeType(envs, transport.MsgRuntimeTurnStarted) {
 		t.Fatalf("launch with no mission must not submit a turn: %+v", envs)
 	}
-	// The instance is idle/ready (the launch reports the idle status).
-	if !hasEnvelopeType(envs, transport.MsgAgentStatus) {
-		t.Fatalf("launch did not report the agent status: %+v", envs)
+	// The instance is reported online/ready (the launch reports the endpoint
+	// status; the idle agent status follows from the background activation).
+	if !hasEnvelopeType(envs, transport.MsgEndpointStatus) {
+		t.Fatalf("launch did not report the endpoint status: %+v", envs)
 	}
 	row, ok, err := d.state.GetInstance(instanceID)
 	if err != nil || !ok {
@@ -470,4 +495,103 @@ func TestDaemon_PersistentRestartStartsFreshSession(t *testing.T) {
 		t.Fatalf("restart did not start a fresh session: both turns used %q", sessionID1)
 	}
 	t.Logf("restart started a fresh session: %s -> %s", sessionID1, sessionID2)
+}
+
+// gatedDriver is a session-driven test double whose Activate blocks on a
+// gate channel until released: it models a slow or wedged activation (the
+// endpoint is "launched" but the handshake never settles). It exists to
+// prove the launch does NOT block the per-instance FIFO on the activation.
+type gatedDriver struct {
+	gate     chan struct{} // closed to let the activation settle
+	launched chan struct{} // closed when Activate is entered
+}
+
+func (g gatedDriver) Name() domain.RuntimeName { return "test-gated" }
+
+func (g gatedDriver) Capabilities() session.Capabilities {
+	return session.Capabilities{
+		PersistentEndpoint: true,
+		StructuredEvents:   true,
+		NativeSubmit:       true,
+	}
+}
+
+func (g gatedDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
+	close(g.launched)
+	select {
+	case <-g.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &session.RuntimeEndpoint{
+		ID:        "ep-" + sess.InstanceID,
+		Runtime:   sess.Runtime,
+		Ownership: session.OwnershipPagnet,
+		Lease:     session.LeaseClaimed,
+		Healthy:   true,
+		Transport: "none",
+		StartedAt: time.Now(),
+	}, nil
+}
+
+func (g gatedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, req session.SubmitRequest, events chan<- session.SessionEvent) error {
+	return errors.New("gated test double: never submitted")
+}
+
+func (g gatedDriver) Hibernate(ctx context.Context, sess *session.RuntimeSession) error { return nil }
+func (g gatedDriver) Stop(instanceID string) error                                      { return nil }
+func (g gatedDriver) PID(instanceID string) *int                                        { return nil }
+func (g gatedDriver) Live(instanceID string) bool                                       { return false }
+
+// TestDaemon_LaunchAcksBeforeActivationSettles is the regression test for
+// the "blue rectangle, then black" terminal starvation. The launch-time
+// activation must NOT occupy the per-instance FIFO: a slow or wedged
+// activation must not block the launch ack, because a blocked FIFO starves
+// every later command for the instance — the terminal attach first, then
+// message delivery. The launch registers the instance and acks; the
+// activation settles in the background (a concurrent attach/turn joins it
+// via the Manager's per-instance activation lock, and a failed activation
+// is re-attempted by the next attach/turn).
+func TestDaemon_LaunchAcksBeforeActivationSettles(t *testing.T) {
+	d := newTestDaemon(t)
+	client, server := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+
+	gate := make(chan struct{})
+	launched := make(chan struct{})
+	d.sessions.RegisterDriver(gatedDriver{gate: gate, launched: launched})
+	t.Cleanup(func() { close(gate) }) // never leak a blocked activation
+
+	instanceID := domain.NewID().String()
+	env, err := transport.NewEnvelope(transport.MsgLaunchAgent, transport.LaunchAgentPayload{
+		CommandID: "cmd-gated-launch", InstanceID: instanceID,
+		Runtime: "test-gated", Kind: "representative",
+	})
+	if err != nil {
+		t.Fatalf("build launch envelope: %v", err)
+	}
+	d.handleCommand(nil, env)
+
+	// The background activation started (it entered Activate).
+	select {
+	case <-launched:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the launch-time activation never started")
+	}
+
+	// The launch acks WITHOUT waiting for the (gated) activation to settle.
+	_, ack := readUntilAck(t, server, "cmd-gated-launch")
+	if errMsg, _ := ack["error"].(string); errMsg != "" {
+		t.Fatalf("launch failed: %s", errMsg)
+	}
+	// The activation is still in progress (gated) when the ack arrived: the
+	// launch did not block on it (before the fix it did, and the FIFO — and
+	// the terminal attach behind it — was starved).
+	select {
+	case <-gate:
+		t.Fatal("the activation settled before the launch acked (the launch blocked on it)")
+	default:
+	}
 }
