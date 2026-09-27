@@ -113,9 +113,12 @@ func (g *gatedPTYDriver) Submit(ctx context.Context, sess *session.RuntimeSessio
 	return errors.New("gated pty test double: never submitted")
 }
 
-func (g *gatedPTYDriver) Hibernate(ctx context.Context, sess *session.RuntimeSession) error { return nil }
-func (g *gatedPTYDriver) Stop(instanceID string) error                                      { return nil }
-func (g *gatedPTYDriver) PID(instanceID string) *int                                        { return nil }
+func (g *gatedPTYDriver) Hibernate(ctx context.Context, sess *session.RuntimeSession) error {
+	return nil
+}
+func (g *gatedPTYDriver) Stop(instanceID string) error { return nil }
+func (g *gatedPTYDriver) PID(instanceID string) *int   { return nil }
+
 // Live reports the endpoint as alive once the activation has settled (the
 // Manager probes it after the state is Live; returning true keeps the
 // Manager from re-activating — which would create a second PTY pair).
