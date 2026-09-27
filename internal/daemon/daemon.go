@@ -2543,7 +2543,15 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		// Locked read through the Manager (State is mutated under the
 		// Manager's mutex; a direct sess.State read here would race it).
 		if st, ok := d.sessions.State(instanceID); ok && st.Live() {
-			d.Log.Info("instance already live; wake is a no-op", "instance", instanceID)
+			// The endpoint is live: the session needs no wake. But the
+			// VIEW may be gone (orphaned by a concurrent re-activation, or
+			// torn down by a master EOF) — a wake that returned without
+			// re-binding it would leave the terminal black ("no live PTY")
+			// on a live instance forever. ensureEndpointView is idempotent
+			// (it reconciles to an existing live view, or creates one on
+			// the current master).
+			d.ensureEndpointView(row)
+			d.Log.Info("instance already live; wake is a no-op (view ensured)", "instance", instanceID)
 			return nil
 		}
 	}
@@ -3490,6 +3498,27 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 			return err
 		}
 	case "idle":
+		if d.sessionActivating(row.InstanceID) {
+			// The session core is ACTIVATING the endpoint right now
+			// (StateActivating) — the launch-time background activation
+			// (doLaunch runs it OFF the per-instance FIFO) or a concurrent
+			// turn's EnsureActive. The PTY master may ALREADY be registered
+			// (the driver registers it at launch, before the handshake
+			// settles), so the PTYMaster check below would pass and a view
+			// would be created on an endpoint that is not yet settled: when
+			// the activation settles it can STOP that endpoint (a
+			// staleLaunch restart, or an activation failure), orphaning the
+			// view (master EOF) and leaving the terminal black — and a
+			// detach landing in the same window hibernates the instance
+			// with the view still bound to the dead master. Do not attach
+			// to an in-flight endpoint: the attach stays queued (the
+			// dispatcher re-sends it) and lands observationally on the
+			// endpoint the activation brings back — the SAME defer the
+			// working/waking/starting branch uses.
+			d.Log.Info("attach deferred; endpoint activation in flight",
+				"instance", row.InstanceID, "status", row.Status)
+			return ErrDeferred
+		}
 		if d.sessions.PTYMaster(row.InstanceID) == nil {
 			// Idle on paper but the endpoint is not live (a daemon restart
 			// leaves the persisted status behind; the process cannot
@@ -3705,16 +3734,26 @@ func (d *Daemon) addAttach(instanceID, sessionID string) {
 }
 
 // removeAttach drops an attach session and reports whether it was the
-// last one for the instance.
+// last one for the instance. It returns false when NO attach was recorded
+// for the session — a spurious or late detach for an attach that was
+// deferred (ErrDeferred) or refused — and the caller must NOT treat that
+// as "the last attach closed": hibernating on it would stop an endpoint
+// no human was attached to, orphaning its view and racing the in-flight
+// activation's settle (the 2026-09-27 black-terminal incident: a client
+// that gave up on a slow attach sent a detach that hibernated the instance
+// at the exact moment the launch-time activation settled).
 func (d *Daemon) removeAttach(instanceID, sessionID string) bool {
 	d.attachMu.Lock()
 	defer d.attachMu.Unlock()
 	sess := d.attaches[instanceID]
+	if _, ok := sess[sessionID]; !ok {
+		return false
+	}
 	delete(sess, sessionID)
 	if len(sess) == 0 {
 		delete(d.attaches, instanceID)
 	}
-	return len(sess) == 0
+	return true
 }
 
 func (d *Daemon) attached(instanceID string) bool {
@@ -3788,11 +3827,16 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayload) error {
 	last := d.removeAttach(p.InstanceID, p.SessionID)
 	if !last {
-		// Other clients still hold this instance's shared PTY: restore one
-		// of their geometries — the shared size would otherwise stick
-		// with the client that just left. hasSession (not active): a
-		// session-driven instance's endpoint VIEW also has a shared size
-		// to restore for its surviving clients (Phase 3).
+		// Either other clients still hold this instance's shared PTY, or
+		// NO attach was recorded for this session (a spurious/late detach
+		// for an attach that was deferred or refused) — in both cases the
+		// instance must NOT be hibernated: the first keeps a human
+		// attached, the second means no human was attached at all.
+		// Restore one of the surviving clients' geometries — the shared
+		// size would otherwise stick with the client that just left.
+		// hasSession (not active): a session-driven instance's endpoint
+		// VIEW also has a shared size to restore for its surviving clients
+		// (Phase 3).
 		if d.terminal.hasSession(p.InstanceID) {
 			d.terminal.reapplySize(p.InstanceID, p.SessionID)
 		}
