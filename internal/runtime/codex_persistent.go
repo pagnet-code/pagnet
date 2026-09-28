@@ -49,6 +49,13 @@ package runtime
 //     Manager must not re-submit). A death before acceptance is
 //     ErrEndpointGone (the Manager re-activates and retries once). A
 //     dead process never wedges the instance.
+//   - Lifecycle (B7): the reader is the single Wait owner. Activation
+//     and stop paths only REQUEST bounded termination (the supervisor's
+//     TERM → grace → KILL) — they never reap. A failed/timeout handshake
+//     is a bounded launch error, not a hang: when the process cannot be
+//     killed, the supervisor keeps tracking it and the activation
+//     returns its failure (the Manager's activation lock is always
+//     released).
 //   - No terminal attach: Codex's app-server has no attachable native
 //     TUI (the machine plane IS the stdio transport). NativeTUI /
 //     SecondClientTerminalAttach are FALSE — the console does not offer
@@ -203,10 +210,12 @@ func (c *CodexPersistent) Activate(ctx context.Context, sess *session.RuntimeSes
 	}
 	if actEv.Type == session.EventSessionLost {
 		// The resume found no usable thread (or re-based onto a
-		// different one). The endpoint that was just launched for the
-		// attempt must be fully stopped AND reaped so a lost resume never
-		// leaves a stale endpoint in the supervisor's registry.
-		c.stopEndpoint(sess.InstanceID)
+		// different one). Retire the endpoint that was just launched for
+		// the attempt: detach it from the registry and request bounded
+		// termination. The reader owns the reap — a lost resume never
+		// leaves a stale endpoint in the registry, and this path never
+		// blocks on the process's exit (B7: the request-vs-reap split).
+		c.retireEndpoint(e)
 		return nil, session.ErrSessionLost
 	}
 	// The driver sets sess.NativeID as the native exchange happens (the
@@ -467,6 +476,22 @@ func (e *codexEndpoint) live() bool {
 	}
 }
 
+// processGone reports whether the endpoint process has exited (it is a
+// zombie — exited, not yet reaped — or it no longer exists). The readLoop
+// consults it before the owner Wait: a process that closed its stdout
+// without exiting must be terminated FIRST, or the owner Wait in
+// cleanupOnExit would block on a process that was never stopped (B7 PATH B).
+func (e *codexEndpoint) processGone() bool {
+	if e.h == nil {
+		return true
+	}
+	pid := e.h.PID()
+	if pid == 0 {
+		return false // still starting
+	}
+	return proc.ProcessIsZombie(pid) || !proc.ProcessAlive(pid)
+}
+
 func (e *codexEndpoint) pid() *int {
 	if e.h == nil {
 		return nil
@@ -628,10 +653,15 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	defer cancel()
 	actEv, herr := e.handshake(hsCtx, sess)
 	if herr != nil {
-		// The handshake failed: stop the endpoint (TERM → grace → KILL →
-		// reap → drop) so a failed activation never leaves a stale
-		// endpoint in the supervisor's registry.
-		c.stopEndpoint(sess.InstanceID)
+		// The handshake failed: retire THIS endpoint (pointer-specific
+		// detach + bounded termination request). A failed activation must
+		// never leave a stale endpoint in the registry — but this path
+		// must NOT reap: the reader is the single Wait owner, and blocking
+		// here on the process's exit would hold the Manager's activation
+		// lock forever on an unkillable process (B7). When the process
+		// cannot be killed, the supervisor keeps tracking it and the
+		// activation returns its bounded failure.
+		c.retireEndpoint(e)
 		return nil, actEv, herr
 	}
 	return e, actEv, nil
@@ -716,9 +746,11 @@ func (e *codexEndpoint) handshake(ctx context.Context, sess *session.RuntimeSess
 // readLoop reads the endpoint's stdout (one JSON-RPC message per line)
 // and dispatches: responses → their waiters (by id), server requests →
 // the state machine (interactions), notifications → the state machine
-// (turn events). On EOF (process gone) it reaps the process (this
-// goroutine is the single Wait owner — it read all of stdout) and
-// signals any waiting turn.
+// (turn events). On EOF it reaps the process (this goroutine is the
+// single Wait owner — it read all of stdout) and signals any waiting
+// turn; when the process is still alive (it closed its stdout without
+// exiting), it requests bounded termination FIRST so the owner Wait
+// never blocks on a process that was never stopped (B7 PATH B).
 func (e *codexEndpoint) readLoop() {
 	defer close(e.readerDone)
 	scanner := bufio.NewScanner(e.stdout)
@@ -737,7 +769,19 @@ func (e *codexEndpoint) readLoop() {
 		}
 		e.dispatchMessage(&msg)
 	}
-	// EOF: the process exited. Clean up (reap, drop, signal the turn).
+	// EOF: the process exited (or closed its stdout). If the process is
+	// still alive, request bounded termination FIRST (TERM → grace → KILL
+	// through the supervisor). The owner Wait in cleanupOnExit must never
+	// block on a process that was never stopped: without this, the Wait on
+	// a live process hangs forever (the B7 lifecycle defect). The Wait is
+	// allowed to wait in THIS background reader goroutine — it holds no
+	// Manager activation lock, daemon FIFO, or attach request. If the
+	// process cannot be killed, the supervisor keeps tracking it and this
+	// Wait waits in the background; the lifecycle has already settled.
+	if !e.processGone() {
+		e.f.requestEndpointStop(e)
+	}
+	// Clean up (reap, drop, signal the turn).
 	e.cleanupOnExit()
 }
 
@@ -859,10 +903,18 @@ func (e *codexEndpoint) settleTurn(ch chan<- session.SessionEvent) {
 	e.mu.Unlock()
 }
 
-// cleanupOnExit runs when the process exits: it reaps the process
-// (single Wait owner — this goroutine read all of stdout), drops the
-// endpoint record, fails any pending requests, and signals any waiting
-// turn. The turn is "cut off" (no terminal event) — it is marked
+// cleanupOnExit runs from the reader goroutine when the process exits: it
+// REAPS the process (this goroutine is the single Wait owner — the ONLY
+// Codex driver path that calls Handle.Wait, and it read all of stdout),
+// drops the endpoint record, fails any pending requests, and signals any
+// waiting turn. The Wait is allowed to block in this background reader
+// goroutine (it holds no Manager activation lock, daemon FIFO, or attach
+// request), but no activation/stop path may call it — that is what wedged
+// the daemon on an unkillable process (B7). When the process cannot be
+// killed, this Wait waits in the background and the supervisor keeps
+// tracking the process; the activation has already returned its failure.
+//
+// The turn is "cut off" (no terminal event) — it is marked
 // endpoint-gone so the blocked Submit classifies the death from the
 // machine-turn state's acceptance signal: accepted →
 // session.ErrTurnInterrupted (surfaced, never auto-retried), not
@@ -921,10 +973,18 @@ func (e *codexEndpoint) cleanupOnExit() {
 	e.stdinMu.Unlock()
 }
 
-// stopEndpoint terminates the instance's endpoint (TERM → grace → KILL
-// via the supervisor) and drops its state. The codex thread rollout
-// persists on disk under CODEX_HOME, so the session survives for a later
-// resume (invariant F).
+// stopEndpoint terminates the instance's endpoint and drops its state.
+// The codex thread rollout persists on disk under CODEX_HOME, so the
+// session survives for a later resume (invariant F).
+//
+// Contract (B7 lifecycle): this path REQUESTS bounded termination (TERM →
+// grace → KILL through the supervisor) and observes the reader's reap for
+// a bounded period; it does NOT reap. The reader is the single Wait owner
+// — it reaps the process after it exits and drops the endpoint record.
+// When the process cannot be killed, the reader keeps waiting and the
+// supervisor keeps tracking the process: the honest result is a bounded
+// stop, never a wedge, and never a Close/Wait fallback that could block
+// on an unkillable process.
 func (c *CodexPersistent) stopEndpoint(instanceID string) error {
 	c.mu.Lock()
 	e := c.endpoints[instanceID]
@@ -932,11 +992,14 @@ func (c *CodexPersistent) stopEndpoint(instanceID string) error {
 	if e == nil {
 		return nil
 	}
-	lif := c.life.get()
-	if el, ok := lif.(proc.EndpointLifecycle); ok {
-		el.StopEndpoint(instanceID)
-	}
-	// Wait for the process to be reaped (bounded), then drop the state.
+	// Request bounded termination (TERM → grace → KILL). It returns within
+	// the termination grace window and does not wait on the exit.
+	c.requestEndpointStop(e)
+	// Bounded observation of the reader's reap: when the process is
+	// killable, the reader reaps it promptly and drops the endpoint record
+	// (so the detach below is a no-op). When it cannot be killed, the
+	// reader keeps waiting and this observation expires — the stop still
+	// returns, bounded.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if !e.live() {
@@ -944,30 +1007,59 @@ func (c *CodexPersistent) stopEndpoint(instanceID string) error {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	c.dropEndpoint(instanceID)
+	// Detach the endpoint record (pointer-specific — never a newer endpoint
+	// for the same instance). The supervisor continues tracking the process
+	// until the reader reaps it.
+	c.dropEndpointRef(e)
 	return nil
 }
 
-func (c *CodexPersistent) dropEndpoint(instanceID string) {
-	c.mu.Lock()
-	e := c.endpoints[instanceID]
-	delete(c.endpoints, instanceID)
-	c.mu.Unlock()
-	if e != nil {
-		// Best-effort: ensure the process is terminated and reaped.
-		if e.h != nil {
-			e.h.Close()
-		}
+// requestEndpointStop requests bounded termination of the endpoint's
+// process group through the supervisor (TERM → grace → KILL). It is the
+// "request termination" half of the lifecycle — never the reap. The
+// endpoint's reader goroutine is the single Wait owner and reaps after the
+// process exits; the supervisor continues tracking the process until that
+// reap. This call returns within the termination grace window (bounded),
+// even when the process cannot be killed (the supervisor then keeps
+// tracking it). It must never call Handle.Wait/Close: that would conflate
+// termination with the single-owner reap and could block the caller
+// forever.
+func (c *CodexPersistent) requestEndpointStop(e *codexEndpoint) {
+	if e == nil {
+		return
+	}
+	if el, ok := c.life.get().(proc.EndpointLifecycle); ok {
+		el.StopEndpoint(e.instanceID)
 	}
 }
 
-// dropEndpointRef removes a SPECIFIC endpoint record (the one whose
-// reader hit exit) from the registry, without touching any other
-// endpoint for the same instance. A concurrent re-activation may have
-// already launched a fresh endpoint for the instance; this must not drop
-// it. It is the exit-path cleanup: the dying endpoint's reader is the
-// single owner of this record, and it runs AFTER the reap (so the
-// supervisor is already clean).
+// retireEndpoint retires a SPECIFIC endpoint after a failed activation
+// (handshake failure, context cancel, or a lost session): it detaches the
+// endpoint from the registry (pointer-specific — it never removes a newer
+// endpoint for the same instance) and requests bounded termination of its
+// process group. It does NOT reap: the reader is the single Wait owner.
+// This is the activation-failure cleanup — it must return within a bounded
+// time (the termination grace window) and must never block on the
+// process's exit, so the Manager's activation lock is always released.
+func (c *CodexPersistent) retireEndpoint(e *codexEndpoint) {
+	if e == nil {
+		return
+	}
+	c.dropEndpointRef(e)
+	c.requestEndpointStop(e)
+}
+
+// dropEndpointRef removes a SPECIFIC endpoint record from the registry,
+// without touching any other endpoint for the same instance. A concurrent
+// re-activation may have already launched a fresh endpoint for the
+// instance; this must not drop it. It is used by two paths:
+//   - the reader's exit path (cleanupOnExit), which runs AFTER the reap (the
+//     supervisor is already clean); and
+//   - the activation-failure / stop paths (retireEndpoint, stopEndpoint),
+//     which run BEFORE the reap — they retire the logical record while the
+//     supervisor still tracks the (possibly unkillable) OS process. The
+//     supervisor record is the safety mechanism that prevents a second
+//     endpoint for the instance, and only the reader's reap removes it.
 func (c *CodexPersistent) dropEndpointRef(e *codexEndpoint) {
 	c.mu.Lock()
 	if c.endpoints[e.instanceID] == e {
