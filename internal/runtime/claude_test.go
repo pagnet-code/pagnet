@@ -496,6 +496,65 @@ func TestClaude_StopKillsProcess(t *testing.T) {
 	}
 }
 
+// TestClaude_HangingChildSettlesByTurnDeadline is the process-per-turn
+// lifecycle regression: the child HANGS — it stays alive, writes no
+// output, and never exits. The turn must STILL settle within a bounded
+// time: when the turn's context hits its deadline, the supervisor's ctx
+// watcher terminates the process group (bounded TERM → grace → KILL),
+// the stdout pipe closes, and StartTurn returns a FAILURE settlement
+// (the ctx error, or a turn.failed event) instead of wedging the daemon
+// forever. A hung child must never be reported as a completed turn.
+func TestClaude_HangingChildSettlesByTurnDeadline(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude")
+	// A single-process stub that hangs until killed (the same shape as
+	// TestClaude_StopKillsProcess, a longer sleep): `exec sleep 300`
+	// replaces bash with one sleep process that ignores stdin, writes
+	// nothing, and stays alive. It outlives the turn deadline by far.
+	if err := os.WriteFile(script, []byte("#!/usr/bin/env bash\nexec sleep 300\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClaude(script)
+	// The turn's bounded context: the deadline is what settles the hang
+	// (the supervisor's ctx watcher terminates the group when it fires)
+	// — not an explicit Stop, so this pins the bounded-lifecycle path.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	events := make(chan TurnEvent, 16)
+	done := make(chan error, 1)
+	go func() { done <- c.StartTurn(ctx, claudeSpec(dir), events) }()
+	// Let the process spawn before the deadline (a deterministic hang).
+	for i := 0; i < 200; i++ {
+		if c.PID("inst-1") != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("StartTurn did not settle within a bounded time: a hanging child wedged the turn")
+	}
+	// StartTurn closed the channel on return; the hung child wrote no
+	// output, so no events are expected at all. Drain to assert the
+	// settlement is a FAILURE, never a completed turn.
+	var failed bool
+	for ev := range events {
+		switch ev.Type {
+		case EventTurnCompleted:
+			t.Fatalf("a hanging child must never complete the turn: %+v", ev)
+		case EventTurnFailed:
+			failed = true
+		}
+	}
+	// The failure settlement is the ctx error (the deadline) or a
+	// turn.failed event — a hung child is a failure, not a success.
+	if err == nil && !failed {
+		t.Fatal("StartTurn settled a hanging child as a clean success (want a failure settlement)")
+	}
+}
+
 // TestStoredSessionRoundTrip covers the SHARED session-persistence helper
 // (readStoredSession / writeStoredSession — used by the process-per-turn
 // adapters): the exact captured id round-trips and the file is 0600
