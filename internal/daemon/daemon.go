@@ -408,7 +408,16 @@ type instQueue struct {
 // daemon Config fields (set by the serve command) > PAGNET_* environment
 // (proc.EnvConfig) > safe defaults. The StateDir is always the daemon's
 // state dir (ownership records live there, §39).
-func procConfigFromDaemon(cfg Config) proc.Config {
+//
+// S2: the daemon's supervisor REQUIRES the filesystem sandbox
+// (RequireSandbox): on sandbox-requiring platforms (Linux) a launch
+// without a sandbox spec, or a sandbox that cannot be applied, is
+// refused (fail closed — H3). There is no environment flag to disable
+// this (H6): the daemon never launches an untrusted runtime without its
+// per-instance allowlist on those platforms. The wrapper is the daemon's
+// own executable (the hidden `sandbox-exec` subcommand — the same
+// self-spawn pattern as the MCP bridges).
+func procConfigFromDaemon(cfg Config, selfExe string) proc.Config {
 	c := proc.EnvConfig() // env + safe defaults
 	c.StateDir = cfg.StateDir
 	if cfg.MaxActiveTurns > 0 {
@@ -444,6 +453,10 @@ func procConfigFromDaemon(cfg Config) proc.Config {
 	if cfg.LaunchCircuitBlock > 0 {
 		c.CircuitBlock = cfg.LaunchCircuitBlock
 	}
+	// S2: the daemon's own executable is the sandbox wrapper, and the
+	// sandbox is REQUIRED (fail closed on sandbox-requiring platforms).
+	c.SandboxWrapper = selfExe
+	c.RequireSandbox = true
 	return c
 }
 
@@ -555,7 +568,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// session this daemon owns. Limits come from the daemon Config (set by
 	// the serve command) with the PAGNET_* environment and safe defaults
 	// as fallbacks.
-	sup := proc.NewSupervisor(procConfigFromDaemon(cfg), log)
+	sup := proc.NewSupervisor(procConfigFromDaemon(cfg, selfExe), log)
 	// Inject the central supervisor into every adapter that manages OS
 	// processes (the LifecycleSetter seam; test stubs skip it).
 	for _, ad := range adapters {
@@ -1334,6 +1347,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 		Arch:            runtime.GOARCH,
 		DaemonVer:       d.Version,
 		BridgeIsolation: bridgeIsolationMode(),
+		RuntimeSandbox:  runtimeSandboxMode(),
 	}
 	metrics.Metrics.CPUCount = runtime.NumCPU()
 	if load, err := readLoadAvg(); err == nil {
@@ -2799,7 +2813,7 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 	// disk as an on-disk reference: the runtime is pointed at it with
 	// PAGNET_COORDINATION_CONTRACT so the agent can re-read it through its
 	// tools.
-	contractPath, _, _ := d.writeContract(row)
+	contractPath, contractText, _ := d.writeContract(row)
 	// The ONE managed standing document (overlay + the operator's standing
 	// instruction when set): the delivery vehicle for every runtime's
 	// standing context. claude reads the file (spec.AgentMDPath →
@@ -2809,17 +2823,39 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 	// opencode materializes the text into its instance-scoped config. It
 	// is NEVER appended to the turn input.
 	standingPath, standingText, _ := d.writeStandingDocument(row)
+	sessionDir := filepath.Join(d.StateDir, "sessions", row.InstanceID)
+	// S2: the sandbox grants the instance's SessionDir — NOT the daemon's
+	// state dir (whose secret file contents must stay denied). Materialize
+	// per-turn COPIES of the standing document and the coordination
+	// contract inside the SessionDir and point the spec at the COPIES:
+	// the state-dir originals remain the daemon's on-disk reference
+	// (unchanged), and a sandboxed runtime reads its standing context from
+	// the granted subtree. A copy failure keeps the state-dir path: the
+	// sandboxed read then fails CLOSED (the turn surfaces the error) —
+	// never an unsandboxed read.
+	agentMDPath := standingPath
+	if standingText != "" && os.MkdirAll(sessionDir, 0o700) == nil { // SEC-415: runtime state
+		if cp := filepath.Join(sessionDir, "pagnet-standing.md"); os.WriteFile(cp, []byte(standingText), 0o600) == nil {
+			agentMDPath = cp
+		}
+	}
+	contractPathForSpec := contractPath
+	if contractText != "" && os.MkdirAll(sessionDir, 0o700) == nil { // SEC-415: runtime state
+		if cp := filepath.Join(sessionDir, "pagnet-contract.md"); os.WriteFile(cp, []byte(contractText), 0o600) == nil {
+			contractPathForSpec = cp
+		}
+	}
 	return agentruntime.TurnSpec{
 		TurnID:               domain.NewID().String(),
 		InstanceID:           row.InstanceID,
 		DefinitionID:         row.DefinitionID,
 		Workspace:            row.Workspace,
-		SessionDir:           filepath.Join(d.StateDir, "sessions", row.InstanceID),
+		SessionDir:           sessionDir,
 		Resume:               resume,
 		Input:                input,
 		InputKind:            kind,
 		Model:                row.Model,
-		AgentMDPath:          standingPath,
+		AgentMDPath:          agentMDPath,
 		StandingInstructions: standingText,
 		Metadata:             map[string]any{"profile": row.Profile},
 		Env: []string{
@@ -2827,7 +2863,7 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 			"PAGNET_AGENT_NAME=" + row.AgentName,
 			"PAGNET_NETWORK_ID=" + row.NetworkID,
 			"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
-			"PAGNET_COORDINATION_CONTRACT=" + contractPath,
+			"PAGNET_COORDINATION_CONTRACT=" + contractPathForSpec,
 		},
 	}
 }

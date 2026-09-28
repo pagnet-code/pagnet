@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // TurnSpec describes one turn to run. The adapter decides how to translate it
@@ -241,6 +242,19 @@ type Adapter interface {
 	// Env are set the same way as for a turn. The caller owns the returned
 	// command (it is started under a PTY by the daemon).
 	InteractiveCmd(spec TurnSpec) (*exec.Cmd, error)
+	// SandboxSpec is the per-instance filesystem allowlist (S2) the
+	// supervisor applies when it starts the runtime for this spec. It is
+	// built from what the driver KNOWS for this instance (H4): the
+	// workspace + pagnet session/state dirs + the runtime's OWN native
+	// state dir as RW, the coarse system read + binary support paths as
+	// RO, and the daemon bridge socket. The daemon's state dir is NEVER
+	// an RW/RO grant (its secret contents stay denied; only the socket's
+	// traversal chain is granted). It must cover BOTH the StartTurn
+	// process and the InteractiveCmd process (the daemon passes the same
+	// spec to both launch shapes). nil is not allowed on a launch — the
+	// supervisor refuses a spec-less launch on sandbox-requiring
+	// platforms (fail closed, H3).
+	SandboxSpec(spec TurnSpec) *sandbox.Spec
 }
 
 // --- shared adapter helpers ----------------------------------------------------

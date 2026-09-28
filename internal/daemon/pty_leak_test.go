@@ -149,6 +149,13 @@ func killMarkerGroups(marker string) {
 // debug mode (fake runtime registered), the fake adapter pointed at the
 // fixture binary, and RuntimeEnv carrying the marker + the PTY-child
 // fixture knob.
+//
+// S2: the self-executable resolver must return THIS test binary (like
+// production's resolveSelfExecutable): the daemon wires selfExe as the
+// sandbox wrapper, and the test binary intercepts the wrapper's
+// sandbox-exec subcommand in TestMain. (A placeholder binary such as
+// /bin/true would be launched as the "sandboxed runtime" — true exits
+// 0 silently, and the session would die before the runtime ever runs.)
 func newP0Daemon(t *testing.T, bin string, env []string) *Daemon {
 	t.Helper()
 	cfg := Config{
@@ -157,8 +164,12 @@ func newP0Daemon(t *testing.T, bin string, env []string) *Daemon {
 		NoScan:     true,
 		RuntimeEnv: env,
 	}
+	selfExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
 	d, err := newDaemon(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		func() (string, error) { return "/bin/true", nil })
+		func() (string, error) { return selfExe, nil })
 	if err != nil {
 		t.Fatalf("newDaemon: %v", err)
 	}

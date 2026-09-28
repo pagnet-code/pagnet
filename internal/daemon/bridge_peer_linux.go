@@ -19,18 +19,41 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // bridgeIsolationMode reports this platform's bridge isolation state
 // (the process-tree binding is enforced here).
 func bridgeIsolationMode() string {
 	return bridgeIsolationProcessBound
+}
+
+// runtimeSandboxMode reports this platform's runtime filesystem-sandbox
+// state (S2, the S1 heartbeat-pattern extension): "landlock" when the
+// Landlock kernel boundary is available (managed runtimes are
+// sandboxed), "fail_closed" when it is NOT (kernel too old — the daemon
+// refuses to launch untrusted runtimes rather than run them
+// unsandboxed; without the sandbox, activation MUST NOT proceed —
+// H3/H5).
+func runtimeSandboxMode() string {
+	if sandbox.Available() {
+		return sandboxModeLandlock
+	}
+	var warned int32
+	if atomic.CompareAndSwapInt32(&warned, 0, 1) {
+		slog.Error("runtime sandbox unavailable: Landlock not supported by this kernel — managed runtimes will be refused (fail closed)",
+			"kernel", sandbox.KernelRelease())
+	}
+	return sandboxModeFailClosed
 }
 
 // bridgeTreeMaxHops bounds the /proc ppid walk: a legitimate bridge is

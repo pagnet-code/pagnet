@@ -27,6 +27,15 @@ func bridgeIsolationMode() string {
 	return bridgeIsolationNonceOnly
 }
 
+// runtimeSandboxMode reports this platform's runtime filesystem-sandbox
+// state (S2, the S1 heartbeat-pattern extension): "unsupported_platform"
+// — there is no Landlock here, so managed runtimes are NOT isolated
+// (H5: owner-scoped dev machines; the weaker guarantee is surfaced on
+// the heartbeat, not hidden) and activation proceeds.
+func runtimeSandboxMode() string {
+	return sandboxModeUnsupportedPlatform
+}
+
 // verifyBridgePeer is the non-Linux stand-in for the process-tree
 // binding: a no-op, because the portable checks (nonce + live instance
 // process) already ran before this call. The isolation state on this

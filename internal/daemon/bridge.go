@@ -54,6 +54,20 @@ import (
 // bridge_peer_other.go.
 const bridgeIsolationProcessBound = "process-bound"
 
+// Runtime filesystem-sandbox states (S2, reported on the daemon
+// heartbeat as RuntimeSandbox — the S1 heartbeat-pattern extension).
+// "landlock": managed runtimes are launched under the Landlock boundary
+// (Linux, kernel supports it). "fail_closed": the kernel has no
+// Landlock — the daemon REFUSES to launch untrusted runtimes (activation
+// cannot proceed without the sandbox; H3/H5). "unsupported_platform":
+// the platform has no Landlock at all (darwin — owner-scoped dev
+// machines; runtimes are NOT isolated and activation proceeds; H5).
+const (
+	sandboxModeLandlock            = "landlock"
+	sandboxModeFailClosed          = "fail_closed"
+	sandboxModeUnsupportedPlatform = "unsupported_platform"
+)
+
 const (
 	bridgeSocketName     = "pagnetd.sock"
 	bridgeAuthTimeout    = 5 * time.Second

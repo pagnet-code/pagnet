@@ -8,12 +8,15 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
+
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // Operational conditions (§54): clean, machine-readable refusal errors.
@@ -47,6 +50,12 @@ var (
 	// alive (or its reap is still pending) and the supervisor keeps
 	// tracking it.
 	ErrExitNotObserved = errors.New("exit not observed within deadline")
+	// ErrSandboxUnavailable: the launch was refused because the filesystem
+	// sandbox (S2) could not be applied — on Linux there is NO fallback to
+	// an unsandboxed launch (H3, fail closed). Returned when the platform
+	// requires a sandbox and the spec is missing, the kernel has no
+	// Landlock, or the wrapper cannot be prepared.
+	ErrSandboxUnavailable = errors.New("sandbox_unavailable")
 )
 
 // IsResourcePressureError reports whether a launch error indicates host
@@ -149,6 +158,13 @@ type LaunchRequest struct {
 	// "PAGNET_TURN_ID=<id>") that is ALREADY in Cmd.Env; it is stored in
 	// the ownership record as the restart-reconciliation proof (§42).
 	Marker string
+	// Sandbox is the per-instance filesystem allowlist (S2). When set and
+	// the platform requires sandboxing (Linux), the supervisor rewrites
+	// Cmd to launch through the sandbox wrapper (single policy point,
+	// H2) BEFORE the Start — one wrap for every class (turn, endpoint,
+	// PTY). nil on a platform that requires a sandbox is refused
+	// (fail closed, H3); nil on a non-sandboxing platform is fine.
+	Sandbox *sandbox.Spec
 }
 
 // Exit is the published result of one managed process (delivered exactly
@@ -228,6 +244,18 @@ type Config struct {
 	// EPERM on SIGKILL — the live macOS condition) deterministically,
 	// without privileges or a broken host.
 	signalGroupFn func(pgid int, sig syscall.Signal) error
+
+	// SandboxWrapper is the executable that implements the sandbox
+	// wrapper (the pagnet binary itself, run as its hidden
+	// `sandbox-exec` subcommand, S2). "" = os.Executable(). Used only on
+	// platforms where sandbox.MustSandbox() is true.
+	SandboxWrapper string
+	// RequireSandbox makes the supervisor refuse (fail closed, H3) any
+	// launch that arrives without a Sandbox spec on a sandbox-requiring
+	// platform (Linux). The daemon sets this: every managed process on
+	// Linux must be sandboxed, and a spec-less launch is a caller bug,
+	// never a silently-unsandboxed launch.
+	RequireSandbox bool
 }
 
 // DefaultConfig returns the safe defaults (§29/§31/§32/§33/§35).
@@ -686,6 +714,39 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		return fail(err)
 	}
 
+	// Filesystem sandbox (S2) — the single policy point: every class
+	// (turn, endpoint, PTY) is wrapped here, before the Start. On Linux
+	// the launch FAILS CLOSED if the sandbox cannot be applied (H3):
+	// spec-less launch, no Landlock, or a wrapper that cannot be
+	// prepared. On platforms without Landlock (H5) nothing is wrapped —
+	// the launch proceeds non-isolated and the platform is reported as
+	// unsupported.
+	if sandbox.MustSandbox() {
+		if req.Sandbox == nil {
+			if s.cfg.RequireSandbox {
+				s.log.Error("launch refused: sandbox spec missing (fail closed)",
+					"instance", key.InstanceID, "turn", key.TurnID, "runtime", req.Runtime)
+				return fail(fmt.Errorf("%w: refusing to launch: sandbox could not be applied — launch carries no sandbox spec (fail closed)",
+					ErrSandboxUnavailable))
+			}
+		} else {
+			if !sandboxAvailable() {
+				s.log.Error("launch refused: Landlock unavailable (fail closed)",
+					"instance", key.InstanceID, "turn", key.TurnID, "runtime", req.Runtime,
+					"kernel", sandbox.KernelRelease())
+				return fail(fmt.Errorf("%w: refusing to launch: sandbox could not be applied — kernel %s supports no Landlock (fail closed)",
+					ErrSandboxUnavailable, sandbox.KernelRelease()))
+			}
+			if err := wrapSandboxed(&req, s.cfg.SandboxWrapper); err != nil {
+				s.log.Error("launch refused: sandbox wrap failed (fail closed)",
+					"instance", key.InstanceID, "turn", key.TurnID, "runtime", req.Runtime,
+					"err", err)
+				return fail(fmt.Errorf("%w: refusing to launch: sandbox could not be applied — %v (fail closed)",
+					ErrSandboxUnavailable, err))
+			}
+		}
+	}
+
 	// Start the process (the supervisor is the single Start owner).
 	var startErr error
 	switch req.Class {
@@ -852,6 +913,50 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 	}()
 
 	return &Handle{t: t}, nil
+}
+
+// sandboxAvailable is the Landlock-availability probe the launch gate
+// consults (a test seam: the launch tests fake it to exercise the
+// fail-closed refusal branch without a kernel that lacks Landlock).
+var sandboxAvailable = sandbox.Available
+
+// wrapSandboxed rewrites req.Cmd in place so the SUPERVISOR-STARTED process
+// is the sandbox wrapper: <wrapper> sandbox-exec [--rw p]* [--ro p]*
+// [--sock p]* -- <target> <args...>. The wrapper applies the sandbox to
+// itself and execs the target IN PLACE (H1): the PID the supervisor started
+// (and records, reaps, and S1 binds) is the runtime's PID — no grandchild.
+// It fails closed on anything unusual: a relative target, a missing or
+// invalid wrapper executable, or a non-normalizable spec.
+func wrapSandboxed(req *LaunchRequest, wrapper string) error {
+	if err := req.Sandbox.Normalize(); err != nil {
+		return fmt.Errorf("sandbox spec: %w (fail closed)", err)
+	}
+	w := wrapper
+	if w == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("sandbox wrapper (os.Executable): %w (fail closed)", err)
+		}
+		w = exe
+	}
+	if st, err := os.Stat(w); err != nil {
+		return fmt.Errorf("sandbox wrapper %s: %w (fail closed)", w, err)
+	} else if st.IsDir() {
+		return fmt.Errorf("sandbox wrapper %s is a directory (fail closed)", w)
+	}
+	target := req.Cmd.Path
+	if target == "" {
+		target = req.Cmd.Args[0]
+	}
+	if !filepath.IsAbs(target) {
+		// A relative target would resolve against an unknowable CWD after
+		// the wrapper execs — refuse rather than guess (fail closed).
+		return fmt.Errorf("sandbox target %q is not an absolute path (fail closed)", target)
+	}
+	req.Cmd.Path = w
+	req.Cmd.Args = append([]string{w, sandbox.Subcommand},
+		sandbox.WrapperArgs(req.Sandbox, target, req.Cmd.Args[1:])...)
+	return nil
 }
 
 // failLaunch cleanup for a process that never started: publish the exit

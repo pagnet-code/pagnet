@@ -104,8 +104,17 @@ func TestTurnSpecInputIsExactlyTheInput(t *testing.T) {
 
 	// The standing context is carried on the spec's native surfaces:
 	// the managed standing document (path + text) = overlay + instruction.
-	if fresh.AgentMDPath != filepath.Join(d.StateDir, "agentmd", instID+".md") {
-		t.Fatalf("AgentMDPath = %q, want the managed standing document", fresh.AgentMDPath)
+	// S2: the spec points at the per-turn COPY in the instance's SessionDir
+	// (the sandbox grants the SessionDir, never the daemon's state dir —
+	// the sandboxed runtime reads its standing context from the granted
+	// subtree; a copy failure keeps the state-dir path and the read then
+	// fails closed).
+	wantStandingCopy := filepath.Join(d.StateDir, "sessions", instID, "pagnet-standing.md")
+	if fresh.AgentMDPath != wantStandingCopy {
+		t.Fatalf("AgentMDPath = %q, want the managed standing document's session-dir copy %q", fresh.AgentMDPath, wantStandingCopy)
+	}
+	if b, err := os.ReadFile(wantStandingCopy); err != nil || !strings.Contains(string(b), "PAGNET COORDINATION CONTRACT") {
+		t.Fatalf("standing document copy not materialised in the SessionDir (err = %v): %q", err, b)
 	}
 	if !strings.Contains(fresh.StandingInstructions, "PAGNET COORDINATION CONTRACT") {
 		t.Fatalf("standing document missing the overlay: %q", fresh.StandingInstructions)
@@ -114,11 +123,11 @@ func TestTurnSpecInputIsExactlyTheInput(t *testing.T) {
 		!strings.Contains(fresh.StandingInstructions, "You are the code explorer. Do not modify code.") {
 		t.Fatalf("standing document missing the operator instruction: %q", fresh.StandingInstructions)
 	}
-	// The on-disk reference (the agent can re-read it via tools) is still
-	// pointed at by the env var.
+	// The on-disk reference the agent re-reads via tools is the SAME
+	// session-dir copy (S2), pointed at by the env var.
 	env := strings.Join(fresh.Env, "\n")
-	if !strings.Contains(env, "PAGNET_COORDINATION_CONTRACT="+filepath.Join(d.StateDir, "contracts", instID+".md")) {
-		t.Fatalf("env missing contract path: %s", env)
+	if !strings.Contains(env, "PAGNET_COORDINATION_CONTRACT="+filepath.Join(d.StateDir, "sessions", instID, "pagnet-contract.md")) {
+		t.Fatalf("env missing the session-dir contract copy path: %s", env)
 	}
 }
 

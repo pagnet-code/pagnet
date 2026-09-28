@@ -37,7 +37,10 @@ func runOpenCodeStub(t *testing.T, spec TurnSpec, stubEnv map[string]string) []s
 	if err := os.WriteFile(script, []byte(fakeOpenCodeScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	argsPath := filepath.Join(dir, "args.txt")
+	// S2: the argv record is WRITTEN by the sandboxed child, so it must
+	// live in a granted RW location — the instance's session dir (the
+	// stub's own dir is RO: the binary support grant).
+	argsPath := filepath.Join(spec.SessionDir, "args.txt")
 	// The child (stub script) reads this from ITS environment; pass it as
 	// an explicit injection pair so it bypasses the ChildEnv allowlist
 	// (external audit F-009). Adapter-side env stays on t.Setenv.
@@ -181,9 +184,11 @@ func TestOpenCode_ProcessDiesMidTurnIsProcessError(t *testing.T) {
 	spec := opencodeSpec(t.TempDir())
 	// The child (stub script) reads these from ITS environment; pass them
 	// as explicit injection pairs so they bypass the ChildEnv allowlist
-	// (external audit F-009). Exit 137 = the SIGKILL death code.
+	// (external audit F-009). Exit 137 = the SIGKILL death code. The argv
+	// record is written by the sandboxed child into the session dir (RW
+	// grant — the stub's own dir is RO under the sandbox, S2).
 	spec.Env = append(spec.Env,
-		"OPENCODE_FAKE_ARGS="+filepath.Join(dir, "args.txt"),
+		"OPENCODE_FAKE_ARGS="+filepath.Join(spec.SessionDir, "args.txt"),
 		"OPENCODE_FAKE_OUT="+outPath,
 		"OPENCODE_FAKE_EXIT=137",
 	)

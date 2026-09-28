@@ -14,6 +14,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // Claude drives the Claude Code CLI (`claude`) as a process-per-turn
@@ -147,6 +148,19 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	scratch, err := ensureScratch(spec.SessionDir)
+	if err != nil {
+		return err
+	}
+	// S2: the runtime's own native state dir (~/.claude — the SAME list
+	// SandboxSpec grants) is a mandatory RW grant — the launch path
+	// guarantees its existence (H3), including on first use (the empty dir
+	// the CLI would create itself).
+	if err := ensureNativeDirs(homeNativeDirs(".claude")...); err != nil {
+		return err
+	}
 	sessionPath := filepath.Join(spec.SessionDir, claudeSessionFile)
 	stored, _ := readStoredSession(sessionPath)
 
@@ -202,7 +216,9 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = EnsureTurnMarker(ChildEnv(c.Env, spec.Env), spec.TurnID)
+	// TMPDIR is the per-instance scratch (an explicit pair — it overrides
+	// any inherited TMPDIR whose target is not in the sandbox allowlist).
+	cmd.Env = EnsureTurnMarker(ChildEnv(c.Env, spec.Env, []string{"TMPDIR=" + scratch}), spec.TurnID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -216,7 +232,10 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle; its ctx watcher terminates the
-	// whole group on cancellation.
+	// whole group on cancellation. The launch carries the per-instance
+	// sandbox spec (S2): the supervisor wraps the Start on
+	// sandbox-requiring platforms and refuses the launch (fail closed)
+	// when the sandbox cannot be applied (H2/H3).
 	h, err := c.life.get().Launch(ctx, proc.LaunchRequest{
 		InstanceID: spec.InstanceID,
 		TurnID:     spec.TurnID,
@@ -224,6 +243,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		Class:      proc.ClassTurn,
 		Cmd:        cmd,
 		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+		Sandbox:    c.SandboxSpec(spec),
 	})
 	if err != nil {
 		return err
@@ -445,6 +465,17 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the daemon passes c.SandboxSpec(spec) with this command to the
+	// supervisor, which refuses a launch whose granted path is missing.
+	if _, err := ensureScratch(spec.SessionDir); err != nil {
+		return nil, err
+	}
+	// S2: the runtime's own native state dir (~/.claude — the SAME list
+	// SandboxSpec grants) must exist (H3), including on first use.
+	if err := ensureNativeDirs(homeNativeDirs(".claude")...); err != nil {
+		return nil, err
+	}
 	// NO --permission-mode here (external audit F-014): the interactive
 	// REPL is a HUMAN-in-the-loop session — the browser shows the actual
 	// Claude Code TUI, and the human approves/denies tool use through the
@@ -490,8 +521,36 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(c.Env, spec.Env)
+	// TMPDIR is the per-instance scratch (same rule as a turn: the
+	// explicit pair overrides any inherited TMPDIR the sandbox denies).
+	cmd.Env = ChildEnv(c.Env, spec.Env, []string{"TMPDIR=" + scratchPath(spec.SessionDir)})
 	return cmd, nil
+}
+
+// SandboxSpec implements Adapter (S2): the per-instance filesystem
+// allowlist built from what the driver KNOWS for this instance (H4):
+// the workspace + the instance's pagnet session dir as RW, the runtime's
+// OWN native state (~/.claude — the runtime's LLM auth + sessions) as RW,
+// the coarse system read + binary support paths as RO, and the daemon
+// bridge socket (recovered from the daemon-rendered PAGNET_MCP_CONFIG in
+// the launch env). The daemon's state dir is never a grant — only the
+// socket's traversal chain reaches it. The same spec covers the StartTurn
+// process and this InteractiveCmd process. It is pure: the scratch it
+// references is created by the launch path (ensureScratch).
+func (c *Claude) SandboxSpec(spec TurnSpec) *sandbox.Spec {
+	// The RESOLVED binary (field, then PATH, then next-to-self — the same
+	// resolution the launch uses): its dir + parent carry the runtime's
+	// executable + module tree (RuntimeSupportRO). An unresolvable binary
+	// yields "" and the spec omits the support grant — the launch itself
+	// fails on the same resolution, so the spec never drifts from it.
+	bin, _ := c.binary()
+	return driverSandbox(driverSandboxOpts{
+		workspace:  spec.Workspace,
+		stateDir:   spec.SessionDir,
+		nativeDirs: homeNativeDirs(".claude"),
+		binary:     bin,
+		env:        spec.Env,
+	})
 }
 
 // --- claude stream-json wire shapes -------------------------------------------

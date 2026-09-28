@@ -36,11 +36,16 @@ func runClaudeStub(t *testing.T, spec TurnSpec, out string, stubEnv map[string]s
 	if err := os.WriteFile(script, []byte(fakeClaudeScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The replay file stays in the stub's dir: under the sandbox the
+	// binary dir is a coarse RO support grant (S2) — the child READS it.
 	outPath := filepath.Join(dir, "out.ndjson")
 	if err := os.WriteFile(outPath, []byte(out), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	argsPath := filepath.Join(dir, "args.txt")
+	// S2: the argv record is WRITTEN by the sandboxed child, so it must
+	// live in a granted RW location — the instance's session dir (the
+	// stub's own dir is RO: the binary support grant).
+	argsPath := filepath.Join(spec.SessionDir, "args.txt")
 	// The child (stub script) reads these from ITS environment; pass them
 	// as explicit injection pairs so they bypass the ChildEnv allowlist
 	// (external audit F-009). Adapter-side env stays on t.Setenv.
@@ -305,10 +310,12 @@ func TestClaude_ProcessDiesMidTurnIsProcessError(t *testing.T) {
 	spec := claudeSpec(t.TempDir())
 	// The child (stub script) reads these from ITS environment; pass them
 	// as explicit injection pairs so they bypass the ChildEnv allowlist
-	// (external audit F-009). Exit 137 = the SIGKILL death code.
+	// (external audit F-009). Exit 137 = the SIGKILL death code. The argv
+	// record is written by the sandboxed child into the session dir (RW
+	// grant — the stub's own dir is RO under the sandbox, S2).
 	spec.Env = append(spec.Env,
 		"CLAUDE_FAKE_OUT="+outPath,
-		"CLAUDE_FAKE_ARGS="+filepath.Join(dir, "args.txt"),
+		"CLAUDE_FAKE_ARGS="+filepath.Join(spec.SessionDir, "args.txt"),
 		"CLAUDE_FAKE_EXIT=137",
 	)
 

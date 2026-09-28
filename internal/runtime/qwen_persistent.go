@@ -597,6 +597,17 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	if err := os.MkdirAll(stateDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	if _, err := ensureScratch(stateDir); err != nil {
+		return nil, err
+	}
+	// S2: the runtime's own native state dir (~/.qwen — the SAME list the
+	// launch spec grants) is a mandatory RW grant; the launch path
+	// guarantees its existence (H3), including on first use.
+	if err := ensureNativeDirs(homeNativeDirs(".qwen")...); err != nil {
+		return nil, err
+	}
 	eventsPath := filepath.Join(stateDir, "events.jsonl")
 	inputPath := filepath.Join(stateDir, "input.jsonl")
 	sessionMetaPath := filepath.Join(stateDir, qwenStateFile)
@@ -696,6 +707,10 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	if !hasMarker {
 		env = append(env, "PAGNET_INSTANCE_ID="+sess.InstanceID)
 	}
+	// S2: TMPDIR is the per-instance scratch (an explicit pair — it
+	// overrides any inherited TMPDIR whose target is not in the sandbox
+	// allowlist).
+	env = append(env, "TMPDIR="+scratchPath(stateDir))
 	// Native-first renderer rule: Pagenet provides the machine channel
 	// (--json-file/--input-file) and does NOT force a TUI renderer — it
 	// follows the vendor default. The user's own QWEN_TUI_RENDERER (if set
@@ -718,6 +733,23 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	if ws == nil {
 		ws = &pty.Winsize{Rows: 24, Cols: 80}
 	}
+	// S2: the per-instance sandbox allowlist (H4) — the endpoint driver
+	// is not a turn-class Adapter, so the spec is built here from the
+	// session: the workspace + this per-instance state dir as RW, the
+	// runtime's OWN native state (~/.qwen) as RW, the coarse system read
+	// + binary support paths as RO, and the daemon bridge socket
+	// (recovered from the session's PAGNET_MCP_CONFIG). The daemon's
+	// state dir is never a grant — only the socket's traversal chain
+	// reaches it. The supervisor wraps the Start on sandbox-requiring
+	// platforms and refuses the launch (fail closed) when the sandbox
+	// cannot be applied (H2/H3).
+	sb := driverSandbox(driverSandboxOpts{
+		workspace:  sess.Workspace,
+		stateDir:   stateDir,
+		nativeDirs: homeNativeDirs(".qwen"),
+		binary:     bin,
+		env:        sess.Env,
+	})
 	// The endpoint is LONG-LIVED: it must survive across turns (the whole
 	// point of the persistent model). The launch ctx must NOT be a turn's
 	// ctx (cancelled at turn end) — it is the driver's own lifetime.
@@ -730,6 +762,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		Marker:     "PAGNET_INSTANCE_ID=" + sess.InstanceID,
 		PTYSize:    ws,
 		PTYStdio:   true, // the TUI renders to the PTY (B1)
+		Sandbox:    sb,
 	})
 	if err != nil {
 		inputFile.Close()

@@ -13,6 +13,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // OpenCode drives the opencode CLI (`opencode`) as a process-per-turn
@@ -138,6 +139,18 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	scratch, err := ensureScratch(spec.SessionDir)
+	if err != nil {
+		return err
+	}
+	// S2: the runtime's own native state dirs (see SandboxSpec's nativeDirs —
+	// the SAME list) are mandatory RW grants; the launch path guarantees
+	// their existence (H3), including on first use.
+	if err := ensureNativeDirs(homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode")...); err != nil {
+		return err
+	}
 	sessionPath := filepath.Join(spec.SessionDir, opencodeSessionFile)
 	stored, _ := readStoredSession(sessionPath)
 
@@ -182,6 +195,10 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 		}
 		extraEnv = append(extraEnv, "OPENCODE_CONFIG="+cfgPath)
 	}
+	// S2: TMPDIR is the per-instance scratch (an explicit pair — it
+	// overrides any inherited TMPDIR whose target is not in the
+	// sandbox allowlist).
+	extraEnv = append(extraEnv, "TMPDIR="+scratch)
 
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
@@ -195,7 +212,10 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle; its ctx watcher terminates the
-	// whole group on cancellation.
+	// whole group on cancellation. The launch carries the per-instance
+	// sandbox spec (S2): the supervisor wraps the Start on
+	// sandbox-requiring platforms and refuses the launch (fail closed)
+	// when the sandbox cannot be applied (H2/H3).
 	h, err := o.life.get().Launch(ctx, proc.LaunchRequest{
 		InstanceID: spec.InstanceID,
 		TurnID:     spec.TurnID,
@@ -203,6 +223,7 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 		Class:      proc.ClassTurn,
 		Cmd:        cmd,
 		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+		Sandbox:    o.SandboxSpec(spec),
 	})
 	if err != nil {
 		return err
@@ -367,6 +388,17 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the daemon passes o.SandboxSpec(spec) with this command to the
+	// supervisor, which refuses a launch whose granted path is missing.
+	if _, err := ensureScratch(spec.SessionDir); err != nil {
+		return nil, err
+	}
+	// S2: the runtime's own native state dirs (the SAME list SandboxSpec
+	// grants) must exist (H3), including on first use.
+	if err := ensureNativeDirs(homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode")...); err != nil {
+		return nil, err
+	}
 	var args []string
 	// Model precedence: the turn's resolved model wins over the adapter's
 	// own (field, then env).
@@ -395,10 +427,37 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		}
 		extraEnv = append(extraEnv, "OPENCODE_CONFIG="+cfgPath)
 	}
+	// S2: TMPDIR is the per-instance scratch (same rule as a turn).
+	extraEnv = append(extraEnv, "TMPDIR="+scratchPath(spec.SessionDir))
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
 	cmd.Env = ChildEnv(extraEnv, spec.Env)
 	return cmd, nil
+}
+
+// SandboxSpec implements Adapter (S2): the per-instance filesystem
+// allowlist built from what the driver KNOWS for this instance (H4):
+// the workspace + the instance's pagnet session dir as RW (the
+// instance-scoped opencode config + standing file live there), the
+// runtime's OWN native state dirs (config, session data, cache) as RW,
+// the coarse system read + binary support paths as RO, and the daemon
+// bridge socket (recovered from the daemon-rendered PAGNET_MCP_CONFIG in
+// the launch env). The daemon's state dir is never a grant — only the
+// socket's traversal chain reaches it. The same spec covers the StartTurn
+// process and this InteractiveCmd process. It is pure: the scratch it
+// references is created by the launch path (ensureScratch).
+func (o *OpenCode) SandboxSpec(spec TurnSpec) *sandbox.Spec {
+	// The RESOLVED binary (same resolution as the launch) — its dir +
+	// parent carry the runtime's executable + module tree
+	// (RuntimeSupportRO); an unresolvable binary fails the launch itself.
+	bin, _ := o.binary()
+	return driverSandbox(driverSandboxOpts{
+		workspace:  spec.Workspace,
+		stateDir:   spec.SessionDir,
+		nativeDirs: homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode"),
+		binary:     bin,
+		env:        spec.Env,
+	})
 }
 
 // writeOpenCodeConfig materializes the instance-scoped opencode config in

@@ -448,6 +448,11 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	if _, err := ensureScratch(sessionDir); err != nil {
+		return nil, err
+	}
 	args := []string{"--persistent", "--instance-id", sess.InstanceID, "--session-dir", sessionDir}
 	if sess.NativeID != "" {
 		args = append(args, "--resume", sess.NativeID)
@@ -493,6 +498,10 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if f.PTYSize != nil {
 		env = append(env, "PAGNET_FAKE_TUI=1")
 	}
+	// S2: TMPDIR is the per-instance scratch (an explicit pair — it
+	// overrides any inherited TMPDIR whose target is not in the sandbox
+	// allowlist).
+	env = append(env, "TMPDIR="+scratchPath(sessionDir))
 	cmd.Env = ChildEnv(f.Env, env)
 
 	stdin, err := cmd.StdinPipe()
@@ -511,6 +520,31 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if !ok {
 		return nil, errors.New("persistent fake: lifecycle does not support endpoints")
 	}
+	// S2: the per-instance sandbox allowlist (H4) — the workspace + this
+	// per-instance session dir as RW, the coarse system read + binary
+	// support paths as RO, and the daemon bridge socket (recovered from
+	// the session's PAGNET_MCP_CONFIG). The fake has no native state dir
+	// of its own; the S1 bridge e2e fixture's result-file dir (the
+	// documented PAGNET_FAKE_* simulation knob) is the one extra RW. The
+	// daemon's state dir is never a grant — only the socket's traversal
+	// chain reaches it. The supervisor wraps the Start on
+	// sandbox-requiring platforms and refuses the launch (fail closed)
+	// when the sandbox cannot be applied (H2/H3).
+	// The launch env is the driver's Env + the session's env (the same
+	// two slices ChildEnv receives below) — the spec must derive its
+	// socket and test-knob grants from the env the child ACTUALLY gets.
+	launchEnv := append(append([]string(nil), f.Env...), sess.Env...)
+	var extraRW []string
+	if dir := fakeBridgeResultDir(launchEnv); dir != "" {
+		extraRW = append(extraRW, dir)
+	}
+	sb := driverSandbox(driverSandboxOpts{
+		workspace: sess.Workspace,
+		stateDir:  sessionDir,
+		binary:    bin,
+		env:       launchEnv,
+		extraRW:   extraRW,
+	})
 	// The endpoint is LONG-LIVED: it must survive across turns (the whole
 	// point of the persistent model — 100 turns, 1 process, stable PID).
 	// The supervisor's Launch installs a context watcher that terminates
@@ -532,6 +566,7 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		// makes the slave the controlling terminal). nil = pre-Phase-3
 		// shape (no PTY).
 		PTYSize: f.PTYSize,
+		Sandbox: sb,
 	})
 	if err != nil {
 		return nil, err

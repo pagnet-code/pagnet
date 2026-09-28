@@ -13,6 +13,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 // Fake is the MVP runtime adapter. It is a REAL process-per-turn runtime:
@@ -122,10 +123,18 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	scratch, err := ensureScratch(spec.SessionDir)
+	if err != nil {
+		return err
+	}
 
 	cmd := exec.Command(bin)
 	cmd.Dir = spec.Workspace
-	cmd.Env = EnsureTurnMarker(ChildEnv(f.Env, spec.Env), spec.TurnID)
+	// TMPDIR is the per-instance scratch (an explicit pair — it overrides
+	// any inherited TMPDIR whose target is not in the sandbox allowlist).
+	cmd.Env = EnsureTurnMarker(ChildEnv(f.Env, spec.Env, []string{"TMPDIR=" + scratch}), spec.TurnID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -140,7 +149,10 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle. The ctx is handed to it (its
 	// watcher terminates the whole group on cancellation — never just
-	// the direct child).
+	// the direct child). The launch carries the per-instance sandbox
+	// spec (S2): the supervisor wraps the Start on sandbox-requiring
+	// platforms and refuses the launch (fail closed) when the sandbox
+	// cannot be applied (H2/H3).
 	h, err := f.life.get().Launch(ctx, proc.LaunchRequest{
 		InstanceID: spec.InstanceID,
 		TurnID:     spec.TurnID,
@@ -148,6 +160,7 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		Class:      proc.ClassTurn,
 		Cmd:        cmd,
 		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
+		Sandbox:    f.SandboxSpec(spec),
 	})
 	if err != nil {
 		return err
@@ -268,6 +281,12 @@ func (f *Fake) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	if err := os.MkdirAll(spec.SessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return nil, err
 	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the daemon passes f.SandboxSpec(spec) with this command to the
+	// supervisor, which refuses a launch whose granted path is missing.
+	if _, err := ensureScratch(spec.SessionDir); err != nil {
+		return nil, err
+	}
 	args := []string{"--pty", "--instance-id", spec.InstanceID, "--session-dir", spec.SessionDir}
 	if spec.Resume {
 		stored, _ := readStoredSession(filepath.Join(spec.SessionDir, "session.json"))
@@ -277,8 +296,43 @@ func (f *Fake) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = spec.Workspace
-	cmd.Env = ChildEnv(f.Env, spec.Env)
+	// TMPDIR is the per-instance scratch (same rule as a turn).
+	cmd.Env = ChildEnv(f.Env, spec.Env, []string{"TMPDIR=" + scratchPath(spec.SessionDir)})
 	return cmd, nil
+}
+
+// SandboxSpec implements Adapter (S2): the per-instance filesystem
+// allowlist built from what the driver KNOWS for this instance (H4):
+// the workspace + the instance's pagnet session dir as RW, the coarse
+// system read + binary support paths as RO, and the daemon bridge socket
+// (recovered from the daemon-rendered PAGNET_MCP_CONFIG in the launch
+// env). The fake has no native state dir of its own. The daemon's state
+// dir is never a grant — only the socket's traversal chain reaches it.
+// The same spec covers the StartTurn process and this InteractiveCmd
+// process. It is pure: the scratch it references is created by the
+// launch path (ensureScratch).
+func (f *Fake) SandboxSpec(spec TurnSpec) *sandbox.Spec {
+	// The launch env is the driver's Env + the spec's env (the same two
+	// slices ChildEnv receives in StartTurn/InteractiveCmd) — the spec
+	// must derive its socket and test-knob grants from the env the child
+	// ACTUALLY gets.
+	launchEnv := append(append([]string(nil), f.Env...), spec.Env...)
+	var extraRW []string
+	// The S1 bridge e2e fixture writes its observed-response file into
+	// the test-scoped dir named by the PAGNET_FAKE_BRIDGE_RESULT_FILE
+	// simulation knob — a sandboxed fake must be able to write it
+	// (documented PAGNET_FAKE_* test namespace, never a production path).
+	if dir := fakeBridgeResultDir(launchEnv); dir != "" {
+		extraRW = append(extraRW, dir)
+	}
+	bin, _ := f.binary()
+	return driverSandbox(driverSandboxOpts{
+		workspace: spec.Workspace,
+		stateDir:  spec.SessionDir,
+		binary:    bin,
+		env:       launchEnv,
+		extraRW:   extraRW,
+	})
 }
 
 // wireEvent is the fake-runtime helper's stdout event (already normalized).

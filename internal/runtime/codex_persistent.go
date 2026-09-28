@@ -552,6 +552,25 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	if sess.Workspace == "" {
 		return nil, session.SessionEvent{}, errors.New("codex persistent: requires a workspace (the thread's cwd)")
 	}
+	// Per-instance pagnet state dir (under the pagnet state dir, never
+	// the workspace — §44, same pattern as the qwen driver): the anchor
+	// for this instance's scratch (the sandboxed child's TMPDIR). Codex's
+	// own native state stays in ~/.codex (granted as the runtime's own).
+	stateDir := filepath.Join(c.stateDir(), "codex", sess.InstanceID)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil { // SEC-415: runtime state
+		return nil, session.SessionEvent{}, err
+	}
+	// S2: the per-instance scratch (TMPDIR) must exist before launch —
+	// the sandbox wrapper refuses a missing granted path (fail closed).
+	if _, err := ensureScratch(stateDir); err != nil {
+		return nil, session.SessionEvent{}, err
+	}
+	// S2: the runtime's own native state dir (~/.codex — the SAME list the
+	// launch spec grants) is a mandatory RW grant; the launch path
+	// guarantees its existence (H3), including on first use.
+	if err := ensureNativeDirs(homeNativeDirs(".codex")...); err != nil {
+		return nil, session.SessionEvent{}, err
+	}
 	// MCP injection (process start, -c overrides): the daemon-rendered
 	// PAGNET_MCP_CONFIG becomes the app-server's mcp_servers config. A
 	// missing/invalid config is a VISIBLE launch failure — the endpoint
@@ -585,6 +604,10 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	if !hasMarker {
 		env = append(env, "PAGNET_INSTANCE_ID="+sess.InstanceID)
 	}
+	// S2: TMPDIR is the per-instance scratch (an explicit pair — it
+	// overrides any inherited TMPDIR whose target is not in the sandbox
+	// allowlist).
+	env = append(env, "TMPDIR="+scratchPath(stateDir))
 	cmd.Env = ChildEnv(c.Env, env)
 
 	stdin, err := cmd.StdinPipe()
@@ -613,6 +636,23 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	// driver's own lifetime. The endpoint is terminated explicitly
 	// (Stop / Hibernate) or by the supervisor's StopAll on daemon
 	// shutdown, never by a turn's cancellation.
+	// S2: the per-instance sandbox allowlist (H4) — the endpoint driver
+	// is not a turn-class Adapter, so the spec is built here from the
+	// session: the workspace + this per-instance state dir as RW, the
+	// runtime's OWN native state (~/.codex — codex auth + sessions) as
+	// RW, the coarse system read + binary support paths as RO, and the
+	// daemon bridge socket (recovered from the session's
+	// PAGNET_MCP_CONFIG). The daemon's state dir is never a grant — only
+	// the socket's traversal chain reaches it. The supervisor wraps the
+	// Start on sandbox-requiring platforms and refuses the launch (fail
+	// closed) when the sandbox cannot be applied (H2/H3).
+	sb := driverSandbox(driverSandboxOpts{
+		workspace:  sess.Workspace,
+		stateDir:   stateDir,
+		nativeDirs: homeNativeDirs(".codex"),
+		binary:     bin,
+		env:        sess.Env,
+	})
 	h, err := el.Launch(context.Background(), proc.LaunchRequest{
 		InstanceID: sess.InstanceID,
 		TurnID:     "endpoint",
@@ -620,6 +660,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		Class:      proc.ClassEndpoint,
 		Cmd:        cmd,
 		Marker:     "PAGNET_INSTANCE_ID=" + sess.InstanceID,
+		Sandbox:    sb,
 	})
 	if err != nil {
 		stdin.Close()
@@ -1066,6 +1107,19 @@ func (c *CodexPersistent) dropEndpointRef(e *codexEndpoint) {
 		delete(c.endpoints, e.instanceID)
 	}
 	c.mu.Unlock()
+}
+
+// stateDir is where the codex endpoint keeps its per-instance pagnet state
+// (the scratch anchor, under the pagnet state dir, never the workspace —
+// §44). Same env-driven resolution as the qwen/fake drivers: the daemon's
+// state dir when PAGNET_STATE_DIR is set, else the default pagnet state
+// base.
+func (c *CodexPersistent) stateDir() string {
+	if d := os.Getenv("PAGNET_STATE_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "pagnet")
 }
 
 // modelFor resolves the launch model: the session's launch model > the

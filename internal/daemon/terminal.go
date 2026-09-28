@@ -413,7 +413,8 @@ func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bo
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
 	}
-	cmd, err := ad.InteractiveCmd(tm.d.turnSpecFor(row, resume, "", "terminal"))
+	spec := tm.d.turnSpecFor(row, resume, "", "terminal")
+	cmd, err := ad.InteractiveCmd(spec)
 	if err != nil {
 		return err
 	}
@@ -422,6 +423,9 @@ func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bo
 	// set, now owned in one place) and hands back the master. context.
 	// Background is deliberate: a PTY session is long-lived and must NOT
 	// be tied to a turn's context (it survives turns and detaches, §10).
+	// S2: the PTY process is sandboxed like every other class — the
+	// driver's per-instance spec (the same one its StartTurn launch
+	// carries) is applied at the supervisor's single policy point.
 	h, err := tm.d.sup.Launch(context.Background(), proc.LaunchRequest{
 		InstanceID: instanceID,
 		TurnID:     proc.PTYTurnID,
@@ -432,7 +436,8 @@ func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bo
 			Rows: terminalDefaultRows,
 			Cols: terminalDefaultCols,
 		},
-		Marker: "PAGNET_INSTANCE_ID=" + instanceID,
+		Marker:  "PAGNET_INSTANCE_ID=" + instanceID,
+		Sandbox: ad.SandboxSpec(spec),
 	})
 	if err != nil {
 		return fmt.Errorf("pty start: %w", err)

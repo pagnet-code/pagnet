@@ -13,6 +13,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -236,10 +237,25 @@ func (d *Daemon) sessionDriverCapabilities(rn domain.RuntimeName) *transport.Run
 // §36/§37): bounded by the daemon's helper concurrency AND a short
 // timeout, so a reconnect-driven inventory (which re-probes every
 // runtime) can never spawn an unbounded version-check storm.
+//
+// S2: the probe is SANDBOXED (helper.RunSandboxed). The runtime CLI is
+// untrusted code — an LLM with shell access — and its `--version`
+// entrypoint is that code executing, so the probe runs under the same
+// fail-closed filesystem policy as a full launch (the brief's default:
+// sandbox the probe). The probe spec is minimal by construction: NO RW
+// (a version probe writes nothing), the coarse system read, and the
+// probed binary's support paths (its dir + parent + the standard
+// interpreter/module locations) so it can EXECUTE. On a
+// sandbox-requiring platform a refusal (no Landlock, or the binary's
+// support paths unusable) makes the probe report failure — the runtime
+// is then reported version-less, never probed unsandboxed. (The git
+// probes stay plain: git is the trusted local toolchain, not an
+// untrusted runtime.)
 func (d *Daemon) runtimeVersion(path string) string {
+	spec := sandbox.NewSpec(sandbox.Options{Binary: path})
 	for _, flag := range []string{"--version", "-v"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		out, err := d.helper.Run(ctx, "", path, flag)
+		out, err := d.helper.RunSandboxed(ctx, d.selfExe, spec, "", path, flag)
 		cancel()
 		if err == nil {
 			return firstLine(string(out))

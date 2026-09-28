@@ -316,9 +316,12 @@ func TestCodexPersistent_CorrelationByID(t *testing.T) {
 // model: N turns on ONE endpoint process (stable PID), ONE thread (a
 // single thread/start), N turn/start — the process is alive across turns.
 func TestCodexPersistent_TurnLoopOneProcess(t *testing.T) {
-	methodsFile := filepath.Join(t.TempDir(), "methods.log")
-	sup, m, _ := newCodexFixture(t, "PAGNET_FAKE_CODEX_METHODS_FILE="+methodsFile)
+	// S2: the wire observation file is WRITTEN by the sandboxed fake
+	// app-server, so it must live in a granted RW location — the
+	// session's workspace.
 	workspace := t.TempDir()
+	methodsFile := filepath.Join(workspace, "methods.log")
+	sup, m, _ := newCodexFixture(t, "PAGNET_FAKE_CODEX_METHODS_FILE="+methodsFile)
 	sess := m.Session("inst-loop", domain.RuntimeCodex, workspace)
 	m.SetLaunchEnv(sess, codexMCPEnv("inst-loop"))
 
@@ -479,13 +482,16 @@ func TestCodexPersistent_CrashAfterAcceptIsInterrupted(t *testing.T) {
 // stale minted id, and the next turn COLD-STARTS a fresh thread
 // (thread/start — never thread/resume) and completes.
 func TestCodexPersistent_UnmaterialisedCrashColdStartsFresh(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "crashed")
-	methodsFile := filepath.Join(t.TempDir(), "methods.log")
+	// S2: the crash marker + wire observation file are WRITTEN by the
+	// sandboxed fake app-server, so they must live in a granted RW
+	// location — the session's workspace.
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "crashed")
+	methodsFile := filepath.Join(workspace, "methods.log")
 	_, m, _ := newCodexFixture(t,
 		"PAGNET_FAKE_CODEX_CRASH_AFTER_ACCEPT=1",
 		"PAGNET_FAKE_CODEX_CRASH_MARKER="+marker,
 		"PAGNET_FAKE_CODEX_METHODS_FILE="+methodsFile)
-	workspace := t.TempDir()
 	sess := m.Session("inst-cold", domain.RuntimeCodex, workspace)
 	m.SetLaunchEnv(sess, codexMCPEnv("inst-cold"))
 
@@ -550,12 +556,15 @@ func TestCodexPersistent_UnmaterialisedCrashColdStartsFresh(t *testing.T) {
 // standing surface) on BOTH thread/start (cold) and thread/resume
 // (resume) — and is NEVER part of the turn input.
 func TestCodexPersistent_StandingDocumentDelivery(t *testing.T) {
-	standingFile := filepath.Join(t.TempDir(), "standing.txt")
-	turnInputFile := filepath.Join(t.TempDir(), "turn-input.txt")
+	// S2: the observation files are WRITTEN by the sandboxed fake
+	// app-server, so they must live in a granted RW location — the
+	// session's workspace.
+	workspace := t.TempDir()
+	standingFile := filepath.Join(workspace, "standing.txt")
+	turnInputFile := filepath.Join(workspace, "turn-input.txt")
 	_, m, _ := newCodexFixture(t,
 		"PAGNET_FAKE_CODEX_STANDING_FILE="+standingFile,
 		"PAGNET_FAKE_CODEX_TURN_INPUT_FILE="+turnInputFile)
-	workspace := t.TempDir()
 	sess := m.Session("inst-std", domain.RuntimeCodex, workspace)
 	m.SetLaunchEnv(sess, codexMCPEnv("inst-std"))
 	const standing = "YOU ARE A PAGNET AGENT. Standing document v1."
@@ -669,9 +678,12 @@ func TestCodexPersistent_MCPConfig(t *testing.T) {
 	})
 
 	t.Run("overridesReachTheProcess", func(t *testing.T) {
-		argvFile := filepath.Join(t.TempDir(), "argv.json")
-		_, m, _ := newCodexFixture(t, "PAGNET_FAKE_CODEX_ARGV_FILE="+argvFile)
+		// S2: the argv record is WRITTEN by the sandboxed fake
+		// app-server — it must live in a granted RW location (the
+		// session's workspace).
 		workspace := t.TempDir()
+		argvFile := filepath.Join(workspace, "argv.json")
+		_, m, _ := newCodexFixture(t, "PAGNET_FAKE_CODEX_ARGV_FILE="+argvFile)
 		sess := m.Session("inst-mcp", domain.RuntimeCodex, workspace)
 		m.SetLaunchEnv(sess, codexMCPEnv("inst-mcp"))
 		res, _, submitErr := codexSubmitTurn(t, m, sess, "t1", "first")
@@ -864,11 +876,14 @@ func TestCodexPersistent_EventMapping(t *testing.T) {
 // error when the decision is inexpressible — never a guessed approval).
 func codexInteractionCase(t *testing.T, method, decision, answer, kind string, wantResult, wantError string) {
 	t.Helper()
-	responseFile := filepath.Join(t.TempDir(), "response.json")
+	// S2: the response record is WRITTEN by the sandboxed fake
+	// app-server — it must live in a granted RW location (the
+	// session's workspace).
+	workspace := t.TempDir()
+	responseFile := filepath.Join(workspace, "response.json")
 	_, m, _ := newCodexFixture(t,
 		"PAGNET_FAKE_CODEX_INTERACTION="+method,
 		"PAGNET_FAKE_CODEX_RESPONSE_FILE="+responseFile)
-	workspace := t.TempDir()
 	sess := m.Session("inst-int", domain.RuntimeCodex, workspace)
 	m.SetLaunchEnv(sess, codexMCPEnv("inst-int"))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

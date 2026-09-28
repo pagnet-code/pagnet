@@ -623,7 +623,16 @@ type HeartbeatPayload struct {
 	// process-isolated). Additive: a control plane that predates the
 	// field ignores it.
 	BridgeIsolation string `json:"bridgeIsolation,omitempty"`
-	Metrics         struct {
+	// RuntimeSandbox states how the daemon's managed runtime processes
+	// are filesystem-isolated (S2): "landlock" (Linux, the Landlock
+	// kernel boundary is applied at the supervisor's launch layer),
+	// "fail_closed" (Linux, no Landlock — the daemon refuses to launch
+	// untrusted runtimes rather than run them unsandboxed) or
+	// "unsupported_platform" (no Landlock on this platform — runtimes
+	// are NOT isolated; owner-scoped dev machines). Additive: a control
+	// plane that predates the field ignores it.
+	RuntimeSandbox string `json:"runtimeSandbox,omitempty"`
+	Metrics        struct {
 		CPUCount      int     `json:"cpuCount"`
 		CPULoad       float64 `json:"cpuLoad"`
 		MemTotalBytes int64   `json:"memTotalBytes"`

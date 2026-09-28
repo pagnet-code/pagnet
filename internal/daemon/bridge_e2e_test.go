@@ -82,6 +82,14 @@ func newBridgeE2EDaemon(t *testing.T) (*Daemon, *websocket.Conn) {
 // in-memory host connection (standing in for the out-of-scope control
 // plane): every tool is answered ok with its name echoed, so a test can
 // assert the EXACT tool was relayed.
+//
+// It is the SOLE reader of this host connection for the test's lifetime: a
+// test that must read the same conn itself (a driveDeliver→readUntilAck of a
+// functional turn) must NOT run while this responder is attached — two
+// readers on one websocket race, and the responder swallows every
+// non-agent.request envelope (it answers the relay and discards the rest).
+// Such a test swaps the daemon onto a fresh host conn (see
+// TestSandboxE2E_EndpointCannotReadDaemonState) instead of sharing this one.
 func startBridgeRelayResponder(t *testing.T, server *websocket.Conn) {
 	t.Helper()
 	go func() {
@@ -215,6 +223,83 @@ func TestBridgeE2E_WorkerNetworkWorks(t *testing.T) {
 		t.Fatalf("network_whoami = %v, want a successful correlated relay", lines[1])
 	}
 	t.Logf("worker in-tree bridge: auth_ok + network_whoami relayed (instance %s)", instanceID)
+}
+
+// TestBridgeE2E_SpawnBridgeWorks: the production bridge path — the
+// sandboxed endpoint EXECs the daemon-rendered bridge worker (the real
+// pagnet binary, exactly like every real runtime's MCP client) as its
+// child and speaks MCP stdio to it. The worker authenticates to the
+// daemon bridge with the per-activation nonce, and — on Linux — the
+// daemon's SO_PEERCRED process-tree check reaches the endpoint's root
+// ONE HOP UP (worker → endpoint), binding the spawned bridge process to
+// the instance (the hostile in-tree fixtures pass that check at 0 hops;
+// this is the real descendant case).
+//
+// It is also the S2 proof that the sandbox spec grants the bridge
+// worker's binary dir (recovered from the rendered PAGNET_MCP_CONFIG):
+// without it the sandboxed runtime cannot exec its MCP server, and the
+// fixture records the spawn failure in the result file.
+func TestBridgeE2E_SpawnBridgeWorks(t *testing.T) {
+	d, server := newBridgeE2EDaemon(t)
+	startBridgeRelayResponder(t, server)
+
+	// The bridge command the daemon renders must be a real pagnet binary
+	// (the spawned worker implements `mcp worker`), not the test binary.
+	pagnetBin := buildPagnetBinary(t)
+	d.selfExe = pagnetBin
+
+	pf := mustPersistentFake(t, d)
+	resultFile := filepath.Join(t.TempDir(), "bridge-result.json")
+	pf.Env = []string{
+		"PAGNET_FAKE_SPAWN_BRIDGE=1",
+		"PAGNET_FAKE_BRIDGE_RESULT_FILE=" + resultFile,
+	}
+
+	instanceID := launchFakeEndpoint(t, d, "worker")
+
+	// Spawn mode records the MCP stdio responses (the fixture plays the
+	// MCP client): the initialize handshake, then the tools/call response.
+	// A daemon-side auth refusal or tree-check rejection surfaces as a
+	// failed/missing relay in the tools/call result.
+	lines := readBridgeResult(t, resultFile)
+	if len(lines) < 2 {
+		t.Fatalf("expected initialize + tools/call responses, got %v", lines)
+	}
+	for _, l := range lines {
+		if e, _ := l["error"].(string); l["fixture"] == "error" {
+			t.Fatalf("spawn fixture failed: %s", e)
+		}
+	}
+	// JSON-RPC ids unmarshal as float64 (json → any): compare as numbers.
+	if id, _ := lines[0]["id"].(float64); id != 1 || lines[0]["result"] == nil {
+		t.Fatalf("MCP initialize = %v, want a successful handshake (the worker ran and responded)", lines[0])
+	}
+	if id, _ := lines[1]["id"].(float64); id != 2 {
+		t.Fatalf("tools/call response id = %v, want 2: %v", lines[1]["id"], lines[1])
+	}
+	if text := mcpResultText(lines[1]); !strings.Contains(text, "network_whoami") || !strings.Contains(text, `"ok": true`) {
+		t.Fatalf("tools/call result = %q, want the relayed network_whoami result", text)
+	}
+	t.Logf("spawned bridge (real pagnet worker, auth + tree check by the daemon): network_whoami relayed (instance %s)", instanceID)
+}
+
+// mcpResultText extracts the concatenated text content of an MCP
+// tools/call result line ("" when the line carries none — e.g. a JSON-RPC
+// error response).
+func mcpResultText(line map[string]any) string {
+	result, ok := line["result"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	content, _ := result["content"].([]any)
+	var b strings.Builder
+	for _, c := range content {
+		cm, _ := c.(map[string]any)
+		if s, _ := cm["text"].(string); s != "" {
+			b.WriteString(s)
+		}
+	}
+	return b.String()
 }
 
 // TestBridgeE2E_RepControlWorks: a live representative endpoint's in-tree

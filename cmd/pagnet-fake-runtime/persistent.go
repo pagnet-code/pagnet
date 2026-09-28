@@ -299,6 +299,11 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	// select always resolves to the drop path, never a panic.
 	stopping := make(chan struct{})
 
+	// S2 e2e fixture: the scripted secret-read probe (runs BEFORE the
+	// bridge fixtures so the sandbox-denial evidence precedes the bridge
+	// auth on the same endpoint) when scripted via PAGNET_FAKE_FS_PROBE
+	// (see fs_probe_fixture.go).
+	fsProbe()
 	// S1 e2e fixtures: play the runtime's MCP-client role (spawn the
 	// daemon-rendered bridge, or dial the bridge socket in-tree as the
 	// supervisor root) when scripted via PAGNET_FAKE_SPAWN_BRIDGE /

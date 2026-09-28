@@ -17,6 +17,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -142,6 +143,11 @@ func (stubAdapter) PID(string) *int            { return nil }
 func (stubAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
 }
+
+// SandboxSpec: nil — the stub spawns no process (its StartTurn returns
+// immediately), so no launch ever carries its spec; the supervisor's
+// fail-closed gate only applies to launches, of which there are none.
+func (stubAdapter) SandboxSpec(agentruntime.TurnSpec) *sandbox.Spec { return nil }
 
 // F4: two CONCURRENT read-write launches on the same repository (parallel
 // per-instance queues) must not both decide they are the first RW agent —

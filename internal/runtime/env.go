@@ -21,6 +21,14 @@ import (
 // injection like the MCP bridge config and the identity vars) are
 // appended after the filter, in order, and always win — they are
 // pagnet's own, deliberately-injected values, not inherited secrets.
+// "Always win" is ENFORCED, not assumed: a child environment is a list
+// where the FIRST occurrence of a key is the one the child observes
+// (execve passes the list verbatim; libc/Go return the first match), so
+// if the filtered inherited env carries the same key, every earlier
+// occurrence of that key is dropped and the last explicit occurrence
+// stands. (Without this, an inherited TMPDIR=/tmp would shadow an
+// explicit TMPDIR=<instance scratch> — the S2 per-instance scratch
+// override relies on the documented contract.)
 func ChildEnv(extra ...[]string) []string {
 	out := make([]string, 0, 32)
 	for _, kv := range os.Environ() {
@@ -35,6 +43,32 @@ func ChildEnv(extra ...[]string) []string {
 	}
 	for _, pairs := range extra {
 		out = append(out, pairs...)
+	}
+	// Enforce the documented explicit-pair precedence (last occurrence
+	// wins) for every key an explicit pair provides.
+	explicitKeys := make(map[string]bool)
+	for _, pairs := range extra {
+		for _, kv := range pairs {
+			if key, _, ok := strings.Cut(kv, "="); ok {
+				explicitKeys[key] = true
+			}
+		}
+	}
+	if len(explicitKeys) > 0 {
+		last := make(map[string]int, len(explicitKeys))
+		for i, kv := range out {
+			if key, _, ok := strings.Cut(kv, "="); ok && explicitKeys[key] {
+				last[key] = i
+			}
+		}
+		kept := make([]string, 0, len(out))
+		for i, kv := range out {
+			if key, _, ok := strings.Cut(kv, "="); ok && explicitKeys[key] && last[key] != i {
+				continue
+			}
+			kept = append(kept, kv)
+		}
+		out = kept
 	}
 	return out
 }

@@ -82,7 +82,10 @@ func newQwenLifecycleFixture(t *testing.T, extraEnv ...string) (*proc.Supervisor
 	if err := os.WriteFile(script, []byte(fakeQwenPersistentScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	argsPath := filepath.Join(dir, "args.txt")
+	// S2: the argv record is WRITTEN by the sandboxed child, so it must
+	// live in a granted RW location — the workspace (the stub's own dir
+	// is RO: the binary support grant).
+	argsPath := filepath.Join(workspace, "args.txt")
 	// The state dir is read by the DRIVER (the test process), so t.Setenv
 	// works for it.
 	t.Setenv("PAGNET_STATE_DIR", stateDir)

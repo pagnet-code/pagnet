@@ -13,6 +13,7 @@ import (
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -37,6 +38,13 @@ func (a *turnCapturingAdapter) BinaryPath() (string, bool) { return "stub", true
 func (a *turnCapturingAdapter) PID(string) *int            { return nil }
 func (a *turnCapturingAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
+}
+
+// SandboxSpec: nil — the stub spawns no process (its StartTurn completes
+// in-process), so no launch ever carries its spec; the supervisor's
+// fail-closed gate only applies to launches, of which there are none.
+func (a *turnCapturingAdapter) SandboxSpec(agentruntime.TurnSpec) *sandbox.Spec {
+	return nil
 }
 
 // newLaunchCryptoDaemon builds a daemon (fresh temp state dir, repo as the

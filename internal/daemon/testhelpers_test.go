@@ -7,7 +7,23 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
+
+// TestMain intercepts the S2 sandbox-wrapper re-exec: in tests the
+// daemon's selfExe (its sandbox wrapper) is THIS test binary, so a
+// wrapped launch execs `<this test binary> sandbox-exec ...`. The
+// production pagnet main() intercepts that subcommand BEFORE the CLI
+// tree; the test binary does the same here, before any test runs.
+// Without it the re-exec would fall through to the Go test main and
+// (re)run the whole suite as the "runtime" — never reaching the wrapper.
+func TestMain(m *testing.M) {
+	if len(os.Args) >= 2 && os.Args[1] == sandbox.Subcommand {
+		os.Exit(sandbox.RunWrapperMain(os.Args[2:]))
+	}
+	os.Exit(m.Run())
+}
 
 // p0FakeBinary builds (when stale/missing) the pagnet-fake-runtime
 // fixture binary into the scratch dir (NEVER into the repo's bin/) and

@@ -21,6 +21,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/accounts"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
 var serverURL string
@@ -91,6 +92,13 @@ func envOrDefault(key, def string) string {
 }
 
 func main() {
+	// The hidden sandbox wrapper (S2) is intercepted BEFORE the CLI command
+	// tree: the wrapper's pre-sandbox path must stay minimal and must never
+	// touch the CLI's flag/credential plumbing. No new binary — it is a
+	// subcommand of the existing pagnet binary (`pagnet sandbox-exec ...`).
+	if len(os.Args) >= 2 && os.Args[1] == sandbox.Subcommand {
+		os.Exit(sandbox.RunWrapperMain(os.Args[2:]))
+	}
 	root = newRootCmd()
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
