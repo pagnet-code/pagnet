@@ -10,9 +10,13 @@
 //     sessions) so a turn's whole tree — runtime CLI, shells, MCP
 //     bridges, node/python helpers — is one killable unit;
 //   - group termination (TERM → grace → KILL via the OS kill syscall on
-//     the negative PGID; never by shelling out to kill/pkill/ps);
-//   - single-owner Wait (one goroutine reaps each direct child exactly
-//     once and publishes the result);
+//     the negative PGID; never by shelling out to kill/pkill/ps), with
+//     an honest bounded result when the group cannot be killed (EPERM);
+//   - supervisor-owned reap: one dedicated reaper goroutine per managed
+//     process performs the single cmd.Wait exactly once and publishes
+//     the result; callers observe the published exit (unbounded Wait or
+//     bounded WaitCtx/WaitDeadline) and never reap themselves, so a
+//     stuck or unkillable child can never wedge a lifecycle caller;
 //   - launch guards (global turn semaphore, per-turn and global
 //     owned-process ceilings, host process-pressure refusal,
 //     EAGAIN/EMFILE/ENFILE classification with exponential backoff and a

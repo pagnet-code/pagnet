@@ -34,6 +34,19 @@ var (
 	// ErrMarkerUnavailable: the platform cannot read another process's
 	// environment (macOS), so marker-based ownership proof is impossible.
 	ErrMarkerUnavailable = errors.New("process environment marker not readable on this platform")
+	// ErrProcessUnkillable: the termination sequence completed but the
+	// process group could NOT be killed (SIGKILL failed with a non-ESRCH
+	// error, e.g. EPERM — observed live on macOS). The process is still
+	// ALIVE: the supervisor keeps its ownership record (it does not
+	// unregister), and the caller must settle into an honest failed
+	// state — never assume the process is gone, and never wait
+	// unboundedly for its exit.
+	ErrProcessUnkillable = errors.New("process could not be killed")
+	// ErrExitNotObserved: a bounded wait (WaitCtx/WaitDeadline) expired
+	// before the process's exit was published. The process is still
+	// alive (or its reap is still pending) and the supervisor keeps
+	// tracking it.
+	ErrExitNotObserved = errors.New("exit not observed within deadline")
 )
 
 // IsResourcePressureError reports whether a launch error indicates host
@@ -170,6 +183,15 @@ type Config struct {
 	HostPressurePct int
 	// TermGrace: TERM → grace → KILL window for group termination (§23).
 	TermGrace time.Duration
+	// ReapWaitBound: how long a lifecycle caller (Handle.Close, the
+	// launch record-failure path) waits for the supervisor-owned reap to
+	// publish the exit AFTER requesting termination. A process that
+	// cannot be killed (SIGKILL → EPERM) must not wedge the caller:
+	// the wait expires, the caller settles into an honest failed state,
+	// and the reaper keeps waiting in the background while the
+	// supervisor keeps tracking the process. For a killable process the
+	// reap completes in milliseconds, far inside this bound.
+	ReapWaitBound time.Duration
 	// BackoffMin/BackoffMax: exponential backoff bounds after
 	// resource-pressure launch failures (§35).
 	BackoffMin time.Duration
@@ -199,6 +221,13 @@ type Config struct {
 	// /proc or kern.proc.
 	countOwnedFn      func(map[int]bool) (int, error)
 	groupLiveMemberFn func(int) (bool, error)
+
+	// signalGroupFn is a test seam for the managed-process group-kill
+	// paths (abort, terminateGroup): nil = the platform SignalGroup. It
+	// lets a test simulate an UNKILLABLE process group (the OS returns
+	// EPERM on SIGKILL — the live macOS condition) deterministically,
+	// without privileges or a broken host.
+	signalGroupFn func(pgid int, sig syscall.Signal) error
 }
 
 // DefaultConfig returns the safe defaults (§29/§31/§32/§33/§35).
@@ -210,6 +239,7 @@ func DefaultConfig() Config {
 		OwnedProcessesHard: 256,
 		HostPressurePct:    80,
 		TermGrace:          5 * time.Second,
+		ReapWaitBound:      10 * time.Second,
 		BackoffMin:         time.Second,
 		BackoffMax:         30 * time.Second,
 		CircuitFailures:    5,
@@ -314,8 +344,12 @@ type EndpointLifecycle interface {
 	Launch(ctx context.Context, req LaunchRequest) (*Handle, error)
 	// StopEndpoint terminates the instance's live endpoint (no-op when
 	// none). It runs the standard TERM → grace → KILL sequence on the
-	// endpoint's process group.
-	StopEndpoint(instanceID string)
+	// endpoint's process group and returns once the signal sequence
+	// completes — it does NOT wait for the process's exit (the
+	// supervisor's reaper owns the reap). It returns an error wrapping
+	// ErrProcessUnkillable when the group could not be killed (the
+	// process is still alive and stays tracked); nil otherwise.
+	StopEndpoint(instanceID string) error
 	// EndpointPID is the instance's live endpoint process id (nil when
 	// no endpoint is live).
 	EndpointPID(instanceID string) *int
@@ -339,6 +373,11 @@ type Supervisor struct {
 	// FAILED: the result is UNKNOWN, never empty.
 	countOwnedFn      func(map[int]bool) (int, error)
 	groupLiveMemberFn func(int) (bool, error)
+
+	// Group-kill source for the managed-process paths (abort,
+	// terminateGroup); resolved from the Config seam (or the platform
+	// SignalGroup) at construction.
+	signalGroupFn func(pgid int, sig syscall.Signal) error
 
 	mu             sync.Mutex
 	turns          map[Key]*managedTurn
@@ -399,6 +438,9 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 	if cfg.TermGrace <= 0 {
 		cfg.TermGrace = d.TermGrace
 	}
+	if cfg.ReapWaitBound <= 0 {
+		cfg.ReapWaitBound = d.ReapWaitBound
+	}
 	if cfg.BackoffMin <= 0 {
 		cfg.BackoffMin = d.BackoffMin
 	}
@@ -436,6 +478,10 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 	if glm == nil {
 		glm = GroupHasLiveMemberErr
 	}
+	sg := cfg.signalGroupFn
+	if sg == nil {
+		sg = SignalGroup
+	}
 	s := &Supervisor{
 		cfg:                cfg,
 		log:                log,
@@ -451,6 +497,7 @@ func NewSupervisor(cfg Config, log *slog.Logger) *Supervisor {
 		userProcessCountFn: upc,
 		countOwnedFn:       co,
 		groupLiveMemberFn:  glm,
+		signalGroupFn:      sg,
 	}
 	go s.monitor()
 	return s
@@ -750,6 +797,17 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		"runtime", req.Runtime, "class", req.Class,
 		"pid", t.pid.Load(), "pgid", t.pgid.Load())
 
+	// The supervisor owns the reap lifecycle: this dedicated reaper is
+	// the SINGLE cmd.Wait owner for the child (launched exactly once,
+	// here, after a successful start). It blocks in cmd.Wait until the
+	// child exits, then reclaims escaped descendants and publishes the
+	// exit exactly once (finish → cleanup). Callers never reap — they
+	// observe the published exit (Handle.Wait / WaitCtx / WaitDeadline),
+	// so a stuck or unkillable child can wedge the reaper (a
+	// background goroutine that holds no lock) but never a lifecycle
+	// caller.
+	go t.reapOwner()
+
 	// The durable ownership record + restart reconciliation are the
 	// PRIMARY orphan-recovery mechanism (§39): the record is the ONLY
 	// cross-restart memory of this tree, and a daemon crash between
@@ -762,20 +820,29 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 	if err := s.writeRecord(t); err != nil {
 		s.log.Error("ownership record write failed; failing launch (unrecorded process = unowned process)",
 			"instance", key.InstanceID, "turn", key.TurnID, "err", err)
-		t.Terminate("ownership_record_failed")
-		// No other goroutine holds this handle yet: Launch is the owner
-		// on this path, and the reap (ownerWait → finish → cleanup)
-		// unregisters the turn and releases the slot exactly once. The
-		// fail() helper must NOT also run — it would release the slot a
-		// second time (stealing another turn's semaphore token).
-		t.ownerWait()
+		if terr := t.Terminate("ownership_record_failed"); terr != nil {
+			s.log.Error("ownership record write failed and the process could not be killed; supervisor keeps tracking it",
+				"instance", key.InstanceID, "turn", key.TurnID, "err", terr)
+		}
+		// The reaper (started above) owns the reap: it unregisters the
+		// turn and releases the slot exactly once. The fail() helper
+		// must NOT also run — it would release the slot a second time
+		// (stealing another turn's semaphore token). The wait is
+		// BOUNDED: an unkillable process must not wedge Launch (the
+		// caller may hold the activation lock); when it expires the
+		// reaper keeps waiting in the background and the supervisor
+		// keeps tracking the process.
+		if !t.waitForExitBounded(s.cfg.ReapWaitBound) {
+			s.log.Error("ownership record write failed; process not reaped within the wait bound; supervisor keeps tracking it",
+				"instance", key.InstanceID, "turn", key.TurnID, "pgid", t.pgid.Load())
+		}
 		s.launchFailedTotal.Add(1)
 		return nil, fmt.Errorf("ownership record: %w", err)
 	}
 
 	// Context watcher: cancellation terminates the GROUP (not just the
-	// direct child). The owner goroutine (the adapter's turn loop / the
-	// terminal exit loop) reaps; this watcher only requests termination.
+	// direct child). The reaper reaps; this watcher only requests
+	// termination.
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -791,6 +858,7 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 // so duplicate-handle consumers observe the failure, and release.
 func (t *managedTurn) finishLaunchError(err error) {
 	t.state.Store(stFinished)
+	t.reaped.Store(true) // no process to reap: the lifecycle is complete
 	t.exitOnce.Do(func() {
 		t.exitCh <- Exit{Err: err, Reason: "launch_failed"}
 		close(t.exitCh)
@@ -856,8 +924,8 @@ func (h *Handle) PID() int { return int(h.t.pid.Load()) }
 // PGID is the process group id (== pid: the child is the group leader).
 func (h *Handle) PGID() int { return int(h.t.pgid.Load()) }
 
-// Exit returns the exit channel (closed exactly once after the owner
-// reaps).
+// Exit returns the exit channel (closed exactly once after the
+// supervisor's reaper reaps the process).
 func (h *Handle) Exit() <-chan Exit { return h.t.exitCh }
 
 // PTY is the PTY master (ClassPTY handles and PTY-owning ClassEndpoint
@@ -866,19 +934,54 @@ func (h *Handle) Exit() <-chan Exit { return h.t.exitCh }
 // terminal view, Phase 3) hold it as a VIEW and never close it.
 func (h *Handle) PTY() *os.File { return h.t.ptyMaster.Load() }
 
-// Wait is the OWNER's reap: call it exactly once, from the goroutine
-// that read the process's stdout (turn) or owns the session (PTY),
-// AFTER all reads are done. It performs the single cmd.Wait, publishes
-// the exit, closes the PTY master, and releases the turn's resources.
-// Idempotent: a second call returns the stored result.
+// Wait blocks until the process's exit is published and returns its
+// error (nil = clean exit 0). The supervisor's dedicated reaper owns
+// the single cmd.Wait; Wait only observes the published exit, so it is
+// safe from ANY goroutine and any number of times (idempotent: after
+// the first return it returns the stored result immediately).
+//
+// Wait is UNBOUNDED: a stuck or unkillable child (SIGKILL → EPERM) keeps
+// the reaper blocked, and with it every Wait caller. A lifecycle path
+// that must not block forever (activation, stop, cleanup) must use
+// WaitCtx or WaitDeadline instead — the reaper keeps running in the
+// background either way, and the supervisor keeps tracking the process.
 func (h *Handle) Wait() error {
-	exit, _ := h.t.ownerWait()
-	return exit.Err
+	h.t.waitForExit()
+	return h.t.exit().Err
 }
 
-// Abort is the OWNER's deliberate fast abort (e.g. a session mismatch):
-// SIGKILL the whole group immediately, no TERM grace. The owner then
-// calls Wait.
+// WaitCtx waits for the process's exit with a bound: it returns the
+// published exit (err == nil) when the reaper publishes it before ctx
+// is done, and (Exit{}, an error wrapping ErrExitNotObserved and
+// ctx.Err()) when the bound expires first.
+//
+// A timeout is an HONEST observation, not a result: the process is
+// still alive (or its reap still pending), the supervisor keeps
+// tracking it, and the caller must settle into a failed state — it
+// must not assume the process is gone. The reap itself is unaffected:
+// the reaper continues in the background and publishes the exit when
+// the process actually dies.
+func (h *Handle) WaitCtx(ctx context.Context) (Exit, error) {
+	select {
+	case <-h.t.exitCh:
+		return h.t.exit(), nil
+	case <-ctx.Done():
+		return Exit{}, fmt.Errorf("%w: %w", ErrExitNotObserved, ctx.Err())
+	}
+}
+
+// WaitDeadline is WaitCtx with a plain duration deadline.
+func (h *Handle) WaitDeadline(d time.Duration) (Exit, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return h.WaitCtx(ctx)
+}
+
+// Abort is the deliberate fast abort (e.g. a session mismatch): SIGKILL
+// the whole group immediately, no TERM grace. The reaper reaps the
+// group after it dies; observe the exit with Wait/WaitCtx/WaitDeadline.
+// If the group cannot be killed (EPERM), the failure is logged with the
+// process identity; the supervisor keeps tracking it.
 func (h *Handle) Abort(reason string) {
 	h.t.abort(reason)
 }
@@ -886,18 +989,39 @@ func (h *Handle) Abort(reason string) {
 // Terminate requests group termination from ANY goroutine (Stop,
 // shutdown, monitor, ctx watcher): SIGTERM the group, wait the grace,
 // SIGKILL survivors. It returns once the signal sequence completes —
-// the owner's reap follows independently. Idempotent.
-func (h *Handle) Terminate(reason string) {
-	h.t.Terminate(reason)
+// it NEVER waits for the process's exit (the reaper owns the reap), so
+// it is bounded by the grace window even for an unkillable process.
+// Idempotent: concurrent and repeated callers get the same result.
+//
+// The result is honest: nil when the group is dead (or was already
+// dead), an error wrapping ErrProcessUnkillable when the group could
+// NOT be killed (the process is still alive and the supervisor keeps
+// tracking it).
+func (h *Handle) Terminate(reason string) error {
+	return h.t.Terminate(reason)
 }
 
-// Close is the defer-safe finalizer: when the owner has not reaped yet
-// (early return, panic unwind), it aborts the group and reaps. After a
-// normal Wait it is a no-op.
+// Close is the defer-safe finalizer: when the reap is not complete yet
+// (early return, panic unwind), it aborts the group (SIGKILL, no TERM
+// grace) and waits for the reaper to publish the exit. After a normal
+// Wait it is a no-op.
+//
+// The wait is BOUNDED (Config.ReapWaitBound): a process that cannot be
+// killed (SIGKILL → EPERM) must not wedge the caller — Close returns
+// when the bound expires, the reaper keeps waiting in the background,
+// and the supervisor keeps tracking the process. For a killable
+// process the reap completes in milliseconds, far inside the bound, so
+// the observable behavior is unchanged.
 func (h *Handle) Close() {
-	if !h.t.reaped.Load() {
-		h.t.abort("close")
-		h.t.ownerWait()
+	if h.t.reaped.Load() {
+		return
+	}
+	h.t.abort("close")
+	if !h.t.waitForExitBounded(h.t.s.cfg.ReapWaitBound) {
+		h.t.s.log.Error("close: process not reaped within the wait bound; supervisor keeps tracking it (reap continues in the background)",
+			"instance", h.t.InstanceID, "turn", h.t.TurnID,
+			"pid", h.t.pid.Load(), "pgid", h.t.pgid.Load(),
+			"runtime", h.t.Runtime, "bound", h.t.s.cfg.ReapWaitBound)
 	}
 }
 
@@ -934,8 +1058,18 @@ type managedTurn struct {
 	identity  string
 	startedAt time.Time
 
-	state      atomic.Int32
-	reaped     atomic.Bool
+	state atomic.Int32
+	// reaped: the process's lifecycle is COMPLETE — the reaper has
+	// reaped the child and published the exit (finish), or the launch
+	// failed before the process started (finishLaunchError). Close uses
+	// it to decide whether there is still work to do.
+	reaped atomic.Bool
+	// reapOwned: the dedicated reaper (reapOwner) has taken ownership of
+	// the single cmd.Wait. Launched exactly once from Launch; the CAS is
+	// a defensive backstop that a double launch can never double-reap
+	// (a second cmd.Wait would error, and a second finish would
+	// double-release the turn slot).
+	reapOwned  atomic.Bool
 	forced     atomic.Bool
 	warnedProc atomic.Bool
 
@@ -946,9 +1080,24 @@ type managedTurn struct {
 	termOnce   sync.Once
 	termDone   chan struct{}
 	termReason atomic.Value // string
+	// termErr: the honest result of the termination sequence (nil = the
+	// group is dead or was already dead; non-nil = it could not be
+	// killed). Written by terminateSequence BEFORE close(termDone) and
+	// read by Terminate AFTER <-termDone — the channel close is the
+	// happens-before edge, so no extra synchronization is needed.
+	termErr error
 }
 
-// ownerWait is the single finalize: reclaim any group members that
+// reapOwner is the supervisor's dedicated reaper for one managed
+// process: the SINGLE cmd.Wait owner (§25). It is launched exactly
+// once, from Launch, after a successful start — the supervisor owns the
+// reap lifecycle, and callers never reap: they observe the published
+// exit (Handle.Wait / WaitCtx / WaitDeadline). Because the reap lives in
+// this background goroutine (which holds no runtime/session lock), a
+// stuck or unkillable child (SIGKILL → EPERM) can wedge the reaper but
+// never a lifecycle caller.
+//
+// The reap is the single finalize: reclaim any group members that
 // outlived the turn, then reap the direct child exactly once. §19/§24:
 // when the turn is no longer executing there must be no forgotten runtime
 // process tree — a runtime that exits cleanly can still leave descendants
@@ -966,7 +1115,7 @@ type managedTurn struct {
 //     child is unreaped, any live group member is this turn's own
 //     descendant. The check fires ONLY when the child has already EXITED
 //     (zombie, ProcessIsZombie): if the child is still alive, the group
-//     is the RUNNING turn itself — an owner may legitimately Wait on a
+//     is the RUNNING turn itself — the reaper may legitimately Wait on a
 //     live turn, and the Wait must block, not terminate it. Firing here
 //     on a live child would kill the running turn (the 2026-09-16
 //     TestProcessExplosion regression: an early Wait killed the
@@ -1002,15 +1151,19 @@ type managedTurn struct {
 //     check. Check 1 then skips; the child dies from the in-flight group
 //     signal, cmd.Wait reaps it, and check 2 reclaims anything that
 //     still survives.
-//   - Normal path: the owner reaps after all stdout reads are done, so
-//     the child has already exited (zombie) and check 1 sees only true
-//     descendants.
+//   - Normal path: the child has already exited (zombie) by the time the
+//     reaper's cmd.Wait returns, so the post-reap check sees only true
+//     descendants; if the child was already a zombie when the reaper
+//     started (a very short-lived process), the pre-reap check fires
+//     instead.
 //
-// Idempotent: only the first caller reaps; the rest observe the exit.
-func (t *managedTurn) ownerWait() (Exit, error) {
-	if !t.reaped.CompareAndSwap(false, true) {
-		t.waitForExit()
-		return t.exit(), nil
+// Single-owner by construction: Launch starts exactly one reaper per
+// managed process; the reapOwned CAS is a defensive backstop that a
+// double launch can never double-reap (a second cmd.Wait would error,
+// and a second finish would double-release the turn slot).
+func (t *managedTurn) reapOwner() {
+	if !t.reapOwned.CompareAndSwap(false, true) {
+		return // defensive: the single cmd.Wait is already owned
 	}
 	pid := int(t.pid.Load())
 	pgid := int(t.pgid.Load())
@@ -1034,7 +1187,26 @@ func (t *managedTurn) ownerWait() (Exit, error) {
 			t.terminateGroup()
 		}
 	}
-	waitErr := t.cmd.Wait()
+	// Reap the direct child WITHOUT closing its I/O pipes. cmd.Wait()
+	// would close parentIOPipes (the StdoutPipe/StderrPipe read ends) the
+	// moment the child exits — but this reaper runs in the background,
+	// CONCURRENTLY with the driver's stdout reads. Closing the pipe mid-
+	// read makes the driver's next read fail with "file already closed"
+	// instead of EOF (the opencode mid-turn-death regression). In the
+	// pre-reap-owner design the driver WAS the cmd.Wait owner and called
+	// it only after draining, so the close always followed the reads.
+	//
+	// cmd.Process.Wait() performs the same single waitpid (the child is
+	// reaped exactly once) and returns the same exit status, but leaves
+	// the pipes open: the driver finishes draining and closes what it
+	// owns, and the remaining parent ends are released when the cmd is
+	// garbage-collected after the turn is unregistered. The exit status
+	// is converted exactly as cmd.Wait() does (nil on success, an
+	// *exec.ExitError on a non-zero exit).
+	state, waitErr := t.cmd.Process.Wait()
+	if waitErr == nil && !state.Success() {
+		waitErr = &exec.ExitError{ProcessState: state}
+	}
 	// Post-reap descendant reclaim (early-Wait case: the child exited
 	// during the Wait above). Fire only when the pgid number is unheld —
 	// a held number is a pid reused by an unrelated new turn (E2E82):
@@ -1052,10 +1224,14 @@ func (t *managedTurn) ownerWait() (Exit, error) {
 		case live:
 			t.s.log.Warn("reclaiming descendants that outlived the turn (post-reap)",
 				"instance", t.InstanceID, "turn", t.TurnID, "pgid", pgid)
+			// Best-effort reclaim: a kill failure (EPERM) is logged
+			// inside terminateGroup; the reap of the direct child
+			// proceeds regardless (the post-reap GroupAlive
+			// verification in finish catches any survivor).
 			t.terminateGroup()
 		}
 	}
-	return t.finish(waitErr), nil
+	t.finish(waitErr)
 }
 
 func (t *managedTurn) exit() Exit {
@@ -1066,25 +1242,51 @@ func (t *managedTurn) exit() Exit {
 	return Exit{Err: t.exitErr, Reason: reason, Forced: t.forced.Load()}
 }
 
+// waitForExit blocks until the reaper publishes the exit (unbounded).
 func (t *managedTurn) waitForExit() {
 	<-t.exitCh
 }
 
-// finish publishes the exit exactly once and releases the turn.
+// waitForExitBounded reports whether the reaper published the exit
+// within d. It is the bounded observation the lifecycle callers use
+// (Close, the launch record-failure path) so an unkillable process can
+// never wedge them.
+func (t *managedTurn) waitForExitBounded(d time.Duration) bool {
+	select {
+	case <-t.exitCh:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// finish publishes the exit exactly once and releases the turn. It runs
+// in the reaper (the single cmd.Wait owner) — or, for a launch that
+// never started, in finishLaunchError — so the reap, the exit
+// publication, and the cleanup each happen exactly once.
 func (t *managedTurn) finish(waitErr error) Exit {
+	t.reaped.Store(true)
 	t.exitErr = waitErr
 	t.state.Store(stFinished)
 	exit := t.exit()
-	t.exitOnce.Do(func() {
-		t.exitCh <- exit
-		close(t.exitCh)
-	})
+	// Cleanup (unregister, slot release, record removal, counter) runs
+	// BEFORE the exit is published. Callers observe the published exit
+	// (Wait / WaitCtx / WaitDeadline / WaitForStop) and must see the
+	// process fully cleaned up at the moment they observe it — the
+	// registry entry gone and the slot released. This preserves the
+	// pre-reap-owner observable ordering: after the exit is observed,
+	// the process is no longer tracked. (Publishing first would let an
+	// observer read a stale registry entry in the gap before cleanup.)
+	t.s.cleanup(t)
 	// PTY master backstop close (cmd.Wait already closed it via the
 	// descriptor cleanup; this covers the launch-failure path).
 	if m := t.ptyMaster.Swap(nil); m != nil {
 		_ = m.Close()
 	}
-	t.s.cleanup(t)
+	t.exitOnce.Do(func() {
+		t.exitCh <- exit
+		close(t.exitCh)
+	})
 	// Post-reap group verification (§23): the direct child is reaped, so
 	// any survivor is an escaped descendant — log it, never chase it by
 	// name (§41/§56).
@@ -1095,7 +1297,12 @@ func (t *managedTurn) finish(waitErr error) Exit {
 	return exit
 }
 
-// abort: immediate group KILL (owner-initiated fast path).
+// abort: immediate group KILL (fast path — Close, Handle.Abort).
+// If the KILL fails with a non-ESRCH error (EPERM: the process cannot
+// be killed), the failure is logged with the full process identity and
+// the supervisor keeps tracking the process — the reaper stays blocked
+// in cmd.Wait in the background, and the caller's bounded wait
+// (waitForExitBounded) settles the lifecycle honestly.
 func (t *managedTurn) abort(reason string) {
 	if t.state.Load() == stFinished {
 		return
@@ -1105,8 +1312,11 @@ func (t *managedTurn) abort(reason string) {
 		t.termReason.Store(reason)
 	}
 	if pgid := int(t.pgid.Load()); pgid > 0 {
-		if err := SignalGroup(pgid, syscall.SIGKILL); err != nil && !errors.Is(err, ErrGroupGone) {
-			t.s.log.Warn("abort: group KILL failed", "pgid", pgid, "err", err)
+		if err := t.s.signalGroupFn(pgid, syscall.SIGKILL); err != nil && !errors.Is(err, ErrGroupGone) {
+			t.s.log.Error("process could not be killed",
+				"instance", t.InstanceID, "turn", t.TurnID,
+				"pid", t.pid.Load(), "pgid", pgid,
+				"runtime", t.Runtime, "reason", reason, "err", err)
 		}
 		t.forced.Store(true)
 		t.s.forceKillTotal.Add(1)
@@ -1114,18 +1324,23 @@ func (t *managedTurn) abort(reason string) {
 }
 
 // Terminate: external TERM → grace → KILL sequence (idempotent; the
-// first caller runs it, the rest wait for it).
-func (t *managedTurn) Terminate(reason string) {
+// first caller runs it, the rest wait for it). It returns the honest
+// result of the sequence: nil when the group is dead (or was already
+// dead), an error wrapping ErrProcessUnkillable when the group could
+// NOT be killed (the process is still alive and stays tracked). It
+// never waits for the process's exit — the reaper owns the reap.
+func (t *managedTurn) Terminate(reason string) error {
 	t.termOnce.Do(func() {
 		go t.terminateSequence(reason)
 	})
 	<-t.termDone
+	return t.termErr
 }
 
 func (t *managedTurn) terminateSequence(reason string) {
 	defer close(t.termDone)
 	if t.state.Load() == stFinished {
-		return
+		return // already dead: the termination "succeeded" (no-op)
 	}
 	t.state.Store(stStopping)
 	if t.termReason.Load() == nil {
@@ -1134,10 +1349,12 @@ func (t *managedTurn) terminateSequence(reason string) {
 	t.s.log.Info("terminating process group",
 		"instance", t.InstanceID, "turn", t.TurnID,
 		"pgid", t.pgid.Load(), "reason", reason)
-	t.terminateGroup()
-	// The owner reaps after the group dies; do not wait on the exit here
-	// (the owner may be this sequence's caller's sibling — waiting on
-	// the exitCh would deadlock the abort path).
+	// The honest result of the sequence (nil = group dead; non-nil =
+	// could not be killed). Stored before close(termDone) — the close
+	// is the happens-before edge for Terminate's read.
+	t.termErr = t.terminateGroup()
+	// The reaper reaps after the group dies; do not wait on the exit
+	// here (waiting on the exitCh would deadlock the abort path).
 }
 
 // terminateGroup runs TERM → grace → KILL on the process group, polling
@@ -1161,21 +1378,30 @@ func (t *managedTurn) terminateSequence(reason string) {
 // UNKNOWN-never-EMPTY invariant as the reclaim and ceiling paths).
 //
 // Idempotent and safe to run concurrently from the external Terminate
-// path and the owner's post-reap descendant reclaim (signaling a dead
+// path and the reaper's post-reap descendant reclaim (signaling a dead
 // group is a no-op; the forced flag is atomic).
-func (t *managedTurn) terminateGroup() {
+//
+// The result is honest: nil when the group is verified dead (or the
+// KILL succeeded), an error wrapping ErrProcessUnkillable when the
+// final KILL failed with a non-ESRCH error (e.g. EPERM — the OS
+// refuses to kill the group; observed live on macOS). In that case the
+// failure is logged with the full process identity, and the caller
+// (Terminate) surfaces it so the higher-level lifecycle settles into a
+// failed state — the process is NOT assumed gone, and the supervisor
+// keeps tracking it.
+func (t *managedTurn) terminateGroup() error {
 	pgid := int(t.pgid.Load())
 	if pgid <= 0 {
-		return
+		return nil
 	}
-	if err := SignalGroup(pgid, syscall.SIGTERM); err != nil && !errors.Is(err, ErrGroupGone) {
+	if err := t.s.signalGroupFn(pgid, syscall.SIGTERM); err != nil && !errors.Is(err, ErrGroupGone) {
 		t.s.log.Warn("group TERM failed", "pgid", pgid, "err", err)
 	}
 	deadline := t.s.now().Add(t.s.cfg.TermGrace)
 	for t.s.now().Before(deadline) {
 		live, err := t.s.groupLiveMemberFn(pgid)
 		if err == nil && !live {
-			return // group verified dead
+			return nil // group verified dead
 		}
 		// live, or UNKNOWN (enumeration failed): keep waiting.
 		time.Sleep(50 * time.Millisecond)
@@ -1183,18 +1409,34 @@ func (t *managedTurn) terminateGroup() {
 	live, err := t.s.groupLiveMemberFn(pgid)
 	if err != nil || live {
 		// still live, or UNKNOWN at the deadline: KILL (fail closed).
-		if err := SignalGroup(pgid, syscall.SIGKILL); err == nil {
+		if killErr := t.s.signalGroupFn(pgid, syscall.SIGKILL); killErr == nil {
 			t.forced.Store(true)
 			t.s.forceKillTotal.Add(1)
-		} else if !errors.Is(err, ErrGroupGone) {
-			t.s.log.Warn("group KILL failed", "pgid", pgid, "err", err)
+			return nil
+		} else if !errors.Is(killErr, ErrGroupGone) {
+			// The OS refused the KILL (EPERM or another non-ESRCH
+			// error): the process is still alive. Log the full
+			// identity and report the honest failure — never pretend
+			// the process is gone.
+			t.s.log.Error("process could not be killed",
+				"instance", t.InstanceID, "turn", t.TurnID,
+				"pid", t.pid.Load(), "pgid", pgid,
+				"runtime", t.Runtime, "err", killErr)
+			return fmt.Errorf("%w: pid=%d pgid=%d runtime=%s instance=%s: %v",
+				ErrProcessUnkillable, t.pid.Load(), pgid, t.Runtime, t.InstanceID, killErr)
 		}
 	}
+	return nil
 }
 
 // --- Stop / PID (Lifecycle) ---------------------------------------------------
 
-// Stop terminates the instance's active turn (§24: explicit stop).
+// Stop terminates the instance's active turn (§24: explicit stop). It
+// runs the standard TERM → grace → KILL sequence and returns once the
+// signal sequence completes — it does NOT wait for the reap (the
+// reaper owns it; WaitForStop observes the bounded reap). It returns an
+// error wrapping ErrProcessUnkillable when the turn's group could not
+// be killed (the process is still alive and stays tracked).
 func (s *Supervisor) Stop(instanceID string) error {
 	s.mu.Lock()
 	t := s.byInstance[instanceID]
@@ -1202,17 +1444,17 @@ func (s *Supervisor) Stop(instanceID string) error {
 	if t == nil {
 		return nil
 	}
-	t.Terminate("stopped")
-	return nil
+	return t.Terminate("stopped")
 }
 
 // WaitForStop waits (up to timeout) for the instance's active turn to be
 // fully reaped and unregistered (external audit F-004). Stop is async:
-// Terminate initiates the kill, and the owner's reap (which unregisters
+// Terminate initiates the kill, and the reaper's reap (which unregisters
 // the turn from byInstance) follows independently. A Stop→immediate-Start
 // that does not wait would race the reap and hit ErrInstanceBusy while the
 // old turn is still registered. Returns true when the turn is gone (or was
-// never there).
+// never there); false when the reap did not complete in time (including
+// an unkillable process — the caller settles into a failed state).
 func (s *Supervisor) WaitForStop(instanceID string, timeout time.Duration) bool {
 	s.mu.Lock()
 	t := s.byInstance[instanceID]
@@ -1225,8 +1467,9 @@ func (s *Supervisor) WaitForStop(instanceID string, timeout time.Duration) bool 
 	case <-time.After(timeout):
 		return false
 	}
-	// The exit is published just before the unregister (same goroutine);
-	// confirm byInstance is cleared (a short re-poll covers the gap).
+	// The reaper unregisters the turn (cleanup) BEFORE publishing the
+	// exit (same goroutine), so byInstance is already cleared when the
+	// exit is observed. The short re-poll is a defensive confirmation.
 	for i := 0; i < 50; i++ {
 		s.mu.Lock()
 		gone := s.byInstance[instanceID] == nil
@@ -1251,26 +1494,37 @@ func (s *Supervisor) PID(instanceID string) *int {
 	return &p
 }
 
-// StopPTY terminates the instance's PTY session (no-op when none).
-func (s *Supervisor) StopPTY(instanceID string) {
+// StopPTY terminates the instance's PTY session (no-op when none). It
+// runs the standard TERM → grace → KILL sequence and returns once the
+// signal sequence completes — it does NOT wait for the reap (the reaper
+// owns it). It returns an error wrapping ErrProcessUnkillable when the
+// session's group could not be killed (the process is still alive and
+// stays tracked).
+func (s *Supervisor) StopPTY(instanceID string) error {
 	s.mu.Lock()
 	t := s.ptyByInst[instanceID]
 	s.mu.Unlock()
-	if t != nil {
-		t.Terminate("stopped")
+	if t == nil {
+		return nil
 	}
+	return t.Terminate("stopped")
 }
 
 // StopEndpoint terminates the instance's live persistent endpoint (no-op
 // when none). It runs the standard TERM → grace → KILL sequence on the
-// endpoint's process group; the owner's reap follows independently.
-func (s *Supervisor) StopEndpoint(instanceID string) {
+// endpoint's process group and returns once the signal sequence
+// completes; the reaper's reap follows independently. It returns an
+// error wrapping ErrProcessUnkillable when the endpoint's group could
+// not be killed (the process is still alive and stays tracked — the
+// record is what refuses a second endpoint for the instance).
+func (s *Supervisor) StopEndpoint(instanceID string) error {
 	s.mu.Lock()
 	t := s.endpointByInst[instanceID]
 	s.mu.Unlock()
-	if t != nil {
-		t.Terminate("stopped")
+	if t == nil {
+		return nil
 	}
+	return t.Terminate("stopped")
 }
 
 // EndpointPID reports the instance's live endpoint process id (nil when no
