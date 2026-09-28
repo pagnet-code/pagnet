@@ -53,6 +53,22 @@ if [ -n "$QWEN_FAKE_NO_SESSION" ]; then
   printf 'No saved session found\n' >&2
   exit 1
 fi
+if [ -n "$QWEN_FAKE_NO_FILE" ]; then
+  # Stay alive but NEVER create the events file: the reader's
+  # waitForEventsFile hits the startup deadline while the process is still
+  # alive (the B7 PATH-B scenario: the driver must request termination
+  # BEFORE the owner Wait, or the reap blocks on a live process).
+  sleep 3600
+fi
+if [ -n "$QWEN_FAKE_NO_START" ]; then
+  # Stay alive but never write the session_start. The events file is created
+  # (touched) so the reader's waitForEventsFile succeeds, but no handshake
+  # line is ever written — the activation times out on the startup deadline
+  # (the B7 lifecycle scenario). The process stays alive (sleep) so the
+  # driver must terminate it, not wait on it.
+  : > "$JSON_FILE"
+  sleep 3600
+fi
 SID="${RESUME_ID:-${QWEN_FAKE_SID:-11111111-aaaa-bbbb-cccc-111111111111}}"
 CWD="$(pwd)"
 cat > "$JSON_FILE" <<EOF

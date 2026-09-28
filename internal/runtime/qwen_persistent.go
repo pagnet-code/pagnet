@@ -222,12 +222,20 @@ func (q *QwenPersistent) Activate(ctx context.Context, sess *session.RuntimeSess
 	select {
 	case actEv = <-e.activationCh:
 	case <-ctx.Done():
-		q.dropEndpoint(sess.InstanceID)
+		// The activation context was cancelled: retire THIS endpoint
+		// (pointer-specific detach + bounded termination request). This
+		// path must NOT reap — the reader is the single Wait owner, and
+		// blocking here on the process's exit would hold the Manager's
+		// activation lock forever on an unkillable process (B7).
+		q.retireEndpoint(e)
 		return nil, ctx.Err()
 	case <-time.After(activationTimeout):
 		// B7: no session_start within the startup deadline is an
-		// activation failure, not a hang.
-		q.dropEndpoint(sess.InstanceID)
+		// activation failure, not a hang. Retire THIS endpoint (pointer-
+		// specific detach + bounded termination request); do NOT reap —
+		// the reader owns the reap, and this path must return within the
+		// activation deadline (never 15s + infinity).
+		q.retireEndpoint(e)
 		return nil, errors.New("qwen persistent: activation timed out (no session_start within the startup deadline)")
 	}
 	if events != nil {
@@ -235,10 +243,12 @@ func (q *QwenPersistent) Activate(ctx context.Context, sess *session.RuntimeSess
 	}
 	if actEv.Type == session.EventSessionLost {
 		// The resume found no usable session (or the handshake gate
-		// failed). The endpoint that was just launched for the attempt must
-		// be fully stopped AND reaped so a lost resume never leaves a stale
-		// endpoint in the supervisor's registry.
-		q.stopEndpoint(sess.InstanceID)
+		// failed). Retire the endpoint that was just launched for the
+		// attempt: detach it from the registry and request bounded
+		// termination. The reader owns the reap — a lost resume never
+		// leaves a stale endpoint in the registry, and this path never
+		// blocks on the process's exit.
+		q.retireEndpoint(e)
 		return nil, session.ErrSessionLost
 	}
 	// The driver sets sess.NativeID as the native exchange happens (the
@@ -757,10 +767,10 @@ func (e *qwenEndpoint) readLoop() {
 	// Wait for the events file to appear (the bridge opens it at startup).
 	f, err := e.waitForEventsFile()
 	if err != nil {
-		// The file never appeared: the process exited before writing it
-		// (e.g. "No saved session found" — exit 1, doc §5.2) or the bridge
-		// failed to open it (doc §7.2: the TUI continues without dual
-		// output). Signal the activation as lost, then reap and drop.
+		// The file never appeared: either the process exited before writing
+		// it (e.g. "No saved session found" — exit 1, doc §5.2) or it is
+		// still alive but the bridge failed to open it (doc §7.2: the TUI
+		// continues without dual output). Signal the activation as lost.
 		e.mu.Lock()
 		if !e.activationSent {
 			e.activationSent = true
@@ -771,6 +781,18 @@ func (e *qwenEndpoint) readLoop() {
 			close(e.activationCh)
 		}
 		e.mu.Unlock()
+		// If the process is still alive, request bounded termination FIRST
+		// (TERM → grace → KILL through the supervisor). The owner Wait in
+		// cleanupOnExit must never block on a process that was never
+		// stopped: without this, cmd.Wait on a live process hangs forever
+		// (the B7 lifecycle defect). The Wait is allowed to wait in THIS
+		// background reader goroutine — it holds no Manager activation
+		// lock, daemon FIFO, or attach request. If the process cannot be
+		// killed, the supervisor keeps tracking it and this Wait waits in
+		// the background; the activation has already returned its failure.
+		if !e.processGone() {
+			e.f.requestEndpointStop(e)
+		}
 		e.cleanupOnExit()
 		return
 	}
@@ -883,16 +905,24 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 	}
 }
 
-// cleanupOnExit runs when the process exits: it reaps the process (single
-// Wait owner — this goroutine read all of the events file), drops the
-// endpoint record, and signals any waiting turn. The turn is "cut off" (no
-// terminal event) — it is marked endpoint-gone so the blocked Submit
-// classifies the death from the machine-turn state's submitDelivered:
-// accepted → session.ErrTurnInterrupted (surfaced, never auto-retried),
-// not accepted → session.ErrEndpointGone (the Manager re-activates —
-// resuming the materialised session — and retries the logical submit once).
-// It must NOT look like a settled turn: that is what left an instance
-// persisted as working with no endpoint.
+// cleanupOnExit runs from the reader goroutine when the process exits: it
+// REAPS the process (this goroutine is the single Wait owner — the ONLY Qwen
+// driver path that calls Handle.Wait), drops the endpoint record, and
+// signals any waiting turn. The Wait is the single-owner reap: it is allowed
+// to block in this background reader goroutine (it holds no Manager
+// activation lock, daemon FIFO, or attach request), but no activation/stop
+// path may call it — that is what wedged the daemon on an unkillable process
+// (B7). When the process cannot be killed, this Wait waits in the background
+// and the supervisor keeps tracking the process; the activation has already
+// returned its failure.
+//
+// The turn is "cut off" (no terminal event) — it is marked endpoint-gone so
+// the blocked Submit classifies the death from the machine-turn state's
+// submitDelivered: accepted → session.ErrTurnInterrupted (surfaced, never
+// auto-retried), not accepted → session.ErrEndpointGone (the Manager
+// re-activates — resuming the materialised session — and retries the logical
+// submit once). It must NOT look like a settled turn: that is what left an
+// instance persisted as working with no endpoint.
 func (e *qwenEndpoint) cleanupOnExit() {
 	if e.h != nil {
 		e.h.Wait()
@@ -928,9 +958,18 @@ func (e *qwenEndpoint) cleanupOnExit() {
 	e.inputMu.Unlock()
 }
 
-// stopEndpoint terminates the instance's endpoint (TERM → grace → KILL via
-// the supervisor) and drops its state. The qwen chat recording persists the
-// session on disk, so the session survives for a later resume (invariant F).
+// stopEndpoint terminates the instance's endpoint and drops its state. The
+// qwen chat recording persists the session on disk, so the session survives
+// for a later resume (invariant F).
+//
+// Contract (B7 lifecycle): this path REQUESTS bounded termination (TERM →
+// grace → KILL through the supervisor) and observes the reader's reap for a
+// bounded period; it does NOT reap. The reader is the single Wait owner —
+// it reaps the process after it exits and drops the endpoint record. When
+// the process cannot be killed, the reader keeps polling (it does not block
+// this stop) and the supervisor keeps tracking the process: the honest
+// result is a bounded stop, never a wedge, and never a Close/Wait fallback
+// that could block forever on an unkillable process.
 func (q *QwenPersistent) stopEndpoint(instanceID string) error {
 	q.mu.Lock()
 	e := q.endpoints[instanceID]
@@ -938,11 +977,14 @@ func (q *QwenPersistent) stopEndpoint(instanceID string) error {
 	if e == nil {
 		return nil
 	}
-	lif := q.life.get()
-	if el, ok := lif.(proc.EndpointLifecycle); ok {
-		el.StopEndpoint(instanceID)
-	}
-	// Wait for the process to be reaped (bounded), then drop the state.
+	// Request bounded termination (TERM → grace → KILL). It returns within
+	// the termination grace window and does not wait on the exit.
+	q.requestEndpointStop(e)
+	// Bounded observation of the reader's reap: when the process is
+	// killable, the reader reaps it promptly and drops the endpoint record
+	// (so the detach below is a no-op). When it cannot be killed, the
+	// reader keeps polling and this observation expires — the stop still
+	// returns, bounded.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if !e.live() {
@@ -950,30 +992,58 @@ func (q *QwenPersistent) stopEndpoint(instanceID string) error {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	q.dropEndpoint(instanceID)
+	// Detach the endpoint record (pointer-specific — never a newer endpoint
+	// for the same instance). The supervisor continues tracking the process
+	// until the reader reaps it.
+	q.dropEndpointRef(e)
 	return nil
 }
 
-func (q *QwenPersistent) dropEndpoint(instanceID string) {
-	q.mu.Lock()
-	e := q.endpoints[instanceID]
-	delete(q.endpoints, instanceID)
-	q.mu.Unlock()
-	if e != nil {
-		// Best-effort: ensure the process is terminated and reaped.
-		if e.h != nil {
-			e.h.Close()
-		}
+// requestEndpointStop requests bounded termination of the endpoint's process
+// group through the supervisor (TERM → grace → KILL). It is the "request
+// termination" half of the lifecycle — never the reap. The endpoint's reader
+// goroutine is the single Wait owner and reaps after the process exits; the
+// supervisor continues tracking the process until that reap. This call
+// returns within the termination grace window (bounded), even when the
+// process cannot be killed (the supervisor then keeps tracking it). It must
+// never call Handle.Wait/Close: that would conflate termination with the
+// single-owner reap and could block the caller forever.
+func (q *QwenPersistent) requestEndpointStop(e *qwenEndpoint) {
+	if e == nil {
+		return
+	}
+	if el, ok := q.life.get().(proc.EndpointLifecycle); ok {
+		el.StopEndpoint(e.instanceID)
 	}
 }
 
-// dropEndpointRef removes a SPECIFIC endpoint record (the one whose reader
-// hit exit) from the registry, without touching any other endpoint for the
-// same instance. A concurrent re-activation may have already launched a
-// fresh endpoint for the instance; this must not drop it. It is the
-// exit-path cleanup: the dying endpoint's reader is the single owner of
-// this record, and it runs AFTER the reap (so the supervisor is already
-// clean).
+// retireEndpoint retires a SPECIFIC endpoint after a failed activation
+// (timeout, context cancel, or a lost session): it detaches the endpoint
+// from the registry (pointer-specific — it never removes a newer endpoint
+// for the same instance) and requests bounded termination of its process
+// group. It does NOT reap: the reader is the single Wait owner. This is the
+// activation-failure cleanup — it must return within a bounded time (the
+// termination grace window) and must never block on the process's exit, so
+// the Manager's activation lock is always released.
+func (q *QwenPersistent) retireEndpoint(e *qwenEndpoint) {
+	if e == nil {
+		return
+	}
+	q.dropEndpointRef(e)
+	q.requestEndpointStop(e)
+}
+
+// dropEndpointRef removes a SPECIFIC endpoint record from the registry,
+// without touching any other endpoint for the same instance. A concurrent
+// re-activation may have already launched a fresh endpoint for the instance;
+// this must not drop it. It is used by two paths:
+//   - the reader's exit path (cleanupOnExit), which runs AFTER the reap (the
+//     supervisor is already clean); and
+//   - the activation-failure / stop paths (retireEndpoint, stopEndpoint),
+//     which run BEFORE the reap — they retire the logical record while the
+//     supervisor still tracks the (possibly unkillable) OS process. The
+//     supervisor record is the safety mechanism that prevents a second
+//     endpoint for the instance, and only the reader's reap removes it.
 func (q *QwenPersistent) dropEndpointRef(e *qwenEndpoint) {
 	q.mu.Lock()
 	if q.endpoints[e.instanceID] == e {
