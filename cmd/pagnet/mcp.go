@@ -38,7 +38,7 @@ func mcpWorkerCmd() *cobra.Command {
 		Short: "Worker MCP bridge: the worker agent's network surface (stdio MCP)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return agentbridge.RunBridge(socket, "pagnet", agentbridge.RegisterWorkerTools)
+			return agentbridge.RunBridge(socket, "pagnet", "worker", agentbridge.RegisterWorkerTools)
 		},
 	}
 	cmd.Flags().StringVar(&socket, "socket", "", "daemon Unix socket (required; injected via PAGNET_MCP_CONFIG)")
@@ -52,7 +52,7 @@ func mcpControlCmd() *cobra.Command {
 		Short: "Representative MCP bridge: the control surface (stdio MCP)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return agentbridge.RunBridge(socket, "pagnet-control", agentbridge.RegisterControlTools)
+			return agentbridge.RunBridge(socket, "pagnet-control", "representative", agentbridge.RegisterControlTools)
 		},
 	}
 	cmd.Flags().StringVar(&socket, "socket", "", "daemon Unix socket (required; injected via PAGNET_MCP_CONFIG)")

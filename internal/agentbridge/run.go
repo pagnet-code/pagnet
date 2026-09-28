@@ -23,25 +23,35 @@ var log = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
 // RunBridge serves one MCP bridge over stdio: check the injected
 // environment, connect to the daemon's Unix socket with the instance
-// identity, register the surface's tools, and serve until the runtime
-// closes stdin. serverName must stay the EXACT name the daemon's MCP
-// config carries ("pagnet" / "pagnet-control").
-func RunBridge(socket, serverName string, register func(s *server.MCPServer, br *Bridge)) error {
+// identity + the per-activation nonce, register the surface's tools, and
+// serve until the runtime closes stdin. serverName must stay the EXACT
+// name the daemon's MCP config carries ("pagnet" / "pagnet-control");
+// kind is the instance kind this surface serves ("worker" /
+// "representative") — the daemon binds the auth to it (S1).
+func RunBridge(socket, serverName, kind string, register func(s *server.MCPServer, br *Bridge)) error {
 	instanceID := os.Getenv("PAGNET_INSTANCE_ID")
 	networkID := os.Getenv("PAGNET_NETWORK_ID") // empty for representatives
+	// S1: the per-activation nonce the daemon minted for this launch and
+	// shipped in the MCP config env. A bridge without it cannot
+	// authenticate — fail closed instead of degrading to identifier-only
+	// auth (that hole is exactly what the nonce closes).
+	nonce := os.Getenv("PAGNET_BRIDGE_NONCE")
 	if socket == "" {
 		return errors.New("--socket is required (the daemon injects it)")
 	}
 	if instanceID == "" {
 		return errors.New("PAGNET_INSTANCE_ID is not set (this process must be launched by the pagnet daemon)")
 	}
+	if nonce == "" {
+		return errors.New("PAGNET_BRIDGE_NONCE is not set (the daemon must mint it in the MCP config; refusing to bridge without per-activation credentials)")
+	}
 
-	br, err := dialWithRetry(socket, instanceID, networkID)
+	br, err := dialWithRetry(socket, instanceID, networkID, nonce, kind)
 	if err != nil {
 		return err
 	}
 	defer br.Close()
-	log.Info("mcp bridge connected", "server", serverName, "instance", instanceID, "network", networkID)
+	log.Info("mcp bridge connected", "server", serverName, "instance", instanceID, "kind", kind, "network", networkID)
 
 	s := server.NewMCPServer(serverName, "1.0.0")
 	register(s, br)
@@ -51,12 +61,12 @@ func RunBridge(socket, serverName string, register func(s *server.MCPServer, br 
 // dialWithRetry dials the daemon's Unix socket with a short retry
 // window: the socket is local and comes up with the daemon, but the
 // runtime process may start a fraction earlier.
-func dialWithRetry(socket, instanceID, networkID string) (*Bridge, error) {
+func dialWithRetry(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 	var br *Bridge
 	var err error
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		br, err = Dial(socket, instanceID, networkID)
+		br, err = Dial(socket, instanceID, networkID, nonce, kind)
 		if err == nil {
 			return br, nil
 		}

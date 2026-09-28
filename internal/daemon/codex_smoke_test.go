@@ -367,7 +367,14 @@ func TestCodexRealSmoke(t *testing.T) {
 
 	// The session, with the daemon-rendered MCP config (the real pagnet
 	// binary + the real bridge socket) in its launch env.
+	// S1: mint the per-activation bridge nonce (the real mint point) BEFORE
+	// the MCP config is rendered, so the bridge the real codex endpoint
+	// spawns authenticates with the credential the daemon will accept. The
+	// smoke's hibernate/resume reuse this launch env and do not invalidate
+	// the nonce (they drive the session core directly), so one mint covers
+	// the whole smoke.
 	row, _, _ := d.state.GetInstance(instanceID)
+	d.bridgeNonceForActivation(row)
 	mcpCfg := d.mcpConfig(row)
 	sess := d.sessions.Session(instanceID, domain.RuntimeCodex, workspace)
 	d.sessions.SetLaunchEnv(sess, []string{

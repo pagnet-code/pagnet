@@ -119,20 +119,27 @@ func driveLaunch(t *testing.T, d *Daemon, server *websocket.Conn, p transport.La
 }
 
 // waitForEndpointLive polls until the instance's session-driven endpoint is
-// live. The launch-time activation runs off the per-instance FIFO (the
-// launch acks before the activation settles), so a test that asserts
-// endpoint state after driveLaunch must wait for the background activation
-// to complete first.
+// live AND the background activation has SETTLED. The launch-time activation
+// runs off the per-instance FIFO (the launch acks before the activation
+// settles), so a test that asserts endpoint state after driveLaunch must wait
+// for the activation to complete first. The endpoint process comes up DURING
+// activation (status "working"), and only settles to "idle" once activation
+// completes — waiting for process liveness alone races that working→idle
+// transition (a test asserting "idle" right after could observe "working").
+// An empty-mission launch (the only shape this helper serves) always settles
+// to idle.
 func waitForEndpointLive(t *testing.T, d *Daemon, instanceID string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if pid := d.sup.EndpointPID(instanceID); pid != nil && proc.ProcessAlive(*pid) {
-			return
+			if row, ok, _ := d.state.GetInstance(instanceID); ok && row.Status == "idle" {
+				return
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("endpoint for %s never became live", instanceID)
+	t.Fatalf("endpoint for %s never settled to idle", instanceID)
 }
 
 // driveDeliver drives a deliver command through the daemon's real command

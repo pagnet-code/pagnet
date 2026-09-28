@@ -1,5 +1,21 @@
 package daemon
 
+// Bridge-socket tests.
+//
+// Security wave S1 made bridge auth NOT identifier-only: the first message
+// now carries the per-activation nonce the daemon minted for the instance's
+// current launch, the bridge surface kind, and (on Linux) the connection is
+// bound to the instance's process tree via SO_PEERCRED. This file covers the
+// PORTABLE layer — every check that fires BEFORE the platform-specific
+// process-tree binding — by dialing the socket from the test process and
+// asserting the specific rejection. Each of these rejections happens before
+// the (Linux) tree check, so the tests exercise the nonce/kind/network/
+// status/live-process paths on EVERY platform.
+//
+// The in-tree positives (a live endpoint authenticating + the per-identity
+// tool surface), the connection caps that need a live root, and the Linux
+// process-tree rejections live in bridge_e2e_test.go / bridge_linux_test.go.
+
 import (
 	"bufio"
 	"encoding/json"
@@ -15,6 +31,8 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+// --- harness -----------------------------------------------------------
+
 type bridgeClient struct {
 	conn net.Conn
 	r    *bufio.Reader
@@ -29,11 +47,14 @@ func startBridgeForTest(t *testing.T) (*Daemon, string) {
 	return d, filepath.Join(d.StateDir, bridgeSocketName)
 }
 
-func upsertBridgeInstance(t *testing.T, d *Daemon, id, name, network, status string) {
+// upsertBridgeInstance records a local instance the bridge auths against.
+// kind "" means worker (the row's default).
+func upsertBridgeInstance(t *testing.T, d *Daemon, id, name, network, status, kind string) {
 	t.Helper()
 	if err := d.state.UpsertInstance(InstanceRow{
 		InstanceID: id, Runtime: "fake", Status: status,
 		Access: domain.AccessReadWrite, AgentName: name, NetworkID: network,
+		Kind: kind,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -70,142 +91,222 @@ func (c *bridgeClient) read(t *testing.T) map[string]any {
 	return out
 }
 
-func (c *bridgeClient) auth(t *testing.T, instanceID, networkID string) map[string]any {
+// authFull sends the full S1 auth message (nonce + kind) and returns the
+// daemon's response. It is the raw primitive the harness negatives use.
+func (c *bridgeClient) authFull(t *testing.T, instanceID, networkID, nonce, kind string) map[string]any {
 	t.Helper()
-	c.write(t, map[string]any{"type": "auth", "instanceId": instanceID, "networkId": networkID})
+	c.write(t, map[string]any{
+		"type": "auth", "instanceId": instanceID, "networkId": networkID,
+		"nonce": nonce, "kind": kind,
+	})
 	return c.read(t)
 }
 
-func TestBridgeAuthOK(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+// authMinted authenticates using the nonce the DAEMON mints for the
+// instance through the real production mint path (bridgeNonceForActivation)
+// and the instance's own kind — no test-only backdoor. It is the "legitimate
+// credential" primitive: where it is still rejected, the rejection is a
+// property of the instance (status / no live process), not of the credential.
+func (c *bridgeClient) authMinted(t *testing.T, d *Daemon, instanceID, networkID string) map[string]any {
+	t.Helper()
+	row, ok, err := d.state.GetInstance(instanceID)
+	if err != nil || !ok {
+		t.Fatalf("instance %s not found: ok=%v err=%v", instanceID, ok, err)
+	}
+	nonce := d.bridgeNonceForActivation(row)
+	if nonce == "" {
+		t.Fatalf("no nonce minted for %s (crypto/rand failed?)", instanceID)
+	}
+	kind := row.Kind
+	if kind == "" {
+		kind = "worker"
+	}
+	return c.authFull(t, instanceID, networkID, nonce, kind)
+}
 
-	resp := bridgeDial(t, sock).auth(t, "inst-1", "net-1")
-	if resp["type"] != "auth_ok" {
-		t.Fatalf("auth = %v, want auth_ok", resp)
+// assertBridgeError asserts the response is an error whose message contains
+// wantSubstr (a distinct rejection reason, S1).
+func assertBridgeError(t *testing.T, resp map[string]any, wantSubstr string) {
+	t.Helper()
+	if resp["type"] != "error" {
+		t.Fatalf("auth = %v, want an error", resp)
+	}
+	msg, _ := resp["error"].(string)
+	if !strings.Contains(msg, wantSubstr) {
+		t.Fatalf("error = %q, want it to contain %q", msg, wantSubstr)
 	}
 }
+
+// --- identity rejections (portable: all fire before the tree check) ----
 
 func TestBridgeAuthUnknownInstance(t *testing.T) {
 	_, sock := startBridgeForTest(t)
-	resp := bridgeDial(t, sock).auth(t, "ghost", "net-1")
-	if resp["type"] != "error" {
-		t.Fatalf("auth = %v, want error", resp)
-	}
+	resp := bridgeDial(t, sock).authFull(t, "ghost", "net-1", "", "worker")
+	assertBridgeError(t, resp, "unknown instance")
 }
 
+// A missing nonce is a rejected identity on every platform (the portable
+// layer that killed identifier-only auth).
+func TestBridgeAuthMissingNonce(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-1", "net-1", "", "worker")
+	assertBridgeError(t, resp, "bridge nonce invalid")
+}
+
+// A nonce that was never minted for this instance is a rejected identity.
+func TestBridgeAuthGarbageNonce(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-1", "net-1", "not-a-real-nonce", "worker")
+	assertBridgeError(t, resp, "bridge nonce invalid")
+}
+
+// A nonce is bound to the instance it was minted for: inst-A's valid nonce
+// is useless against inst-B (cross-instance credential theft is refused).
+func TestBridgeAuthCrossInstanceNonce(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-A", "coder", "net-1", "idle", "worker")
+	upsertBridgeInstance(t, d, "inst-B", "other", "net-2", "idle", "worker")
+
+	rowA, _, _ := d.state.GetInstance("inst-A")
+	nonceA := d.bridgeNonceForActivation(rowA)
+	if nonceA == "" {
+		t.Fatal("no nonce minted for inst-A")
+	}
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-B", "net-2", nonceA, "worker")
+	assertBridgeError(t, resp, "bridge nonce invalid")
+}
+
+// A stale nonce (minted for a superseded activation of the SAME instance) is
+// a rejected identity: a new activation re-mints and replaces the prior
+// credential, so the old one no longer matches what the daemon holds.
+func TestBridgeAuthStaleNonce(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
+
+	row, _, _ := d.state.GetInstance("inst-1")
+	stale := d.bridgeNonceForActivation(row) // activation 1
+	fresh := d.bridgeNonceForActivation(row) // activation 2 supersedes it
+	if stale == "" || fresh == "" || stale == fresh {
+		t.Fatalf("expected two distinct minted nonces (stale=%q fresh=%q)", stale, fresh)
+	}
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-1", "net-1", stale, "worker")
+	assertBridgeError(t, resp, "bridge nonce invalid")
+}
+
+// Representative impersonation: a WORKER's own valid nonce, presented against
+// a REPRESENTATIVE's instance id (with the rep kind), must not open the
+// control surface. The nonce is instance-bound, so it is rejected at the
+// nonce check — before kind could matter.
+func TestBridgeAuthRepImpersonation(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-w", "coder", "net-1", "idle", "worker")
+	upsertBridgeInstance(t, d, "inst-r", "rep", "", "idle", "representative")
+
+	rowW, _, _ := d.state.GetInstance("inst-w")
+	nonceW := d.bridgeNonceForActivation(rowW)
+	if nonceW == "" {
+		t.Fatal("no nonce minted for the worker")
+	}
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-r", "", nonceW, "representative")
+	assertBridgeError(t, resp, "bridge nonce invalid")
+}
+
+// Kind binding: a valid nonce for a WORKER instance, but presented with the
+// REPRESENTATIVE kind, is refused — the bridge surface must match the
+// instance's kind.
+func TestBridgeAuthKindMismatch(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
+
+	row, _, _ := d.state.GetInstance("inst-1")
+	nonce := d.bridgeNonceForActivation(row)
+	if nonce == "" {
+		t.Fatal("no nonce minted")
+	}
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-1", "net-1", nonce, "representative")
+	assertBridgeError(t, resp, "bridge kind does not match")
+}
+
+// The network comparison is defense-in-depth only (S1): it is no longer a
+// security boundary, but a mismatch is still surfaced with a distinct error.
 func TestBridgeAuthNetworkMismatch(t *testing.T) {
 	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
 
-	resp := bridgeDial(t, sock).auth(t, "inst-1", "other-net")
-	if resp["type"] != "error" {
-		t.Fatalf("auth = %v, want error (network mismatch)", resp)
+	row, _, _ := d.state.GetInstance("inst-1")
+	nonce := d.bridgeNonceForActivation(row)
+	if nonce == "" {
+		t.Fatal("no nonce minted")
 	}
+
+	resp := bridgeDial(t, sock).authFull(t, "inst-1", "other-net", nonce, "worker")
+	assertBridgeError(t, resp, "network mismatch")
 }
 
+// A stopped instance has no live process, so no legitimate bridge exists:
+// even a valid nonce is refused.
 func TestBridgeAuthStoppedInstance(t *testing.T) {
 	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "stopped")
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "stopped", "worker")
 
-	resp := bridgeDial(t, sock).auth(t, "inst-1", "net-1")
-	if resp["type"] != "error" {
-		t.Fatalf("auth = %v, want error (stopped)", resp)
-	}
+	resp := bridgeDial(t, sock).authMinted(t, d, "inst-1", "net-1")
+	assertBridgeError(t, resp, "instance is stopped")
 }
 
-// With no host connection the relay must fail cleanly (not hang): the
-// bridge surfaces an error so the agent's tool call gets a real error.
+// A hibernated instance is rejected too (the old stopped-only check left
+// hibernated open to a surviving bridge).
+func TestBridgeAuthHibernatedInstance(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "hibernated", "worker")
+
+	resp := bridgeDial(t, sock).authMinted(t, d, "inst-1", "net-1")
+	assertBridgeError(t, resp, "instance is hibernated")
+}
+
+// The portable floor: everything passes (valid nonce/kind/network/status)
+// until the live-process check — a plain upserted instance has no supervisor
+// process, so the bridge is refused on EVERY platform.
+func TestBridgeAuthNoLiveProcess(t *testing.T) {
+	d, sock := startBridgeForTest(t)
+	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle", "worker")
+
+	resp := bridgeDial(t, sock).authMinted(t, d, "inst-1", "net-1")
+	assertBridgeError(t, resp, "instance has no live process")
+}
+
+// --- relay / resource bounds (portable) -------------------------------
+
+// With no host connection the relay must fail cleanly (not hang): the agent's
+// tool call gets a real, correlated error. Exercised directly on relayToServer
+// (the client-facing correlation is proven by the e2e bridge tests).
 func TestBridgeRelayWithoutConnection(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
-
-	c := bridgeDial(t, sock)
-	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
-		t.Fatalf("auth = %v, want auth_ok", resp)
+	d := newTestDaemon(t)
+	_, errMsg := d.relayToServer("inst-1", "", "network_whoami", nil)
+	if errMsg == "" {
+		t.Fatal("relay without a host connection must fail")
 	}
-	c.write(t, map[string]any{"id": "1", "tool": "network_whoami", "args": map[string]any{}})
-	resp := c.read(t)
-	if resp["ok"] == true {
-		t.Fatalf("relay without connection must fail, got %v", resp)
-	}
-	if resp["id"] != "1" {
-		t.Fatalf("response id = %v, want 1", resp["id"])
+	if !strings.Contains(errMsg, errConnInterrupted) {
+		t.Fatalf("relay error = %q, want the connection-interrupted message", errMsg)
 	}
 }
 
-// Unknown tools are rejected by the server-side dispatcher; without a
-// connection the local failure comes first. Either way the client gets a
-// correlated error, never a hang.
-func TestBridgeUnknownToolLocal(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
-
-	c := bridgeDial(t, sock)
-	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
-		t.Fatalf("auth = %v, want auth_ok", resp)
-	}
-	c.write(t, map[string]any{"id": "2", "tool": "network_bogus"})
-	resp := c.read(t)
-	if resp["ok"] == true {
-		t.Fatalf("bogus tool must fail, got %v", resp)
-	}
-}
-
-// TestStartBridgeSocket_RefusesLiveDoubleStart: two daemons sharing a
-// state dir must not both own the bridge socket — the second refuses to
-// start. Without the guard they would fight over the host identity: each
-// new connection supersedes the other, in an endless reconnect loop that
-// flaps the host online/offline every backoff cycle.
-func TestStartBridgeSocket_RefusesLiveDoubleStart(t *testing.T) {
-	d, _ := startBridgeForTest(t)
-	defer d.stopBridgeSocket()
-
-	d2, err := New(Config{StateDir: d.StateDir}, nil)
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	defer d2.Close()
-	if err := d2.startBridgeSocket(); err == nil {
-		t.Fatal("second daemon must refuse to start while the first owns the bridge socket")
-	}
-}
-
-// TestBridgePerInstanceConnCap (external audit F-010): a single instance
-// must not hold more than bridgeMaxConnsPerInst bridge connections. The
-// (cap+1)th connection for the same instance is refused with a
-// per-instance error (the global slot is released by the deferred
-// releaseBridgeConn).
-func TestBridgePerInstanceConnCap(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
-
-	for i := 0; i < bridgeMaxConnsPerInst; i++ {
-		c := bridgeDial(t, sock)
-		if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
-			t.Fatalf("conn %d: auth = %v, want auth_ok", i, resp)
-		}
-	}
-	// The (cap+1)th connection for the same instance is refused.
-	c := bridgeDial(t, sock)
-	resp := c.auth(t, "inst-1", "net-1")
-	if resp["type"] != "error" {
-		t.Fatalf("conn %d: auth = %v, want error (per-instance cap)", bridgeMaxConnsPerInst, resp)
-	}
-	if !strings.Contains(resp["error"].(string), "this instance") {
-		t.Fatalf("error = %v, want the per-instance cap message", resp["error"])
-	}
-}
-
-// TestBridgeGlobalConnCap (external audit F-010): once the global
-// connection cap is reached, new connections are refused regardless of
-// instance.
+// TestBridgeGlobalConnCap (external audit F-010): once the global connection
+// cap is reached, new connections are refused regardless of instance. The
+// cap is enforced before the auth message is read, so no instance/nonce is
+// needed.
 func TestBridgeGlobalConnCap(t *testing.T) {
 	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
 
-	// Saturate the global counter (under the lock, to avoid a data race
-	// with the handler goroutine's locked read).
+	// Saturate the global counter (under the lock, to avoid a data race with
+	// the handler goroutine's locked read).
 	d.bridgeConnMu.Lock()
 	d.bridgeConns = bridgeMaxConns
 	d.bridgeConnMu.Unlock()
@@ -217,9 +318,9 @@ func TestBridgeGlobalConnCap(t *testing.T) {
 
 	// The handler enforces the global cap BEFORE reading the auth message
 	// (it writes the error and closes the connection immediately). So the
-	// test must NOT write the auth first: doing so races the handler's
-	// close and can fail with a broken pipe under load. Just read the
-	// error the handler already sent.
+	// test must NOT write the auth first: doing so races the handler's close
+	// and can fail with a broken pipe under load. Just read the error the
+	// handler already sent.
 	c := bridgeDial(t, sock)
 	resp := c.read(t)
 	if resp["type"] != "error" {
@@ -230,35 +331,9 @@ func TestBridgeGlobalConnCap(t *testing.T) {
 	}
 }
 
-// TestBridgeRequestRequiresIDAndTool (external audit F-010): a request
-// with an empty id or an empty tool is rejected (an id-less request
-// cannot be correlated to a response; an empty tool is a no-op that would
-// still consume a relay slot).
-func TestBridgeRequestRequiresIDAndTool(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
-
-	c := bridgeDial(t, sock)
-	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
-		t.Fatalf("auth = %v, want auth_ok", resp)
-	}
-	// Empty id: rejected, response echoes the empty id.
-	c.write(t, map[string]any{"id": "", "tool": "network_whoami"})
-	resp := c.read(t)
-	if resp["ok"] == true || resp["id"] != "" {
-		t.Fatalf("empty-id request = %v, want ok=false + empty id", resp)
-	}
-	// Empty tool: rejected, response echoes the id.
-	c.write(t, map[string]any{"id": "7", "tool": ""})
-	resp = c.read(t)
-	if resp["ok"] == true || resp["id"] != "7" {
-		t.Fatalf("empty-tool request = %v, want ok=false + id 7", resp)
-	}
-}
-
 // TestBridgeBoundedPending (external audit F-010): the pending
-// agent.request map is capped; once full, new relays are refused instead
-// of growing the map without bound.
+// agent.request map is capped; once full, new relays are refused instead of
+// growing the map without bound.
 func TestBridgeBoundedPending(t *testing.T) {
 	d := newTestDaemon(t)
 	client, _ := newMemWS(t)
@@ -279,50 +354,10 @@ func TestBridgeBoundedPending(t *testing.T) {
 	}
 }
 
-// TestBridgeAuthenticatedConnSurvivesIdle: the read deadline bounds the
-// AUTH phase only. A managed agent keeps ONE bridge connection for the
-// endpoint's whole lifetime and is legitimately quiet on it for minutes
-// at a time (the model works on non-bridge tools between network calls),
-// so an authenticated connection must survive idle gaps longer than the
-// deadline — with the absolute deadline in force, the next tool call hits
-// a severed connection and fails with EOF, bricking the agent's network
-// surface for the rest of the endpoint's life. Resource bounds for
-// authenticated connections come from the connection caps, not a timer.
-func TestBridgeAuthenticatedConnSurvivesIdle(t *testing.T) {
-	d, sock := startBridgeForTest(t)
-	upsertBridgeInstance(t, d, "inst-1", "coder", "net-1", "idle")
-
-	prev := atomic.LoadInt64(&bridgeConnReadTimeoutNs)
-	atomic.StoreInt64(&bridgeConnReadTimeoutNs, int64(300*time.Millisecond))
-	t.Cleanup(func() { atomic.StoreInt64(&bridgeConnReadTimeoutNs, prev) })
-
-	c := bridgeDial(t, sock)
-	if resp := c.auth(t, "inst-1", "net-1"); resp["type"] != "auth_ok" {
-		t.Fatalf("auth = %v, want auth_ok", resp)
-	}
-	// Go quiet longer than the (shortened) read deadline.
-	time.Sleep(900 * time.Millisecond)
-	// The connection must still be alive: the tool call gets a proper
-	// correlated reply (a relay error, since no host connection is set),
-	// not EOF.
-	c.write(t, map[string]any{"id": "1", "tool": "network_whoami", "args": map[string]any{}})
-	line, err := readLine(c.r)
-	if err != nil {
-		t.Fatalf("authenticated bridge connection was severed while idle: %v", err)
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(line, &resp); err != nil {
-		t.Fatalf("bad response %q: %v", line, err)
-	}
-	if resp["id"] != "1" || resp["ok"] == nil {
-		t.Fatalf("response = %v, want a correlated reply", resp)
-	}
-}
-
-// TestBridgeReadDeadlineCutsSlowLoris (external audit F-010): a
-// connection that connects but never sends its auth must be cut off by the
-// read deadline instead of holding a goroutine + socket descriptor
-// indefinitely. The deadline is shortened for the test.
+// TestBridgeReadDeadlineCutsSlowLoris (external audit F-010): a connection
+// that connects but never sends its auth must be cut off by the read deadline
+// instead of holding a goroutine + socket descriptor indefinitely. The
+// deadline is shortened for the test.
 func TestBridgeReadDeadlineCutsSlowLoris(t *testing.T) {
 	_, sock := startBridgeForTest(t)
 
@@ -331,13 +366,32 @@ func TestBridgeReadDeadlineCutsSlowLoris(t *testing.T) {
 	t.Cleanup(func() { atomic.StoreInt64(&bridgeConnReadTimeoutNs, prev) })
 
 	conn := bridgeDial(t, sock)
-	// Send nothing. The daemon must close the connection after the
-	// read deadline; a subsequent read returns EOF.
+	// Send nothing. The daemon must close the connection after the read
+	// deadline; a subsequent read returns EOF.
 	start := time.Now()
 	if line, err := readLine(conn.r); err == nil {
 		t.Fatalf("slow-loris connection was not cut off (read %q, want EOF)", line)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("read deadline took too long: %v", elapsed)
+	}
+}
+
+// TestStartBridgeSocket_RefusesLiveDoubleStart: two daemons sharing a state
+// dir must not both own the bridge socket — the second refuses to start.
+// Without the guard they would fight over the host identity: each new
+// connection supersedes the other, in an endless reconnect loop that flaps
+// the host online/offline every backoff cycle.
+func TestStartBridgeSocket_RefusesLiveDoubleStart(t *testing.T) {
+	d, _ := startBridgeForTest(t)
+	defer d.stopBridgeSocket()
+
+	d2, err := New(Config{StateDir: d.StateDir}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d2.Close()
+	if err := d2.startBridgeSocket(); err == nil {
+		t.Fatal("second daemon must refuse to start while the first owns the bridge socket")
 	}
 }

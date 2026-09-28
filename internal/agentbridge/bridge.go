@@ -52,8 +52,14 @@ type bridgeResponse struct {
 }
 
 // Dial connects to the daemon's Unix socket and authenticates with the
-// instance identity (the agent never holds the host credential).
-func Dial(socket, instanceID, networkID string) (*Bridge, error) {
+// instance identity + the daemon-minted per-activation nonce (security
+// wave S1: identifier-only auth is gone — the daemon accepts a bridge
+// only when the presented nonce matches the one it minted for the
+// instance's current launch and shipped in the MCP config, the claimed
+// kind matches the instance's kind, and — on Linux — the connecting
+// process is inside the instance's process tree). The agent never holds
+// the host credential.
+func Dial(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 	conn, err := net.Dial("unix", socket)
 	if err != nil {
 		return nil, err
@@ -63,6 +69,8 @@ func Dial(socket, instanceID, networkID string) (*Bridge, error) {
 		"type":       "auth",
 		"instanceId": instanceID,
 		"networkId":  networkID,
+		"nonce":      nonce,
+		"kind":       kind,
 	}), '\n')); err != nil {
 		_ = conn.Close()
 		return nil, err

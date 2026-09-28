@@ -26,7 +26,7 @@ var genericToolNames = []string{
 // generic tools — and nothing else (no per-capability generation).
 func TestGenericTools_Registered(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	br, err := Dial(socket, "inst-1", "net-1")
+	br, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestGenericTools_Registered(t *testing.T) {
 // untrusted-data wording on the participant-content tools.
 func TestGenericTools_Schemas(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	br, err := Dial(socket, "inst-1", "net-1")
+	br, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestGenericTools_Schemas(t *testing.T) {
 // (unknown keys are filtered by Handle; values pass through verbatim).
 func TestGenericTools_RelayArgs(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	br, err := Dial(socket, "inst-1", "net-1")
+	br, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}

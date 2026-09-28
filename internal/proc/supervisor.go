@@ -1540,6 +1540,22 @@ func (s *Supervisor) EndpointPID(instanceID string) *int {
 	return &p
 }
 
+// PTYPID reports the instance's live PTY session process id (nil when no
+// PTY session is live). Read-only accessor in the style of PID/EndpointPID
+// (the agent-bridge process-tree binding needs the PTY root — the runtime a
+// PTY attach spawned is the root its bridge must descend from); it does not
+// touch launch/reap/termination behavior.
+func (s *Supervisor) PTYPID(instanceID string) *int {
+	s.mu.Lock()
+	t := s.ptyByInst[instanceID]
+	s.mu.Unlock()
+	if t == nil || t.pid.Load() == 0 {
+		return nil
+	}
+	p := int(t.pid.Load())
+	return &p
+}
+
 // EndpointCount is the number of live ClassEndpoint handles. The
 // auto-update idle gate uses it (Phase 3 A7): a re-exec with a live
 // endpoint would orphan it — the endpoint outlives turns, so nothing

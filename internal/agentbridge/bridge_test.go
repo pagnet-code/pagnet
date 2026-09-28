@@ -86,7 +86,7 @@ func fakeBridgeServer(t *testing.T) (socket string, closeFn func()) {
 // THEIR OWN result — the old per-Call reader raced on the shared conn.
 func TestBridgeConcurrentCalls_EchoOwnMarker(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	b, err := Dial(socket, "inst-1", "net-1")
+	b, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestBridgeConcurrentCalls_EchoOwnMarker(t *testing.T) {
 // call on the same bridge works.
 func TestBridgeCanceledCall_DoesNotCorruptNext(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	b, err := Dial(socket, "inst-1", "net-1")
+	b, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestBridgeCanceledCall_DoesNotCorruptNext(t *testing.T) {
 // blocks on a dead connection).
 func TestBridgeClose_FailsPending(t *testing.T) {
 	socket, _ := fakeBridgeServer(t)
-	b, err := Dial(socket, "inst-1", "net-1")
+	b, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
 	if err != nil {
 		t.Fatal(err)
 	}

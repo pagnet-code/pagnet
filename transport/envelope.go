@@ -615,7 +615,15 @@ type HeartbeatPayload struct {
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`
 	DaemonVer string `json:"daemonVersion"`
-	Metrics   struct {
+	// BridgeIsolation states how the local agent-bridge socket binds a
+	// bridge's identity to its instance: "process-bound" (Linux: the
+	// SO_PEERCRED process-tree binding is enforced) or
+	// "nonce-only (platform lacks peer credentials)" (non-Linux: the
+	// per-activation nonce is the boundary; the platform is not
+	// process-isolated). Additive: a control plane that predates the
+	// field ignores it.
+	BridgeIsolation string `json:"bridgeIsolation,omitempty"`
+	Metrics         struct {
 		CPUCount      int     `json:"cpuCount"`
 		CPULoad       float64 `json:"cpuLoad"`
 		MemTotalBytes int64   `json:"memTotalBytes"`

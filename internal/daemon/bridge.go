@@ -27,11 +27,32 @@ import (
 // agent.response to the waiting socket client (PROTOCOL §6).
 //
 // Wire format: newline-delimited JSON.
-//   {"type":"auth","instanceId":"…","networkId":"…"}  (first message)
+//   {"type":"auth","instanceId":"…","networkId":"…","nonce":"…","kind":"worker|representative"}  (first message)
 //   {"type":"auth_ok","instanceId":"…"}               (success)
 //   {"type":"error","error":"…"}                      (auth failed; closes)
 //   {"id":"…","tool":"network_ask","args":{…}}        (tool call)
 //   {"id":"…","ok":true,"result":{…}} | {"id":"…","ok":false,"error":"…"}
+//
+// Auth (security wave S1) is NOT identifier-only:
+//   - nonce: the per-activation capability the daemon minted for this
+//     instance's current launch and shipped inside the MCP config.
+//     Enforced on EVERY platform (the portable layer).
+//   - kind: the bridge surface the client was spawned as; it must match
+//     the claimed instance's kind (a worker credential is valid only
+//     for its own worker instance).
+//   - process tree (Linux, after the checks above): SO_PEERCRED peer
+//     uid + the /proc ppid chain must reach the instance's current
+//     supervisor root process, with the peer no older than the root
+//     (pid-reuse refusal). See bridge_peer_linux.go.
+// The networkId comparison below stays as defense-in-depth only — it
+// was VACUOUS for representatives (empty network) and is no longer a
+// security boundary.
+
+// bridgeIsolationProcessBound is the strongest bridge isolation state
+// (reported on the daemon heartbeat): the SO_PEERCRED process-tree
+// binding is enforced (Linux). The non-Linux state constant lives in
+// bridge_peer_other.go.
+const bridgeIsolationProcessBound = "process-bound"
 
 const (
 	bridgeSocketName     = "pagnetd.sock"
@@ -99,6 +120,15 @@ func (d *Daemon) startBridgeSocket() error {
 	d.bridgeL = l
 	d.bridgeMu.Unlock()
 	d.Log.Info("agent bridge socket listening", "socket", sockPath)
+	// One-time platform notice (S1): on platforms without peer
+	// credentials the bridge identity is bound by the nonce + live
+	// process only — the state is also reported on every heartbeat, but
+	// the operator should see it once at startup as well.
+	if mode := bridgeIsolationMode(); mode != bridgeIsolationProcessBound {
+		d.Log.Warn("agent bridge is NOT process-tree isolated on this platform",
+			"isolation", mode,
+			"note", "the per-activation nonce is still enforced; run on Linux for the SO_PEERCRED process-tree binding")
+	}
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -170,6 +200,25 @@ func (d *Daemon) releaseBridgeConn(instanceID string) {
 	}
 }
 
+// instanceRootPID reports the instance's CURRENT supervisor root
+// process id (nil when the instance has no live process): the persistent
+// endpoint, the PTY session, or the active turn — whichever class the
+// supervisor holds live for it. This is the root the bridge's process
+// tree must reach (the bridge is a descendant of the process the
+// supervisor launched for the instance).
+func (d *Daemon) instanceRootPID(instanceID string) *int {
+	if d.sup == nil {
+		return nil
+	}
+	if p := d.sup.EndpointPID(instanceID); p != nil {
+		return p
+	}
+	if p := d.sup.PTYPID(instanceID); p != nil {
+		return p
+	}
+	return d.sup.PID(instanceID)
+}
+
 func (d *Daemon) handleBridgeConn(c net.Conn) {
 	defer c.Close()
 	// Read deadline after Accept (external audit F-010): a connection
@@ -193,6 +242,8 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		Type       string `json:"type"`
 		InstanceID string `json:"instanceId"`
 		NetworkID  string `json:"networkId"`
+		Nonce      string `json:"nonce"`
+		Kind       string `json:"kind"`
 	}
 	if err := json.Unmarshal(line, &auth); err != nil || auth.Type != "auth" {
 		writeBridgeError(c, "first message must be auth")
@@ -203,28 +254,78 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		writeBridgeError(c, "unknown instance (identity rejected)")
 		return
 	}
+	// Per-activation nonce (S1, enforced on EVERY platform): the daemon
+	// minted this credential for the instance's current launch; a
+	// missing/stale/wrong nonce is a rejected identity. This is what
+	// killed identifier-only auth — including the representative gap,
+	// since a worker's nonce is bound to its own worker instance.
+	if !d.bridgeNonceValid(row.InstanceID, auth.Nonce) {
+		writeBridgeError(c, "bridge nonce invalid for this instance (identity rejected)")
+		return
+	}
+	// Kind binding (S1): the bridge surface must match the claimed
+	// instance's kind. Empty normalizes to worker (the row's default and
+	// the bridge's default surface).
+	wantKind := row.Kind
+	if wantKind == "" {
+		wantKind = "worker"
+	}
+	gotKind := auth.Kind
+	if gotKind == "" {
+		gotKind = "worker"
+	}
+	if gotKind != wantKind {
+		writeBridgeError(c, "bridge kind does not match this instance (identity rejected)")
+		return
+	}
+	// Network comparison: defense-in-depth ONLY (S1). It is vacuous for
+	// representatives (their row network is empty) and is no longer a
+	// security boundary — the nonce + kind + process-tree binding are.
 	if row.NetworkID != "" && auth.NetworkID != row.NetworkID {
 		writeBridgeError(c, "network mismatch for this instance (identity rejected)")
 		return
 	}
-	if row.Status == "stopped" {
-		writeBridgeError(c, "instance is stopped")
+	// A stopped OR hibernated instance has no live process, so no
+	// legitimate bridge can exist for it: both are rejected (the old
+	// stopped-only check left hibernated open to a surviving bridge).
+	if row.Status == "stopped" || row.Status == "hibernated" {
+		writeBridgeError(c, "instance is "+row.Status)
+		return
+	}
+	// The claimed instance must have a LIVE supervisor process (the
+	// bridge is spawned by that process, so none means the connector is
+	// not it). Portable floor on every platform; on Linux the tree
+	// check below then proves the ancestry.
+	rootPID := d.instanceRootPID(row.InstanceID)
+	if rootPID == nil {
+		writeBridgeError(c, "instance has no live process (identity rejected)")
 		return
 	}
 	// Per-instance connection cap (external audit F-010): a single agent
-	// must not hold unbounded bridge connections. On failure the deferred
-	// releaseBridgeConn("") still releases the global slot.
+	// must not hold unbounded bridge connections. instanceID is set at
+	// this point (before the peer check) so the deferred release returns
+	// the per-instance slot no matter which later check rejects the
+	// connection.
 	if !d.acquireBridgeInstSlot(row.InstanceID) {
 		writeBridgeError(c, "bridge connection limit reached for this instance")
 		return
 	}
 	instanceID = row.InstanceID
+	// Process-tree binding (Linux, S1): the accepted connection's peer
+	// (SO_PEERCRED) must be the daemon's uid and a descendant of the
+	// instance's current root process, no older than it. No such binding
+	// exists on non-Linux platforms (nonce-only, surfaced in status).
+	if err := d.verifyBridgePeer(c, *rootPID); err != nil {
+		d.Log.Warn("bridge peer verification failed", "instance", row.InstanceID, "err", err.Error())
+		writeBridgeError(c, "peer process verification failed (identity rejected): "+err.Error())
+		return
+	}
 	if _, err := writeBridge(c, map[string]any{
 		"type": "auth_ok", "instanceId": row.InstanceID,
 	}); err != nil {
 		return
 	}
-	d.Log.Info("bridge authenticated", "instance", row.InstanceID)
+	d.Log.Info("bridge authenticated", "instance", row.InstanceID, "kind", wantKind)
 	// The read deadline above bounds the AUTH phase only (slow-loris). A
 	// managed agent keeps ONE bridge connection for the endpoint's whole
 	// lifetime and is legitimately quiet on it for minutes at a time —
@@ -253,6 +354,22 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		if err := json.Unmarshal(line, &req); err != nil || req.ID == "" || req.Tool == "" {
 			writeBridge(c, map[string]any{"id": req.ID, "ok": false,
 				"error": "bad request (need non-empty id + tool)"})
+			continue
+		}
+		// Per-identity tool surface (S1): auth bound the connection to an
+		// instance of a kind, and dispatch enforces that kind's surface —
+		// worker connections may relay network_* ONLY, representative
+		// connections control_* ONLY. (The bridge binaries themselves
+		// register only their own surface; this is the daemon-side
+		// enforcement for a socket client that authenticates with a
+		// valid identity but calls outside its surface.)
+		surfacePrefix := "network_"
+		if row.Kind == "representative" {
+			surfacePrefix = "control_"
+		}
+		if !strings.HasPrefix(req.Tool, surfacePrefix) {
+			writeBridge(c, map[string]any{"id": req.ID, "ok": false,
+				"error": "tool " + req.Tool + " is not on this identity's surface"})
 			continue
 		}
 		if req.Args == nil {

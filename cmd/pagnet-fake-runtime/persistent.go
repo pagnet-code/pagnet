@@ -298,6 +298,18 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	// channel is never "ready" in a select, so once stopping is closed the
 	// select always resolves to the drop path, never a panic.
 	stopping := make(chan struct{})
+
+	// S1 e2e fixtures: play the runtime's MCP-client role (spawn the
+	// daemon-rendered bridge, or dial the bridge socket in-tree as the
+	// supervisor root) when scripted via PAGNET_FAKE_SPAWN_BRIDGE /
+	// PAGNET_FAKE_HOSTILE_BRIDGE (see bridge_fixture.go).
+	if os.Getenv("PAGNET_FAKE_SPAWN_BRIDGE") == "1" {
+		go spawnBridgeFixture(stopping)
+	}
+	if os.Getenv("PAGNET_FAKE_HOSTILE_BRIDGE") == "1" {
+		go hostileBridgeFixture()
+	}
+
 	tuiDone := make(chan struct{})
 	if tty != nil {
 		go func() {

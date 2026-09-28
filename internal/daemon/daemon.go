@@ -269,6 +269,13 @@ type Daemon struct {
 	bridgeConns     int
 	bridgeConnsInst map[string]int
 
+	// Per-activation bridge nonces (security wave S1): instanceID -> the
+	// nonce minted for the instance's CURRENT process launch. In-memory
+	// only (never logged, never persisted); minted at activation,
+	// invalidated at stop/hibernate/restart/removal. See bridge_nonce.go.
+	bridgeNonceMu sync.Mutex
+	bridgeNonces  map[string]string
+
 	// Inventory single-flight (external audit F-016): the workspace scan +
 	// runtime version probes fan out bounded helper processes, and a
 	// reconnect + a host.request_inventory + an UpdateRoots can arrive
@@ -587,6 +594,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		attaches:        map[string]map[string]time.Time{},
 		pending:         map[string]chan transport.AgentResponsePayload{},
 		bridgeConnsInst: map[string]int{},
+		bridgeNonces:    map[string]string{},
 		instQueues:      map[string]*instQueue{},
 		seen:            map[string]time.Time{},
 		deliveredEvents: map[string]time.Time{},
@@ -1322,9 +1330,10 @@ func (d *Daemon) sendAckResult(conn *websocket.Conn, commandID string, errMsg st
 
 func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 	metrics := transport.HeartbeatPayload{
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-		DaemonVer: d.Version,
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		DaemonVer:       d.Version,
+		BridgeIsolation: bridgeIsolationMode(),
 	}
 	metrics.Metrics.CPUCount = runtime.NumCPU()
 	if load, err := readLoadAvg(); err == nil {
@@ -2433,6 +2442,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	if !d.sup.WaitForStop(instanceID, 10*time.Second) {
 		d.Log.Warn("stop: turn not fully reaped within the wait window", "instance", instanceID)
 	}
+	d.invalidateBridgeNonce(instanceID) // S1: the activation's bridge credential dies with the process
 	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err
 	}
@@ -2469,6 +2479,7 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 		}
 		d.removeWorktree(row)
 	}
+	d.invalidateBridgeNonce(instanceID) // S1: the instance is gone for good
 	if err := d.state.DeleteInstance(instanceID); err != nil {
 		return err
 	}
@@ -2500,6 +2511,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	// Cold start: the prior session is NOT resumed on restart — the local
 	// session reference is cleared so the next turn starts fresh (this is
 	// the explicit "Start fresh session" path after a lost session, §74).
+	d.invalidateBridgeNonce(instanceID) // S1: activation reset — the next launch mints a fresh nonce
 	if err := d.state.SetInstanceSession(instanceID, ""); err != nil {
 		return err
 	}
@@ -2635,6 +2647,7 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 			return err
 		}
 	}
+	d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
 	_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
 	_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 		"instanceId": instanceID, "sessionId": row.SessionID,
@@ -2777,6 +2790,11 @@ func (d *Daemon) sessionActivating(instanceID string) bool {
 // standing instruction) reaches the model through the runtime's native
 // standing surface, never as a chat message (instruction-model Wave 3).
 func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) agentruntime.TurnSpec {
+	// S1: mint (or, for an already-live persistent endpoint, keep) the
+	// bridge nonce for the process launch this spec drives — BEFORE the
+	// MCP config is rendered below, so the launch env carries the nonce
+	// the daemon will accept at bridge auth.
+	d.bridgeNonceForActivation(row)
 	// The pagnet overlay is re-rendered per turn (idempotent) and stays on
 	// disk as an on-disk reference: the runtime is pointed at it with
 	// PAGNET_COORDINATION_CONTRACT so the agent can re-read it through its
@@ -2831,15 +2849,25 @@ func (d *Daemon) mcpConfig(row *InstanceRow) string {
 		name, args = "pagnet-control", []string{"mcp", "control"}
 	}
 	args = append(args, "--socket", filepath.Join(d.StateDir, "pagnetd.sock"))
+	// S1: the bridge's per-activation nonce ships inside the MCP config
+	// (the daemon-generated payload the RUNTIME hands to the bridge — it
+	// never enters the runtime's own env, which the child-env allowlist
+	// keeps fail-closed). Omitted when no nonce is stored for the
+	// instance (never activated / invalidated): a bridge that starts
+	// without one refuses to run.
+	bridgeEnv := map[string]string{
+		"PAGNET_INSTANCE_ID": row.InstanceID,
+		"PAGNET_NETWORK_ID":  row.NetworkID,
+	}
+	if n := d.currentBridgeNonce(row.InstanceID); n != "" {
+		bridgeEnv["PAGNET_BRIDGE_NONCE"] = n
+	}
 	cfg := map[string]any{
 		"mcpServers": map[string]any{
 			name: map[string]any{
 				"command": d.selfExe,
 				"args":    args,
-				"env": map[string]string{
-					"PAGNET_INSTANCE_ID": row.InstanceID,
-					"PAGNET_NETWORK_ID":  row.NetworkID,
-				},
+				"env":     bridgeEnv,
 			},
 		},
 	}
@@ -3149,6 +3177,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		// Completed: hibernate with the session preserved. (A deferrable
 		// pending interaction is safe to hibernate under — the interaction
 		// is durable and the instance wakes on the next work/resolve.)
+		d.invalidateBridgeNonce(spec.InstanceID) // S1: the turn process (and its bridge) is dead
 		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
@@ -3865,6 +3894,7 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 		if d.sessionDriverFor(row) != nil {
 			return d.hibernateInstance(conn, p.InstanceID, "attach_closed")
 		}
+		d.invalidateBridgeNonce(p.InstanceID) // S1: the turn process (and its bridge) is dead
 		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
@@ -3902,6 +3932,7 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 		if d.sessionDriverFor(row) != nil {
 			return d.hibernateInstance(conn, p.InstanceID, "stopped")
 		}
+		d.invalidateBridgeNonce(p.InstanceID) // S1: the PTY (and its bridge) is dead
 		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
