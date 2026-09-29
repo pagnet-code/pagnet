@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
 // Version is the SDK version reported in endpoint.register (sdkVersion) and
@@ -75,6 +77,13 @@ func ConfigFromEnv() Config {
 // Validate checks the config. It rejects nothing by credential CONTENT —
 // the server decides whether a credential is valid; the SDK only checks
 // shape (a principal credential carries the pgn_ prefix).
+//
+// It ALSO enforces the netpolicy on the server URL (F-SDK-1): the SDK is
+// a principal-credential holder and sends that credential over REST + WS
+// to Server, so a plain-HTTP non-loopback control plane is refused — the
+// same policy the daemon enforces at its URL resolution points, via the
+// same function (same error style, same PAGNET_INSECURE_REMOTE_HTTP opt-in;
+// the SDK has no CLI flag, so the flag half is false).
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.Server) == "" {
 		return fmt.Errorf("sdk: Server is required (set Config.Server or %s)", EnvServer)
@@ -85,6 +94,9 @@ func (c Config) Validate() error {
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return fmt.Errorf("sdk: Server must be an http(s) URL, got %q", u.Scheme)
+	}
+	if err := netpolicy.Check(c.Server, false); err != nil {
+		return fmt.Errorf("sdk: %w", err)
 	}
 	if strings.TrimSpace(c.Credential) == "" {
 		return fmt.Errorf("sdk: Credential is required (set Config.Credential or %s)", EnvCredential)
