@@ -60,8 +60,13 @@ package runtime
 //     the line-protocol receiver strips it too, and the correlation is an
 //     EXACT match of the echoed text against what was written (see
 //     Submit).
-//   - B7: the 15s startup deadline (no session_start = activation
-//     failure); the 60s in-flight stall is ALERTABLE (surfaced, not a kill).
+//   - B7: the startup budget (no session_start within it = activation
+//     failure) is DRIVER-OWNED: QwenPersistent.StartupTimeout, zero = the
+//     production default (60s). One activation attempt gets ONE budget,
+//     shared by the events-file wait and the handshake wait. It is a
+//     startup-only watchdog: the submit correlation deadline and the
+//     alertable (surfaced, never a kill) in-flight stall window
+//     (qwen_persistent_state.go) are different, untouched watchdogs.
 //   - §6/R3: ask_user_question is HUMAN-ONLY — the daemon must never
 //     auto-resolve it (a generic allowed:true yields a phantom answer).
 //     can_use_tool remote resolution expresses ONLY proceed_once / cancel.
@@ -122,6 +127,15 @@ type QwenPersistent struct {
 	// PTYSize is the initial winsize for the endpoint's TUI PTY. When nil,
 	// a sane default is used (the TUI needs a PTY — doc §2.4 / §7.1).
 	PTYSize *pty.Winsize
+	// StartupTimeout is this driver's STARTUP budget: how long a launched
+	// qwen process may take to complete the session_start handshake before
+	// the activation fails. Zero means the production default (see
+	// effectiveStartupTimeout) — the daemon deliberately leaves it unset.
+	// It bounds ONLY the startup stage: it is not the submit correlation
+	// deadline, not the in-flight stall window, and not a turn deadline.
+	// It is owned by this driver: the fake persistent driver's test deadline
+	// must not (and can no longer) decide when a real qwen startup is killed.
+	StartupTimeout time.Duration
 
 	life lifecycleState
 
@@ -132,6 +146,13 @@ type QwenPersistent struct {
 // NewQwenPersistent builds a Qwen Dual Output persistent driver.
 func NewQwenPersistent(binary string) *QwenPersistent {
 	return &QwenPersistent{Binary: binary, endpoints: map[string]*qwenEndpoint{}}
+}
+
+// startupTimeout is this driver's resolved startup budget (zero field = the
+// production default). Tests set StartupTimeout directly to keep the startup
+// scenarios deterministic.
+func (q *QwenPersistent) startupTimeout() time.Duration {
+	return effectiveStartupTimeout(q.StartupTimeout)
 }
 
 // SetLifecycle implements LifecycleSetter (the daemon injects its central
@@ -239,19 +260,21 @@ func (q *QwenPersistent) Activate(ctx context.Context, sess *session.RuntimeSess
 		// activation lock forever on an unkillable process (B7).
 		q.retireEndpoint(e)
 		return nil, ctx.Err()
-	case <-time.After(activationTimeout):
-		// B7: no session_start within the startup deadline is an
-		// activation failure, not a hang. Compute the startup diagnostic
-		// BEFORE retiring: the process state must reflect the deadline
-		// moment (the retirement below requests termination, which a
-		// later liveness probe would report as exited). Retire THIS
-		// endpoint (pointer-specific detach + bounded termination
-		// request); do NOT reap — the reader owns the reap, and this path
-		// must return within the activation deadline (never 15s +
-		// infinity).
+	case <-time.After(time.Until(e.startupDeadline)):
+		// B7: no session_start within the startup budget is an
+		// activation failure, not a hang. The timer runs out the ONE
+		// deadline this endpoint was launched with (shared with the
+		// reader's events-file wait — see qwenEndpoint.startupDeadline),
+		// never a fresh budget. Compute the startup diagnostic BEFORE
+		// retiring: the process state must reflect the deadline moment (the
+		// retirement below requests termination, which a later liveness
+		// probe would report as exited). Retire THIS endpoint
+		// (pointer-specific detach + bounded termination request); do NOT
+		// reap — the reader owns the reap, and this path must return within
+		// the startup budget (never the budget + infinity).
 		diag := e.startupDiag()
 		q.retireEndpoint(e)
-		return nil, errors.New("qwen persistent: activation timed out (no session_start within the startup deadline); " + diag)
+		return nil, fmt.Errorf("qwen persistent: activation timed out (no session_start within the %s startup budget); %s", startupBudgetText(e.startupBudget), diag)
 	}
 	if events != nil {
 		events <- actEv
@@ -451,6 +474,16 @@ type qwenEndpoint struct {
 	// activationCh carries the process's first (activation) event; closed
 	// by the reader after it is delivered.
 	activationCh chan session.SessionEvent
+	// startupBudget is the driver's resolved startup budget for THIS
+	// activation attempt and startupDeadline the absolute instant it
+	// expires (launch time + budget). BOTH stages that wait for the
+	// handshake — the reader's events-file wait and Activate's activation-
+	// event wait — observe this ONE deadline: one activation attempt gets
+	// one maximum startup budget, never one budget per waiting stage (two
+	// independent timers would double the real limit and let the surfaced
+	// error text lie about it). Set once at launch, immutable after.
+	startupBudget   time.Duration
+	startupDeadline time.Time
 	// readerDone is closed when the event-file reader exits (the process
 	// has exited). It is the liveness signal.
 	readerDone chan struct{}
@@ -517,7 +550,7 @@ func (e *qwenEndpoint) processGone() bool {
 // startup-timeout moment: the events-file state (absent, or its size + a
 // bounded log-safe tail) and the process liveness, as one short line
 // ("events_file=...; process=..."). The activation timeout error carries
-// it, so a "no session_start within the startup deadline" failure is never
+// it, so a "no session_start within the startup budget" failure is never
 // a black box: the file-appeared-but-handshake-never-arrived case (the TUI
 // stuck in a pre-session state, e.g. first-run onboarding) is distinguishable
 // from the bridge never opening the file and from the process dying. The
@@ -882,6 +915,16 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	// The endpoint is LONG-LIVED: it must survive across turns (the whole
 	// point of the persistent model). The launch ctx must NOT be a turn's
 	// ctx (cancelled at turn end) — it is the driver's own lifetime.
+	//
+	// The ONE startup budget for this activation attempt: an absolute
+	// deadline fixed at launch and observed by BOTH the reader's events-file
+	// wait and Activate's activation-event wait (see
+	// qwenEndpoint.startupDeadline). It is taken BEFORE the process is
+	// spawned so the spawn itself is inside the budget — the production cold
+	// start that motivated this fix was slow before the first event, not
+	// after it.
+	startupBudget := q.startupTimeout()
+	startupDeadline := time.Now().Add(startupBudget)
 	h, err := el.Launch(context.Background(), proc.LaunchRequest{
 		InstanceID: sess.InstanceID,
 		TurnID:     "endpoint",
@@ -899,16 +942,18 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	}
 
 	e := &qwenEndpoint{
-		f:            q,
-		instanceID:   sess.InstanceID,
-		stateDir:     stateDir,
-		h:            h,
-		eventsPath:   eventsPath,
-		inputPath:    inputPath,
-		inputFile:    inputFile,
-		state:        newQwenTurnState(resuming, resumeID, time.Now),
-		activationCh: make(chan session.SessionEvent, 1),
-		readerDone:   make(chan struct{}),
+		f:               q,
+		instanceID:      sess.InstanceID,
+		stateDir:        stateDir,
+		h:               h,
+		eventsPath:      eventsPath,
+		inputPath:       inputPath,
+		inputFile:       inputFile,
+		state:           newQwenTurnState(resuming, resumeID, time.Now),
+		activationCh:    make(chan session.SessionEvent, 1),
+		startupBudget:   startupBudget,
+		startupDeadline: startupDeadline,
+		readerDone:      make(chan struct{}),
 	}
 	go e.readLoop()
 	q.mu.Lock()
@@ -992,12 +1037,16 @@ func (e *qwenEndpoint) readLoop() {
 
 // waitForEventsFile waits for the events file to appear (the bridge opens
 // it at startup). It returns the opened file, or an error when the file
-// does not appear within the startup deadline (the bridge failed to open
-// it — doc §7.2: the TUI continues without dual output) or the process
-// exits first (e.g. "No saved session found" — exit 1, doc §5.2).
+// does not appear within the endpoint's startup deadline (the bridge failed
+// to open it — doc §7.2: the TUI continues without dual output) or the
+// process exits first (e.g. "No saved session found" — exit 1, doc §5.2).
+//
+// The deadline is the endpoint's ONE startup deadline (fixed at launch), not
+// a fresh budget: the process-exit check below is what keeps an early death
+// fast — this loop returns as soon as the process is gone, long before the
+// deadline expires.
 func (e *qwenEndpoint) waitForEventsFile() (*os.File, error) {
-	deadline := time.Now().Add(activationTimeout)
-	for time.Now().Before(deadline) {
+	for time.Now().Before(e.startupDeadline) {
 		if e.processGone() {
 			return nil, errors.New("qwen process exited before the event file appeared")
 		}
@@ -1009,7 +1058,7 @@ func (e *qwenEndpoint) waitForEventsFile() (*os.File, error) {
 	}
 	// The file-absence fact is already in the message — only the process
 	// state is appended (the driver owns both facts at this moment).
-	return nil, fmt.Errorf("qwen event file did not appear within the startup deadline; process=%s", e.processStateDiag())
+	return nil, fmt.Errorf("qwen event file did not appear within the %s startup budget; process=%s", startupBudgetText(e.startupBudget), e.processStateDiag())
 }
 
 // handleEventLine processes one event line: it runs the state machine and

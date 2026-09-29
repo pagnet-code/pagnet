@@ -83,6 +83,15 @@ if [ -n "$QWEN_FAKE_NO_START" ]; then
 fi
 SID="${RESUME_ID:-${QWEN_FAKE_SID:-11111111-aaaa-bbbb-cccc-111111111111}}"
 CWD="$(pwd)"
+if [ -n "$QWEN_FAKE_START_DELAY_MS" ]; then
+  # Cold-start latency simulation (the production incident): the process is
+  # alive and the machine channel is fine, but session_start is only emitted
+  # after the delay — exactly a healthy qwen that takes a while to come up.
+  # The events file is NOT created during the delay (the observed prod
+  # shape: no file yet, process alive).
+  S="$QWEN_FAKE_START_DELAY_MS"
+  sleep "$(printf '%d.%03d' $((S / 1000)) $((S % 1000)))"
+fi
 cat > "$JSON_FILE" <<EOF
 {"type":"system","subtype":"session_start","session_id":"$SID","data":{"session_id":"$SID","cwd":"$CWD","protocol_version":2,"version":"0.23.4","supported_events":["system","user","assistant","stream_event","control_request","control_response"]}}
 EOF

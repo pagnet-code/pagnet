@@ -214,6 +214,11 @@ func TestCodexPersistent_Handshake(t *testing.T) {
 
 	t.Run("timeoutIsACleanLaunchError", func(t *testing.T) {
 		sup, m, cp := newCodexFixture(t, "PAGNET_FAKE_CODEX_NO_INITIALIZE_RESPONSE=1")
+		// The driver's startup budget is its own field (the production
+		// default is 60s); the test sets a short one so the fixture stays
+		// deterministic and fast.
+		const budget = 700 * time.Millisecond
+		cp.StartupTimeout = budget
 		workspace := t.TempDir()
 		sess := m.Session("inst-hs-timeout", domain.RuntimeCodex, workspace)
 		m.SetLaunchEnv(sess, codexMCPEnv("inst-hs-timeout"))
@@ -230,9 +235,16 @@ func TestCodexPersistent_Handshake(t *testing.T) {
 		if !strings.Contains(err.Error(), "initialize") {
 			t.Fatalf("error = %q, want the initialize handshake failure", err)
 		}
-		// Bounded by the activation timeout (a clean failure, not a hang).
+		if !strings.Contains(err.Error(), startupBudgetText(budget)+" startup budget") {
+			t.Fatalf("error = %q, want it to name the effective %s startup budget", err, startupBudgetText(budget))
+		}
+		// Bounded by the driver's startup budget (a clean failure, not a
+		// hang).
 		if elapsed > 30*time.Second {
-			t.Fatalf("handshake failure took %s (want bounded by the activation timeout)", elapsed)
+			t.Fatalf("handshake failure took %s (want bounded by the %s startup budget)", elapsed, budget)
+		}
+		if elapsed < budget {
+			t.Fatalf("handshake failure took %s, before the %s budget the driver granted", elapsed, budget)
 		}
 		// The failed activation left NO stale endpoint behind (the
 		// supervisor record clears asynchronously with the reap).

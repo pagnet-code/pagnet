@@ -107,6 +107,16 @@ type CodexPersistent struct {
 	// Env is appended to the inherited environment for the endpoint
 	// process.
 	Env []string
+	// StartupTimeout is this driver's STARTUP budget: how long a launched
+	// app-server process may take to complete the initialize + thread
+	// start/resume handshake before the activation fails. Zero means the
+	// production default (see effectiveStartupTimeout) — the daemon
+	// deliberately leaves it unset. It bounds ONLY the startup handshake:
+	// it is not a turn deadline and not an RPC timeout for anything after
+	// activation. It is owned by this driver: the fake persistent driver's
+	// test deadline must not decide when a real app-server startup is
+	// killed.
+	StartupTimeout time.Duration
 
 	life lifecycleState
 
@@ -117,6 +127,13 @@ type CodexPersistent struct {
 // NewCodexPersistent builds a Codex persistent driver.
 func NewCodexPersistent(binary string) *CodexPersistent {
 	return &CodexPersistent{Binary: binary, endpoints: map[string]*codexEndpoint{}}
+}
+
+// startupTimeout is this driver's resolved startup budget (zero field = the
+// production default). Tests set StartupTimeout directly to keep the startup
+// scenarios deterministic.
+func (c *CodexPersistent) startupTimeout() time.Duration {
+	return effectiveStartupTimeout(c.StartupTimeout)
 }
 
 // SetLifecycle implements LifecycleSetter (the daemon injects its central
@@ -427,6 +444,13 @@ type codexEndpoint struct {
 	// activationCh carries the (synthesized) activation event; closed by
 	// the driver after it is delivered.
 	activationCh chan session.SessionEvent
+	// handshakeStage names the startup exchange the activation is currently
+	// awaiting ("initialize" or "thread/start" / "thread/resume"), so the
+	// startup-timeout error can say WHERE the handshake stopped. It is
+	// written by handshake and read by launchEndpoint — both run on the
+	// activating goroutine, so it needs no lock and no other path may touch
+	// it. Empty once the handshake completed.
+	handshakeStage string
 	// readerDone is closed when the stdout reader exits (the process has
 	// exited — its stdout is closed). It is the liveness signal.
 	readerDone chan struct{}
@@ -489,6 +513,18 @@ func (e *codexEndpoint) processGone() bool {
 		return false // still starting
 	}
 	return proc.ProcessIsZombie(pid) || !proc.ProcessAlive(pid)
+}
+
+// processStateDiag renders the endpoint's process liveness as the
+// diagnostic suffix value ("alive" / "exited") — the codex counterpart of
+// the qwen driver's startup diagnostic. It is deliberately narrow: the
+// handshake stage says WHERE the startup stopped, this says whether the
+// process is even still there. No prompts, no secrets, no environment.
+func (e *codexEndpoint) processStateDiag() string {
+	if e.processGone() {
+		return "exited"
+	}
+	return "alive"
 }
 
 func (e *codexEndpoint) pid() *int {
@@ -690,12 +726,27 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 
 	// The handshake (initialize + thread start/resume) bounds the
 	// activation: a process that starts but never completes the handshake
-	// is a failure, not a hang. The ctx bounds it (the caller's ctx plus
-	// the activation deadline).
-	hsCtx, cancel := context.WithTimeout(ctx, activationTimeout)
+	// is a failure, not a hang. ONE budget covers the whole handshake (the
+	// two exchanges share this deadline — never one per exchange), and it is
+	// the driver's OWN startup budget, not the fake runtime driver's test
+	// deadline. The caller's ctx bounds it too, whichever comes first.
+	startupBudget := c.startupTimeout()
+	hsCtx, cancel := context.WithTimeout(ctx, startupBudget)
 	defer cancel()
 	actEv, herr := e.handshake(hsCtx, sess)
 	if herr != nil {
+		// A handshake that stopped because THIS budget expired (the caller's
+		// ctx is still live — otherwise its cancellation would have ended
+		// the wait) is the user-facing startup timeout. Its facts must be
+		// captured BEFORE the retirement below requests termination: a later
+		// liveness probe would report the process as exited (which is the
+		// driver's own doing, not a fact about the startup). Any other
+		// failure (a JSON-RPC error, the process dying, the caller's cancel)
+		// rides its own error unchanged and fast — the budget is only the
+		// maximum for a live process that has not answered yet.
+		budgetExpired := hsCtx.Err() != nil && ctx.Err() == nil
+		stage := e.handshakeStage
+		processState := e.processStateDiag()
 		// The handshake failed: retire THIS endpoint (pointer-specific
 		// detach + bounded termination request). A failed activation must
 		// never leave a stale endpoint in the registry — but this path
@@ -705,6 +756,13 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		// cannot be killed, the supervisor keeps tracking it and the
 		// activation returns its bounded failure.
 		c.retireEndpoint(e)
+		if budgetExpired {
+			if stage == "" {
+				stage = "handshake"
+			}
+			return nil, actEv, fmt.Errorf("codex persistent: activation timed out (no response to %s within the %s startup budget); process=%s: %w",
+				stage, startupBudgetText(startupBudget), processState, herr)
+		}
 		return nil, actEv, herr
 	}
 	return e, actEv, nil
@@ -716,6 +774,9 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 // thread/resume (the stored thread is gone, or the server re-based onto
 // a different one) is a session loss.
 func (e *codexEndpoint) handshake(ctx context.Context, sess *session.RuntimeSession) (session.SessionEvent, error) {
+	// Track the exchange being awaited so the startup-timeout error can name
+	// it (see codexEndpoint.handshakeStage).
+	e.handshakeStage = "initialize"
 	// 1. initialize: the protocol handshake (awaited before any other
 	// request — the app-server refuses thread/turn work before it).
 	if _, err := e.request(ctx, "initialize", map[string]any{
@@ -744,6 +805,7 @@ func (e *codexEndpoint) handshake(ctx context.Context, sess *session.RuntimeSess
 	if model := e.f.modelFor(sess); model != "" {
 		params["model"] = model
 	}
+	e.handshakeStage = method
 	res, err := e.request(ctx, method, params)
 	if err != nil {
 		if resuming {
@@ -780,6 +842,7 @@ func (e *codexEndpoint) handshake(ctx context.Context, sess *session.RuntimeSess
 	}
 	// Publish the activation event: from this moment the reader routes
 	// turn events (before it, there is no turn to route to).
+	e.handshakeStage = "" // the handshake is complete — nothing is awaited
 	e.mu.Lock()
 	e.activationSent = true
 	e.mu.Unlock()

@@ -20,10 +20,17 @@ import (
 	"github.com/pagnet-code/pagnet/internal/session"
 )
 
-// activationTimeout bounds how long Activate waits for the endpoint process
-// to emit its activation event (session.started / resumed / lost). A process
-// that starts but never reports is a failure, not a hang.
-const activationTimeout = 15 * time.Second
+// fakeActivationTimeout is the FAKE persistent driver's OWN deterministic
+// test deadline for Activate waiting on the endpoint process's activation
+// event (session.started / resumed / lost). A process that starts but never
+// reports is a failure, not a hang.
+//
+// It belongs to the fake alone. The production persistent drivers (Qwen,
+// Codex) own their startup budget through their own StartupTimeout field
+// (see effectiveStartupTimeout) and must never consume this value — a test
+// driver's deadline defining production runtime behavior is exactly the
+// defect that killed healthy cold starts in production.
+const fakeActivationTimeout = 15 * time.Second
 
 // PersistentFake is the deterministic FAKE PERSISTENT runtime driver
 // (runtime-lifecycle refactor, Phase 1). It is the reference implementation
@@ -135,7 +142,7 @@ func (f *PersistentFake) Activate(ctx context.Context, sess *session.RuntimeSess
 	case <-ctx.Done():
 		f.dropEndpoint(sess.InstanceID)
 		return nil, ctx.Err()
-	case <-time.After(activationTimeout):
+	case <-time.After(fakeActivationTimeout):
 		f.dropEndpoint(sess.InstanceID)
 		return nil, errors.New("persistent fake: activation timed out")
 	}

@@ -61,6 +61,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -191,12 +192,18 @@ func TestQwenPersistent_ActivationCancelBounded(t *testing.T) {
 // reaped by the reader (the reader's owner Wait must never block on a
 // process that was never stopped), and the termination must be requested,
 // not aborted.
+//
+// The startup budget is the DRIVER-OWNED field (the driver's production
+// default is 60s); the test sets a short one so the scenario stays
+// deterministic and the suite stays fast.
 func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_NO_FILE=1")
+	const budget = 600 * time.Millisecond
+	q.StartupTimeout = budget
 	sess := newLifecycleSession(workspace, stubEnv)
 
-	// B: the startup deadline (no events file within 15s while the process
-	// is alive) is an activation failure, not a hang. The activation
+	// B: the startup deadline (no events file within the budget while the
+	// process is alive) is an activation failure, not a hang. The activation
 	// returns within the deadline + bounded termination overhead.
 	events := make(chan session.SessionEvent, 8)
 	start := time.Now()
@@ -205,25 +212,33 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 	t.Logf("startup deadline: Activate failed after %v: %v", elapsed, err)
 
 	if err == nil {
-		t.Fatal("Activate succeeded, want an activation failure (no session_start within the startup deadline)")
+		t.Fatal("Activate succeeded, want an activation failure (no session_start within the startup budget)")
 	}
-	// Bounded: the 15s deadline + bounded termination overhead, NOT
-	// infinity (the pre-fix PATH B blocked the reader's owner Wait on a
-	// live process that was never stopped).
-	if elapsed > 30*time.Second {
-		t.Fatalf("Activate took %v, want bounded (15s deadline + termination overhead, not a hang)", elapsed)
+	// The deadline is honored, not shortened: the failure may not arrive
+	// before the budget the driver granted the startup.
+	if elapsed < budget {
+		t.Fatalf("Activate failed after %v, before the %v startup budget it granted", elapsed, budget)
+	}
+	// Bounded: the deadline + bounded termination overhead, NOT infinity (the
+	// pre-fix PATH B blocked the reader's owner Wait on a live process that
+	// was never stopped). The one-budget-per-attempt invariant is pinned by
+	// TestQwenPersistent_StartupBudgetIsOneBudgetPerActivation, not by this
+	// (deliberately generous) overhead bound.
+	if elapsed > 4*time.Second {
+		t.Fatalf("Activate took %v, want ~the %v deadline + bounded termination overhead (not a hang)", elapsed, budget)
 	}
 	// The process-state diagnostic rides the failure surface. In this
-	// scenario the file NEVER appears, and the two 15s clocks (Activate's
-	// own timer and the reader's file deadline) start a hair apart, so
-	// either surface can fire first:
+	// scenario the file NEVER appears, and the two stages that watch the ONE
+	// shared deadline (the reader's file deadline and Activate's own timer)
+	// race for who reports it first:
 	//   - the reader's file deadline: Activate returns ErrSessionLost and
 	//     the lost activation event carries the file-deadline message with
 	//     the process=alive suffix;
 	//   - Activate's own timer: the returned error carries the full
 	//     startup diagnostic (events_file=absent; process=alive).
-	// Both are the deadline failure with the diagnostic attached — assert
-	// it on the surface that fired.
+	// Both are the deadline failure with the diagnostic attached, and both
+	// name the effective budget — assert it on the surface that fired.
+	budgetText := startupBudgetText(budget)
 	if errors.Is(err, session.ErrSessionLost) {
 		var actEv session.SessionEvent
 		select {
@@ -234,12 +249,15 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 		if actEv.Type != session.EventSessionLost {
 			t.Fatalf("activation event = %q, want %q", actEv.Type, session.EventSessionLost)
 		}
-		if !strings.Contains(actEv.Error, "qwen event file did not appear within the startup deadline; process=alive") {
-			t.Fatalf("lost event error = %q, want the file-deadline message with the process=alive diagnostic", actEv.Error)
+		if !strings.Contains(actEv.Error, "qwen event file did not appear within the "+budgetText+" startup budget; process=alive") {
+			t.Fatalf("lost event error = %q, want the file-deadline message naming the %s budget with the process=alive diagnostic", actEv.Error, budgetText)
 		}
 	} else {
 		if !strings.Contains(err.Error(), "events_file=absent") || !strings.Contains(err.Error(), "process=alive") {
 			t.Fatalf("error = %q, want the startup diagnostic (events_file=absent; process=alive)", err.Error())
+		}
+		if !strings.Contains(err.Error(), budgetText+" startup budget") {
+			t.Fatalf("error = %q, want it to name the effective %s startup budget", err.Error(), budgetText)
 		}
 	}
 	// The endpoint record is detached (pointer-specific retire).
@@ -262,13 +280,15 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 // in a pre-session state (first-run onboarding / auth). This is the
 // hibernated-instance black box: the generic timeout error used to be the
 // only evidence. Here the reader is happily polling the existing file (it
-// has no deadline of its own in this scenario), so Activate's OWN 15s
+// has no deadline of its own in this scenario), so Activate's OWN startup
 // timer deterministically fires and the returned error must carry the
-// startup diagnostic: the events-file size + a bounded tail with the
-// file's own content, and process=alive (the state at the deadline
-// moment, computed before the retirement requests termination).
+// startup diagnostic: the events-file size + a bounded tail with the file's
+// own content, and process=alive (the state at the deadline moment, computed
+// before the retirement requests termination).
 func TestQwenPersistent_StartupDeadlineDiagCarriesEventsTail(t *testing.T) {
 	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_PRE_SESSION=1")
+	const budget = 800 * time.Millisecond
+	q.StartupTimeout = budget
 	sess := newLifecycleSession(workspace, stubEnv)
 
 	start := time.Now()
@@ -277,16 +297,17 @@ func TestQwenPersistent_StartupDeadlineDiagCarriesEventsTail(t *testing.T) {
 	t.Logf("startup deadline (file appeared, no session_start): Activate failed after %v: %v", elapsed, err)
 
 	if err == nil {
-		t.Fatal("Activate succeeded, want an activation failure (no session_start within the startup deadline)")
+		t.Fatal("Activate succeeded, want an activation failure (no session_start within the startup budget)")
 	}
-	// Bounded: the 15s deadline + bounded termination overhead, NOT a hang.
-	if elapsed > 30*time.Second {
-		t.Fatalf("Activate took %v, want bounded (15s deadline + termination overhead, not a hang)", elapsed)
+	// Bounded: the deadline + bounded termination overhead, NOT a hang.
+	if elapsed > 15*time.Second {
+		t.Fatalf("Activate took %v, want bounded (%v deadline + termination overhead, not a hang)", elapsed, budget)
 	}
-	// The existing message prefix is preserved verbatim...
-	const prefix = "qwen persistent: activation timed out (no session_start within the startup deadline)"
+	// The message keeps its shape and now names the effective budget the
+	// operator can act on...
+	prefix := "qwen persistent: activation timed out (no session_start within the " + startupBudgetText(budget) + " startup budget)"
 	if !strings.HasPrefix(err.Error(), prefix) {
-		t.Fatalf("error = %q, want the unchanged prefix %q", err.Error(), prefix)
+		t.Fatalf("error = %q, want the prefix %q", err.Error(), prefix)
 	}
 	// ...and the diagnostic now rides the error: the events file existed
 	// (its size + a bounded tail carrying the file's own content — the
@@ -376,6 +397,11 @@ func TestQwenPersistent_StopPathSingleWaitOwner(t *testing.T) {
 // proc-level unkillable tests).
 func TestQwenPersistent_RetrySafetyNoSecondProcess(t *testing.T) {
 	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t)
+	// The retry's failure is bounded by the startup budget (the reconciled
+	// endpoint's events file is gone and the stuck old process never
+	// recreates it); the budget's LENGTH is not what this test is about, so
+	// it is set short to keep the scenario fast and deterministic.
+	q.StartupTimeout = 600 * time.Millisecond
 	sess := newLifecycleSession(workspace, stubEnv)
 
 	// Cold start (the stub writes a session_start; the endpoint is live).
@@ -472,4 +498,199 @@ func TestQwenPersistent_NormalPathUnchanged(t *testing.T) {
 	if q.Live("inst-1") {
 		t.Fatal("endpoint still live after Stop")
 	}
+}
+
+// --- driver-owned startup budget -------------------------------------------
+//
+// The scenarios below pin the STARTUP budget contract of the production
+// driver: the budget is the driver's own (never the fake runtime driver's
+// test deadline), it is the MAXIMUM for a live process whose handshake has
+// not completed yet, and one activation attempt gets exactly ONE budget.
+
+// TestQwenPersistent_DelayedStartupWithinBudgetSucceeds is the production
+// incident as a test: a HEALTHY qwen cold start that is merely slow — the
+// process is alive, the machine channel is fine, and session_start only
+// arrives after a delay. The same stubbed delay is run against a budget that
+// covers it (activation SUCCEEDS — the acceptance proof: a startup inside
+// the budget is never killed) and against a budget it exceeds (activation
+// FAILS, at the budget, with the diagnostic). Nothing about the process
+// differs between the two runs: only the driver's budget.
+func TestQwenPersistent_DelayedStartupWithinBudgetSucceeds(t *testing.T) {
+	const delayMS = 1200
+
+	t.Run("withinBudgetSucceeds", func(t *testing.T) {
+		sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_START_DELAY_MS="+strconv.Itoa(delayMS))
+		const budget = 15 * time.Second
+		q.StartupTimeout = budget
+		sess := newLifecycleSession(workspace, stubEnv)
+
+		start := time.Now()
+		_, err := q.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+		elapsed := time.Since(start)
+		t.Logf("delayed startup: Activate returned after %v (err=%v)", elapsed, err)
+
+		// THE PROOF: the delayed-but-healthy startup is activated, not
+		// killed.
+		if err != nil {
+			t.Fatalf("Activate = %v, want success — a healthy startup that finishes within the %v budget must not be terminated", err, budget)
+		}
+		// The handshake really was delayed (an instant stub would prove
+		// nothing): the activation could not have completed before the stub
+		// emitted session_start.
+		if elapsed < time.Duration(delayMS)*time.Millisecond/2 {
+			t.Fatalf("Activate returned after %v, faster than the %dms startup delay — the stub did not delay the handshake", elapsed, delayMS)
+		}
+		if elapsed >= budget {
+			t.Fatalf("Activate returned after %v, at or past the %v budget", elapsed, budget)
+		}
+		if sess.NativeID == "" {
+			t.Fatal("NativeID not set after the delayed activation (the handshake was not consumed)")
+		}
+		if !q.Live("inst-1") {
+			t.Fatal("endpoint not live after the delayed activation")
+		}
+		if err := q.Stop("inst-1"); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		waitReaped(t, sup, "inst-1", 30*time.Second)
+		assertTerminationRequested(t, sup, "delayed startup")
+	})
+
+	t.Run("beyondBudgetFailsAtTheBudget", func(t *testing.T) {
+		// The identical slow startup, a budget it cannot finish inside.
+		sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_START_DELAY_MS="+strconv.Itoa(delayMS))
+		const budget = 250 * time.Millisecond
+		q.StartupTimeout = budget
+		sess := newLifecycleSession(workspace, stubEnv)
+
+		events := make(chan session.SessionEvent, 8)
+		start := time.Now()
+		_, err := q.Activate(context.Background(), sess, events)
+		elapsed := time.Since(start)
+		t.Logf("startup beyond the budget: Activate failed after %v: %v", elapsed, err)
+
+		if err == nil {
+			t.Fatalf("Activate succeeded, want the startup-budget failure (session_start at %dms > the %v budget)", delayMS, budget)
+		}
+		if elapsed < budget {
+			t.Fatalf("Activate failed after %v, before the %v budget it granted", elapsed, budget)
+		}
+		if elapsed > 10*time.Second {
+			t.Fatalf("Activate took %v, want the %v budget + bounded termination overhead", elapsed, budget)
+		}
+		// Whichever stage reports the expired shared deadline, the surfaced
+		// text names the effective budget and the process liveness.
+		text := err.Error()
+		if errors.Is(err, session.ErrSessionLost) {
+			// The reader's file-deadline surface: the reason rides the lost
+			// activation event it published.
+			var actEv session.SessionEvent
+			select {
+			case actEv = <-events:
+			case <-time.After(2 * time.Second):
+				t.Fatal("no activation event on the reader-deadline path")
+			}
+			if actEv.Type != session.EventSessionLost {
+				t.Fatalf("activation event = %q, want %q", actEv.Type, session.EventSessionLost)
+			}
+			text = actEv.Error
+		}
+		if !strings.Contains(text, "process=alive") {
+			t.Fatalf("text = %q, want the process=alive diagnostic (the process was alive, merely slow)", text)
+		}
+		if !strings.Contains(text, startupBudgetText(budget)+" startup budget") {
+			t.Fatalf("text = %q, want it to name the effective %s startup budget", text, startupBudgetText(budget))
+		}
+		if q.Live("inst-1") {
+			t.Fatal("endpoint still registered after the startup-budget failure")
+		}
+		waitReaped(t, sup, "inst-1", 30*time.Second)
+		assertTerminationRequested(t, sup, "startup beyond the budget")
+	})
+}
+
+// TestQwenPersistent_EarlyProcessExitFailsFast pins that the startup budget
+// is only the MAXIMUM for a live process. The endpoint exits on its own
+// before the handshake ("No saved session found" — exit 1, doc §5.2), and
+// the activation must settle in milliseconds — the full production default
+// (60s here, left at its zero value) must NOT be paid for a dead process.
+func TestQwenPersistent_EarlyProcessExitFailsFast(t *testing.T) {
+	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_NO_SESSION=1")
+	// The field is deliberately left at its zero value: this is the
+	// production default budget (60s), and it must not slow the early exit.
+	if got := q.startupTimeout(); got != 60*time.Second {
+		t.Fatalf("default startupTimeout = %v, want the 60s production default", got)
+	}
+	sess := newLifecycleSession(workspace, stubEnv)
+
+	start := time.Now()
+	_, err := q.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+	elapsed := time.Since(start)
+	t.Logf("early exit: Activate failed after %v: %v", elapsed, err)
+
+	if !errors.Is(err, session.ErrSessionLost) {
+		t.Fatalf("Activate = %v, want ErrSessionLost (the process exited before the handshake)", err)
+	}
+	// Fast: an order of magnitude inside the 60s budget. The failure is the
+	// process exit, not the deadline.
+	if elapsed > 10*time.Second {
+		t.Fatalf("Activate took %v for a process that exited immediately, want a fast failure (the %v startup budget must not be paid)", elapsed, q.startupTimeout())
+	}
+	if q.Live("inst-1") {
+		t.Fatal("endpoint still registered after the early exit")
+	}
+	waitReaped(t, sup, "inst-1", 30*time.Second)
+	assertTerminationRequested(t, sup, "early exit")
+}
+
+// TestQwenPersistent_StartupBudgetIsOneBudgetPerActivation pins the
+// one-budget-per-attempt invariant. The handshake is awaited by TWO stages —
+// the reader's events-file wait and Activate's activation-event wait — and
+// they must observe ONE deadline fixed at launch, not a fresh budget each (a
+// second budget would double the real limit and make the surfaced error text
+// lie about it). Observed through the file-wait stage directly: it returns
+// its failure at the launch deadline, leaving NOTHING pending for the other
+// stage.
+func TestQwenPersistent_StartupBudgetIsOneBudgetPerActivation(t *testing.T) {
+	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_NO_FILE=1")
+	const budget = 1500 * time.Millisecond
+	q.StartupTimeout = budget
+	sess := newLifecycleSession(workspace, stubEnv)
+
+	launchAt := time.Now()
+	e, err := q.launchEndpoint(sess)
+	if err != nil {
+		t.Fatalf("launchEndpoint: %v", err)
+	}
+	// The endpoint carries the driver's resolved budget and the absolute
+	// instant it expires — one budget, measured from the launch.
+	if e.startupBudget != budget {
+		t.Fatalf("endpoint startupBudget = %v, want the driver's %v", e.startupBudget, budget)
+	}
+	if remaining := time.Until(e.startupDeadline); remaining > budget || remaining <= 0 {
+		t.Fatalf("startup deadline is %v away at launch, want within the %v budget", remaining, budget)
+	}
+	// The file never appears (QWEN_FAKE_NO_FILE): this stage returns its
+	// failure AT the launch deadline — about one budget after launch, never
+	// two. The bound is deliberately below 2x the budget.
+	_, werr := e.waitForEventsFile()
+	waited := time.Since(launchAt)
+	t.Logf("file wait returned after %v: %v", waited, werr)
+	if werr == nil {
+		t.Fatal("waitForEventsFile succeeded, want the file-absent deadline failure")
+	}
+	if waited < budget {
+		t.Fatalf("the file wait returned after %v, before the %v deadline", waited, budget)
+	}
+	if waited > budget+900*time.Millisecond {
+		t.Fatalf("the file wait returned after %v, past one budget + poll slack (2x the budget would be %v — a second, independent budget)", waited, 2*budget)
+	}
+	// The other consumer of the same deadline (Activate's timer, computed as
+	// the time remaining to it) has nothing left to wait on.
+	if time.Now().Before(e.startupDeadline) {
+		t.Fatalf("the startup deadline is still %v away after the file wait — the stages would get one budget EACH", time.Until(e.startupDeadline))
+	}
+	q.retireEndpoint(e)
+	waitReaped(t, sup, "inst-1", 30*time.Second)
+	assertTerminationRequested(t, sup, "one startup budget")
 }

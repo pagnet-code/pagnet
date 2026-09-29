@@ -645,3 +645,44 @@ func TestPersistentFake_TurnIDEchoedInEvents(t *testing.T) {
 	}
 	t.Logf("all %d turn events carry the logical turn id", turnEvents)
 }
+
+// TestPersistentStartupBudgetOwnershipIsPerDriver is the independence guard
+// between the FAKE persistent driver's test deadline and the PRODUCTION
+// drivers' startup budgets.
+//
+// It exists because the startup deadline used to be a package constant
+// declared right here, in the fake persistent driver's file, and silently
+// consumed by the real Qwen and Codex drivers: a test fake's timing defined
+// production runtime behavior and terminated a healthy qwen cold start in
+// production before its handshake completed. Each production driver now owns
+// its budget through its own field, so this asserts the values are genuinely
+// different — reintroducing the shared constant fails here instead of in the
+// field.
+func TestPersistentStartupBudgetOwnershipIsPerDriver(t *testing.T) {
+	// Zero value = the production default, for BOTH production persistent
+	// drivers (the daemon constructs them this way and needs no change).
+	q := NewQwenPersistent("")
+	if got := q.startupTimeout(); got != 60*time.Second {
+		t.Fatalf("QwenPersistent zero-value startupTimeout = %v, want the 60s production default", got)
+	}
+	cp := NewCodexPersistent("")
+	if got := cp.startupTimeout(); got != 60*time.Second {
+		t.Fatalf("CodexPersistent zero-value startupTimeout = %v, want the 60s production default", got)
+	}
+	// The production budgets are NOT the fake's deadline.
+	if got := q.startupTimeout(); got == fakeActivationTimeout {
+		t.Fatalf("qwen startup budget = %v, which is the fake persistent driver's deadline — production must own its startup budget", got)
+	}
+	if got := cp.startupTimeout(); got == fakeActivationTimeout {
+		t.Fatalf("codex startup budget = %v, which is the fake persistent driver's deadline — production must own its startup budget", got)
+	}
+	// An explicit field wins, per driver: setting one does not move the
+	// other (there is no package-global left to move).
+	q.StartupTimeout = 3 * time.Second
+	if got := q.startupTimeout(); got != 3*time.Second {
+		t.Fatalf("explicit qwen startupTimeout = %v, want 3s", got)
+	}
+	if got := cp.startupTimeout(); got != 60*time.Second {
+		t.Fatalf("codex startupTimeout = %v after qwen's was set, want its own 60s default", got)
+	}
+}

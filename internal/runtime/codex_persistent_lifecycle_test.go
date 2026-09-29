@@ -63,6 +63,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,6 +82,12 @@ import (
 //   - FAKE_CODEX_HANG_HANDSHAKE=1: read the initialize request, then block
 //     forever WITHOUT answering (the handshake-timeout fixture: the process
 //     stays alive and honors SIGTERM).
+//   - FAKE_CODEX_START_DELAY_MS=<n>: answer initialize only after n
+//     milliseconds (the slow-but-healthy startup fixture: the process is
+//     alive and the handshake DOES complete, just late).
+//   - FAKE_CODEX_DIE_BEFORE_HANDSHAKE=1: exit 1 without answering anything
+//     (the early-exit fixture: the driver must fail on the dead connection,
+//     not pay its startup budget for a process that is already gone).
 //   - FAKE_CODEX_RESUME_FAIL=1: answer thread/resume with a JSON-RPC error
 //     (the lost-session fixture).
 //   - FAKE_CODEX_CLOSE_STDOUT=1: complete the handshake, then close stdout
@@ -100,6 +108,12 @@ reply_result() {
 reply_error() {
   printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"fake: %s"}}\n' "$1" "$2"
 }
+if [ -n "$FAKE_CODEX_DIE_BEFORE_HANDSHAKE" ]; then
+  # The app-server dies before it answers anything: the handshake must fail
+  # on the dead connection immediately, NOT on the driver's startup budget.
+  printf 'fake-codex: cannot start\n' >&2
+  exit 1
+fi
 if [ -n "$FAKE_CODEX_HANG_HANDSHAKE" ]; then
   # Read the initialize request, then block forever without answering:
   # the driver's handshake must time out (a clean launch error, not a
@@ -112,6 +126,12 @@ fi
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*)
+      if [ -n "$FAKE_CODEX_START_DELAY_MS" ]; then
+        # Slow-but-healthy startup: alive, and the handshake completes —
+        # only after the delay.
+        S="$FAKE_CODEX_START_DELAY_MS"
+        sleep "$(printf '%d.%03d' $((S / 1000)) $((S % 1000)))"
+      fi
       reply_result "$(id_of "$line")" '{"serverInfo":{"name":"fake-codex","version":"0.0.0"}}'
       ;;
     *'"method":"thread/start"'*)
@@ -289,9 +309,13 @@ func TestCodexPersistent_ActivationFailureBounded(t *testing.T) {
 // must be requested, not aborted.
 func TestCodexPersistent_HandshakeTimeoutBounded(t *testing.T) {
 	t.Run("handshakeTimeout", func(t *testing.T) {
-		// The stub never answers initialize: the 15s handshake deadline is
-		// an activation failure while the process is alive.
+		// The stub never answers initialize: the startup budget is an
+		// activation failure while the process is alive. The budget is the
+		// DRIVER's own field (the production default is 60s); the test sets a
+		// short one so the scenario stays deterministic and fast.
 		sup, cp, workspace, stubEnv := newCodexLifecycleFixture(t, "FAKE_CODEX_HANG_HANDSHAKE=1")
+		const budget = 600 * time.Millisecond
+		cp.StartupTimeout = budget
 		sess := newCodexLifecycleSession(workspace, stubEnv)
 
 		start := time.Now()
@@ -300,13 +324,26 @@ func TestCodexPersistent_HandshakeTimeoutBounded(t *testing.T) {
 		t.Logf("handshake timeout: Activate failed after %v: %v", elapsed, err)
 
 		if err == nil {
-			t.Fatal("Activate succeeded, want an activation failure (no handshake within the activation deadline)")
+			t.Fatal("Activate succeeded, want an activation failure (no handshake within the startup budget)")
 		}
-		// Bounded: the 15s deadline + bounded termination overhead, NOT
-		// infinity (the pre-fix PATH B blocked on a live process that was
-		// never stopped).
-		if elapsed > 30*time.Second {
-			t.Fatalf("Activate took %v, want bounded (15s deadline + termination overhead, not a hang)", elapsed)
+		// The budget is honored, not shortened.
+		if elapsed < budget {
+			t.Fatalf("Activate failed after %v, before the %v startup budget it granted", elapsed, budget)
+		}
+		// Bounded: the deadline + bounded termination overhead, NOT infinity
+		// (the pre-fix PATH B blocked on a live process that was never
+		// stopped).
+		if elapsed > 10*time.Second {
+			t.Fatalf("Activate took %v, want ~the %v deadline + termination overhead (not a hang)", elapsed, budget)
+		}
+		// The surfaced error names the budget, the exchange that never got
+		// its response, and the process liveness.
+		budgetText := startupBudgetText(budget)
+		if !strings.Contains(err.Error(), "codex persistent: activation timed out (no response to initialize within the "+budgetText+" startup budget)") {
+			t.Fatalf("error = %q, want the startup-timeout message naming the %s budget and the initialize stage", err.Error(), budgetText)
+		}
+		if !strings.Contains(err.Error(), "process=alive") {
+			t.Fatalf("error = %q, want the process=alive diagnostic", err.Error())
 		}
 		// The endpoint record is detached (pointer-specific retire).
 		if cp.Live("inst-1") {
@@ -423,6 +460,11 @@ func TestCodexPersistent_StopPathSingleWaitOwner(t *testing.T) {
 // the proc-level unkillable tests).
 func TestCodexPersistent_RetrySafetyNoSecondProcess(t *testing.T) {
 	sup, cp, workspace, stubEnv := newCodexLifecycleFixture(t)
+	// The retry's failure is bounded by the startup budget at worst (the
+	// reconciled endpoint's pipes are never serviced by the old process);
+	// the budget's LENGTH is not what this test is about, so it is set short
+	// to keep the scenario fast and deterministic.
+	cp.StartupTimeout = 600 * time.Millisecond
 	sess := newCodexLifecycleSession(workspace, stubEnv)
 
 	// Cold start (the stub completes the handshake; the endpoint is live).
@@ -520,4 +562,131 @@ func TestCodexPersistent_NormalPathUnchanged(t *testing.T) {
 	if cp.Live("inst-1") {
 		t.Fatal("endpoint still live after Stop")
 	}
+}
+
+// --- driver-owned startup budget -------------------------------------------
+//
+// The codex counterpart of the qwen startup-budget scenarios: the handshake
+// budget is the DRIVER's own (never the fake runtime driver's test deadline),
+// a slow-but-healthy app-server is activated rather than killed, and the
+// budget is only the MAXIMUM for a live process — a dead one fails now.
+
+// TestCodexPersistent_DelayedHandshakeWithinBudgetSucceeds is the production
+// incident on the codex side: a HEALTHY app-server whose startup handshake
+// is merely slow. The identical stubbed delay is run against a budget that
+// covers it (activation SUCCEEDS — the acceptance proof) and against one it
+// exceeds (activation FAILS, at the budget, naming the stage that never
+// answered). Only the driver's budget differs between the runs.
+func TestCodexPersistent_DelayedHandshakeWithinBudgetSucceeds(t *testing.T) {
+	const delayMS = 1200
+
+	t.Run("withinBudgetSucceeds", func(t *testing.T) {
+		sup, cp, workspace, stubEnv := newCodexLifecycleFixture(t, "FAKE_CODEX_START_DELAY_MS="+strconv.Itoa(delayMS))
+		const budget = 15 * time.Second
+		cp.StartupTimeout = budget
+		sess := newCodexLifecycleSession(workspace, stubEnv)
+
+		start := time.Now()
+		_, err := cp.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+		elapsed := time.Since(start)
+		t.Logf("delayed handshake: Activate returned after %v (err=%v)", elapsed, err)
+
+		// THE PROOF: the delayed-but-healthy handshake is activated, not
+		// killed.
+		if err != nil {
+			t.Fatalf("Activate = %v, want success — a healthy app-server whose handshake finishes within the %v budget must not be terminated", err, budget)
+		}
+		// The handshake really was delayed (an instant stub would prove
+		// nothing).
+		if elapsed < time.Duration(delayMS)*time.Millisecond/2 {
+			t.Fatalf("Activate returned after %v, faster than the %dms startup delay — the stub did not delay the handshake", elapsed, delayMS)
+		}
+		if elapsed >= budget {
+			t.Fatalf("Activate returned after %v, at or past the %v budget", elapsed, budget)
+		}
+		if sess.NativeID == "" {
+			t.Fatal("NativeID not set after the delayed activation (the handshake was not consumed)")
+		}
+		if !cp.Live("inst-1") {
+			t.Fatal("endpoint not live after the delayed activation")
+		}
+		if err := cp.Stop("inst-1"); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		waitCodexEndpointReaped(t, sup, "inst-1", 30*time.Second)
+		assertCodexTerminationRequested(t, sup, "delayed handshake")
+	})
+
+	t.Run("beyondBudgetFailsAtTheBudget", func(t *testing.T) {
+		// The identical slow handshake, a budget it cannot finish inside.
+		sup, cp, workspace, stubEnv := newCodexLifecycleFixture(t, "FAKE_CODEX_START_DELAY_MS="+strconv.Itoa(delayMS))
+		const budget = 300 * time.Millisecond
+		cp.StartupTimeout = budget
+		sess := newCodexLifecycleSession(workspace, stubEnv)
+
+		start := time.Now()
+		_, err := cp.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+		elapsed := time.Since(start)
+		t.Logf("handshake beyond the budget: Activate failed after %v: %v", elapsed, err)
+
+		if err == nil {
+			t.Fatalf("Activate succeeded, want the startup-budget failure (initialize answered at %dms > the %v budget)", delayMS, budget)
+		}
+		if elapsed < budget {
+			t.Fatalf("Activate failed after %v, before the %v budget it granted", elapsed, budget)
+		}
+		// Bounded: the budget + bounded termination overhead, not a hang.
+		if elapsed > budget+10*time.Second {
+			t.Fatalf("Activate took %v, want the %v budget + bounded termination overhead", elapsed, budget)
+		}
+		text := err.Error()
+		if !strings.Contains(text, "codex persistent: activation timed out (no response to initialize within the "+startupBudgetText(budget)+" startup budget)") {
+			t.Fatalf("error = %q, want the startup-timeout message naming the %s budget and the initialize stage", text, startupBudgetText(budget))
+		}
+		if !strings.Contains(text, "process=alive") {
+			t.Fatalf("error = %q, want the process=alive diagnostic (the app-server was alive, merely slow)", text)
+		}
+		if cp.Live("inst-1") {
+			t.Fatal("endpoint still registered after the startup-budget failure")
+		}
+		waitCodexEndpointReaped(t, sup, "inst-1", 30*time.Second)
+		assertCodexTerminationRequested(t, sup, "handshake beyond the budget")
+	})
+}
+
+// TestCodexPersistent_EarlyProcessExitFailsFast pins that the startup budget
+// is only the MAXIMUM for a live process: the app-server exits before it
+// answers anything, and the activation must settle immediately — the full
+// production default (60s, left at its zero value) must NOT be paid for a
+// process that is already gone.
+func TestCodexPersistent_EarlyProcessExitFailsFast(t *testing.T) {
+	sup, cp, workspace, stubEnv := newCodexLifecycleFixture(t, "FAKE_CODEX_DIE_BEFORE_HANDSHAKE=1")
+	// The field is deliberately left at its zero value: this is the
+	// production default budget (60s), and it must not slow the early exit.
+	if got := cp.startupTimeout(); got != 60*time.Second {
+		t.Fatalf("default startupTimeout = %v, want the 60s production default", got)
+	}
+	sess := newCodexLifecycleSession(workspace, stubEnv)
+
+	start := time.Now()
+	_, err := cp.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+	elapsed := time.Since(start)
+	t.Logf("early exit: Activate failed after %v: %v", elapsed, err)
+
+	if err == nil {
+		t.Fatal("Activate succeeded, want a failure (the app-server died before the handshake)")
+	}
+	// Fast — and NOT the startup-timeout surface: the failure is the dead
+	// connection, not an expired budget.
+	if elapsed > 10*time.Second {
+		t.Fatalf("Activate took %v for a process that died immediately, want a fast failure (the %v startup budget must not be paid)", elapsed, cp.startupTimeout())
+	}
+	if strings.Contains(err.Error(), "startup budget") {
+		t.Fatalf("error = %q, want the dead-connection failure, not the startup-budget timeout", err.Error())
+	}
+	if cp.Live("inst-1") {
+		t.Fatal("endpoint still registered after the early exit")
+	}
+	waitCodexEndpointReaped(t, sup, "inst-1", 30*time.Second)
+	assertCodexTerminationRequested(t, sup, "early exit")
 }
