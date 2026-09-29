@@ -61,6 +61,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,8 +198,9 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 	// B: the startup deadline (no events file within 15s while the process
 	// is alive) is an activation failure, not a hang. The activation
 	// returns within the deadline + bounded termination overhead.
+	events := make(chan session.SessionEvent, 8)
 	start := time.Now()
-	_, err := q.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+	_, err := q.Activate(context.Background(), sess, events)
 	elapsed := time.Since(start)
 	t.Logf("startup deadline: Activate failed after %v: %v", elapsed, err)
 
@@ -210,6 +212,35 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 	// live process that was never stopped).
 	if elapsed > 30*time.Second {
 		t.Fatalf("Activate took %v, want bounded (15s deadline + termination overhead, not a hang)", elapsed)
+	}
+	// The process-state diagnostic rides the failure surface. In this
+	// scenario the file NEVER appears, and the two 15s clocks (Activate's
+	// own timer and the reader's file deadline) start a hair apart, so
+	// either surface can fire first:
+	//   - the reader's file deadline: Activate returns ErrSessionLost and
+	//     the lost activation event carries the file-deadline message with
+	//     the process=alive suffix;
+	//   - Activate's own timer: the returned error carries the full
+	//     startup diagnostic (events_file=absent; process=alive).
+	// Both are the deadline failure with the diagnostic attached — assert
+	// it on the surface that fired.
+	if errors.Is(err, session.ErrSessionLost) {
+		var actEv session.SessionEvent
+		select {
+		case actEv = <-events:
+		case <-time.After(2 * time.Second):
+			t.Fatal("no activation event on the reader-deadline path")
+		}
+		if actEv.Type != session.EventSessionLost {
+			t.Fatalf("activation event = %q, want %q", actEv.Type, session.EventSessionLost)
+		}
+		if !strings.Contains(actEv.Error, "qwen event file did not appear within the startup deadline; process=alive") {
+			t.Fatalf("lost event error = %q, want the file-deadline message with the process=alive diagnostic", actEv.Error)
+		}
+	} else {
+		if !strings.Contains(err.Error(), "events_file=absent") || !strings.Contains(err.Error(), "process=alive") {
+			t.Fatalf("error = %q, want the startup diagnostic (events_file=absent; process=alive)", err.Error())
+		}
 	}
 	// The endpoint record is detached (pointer-specific retire).
 	if q.Live("inst-1") {
@@ -223,6 +254,61 @@ func TestQwenPersistent_StartupDeadlineBounded(t *testing.T) {
 	// The termination was REQUESTED (TERM → grace via StopEndpoint), not
 	// a Close/Abort forced KILL.
 	assertTerminationRequested(t, sup, "startup deadline")
+}
+
+// TestQwenPersistent_StartupDeadlineDiagCarriesEventsTail is scenario F:
+// the events file APPEARS (with pre-session, non-session_start lines) and
+// the process stays alive, but the handshake never arrives — the TUI is up
+// in a pre-session state (first-run onboarding / auth). This is the
+// hibernated-instance black box: the generic timeout error used to be the
+// only evidence. Here the reader is happily polling the existing file (it
+// has no deadline of its own in this scenario), so Activate's OWN 15s
+// timer deterministically fires and the returned error must carry the
+// startup diagnostic: the events-file size + a bounded tail with the
+// file's own content, and process=alive (the state at the deadline
+// moment, computed before the retirement requests termination).
+func TestQwenPersistent_StartupDeadlineDiagCarriesEventsTail(t *testing.T) {
+	sup, q, workspace, stubEnv := newQwenLifecycleFixture(t, "QWEN_FAKE_PRE_SESSION=1")
+	sess := newLifecycleSession(workspace, stubEnv)
+
+	start := time.Now()
+	_, err := q.Activate(context.Background(), sess, make(chan session.SessionEvent, 8))
+	elapsed := time.Since(start)
+	t.Logf("startup deadline (file appeared, no session_start): Activate failed after %v: %v", elapsed, err)
+
+	if err == nil {
+		t.Fatal("Activate succeeded, want an activation failure (no session_start within the startup deadline)")
+	}
+	// Bounded: the 15s deadline + bounded termination overhead, NOT a hang.
+	if elapsed > 30*time.Second {
+		t.Fatalf("Activate took %v, want bounded (15s deadline + termination overhead, not a hang)", elapsed)
+	}
+	// The existing message prefix is preserved verbatim...
+	const prefix = "qwen persistent: activation timed out (no session_start within the startup deadline)"
+	if !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("error = %q, want the unchanged prefix %q", err.Error(), prefix)
+	}
+	// ...and the diagnostic now rides the error: the events file existed
+	// (its size + a bounded tail carrying the file's own content — the
+	// pre-session probe lines the stub wrote), and the process was alive
+	// at the deadline moment.
+	if !strings.Contains(err.Error(), "process=alive") {
+		t.Fatalf("error = %q, want the process=alive diagnostic", err.Error())
+	}
+	if strings.Contains(err.Error(), "events_file=absent") || !strings.Contains(err.Error(), "bytes, tail=") {
+		t.Fatalf("error = %q, want the events_file=<N bytes, tail=...> diagnostic (the file existed)", err.Error())
+	}
+	if !strings.Contains(err.Error(), "onboarding-pending-42") {
+		t.Fatalf("error = %q, want the events-file tail content (the file's own pre-session line)", err.Error())
+	}
+	// The endpoint record is detached (pointer-specific retire).
+	if q.Live("inst-1") {
+		t.Fatal("endpoint still registered after the startup deadline (it must be detached)")
+	}
+	// The process was terminated by the retirement (requested, not
+	// aborted) and reaped by the reader.
+	waitReaped(t, sup, "inst-1", 30*time.Second)
+	assertTerminationRequested(t, sup, "startup deadline diag")
 }
 
 // TestQwenPersistent_StopPathSingleWaitOwner is scenario C: the endpoint

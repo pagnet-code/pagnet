@@ -78,6 +78,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 
@@ -96,6 +97,15 @@ const eventPollInterval = 100 * time.Millisecond
 // qwenStateFile is the per-instance session metadata file (the session id +
 // exact cwd, the resume anchor — B3 / R6).
 const qwenStateFile = "session.json"
+
+// startupDiagTailBytes bounds the events-file tail carried in the
+// startup-timeout diagnostic (the recent lines are what a failure needs;
+// the rest is noise).
+const startupDiagTailBytes = 240
+
+// startupDiagLineRunes caps one line of the tail so a single huge event
+// cannot blow up the error text.
+const startupDiagLineRunes = 200
 
 // QwenPersistent is the Qwen Dual Output persistent driver.
 type QwenPersistent struct {
@@ -231,12 +241,17 @@ func (q *QwenPersistent) Activate(ctx context.Context, sess *session.RuntimeSess
 		return nil, ctx.Err()
 	case <-time.After(activationTimeout):
 		// B7: no session_start within the startup deadline is an
-		// activation failure, not a hang. Retire THIS endpoint (pointer-
-		// specific detach + bounded termination request); do NOT reap —
-		// the reader owns the reap, and this path must return within the
-		// activation deadline (never 15s + infinity).
+		// activation failure, not a hang. Compute the startup diagnostic
+		// BEFORE retiring: the process state must reflect the deadline
+		// moment (the retirement below requests termination, which a
+		// later liveness probe would report as exited). Retire THIS
+		// endpoint (pointer-specific detach + bounded termination
+		// request); do NOT reap — the reader owns the reap, and this path
+		// must return within the activation deadline (never 15s +
+		// infinity).
+		diag := e.startupDiag()
 		q.retireEndpoint(e)
-		return nil, errors.New("qwen persistent: activation timed out (no session_start within the startup deadline)")
+		return nil, errors.New("qwen persistent: activation timed out (no session_start within the startup deadline); " + diag)
 	}
 	if events != nil {
 		events <- actEv
@@ -496,6 +511,119 @@ func (e *qwenEndpoint) processGone() bool {
 		return false // still starting
 	}
 	return proc.ProcessIsZombie(pid) || !proc.ProcessAlive(pid)
+}
+
+// startupDiag reports the two diagnostic facts the driver OWNS at the
+// startup-timeout moment: the events-file state (absent, or its size + a
+// bounded log-safe tail) and the process liveness, as one short line
+// ("events_file=...; process=..."). The activation timeout error carries
+// it, so a "no session_start within the startup deadline" failure is never
+// a black box: the file-appeared-but-handshake-never-arrived case (the TUI
+// stuck in a pre-session state, e.g. first-run onboarding) is distinguishable
+// from the bridge never opening the file and from the process dying. The
+// text is self-explanatory and log-safe: no newlines, no absolute paths
+// (the tail content is the qwen bridge's own event output, which is fine).
+func (e *qwenEndpoint) startupDiag() string {
+	return e.eventsFileDiag() + "; process=" + e.processStateDiag()
+}
+
+// processStateDiag renders the endpoint's process liveness as the
+// diagnostic suffix value ("alive" / "exited").
+func (e *qwenEndpoint) processStateDiag() string {
+	if e.processGone() {
+		return "exited"
+	}
+	return "alive"
+}
+
+// eventsFileDiag renders the events-file fact for the diagnostic:
+// "events_file=absent" when the file does not exist, otherwise
+// "events_file=<N bytes, tail=\"...\">".
+func (e *qwenEndpoint) eventsFileDiag() string {
+	fi, err := os.Stat(e.eventsPath)
+	if err != nil {
+		return "events_file=absent"
+	}
+	return fmt.Sprintf("events_file=%d bytes, tail=%q", fi.Size(), e.eventsFileTail(fi.Size()))
+}
+
+// eventsFileTail reads up to startupDiagTailBytes from the END of the
+// events file and renders it log-safe (see sanitizeDiagTail). It is a plain
+// bounded read from a FRESH open (one ReadAt at a computed offset) —
+// independent of the reader's own open file and read offset, so it is
+// race-safe against the readLoop's concurrent read of the same file; no
+// lock is added that the readLoop would have to take. Best-effort: any
+// read problem yields "" (the size is already reported).
+func (e *qwenEndpoint) eventsFileTail(size int64) string {
+	if size <= 0 {
+		return ""
+	}
+	n := size
+	if n > startupDiagTailBytes {
+		n = startupDiagTailBytes
+	}
+	f, err := os.Open(e.eventsPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	b := make([]byte, n)
+	m, rerr := f.ReadAt(b, size-n)
+	if m > 0 {
+		b = b[:m]
+	}
+	if rerr != nil && rerr != io.EOF {
+		return ""
+	}
+	return sanitizeDiagTail(b)
+}
+
+// sanitizeDiagTail renders a bounded events-file tail as a log-safe
+// fragment: non-printable characters (including newlines) become spaces,
+// and any single line longer than startupDiagLineRunes is truncated. The
+// result never contains a newline and stays bounded.
+func sanitizeDiagTail(b []byte) string {
+	// A byte-bounded cut may split a multi-byte UTF-8 rune at the end:
+	// drop the incomplete fragment (an invalid lone byte decodes as
+	// RuneError of width 1) so the tail stays valid UTF-8.
+	for len(b) > 0 {
+		r, size := utf8.DecodeLastRune(b)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	lines := strings.Split(string(b), "\n")
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) > startupDiagLineRunes {
+			runes = runes[:startupDiagLineRunes]
+		}
+		for j, r := range runes {
+			if !diagTailPrintable(r) {
+				runes[j] = ' '
+			}
+		}
+		lines[i] = string(runes)
+	}
+	return strings.Join(lines, " ")
+}
+
+// diagTailPrintable reports whether a rune is safe to keep in a
+// log/console diagnostic line: ASCII printable, or a non-ASCII rune outside
+// the C0/C1 control blocks and the Unicode line separators (everything else
+// becomes a space).
+func diagTailPrintable(r rune) bool {
+	if r >= 0x20 && r <= 0x7E {
+		return true
+	}
+	if r < 0xA0 {
+		return false // C0 controls, DEL, C1 controls
+	}
+	return r != 0x2028 && r != 0x2029
 }
 
 func (e *qwenEndpoint) pid() *int {
@@ -879,7 +1007,9 @@ func (e *qwenEndpoint) waitForEventsFile() (*os.File, error) {
 		}
 		time.Sleep(eventPollInterval)
 	}
-	return nil, errors.New("qwen event file did not appear within the startup deadline")
+	// The file-absence fact is already in the message — only the process
+	// state is appended (the driver owns both facts at this moment).
+	return nil, fmt.Errorf("qwen event file did not appear within the startup deadline; process=%s", e.processStateDiag())
 }
 
 // handleEventLine processes one event line: it runs the state machine and

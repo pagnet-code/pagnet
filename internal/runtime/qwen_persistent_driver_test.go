@@ -60,6 +60,18 @@ if [ -n "$QWEN_FAKE_NO_FILE" ]; then
   # BEFORE the owner Wait, or the reap blocks on a live process).
   sleep 3600
 fi
+if [ -n "$QWEN_FAKE_PRE_SESSION" ]; then
+  # The events file APPEARS (with pre-session, non-session_start lines)
+  # and the process stays alive, but the handshake never arrives: the TUI
+  # is up in a pre-session state (first-run onboarding / auth) and the
+  # activation times out on the startup deadline — the diagnostic scenario
+  # (file present, process alive, no session_start).
+  cat > "$JSON_FILE" <<EOF
+{"type":"system","subtype":"pre_session_probe","session_id":""}
+{"type":"system","subtype":"ui_probe","detail":"onboarding-pending-42"}
+EOF
+  sleep 3600
+fi
 if [ -n "$QWEN_FAKE_NO_START" ]; then
   # Stay alive but never write the session_start. The events file is created
   # (touched) so the reader's waitForEventsFile succeeds, but no handshake
