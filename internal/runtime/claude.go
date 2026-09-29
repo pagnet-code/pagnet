@@ -550,6 +550,7 @@ func (c *Claude) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 		nativeDirs: homeNativeDirs(".claude"),
 		binary:     bin,
 		env:        spec.Env,
+		denied:     spec.SandboxDenied,
 	})
 }
 

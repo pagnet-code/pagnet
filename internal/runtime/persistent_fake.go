@@ -544,6 +544,7 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		binary:    bin,
 		env:       launchEnv,
 		extraRW:   extraRW,
+		denied:    sess.SandboxDenied,
 	})
 	// The endpoint is LONG-LIVED: it must survive across turns (the whole
 	// point of the persistent model — 100 turns, 1 process, stable PID).

@@ -258,6 +258,10 @@ func TestDaemon_PersistentLaunchTurnCompletes(t *testing.T) {
 		Runtime:    string(domain.RuntimeFakePersistent),
 		Kind:       "representative",
 	})
+	// The launch acks before the background activation settles; wait for
+	// the endpoint to come up before asserting endpoint state (the same
+	// protocol as TestDaemon_PersistentLaunchEmptyMissionEstablishesSession).
+	waitForEndpointLive(t, d, instanceID)
 	// One endpoint process at launch time (session established, idle).
 	if n := d.sup.Stats().ActiveEndpoints; n != 1 {
 		t.Fatalf("expected 1 active endpoint at launch (session established), got %d", n)

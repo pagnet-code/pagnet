@@ -295,6 +295,14 @@ type RuntimeSession struct {
 	// hosted the interaction is gone (a dead endpoint's interaction is
 	// stale — it cannot be resolved against a re-activated session).
 	PendingInteractions map[string]bool
+	// SandboxDenied is the sandbox containment set (F-CFG-1) for the
+	// endpoint's launch spec: paths that must not be equal to or
+	// path-beneath any RW grant (the daemon sets it to its own state dir).
+	// Like Env it is a LAUNCH parameter — the driver reads it when it
+	// builds the per-instance sandbox spec, and the supervisor's wrap
+	// refuses the launch (fail closed, before any process starts) when a
+	// grant covers a denied path.
+	SandboxDenied []string
 }
 
 // HasPendingInteraction reports whether the session has an observed

@@ -89,6 +89,16 @@ type probeResult struct {
 	NoNewPrivs   string `json:"noNewPrivs"` // "0" / "1" / "err:<msg>"
 	SockOK       string `json:"sockOk"`
 	SockDeny     string `json:"sockDeny"`
+	// F-S2-2: creation gating (the MAKE_* bits). Inside the RW subtree the
+	// runtime must still be able to create (its workspace); outside every
+	// grant (the secret tree) creation must be DENIED on ABIs that gate it
+	// (v2+).
+	RWMkdir        string `json:"rwMkdir"`
+	RWSymlink      string `json:"rwSymlink"`
+	RWCreateFile   string `json:"rwCreateFile"`
+	DenyMkdir      string `json:"denyMkdir"`
+	DenySymlink    string `json:"denySymlink"`
+	DenyCreateFile string `json:"denyCreateFile"`
 }
 
 // runProbe executes the check set in the CURRENT process (the exec'd target)
@@ -125,6 +135,27 @@ func runProbe() int {
 		r.Secret = checkOK(err)
 	} else {
 		r.Secret = "ok"
+	}
+	// F-S2-2: creation (the MAKE_* bits). The runtime must create INSIDE
+	// its RW subtree (workspace); outside every grant (the secret tree) it
+	// must be denied on ABIs that gate creation (v2+).
+	secretDir := filepath.Dir(secret)
+	r.RWMkdir = checkOK(os.Mkdir(filepath.Join(rwDir, "probe-mkdir"), 0o755))
+	r.RWSymlink = checkOK(os.Symlink(roFile, filepath.Join(rwDir, "probe-symlink")))
+	if f, err := os.OpenFile(filepath.Join(rwDir, "probe-create"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err == nil {
+		f.Close()
+		r.RWCreateFile = "ok"
+	} else {
+		r.RWCreateFile = checkOK(err)
+	}
+	r.DenyMkdir = checkOK(os.Mkdir(filepath.Join(secretDir, "planted-mkdir"), 0o755))
+	r.DenySymlink = checkOK(os.Symlink(secret, filepath.Join(secretDir, "planted-symlink")))
+	if f, err := os.OpenFile(filepath.Join(secretDir, "planted-file"), os.O_WRONLY|os.O_CREATE, 0o600); err == nil {
+		f.Close()
+		os.Remove(filepath.Join(secretDir, "planted-file"))
+		r.DenyCreateFile = "ok"
+	} else {
+		r.DenyCreateFile = checkOK(err)
 	}
 	if outBytes, err := exec.Command(execBin).CombinedOutput(); err != nil {
 		r.Exec = "err:" + firstLine(err.Error()) + " out=" + firstLine(string(outBytes))
@@ -401,6 +432,18 @@ func assertProbe(t *testing.T, res probeResult, wants ...string) {
 			got = res.SockOK
 		case "sockDeny":
 			got = res.SockDeny
+		case "rwMkdir":
+			got = res.RWMkdir
+		case "rwSymlink":
+			got = res.RWSymlink
+		case "rwCreateFile":
+			got = res.RWCreateFile
+		case "denyMkdir":
+			got = res.DenyMkdir
+		case "denySymlink":
+			got = res.DenySymlink
+		case "denyCreateFile":
+			got = res.DenyCreateFile
 		default:
 			t.Fatalf("assertProbe: unknown check %q", name)
 		}

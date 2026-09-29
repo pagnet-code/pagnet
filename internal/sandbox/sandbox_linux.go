@@ -117,16 +117,37 @@ const (
 	bTruncate   = unix.LANDLOCK_ACCESS_FS_TRUNCATE
 	bRemoveDir  = unix.LANDLOCK_ACCESS_FS_REMOVE_DIR
 	bRemoveFile = unix.LANDLOCK_ACCESS_FS_REMOVE_FILE
+	bMakeChar   = unix.LANDLOCK_ACCESS_FS_MAKE_CHAR
+	bMakeDir    = unix.LANDLOCK_ACCESS_FS_MAKE_DIR
+	bMakeReg    = unix.LANDLOCK_ACCESS_FS_MAKE_REG
+	bMakeSock   = unix.LANDLOCK_ACCESS_FS_MAKE_SOCK
+	bMakeFIFO   = unix.LANDLOCK_ACCESS_FS_MAKE_FIFO
+	bMakeBlock  = unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK
+	bMakeSym    = unix.LANDLOCK_ACCESS_FS_MAKE_SYM
 )
 
 // Access sets (uint64).
 var (
 	// rwAccess: full write access for per-instance RW subtrees (workspace,
-	// state, scratch, the runtime's native state): read, create/modify/delete
-	// (write + truncate + the remove bits), and execute. Making a file
-	// executable (chmod +x) is not gated by a Landlock bit, so no extra bit
-	// is needed for it.
-	rwAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate | bRemoveDir | bRemoveFile)
+	// state, scratch, the runtime's native state): read, modify, execute,
+	// the remove bits (delete), TRUNCATE, and the seven MAKE_* bits
+	// (creation: open(O_CREAT), mkdir, symlink, mknod, mkfifo, mksocket,
+	// mkblock). The MAKE bits are what gate node/pipe/socket/symlink
+	// CREATION: Landlock gates an access only when its bit is in the
+	// ruleset's handled set, so without them a sandboxed process could
+	// mkdir/symlink/mknod ANYWHERE DAC allows (plant ~/.ssh/authorized_keys,
+	// plant entries at daemon-state locations). With them granted on the
+	// RW subtrees, creation inside them is unchanged (it succeeded while
+	// unhandled too — it is now an explicit grant) and creation OUTSIDE
+	// them is denied (EACCES). On ABI v1 kernels (5.13–5.18) the kernel
+	// mask has no MAKE bits: `grant & abiMask` drops them and creation is
+	// ungated there — a kernel-inherent residual (the same class as the
+	// unix-socket-connect limitation), documented, not fixable in userspace.
+	// Making a file executable (chmod +x) is not gated by a Landlock bit,
+	// so no extra bit is needed for it.
+	rwAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate |
+		bRemoveDir | bRemoveFile |
+		bMakeChar | bMakeDir | bMakeReg | bMakeSock | bMakeFIFO | bMakeBlock | bMakeSym)
 	// roAccess: read + execute, for system / runtime-support subtrees.
 	roAccess = uint64(bReadFile | bReadDir | bExecute)
 	// devAccess: the device subtree (Spec.Dev, /dev): read + write +
@@ -139,12 +160,18 @@ var (
 	// user: /dev/null + own ttys; /dev/mem, /dev/sda, ... stay denied).
 	// See the Spec.Dev doc.
 	devAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate)
-	// traverseAccess: the minimal access to WALK INTO a directory (to resolve
-	// a path down to a grant or socket beneath it). Granted to ANCESTOR
-	// directories only — it reveals a directory's entry NAMES but never file
-	// contents (no READ_FILE). This is the minimal unavoidable cost of
-	// reaching a grant that lives beneath a secret dir (the bridge socket
-	// inside the daemon state dir, the per-instance state beneath it).
+	// traverseAccess: READ_DIR, granted to (a) the parent of a granted
+	// socket (to resolve the socket file) and (b) on ABI v1–v3 kernels only,
+	// to EVERY ancestor of every grant up to / — the kernel there gates
+	// each path component of an absolute-path resolution, so a subtree
+	// grant is unreachable without its ancestor chain. READ_DIR reveals a
+	// directory's entry NAMES but never file contents (no READ_FILE).
+	//
+	// The ancestor-chain exposure is kernel-inherent on v1–v3 and is the
+	// reason v4+ does NOT pay it: on ABI v4 (verified empirically on this
+	// host, 6.8), absolute-path resolution INTO a granted subtree succeeds
+	// with ONLY the subtree rule — no ancestor grants — so computeRules
+	// adds no ancestor rules there (see the function doc).
 	traverseAccess = uint64(bReadDir)
 )
 
@@ -200,7 +227,7 @@ func applyLandlock(spec *Spec) error {
 	if a.version == 0 {
 		return fmt.Errorf("kernel %s supports no Landlock", kernelRelease())
 	}
-	rules, accessFs, mandatory, err := computeRules(spec, a.fsMask)
+	rules, accessFs, mandatory, err := computeRules(spec, a)
 	if err != nil {
 		return err
 	}
@@ -264,18 +291,35 @@ func applyLandlock(spec *Spec) error {
 // grants — the daemon guarantees them; a missing one refuses the launch)
 // as opposed to the best-effort coarse RO support paths (a missing one is
 // a deterministic no-op skip — see applyLandlock). For each granted
-// subtree (RW/RO/Dev) it records the grant on the subtree root and READ_DIR
-// (traversal) on every ancestor up to /; for each socket it records
-// READ_DIR on the socket's parent subtree plus traversal on the ancestors.
+// subtree (RW/RO/Dev) it records the grant on the subtree root; for each
+// socket it records READ_DIR (traversal) on the socket's parent subtree.
 //
-// abiMask is the kernel's access mask for the detected ABI: grants are
-// intersected with it so the policy stays valid on legacy kernels (5.13–6.6
-// lack truncate/remove bits — the result there is MORE restrictive, never
-// less; a zeroed grant is refused, never silently dropped).
+// Ancestor traversal is ABI-dependent (the kernel's path-resolution
+// gating, settled empirically on this host — ABI v4 / 6.8):
 //
-// Traversal on an ancestor reveals that directory's entry NAMES but never
-// file contents (no READ_FILE on ancestors) — the minimal unavoidable cost
-// of reaching a grant beneath a secret dir.
+//   - ABI v1–v3 (5.13–6.6): the kernel gates each component of an
+//     absolute-path resolution, so a subtree grant is unreachable without
+//     READ_DIR on every ancestor up to /. computeRules therefore adds the
+//     ancestor chain there. THE EXPOSURE (kernel-inherent, documented):
+//     a path_beneath rule on / grants READ_DIR to the whole filesystem —
+//     a sandboxed runtime can readdir (entry NAMES) of ANY directory
+//     (~/.ssh, ~/.aws, the daemon's accounts/ ...) and stat/lstat any path
+//     (existence/size/mtime of secret files). File CONTENTS remain denied
+//     (no READ_FILE on ancestors), and stat is ungated by Landlock on ALL
+//     ABIs (kernel-inherent — it cannot be fixed in userspace).
+//   - ABI v4+ (6.7+, this host 6.8): absolute-path resolution INTO a
+//     granted subtree succeeds with ONLY the subtree rule (verified: an
+//     open of a file — direct and nested — and a unix-socket connect, both
+//     by absolute path, in a leaf subtree whose ancestors carry no rule).
+//     No ancestor rules are added, so the runtime sees only the granted
+//     subtrees' entry names; the stat-metadata exposure above remains
+//     (Landlock never gates stat).
+//
+// abi is the detected kernel ABI: grants are intersected with abi.fsMask
+// (the kernel's access mask) so the policy stays valid on legacy kernels
+// (5.13–6.6 lack truncate/remove/make bits — the result there is MORE
+// restrictive, never less; a zeroed grant is refused, never silently
+// dropped), and abi.version selects the ancestor-traversal behavior above.
 //
 // Unix-socket CONNECT is deliberately NOT in the handled set: no kernel in
 // the supported range (ABI v1–v4, 5.13–6.8) has a connect-unix access bit
@@ -286,7 +330,7 @@ func applyLandlock(spec *Spec) error {
 // future ABI v5+ kernel the CONNECT_UNIX bit could gate connects precisely;
 // omitting it keeps the bridge reachable there too (an unhandled access is
 // never gated).
-func computeRules(spec *Spec, abiMask uint64) (map[string]uint64, uint64, map[string]bool, error) {
+func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[string]bool, error) {
 	rules := map[string]uint64{}
 	var accessFs uint64
 	// mandatory: the rule paths whose EXISTENCE is a launch precondition
@@ -295,6 +339,11 @@ func computeRules(spec *Spec, abiMask uint64) (map[string]uint64, uint64, map[st
 	// is a deterministic failure, never a skip. The coarse RO support
 	// paths are best-effort (a missing one is a no-op grant, skipped).
 	mandatory := map[string]bool{}
+	abiMask := abi.fsMask
+	// Ancestors up to / get READ_DIR traversal only where the kernel's
+	// path resolution requires it (ABI v1–v3). See the function doc for
+	// the per-ABI behavior and the exposure each branch implies.
+	legacyTraversal := abi.version >= 1 && abi.version < 4
 	add := func(p string, selfAccess uint64, isMandatory bool) error {
 		p = filepath.Clean(p)
 		if p == "" {
@@ -309,11 +358,13 @@ func computeRules(spec *Spec, abiMask uint64) (map[string]uint64, uint64, map[st
 			mandatory[p] = true
 		}
 		accessFs |= grant
-		for d := filepath.Dir(p); ; d = filepath.Dir(d) {
-			rules[d] |= traverseAccess
-			accessFs |= traverseAccess
-			if d == "/" {
-				break
+		if legacyTraversal {
+			for d := filepath.Dir(p); ; d = filepath.Dir(d) {
+				rules[d] |= traverseAccess
+				accessFs |= traverseAccess
+				if d == "/" {
+					break
+				}
 			}
 		}
 		return nil

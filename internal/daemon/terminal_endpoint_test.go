@@ -477,6 +477,12 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 			CommandID: "cmd-tar-launch-" + status, InstanceID: instanceID,
 			Runtime: string(domain.RuntimeFakePersistent), Kind: "representative",
 		})
+		// The launch acks before the background activation settles; wait
+		// for the endpoint to come up first, so the endpoint count below
+		// is stable (a refused attach must change nothing — not even the
+		// launch's own still-settling activation) and the activation's
+		// final idle write cannot clobber the status set below.
+		waitForEndpointLive(t, d, instanceID)
 		if err := d.state.SetInstanceStatus(instanceID, status, ""); err != nil {
 			t.Fatalf("set status %s: %v", status, err)
 		}

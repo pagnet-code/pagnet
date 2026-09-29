@@ -498,6 +498,10 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if err != nil {
 		return nil, err
 	}
+	// I-4: the sqlite driver creates the file with its default perms
+	// (0644) inside the 0700 state dir. Best-effort owner-only (the 0700
+	// dir already protects it; a chmod failure must not fail the daemon).
+	_ = os.Chmod(filepath.Join(cfg.StateDir, "daemon.sqlite"), 0o600)
 	if cfg.HostID != "" {
 		_ = st.KVSet("host_id", cfg.HostID)
 	}
@@ -2833,15 +2837,22 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 	// the granted subtree. A copy failure keeps the state-dir path: the
 	// sandboxed read then fails CLOSED (the turn surfaces the error) —
 	// never an unsandboxed read.
+	//
+	// F-S2-1: the copies are written RENAME-BASED (AtomicWriteFile), not
+	// os.WriteFile: the SessionDir is runtime-writable under the sandbox,
+	// so a prompt-injected runtime can unlink a copy and plant a symlink
+	// pointing at a daemon-state secret. rename(2) replaces the symlink
+	// ENTRY without following it — a plain O_TRUNC write would clobber
+	// the pointed-at file on the next turn.
 	agentMDPath := standingPath
 	if standingText != "" && os.MkdirAll(sessionDir, 0o700) == nil { // SEC-415: runtime state
-		if cp := filepath.Join(sessionDir, "pagnet-standing.md"); os.WriteFile(cp, []byte(standingText), 0o600) == nil {
+		if cp := filepath.Join(sessionDir, "pagnet-standing.md"); agentruntime.AtomicWriteFile(cp, []byte(standingText), 0o600) == nil {
 			agentMDPath = cp
 		}
 	}
 	contractPathForSpec := contractPath
 	if contractText != "" && os.MkdirAll(sessionDir, 0o700) == nil { // SEC-415: runtime state
-		if cp := filepath.Join(sessionDir, "pagnet-contract.md"); os.WriteFile(cp, []byte(contractText), 0o600) == nil {
+		if cp := filepath.Join(sessionDir, "pagnet-contract.md"); agentruntime.AtomicWriteFile(cp, []byte(contractText), 0o600) == nil {
 			contractPathForSpec = cp
 		}
 	}
@@ -2865,6 +2876,14 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 			"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
 			"PAGNET_COORDINATION_CONTRACT=" + contractPathForSpec,
 		},
+		// F-CFG-1: the daemon's OWN state dir is the containment set — a
+		// spec whose RW grants cover it (e.g. a workspace of $HOME or of
+		// the state dir's parent) is refused at the launch's wrap, before
+		// any process starts. The per-instance SessionDir (a CHILD of
+		// StateDir, granted RW) is the instance's own state and stays
+		// granted; what is denied is the state dir ROOT, which holds the
+		// account creds, host key, and daemon.sqlite.
+		SandboxDenied: []string{d.StateDir},
 	}
 }
 
@@ -3503,6 +3522,11 @@ func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *s
 	// change restarts the endpoint on the next EnsureActive (preserving
 	// the session) so the new standing context takes effect.
 	d.sessions.SetStandingInstructions(sess, spec.StandingInstructions)
+	// The sandbox containment set (F-CFG-1): the daemon's own state dir —
+	// the endpoint's launch spec must not carry an RW grant that covers
+	// it (the supervisor's wrap refuses such a launch before any process
+	// starts).
+	d.sessions.SetSandboxDenied(sess, spec.SandboxDenied)
 	return sess
 }
 

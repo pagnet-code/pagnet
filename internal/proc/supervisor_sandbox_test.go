@@ -167,6 +167,49 @@ func TestLaunch_LandlockUnavailable_Refused(t *testing.T) {
 	}
 }
 
+// TestLaunch_DeniedContainment_Refused pins F-CFG-1 at the single policy
+// point every launch passes: a spec whose RW grant covers a Denied path —
+// the $HOME-shape (a workspace that contains the daemon's state dir) — is
+// refused BEFORE any process starts, with an explicit error naming the
+// denied path. The target must never run.
+func TestLaunch_DeniedContainment_Refused(t *testing.T) {
+	skipNoSandboxPlatform(t)
+	s := newTestSupervisor(t, Config{
+		MaxActiveTurns:  8,
+		MonitorInterval: time.Hour,
+		RequireSandbox:  true,
+	})
+	// The $HOME shape: the workspace is the parent of the (denied) daemon
+	// state dir, and the instance's session dir is the state dir's child
+	// (the normal production layout — it stays granted).
+	home := t.TempDir()
+	stateDir := filepath.Join(home, ".pagnet")
+	if err := os.MkdirAll(filepath.Join(stateDir, "sessions", "inst-dc"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, "denied-containment-ran")
+	_, err := s.Launch(context.Background(), LaunchRequest{
+		InstanceID: "inst-dc", TurnID: "turn-dc",
+		Runtime: "test", Class: ClassTurn,
+		Cmd: exec.Command("touch", marker),
+		Sandbox: sandbox.NewSpec(sandbox.Options{
+			Workspace: home,
+			StateDirs: []string{filepath.Join(stateDir, "sessions", "inst-dc")},
+			Binary:    "/bin/true",
+			Denied:    []string{stateDir},
+		}),
+	})
+	if err == nil {
+		t.Fatal("launch with a workspace covering the denied state dir: accepted, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "denied path") || !strings.Contains(err.Error(), stateDir) {
+		t.Fatalf("refusal = %q, want the explicit containment refusal naming the state dir", err)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatal("the target ran despite the refused launch (marker exists) — the refusal is not fail-closed")
+	}
+}
+
 // TestLaunch_SandboxedTurn_RunsAndReaps proves the full path on a
 // Landlock-capable kernel: the supervisor wraps the launch, the wrapper
 // applies the real sandbox, execs the target IN PLACE, and the supervisor

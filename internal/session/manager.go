@@ -169,6 +169,22 @@ func (m *Manager) SetStandingInstructions(sess *RuntimeSession, text string) {
 	m.mu.Unlock()
 }
 
+// SetSandboxDenied sets the session's sandbox containment set (the turn
+// spec's SandboxDenied, F-CFG-1). It is called by the daemon's
+// prepareSession on every activation and turn, so the endpoint
+// (re)activation's spec carries the current denied set (the daemon's own
+// state dir). A launch whose grants cover a denied path is refused by the
+// supervisor's wrap — fail closed, before any process starts. See
+// RuntimeSession.SandboxDenied.
+func (m *Manager) SetSandboxDenied(sess *RuntimeSession, denied []string) {
+	if sess == nil {
+		return
+	}
+	m.mu.Lock()
+	sess.SandboxDenied = denied
+	m.mu.Unlock()
+}
+
 // GetSession returns the session for an instance (nil when none).
 func (m *Manager) GetSession(instanceID string) *RuntimeSession {
 	m.mu.Lock()

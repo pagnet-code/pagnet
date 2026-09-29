@@ -332,6 +332,7 @@ func (f *Fake) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 		binary:    bin,
 		env:       launchEnv,
 		extraRW:   extraRW,
+		denied:    spec.SandboxDenied,
 	})
 }
 

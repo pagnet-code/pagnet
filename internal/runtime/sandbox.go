@@ -105,6 +105,12 @@ type driverSandboxOpts struct {
 	env []string
 	// extraRW: driver-specific RW additions.
 	extraRW []string
+	// denied: the containment set (F-CFG-1) — paths that must not be
+	// equal to or path-beneath any RW grant (the daemon's own state dir).
+	// Carried from the turn spec / session by the driver; the spec's
+	// Normalize refuses a violating spec and the supervisor's wrap fails
+	// the launch before any process starts.
+	denied []string
 }
 
 // driverSandbox assembles the per-instance allowlist (H4). It is PURE
@@ -128,6 +134,7 @@ func driverSandbox(o driverSandboxOpts) *sandbox.Spec {
 		Socket:     sandbox.SocketFromMCPConfig(mcp),
 		BridgeDir:  sandbox.BridgeDirFromMCPConfig(mcp),
 		ExtraRW:    o.extraRW,
+		Denied:     o.denied,
 	})
 }
 

@@ -457,6 +457,7 @@ func (o *OpenCode) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 		nativeDirs: homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode"),
 		binary:     bin,
 		env:        spec.Env,
+		denied:     spec.SandboxDenied,
 	})
 }
 
@@ -515,8 +516,12 @@ func writeOpenCodeConfig(sessionDir, mcpJSON, standingInstructions string) (stri
 		if err := os.MkdirAll(sessionDir, 0o700); err != nil { // SEC-415: runtime state
 			return "", err
 		}
+		// F-S2-1: the sessionDir is runtime-writable under the sandbox —
+		// a compromised runtime can plant a symlink here; the write must
+		// be rename-based (AtomicWriteFile) so a planted symlink is
+		// replaced, never followed.
 		standingPath := filepath.Join(sessionDir, "standing.md")
-		if err := os.WriteFile(standingPath, []byte(standingInstructions), 0o600); err != nil {
+		if err := AtomicWriteFile(standingPath, []byte(standingInstructions), 0o600); err != nil {
 			return "", err
 		}
 		cfg["instructions"] = []string{standingPath}
@@ -531,8 +536,9 @@ func writeOpenCodeConfig(sessionDir, mcpJSON, standingInstructions string) (stri
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil { // SEC-415: runtime state
 		return "", err
 	}
+	// F-S2-1: rename-based write — see the standing.md site above.
 	path := filepath.Join(sessionDir, "opencode.json")
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+	if err := AtomicWriteFile(path, append(b, '\n'), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

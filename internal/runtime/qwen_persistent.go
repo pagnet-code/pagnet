@@ -749,6 +749,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		nativeDirs: homeNativeDirs(".qwen"),
 		binary:     bin,
 		env:        sess.Env,
+		denied:     sess.SandboxDenied,
 	})
 	// The endpoint is LONG-LIVED: it must survive across turns (the whole
 	// point of the persistent model). The launch ctx must NOT be a turn's
@@ -1138,7 +1139,7 @@ func writeStoredQwenSession(path, id, cwd string) error {
 		SessionID string `json:"sessionId"`
 		CWD       string `json:"cwd"`
 	}{SessionID: id, CWD: cwd})
-	return atomicWriteFile(path, append(b, '\n'), 0o600)
+	return AtomicWriteFile(path, append(b, '\n'), 0o600)
 }
 
 // readStoredQwenSession loads the persisted qwen session id + cwd.

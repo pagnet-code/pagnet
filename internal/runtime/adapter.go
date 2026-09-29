@@ -69,6 +69,14 @@ type TurnSpec struct {
 	// pagnet injection: MCP bridge config, coordination contract,
 	// identity). Appended after the adapter's own environment.
 	Env []string
+	// SandboxDenied is the sandbox containment set (F-CFG-1): paths that
+	// must not be equal to or path-beneath any RW grant of the spec this
+	// turn's launch carries. The daemon sets it to its OWN state dir, so
+	// a workspace that would swallow the state dir (e.g. workspace =
+	// $HOME) makes the launch fail closed with an explicit error BEFORE
+	// any process starts (the supervisor's wrap validates the spec; the
+	// wrapper re-validates in Apply). Empty in tests / standalone use.
+	SandboxDenied []string
 }
 
 // TurnEvent is a normalized, runtime-agnostic observation of a turn.
@@ -139,13 +147,21 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// atomicWriteFile writes data to path atomically: write a temp file in
+// AtomicWriteFile writes data to path atomically: write a temp file in
 // the SAME directory, fsync, then rename over path. A crash mid-write
 // leaves the previous file intact — never a partial/corrupt one (external
 // audit F-013). The temp file is created 0600 and chmod'd to perm before
 // it is linked into place, so the session/config file is never world-
 // readable even transiently.
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+//
+// The rename is also the SYMLINK-SAFE primitive (F-S2-1): rename(2)
+// replaces the destination ENTRY without following it, so a file that a
+// compromised same-UID process planted as a symlink at the destination
+// (pointing at a secret outside the subtree) is replaced, never written
+// through. Plain os.WriteFile (O_WRONLY|O_CREATE|O_TRUNC) follows the
+// symlink and would clobber the pointed-at file — which is why every
+// daemon/driver write into a runtime-writable dir uses this helper.
+func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
@@ -282,7 +298,7 @@ func writeStoredSession(path, id string) error {
 	b, _ := json.Marshal(struct {
 		SessionID string `json:"sessionId"`
 	}{SessionID: id})
-	return atomicWriteFile(path, append(b, '\n'), 0o600)
+	return AtomicWriteFile(path, append(b, '\n'), 0o600)
 }
 
 // intPtr is the token-usage pointer helper (nil when the runtime reports

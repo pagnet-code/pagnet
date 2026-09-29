@@ -29,6 +29,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -158,6 +159,122 @@ func TestSandboxE2E_EndpointCannotReadDaemonState(t *testing.T) {
 	// denial; nothing mutated them).
 	if b, err := os.ReadFile(accountsCfg); err != nil || !strings.Contains(string(b), "pagnet-account-secret") {
 		t.Fatalf("planted account config not intact after the sandboxed turn: %v %q", err, b)
+	}
+}
+
+// TestSandboxE2E_PlantedSymlinkNotFollowed is the F-S2-1 negative test at
+// the daemon level (full e2e turn): the daemon's per-turn standing/contract
+// copies live in the instance's SessionDir, which the runtime is RW on
+// under the sandbox (production shape: PAGNET_STATE_DIR = the daemon's
+// StateDir, so the endpoint's granted session dir IS the copy dir). A
+// compromised (prompt-injected) runtime unlinks a copy and plants a
+// symlink at its path pointing at a daemon-state secret; the daemon's next
+// turn-spec render rewrites the copies. The writes must be rename-based,
+// so the planted symlink is REPLACED by a regular file — the decoy secret
+// stays byte-identical (the pre-fix os.WriteFile would have clobbered it).
+func TestSandboxE2E_PlantedSymlinkNotFollowed(t *testing.T) {
+	if !sandbox.Available() {
+		t.Skipf("kernel %s has no Landlock — the fail-closed refusal is the platform behavior (no launch happens to sandbox)", sandbox.KernelRelease())
+	}
+	d, server := newBridgeE2EDaemon(t)
+	startBridgeRelayResponder(t, server)
+
+	// The decoy secret: the exact P0-named shape, in the test-scoped
+	// StateDir the real daemon owns (the symlink target a compromised
+	// runtime would plant).
+	decoy := filepath.Join(d.StateDir, "accounts", "x", "config.yaml")
+	if err := os.MkdirAll(filepath.Dir(decoy), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	decoyBytes := []byte("host_credential: pagnet-account-secret\n")
+	if err := os.WriteFile(decoy, decoyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Production shape for the F-S2-1 attack: the fake endpoint's pagnet
+	// state (and thus its sandboxed RW session dir) is the daemon's OWN
+	// StateDir — the copy dir is runtime-writable, while the rest of the
+	// state dir (accounts/...) stays denied.
+	t.Setenv("PAGNET_STATE_DIR", d.StateDir)
+
+	resultDir := t.TempDir()
+	pf := mustPersistentFake(t, d)
+	// The fake binary must live OUTSIDE this test's /tmp root (the binary
+	// dir + its parent are granted RO by RuntimeSupportRO; the test-scoped
+	// StateDir lives under the shared /tmp/TestXXX root — see
+	// TestSandboxE2E_EndpointCannotReadDaemonState for the rationale).
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("resolve user cache dir: %v", err)
+	}
+	t.Setenv("PAGNET_P0_BIN_DIR", filepath.Join(cacheDir, "pagnet-s2-fs21"))
+	pf.Binary = p0FakeBinary(t)
+	pf.Env = hostileFixtureEnv(filepath.Join(resultDir, "bridge-result.json"), "network_whoami", "", false)
+
+	instanceID := launchFakeEndpoint(t, d, "worker")
+
+	// Plant the attack at both session copy targets (the copy files do
+	// not exist yet: the first turn-spec render creates them — the
+	// runtime's unlink+plant shape is identical either way).
+	sessionDir := filepath.Join(d.StateDir, "sessions", instanceID)
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	standingCopy := filepath.Join(sessionDir, "pagnet-standing.md")
+	contractCopy := filepath.Join(sessionDir, "pagnet-contract.md")
+	for _, cp := range []string{standingCopy, contractCopy} {
+		os.Remove(cp)
+		if err := os.Symlink(decoy, cp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Drive a full e2e turn: doDeliverEvent renders the turn spec
+	// (turnSpecFor — the copy rewrite) before the ack, so the copies are
+	// rewritten by the time driveDeliver returns. The relay responder is
+	// the sole reader of the bridge host conn, so the turn rides a FRESH
+	// conn (the same swap the daemon performs on a control-plane
+	// reconnect).
+	client2, server2 := newMemWS(t)
+	d.connMu.Lock()
+	d.curConn = client2
+	d.connMu.Unlock()
+	envs := driveDeliver(t, d, server2, transport.NetworkEventPayload{
+		CommandID:  "cmd-fs21-symlink",
+		InstanceID: instanceID,
+		Kind:       "task",
+		Body:       "symlink canary turn",
+	})
+	if !hasEnvelopeType(envs, transport.MsgRuntimeTurnCompleted) {
+		t.Fatalf("turn on the sandboxed endpoint did not complete: %+v", envs)
+	}
+
+	// (1) The decoy secret is byte-identical — no write followed the
+	// planted symlink.
+	if b, err := os.ReadFile(decoy); err != nil || !bytes.Equal(b, decoyBytes) {
+		t.Fatalf("planted symlink was followed: the decoy secret was clobbered (%v, %q, want %q)", err, b, decoyBytes)
+	}
+	// (2) Both session files are now REGULAR files (the symlink entries
+	// were replaced by the rename), holding the daemon-rendered copies —
+	// never the decoy content.
+	for _, cp := range []string{standingCopy, contractCopy} {
+		st, err := os.Lstat(cp)
+		if err != nil {
+			t.Fatalf("copy %s: %v", cp, err)
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("copy %s is still a symlink — the rename-based write did not replace the planted entry", cp)
+		}
+		if !st.Mode().IsRegular() {
+			t.Fatalf("copy %s mode = %v, want a regular file", cp, st.Mode())
+		}
+		b, err := os.ReadFile(cp)
+		if err != nil {
+			t.Fatalf("read copy %s: %v", cp, err)
+		}
+		if len(b) == 0 || bytes.Contains(b, decoyBytes) {
+			t.Fatalf("copy %s holds the decoy content (len %d) — want the daemon-rendered copy", cp, len(b))
+		}
 	}
 }
 

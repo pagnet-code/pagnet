@@ -84,12 +84,14 @@ func TestLandlockABI(t *testing.T) {
 // rule level: intersecting with an ABI mask can only REMOVE bits (the
 // result is more restrictive, never less) and a zeroed grant is refused.
 func TestComputeRules_MaskIntersection(t *testing.T) {
-	// ABI v1 mask: only read_file/write_file/execute/read_dir.
+	// ABI v1: only read_file/write_file/execute/read_dir in the kernel
+	// mask (no truncate/remove/make bits) — and a legacy kernel, so the
+	// ancestor traversal chain is present.
 	rules, accessFs, mandatory, err := computeRules(&Spec{
 		RW:  []string{"/tmp/x"},
 		RO:  []string{"/tmp/y"},
 		Dev: []string{"/dev"},
-	}, uint64(bReadFile|bReadDir|bWriteFile|bExecute))
+	}, landlockABI{version: 1, threeArg: false, fsMask: uint64(bReadFile | bReadDir | bWriteFile | bExecute)})
 	if err != nil {
 		t.Fatalf("computeRules (v1 mask): %v", err)
 	}
@@ -119,8 +121,81 @@ func TestComputeRules_MaskIntersection(t *testing.T) {
 	}
 	// A grant that intersects to zero must be refused, never silently
 	// dropped (a zero allowed_access rule is meaningless).
-	if _, _, _, err := computeRules(&Spec{RW: []string{"/tmp/x"}}, 0); err == nil {
+	if _, _, _, err := computeRules(&Spec{RW: []string{"/tmp/x"}}, landlockABI{version: 4, threeArg: true, fsMask: 0}); err == nil {
 		t.Fatal("computeRules with an empty ABI mask: accepted, want refusal")
+	}
+}
+
+// TestComputeRules_AncestorTraversalPerABI pins the F-S2-3 behavior: the
+// ancestor READ_DIR chain is added ONLY on ABI v1–v3 (the kernel's path
+// resolution requires it there); on ABI v4+ the subtree rules stand alone
+// (verified empirically: absolute-path open + socket connect into a leaf
+// subtree succeed with no ancestor grants on this host, 6.8 / ABI v4).
+func TestComputeRules_AncestorTraversalPerABI(t *testing.T) {
+	spec := &Spec{RW: []string{"/home/u/ws"}, Sockets: []string{"/state/pagnetd.sock"}}
+	// ABI v1: every ancestor up to / gets READ_DIR (the legacy exposure).
+	// v1 kernel mask: execute|write_file|read_file|read_dir only.
+	rules, _, _, err := computeRules(spec, landlockABI{
+		version: 1, threeArg: false, fsMask: uint64(bExecute | bWriteFile | bReadFile | bReadDir),
+	})
+	if err != nil {
+		t.Fatalf("computeRules (v1): %v", err)
+	}
+	for _, ancestor := range []string{"/home/u", "/home", "/"} {
+		if rules[ancestor]&traverseAccess != traverseAccess {
+			t.Errorf("v1: ancestor %s lacks READ_DIR traversal (got 0x%x)", ancestor, rules[ancestor])
+		}
+	}
+	// ABI v4: NO ancestor rules — only the granted subtrees (the RW root
+	// and the socket's parent). The stat-metadata exposure remains on all
+	// ABIs (kernel-inherent); the entry-name exposure does not.
+	rules, _, _, err = computeRules(spec, landlockABI{version: 4, threeArg: true, fsMask: 0x7FFF})
+	if err != nil {
+		t.Fatalf("computeRules (v4): %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("v4: %d rules, want exactly the 2 subtree rules (got %v)", len(rules), rules)
+	}
+	for _, p := range []string{"/home/u", "/home", "/"} {
+		if _, ok := rules[p]; ok {
+			t.Errorf("v4: unexpected ancestor rule %q (got %v)", p, rules)
+		}
+	}
+	if rules["/home/u/ws"] != rwAccess {
+		t.Errorf("v4: rw grant = 0x%x, want the full rw set 0x%x", rules["/home/u/ws"], rwAccess)
+	}
+	if rules["/state"]&traverseAccess != traverseAccess {
+		t.Errorf("v4: socket parent %q lacks READ_DIR (got 0x%x)", "/state", rules["/state"])
+	}
+}
+
+// TestComputeRules_MakeBitsGated pins the F-S2-2 rule shape: the RW grant
+// carries all seven MAKE_* bits on an ABI that has them (v2+), so creation
+// is HANDLED (gated) — granted inside the subtree, denied outside. On ABI
+// v1 the bits are absent from the kernel mask and are dropped (the
+// documented kernel-inherent residual).
+func TestComputeRules_MakeBitsGated(t *testing.T) {
+	v4 := landlockABI{version: 4, threeArg: true, fsMask: 0x7FFF}
+	rules, accessFs, _, err := computeRules(&Spec{RW: []string{"/ws"}}, v4)
+	if err != nil {
+		t.Fatalf("computeRules (v4): %v", err)
+	}
+	makeBits := uint64(bMakeChar | bMakeDir | bMakeReg | bMakeSock | bMakeFIFO | bMakeBlock | bMakeSym)
+	if rules["/ws"]&makeBits != makeBits {
+		t.Errorf("v4: rw grant 0x%x lacks the make bits 0x%x", rules["/ws"], makeBits)
+	}
+	if accessFs&makeBits != makeBits {
+		t.Errorf("v4: handled set 0x%x lacks the make bits (creation must be GATED, not ungated)", accessFs)
+	}
+	// ABI v1: the make bits do not exist in the kernel mask — dropped,
+	// creation ungated there (residual, documented).
+	rules, accessFs, _, err = computeRules(&Spec{RW: []string{"/ws"}},
+		landlockABI{version: 1, threeArg: false, fsMask: uint64(bReadFile | bReadDir | bWriteFile | bExecute)})
+	if err != nil {
+		t.Fatalf("computeRules (v1): %v", err)
+	}
+	if rules["/ws"]&makeBits != 0 || accessFs&makeBits != 0 {
+		t.Errorf("v1: make bits must be dropped by the mask intersection (rule 0x%x, handled 0x%x)", rules["/ws"], accessFs)
 	}
 }
 
@@ -173,6 +248,23 @@ func TestWrapperSandboxed(t *testing.T) {
 		"noNewPrivs", "1",
 		"sockOk", "ok",
 	)
+	// (g) F-S2-2: creation gating (the MAKE_* bits). INSIDE the RW subtree
+	// the runtime must still create files/dirs/symlinks (its workspace);
+	// OUTSIDE every grant (the secret tree) creation is DENIED. On ABI v1
+	// the kernel mask has no make bits — creation is ungated there (the
+	// documented kernel-inherent residual, recorded, not asserted).
+	if a := getABI(); a.version >= 2 {
+		assertProbe(t, res,
+			"rwMkdir", "ok",
+			"rwSymlink", "ok",
+			"rwCreateFile", "ok",
+			"denyMkdir", "EACCES",
+			"denySymlink", "EACCES",
+			"denyCreateFile", "EACCES",
+		)
+	} else {
+		t.Logf("make-bit gating not asserted on ABI v%d (no make bits in the kernel mask — creation ungated there, documented residual)", a.version)
+	}
 	// (f, second half) KNOWN KERNEL LIMITATION: on the supported kernels
 	// (ABI v1–v4, 5.13–6.8) Landlock does not gate unix-socket connects at
 	// all (no connect-unix bit before ABI v5/6.10; 6.8 registers no

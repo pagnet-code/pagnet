@@ -652,6 +652,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		nativeDirs: homeNativeDirs(".codex"),
 		binary:     bin,
 		env:        sess.Env,
+		denied:     sess.SandboxDenied,
 	})
 	h, err := el.Launch(context.Background(), proc.LaunchRequest{
 		InstanceID: sess.InstanceID,

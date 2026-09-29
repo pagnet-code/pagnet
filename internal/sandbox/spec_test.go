@@ -176,6 +176,100 @@ func TestResolvRO(t *testing.T) {
 	}
 }
 
+// TestNormalize_DeniedContainment pins F-CFG-1: a Denied path that an RW
+// grant covers (equal to it, or path-beneath it) makes Normalize refuse —
+// the classic case is a workspace of $HOME (or of the state dir's parent)
+// swallowing the daemon's state dir. Disjoint workspaces stay accepted,
+// and a granted CHILD of the state dir (the per-instance session dir) does
+// NOT trip the check — only the containment direction (denied beneath an
+// RW grant) is a violation.
+func TestNormalize_DeniedContainment(t *testing.T) {
+	cases := []struct {
+		name    string
+		rw      []string
+		denied  []string
+		wantErr string // "" = accepted; otherwise the substrings the error must name
+	}{
+		{"workspace is the state dir", []string{"/home/u/.pagnet"}, []string{"/home/u/.pagnet"}, "equal"},
+		{"workspace is the state dir's parent", []string{"/home/u"}, []string{"/home/u/.pagnet"}, "beneath"},
+		{"home-style workspace", []string{"/home/u", "/home/u/.pagnet/sessions/inst1"}, []string{"/home/u/.pagnet"}, "beneath"},
+		{"sibling workspace ok", []string{"/home/u/projects/ws"}, []string{"/home/u/.pagnet"}, ""},
+		{"session-dir child of state dir ok", []string{"/home/u/.pagnet/sessions/inst1"}, []string{"/home/u/.pagnet"}, ""},
+		{"prefix-sibling must not match", []string{"/home/u/.pagnet2"}, []string{"/home/u/.pagnet"}, ""},
+		{"denied beneath a native dir grant", []string{"/home/u/.qwen/sub", "/home/u"}, []string{"/home/u/.pagnet"}, "beneath"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Spec{RW: tc.rw, Denied: tc.denied}
+			err := s.Normalize()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Normalize: %v, want accepted", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Normalize accepted a spec whose RW grant covers a denied path — the launch must be refused")
+			}
+			// The refusal must name the offending grant and the denied path.
+			for _, want := range append([]string{"denied path", "RW grant"}, tc.denied...) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestNewSpec_DeniedPassThrough pins that NewSpec carries Options.Denied
+// into the spec (so the single construction point feeds the containment
+// check), and that the driver-shape options still assemble when a denied
+// path is present but disjoint from every grant.
+func TestNewSpec_DeniedPassThrough(t *testing.T) {
+	s := NewSpec(Options{
+		Workspace: "/ws/inst1",
+		StateDirs: []string{"/state/inst1/sessions"},
+		Binary:    "/usr/local/bin/qwen",
+		Home:      "/home/u",
+		Socket:    "/state/pagnetd.sock",
+		Denied:    []string{"/state"},
+	})
+	if err := s.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v, want accepted (the session dir is a CHILD of the denied state dir — that direction is fine)", err)
+	}
+	if len(s.Denied) != 1 || s.Denied[0] != "/state" {
+		t.Fatalf("NewSpec did not carry Denied through: %v", s.Denied)
+	}
+	// The $HOME-shape violation: a workspace that CONTAINS the denied path.
+	bad := NewSpec(Options{
+		Workspace: "/home/u",
+		StateDirs: []string{"/home/u/.pagnet/sessions/inst1"},
+		Home:      "/home/u",
+		Denied:    []string{"/home/u/.pagnet"},
+	})
+	if err := bad.Normalize(); err == nil {
+		t.Fatal("workspace=$HOME covering the state dir: accepted, want a refusal")
+	}
+}
+
+// TestWrapperArgs_DeniedRoundTrip pins the --denied argv shape: the
+// containment set travels with the allowlist (it is the wrapper's
+// re-validation input, fail closed at the last gate before exec).
+func TestWrapperArgs_DeniedRoundTrip(t *testing.T) {
+	spec := &Spec{
+		RW:     []string{"/ws"},
+		Denied: []string{"/state"},
+	}
+	argv := WrapperArgs(spec, "/bin/true", nil)
+	got, _, _, err := ParseWrapperArgs(argv)
+	if err != nil {
+		t.Fatalf("ParseWrapperArgs: %v", err)
+	}
+	if len(got.Denied) != 1 || got.Denied[0] != "/state" {
+		t.Fatalf("Denied round-trip = %v, want [/state]", got.Denied)
+	}
+}
+
 func TestNewSpec_AssemblesExpectedShape(t *testing.T) {
 	s := NewSpec(Options{
 		Workspace:  "/ws/inst1",

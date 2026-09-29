@@ -18,8 +18,18 @@
 //
 // The allowlist is per-instance and built by the daemon/driver layer from
 // what it already knows (NewSpec). Coarse system read + tight per-instance
-// write; the daemon's state dir is reached only via READ_DIR traversal on
-// the bridge socket's path, so its secret FILE CONTENTS stay denied.
+// write; the daemon's state dir is reached only via READ_DIR on the bridge
+// socket's PARENT (entry names, never file contents), and a Denied entry
+// (the daemon's state dir itself) makes a spec that grants any RW subtree
+// covering it refuse the launch — the state dir can never be silently
+// swallowed by an over-broad RW grant (e.g. workspace = $HOME).
+//
+// Actual exposure (kernel-inherent, all ABIs): Landlock never gates
+// stat/lstat — a sandboxed process can learn the existence/size/mtime of
+// any path, but never file contents. On ABI v1–v3 kernels the ancestor
+// traversal chain (required for path resolution there) additionally
+// exposes directory entry NAMES system-wide; on ABI v4+ no ancestor grants
+// are added, so only the granted subtrees' entry names are visible.
 package sandbox
 
 import (
@@ -38,23 +48,38 @@ import (
 const Subcommand = "sandbox-exec"
 
 // Spec is the per-instance filesystem allowlist. RW/RO are absolute
-// directory subtrees; Sockets are absolute unix socket file paths.
-// Execute is implied by both RW and RO (a runtime must be able to run its own
-// binary and its dependencies inside the allowed subtrees).
+// directory subtrees; Sockets are absolute unix socket file paths; Denied
+// is the containment set (F-CFG-1). Execute is implied by both RW and RO
+// (a runtime must be able to run its own binary and its dependencies
+// inside the allowed subtrees).
 type Spec struct {
 	// RW: read-write subtrees — the instance's workspace, its pagnet
 	// session/state dirs, its scratch, and the runtime's OWN native state
 	// dir (which holds the runtime's LLM auth + sessions: legitimately the
 	// runtime's own, allowed by the owner's allowlist).
 	RW []string
+	// Denied: paths that must NOT be equal to or path-beneath ANY RW grant
+	// (F-CFG-1: the daemon's state dir). A workspace that contains a denied
+	// path (e.g. workspace = $HOME covering ~/.pagnet) would silently void
+	// the sandbox — the runtime would read the host key, account creds, and
+	// daemon.sqlite directly, no symlink needed. Normalize refuses such a
+	// spec with an explicit error naming the offending grant and the denied
+	// path, so every launch path (the supervisor's single policy point and
+	// the wrapper itself) fails closed BEFORE any process starts. "" entries
+	// are ignored; the check is against RW only (RO grants never carry
+	// write authority and are never the state dir by construction).
+	Denied []string
 	// RO: read-only subtrees — the coarse system paths a runtime needs to run
 	// at all (SystemRO) plus its interpreter/module support paths
 	// (RuntimeSupportRO) and any extras.
 	RO []string
 	// Sockets: unix socket paths the runtime must be able to reach (the
 	// daemon bridge socket). The sandbox grants READ_DIR (traversal) on the
-	// socket's parent + ancestors so any file access toward that path walks
-	// a granted chain — no read/write on the surrounding dir contents.
+	// socket's parent — and, on ABI v1–v3 kernels only, on its ancestors up
+	// to / (their path resolution requires the chain; on ABI v4+ the
+	// parent rule alone suffices — verified empirically) — so any file
+	// access toward that path walks a granted chain. No read/write on the
+	// surrounding dir contents.
 	//
 	// KNOWN KERNEL LIMITATION (documented, not a sandbox bug): on the
 	// supported kernels (Landlock ABI v1–v4, Linux 5.13–6.8) unix-socket
@@ -83,9 +108,18 @@ type Spec struct {
 }
 
 // Normalize makes the spec canonical: absolute + cleaned + de-duplicated,
-// empty entries dropped. It is deterministic and fails closed on a
-// non-absolute path (the daemon/driver always pass absolute paths; a relative
-// one is a caller bug we refuse, not silently resolve against an unknown CWD).
+// empty entries dropped. It is deterministic and fails closed on:
+//
+//   - a non-absolute path (the daemon/driver always pass absolute paths; a
+//     relative one is a caller bug we refuse, not silently resolve against
+//     an unknown CWD), and
+//   - a Denied path that is equal to or path-beneath any RW grant (F-CFG-1
+//     containment): such a spec would hand the runtime write access to a
+//     protected path — the classic case is a workspace that contains the
+//     daemon's state dir. The refusal names the offending grant and the
+//     denied path. This is the single enforcement point: the supervisor
+//     calls Normalize at its wrap (before any process starts) and the
+//     wrapper calls it again in Apply, so no launch path can bypass it.
 func (s *Spec) Normalize() error {
 	norm := func(in []string, label string) ([]string, error) {
 		seen := map[string]bool{}
@@ -122,14 +156,29 @@ func (s *Spec) Normalize() error {
 	if err != nil {
 		return err
 	}
-	s.RW, s.RO, s.Sockets, s.Dev = rw, ro, sock, dev
+	denied, err := norm(s.Denied, "denied")
+	if err != nil {
+		return err
+	}
+	s.RW, s.RO, s.Sockets, s.Dev, s.Denied = rw, ro, sock, dev, denied
+	// F-CFG-1 containment: a denied path equal to, or path-beneath, an RW
+	// grant gives the runtime write access to a protected path. Refuse,
+	// naming both sides (prefix-with-separator: /a/b must NOT match grant
+	// /a by plain prefix — only /a/b/... does).
+	for _, dn := range denied {
+		for _, g := range rw {
+			if dn == g || strings.HasPrefix(dn, g+string(filepath.Separator)) {
+				return fmt.Errorf("sandbox: denied path %q is equal to or beneath RW grant %q — the runtime would get write access to a protected path (refusing the launch)", dn, g)
+			}
+		}
+	}
 	return nil
 }
 
 // WrapperArgs returns the argv (following the `sandbox-exec` token) that
 // encodes spec and the target launch:
 //
-//	[--rw p]* [--ro p]* [--dev p]* [--sock p]* -- target arg1 arg2 ...
+//	[--rw p]* [--ro p]* [--dev p]* [--sock p]* [--denied p]* -- target arg1 arg2 ...
 //
 // target is the absolute target binary; targetArgs are the runtime's own
 // arguments (NOT including the target itself). Paths are not secret — the
@@ -150,6 +199,9 @@ func WrapperArgs(spec *Spec, target string, targetArgs []string) []string {
 	for _, p := range spec.Sockets {
 		out = append(out, "--sock", p)
 	}
+	for _, p := range spec.Denied {
+		out = append(out, "--denied", p)
+	}
 	out = append(out, "--", target)
 	out = append(out, targetArgs...)
 	return out
@@ -163,7 +215,7 @@ func ParseWrapperArgs(argv []string) (Spec, string, []string, error) {
 	dashdash := -1
 	for i := 0; i < len(argv); {
 		switch a := argv[i]; a {
-		case "--rw", "--ro", "--dev", "--sock":
+		case "--rw", "--ro", "--dev", "--sock", "--denied":
 			if i+1 >= len(argv) {
 				return Spec{}, "", nil, fmt.Errorf("sandbox-exec: %s requires a path", a)
 			}
@@ -180,6 +232,8 @@ func ParseWrapperArgs(argv []string) (Spec, string, []string, error) {
 				spec.Dev = append(spec.Dev, p)
 			case "--sock":
 				spec.Sockets = append(spec.Sockets, p)
+			case "--denied":
+				spec.Denied = append(spec.Denied, p)
 			}
 			i += 2
 		case "--":
@@ -398,6 +452,12 @@ type Options struct {
 	// ExtraRO / ExtraRW: driver-specific additions.
 	ExtraRO []string
 	ExtraRW []string
+	// Denied: paths that must not be equal to or path-beneath any RW grant
+	// (F-CFG-1). The daemon passes its OWN state dir here: a workspace that
+	// contains it (e.g. workspace = $HOME) would silently void the sandbox,
+	// and Normalize refuses such a spec — the launch fails with an explicit
+	// error before any process starts.
+	Denied []string
 }
 
 // NewSpec assembles the per-instance allowlist from Options (H4). It is the
@@ -405,12 +465,13 @@ type Options struct {
 // RuntimeSupportRO + the resolver-config target, ResolvRO) + the device
 // grant (SystemDev) + the bridge worker's binary dir (the runtime must EXEC
 // its MCP server) + tight per-instance write (workspace/state/scratch/native)
-// + the bridge socket. The daemon's
-// state dir is NEVER placed in RW or RO — it is reached only through READ_DIR
-// traversal on the socket's path, so the secret FILE CONTENTS (accounts/,
-// e2ee/, daemon.sqlite) stay denied (Landlock grants READ_DIR on the state
-// dir for traversal but never READ_FILE, so only entry NAMES are visible,
-// not contents).
+// + the bridge socket + the Denied containment set. The daemon's state dir
+// is NEVER placed in RW or RO — it is reached only through READ_DIR on the
+// socket's parent (entry NAMES visible, never file CONTENTS: Landlock
+// grants READ_DIR on the state dir for traversal but never READ_FILE), and
+// Options.Denied carries it as a containment set: a spec whose RW grants
+// cover a denied path (workspace = $HOME swallowing ~/.pagnet) is refused
+// by Normalize — the launch fails closed before any process starts.
 func NewSpec(o Options) *Spec {
 	if o.Home == "" {
 		o.Home = Home()
@@ -434,5 +495,6 @@ func NewSpec(o Options) *Spec {
 	if o.Socket != "" {
 		s.Sockets = append(s.Sockets, o.Socket)
 	}
+	s.Denied = append(s.Denied, o.Denied...)
 	return s
 }

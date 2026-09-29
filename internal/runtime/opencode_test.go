@@ -437,3 +437,90 @@ func mustReadDir(t *testing.T, dir string) []os.DirEntry {
 	}
 	return entries
 }
+
+// TestOpenCode_ConfigWriteSymlinkSafe pins F-S2-1: the SessionDir is
+// runtime-writable under the sandbox, so a compromised runtime can unlink
+// a managed file and plant a symlink at its path pointing at a secret
+// outside the subtree. writeOpenCodeConfig re-materializes both managed
+// files every turn; the writes must be rename-based so the planted
+// symlink is REPLACED, never followed (an os.WriteFile would have
+// clobbered the pointed-at file).
+func TestOpenCode_ConfigWriteSymlinkSafe(t *testing.T) {
+	const mcp = `{"mcpServers":{"pagnet":{"command":"/usr/local/bin/pagnet","args":["mcp","worker","--socket","/s/pagnetd.sock"]}}}`
+	const standing = "PAGNET COORDINATION CONTRACT\n\nAGENT INSTRUCTIONS\n\nDo not modify code.\n"
+
+	dir := t.TempDir()
+	sessionDir := filepath.Join(dir, "pagnet-session")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The decoy secret (the shape a planted symlink would target): a
+	// secret file OUTSIDE the SessionDir.
+	decoy := filepath.Join(dir, "decoy-secret")
+	decoyBytes := []byte("host_credential: decoy-secret\n")
+	if err := os.WriteFile(decoy, decoyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Plant the attack: both managed-file paths are symlinks at the decoy.
+	standingPath := filepath.Join(sessionDir, "standing.md")
+	cfgPath := filepath.Join(sessionDir, "opencode.json")
+	for _, p := range []string{standingPath, cfgPath} {
+		if err := os.Symlink(decoy, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := writeOpenCodeConfig(sessionDir, mcp, standing)
+	if err != nil {
+		t.Fatalf("writeOpenCodeConfig: %v", err)
+	}
+	if got != cfgPath {
+		t.Fatalf("writeOpenCodeConfig path = %q, want %q", got, cfgPath)
+	}
+	// (1) The decoy is byte-identical — neither write followed the link.
+	if b, err := os.ReadFile(decoy); err != nil || string(b) != string(decoyBytes) {
+		t.Fatalf("planted symlink was followed: decoy = %q (%v), want the original %q", b, err, decoyBytes)
+	}
+	// (2) Both managed files are now REGULAR files (the symlink entries
+	// were replaced by the rename), with the managed content.
+	for name, want := range map[string]string{
+		standingPath: standing,
+		cfgPath:      "", // validated structurally below
+	} {
+		st, err := os.Lstat(name)
+		if err != nil {
+			t.Fatalf("lstat %s: %v", name, err)
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("%s is still a symlink — the write did not replace the planted entry", name)
+		}
+		if !st.Mode().IsRegular() {
+			t.Fatalf("%s mode = %v, want a regular file", name, st.Mode())
+		}
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if want != "" && string(b) != want {
+			t.Fatalf("%s = %q, want the managed content %q", name, b, want)
+		}
+	}
+	var cfg struct {
+		Instructions []string `json:"instructions"`
+	}
+	if err := json.Unmarshal(mustReadFile(t, cfgPath), &cfg); err != nil {
+		t.Fatalf("opencode.json is not valid JSON: %v", err)
+	}
+	if len(cfg.Instructions) != 1 || cfg.Instructions[0] != standingPath {
+		t.Fatalf("instructions = %v, want [%s]", cfg.Instructions, standingPath)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
+}
