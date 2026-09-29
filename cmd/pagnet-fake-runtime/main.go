@@ -280,6 +280,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "save session:", err)
 	}
 
+	// S1 e2e fixture: the scripted in-tree bridge exchange (hostile mode,
+	// see bridge_fixture.go) runs here — SYNCHRONOUSLY, as part of turn
+	// completion, after the session bookkeeping and BEFORE the terminal
+	// event. The placement is load-bearing: the daemon invalidates the
+	// per-activation bridge nonce and hibernates the instance the moment
+	// it observes turn.completed, so the exchange must finish while the
+	// turn is still in flight (instance working, nonce valid, this
+	// process is the instance root the peer check binds to). Running it
+	// here is also what makes the result file complete by the time the
+	// harness observes the turn. First-run only per instance (marker
+	// file in the session dir); a no-op unless PAGNET_FAKE_HOSTILE_
+	// BRIDGE=1 is set.
+	hostileBridgeFixtureOnce(s.SessionDir)
+
 	inTok := 4 + len(s.Input)/4
 	outTok := 4 + len(out)/4
 	emit(event{
