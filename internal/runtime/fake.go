@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -143,8 +142,13 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	if err != nil {
 		return err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	// The supervisor reaps with Process.Wait and never calls cmd.Wait
+	// (see capturedStderr), so stderr gets the driver-owned drain, not
+	// the io.Writer form whose exec copier would never be joined.
+	stderr, err := attachStderrDrain(cmd)
+	if err != nil {
+		return err
+	}
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle. The ctx is handed to it (its
@@ -251,11 +255,12 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		return ctx.Err()
 	}
 	if waitErr != nil {
-		// Surface a crash as a process_error turn failure.
+		// Surface a crash as a process_error turn failure. The child is
+		// reaped: its stderr write end is closed and the drain is done.
 		events <- TurnEvent{
 			Type:        EventTurnFailed,
 			FailureKind: domain.RuntimeFailureProcessError,
-			Error:       fmt.Sprintf("fake runtime exited: %v (%s)", waitErr, stderrBuf.String()),
+			Error:       fmt.Sprintf("fake runtime exited: %v (%s)", waitErr, stderr.Text()),
 		}
 	}
 	return nil

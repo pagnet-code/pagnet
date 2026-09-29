@@ -423,7 +423,6 @@ type codexEndpoint struct {
 	state      *codexTurnState
 	stdin      io.WriteCloser
 	stdout     io.ReadCloser
-	stderr     *bytes.Buffer
 
 	// activationCh carries the (synthesized) activation event; closed by
 	// the driver after it is delivered.
@@ -619,8 +618,11 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		stdin.Close()
 		return nil, session.SessionEvent{}, err
 	}
-	stderr := &bytes.Buffer{}
-	cmd.Stderr = stderr
+	// The endpoint's stderr is captured nowhere (never read after
+	// launch) — discard it. The io.Writer-buffer form would grow
+	// unboundedly for a long-lived endpoint AND ride exec's internal
+	// copier, which the supervisor's Process.Wait reap never joins.
+	cmd.Stderr = io.Discard
 
 	lif := c.life.get()
 	el, ok := lif.(proc.EndpointLifecycle)
@@ -676,7 +678,6 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		state:        newCodexTurnState(resuming, sess.NativeID),
 		stdin:        stdin,
 		stdout:       stdout,
-		stderr:       stderr,
 		activationCh: make(chan session.SessionEvent, 1),
 		readerDone:   make(chan struct{}),
 		pending:      map[int64]*codexRPCWaiter{},

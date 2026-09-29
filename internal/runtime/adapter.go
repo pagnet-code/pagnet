@@ -10,12 +10,16 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/sandbox"
@@ -192,6 +196,97 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	ok = true
 	return nil
+}
+
+// capturedStderr captures a child's stderr under the supervisor's reap
+// semantics. The supervisor reaps the direct child with Process.Wait
+// (a raw waitpid) and deliberately NEVER calls cmd.Wait: cmd.Wait would
+// close the child's I/O pipes in the background while the driver is
+// still draining stdout (the opencode mid-turn-death regression). The
+// cost: with cmd.Stderr set to an io.Writer (*bytes.Buffer), the
+// copier goroutine exec.Cmd spawns internally for the pipe→buffer copy
+// is joined ONLY by cmd.Wait — which the supervisor never calls — so
+// h.Wait() could return while the copier was still writing, and the
+// driver's post-reap stderrBuf.String() data-raced (the 2026-09-29
+// -race CI finding: claude.go / opencode.go / fake.go).
+//
+// The driver therefore owns the drain: attachStderrDrain switches
+// cmd.Stderr from the io.Writer form to StderrPipe plus a dedicated
+// goroutine that reads the pipe to EOF and appends to the buffer under
+// a mutex. The child's write end closes when the child exits, so the
+// drain completes right after the reap — unless a descendant inherited
+// and holds the write end (the same pipe-hold hazard the stdout loops
+// handle with an early break); the reaper's group reclaim kills the
+// holder and the drain then finishes in the background. Text never
+// races: the buffer is read only under the same mutex, and Text gives
+// the drain a bounded head start so the normal case returns the
+// complete stream.
+type capturedStderr struct {
+	mu         sync.Mutex
+	buf        bytes.Buffer
+	drained    chan struct{}
+	drainBound time.Duration
+}
+
+// stderrDrainBound is how long Text waits for the drain to complete
+// after the reap before returning a best-effort prefix. The normal
+// drain (child reaped → write end closed) completes in milliseconds;
+// the bound elapses only while a descendant still holds the write end,
+// and the reaper's group reclaim bounds that in the background.
+const stderrDrainBound = 2 * time.Second
+
+// newCapturedStderr starts the drain goroutine on pipe and returns the
+// capture. The goroutine exits when the pipe reaches EOF (the child's
+// write end closes at exit — or when the reaper's group reclaim kills
+// a descendant holding it).
+func newCapturedStderr(pipe io.ReadCloser, drainBound time.Duration) *capturedStderr {
+	c := &capturedStderr{drained: make(chan struct{}), drainBound: drainBound}
+	go c.drain(pipe)
+	return c
+}
+
+// attachStderrDrain sets cmd.Stderr to a driver-owned drain (see
+// capturedStderr). It must be called before Start (the pipe is created
+// at Start) — and before the supervisor's Launch wraps the cmd.
+func attachStderrDrain(cmd *exec.Cmd) (*capturedStderr, error) {
+	pipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	return newCapturedStderr(pipe, stderrDrainBound), nil
+}
+
+func (c *capturedStderr) drain(pipe io.ReadCloser) {
+	defer close(c.drained)
+	chunk := make([]byte, 32*1024)
+	for {
+		n, rerr := pipe.Read(chunk)
+		if n > 0 {
+			c.mu.Lock()
+			c.buf.Write(chunk[:n])
+			c.mu.Unlock()
+		}
+		if rerr != nil {
+			pipe.Close()
+			return
+		}
+	}
+}
+
+// Text returns the captured stderr. It first waits up to drainBound
+// for the drain to complete (the normal case: the child is reaped, its
+// write end closed, and the drain finishes in milliseconds); if the
+// bound elapses a descendant is still holding the write end and the
+// text is a best-effort prefix — the reaper's group reclaim kills the
+// holder and the drain finishes in the background.
+func (c *capturedStderr) Text() string {
+	select {
+	case <-c.drained:
+	case <-time.After(c.drainBound):
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
 }
 
 // InteractionEvent is a normalized observation of a native runtime

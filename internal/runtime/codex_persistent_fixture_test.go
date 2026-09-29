@@ -132,6 +132,27 @@ func codexEventTypes(evs []session.SessionEvent) []string {
 	return out
 }
 
+// waitForActiveEndpoints polls the supervisor's endpoint count until it
+// reaches want (or the deadline). The reaper reaps and unregisters in a
+// background goroutine (B7: a lifecycle caller never blocks on the
+// process's exit), so the count settles ASYNCHRONOUSLY after a stop or
+// retire — asserting the point-in-time count races the reap under load
+// (the pre-B7 synchronous-reap assumption). A killable process is
+// reaped in milliseconds, so the bound elapses only when the reap is
+// genuinely broken — the stale-endpoint leak this guard exists for.
+func waitForActiveEndpoints(t *testing.T, sup *proc.Supervisor, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := sup.Stats().ActiveEndpoints; n == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("active endpoints = %d, want %d (the reaper did not settle within the bound)",
+		sup.Stats().ActiveEndpoints, want)
+}
+
 // assertCodexEventTypes asserts the normalized events have exactly the
 // given types, in order.
 func assertCodexEventTypes(t *testing.T, got []session.SessionEvent, want ...string) {
@@ -213,10 +234,9 @@ func TestCodexPersistent_Handshake(t *testing.T) {
 		if elapsed > 30*time.Second {
 			t.Fatalf("handshake failure took %s (want bounded by the activation timeout)", elapsed)
 		}
-		// The failed activation left NO stale endpoint behind.
-		if n := sup.Stats().ActiveEndpoints; n != 0 {
-			t.Fatalf("%d active endpoints after a failed handshake, want 0", n)
-		}
+		// The failed activation left NO stale endpoint behind (the
+		// supervisor record clears asynchronously with the reap).
+		waitForActiveEndpoints(t, sup, 0)
 		if cp.Live("inst-hs-timeout") {
 			t.Fatal("Live() is true after a failed handshake")
 		}
@@ -466,10 +486,9 @@ func TestCodexPersistent_CrashAfterAcceptIsInterrupted(t *testing.T) {
 	if sess.Materialised {
 		t.Fatal("the session must not be materialised after an interrupted first turn")
 	}
-	// The dead process is fully reaped: no stale endpoint, no wedge.
-	if n := sup.Stats().ActiveEndpoints; n != 0 {
-		t.Fatalf("%d active endpoints after the crash, want 0", n)
-	}
+	// The dead process is fully reaped: no stale endpoint, no wedge (the
+	// supervisor record clears asynchronously with the reap).
+	waitForActiveEndpoints(t, sup, 0)
 	if cp.Live("inst-crash") {
 		t.Fatal("Live() is true after the crash")
 	}

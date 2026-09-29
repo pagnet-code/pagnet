@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -332,7 +331,6 @@ type persistEndpoint struct {
 	standingInstructions string
 	stdin                io.WriteCloser
 	stdout               io.ReadCloser
-	stderr               *bytes.Buffer
 	// activationCh carries the process's first (activation) event; closed
 	// by the reader after it is delivered.
 	activationCh chan session.SessionEvent
@@ -512,8 +510,11 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if err != nil {
 		return nil, err
 	}
-	stderr := &bytes.Buffer{}
-	cmd.Stderr = stderr
+	// The endpoint's stderr is captured nowhere (never read after
+	// launch) — discard it. The io.Writer-buffer form would grow
+	// unboundedly for a long-lived endpoint AND ride exec's internal
+	// copier, which the supervisor's Process.Wait reap never joins.
+	cmd.Stderr = io.Discard
 
 	lif := f.life.get()
 	el, ok := lif.(proc.EndpointLifecycle)
@@ -580,7 +581,6 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		standingInstructions: sess.StandingInstructions,
 		stdin:                stdin,
 		stdout:               stdout,
-		stderr:               stderr,
 		activationCh:         make(chan session.SessionEvent, 1),
 		readerDone:           make(chan struct{}),
 	}

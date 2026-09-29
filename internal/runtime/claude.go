@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -227,8 +226,13 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	if err != nil {
 		return err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	// The supervisor reaps with Process.Wait and never calls cmd.Wait
+	// (see capturedStderr), so stderr gets the driver-owned drain, not
+	// the io.Writer form whose exec copier would never be joined.
+	stderr, err := attachStderrDrain(cmd)
+	if err != nil {
+		return err
+	}
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle; its ctx watcher terminates the
@@ -322,8 +326,8 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 				_ = writeStoredSession(sessionPath, sessionID)
 			}
 			terminal = true
-			// (Only ev.Errors is safe to read here; stderrBuf is owned by
-			// the copy goroutine until cmd.Wait below.)
+			// (Only ev.Errors is safe to read here; the stderr drain
+			// completes only after the reap + capture below.)
 			if resuming && errorsIndicateMissingSession(ev.Errors) {
 				// §74/§88: the stored session does not exist on this
 				// host. Report it as lost — never a silent fresh session.
@@ -407,9 +411,12 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if resuming && sessionMissingInStderr(stderrBuf.String()) {
+	// The child is reaped: its stderr write end is closed, so the drain
+	// has (or is about to) completed — capture once, reads never race.
+	stderrText := stderr.Text()
+	if resuming && sessionMissingInStderr(stderrText) {
 		events <- TurnEvent{Type: EventSessionLost, SessionID: stored,
-			Error: trunc(stderrBuf.String())}
+			Error: trunc(stderrText)}
 		return nil
 	}
 	// Exited without a result line. Provider-shaped stderr is
@@ -417,11 +424,11 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	// provider mystery.
 	kind := domain.RuntimeFailureProcessError
 	var retryAt *string
-	if LooksLikeProviderError(trunc(stderrBuf.String())) {
-		kind, retryAt = ClassifyProviderError(trunc(stderrBuf.String()))
+	if LooksLikeProviderError(trunc(stderrText)) {
+		kind, retryAt = ClassifyProviderError(trunc(stderrText))
 	}
 	events <- TurnEvent{Type: EventTurnFailed, FailureKind: kind,
-		Error: trunc(firstNonEmpty(stderrBuf.String(), errorString(waitErr))), RetryAt: retryAt}
+		Error: trunc(firstNonEmpty(stderrText, errorString(waitErr))), RetryAt: retryAt}
 	return nil
 }
 
@@ -438,8 +445,8 @@ func errorsIndicateMissingSession(errors []string) bool {
 }
 
 // sessionMissingInStderr reports whether stderr carries the CLI's
-// "resumed session does not exist" message. Only call after cmd.Wait
-// (the stderr copy goroutine owns the buffer until then).
+// "resumed session does not exist" message. Only call on captured text
+// (capturedStderr.Text — the drain completes after the reap).
 func sessionMissingInStderr(stderr string) bool {
 	return strings.Contains(stderr, claudeMissingSession)
 }

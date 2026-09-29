@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -207,8 +206,13 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	if err != nil {
 		return err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	// The supervisor reaps with Process.Wait and never calls cmd.Wait
+	// (see capturedStderr), so stderr gets the driver-owned drain, not
+	// the io.Writer form whose exec copier would never be joined.
+	stderr, err := attachStderrDrain(cmd)
+	if err != nil {
+		return err
+	}
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle; its ctx watcher terminates the
@@ -336,12 +340,15 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// The child is reaped: its stderr write end is closed, so the drain
+	// has (or is about to) completed — capture once, reads never race.
+	stderrText := stderr.Text()
 	// A failed resume that never confirmed the stored session is a lost
 	// session, not a turn failure (the stored id does not exist on this
 	// host) — never a silent fresh session (§74/§88).
 	if resuming && !sawStoredSession {
 		events <- TurnEvent{Type: EventSessionLost, SessionID: stored,
-			Error: trunc(firstNonEmpty(errText, stderrBuf.String(),
+			Error: trunc(firstNonEmpty(errText, stderrText,
 				"opencode resume failed without confirming the stored session"))}
 		return nil
 	}
@@ -356,11 +363,11 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 		// stderr is classified; anything else is a process-level failure.
 		kind := domain.RuntimeFailureProcessError
 		var retryAt *string
-		if LooksLikeProviderError(trunc(stderrBuf.String())) {
-			kind, retryAt = ClassifyProviderError(trunc(stderrBuf.String()))
+		if LooksLikeProviderError(trunc(stderrText)) {
+			kind, retryAt = ClassifyProviderError(trunc(stderrText))
 		}
 		events <- TurnEvent{Type: EventTurnFailed, FailureKind: kind,
-			Error: trunc(firstNonEmpty(stderrBuf.String(), waitErr.Error())), RetryAt: retryAt}
+			Error: trunc(firstNonEmpty(stderrText, waitErr.Error())), RetryAt: retryAt}
 		return nil
 	}
 	// Exited cleanly: the one-shot run finished the turn.
