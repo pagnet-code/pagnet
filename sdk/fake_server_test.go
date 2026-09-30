@@ -105,6 +105,7 @@ type fakeInvocation struct {
 	target           string
 	capability       string
 	version          int
+	endpointID       string // current dispatch lease
 	state            string // pending|dispatched|running|completed|failed|cancelled
 	idempotencyKey   string
 	input            *fakeEncField
@@ -122,6 +123,7 @@ type fakeEndpoint struct {
 	principalID  string
 	publicKey    []byte
 	capabilities []domain.Capability
+	online       bool // guarded by fs.mu; conn is immutable
 	conn         *websocket.Conn
 	sendMu       *sync.Mutex
 }
@@ -130,7 +132,10 @@ type fakeServer struct {
 	t  *testing.T
 	ts *httptest.Server
 
-	mu sync.Mutex
+	mu               sync.Mutex
+	dispatchMu       sync.Mutex
+	authGate         <-chan struct{}
+	registerObserved chan string
 
 	principals map[string]*fakePrincipal
 	networks   map[string]*fakeNetwork
@@ -270,6 +275,7 @@ func (fs *fakeServer) dropEndpoint(endpointID string) {
 	conn := (*websocket.Conn)(nil)
 	if ep != nil {
 		conn = ep.conn
+		ep.online = false
 	}
 	fs.mu.Unlock()
 	if conn != nil {
@@ -287,7 +293,7 @@ func (fs *fakeServer) endpointForPrincipal(principalID string) string {
 
 func (fs *fakeServer) endpointOfPrincipalLocked(principalID string) string {
 	for id, ep := range fs.endpoints {
-		if ep.principalID == principalID && ep.conn != nil {
+		if ep.principalID == principalID && ep.online {
 			return id
 		}
 	}
@@ -618,9 +624,7 @@ func (fs *fakeServer) createPlainInvocation(networkID, caller, target, capabilit
 	}
 	fs.invocations[id] = inv
 	fs.mu.Unlock()
-	if epID := fs.endpointForPrincipal(target); epID != "" {
-		_ = fs.pushInvocationDispatch(epID, inv)
-	}
+	fs.dispatchPendingInvocations()
 	return id
 }
 
@@ -664,7 +668,7 @@ func (fs *fakeServer) wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	fs.mu.Lock()
 	epID := uuid.New().String()
-	ep := &fakeEndpoint{id: epID, principalID: principalID, conn: ws, sendMu: &sync.Mutex{}}
+	ep := &fakeEndpoint{id: epID, principalID: principalID, conn: ws, online: true, sendMu: &sync.Mutex{}}
 	fs.endpoints[epID] = ep
 	fs.mu.Unlock()
 	go fs.wsReadLoop(ep, principalID, netIDs, durableCred)
@@ -674,9 +678,15 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 	defer func() {
 		fs.mu.Lock()
 		if cur, ok := fs.endpoints[ep.id]; ok && cur.conn == ep.conn {
-			cur.conn = nil // keep the record; the endpoint is offline
+			cur.online = false // keep the immutable socket and endpoint record
+			for _, inv := range fs.invocations {
+				if inv.state == "dispatched" && inv.endpointID == ep.id {
+					inv.state = "pending"
+				}
+			}
 		}
 		fs.mu.Unlock()
+		fs.dispatchPendingInvocations()
 	}()
 	for {
 		var env transport.Envelope
@@ -694,7 +704,17 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 			fs.mu.Lock()
 			ep.publicKey = pub
 			ep.capabilities = p.Capabilities
+			gate, observed := fs.authGate, fs.registerObserved
 			fs.mu.Unlock()
+			if observed != nil {
+				select {
+				case observed <- ep.id:
+				default:
+				}
+			}
+			if gate != nil {
+				<-gate
+			}
 			ok := transport.EndpointAuthOKPayload{
 				PrincipalID:     principalID,
 				EndpointID:      ep.id,
@@ -742,7 +762,7 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 				continue
 			}
 			fs.mu.Lock()
-			if inv, ok := fs.invocations[p.InvocationID]; ok && inv.state == "dispatched" {
+			if inv, ok := fs.invocations[p.InvocationID]; ok && inv.state == "dispatched" && inv.endpointID == ep.id {
 				inv.state = "running"
 			}
 			fs.mu.Unlock()
@@ -763,6 +783,7 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 				fs.cryptoReady[ep.id] = true
 			}
 			fs.mu.Unlock()
+			fs.dispatchPendingInvocations()
 		case transport.MsgEndpointDisconnect:
 			return
 		}
@@ -854,24 +875,58 @@ func (fs *fakeServer) pushMessageDelivery(epID string, m *fakeMessage) error {
 	return fs.sendTo(ep, transport.MsgEndpointMessageDeliver, payload)
 }
 
-// pushInvocationDispatch sends one invocation dispatch to an endpoint.
-func (fs *fakeServer) pushInvocationDispatch(epID string, inv *fakeInvocation) error {
-	fs.mu.Lock()
-	ep := fs.endpoints[epID]
-	inv.state = "dispatched"
-	fs.mu.Unlock()
-	if ep == nil || ep.conn == nil {
-		return fmt.Errorf("endpoint %s not connected", epID)
+// dispatchPendingInvocations models durable scheduling: new work waits for
+// a registered, crypto-ready endpoint advertising the requested capability.
+// Serialize sends with enrollment so a failed old socket cannot lose a wakeup.
+func (fs *fakeServer) dispatchPendingInvocations() {
+	fs.dispatchMu.Lock()
+	defer fs.dispatchMu.Unlock()
+	for {
+		fs.mu.Lock()
+		var selected *fakeInvocation
+		var endpoint *fakeEndpoint
+		for _, inv := range fs.invocations {
+			if inv.state != "pending" {
+				continue
+			}
+			for _, ep := range fs.endpoints {
+				if !ep.online || ep.principalID != inv.target || !fs.cryptoReady[ep.id] {
+					continue
+				}
+				for _, cap := range ep.capabilities {
+					if cap.ID == inv.capability && (inv.version == 0 || cap.Version == inv.version) {
+						selected, endpoint = inv, ep
+						break
+					}
+				}
+				if endpoint != nil {
+					break
+				}
+			}
+			if endpoint != nil {
+				break
+			}
+		}
+		if selected == nil {
+			fs.mu.Unlock()
+			return
+		}
+		selected.state, selected.endpointID = "dispatched", endpoint.id
+		payload := transport.EndpointInvocationDispatchPayload{
+			InvocationID: selected.id, NetworkID: selected.networkID,
+			CapabilityID: selected.capability, CapabilityVersion: selected.version,
+			Envelope: &selected.input.Envelope, AAD: &selected.input.AAD,
+		}
+		fs.mu.Unlock()
+		if err := fs.sendTo(endpoint, transport.MsgEndpointInvocationDispatch, payload); err != nil {
+			fs.mu.Lock()
+			endpoint.online = false
+			if selected.state == "dispatched" {
+				selected.state = "pending"
+			}
+			fs.mu.Unlock()
+		}
 	}
-	payload := transport.EndpointInvocationDispatchPayload{
-		InvocationID:      inv.id,
-		NetworkID:         inv.networkID,
-		CapabilityID:      inv.capability,
-		CapabilityVersion: inv.version,
-		Envelope:          &inv.input.Envelope,
-		AAD:               &inv.input.AAD,
-	}
-	return fs.sendTo(ep, transport.MsgEndpointInvocationDispatch, payload)
 }
 
 // --- REST --------------------------------------------------------------------------
@@ -1142,9 +1197,7 @@ func (fs *fakeServer) handleCreateInvocation(w http.ResponseWriter, principalID,
 	}
 	fs.invocations[inv.id] = inv
 	fs.mu.Unlock()
-	if epID := fs.endpointForPrincipal(req.TargetPrincipalID); epID != "" {
-		_ = fs.pushInvocationDispatch(epID, inv)
-	}
+	fs.dispatchPendingInvocations()
 	writeJSON(http.StatusCreated, fs.invocationView(inv))
 }
 

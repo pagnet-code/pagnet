@@ -787,7 +787,15 @@ func TestDaemon_TerminalSameSessionEightStep(t *testing.T) {
 	if !strings.Contains(ring, "done") {
 		t.Fatalf("step 5: the human turn did not complete on the TUI: %q", ring)
 	}
+	// The ring still contains the first machine turn's "done". The
+	// human output is rendered before the atomic session save, so matching
+	// both strings anywhere does not prove this turn has persisted yet.
+	deadline := time.Now().Add(20 * time.Second)
 	sf := readDaemonFakeSessionVars(t, instanceID)
+	for sf.Vars["color"] != "blue" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		sf = readDaemonFakeSessionVars(t, instanceID)
+	}
 	if sf.SessionID != sessionID {
 		t.Fatalf("step 5: the human turn ran in a different session: file=%q want=%q", sf.SessionID, sessionID)
 	}

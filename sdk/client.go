@@ -101,6 +101,7 @@ type Client struct {
 
 	// handlers + capabilities
 	handlerMu     sync.RWMutex
+	capsRevision  uint64 // guarded by handlerMu
 	caps          map[string]capRegistration
 	msgHandler    func(ctx context.Context, m *Message) error
 	eventHandlers map[string]eventHandler
@@ -776,7 +777,8 @@ func (c *Client) connectOnce() error {
 	c.cur = pc
 	c.connMu.Unlock()
 	// Register (carries the crypto identity + advertised capabilities).
-	if err := pc.send(transport.MsgEndpointRegister, c.registerPayload()); err != nil {
+	registration, revision := c.registerPayloadVersioned()
+	if err := pc.send(transport.MsgEndpointRegister, registration); err != nil {
 		ws.Close()
 		c.connMu.Lock()
 		if c.cur == pc {
@@ -809,9 +811,19 @@ func (c *Client) connectOnce() error {
 	c.cur = pc
 	c.connMu.Unlock()
 	c.connected.Store(true)
-	go pc.heartbeat()
-	// Agents resume subscriptions (server is the source of truth).
-	c.onLive()
+	// Changes made while auth_ok was pending could not trigger sendRegister.
+	// Compare after promotion so every change either dirties this snapshot or
+	// closes the now-live connection itself.
+	c.handlerMu.RLock()
+	registrationChanged := c.capsRevision != revision
+	c.handlerMu.RUnlock()
+	if registrationChanged {
+		_ = pc.ws.Close()
+	} else {
+		go pc.heartbeat()
+		// Agents resume subscriptions (server is the source of truth).
+		c.onLive()
+	}
 	// Wait for the session to end.
 	<-pc.dead
 	c.connected.Store(false)
@@ -823,18 +835,24 @@ func (c *Client) connectOnce() error {
 	return nil
 }
 
-// registerPayload builds the endpoint.register payload (the current
-// capability set + crypto identity).
-func (c *Client) registerPayload() transport.EndpointRegisterPayload {
+// registerPayloadVersioned snapshots the capability descriptors and revision
+// together, so updates during authentication cannot escape the promotion check.
+func (c *Client) registerPayloadVersioned() (transport.EndpointRegisterPayload, uint64) {
 	c.endpointNameMu.Lock()
 	name := c.endpointName
 	c.endpointNameMu.Unlock()
+	c.handlerMu.RLock()
+	defer c.handlerMu.RUnlock()
+	caps := make([]Capability, 0, len(c.caps))
+	for _, reg := range c.caps {
+		caps = append(caps, reg.capability)
+	}
 	return transport.EndpointRegisterPayload{
 		EndpointName: name,
 		PublicKey:    base64.StdEncoding.EncodeToString(c.identityPub),
 		SDKVersion:   Version,
-		Capabilities: c.capabilities(),
-	}
+		Capabilities: caps,
+	}, c.capsRevision
 }
 
 // capabilities returns the registered capability descriptors.

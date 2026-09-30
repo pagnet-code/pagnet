@@ -134,6 +134,7 @@ func (c *Client) registerCapability(cap Capability, h CapHandler, typed reflect.
 		reg.inputType = old.inputType
 	}
 	c.caps[cap.ID] = reg
+	c.capsRevision++
 	c.handlerMu.Unlock()
 	return c.sendRegister()
 }

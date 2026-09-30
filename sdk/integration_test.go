@@ -67,6 +67,25 @@ func waitForCryptoReady(t *testing.T, fs *fakeServer, principalID string) string
 	return epID
 }
 
+// Wait for the connection which actually accepted this invocation, rather
+// than selecting an arbitrary socket during capability re-registration.
+func waitForInvocationEndpoint(t *testing.T, fs *fakeServer, client *Client, invocationID string) string {
+	t.Helper()
+	var endpointID string
+	waitFor(t, 5*time.Second, "authenticated invocation endpoint", func() bool {
+		fs.mu.Lock()
+		inv := fs.invocations[invocationID]
+		if inv != nil {
+			endpointID = inv.endpointID
+		}
+		ep := fs.endpoints[endpointID]
+		ready := ep != nil && ep.online && fs.cryptoReady[endpointID]
+		fs.mu.Unlock()
+		return ready && client.connected.Load() && client.EndpointID() == endpointID
+	})
+	return endpointID
+}
+
 // runAgent registers an event handler on a new agent and runs it (which
 // resolves the network and creates the server-side subscription via
 // ensureSubscriptions). The run context is cancelled on test cleanup.
@@ -583,7 +602,7 @@ func TestAsyncInvocationSurvivesReconnect(t *testing.T) {
 	targetID, targetCred := fs.createPrincipal("service", "target", net)
 
 	target := mustConnect(t, fs, targetCred, t.TempDir())
-	firstEp := waitForCryptoReady(t, fs, targetID)
+	waitForCryptoReady(t, fs, targetID)
 	dispatched := make(chan *Invocation, 1)
 	target.Service("svc").Handle("slow.job", func(ctx context.Context, inv *Invocation) (any, error) {
 		dispatched <- inv
@@ -617,11 +636,13 @@ func TestAsyncInvocationSurvivesReconnect(t *testing.T) {
 	}
 
 	// Drop the target's connection; wait for a full reconnect + re-enroll.
+	firstEp := waitForInvocationEndpoint(t, fs, target, inv.ID)
+	previousGeneration := target.connGeneration.Load()
 	fs.dropEndpoint(firstEp)
 	var newEp string
 	waitFor(t, 15*time.Second, "reconnect + re-enroll", func() bool {
 		newEp = fs.endpointForPrincipal(targetID)
-		return newEp != "" && newEp != firstEp && fs.cryptoReadyFor(newEp)
+		return newEp != "" && newEp != firstEp && fs.cryptoReadyFor(newEp) && target.connGeneration.Load() > previousGeneration
 	})
 
 	// Complete the in-flight invocation on the reconnected session.
@@ -681,12 +702,13 @@ func TestAsyncInvocationFailsClearlyWhenCancelled(t *testing.T) {
 	// later Complete takes the server-state-check path and sees the
 	// cancellation — a clear error, not a silently dropped result.
 	fs.cancelInvocation(inv.ID)
-	firstEp := fs.endpointForPrincipal(targetID)
+	firstEp := waitForInvocationEndpoint(t, fs, target, inv.ID)
+	previousGeneration := target.connGeneration.Load()
 	fs.dropEndpoint(firstEp)
 	var newEp string
 	waitFor(t, 15*time.Second, "reconnect", func() bool {
 		newEp = fs.endpointForPrincipal(targetID)
-		return newEp != "" && newEp != firstEp
+		return newEp != "" && newEp != firstEp && fs.cryptoReadyFor(newEp) && target.connGeneration.Load() > previousGeneration
 	})
 
 	err := inv.Complete(context.Background(), map[string]any{"done": true})
@@ -949,4 +971,95 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A capability registered after endpoint.register but before auth_ok must
+// reach the control plane. Durable work created in that window must wait
+// for the reconnect and the advertised, crypto-ready capability.
+func TestCapabilityUpdateDuringAuthenticationDispatchesPendingInvocation(t *testing.T) {
+	fs := newFakeServer(t)
+	net := fs.createNetwork("net", true)
+	callerID, callerCred := fs.createPrincipal("agent", "caller", net)
+	targetID, targetCred := fs.createPrincipal("service", "target", net)
+	caller := mustConnect(t, fs, callerCred, t.TempDir())
+	waitForCryptoReady(t, fs, callerID)
+	target := mustConnect(t, fs, targetCred, t.TempDir())
+	waitForCryptoReady(t, fs, targetID)
+
+	gate := make(chan struct{})
+	var released atomic.Bool
+	release := func() {
+		if released.CompareAndSwap(false, true) {
+			close(gate)
+		}
+	}
+	t.Cleanup(release)
+	observed := make(chan string, 8)
+	fs.mu.Lock()
+	fs.authGate, fs.registerObserved = gate, observed
+	fs.mu.Unlock()
+	service := target.Service("svc")
+	if err := service.Handle("first", func(context.Context, *Invocation) (any, error) { return nil, nil }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-observed: // first capability snapshot is now sent; auth_ok is gated
+	case <-time.After(5 * time.Second):
+		t.Fatal("registration never reached authentication gate")
+	}
+	if target.connected.Load() {
+		t.Fatal("connection unexpectedly promoted before auth_ok")
+	}
+	var calls atomic.Int32
+	if err := service.Handle("second", func(context.Context, *Invocation) (any, error) {
+		calls.Add(1)
+		return map[string]any{"done": true}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := caller.Invoke(testCtx(t), Invocation{NetworkID: net, TargetPrincipalID: targetID, CapabilityID: "second", Input: map[string]any{"x": 1}})
+		result <- err
+	}()
+	waitFor(t, 5*time.Second, "durable pending invocation before authentication", func() bool {
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+		for _, inv := range fs.invocations {
+			if inv.target == targetID && inv.capability == "second" && inv.state == "pending" {
+				return true
+			}
+		}
+		return false
+	})
+	release()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("pending invocation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pending invocation was not dispatched after re-enrollment")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", calls.Load())
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	found := false
+	for _, ep := range fs.endpoints {
+		if ep.principalID != targetID || !ep.online {
+			continue
+		}
+		caps := map[string]bool{}
+		for _, cap := range ep.capabilities {
+			caps[cap.ID] = true
+		}
+		if caps["first"] && caps["second"] {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("live endpoint did not advertise both capabilities")
+	}
 }
