@@ -1,8 +1,12 @@
 package netpolicy
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // IsLoopbackHost: the loopback definition is an IP literal that is
@@ -115,4 +119,48 @@ func TestCheck(t *testing.T) {
 			t.Fatal("Check with a non-true env value must refuse")
 		}
 	})
+}
+
+func TestCheckRejectsMalformedURLsEvenWithOptIn(t *testing.T) {
+	for _, raw := range []string{"https:///no-host", "ftp://localhost/file", "file:///etc/passwd", "https://user:secret@example.com", "https://example.com/#fragment"} {
+		if err := Check(raw, true); err == nil {
+			t.Fatalf("accepted malformed remote %q", raw)
+		}
+	}
+}
+
+func TestHTTPClientRedirectTrustBoundary(t *testing.T) {
+	reached := false
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true }))
+	defer other.Close()
+	same := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cross":
+			http.Redirect(w, r, other.URL, http.StatusTemporaryRedirect)
+		case "/same":
+			http.Redirect(w, r, "/done", http.StatusTemporaryRedirect)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer same.Close()
+	client := NewHTTPClient(time.Second, false)
+	req, _ := http.NewRequest(http.MethodPost, same.URL+"/cross", strings.NewReader("secret-body"))
+	req.Header.Set("Authorization", "Bearer secret")
+	if _, err := client.Do(req); err == nil {
+		t.Fatal("cross-origin redirect accepted")
+	}
+	if reached {
+		t.Fatal("redirect destination received sensitive request")
+	}
+	resp, err := client.Get(same.URL + "/same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	origin, _ := url.Parse("https://localhost:443")
+	target, _ := url.Parse("http://localhost:443")
+	if err := client.CheckRedirect(&http.Request{URL: target}, []*http.Request{{URL: origin}}); err == nil {
+		t.Fatal("TLS downgrade to loopback accepted")
+	}
 }

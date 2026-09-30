@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/e2ee"
@@ -435,7 +436,7 @@ func eventWatchCmd() *cobra.Command {
 			if c.token != "" {
 				req.Header.Set("Authorization", "Bearer "+c.token)
 			}
-			resp, err := http.DefaultClient.Do(req)
+			resp, err := netpolicy.NewHTTPClient(0, insecureRemoteHTTP).Do(req)
 			if err != nil {
 				return err
 			}

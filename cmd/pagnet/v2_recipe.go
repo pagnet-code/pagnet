@@ -172,7 +172,7 @@ func readRecipeSource(src string) ([]byte, error) {
 		if err := netpolicy.Check(src, insecureRemoteHTTP); err != nil {
 			return nil, err
 		}
-		client := &http.Client{Timeout: 30 * time.Second}
+		client := netpolicy.NewHTTPClient(30*time.Second, insecureRemoteHTTP)
 		resp, err := client.Get(src)
 		if err != nil {
 			return nil, err

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"io"
 	"net/http"
 	"os"
@@ -49,7 +50,7 @@ func authenticateUser(stateDir, account, server string, interactive bool) (strin
 // class, so reusing it would return the very credential being replaced.
 func authenticateUserFresh(stateDir, account, server string, interactive, fresh bool) (string, error) {
 	base := strings.TrimSuffix(server, "/") + "/"
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := netpolicy.NewHTTPClient(60*time.Second, insecureRemoteHTTP)
 	// The credential slot is the ACCOUNT's config dir — the one `pagnet login`
 	// writes, `pagnet status` reads, and loginWithPastedToken documents. The
 	// machine dir is not a fallback: the one-time account migration moves the
@@ -109,7 +110,7 @@ func userCredentialForServeFresh(stateDir, account, server string, fresh bool) (
 	if userToken == "" {
 		return authenticateUserFresh(stateDir, account, server, interactiveMode(), fresh)
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := netpolicy.NewHTTPClient(60*time.Second, insecureRemoteHTTP)
 	accDir := accountConfigDir(stateDir, account)
 	if _, err := loginWithPastedToken(accDir, account, server, client, userToken); err != nil {
 		return "", err

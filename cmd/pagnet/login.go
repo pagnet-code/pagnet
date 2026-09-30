@@ -93,7 +93,7 @@ listings, and CI logs.`,
 				return err
 			}
 			base := server + "/"
-			client := &http.Client{Timeout: 60 * time.Second}
+			client := netpolicy.NewHTTPClient(60*time.Second, insecureRemoteHTTP)
 
 			// Which auth mode is the server running? (public endpoint)
 			var status struct {
@@ -479,7 +479,7 @@ func pkceChallenge(verifier string) string {
 // $PAGNET_NO_BROWSER=1) skips the browser-open attempt (the URL + code are
 // always printed).
 func loginOIDCDeviceFlow(base string, noBrowser bool) (mintedCredential, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := netpolicy.NewHTTPClient(30*time.Second, insecureRemoteHTTP)
 
 	// 1. Device config from the control plane (public endpoint).
 	var cfg deviceConfig
@@ -683,7 +683,7 @@ var hasTTYFn = hasTTY
 
 // serverAuthMode queries the public /auth/setup/status endpoint.
 func serverAuthMode(base string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := netpolicy.NewHTTPClient(10*time.Second, insecureRemoteHTTP)
 	resp, err := client.Get(base + "api/v1/auth/setup/status")
 	if err != nil {
 		return "", err
@@ -735,7 +735,7 @@ func ensureUserToken(stateDir, account, base string, noBrowser, interactive bool
 	if !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := netpolicy.NewHTTPClient(60*time.Second, insecureRemoteHTTP)
 	// The credential slot is the account's config dir (see
 	// authenticateUserFresh): stateDir is the machine dir for every REST
 	// command, and the account migration has already moved the credential out

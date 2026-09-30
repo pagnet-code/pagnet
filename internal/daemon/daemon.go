@@ -14,15 +14,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	"golang.org/x/sys/unix"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
@@ -187,6 +184,18 @@ type Daemon struct {
 	turnMu      sync.Mutex
 	activeTurns map[string]bool
 
+	// turnsInFlight (also guarded by turnMu) tracks session-driven turns
+	// (runTurnPersistent) from the moment they START — before the
+	// "working" status write — until they settle (every return path, via
+	// defer). The Manager's StateBusy is only set later, inside Submit
+	// after its own EnsureActive, so a concurrent (launch-time) activation
+	// settling in that window sees turnInFlight()==false and would
+	// clobber the turn's "working" back to "idle" — letting a hibernate
+	// (status-gated) race a live turn. The guard closes that window. The
+	// per-instance FIFO serializes turns for one instance, so one mark
+	// per instance is never held by two turns at once.
+	turnsInFlight map[string]bool
+
 	// turnCtx cancels when the daemon shuts down (Close): adapters kill
 	// the running turn subprocess on cancellation (spec §90: context
 	// cancellation must terminate subprocess work), so a SIGTERM never
@@ -213,6 +222,17 @@ type Daemon struct {
 	// and the next attach re-wakes it.
 	attachMu sync.Mutex
 	attaches map[string]map[string]time.Time // instanceID -> attachSessionID
+
+	// settleMu guards settleGens: a per-instance monotonically increasing
+	// settle generation, bumped by activateSessionIdle after the idle
+	// activation has settled (status write + endpoint report). The row
+	// alone cannot serve as an "activation finished" oracle — the instance
+	// is registered "idle" at launch (process-per-turn heritage) and only
+	// returns to "idle" at settle — so waiting for row status races the
+	// transient "working" write. Daemon tests use the generation bump to
+	// wait for the launch-time activation deterministically.
+	settleMu   sync.Mutex
+	settleGens map[string]int
 
 	// PTY terminal sessions (addendum §8–§15): the long-lived interactive
 	// runtime process per instance, separate from the process-per-turn
@@ -462,6 +482,9 @@ func procConfigFromDaemon(cfg Config, selfExe string) proc.Config {
 
 // New builds a daemon. State is opened at stateDir/daemon.sqlite.
 func New(cfg Config, log *slog.Logger) (*Daemon, error) {
+	if err := hostPlatformError(); err != nil {
+		return nil, err
+	}
 	return newDaemon(cfg, log, resolveSelfExecutable)
 }
 
@@ -608,7 +631,9 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		selfExe:         selfExe,
 		bootID:          domain.NewID().String(),
 		activeTurns:     map[string]bool{},
+		turnsInFlight:   map[string]bool{},
 		attaches:        map[string]map[string]time.Time{},
+		settleGens:      map[string]int{},
 		pending:         map[string]chan transport.AgentResponsePayload{},
 		bridgeConnsInst: map[string]int{},
 		bridgeNonces:    map[string]string{},
@@ -652,12 +677,12 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if err := st.PruneProcessed(time.Now().UTC().Add(-processedRetention)); err != nil {
 		log.Warn("prune processed_commands at startup", "err", err)
 	}
-	// §66: a process-per-turn turn cannot survive a daemon restart, so a
-	// locally 'working' row at startup is stale (its subprocess is gone).
-	// Reconcile to hibernated/idle; the server re-sends the un-acked
-	// command, which re-wakes the instance and re-runs the turn.
+	// §66: live endpoints cannot survive a daemon restart. Reconcile stale
+	// idle/working/waking rows to hibernated, retaining their native session.
+	// The next heartbeat publishes the corrected state; explicit wake and
+	// redelivery can resume the endpoint through the existing CAS gate.
 	if n, err := st.ReconcileRestart(); err == nil && n > 0 {
-		log.Warn("reconciled instances left working by a previous run", "n", n)
+		log.Warn("reconciled stale live instances from a previous run", "n", n)
 	}
 	// P6 auto-update: clear a leftover staging dir from a previous
 	// update that re-exec'd successfully (nothing runs after the exec to
@@ -757,121 +782,6 @@ func (d *Daemon) Close() error {
 // serve` take the state dir in the window before the new image
 // re-acquires it).
 const serveLockFDEnv = "PAGNET_SERVE_LOCK_FD"
-
-// acquireServeLock takes an exclusive advisory lock on
-// <StateDir>/serve.lock (external audit F-006) and returns a release
-// function. The lock is held for the daemon's lifetime; closing the fd
-// (on release or process exit) drops the flock. A second daemon with the
-// same state dir gets EWOULDBLOCK and must refuse to start.
-//
-// Re-exec adoption: when the environment carries a lock fd from a
-// re-exec'd image (serveLockFDEnv), it is adopted instead of freshly
-// acquired — the flock is held by the open file description, so the
-// lock was never released and no second daemon can have taken the state
-// dir in between.
-func (d *Daemon) acquireServeLock() (func(), error) {
-	path := filepath.Join(d.StateDir, "serve.lock")
-
-	if v := os.Getenv(serveLockFDEnv); v != "" {
-		if release, ok := d.adoptServeLock(path, v); ok {
-			d.Log.Info("adopted serve lock across re-exec")
-			return release, nil
-		}
-		// Stale/foreign fd: fall through to the normal fresh acquire.
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("serve lock: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("another pagnet daemon is already running (state dir %s is locked): %w", d.StateDir, err)
-	}
-	d.serveLockFile = f
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-// adoptServeLock re-adopts the serve lock carried across a re-exec. The
-// carried fd is verified to be exactly the lock file (fstat dev+ino vs
-// the path — a reused fd number or a stale env from an unrelated
-// process must not be adopted) and the lock is re-asserted on the same
-// open file description (a re-flock succeeds only for the current
-// holder). On any mismatch the fd is closed and false is returned (the
-// caller does a fresh acquire).
-//
-// CLOEXEC is re-set IMMEDIATELY after the identity check, before the
-// verifying flock: from that point on the fd can never leak into a
-// spawned process (runtime children, MCP bridges, git/update helpers).
-// If it leaked, the lock would survive this daemon's exit — a
-// descendant still holding the descriptor keeps the flock — and the
-// state dir would be permanently locked.
-func (d *Daemon) adoptServeLock(path, fdStr string) (func(), bool) {
-	fd, err := strconv.Atoi(fdStr)
-	if err != nil || fd <= 0 {
-		return nil, false
-	}
-	f := os.NewFile(uintptr(fd), "serve.lock")
-	// Verify the fd is actually our lock file (fstat on the fd vs the
-	// path): a closed/reused fd number must not be adopted.
-	fdFi, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, false
-	}
-	pathFi, err := os.Stat(path)
-	if err != nil {
-		_ = f.Close()
-		return nil, false
-	}
-	fdSt, ok1 := fdFi.Sys().(*syscall.Stat_t)
-	pathSt, ok2 := pathFi.Sys().(*syscall.Stat_t)
-	if !ok1 || !ok2 || fdSt.Dev != pathSt.Dev || fdSt.Ino != pathSt.Ino {
-		_ = f.Close()
-		return nil, false
-	}
-	// Re-arm CLOEXEC NOW (before the verifying flock): the fd must not
-	// leak into processes this daemon spawns; only a deliberate
-	// re-exec carries it (serveLockExecEnv clears it again).
-	if _, err := unix.FcntlInt(f.Fd(), unix.F_SETFD, unix.FD_CLOEXEC); err != nil {
-		_ = f.Close()
-		return nil, false
-	}
-	// Prove we hold the lock: a re-flock on the same open file
-	// description succeeds only for the current holder.
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, false
-	}
-	os.Unsetenv(serveLockFDEnv)
-	d.serveLockFile = f
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, true
-}
-
-// serveLockExecEnv prepares the serve lock to survive an auto-update
-// re-exec and returns the env var that carries the fd to the new image
-// ("" when the daemon holds no serve lock). The flock is held by the
-// open file description, not the process: Go opens every file with
-// O_CLOEXEC, so without clearing the flag the fd would be closed at
-// exec and the lock silently released — opening a window in which a
-// second `pagnet serve` can take over the state dir. The adopt path
-// re-sets CLOEXEC immediately, so the carried fd cannot leak into
-// spawned processes of the new image.
-func (d *Daemon) serveLockExecEnv() (string, error) {
-	if d.serveLockFile == nil {
-		return "", nil
-	}
-	if _, err := unix.FcntlInt(d.serveLockFile.Fd(), unix.F_SETFD, 0); err != nil {
-		return "", fmt.Errorf("clear CLOEXEC on serve lock fd: %w", err)
-	}
-	return serveLockFDEnv + "=" + strconv.FormatInt(int64(d.serveLockFile.Fd()), 10), nil
-}
 
 // Run connects and stays connected (reconnecting with backoff) until ctx is
 // canceled.
@@ -2785,18 +2695,41 @@ func dashOr(s string) string {
 func (d *Daemon) busy(instanceID string) bool {
 	d.turnMu.Lock()
 	defer d.turnMu.Unlock()
-	return d.activeTurns[instanceID]
+	return d.activeTurns[instanceID] || d.turnsInFlight[instanceID]
+}
+
+// markTurnInFlight / clearTurnInFlight bracket a session-driven turn's
+// lifetime (see the turnsInFlight field): mark at the top of
+// runTurnPersistent (before the "working" write), clear on settle via defer
+// so every return path releases it.
+func (d *Daemon) markTurnInFlight(instanceID string) {
+	d.turnMu.Lock()
+	d.turnsInFlight[instanceID] = true
+	d.turnMu.Unlock()
+}
+
+func (d *Daemon) clearTurnInFlight(instanceID string) {
+	d.turnMu.Lock()
+	delete(d.turnsInFlight, instanceID)
+	d.turnMu.Unlock()
 }
 
 // turnInFlight reports whether a LOGICAL TURN is currently in flight for the
 // instance, whichever turn path owns it.
 //
-// d.busy alone is NOT enough: the legacy activeTurns map is set only by the
-// process-per-turn path (see the Phase 2 note in wakeInstance), so a
-// session-driven turn — the one that can outlive its endpoint mid-flight —
-// is invisible to it. For that path the session core's own StateBusy is the
-// authoritative signal ("a live endpoint services the session; a turn is in
-// flight"), and it is the state that must not be raced by a second endpoint.
+// d.busy covers BOTH turn ledgers: the legacy activeTurns map (set by the
+// process-per-turn path, see the Phase 2 note in wakeInstance) and the
+// turnsInFlight guard (set by runTurnPersistent at turn START — before the
+// "working" write). The turnsInFlight guard is load-bearing: a
+// session-driven turn's StateBusy is set only later, inside Submit after its
+// own EnsureActive, so a concurrent (launch-time) activation settling in
+// that window would otherwise read turnInFlight()==false and clobber the
+// turn's "working" back to "idle" (the status a hibernate is gated on).
+//
+// For the remainder of a session-driven turn the session core's own
+// StateBusy is the authoritative signal ("a live endpoint services the
+// session; a turn is in flight"), and it is the state that must not be raced
+// by a second endpoint.
 //
 // The state is read through the Manager's LOCKED query (State), never by
 // dereferencing the *RuntimeSession: the field is mutated by the Manager
@@ -3272,6 +3205,14 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnSpec, row *InstanceRow) error {
 	started := time.Now()
 
+	// In-flight guard (see the turnsInFlight field): marked BEFORE the
+	// "working" write so a concurrent (launch-time) activation settling in
+	// the window until Submit's StateBusy cannot clobber the turn's status.
+	// The per-instance FIFO serializes turns, so the deferred clear never
+	// releases a mark a successor turn relies on.
+	d.markTurnInFlight(spec.InstanceID)
+	defer d.clearTurnInFlight(spec.InstanceID)
+
 	// The session this turn runs in (prepareSession: the pagnet-persisted
 	// native id is restored so a daemon restart can resume the stored
 	// session — Codex R4 — and the launch env is set for the endpoint
@@ -3616,6 +3557,15 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 		return fmt.Errorf("instance %s runtime %s has no terminal surface (no native TUI); attach refused",
 			p.InstanceID, row.Runtime)
 	}
+	// A registered PTY is not proof that activation has settled. Drivers
+	// expose their master before the handshake, including when a waking or
+	// working instance is resuming. Never bind a human to that transient
+	// process: failure/retry can replace it and leave an orphaned screen.
+	if d.sessionActivating(row.InstanceID) {
+		d.Log.Info("attach deferred; endpoint activation in flight",
+			"instance", row.InstanceID, "status", row.Status)
+		return ErrDeferred
+	}
 	switch row.Status {
 	case "hibernated", "interrupted":
 		// Wake/resume: the session is materialised (or cold-started when
@@ -3629,27 +3579,6 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 			return err
 		}
 	case "idle":
-		if d.sessionActivating(row.InstanceID) {
-			// The session core is ACTIVATING the endpoint right now
-			// (StateActivating) — the launch-time background activation
-			// (doLaunch runs it OFF the per-instance FIFO) or a concurrent
-			// turn's EnsureActive. The PTY master may ALREADY be registered
-			// (the driver registers it at launch, before the handshake
-			// settles), so the PTYMaster check below would pass and a view
-			// would be created on an endpoint that is not yet settled: when
-			// the activation settles it can STOP that endpoint (a
-			// staleLaunch restart, or an activation failure), orphaning the
-			// view (master EOF) and leaving the terminal black — and a
-			// detach landing in the same window hibernates the instance
-			// with the view still bound to the dead master. Do not attach
-			// to an in-flight endpoint: the attach stays queued (the
-			// dispatcher re-sends it) and lands observationally on the
-			// endpoint the activation brings back — the SAME defer the
-			// working/waking/starting branch uses.
-			d.Log.Info("attach deferred; endpoint activation in flight",
-				"instance", row.InstanceID, "status", row.Status)
-			return ErrDeferred
-		}
 		if d.sessions.PTYMaster(row.InstanceID) == nil {
 			// Idle on paper but the endpoint is not live (a daemon restart
 			// leaves the persisted status behind; the process cannot
@@ -3678,18 +3607,6 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 			// dispatcher re-sends it) and lands observationally on the
 			// endpoint the session core brings back.
 			d.Log.Info("attach deferred; turn in flight with the endpoint briefly down",
-				"instance", row.InstanceID, "status", row.Status)
-			return ErrDeferred
-		case d.sessionActivating(row.InstanceID):
-			// The session core is ACTIVATING the endpoint right now
-			// (StateActivating): an attach that independently activated
-			// would race the in-flight activation. It does not — the
-			// Manager's per-instance activation lock makes a second
-			// EnsureActive join the first instead of launching a second
-			// runtime — but the attach still stays queued (the dispatcher
-			// re-sends it) and lands observationally on the endpoint the
-			// activation brings back.
-			d.Log.Info("attach deferred; endpoint activation in flight",
 				"instance", row.InstanceID, "status", row.Status)
 			return ErrDeferred
 		default:
@@ -3844,7 +3761,21 @@ drain:
 	d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
 		"instance", row.InstanceID, "session", sessionID)
 	d.ensureEndpointView(row)
+	// Settle marker (see the settleGens field): the activation is done and
+	// the status write above is final — daemon tests wait on this instead
+	// of polling the ambiguous row status.
+	d.settleMu.Lock()
+	d.settleGens[row.InstanceID]++
+	d.settleMu.Unlock()
 	return nil
+}
+
+// settleGeneration returns the instance's settle generation (0 when no
+// idle activation has settled for it yet). See the settleGens field.
+func (d *Daemon) settleGeneration(instanceID string) int {
+	d.settleMu.Lock()
+	defer d.settleMu.Unlock()
+	return d.settleGens[instanceID]
 }
 
 // activateSessionForAttach (re)activates a session-driven instance's
@@ -4055,6 +3986,16 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 // bounded screen instead of a stale one. No frame when the PTY is not
 // running — the session's teardown owns the waiting client.
 func (d *Daemon) doTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSnapshotPayload) error {
+	// An on-demand snapshot can follow a deferred attach while activation
+	// is still in flight. It must not turn an unsettled capture into the
+	// client's ready signal; the successful attach sends that snapshot.
+	d.attachMu.Lock()
+	_, attached := d.attaches[p.InstanceID][p.SessionID]
+	d.attachMu.Unlock()
+	if !attached || d.sessionActivating(p.InstanceID) {
+		return nil
+	}
+
 	s := d.terminal.get(p.InstanceID)
 	if s == nil {
 		return nil
@@ -4184,13 +4125,3 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 // --- small platform helpers ---------------------------------------------------
 // readLoadAvg / readMemInfo are platform-specific (sysinfo_linux.go,
 // sysinfo_darwin.go, sysinfo_other.go).
-
-func readDiskFree(path string) (int64, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0, err
-	}
-	// Bsize is int64 on Linux but uint32 on Darwin — normalize explicitly
-	// so the daemon cross-compiles (make release).
-	return int64(st.Bavail) * int64(st.Bsize), nil
-}

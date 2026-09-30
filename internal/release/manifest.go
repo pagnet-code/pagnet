@@ -201,7 +201,7 @@ func fetchManifest(serverURL, version string, allowUnsigned bool) (*Manifest, er
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: DownloadTimeout}
+	client := netpolicy.NewHTTPClient(DownloadTimeout, false)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -238,7 +238,7 @@ func downloadFile(serverURL, name, dst string) error {
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: DownloadTimeout}
+	client := netpolicy.NewHTTPClient(DownloadTimeout, false)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

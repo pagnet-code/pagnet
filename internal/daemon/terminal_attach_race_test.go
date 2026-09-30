@@ -146,7 +146,7 @@ func (g *gatedPTYDriver) Live(instanceID string) bool { return g.master != nil }
 //     with a live capture bound to the settled endpoint's master.
 func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 	d := newTestDaemon(t)
-	client, _ := newMemWS(t)
+	client, peer := newMemWS(t)
 	d.connMu.Lock()
 	d.curConn = client
 	d.connMu.Unlock()
@@ -193,18 +193,49 @@ func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 		t.Fatal("precondition: the PTY master is not registered during the in-flight activation")
 	}
 
+	// The real drivers capture their PTY before activation settles. A
+	// reconnect may request a snapshot before its deferred attach finishes;
+	// that capture must not be advertised as ready to the browser.
+	activatingRow, ok, err := d.state.GetInstance(instanceID)
+	if err != nil || !ok {
+		t.Fatalf("get activating instance: ok=%v err=%v", ok, err)
+	}
+	d.ensureEndpointView(activatingRow)
+	if d.terminal.get(instanceID) == nil {
+		t.Fatal("precondition: no launch-time capture")
+	}
+	frames := driveCommand(t, d, peer, transport.MsgTerminalSnapshot,
+		transport.TerminalSnapshotPayload{CommandID: "snapshot-before-attach", InstanceID: instanceID, SessionID: "sess-1"},
+		"snapshot-before-attach")
+	for _, frame := range frames {
+		if frame.Type != transport.MsgTerminalOutput {
+			continue
+		}
+		var output transport.TerminalOutputPayload
+		if frame.DecodePayload(&output) == nil && output.Snapshot {
+			t.Fatal("unsettled capture was sent as a ready snapshot before attach")
+		}
+	}
+
 	// (1) The concurrent attach is DEFERRED (ErrDeferred) — it must not
 	// bind a client to a capture on the in-flight endpoint.
 	attachP := transport.TerminalAttachPayload{
 		CommandID: "cmd-race-attach", InstanceID: instanceID, SessionID: "sess-1",
 	}
-	err = d.doAttach(nil, attachP)
-	if !errors.Is(err, ErrDeferred) {
-		t.Fatalf("attach during the in-flight activation = %v, want ErrDeferred (never bind a client to a capture on the in-flight endpoint)", err)
+	for _, status := range []string{"idle", "working", "waking", "starting"} {
+		if err := d.state.SetInstanceStatus(instanceID, status, ""); err != nil {
+			t.Fatal(err)
+		}
+		err = d.doAttach(nil, attachP)
+		if !errors.Is(err, ErrDeferred) {
+			t.Fatalf("attach during %s activation = %v, want ErrDeferred", status, err)
+		}
+		if d.attached(instanceID) {
+			t.Fatalf("a deferred %s attach was recorded", status)
+		}
 	}
-	// The deferred attach was NOT recorded (no attach bookkeeping).
-	if d.attached(instanceID) {
-		t.Fatal("a deferred attach was recorded (it must not be — the detach below would then hibernate)")
+	if err := d.state.SetInstanceStatus(instanceID, "idle", ""); err != nil {
+		t.Fatal(err)
 	}
 
 	// (2) A detach for the (deferred, unrecorded) attach does NOT

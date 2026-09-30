@@ -347,17 +347,17 @@ func (s *State) DeleteInstance(instanceID string) error {
 	return err
 }
 
-// ReconcileRestart fixes local statuses that a dead process left behind:
-// a process-per-turn turn cannot survive a daemon restart, so 'working'
-// at startup is stale. Rows keep their session (resumable) and become
-// hibernated, or idle when they never had one. The control plane re-sends
-// the un-acked command, which re-wakes the instance and re-runs the turn.
+// ReconcileRestart fixes every live status left by a previous daemon. Startup
+// has no live endpoint: idle, working and waking all become hibernated. Keep
+// the native session ID and on-disk session state so explicit wake resumes it;
+// an instance with no session can activate for the first time. Terminal and
+// intervention states remain unchanged.
 func (s *State) ReconcileRestart() (int64, error) {
 	res, err := s.db.Exec(`
 		UPDATE instances
-		SET status = CASE WHEN COALESCE(session_id, '') <> '' THEN 'hibernated' ELSE 'idle' END,
+		SET status = 'hibernated',
 		    updated_at = ?
-		WHERE status = 'working'`,
+		WHERE status IN ('idle', 'working', 'waking')`,
 		time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return 0, err

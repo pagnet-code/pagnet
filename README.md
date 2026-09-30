@@ -37,6 +37,25 @@ pagnet -d
 To remove the binary and local state again:
 `curl -fsSL https://app.pagnet.dev/uninstall.sh | bash`.
 
+## Windows clients
+
+The remote CLI, Go SDK and external MCP bridge cross-compile for Windows.
+Build the client from this repository in PowerShell with Go installed:
+
+```powershell
+go build -o pagnet.exe ./cmd/pagnet
+.\pagnet.exe version
+```
+
+Use `pagnet mcp external` to connect a cloud agent, or `pagnet attach` to
+access an agent running on a Linux or macOS host. Native Windows host
+execution (`serve`, `-d`, local workers) is unsupported until Job Object
+process containment and ConPTY integration are implemented and tested.
+Run the host daemon inside WSL2 instead. Windows binaries are not yet
+published by the installer; replace manually rather than using `update`.
+Windows amd64 and arm64 builds are checked from Linux; Windows runtime
+behavior has not been verified on a Windows runner.
+
 ## Quick start: a custom Service
 
 The Go SDK connects a custom Agent or Service principal to a control plane and

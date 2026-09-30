@@ -1,16 +1,8 @@
-// The MCP bridge entrypoints (packaging migration, step 2):
+// MCP entrypoints use separate trust boundaries:
 //
-//	pagnet mcp worker  — the worker agent's network surface (stdio MCP)
-//	pagnet mcp control — the representative's control surface (stdio MCP)
-//
-// They are INTERNAL: the daemon spawns them for the agent runtimes it
-// launches (PAGNET_MCP_CONFIG), so the parent command is hidden from
-// the top-level help. The tool names are fixed protocol names — see
-// internal/agentbridge (tools_worker.go / tools_control.go). The run
-// body is the shared agentbridge.RunBridge. The daemon spawns the
-// bridges as <self> mcp worker|control (step 5), so the unified binary
-// is the only bridge implementation (the separate bridge binaries are
-// gone).
+// pagnet mcp worker/control are spawned by the managed daemon and use its
+// authenticated local socket. pagnet mcp external connects independent agents
+// and plugins using a dedicated principal credential and explicit grants.
 
 package main
 
@@ -20,23 +12,24 @@ import (
 	"github.com/pagnet-code/pagnet/internal/agentbridge"
 )
 
-// mcpCmd is the hidden `pagnet mcp` parent (internal entrypoints).
+// mcpCmd exposes the external integration while retaining managed entrypoints.
 func mcpCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "mcp",
-		Short:  "MCP bridge entrypoints (internal: spawned by the daemon)",
-		Hidden: true,
+		Short:  "MCP bridges for managed and external agents",
+		Hidden: false,
 	}
-	cmd.AddCommand(mcpWorkerCmd(), mcpControlCmd())
+	cmd.AddCommand(mcpWorkerCmd(), mcpControlCmd(), mcpExternalCmd())
 	return cmd
 }
 
 func mcpWorkerCmd() *cobra.Command {
 	var socket string
 	cmd := &cobra.Command{
-		Use:   "worker",
-		Short: "Worker MCP bridge: the worker agent's network surface (stdio MCP)",
-		Args:  cobra.NoArgs,
+		Use:    "worker",
+		Hidden: true,
+		Short:  "Worker MCP bridge: the worker agent's network surface (stdio MCP)",
+		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return agentbridge.RunBridge(socket, "pagnet", "worker", agentbridge.RegisterWorkerTools)
 		},
@@ -48,9 +41,10 @@ func mcpWorkerCmd() *cobra.Command {
 func mcpControlCmd() *cobra.Command {
 	var socket string
 	cmd := &cobra.Command{
-		Use:   "control",
-		Short: "Representative MCP bridge: the control surface (stdio MCP)",
-		Args:  cobra.NoArgs,
+		Use:    "control",
+		Hidden: true,
+		Short:  "Representative MCP bridge: the control surface (stdio MCP)",
+		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return agentbridge.RunBridge(socket, "pagnet-control", "representative", agentbridge.RegisterControlTools)
 		},

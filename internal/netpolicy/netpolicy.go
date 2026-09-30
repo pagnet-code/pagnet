@@ -17,10 +17,12 @@ package netpolicy
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EnvInsecure is the environment variable that opts into plain HTTP for
@@ -102,6 +104,12 @@ func Check(rawURL string, flagInsecure bool) error {
 		return fmt.Errorf("invalid remote URL %q: %w", rawURL, err)
 	}
 	scheme := strings.ToLower(u.Scheme)
+	if u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("remote URL must have a host and no credentials or fragment")
+	}
+	if scheme != "https" && scheme != "wss" && scheme != "http" && scheme != "ws" {
+		return fmt.Errorf("unsupported remote URL scheme %q", scheme)
+	}
 	if scheme == "https" || scheme == "wss" {
 		return nil
 	}
@@ -115,4 +123,25 @@ func Check(rawURL string, flagInsecure bool) error {
 	return fmt.Errorf("plain HTTP is not allowed for non-loopback remote endpoint %s — "+
 		"use HTTPS, or set PAGNET_INSECURE_REMOTE_HTTP=1 / --insecure-remote-http for development",
 		rawURL)
+}
+
+// NewHTTPClient keeps redirects inside the original trust boundary. Go's
+// default permits HTTPS downgrades and forwards bearer credentials to
+// subdomains; neither is appropriate for a configured control plane.
+func NewHTTPClient(timeout time.Duration, flagInsecure bool) *http.Client {
+	return &http.Client{Timeout: timeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		if err := Check(req.URL.String(), flagInsecure); err != nil {
+			return err
+		}
+		if len(via) > 0 {
+			original := via[0].URL
+			if !strings.EqualFold(req.URL.Scheme, original.Scheme) || !strings.EqualFold(req.URL.Host, original.Host) {
+				return fmt.Errorf("redirect changes the configured remote origin")
+			}
+		}
+		return nil
+	}}
 }

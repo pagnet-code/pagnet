@@ -291,7 +291,7 @@ func TestReconcileRestart(t *testing.T) {
 		want        string
 	}{
 		{"inst-w1", "sess-1", "hibernated"},
-		{"inst-w2", "", "idle"},
+		{"inst-w2", "", "hibernated"},
 		{"inst-h1", "sess-2", "hibernated"}, // already hibernated: untouched
 	} {
 		st := "working"
@@ -309,7 +309,7 @@ func TestReconcileRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []struct{ id, status string }{
-		{"inst-w1", "hibernated"}, {"inst-w2", "idle"}, {"inst-h1", "hibernated"},
+		{"inst-w1", "hibernated"}, {"inst-w2", "hibernated"}, {"inst-h1", "hibernated"},
 	} {
 		row, ok, _ := d.state.GetInstance(want.id)
 		if !ok || row.Status != want.status {

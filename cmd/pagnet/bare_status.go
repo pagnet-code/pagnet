@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"net/http"
 	"time"
 
@@ -51,7 +52,7 @@ func runBareStatus(cmd *cobra.Command) error {
 	identity := ""
 	runtimes := 0
 	if tok := loadUserToken(accountConfigDir(root, account), account, server); tok != "" {
-		client := &http.Client{Timeout: 3 * time.Second}
+		client := netpolicy.NewHTTPClient(3*time.Second, insecureRemoteHTTP)
 		base := server + "/"
 		var me struct {
 			Username string `json:"username"`

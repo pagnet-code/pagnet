@@ -9,6 +9,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"io"
 	"net/http"
 	"os"
@@ -512,7 +513,7 @@ func doctorCmd() *cobra.Command {
 			}
 
 			// 1. Server reachable?
-			client := &http.Client{Timeout: 5 * time.Second}
+			client := netpolicy.NewHTTPClient(5*time.Second, insecureRemoteHTTP)
 			resp, err := client.Get(server + "/healthz")
 			if err != nil {
 				check("server reachable", false, fmt.Sprintf("%s: %v", server, err))

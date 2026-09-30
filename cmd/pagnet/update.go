@@ -46,6 +46,9 @@ func updateCmd() *cobra.Command {
 // pagnet executable this command runs from) with the latest release,
 // then print how to restart the daemon so the new version takes effect.
 func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
+	if runtime.GOOS == "windows" {
+		return errors.New("Windows self-update is not supported yet; close pagnet and replace pagnet.exe manually, or rebuild from source")
+	}
 	// Server precedence: --server > $PAGNET_SERVER > stored account config
 	// > build default (resolveServerURL; the param carries the --server flag).
 	cfg, _, _ := loadAccountConfig(machineStateDir(stateDir))

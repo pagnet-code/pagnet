@@ -696,6 +696,20 @@ func TestDaemon_TerminalEndpointCrashWhileAttached(t *testing.T) {
 			t.Fatalf("the crash emitted a hibernated event (the view's teardown must be observational): %+v", env)
 		}
 	}
+	closedView := false
+	for _, env := range envs {
+		if env.Type != transport.MsgTerminalOutput {
+			continue
+		}
+		var output transport.TerminalOutputPayload
+		if env.DecodePayload(&output) == nil && output.InstanceID == instanceID && output.SessionID == sessionID && output.ClosedReason == "process_exited" {
+			closedView = true
+		}
+	}
+	if !closedView {
+		t.Fatal("endpoint crash left the browser attached to a frozen terminal")
+	}
+
 	row, _, _ = d.state.GetInstance(instanceID)
 	if row.Status != "idle" {
 		t.Fatalf("status after the re-attach = %q, want idle", row.Status)

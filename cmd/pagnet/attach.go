@@ -18,8 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -111,6 +110,7 @@ type ptyFrame struct {
 func outputPump(ws *websocket.Conn) (<-chan struct{}, func() string) {
 	done := make(chan struct{})
 	reason := ""
+	var reasonMu sync.Mutex
 	go func() {
 		defer close(done)
 		var lastSeq uint64
@@ -134,30 +134,41 @@ func outputPump(ws *websocket.Conn) (<-chan struct{}, func() string) {
 				} else if !ready || f.Seq <= lastSeq {
 					continue
 				}
-				lastSeq = f.Seq
+				if !f.Snapshot {
+					lastSeq = f.Seq
+				}
 				if b, err := base64.StdEncoding.DecodeString(f.Data); err == nil {
 					_, _ = os.Stdout.Write(b)
 				}
 			case "closed":
+				reasonMu.Lock()
 				reason = f.Reason
+				reasonMu.Unlock()
 				return
 			case "error":
 				fmt.Fprintf(os.Stderr, "\nattach: %s\n", f.Error)
 			}
 		}
 	}()
-	return done, func() string { return reason }
+	return done, func() string { reasonMu.Lock(); defer reasonMu.Unlock(); return reason }
 }
 
-// sendFrame writes one attach-WS frame (best effort: live semantics).
-func sendFrame(ws *websocket.Conn, m map[string]any) {
-	_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_ = ws.WriteJSON(m)
+// newAttachWriter serializes input and resize frames: Gorilla permits only
+// one concurrent writer, including write-deadline updates.
+func newAttachWriter(ws *websocket.Conn) func(map[string]any) {
+	var mu sync.Mutex
+	return func(m map[string]any) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = ws.WriteJSON(m)
+	}
 }
 
 // runRawAttach is the TTY path: raw stdin mirroring, SIGWINCH resizes,
 // Ctrl-] to detach.
 func runRawAttach(ws *websocket.Conn, fd int) (err error) {
+	sendFrame := newAttachWriter(ws)
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return fmt.Errorf("raw terminal: %w", err)
@@ -168,32 +179,17 @@ func runRawAttach(ws *websocket.Conn, fd int) (err error) {
 
 	// Initial size.
 	if cols, rows, err := term.GetSize(fd); err == nil {
-		sendFrame(ws, map[string]any{
+		sendFrame(map[string]any{
 			"type": "resize", "cols": cols, "rows": rows,
 		})
 	}
 
 	done, closedReason := outputPump(ws)
 
-	// SIGWINCH → debounced resize frame (the PTY gets SIGWINCH, §9).
-	winch := make(chan os.Signal, 1)
-	signal.Notify(winch, syscall.SIGWINCH)
-	defer signal.Stop(winch)
-	go func() {
-		var last time.Time
-		for range winch {
-			// 100 ms debounce: drags produce a burst of SIGWINCH.
-			if time.Since(last) < 100*time.Millisecond {
-				continue
-			}
-			last = time.Now()
-			if cols, rows, err := term.GetSize(fd); err == nil {
-				sendFrame(ws, map[string]any{
-					"type": "resize", "cols": cols, "rows": rows,
-				})
-			}
-		}
-	}()
+	stopResize := watchTerminalResize(fd, func(cols, rows int) {
+		sendFrame(map[string]any{"type": "resize", "cols": cols, "rows": rows})
+	})
+	defer stopResize()
 
 	buf := make([]byte, 4096)
 	for {
@@ -204,13 +200,13 @@ func runRawAttach(ws *websocket.Conn, fd int) (err error) {
 			// carry it mid-chunk — forward only the prefix).
 			if i := indexByte(b, detachKey); i >= 0 {
 				if i > 0 {
-					sendFrame(ws, map[string]any{
+					sendFrame(map[string]any{
 						"type": "input", "data": base64.StdEncoding.EncodeToString(b[:i]),
 					})
 				}
 				break
 			}
-			sendFrame(ws, map[string]any{
+			sendFrame(map[string]any{
 				"type": "input", "data": base64.StdEncoding.EncodeToString(b),
 			})
 			continue
@@ -247,13 +243,14 @@ func isDone(ch <-chan struct{}) bool {
 // input + newline; EOF detaches. No resize frames are sent (the PTY
 // keeps its default size).
 func runLineAttach(ws *websocket.Conn) (err error) {
+	sendFrame := newAttachWriter(ws)
 	fmt.Fprintln(os.Stderr, "attached (line mode; the PTY keeps running on the host)")
 	done, closedReason := outputPump(ws)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := scanner.Text()
-		sendFrame(ws, map[string]any{
+		sendFrame(map[string]any{
 			"type": "input",
 			"data": base64.StdEncoding.EncodeToString([]byte(line + "\n")),
 		})

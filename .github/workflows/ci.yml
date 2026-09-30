@@ -29,6 +29,10 @@ jobs:
       # must compile, and the fleet includes arm64 hosts.
       - run: GOOS=darwin GOARCH=arm64 go vet ./...
       - run: GOOS=linux GOARCH=arm64 go vet ./...
+      # Windows remote clients compile on Linux; native host execution stays unsupported.
+      - run: GOOS=windows GOARCH=amd64 go build -o /tmp/pagnet-windows-amd64.exe ./cmd/pagnet
+      - run: GOOS=windows GOARCH=arm64 go build -o /tmp/pagnet-windows-arm64.exe ./cmd/pagnet
+      - run: GOOS=windows GOARCH=amd64 go vet ./sdk ./e2ee ./internal/externalbridge
       - run: go test -count=1 ./...
       # -race: pagnet pushes BEFORE the monorepo pointer bump, so a
       # regression only the race detector catches must fail here, not

@@ -39,7 +39,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -133,7 +132,7 @@ func workerCmd() *cobra.Command {
 				// terminal commands run from this directory are
 				// authenticated by default.
 				base := strings.TrimSuffix(cfg.ServerURL, "/") + "/"
-				ok, err := bearerMe(&http.Client{Timeout: 30 * time.Second}, base, userTok)
+				ok, err := bearerMe(netpolicy.NewHTTPClient(30*time.Second, insecureRemoteHTTP), base, userTok)
 				if err != nil {
 					return fmt.Errorf("validate --user-token: %w", err)
 				}

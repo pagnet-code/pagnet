@@ -118,28 +118,35 @@ func driveLaunch(t *testing.T, d *Daemon, server *websocket.Conn, p transport.La
 	return envs
 }
 
-// waitForEndpointLive polls until the instance's session-driven endpoint is
-// live AND the background activation has SETTLED. The launch-time activation
-// runs off the per-instance FIFO (the launch acks before the activation
-// settles), so a test that asserts endpoint state after driveLaunch must wait
-// for the activation to complete first. The endpoint process comes up DURING
-// activation (status "working"), and only settles to "idle" once activation
-// completes — waiting for process liveness alone races that working→idle
-// transition (a test asserting "idle" right after could observe "working").
-// An empty-mission launch (the only shape this helper serves) always settles
-// to idle.
+// waitForEndpointLive waits until the instance's session-driven endpoint is
+// live AND the background launch-time activation has SETTLED. The launch
+// acks before the activation settles, so a test that asserts endpoint or
+// status state after driveLaunch must wait for the settle first.
+//
+// The row status alone is an AMBIGUOUS oracle: the instance is registered
+// "idle" at launch (process-per-turn heritage) and the settle writes "idle"
+// again at the end, so a poll that sees "idle" + a live pid during the
+// handshake returns early and a subsequent read can catch the transient
+// "working" write (a load-dependent CI flake). The daemon's per-instance
+// settle generation (bumped by activateSessionIdle after the settle write)
+// is the unambiguous signal: it only moves once the activation is done and
+// the status write is final.
 func waitForEndpointLive(t *testing.T, d *Daemon, instanceID string) {
 	t.Helper()
+	base := d.settleGeneration(instanceID)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if pid := d.sup.EndpointPID(instanceID); pid != nil && proc.ProcessAlive(*pid) {
-			if row, ok, _ := d.state.GetInstance(instanceID); ok && row.Status == "idle" {
-				return
-			}
+		if d.settleGeneration(instanceID) > base {
+			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("endpoint for %s never settled to idle", instanceID)
+	if d.settleGeneration(instanceID) <= base {
+		t.Fatalf("endpoint for %s never settled", instanceID)
+	}
+	if pid := d.sup.EndpointPID(instanceID); pid == nil || !proc.ProcessAlive(*pid) {
+		t.Fatalf("endpoint for %s not live after settle (pid=%v)", instanceID, pid)
+	}
 }
 
 // driveDeliver drives a deliver command through the daemon's real command

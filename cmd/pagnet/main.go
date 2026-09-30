@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"io"
 	"net/http"
 	"os"
@@ -389,7 +390,7 @@ func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+userTok)
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := netpolicy.NewHTTPClient(15*time.Second, insecureRemoteHTTP)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -492,7 +493,7 @@ func apiPostJSON(url string, in any, out any) error {
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := netpolicy.NewHTTPClient(15*time.Second, insecureRemoteHTTP)
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err

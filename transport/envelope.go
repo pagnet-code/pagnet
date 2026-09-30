@@ -775,12 +775,15 @@ type TerminalResizePayload struct {
 //     output immediately after forwarding the snapshot, so no byte is ever
 //     delivered twice (addendum §11).
 type TerminalOutputPayload struct {
-	InstanceID string `json:"instanceId"`
-	SessionID  string `json:"sessionId"`
-	Data       string `json:"data"` // base64
-	Seq        uint64 `json:"seq,omitempty"`
-	Snapshot   bool   `json:"snapshot,omitempty"`
-	LastSeq    uint64 `json:"lastSeq,omitempty"`
+	// ClosedReason ends only this attach view when its PTY disappears.
+	// Instance/runtime session state remains owned by the session core.
+	ClosedReason string `json:"closedReason,omitempty"`
+	InstanceID   string `json:"instanceId"`
+	SessionID    string `json:"sessionId"`
+	Data         string `json:"data"` // base64
+	Seq          uint64 `json:"seq,omitempty"`
+	Snapshot     bool   `json:"snapshot,omitempty"`
+	LastSeq      uint64 `json:"lastSeq,omitempty"`
 	// ConfigStale (snapshot frames only, P6): the instance's PTY was
 	// started under a different runtime-injected config (MCP bridge +
 	// identity env) than the daemon renders now — the main trigger is an

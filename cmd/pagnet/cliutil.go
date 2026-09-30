@@ -141,7 +141,7 @@ func (c *cliCtx) do(method, path string, body, out any) error {
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := netpolicy.NewHTTPClient(15*time.Second, insecureRemoteHTTP)
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

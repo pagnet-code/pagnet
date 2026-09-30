@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/release"
@@ -276,7 +275,7 @@ func (d *Daemon) performAutoUpdate(latest string) {
 	} else if envVar != "" {
 		execEnv = append(execEnv, envVar)
 	}
-	if err := syscall.Exec(execPath, os.Args, execEnv); err != nil {
+	if err := reexecDaemon(execPath, os.Args, execEnv); err != nil {
 		// Exec only fails on a broken binary/OS error: log + back off,
 		// the daemon keeps running its current build.
 		d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)

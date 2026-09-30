@@ -630,11 +630,24 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 	if s.endpointView {
 		<-s.eofCh // the read loop closed it on master EOF (endpoint died)
 		tm.mu.Lock()
+		var ended []string
 		if tm.sessions[s.instanceID] == s {
+			// Record only viewers of this capture before releasing its slot.
+			// A replacement capture's late EOF must not close the new view.
+			tm.d.attachMu.Lock()
+			for sessionID := range tm.d.attaches[s.instanceID] {
+				ended = append(ended, sessionID)
+			}
+			tm.d.attachMu.Unlock()
 			delete(tm.sessions, s.instanceID)
 			delete(tm.lastSize, s.instanceID)
 		}
 		tm.mu.Unlock()
+		for _, sessionID := range ended {
+			_ = tm.d.send(nil, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+				InstanceID: s.instanceID, SessionID: sessionID, ClosedReason: "process_exited",
+			})
+		}
 		tm.d.Log.Info("endpoint view torn down (master EOF; session core owns lifecycle)",
 			"instance", s.instanceID)
 		return

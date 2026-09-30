@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"io"
 	"net/http"
 	"net/url"
@@ -37,7 +38,7 @@ type restClient struct {
 
 func newRestClient(base, userAgent string, cred func() string) *restClient {
 	return &restClient{
-		http:      &http.Client{Timeout: 30 * time.Second},
+		http:      netpolicy.NewHTTPClient(30*time.Second, false),
 		base:      strings.TrimSuffix(base, "/") + "/api/v1",
 		cred:      cred,
 		userAgent: userAgent,
@@ -80,10 +81,18 @@ func (r *restClient) do(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("sdk: REST %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	// Bound responses without silently truncating large network listings.
+	const maxResponseBytes = 16 << 20
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("sdk: read REST response: %w", err)
+	}
+	if len(raw) > maxResponseBytes {
+		return fmt.Errorf("sdk: REST response exceeds %d bytes", maxResponseBytes)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err := &restError{status: resp.StatusCode, body: strings.TrimSpace(string(raw))}
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if resp.StatusCode == http.StatusUnauthorized {
 			return fmt.Errorf("%w: %s", ErrCredentialDead, err.Error())
 		}
 		return err

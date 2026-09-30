@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"io"
 	"log/slog"
 	"net/http"
@@ -91,6 +92,9 @@ func needsEnroll(cfg config.Daemon) bool {
 // runDaemon is the `pagnet serve` foreground body: state-dir config,
 // daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
+	if err := hostPlatformError(); err != nil {
+		return err
+	}
 	var level slog.Level
 	switch daemonLogLevel {
 	case "debug":
@@ -257,7 +261,7 @@ func countNetworks(base, bearer string) int {
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Accept", "application/json")
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := netpolicy.NewHTTPClient(5*time.Second, insecureRemoteHTTP)
 	resp, err := client.Do(req)
 	if err != nil {
 		return -1
@@ -281,6 +285,9 @@ func countNetworks(base, bearer string) int {
 // convenience, not a second runtime mode: the child runs the identical
 // foreground `serve` path.
 func runDetach(cmd *cobra.Command) error {
+	if err := hostPlatformError(); err != nil {
+		return err
+	}
 	// The log path needs the state dir BEFORE the re-exec: the flag
 	// value when given, else LoadDaemon's default (~/.pagnet).
 	stateDir := daemonStateDir
@@ -370,7 +377,7 @@ func daemonizeSelf(stateDir string, args []string) error {
 		exe = canonical
 	}
 	child := exec.Command(exe, args...)
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.SysProcAttr = detachedProcessAttrs()
 	child.Stdin = nil
 	child.Stdout = f
 	child.Stderr = f
