@@ -136,6 +136,18 @@ type QwenPersistent struct {
 	// It is owned by this driver: the fake persistent driver's test deadline
 	// must not (and can no longer) decide when a real qwen startup is killed.
 	StartupTimeout time.Duration
+	// PTYAvailable is invoked (from the launch path, BEFORE the
+	// handshake/session_start wait, and without the driver mutex held)
+	// the moment the endpoint's PTY master becomes available, so the
+	// daemon's terminal plane can start reading it immediately. A TUI
+	// renders to its PTY before session_start: without a reader from the
+	// first byte the kernel PTY buffer fills and the TUI blocks in write(),
+	// starving the very session_start this activation waits for (the
+	// 60s-budget activation deadlock). Nil = no observer (tests that
+	// don't set it). The observer takes terminal-manager locks, so the
+	// hook is fired outside this driver's critical sections — never call
+	// it while holding q.mu.
+	PTYAvailable func(instanceID string, master *os.File)
 
 	life lifecycleState
 
@@ -959,6 +971,16 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	q.mu.Lock()
 	q.endpoints[sess.InstanceID] = e
 	q.mu.Unlock()
+	// The PTY is live from here: hand the master to the observer BEFORE
+	// the handshake/session_start wait so the terminal plane reads it
+	// from the first byte (the TUI renders before session_start — a
+	// never-read master deadlocks the activation, see PTYAvailable).
+	// Fired after registration (PTYMaster works) and outside q.mu (the
+	// observer takes terminal-manager locks — lock ordering); nil-safe,
+	// and PTY-less launches do not fire it.
+	if q.PTYAvailable != nil && e.h != nil && e.h.PTY() != nil {
+		q.PTYAvailable(e.instanceID, e.h.PTY())
+	}
 	return e, nil
 }
 

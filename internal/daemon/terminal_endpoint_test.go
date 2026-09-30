@@ -15,34 +15,37 @@ package daemon
 //
 // Proved here (asserted on process/state facts, not logs):
 //
-//  1. attach to a live endpoint: one endpoint, zero ClassPTY, the view
-//     exists from the activation site (A5), the human line on the PTY and
-//     the machine message act on the SAME session, and the machine plane's
-//     JSONL never crosses into the PTY (two-planes invariant);
+//  1. attach to a live endpoint: one endpoint, zero ClassPTY, the capture
+//     exists from the LAUNCH site (the driver's PTYAvailable hook adopts
+//     the master at registration — the A5 invariant, strengthened: a
+//     reader from the first byte, before the activation settles), the
+//     human line on the PTY and the machine message act on the SAME
+//     session, and the machine plane's JSONL never crosses into the PTY
+//     (two-planes invariant);
 //  2. attach wakes a hibernated instance (session.resumed, same id, new
-//     PID, view on the new PTY, high-water endpoint count 1);
+//     PID, capture on the new PTY, high-water endpoint count 1);
 //  3. refusals: blocked/failed/stopped + a session-driven runtime without
 //     a native TUI (capability gate) — honest refusal, no process, no
 //     attach bookkeeping;
 //  4. terminal stop on a session-driven instance hibernates through the
 //     session core (endpoint stopped, session preserved, reason "stopped",
-//     view gone);
-//  5. an endpoint crash while attached tears the view down observationally
-//     (master EOF, no hibernated event, status untouched) and a re-attach
-//     (re)activates cleanly;
+//     capture gone);
+//  5. an endpoint crash while attached tears the capture down
+//     observationally (master EOF, no hibernated event, status untouched)
+//     and a re-attach (re)activates cleanly;
 //  6. the §42 eight-step acceptance proof (fake variant): terminal is the
 //     same session;
-//  7. keep-awake (A6): a view WITHOUT an attached human does not block
+//  7. keep-awake (A6): a capture WITHOUT an attached human does not block
 //     hibernation; an attached human does; the last detach hibernates;
 //  8. activeWorkCount (A7) counts the live endpoint (a re-exec would
-//     orphan it) while terminal.activeCount excludes the view;
-//  9. concurrent attachEndpoint calls reconcile to exactly one view;
-// 10. the view exists DURING an in-flight turn (A5/G8 placement): the
-//     view's read loop is the PTY's only reader while no human is
-//     attached, so a turn parked on a native interaction must have a
-//     live view from activation — without a reader a native TUI blocks
-//     on tty writes once the PTY buffer fills and the model turn never
-//     starts.
+//     orphan it) while terminal.activeCount excludes the capture;
+//  9. concurrent attachEndpoint calls reconcile to exactly one capture;
+// 10. the capture exists DURING an in-flight turn (A5 strengthened, G8):
+//     the capture's read loop is the PTY's only reader while no human is
+//     attached — adopted at the driver's LAUNCH, strictly before the turn
+//     — so a turn parked on a native interaction must find a live capture;
+//     without a reader a native TUI blocks on tty writes once the PTY
+//     buffer fills and the model turn never starts.
 //
 // Linux-gated: the TUI human plane depends on the endpoint owning its
 // controlling terminal (Setsid+Setctty, the ClassEndpoint PTY path),
@@ -314,10 +317,11 @@ func TestDaemon_TerminalAttachLiveEndpoint(t *testing.T) {
 		t.Fatalf("active ClassPTY sessions = %d, want 0 (no second interactive process)", n)
 	}
 
-	// A5: the view exists from the ACTIVATION (the turn), not from the
-	// attach.
+	// A5 (strengthened): the capture exists from the LAUNCH site — the
+	// driver's PTYAvailable hook adopted the master at registration, so
+	// it is strictly earlier than the old activation-site invariant.
 	if view := d.terminal.get(instanceID); view == nil || !view.endpointView {
-		t.Fatal("no endpoint view after the activation turn (the view is ensured at activation, A5)")
+		t.Fatal("no endpoint capture after the activation turn (the capture is adopted at the driver's launch, A5 strengthened)")
 	}
 
 	// Attach (durable command): the human is connected to the endpoint's
@@ -449,13 +453,16 @@ func TestDaemon_TerminalAttachWakesHibernated(t *testing.T) {
 		t.Fatalf("waking attach did not send a PTY snapshot frame: %+v", envs)
 	}
 
-	// The view is on the NEW endpoint's PTY.
+	// The capture is on the NEW endpoint's PTY: the old endpoint's
+	// capture was dropped by its own observational EOF teardown when the
+	// old master died, and the new launch adopted a fresh capture for the
+	// fresh master.
 	view := d.terminal.get(instanceID)
 	if view == nil || !view.endpointView {
-		t.Fatal("no endpoint view after the waking attach")
+		t.Fatal("no endpoint capture after the waking attach")
 	}
 	if view.f != d.sessions.PTYMaster(instanceID) {
-		t.Fatal("the view is not on the new endpoint's PTY master")
+		t.Fatal("the capture is not on the new endpoint's PTY master")
 	}
 }
 
@@ -487,9 +494,9 @@ func TestDaemon_TerminalAttachRefusals(t *testing.T) {
 			t.Fatalf("set status %s: %v", status, err)
 		}
 		// The launch established the session-driven endpoint (instruction-
-		// model Wave 3) — its view exists from the activation (A5); a
-		// refused attach must change NOTHING: no second process, no
-		// attach bookkeeping, no new/changed terminal session.
+		// model Wave 3) — its capture exists from the LAUNCH site (A5
+		// strengthened); a refused attach must change NOTHING: no second
+		// process, no attach bookkeeping, no new/changed terminal session.
 		before := d.sup.Stats().ActiveEndpoints
 		viewBefore := d.terminal.get(instanceID)
 		attachEnv, err := transport.NewEnvelope(transport.MsgAttachTerminal, transport.TerminalAttachPayload{
@@ -929,8 +936,9 @@ func TestDaemon_ActiveWorkCountCountsLiveEndpoints(t *testing.T) {
 }
 
 // 9. Concurrent attachEndpoint calls on the same master reconcile to
-// EXACTLY ONE view (one *ptySession): the first creates, the rest
-// reconcile — never a second view on one master.
+// EXACTLY ONE capture (one *ptySession) in the terminal plane: the first
+// adopts, the rest reconcile — never a second capture registered for one
+// master.
 func TestDaemon_AttachEndpointConcurrent(t *testing.T) {
 	d := newPersistentTestDaemon(t)
 	client, server := newMemWS(t)
@@ -952,11 +960,11 @@ func TestDaemon_AttachEndpointConcurrent(t *testing.T) {
 		t.Fatal("PTYMaster is nil on the live endpoint")
 	}
 
-	// Drop the existing view (the endpoint keeps running) so the
-	// concurrent calls race to CREATE.
+	// Drop the existing capture (the endpoint keeps running) so the
+	// concurrent calls race to ADOPT a fresh one.
 	d.terminal.stop(instanceID)
 	if d.terminal.get(instanceID) != nil {
-		t.Fatal("view not dropped by stop")
+		t.Fatal("capture not dropped by stop")
 	}
 
 	const n = 8
@@ -989,25 +997,28 @@ func TestDaemon_AttachEndpointConcurrent(t *testing.T) {
 		if first == nil {
 			first = r.s
 		} else if r.s != first {
-			t.Fatalf("goroutine %d got a different session object (a second view was created)", i)
+			t.Fatalf("goroutine %d got a different session object (a second capture was created)", i)
 		}
 	}
 	if createdCount != 1 {
 		t.Fatalf("created count = %d, want exactly 1 (the rest reconcile)", createdCount)
 	}
 	if d.terminal.get(instanceID) != first {
-		t.Fatal("the map does not hold the single created view")
+		t.Fatal("the map does not hold the single adopted capture")
 	}
 }
 
-// 10. The view exists DURING an in-flight turn (A5/G8): the turn parks on
-// a scripted native interaction (the endpoint is live, the turn is
-// mid-flight), and while no human is attached the endpoint's PTY must
-// still have a reader — the view. Its read loop drains the TUI's
-// rendering; without it a native TUI (Ink) blocks on tty writes once the
-// PTY buffer fills and the model call never fires (no user event, no
-// message_start). Regression: the view was once ensured only after the
-// turn settled, leaving the PTY un-read for the whole turn.
+// 10. The capture exists DURING an in-flight turn (A5 strengthened, G8):
+// the turn parks on a scripted native interaction (the endpoint is live,
+// the turn is mid-flight), and while no human is attached the endpoint's
+// PTY must still have a reader — the capture, adopted at the driver's
+// LAUNCH (strictly before the turn started). Its read loop drains the
+// TUI's rendering; without it a native TUI (Ink) blocks on tty writes
+// once the PTY buffer fills and the model call never fires (no user
+// event, no message_start). Regression: the view was once ensured only
+// after the turn settled, leaving the PTY un-read for the whole turn —
+// and the pre-fix activation-deadlock variant left it un-read from the
+// very first TUI byte.
 func TestDaemon_EndpointViewExistsDuringTurn(t *testing.T) {
 	d := newPersistentTestDaemon(t)
 	client, server := newMemWS(t)
@@ -1053,12 +1064,12 @@ func TestDaemon_EndpointViewExistsDuringTurn(t *testing.T) {
 		t.Fatal("turn did not park on the interaction")
 	}
 
-	// A5/G8: the view exists from the ACTIVATION — while the turn is in
-	// flight and no human is attached. The view is ensured when the
-	// daemon's turn event loop processes the activation event, which runs
-	// concurrently with the parked turn — poll for it (the loop is at most
-	// a few scheduler hops behind; a one-shot check races the scheduler
-	// on loaded CI VMs and has gone red there).
+	// A5 (strengthened)/G8: the capture exists from the LAUNCH — while the
+	// turn is in flight and no human is attached. It was adopted when the
+	// driver's launch registered the master (the PTYAvailable hook), which
+	// ran before the deliver below — poll for it (the hook fires a few
+	// scheduler hops after the process launch; a one-shot check races the
+	// scheduler on loaded CI VMs and has gone red there).
 	viewOK := false
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1070,12 +1081,12 @@ func TestDaemon_EndpointViewExistsDuringTurn(t *testing.T) {
 	}
 	if !viewOK {
 		row, _, _ := d.state.GetInstance(instanceID)
-		t.Fatalf("no endpoint view while the turn is in flight (the view is ensured at activation, A5/G8); status=%q endpointPid=%v",
+		t.Fatalf("no endpoint capture while the turn is in flight (the capture is adopted at the driver's launch, A5 strengthened/G8); status=%q endpointPid=%v",
 			row.Status, d.sup.EndpointPID(instanceID))
 	}
-	// And the view is actively draining the TUI: the parked interaction's
-	// rendering is in the ring (with no reader it would sit in the PTY
-	// buffer).
+	// And the capture is actively draining the TUI: the parked
+	// interaction's rendering is in the ring (with no reader it would sit
+	// in the PTY buffer).
 	waitForRing(t, d, instanceID, []string{"? fake question (simulated)"}, 10*time.Second)
 
 	// Answer the interaction; the turn completes and the deliver acks.

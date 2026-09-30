@@ -4,15 +4,15 @@ package daemon
 // session activation runs OFF the per-instance FIFO (doLaunch backgrounds
 // it), and the driver registers the PTY master at launch (before the
 // handshake settles). A concurrent attach that lands while the activation
-// is still in flight (StateActivating) must NOT create a view on the
-// in-flight endpoint — when the activation settles it can stop that
+// is still in flight (StateActivating) must NOT bind a client to a capture
+// on the in-flight endpoint — when the activation settles it can stop that
 // endpoint (a staleLaunch restart, or an activation failure), orphaning
-// the view (master EOF) and leaving the terminal black. A detach landing
+// the capture (master EOF) and leaving the terminal black. A detach landing
 // in the same window (a client that gave up on a slow attach) must NOT
 // hibernate the instance (it would stop the endpoint no human was
-// attached to, with the view still bound to the dead master, and leave the
-// instance hibernated with an empty session — stuck, because the explicit
-// wake runs resume=false and never re-establishes a PTY).
+// attached to, with the capture still bound to the dead master, and leave
+// the instance hibernated with an empty session — stuck, because the
+// explicit wake runs resume=false and never re-establishes a PTY).
 //
 // The fix (three coordinated changes in daemon.go):
 //  1. attachSessionDriven defers the attach (ErrDeferred) when an
@@ -23,14 +23,19 @@ package daemon
 //  2. removeAttach returns false when NO attach was recorded for the
 //     session (a spurious/late detach for a deferred or refused attach),
 //     so doDetach does NOT hibernate on it.
-//  3. doWake ensures the view is bound when the session is already Live
-//     (the view may be gone — orphaned by a concurrent re-activation, or
-//     torn down by a master EOF — and a wake that returned without
+//  3. doWake ensures the capture is bound when the session is already Live
+//     (the capture may be gone — orphaned by a concurrent re-activation,
+//     or torn down by a master EOF — and a wake that returned without
 //     re-binding it would leave the terminal black on a live instance).
+//
+// Note: the test double below has NO PTYAvailable hook (it is not a
+// launch-path driver), so the capture is adopted when the re-sent attach
+// lands (attachEndpoint's no-capture path) or by the ensureEndpointView
+// backstop — the SAME adoptEndpoint code path the driver's launch uses.
 //
 // This test proves (1) and (2) directly (the attach is deferred during the
 // in-flight activation, and the detach does not hibernate), and that the
-// re-sent attach ends with a live PTY view bound to the settled endpoint
+// re-sent attach ends with a live capture bound to the settled endpoint
 // (the instance is not left hibernated-with-empty-session).
 
 import (
@@ -55,8 +60,8 @@ import (
 // in-flight activation), then blocks on a gate (the handshake is in
 // flight). It has NativeTUI: true (so the attach is not refused by the
 // capability gate) and implements PTYOwner (so the attach's PTYMaster
-// check passes). The slave is kept open for the test's duration (the view's
-// read loop blocks on it; no EOF, no teardown).
+// check passes). The slave is kept open for the test's duration (the
+// capture's read loop blocks on it; no EOF, no teardown).
 type gatedPTYDriver struct {
 	gate     chan struct{} // closed to let the activation settle
 	launched chan struct{} // closed when Activate is entered (PTY registered)
@@ -130,14 +135,15 @@ func (g *gatedPTYDriver) Live(instanceID string) bool { return g.master != nil }
 // gated) + a concurrent attach. It asserts:
 //
 //   - the attach is DEFERRED (ErrDeferred) while the activation is in
-//     flight (it must not create a view on the in-flight endpoint);
+//     flight (it must not bind a client to a capture on the in-flight
+//     endpoint);
 //   - a detach for the (deferred, unrecorded) attach does NOT hibernate
 //     the instance (no attach was recorded — hibernating would stop the
 //     endpoint no human was attached to);
 //   - the instance is NOT left hibernated-with-empty-session (it stays
 //     idle with the in-flight activation);
 //   - after the activation settles, the re-sent attach SUCCEEDS and ends
-//     with a live PTY view bound to the settled endpoint's master.
+//     with a live capture bound to the settled endpoint's master.
 func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 	d := newTestDaemon(t)
 	client, _ := newMemWS(t)
@@ -188,13 +194,13 @@ func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 	}
 
 	// (1) The concurrent attach is DEFERRED (ErrDeferred) — it must not
-	// create a view on the in-flight endpoint.
+	// bind a client to a capture on the in-flight endpoint.
 	attachP := transport.TerminalAttachPayload{
 		CommandID: "cmd-race-attach", InstanceID: instanceID, SessionID: "sess-1",
 	}
 	err = d.doAttach(nil, attachP)
 	if !errors.Is(err, ErrDeferred) {
-		t.Fatalf("attach during the in-flight activation = %v, want ErrDeferred (never bind a view to the in-flight endpoint)", err)
+		t.Fatalf("attach during the in-flight activation = %v, want ErrDeferred (never bind a client to a capture on the in-flight endpoint)", err)
 	}
 	// The deferred attach was NOT recorded (no attach bookkeeping).
 	if d.attached(instanceID) {
@@ -240,23 +246,26 @@ func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 	}
 
 	// (4) The re-sent attach SUCCEEDS (the activation is settled) and ends
-	// with a live PTY view bound to the settled endpoint's master.
+	// with a live capture bound to the settled endpoint's master (this
+	// double has no launch-site hook, so the capture is adopted by the
+	// ensureEndpointView backstop or by attachEndpoint's no-capture path —
+	// the same adoptEndpoint code path).
 	err = d.doAttach(nil, attachP)
 	if err != nil {
-		t.Fatalf("re-sent attach after the activation settled = %v, want nil (a live PTY view)", err)
+		t.Fatalf("re-sent attach after the activation settled = %v, want nil (a live capture)", err)
 	}
 	if !d.attached(instanceID) {
 		t.Fatal("the re-sent attach was not recorded")
 	}
 	view := d.terminal.get(instanceID)
 	if view == nil || !view.endpointView {
-		t.Fatal("no endpoint view after the re-sent attach (the terminal would be black)")
+		t.Fatal("no endpoint capture after the re-sent attach (the terminal would be black)")
 	}
 	if view.f == nil {
-		t.Fatal("the view has no live PTY master (the terminal would be black)")
+		t.Fatal("the capture has no live PTY master (the terminal would be black)")
 	}
 	if view.f != d.sessions.PTYMaster(instanceID) {
-		t.Fatal("the view is not bound to the settled endpoint's PTY master")
+		t.Fatal("the capture is not bound to the settled endpoint's PTY master")
 	}
 
 	// The instance is idle (not hibernated) with the live endpoint.
@@ -267,5 +276,5 @@ func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 	if row.Status == "hibernated" {
 		t.Fatalf("the instance is hibernated after the re-sent attach (session=%q) — stuck", row.SessionID)
 	}
-	t.Logf("attach during the in-flight activation deferred; the detach did not hibernate; the re-sent attach bound a live PTY view (instance %s, status %s)", instanceID, row.Status)
+	t.Logf("attach during the in-flight activation deferred; the detach did not hibernate; the re-sent attach bound a live capture (instance %s, status %s)", instanceID, row.Status)
 }

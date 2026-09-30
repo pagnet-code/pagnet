@@ -89,16 +89,21 @@ type ptySession struct {
 	// natural-exit (hibernated) event — the stopper owns instance state.
 	killed bool
 
-	// endpointView marks a Phase 3 (terminal session unification) VIEW of
-	// a session-driven endpoint's OWN TUI PTY, as opposed to a legacy
-	// ClassPTY session the terminal plane launched itself. A view:
+	// endpointView marks a Phase 3 (terminal session unification) session
+	// on a session-driven endpoint's OWN TUI PTY — the always-on CAPTURE
+	// (adoptEndpoint: from the driver's launch via its PTYAvailable hook,
+	// with the attach-time backstop adopting the same way; the master's
+	// single reader, A6) — as opposed to a legacy ClassPTY session the
+	// terminal plane launched itself. A capture:
 	//   - holds h == nil (the endpoint's handle is owned by the session
-	//     core / its driver — the view never Waits or Terminates it, G3/G5);
+	//     core / its driver — the capture never Waits or Terminates it,
+	//     G3/G5);
 	//   - holds f = the endpoint's PTY master as a VIEW (never closes it —
-	//     the process handle owns it; a closed master is EOF to the view);
+	//     the process handle owns it; a closed master is EOF to the
+	//     capture);
 	//   - is torn down observationally on master EOF (eofCh): the session
 	//     core owns the endpoint's lifecycle and instance status, so the
-	//     view's teardown writes NO status and emits NO hibernated event.
+	//     teardown writes NO status and emits NO hibernated event.
 	endpointView bool
 	// eofCh is closed when the view's master hits EOF (the endpoint died).
 	// It is the view's exit signal (readLoop closes it; exitLoop waits on
@@ -320,44 +325,68 @@ func (tm *terminalManager) awaitLive(s *ptySession) (*ptySession, error) {
 	return s, nil
 }
 
-// attachEndpoint creates (or reconciles to) a VIEW of a session-driven
-// endpoint's OWN TUI PTY (Phase 3 terminal session unification). Unlike
-// start/launchPTY (which LAUNCH a legacy ClassPTY process), attachEndpoint
-// never spawns a process: it holds the endpoint's existing PTY master as a
-// view and relays a human to it (the two-planes invariant — the human plane
-// is the endpoint's own PTY, not a second interactive process).
+// adoptEndpoint creates (or reconciles to) the always-on CAPTURE of a
+// session-driven endpoint's OWN TUI PTY (Phase 3 terminal session
+// unification, promoted to launch-time by the activation-deadlock fix):
+// the master's SINGLE reader (A6), in place from the FIRST byte. It is
+// wired from the driver's launch through its PTYAvailable hook the moment
+// the PTY master is registered — strictly BEFORE the activation
+// (session_start) settles — so a TUI runtime that renders before
+// session_start (qwen, codex) always finds a reader: a never-read master
+// fills the kernel PTY buffer, the TUI blocks in write(), and the
+// activation times out at the startup budget with a healthy, alive process
+// (the 2026-09-30 incident).
+//
+// Unlike start/launchPTY (which LAUNCH a legacy ClassPTY process),
+// adoptEndpoint never spawns a process: it holds the endpoint's existing
+// PTY master as a view (the two-planes invariant — the human plane is the
+// endpoint's own PTY, not a second interactive process).
+//
+// The capture carries the endpointView semantics: it is OBSERVATIONAL —
+// h == nil (the endpoint's handle is owned by the session core / its
+// driver — the capture never Waits or Terminates it, G3/G5), it never
+// closes the master (the process handle owns it; a closed master is EOF to
+// the capture), and it is torn down observationally on master EOF (eofCh)
+// with no status write and no hibernated event (the session core owns the
+// endpoint's lifecycle and instance status).
 //
 // Idempotent + reconciled under tm.mu (the same reservation discipline as
 // start):
-//   - master nil → error (the endpoint has no live PTY — the daemon refuses
-//     the attach cleanly: no crash, no hang, no partial state);
-//   - an existing LEGACY session → error (a view and a launched PTY are
+//   - master nil → error (the launch has no PTY — the no-PTY topology is
+//     first-class, I1; the hook must not fire for it);
+//   - an existing LEGACY session → error (a capture and a launched PTY are
 //     mutually exclusive for an instance);
-//   - an existing DEAD view (eofCh closed — master EOF) → drop it and create
-//     a fresh one (G7: never attach to a dead master — re-activation creates
-//     a fresh view);
-//   - an existing LIVE view → return it (reconcile, no second view).
+//   - an existing LIVE capture → return it (reconcile, created=false —
+//     never a second readLoop or session, A6);
+//   - an existing DEAD capture (eofCh closed — master EOF) → the endpoint
+//     it captured is gone; the master handed to us belongs to a
+//     re-activation's fresh endpoint — replace it (the remembered client
+//     geometry, when any, is applied to the fresh master so the PTY does
+//     not boot at the 24x80 default).
 //
-// The created result reports whether a NEW view was created (true) or the
-// call reconciled to an existing live view (false) — the caller uses it to
-// stamp the config fingerprint only at a genuine (re)activation, so a
+// The created result reports whether a NEW capture was created (true) or
+// the call reconciled to an existing live capture (false) — the caller
+// stamps the config fingerprint only at a genuine (re)activation, so a
 // reconcile never hides a stale fingerprint.
 //
-// The view is live immediately (no slow launch): live is closed before
-// return and the read/exit loops are started. The view never closes the
-// master, Waits, or Terminates (the process handle owns those — G3/G5).
-func (tm *terminalManager) attachEndpoint(instanceID string, master *os.File) (*ptySession, bool, error) {
+// The capture is live immediately (no slow launch): live is closed before
+// return and the read/exit loops are started.
+func (tm *terminalManager) adoptEndpoint(instanceID string, master *os.File) (*ptySession, bool, error) {
 	if master == nil {
 		return nil, false, fmt.Errorf("endpoint %s has no live TUI PTY to attach", instanceID)
 	}
+	var remembered lastSize
+	haveRemembered := false
 	tm.mu.Lock()
 	if s := tm.sessions[instanceID]; s != nil {
 		if !s.endpointView {
 			tm.mu.Unlock()
 			return nil, false, fmt.Errorf("instance %s has a legacy PTY session; a view cannot attach to it", instanceID)
 		}
-		// Existing view: if it is dead (master EOF), drop it and recreate
-		// (G7); if live, reconcile to it (idempotent).
+		// Existing capture: live → reconcile to it (idempotent, one
+		// reader per master); dead (master EOF) → the endpoint it
+		// captured is gone and the master belongs to a re-activation's
+		// fresh endpoint — replace it.
 		dead := false
 		select {
 		case <-s.eofCh:
@@ -368,6 +397,10 @@ func (tm *terminalManager) attachEndpoint(instanceID string, master *os.File) (*
 			tm.mu.Unlock()
 			return s, false, nil
 		}
+		// Remember the most recent client geometry BEFORE the old record
+		// is dropped, so the fresh PTY boots at the size a (still
+		// attached) client last asked for instead of the 24x80 default.
+		remembered, haveRemembered = tm.latestSizeLocked(instanceID)
 		delete(tm.sessions, instanceID)
 		delete(tm.lastSize, instanceID)
 	}
@@ -381,13 +414,94 @@ func (tm *terminalManager) attachEndpoint(instanceID string, master *os.File) (*
 	tm.sessions[instanceID] = s
 	tm.mu.Unlock()
 
-	// A view is ready immediately (no launch): close live, start the
+	// The fresh master must not boot at the 24x80 default when the
+	// terminal plane already knows a client's geometry for the instance.
+	if haveRemembered {
+		_ = pty.Setsize(s.f, &pty.Winsize{Rows: remembered.rows, Cols: remembered.cols})
+	}
+
+	// A capture is ready immediately (no launch): close live, start the
 	// read/exit loops.
 	close(s.live)
 	go tm.readLoop(s)
 	go tm.exitLoop(s)
-	tm.d.Log.Info("endpoint view attached", "instance", instanceID)
+	tm.d.Log.Info("endpoint capture adopted", "instance", instanceID)
 	return s, true, nil
+}
+
+// latestSizeLocked reports the instance's most recently requested geometry
+// across all of its attach sessions (see lastSize). The caller must hold
+// tm.mu.
+func (tm *terminalManager) latestSizeLocked(instanceID string) (lastSize, bool) {
+	var bestSz lastSize
+	found := false
+	for _, sz := range tm.lastSize[instanceID] {
+		if !found || sz.at.After(bestSz.at) {
+			bestSz = sz
+			found = true
+		}
+	}
+	return bestSz, found
+}
+
+// attachEndpoint binds a client to the instance's endpoint CAPTURE (the
+// always-on ptySession adoptEndpoint adopted at the driver's launch — the
+// capture exists from the LAUNCH site, the master registration: strictly
+// earlier than the old activation-site invariant, A5). It never spawns a
+// process and never starts a second readLoop or session: the capture is
+// the master's single reader (A6).
+//
+// Idempotent + reconciled under tm.mu (the same reservation discipline as
+// start):
+//   - master nil → error (the endpoint has no live PTY — the daemon refuses
+//     the attach cleanly: no crash, no hang, no partial state);
+//   - an existing LEGACY session → error (a capture and a launched PTY are
+//     mutually exclusive for an instance);
+//   - an existing DEAD capture (eofCh closed — master EOF) → the attach is
+//     REFUSED (G7: never bind a client to a dead master — the endpoint is
+//     gone; a (re)activation adopts a fresh capture for the fresh endpoint
+//     at launch, so a bind landing on a dead capture is a race to be
+//     retried, never a terminal to be shown);
+//   - an existing LIVE capture → return it (reconcile, created=false);
+//   - no session at all (should be impossible — the driver's launch adopts
+//     the capture; a capture dropped by stop() while the endpoint is live
+//     is the only realistic case) → adopt it now, the same code path.
+//
+// The created result reports whether a NEW capture was created (true) or
+// the call reconciled to the existing live capture (false).
+//
+// The capture is live immediately (no slow launch): live is closed before
+// return and the read/exit loops are started. It never closes the master,
+// Waits, or Terminates (the process handle owns those — G3/G5).
+func (tm *terminalManager) attachEndpoint(instanceID string, master *os.File) (*ptySession, bool, error) {
+	if master == nil {
+		return nil, false, fmt.Errorf("endpoint %s has no live TUI PTY to attach", instanceID)
+	}
+	tm.mu.Lock()
+	if s := tm.sessions[instanceID]; s != nil {
+		if !s.endpointView {
+			tm.mu.Unlock()
+			return nil, false, fmt.Errorf("instance %s has a legacy PTY session; a view cannot attach to it", instanceID)
+		}
+		select {
+		case <-s.eofCh:
+			// G7: the capture's endpoint is gone (master EOF). Refuse the
+			// bind with the existing no-live-PTY error shape — a
+			// (re)activation adopts a fresh capture at launch, so a client
+			// that lands on a dead capture is retried, never shown a
+			// torn-down terminal.
+			tm.mu.Unlock()
+			return nil, false, fmt.Errorf("endpoint %s has no live TUI PTY to attach", instanceID)
+		default:
+			tm.mu.Unlock()
+			return s, false, nil
+		}
+	}
+	tm.mu.Unlock()
+	// No capture (the backstop — the driver's launch adopts one, so this
+	// is only reachable when a capture was dropped while the endpoint is
+	// live): adopt it now, exactly the launch-time path.
+	return tm.adoptEndpoint(instanceID, master)
 }
 
 // hasSession reports whether the instance has ANY terminal session (legacy

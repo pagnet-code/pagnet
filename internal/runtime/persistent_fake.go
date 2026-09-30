@@ -61,6 +61,19 @@ type PersistentFake struct {
 	// while the stdin/stdout pipes remain the machine plane. nil keeps the
 	// pre-Phase-3 shape (no PTY; the fake's TUI degrades off).
 	PTYSize *pty.Winsize
+	// PTYAvailable is invoked (from the launch path, BEFORE the
+	// activation/session_start wait, and without the driver mutex held)
+	// the moment the endpoint's PTY master becomes available, so the
+	// daemon's terminal plane can start reading it immediately. The fake
+	// can render to its TUI PTY before the activation event (the
+	// PAGNET_FAKE_TUI_BOOT_BYTES simulation knob writes boot bytes to the
+	// PTY first): without a reader from the first byte the kernel PTY
+	// buffer fills and the write blocks, starving the very activation
+	// event this driver waits for (the 60s-budget activation deadlock).
+	// Nil = no observer (tests that don't set it). The observer takes
+	// terminal-manager locks, so the hook is fired outside this driver's
+	// critical sections — never call it while holding f.mu.
+	PTYAvailable func(instanceID string, master *os.File)
 
 	life lifecycleState
 
@@ -595,6 +608,16 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	f.mu.Lock()
 	f.endpoints[sess.InstanceID] = e
 	f.mu.Unlock()
+	// The PTY (when the launch owns one) is live from here: hand the
+	// master to the observer BEFORE the activation wait so the terminal
+	// plane reads it from the first byte (the fake's TUI boot bytes are
+	// written before the activation event — see PTYAvailable). Fired
+	// after registration (PTYMaster works) and outside f.mu (the observer
+	// takes terminal-manager locks — lock ordering); nil-safe, and PTY-less
+	// launches do not fire it.
+	if f.PTYAvailable != nil && e.h != nil && e.h.PTY() != nil {
+		f.PTYAvailable(e.instanceID, e.h.PTY())
+	}
 	return e, nil
 }
 

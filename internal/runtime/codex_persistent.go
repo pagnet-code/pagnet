@@ -117,6 +117,21 @@ type CodexPersistent struct {
 	// test deadline must not decide when a real app-server startup is
 	// killed.
 	StartupTimeout time.Duration
+	// PTYAvailable is invoked (from the launch path, BEFORE the
+	// handshake/session_start wait, and without the driver mutex held)
+	// the moment the endpoint's PTY master becomes available, so the
+	// daemon's terminal plane can start reading it immediately. A TUI
+	// renders to its PTY before session_start: without a reader from the
+	// first byte the kernel PTY buffer fills and the TUI blocks in write(),
+	// starving the very session_start this activation waits for (the
+	// 60s-budget activation deadlock). The app-server launch is PTY-less
+	// (the stdio JSON-RPC IS the machine plane), so the hook is nil-safe
+	// and never fires today — the seam exists so a PTY-owning codex
+	// topology gets the same always-on capture without a new mechanism.
+	// The observer takes terminal-manager locks, so the hook is fired
+	// outside this driver's critical sections — never call it while
+	// holding c.mu.
+	PTYAvailable func(instanceID string, master *os.File)
 
 	life lifecycleState
 
@@ -723,6 +738,15 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	c.mu.Lock()
 	c.endpoints[sess.InstanceID] = e
 	c.mu.Unlock()
+	// The PTY (when the launch owns one) is live from here: hand the
+	// master to the observer BEFORE the handshake wait so the terminal
+	// plane reads it from the first byte (see PTYAvailable). Fired after
+	// registration (PTYMaster works) and outside c.mu (the observer takes
+	// terminal-manager locks — lock ordering); nil-safe, and PTY-less
+	// launches (the app-server shape) do not fire it.
+	if c.PTYAvailable != nil && e.h != nil && e.h.PTY() != nil {
+		c.PTYAvailable(e.instanceID, e.h.PTY())
+	}
 
 	// The handshake (initialize + thread start/resume) bounds the
 	// activation: a process that starts but never completes the handshake

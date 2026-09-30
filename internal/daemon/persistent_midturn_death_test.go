@@ -263,8 +263,11 @@ func TestDaemon_AttachReconcilesStaleWorkingStatus(t *testing.T) {
 	if !sawSnapshotFrame(envs, instanceID) {
 		t.Fatalf("the reconciling attach did not send a PTY snapshot frame: %+v", envs)
 	}
+	// The reconciling attach (re)activated the endpoint; the new launch
+	// adopted a fresh capture for the fresh master (the dead endpoint's
+	// capture was dropped by its observational EOF teardown).
 	if view := d.terminal.get(instanceID); view == nil || !view.endpointView {
-		t.Fatal("no endpoint view after the reconciling attach")
+		t.Fatal("no endpoint capture after the reconciling attach")
 	}
 }
 

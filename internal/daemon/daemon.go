@@ -627,6 +627,22 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		writeTimeout:    wsWriteTimeout,
 	}
 	d.terminal = newTerminalManager(d)
+	// The always-on PTY capture (the activation-deadlock fix): the moment
+	// a persistent driver's launch registers the endpoint's PTY master,
+	// the terminal plane adopts it as the master's single reader (A6) —
+	// a TUI runtime that renders to its PTY before session_start (qwen,
+	// codex) must never find a never-read master (the kernel PTY buffer
+	// fills, the TUI blocks in write(), and the activation times out at
+	// the startup budget with a healthy, alive process).
+	if persistentFake != nil {
+		persistentFake.PTYAvailable = d.adoptEndpointPTY
+	}
+	if qwenPersistentRegistered {
+		qwenPersistent.PTYAvailable = d.adoptEndpointPTY
+	}
+	if codexPersistentRegistered {
+		codexPersistent.PTYAvailable = d.adoptEndpointPTY
+	}
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
@@ -2574,11 +2590,11 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		// Manager's mutex; a direct sess.State read here would race it).
 		if st, ok := d.sessions.State(instanceID); ok && st.Live() {
 			// The endpoint is live: the session needs no wake. But the
-			// VIEW may be gone (orphaned by a concurrent re-activation, or
-			// torn down by a master EOF) — a wake that returned without
-			// re-binding it would leave the terminal black ("no live PTY")
-			// on a live instance forever. ensureEndpointView is idempotent
-			// (it reconciles to an existing live view, or creates one on
+			// CAPTURE may be gone (a terminal stop dropped it while the
+			// endpoint is live) — a wake that returned without re-binding
+			// it would leave the terminal black ("no live PTY") on a live
+			// instance forever. ensureEndpointView is idempotent (it
+			// reconciles to the existing live capture, or adopts one on
 			// the current master).
 			d.ensureEndpointView(row)
 			d.Log.Info("instance already live; wake is a no-op (view ensured)", "instance", instanceID)
@@ -3322,13 +3338,13 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID, ev.Type == session.EventSessionResumed)
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
-			// Phase 3 (A5/G8): the ACTIVATION site. The human-plane view
-			// onto the endpoint's PTY is ensured the moment the endpoint
-			// is live, not after the turn settles: its read loop is the
-			// PTY's only reader while no human is attached, and without a
-			// reader a native TUI blocks on tty writes once the PTY
-			// buffer fills — the model turn then never starts (no user
-			// event, no message_start; the e2e cold-start deadline).
+			// Phase 3 (A5/G8, strengthened): the capture onto the
+			// endpoint's PTY exists from the LAUNCH site (the driver's
+			// PTYAvailable hook adopted the master at registration — its
+			// read loop is the PTY's only reader from the first byte, so
+			// a native TUI can never block on tty writes with no reader).
+			// This is the idempotent backstop (a no-op when the capture is
+			// already in place, which it is).
 			d.ensureEndpointView(row)
 		case session.EventSessionLost:
 			sessionLost = true
@@ -3500,10 +3516,12 @@ func sessionInteractionToAdapter(ie *session.InteractionEvent) *agentruntime.Int
 // process owns both planes — the PTY is the HUMAN plane (raw bytes to the
 // native TUI), the JSONL pipes are the MACHINE plane (native protocol;
 // never PTY keystrokes). Attach (A3) = "ensure the session is active, then
-// view its PTY": hibernated → wake/resume, live → observational, and NEVER
-// a second interactive process. The view (terminal.attachEndpoint) is
-// created at ACTIVATION (A5/G8); keep-awake is the human attach
-// (d.attached), not the view (A6).
+// bind to its PTY": hibernated → wake/resume, live → observational, and
+// NEVER a second interactive process. The capture (terminal.adoptEndpoint,
+// the master's single reader) exists from the LAUNCH site (the driver's
+// PTYAvailable hook adopts the master at registration) — strictly stronger
+// than the old A5/G8 "view exists from the activation site" invariant;
+// keep-awake is the human attach (d.attached), not the capture (A6).
 
 // prepareSession is the session setup shared by every session-driven
 // activation path (turns and attach): the logical session for the row,
@@ -3530,19 +3548,49 @@ func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *s
 	return sess
 }
 
-// ensureEndpointView creates (or reconciles to) the human-plane VIEW onto
-// a session-driven endpoint's own TUI PTY, at the ACTIVATION site (A5/G8:
-// the view exists from activation, not from the first attach). It is a
-// no-op unless the instance is session-driven AND the endpoint is live
-// with a PTY (PTYSize-gated — the no-PTY topology is first-class, I1).
-// The view is observational (it never owns the endpoint's lifecycle, G3/G5)
-// and does NOT keep the instance awake (A6: keep-awake is d.attached).
-//
-// The config fingerprint (P6 configStale) is stamped only when a NEW view
-// is created — i.e. at a genuine (re)activation, when the running endpoint
-// was just launched with the daemon's CURRENT injected config. A reconcile
-// to an existing view never re-stamps: the fingerprint must keep describing
-// the config the running endpoint was actually launched with.
+// adoptEndpointPTY is the daemon's PTYAvailable hook body (and the
+// ensureEndpointView backstop's shared path): it wires the terminal
+// plane's always-on capture to the endpoint's PTY master the moment the
+// driver's launch registers it (see terminal.adoptEndpoint). On error it
+// warns and does NOT fail the launch — the capture is the terminal plane's
+// read path, and the startup budget remains the honest backstop for a
+// genuinely broken runtime. When a NEW capture is created (a genuine
+// (re)activation) the config fingerprint (P6 configStale) is stamped: the
+// running endpoint was just launched with the daemon's CURRENT injected
+// config. A reconcile to an existing capture never re-stamps: the
+// fingerprint must keep describing the config the running endpoint was
+// actually launched with.
+func (d *Daemon) adoptEndpointPTY(instanceID string, master *os.File) {
+	if master == nil {
+		return
+	}
+	_, created, err := d.terminal.adoptEndpoint(instanceID, master)
+	if err != nil {
+		d.Log.Warn("endpoint capture adopt failed", "instance", instanceID,
+			"error", err.Error())
+		return
+	}
+	if created {
+		if row, ok, rerr := d.state.GetInstance(instanceID); rerr == nil && ok {
+			_ = d.state.SetInstanceConfigFingerprint(instanceID, d.instanceFingerprint(row))
+		}
+	}
+}
+
+// ensureEndpointView is the BACKSTOP for the always-on endpoint capture:
+// the capture exists from the LAUNCH site (the driver's PTYAvailable hook
+// adopts the master the moment it is registered — strictly stronger than
+// the old A5/G8 invariant "view exists from the activation site"), so this
+// is a no-op (reconcile) when the live capture is already in place. It
+// adopts now — the SAME code path as the hook (adoptEndpointPTY) — only
+// when the capture is absent but the endpoint has a live PTY: impossible
+// for the persistent drivers (the hook fires at launch), and present for
+// drivers without the hook (test doubles) and for a capture dropped while
+// the endpoint is live. It is a no-op unless the instance is session-
+// driven AND the endpoint is live with a PTY (PTYSize-gated — the no-PTY
+// topology is first-class, I1). The capture is observational (it never
+// owns the endpoint's lifecycle, G3/G5) and does NOT keep the instance
+// awake (A6: keep-awake is d.attached).
 func (d *Daemon) ensureEndpointView(row *InstanceRow) {
 	if d.sessionDriverFor(row) == nil {
 		return
@@ -3551,13 +3599,7 @@ func (d *Daemon) ensureEndpointView(row *InstanceRow) {
 	if master == nil {
 		return // no live endpoint, or a PTY-less endpoint (I1)
 	}
-	if _, created, err := d.terminal.attachEndpoint(row.InstanceID, master); err != nil {
-		d.Log.Warn("endpoint view attach failed", "instance", row.InstanceID,
-			"error", err.Error())
-		return
-	} else if created {
-		_ = d.state.SetInstanceConfigFingerprint(row.InstanceID, d.instanceFingerprint(row))
-	}
+	d.adoptEndpointPTY(row.InstanceID, master)
 }
 
 // attachSessionDriven is the doAttach path for a session-driven runtime
@@ -3616,14 +3658,14 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 				return err
 			}
 		}
-		// Live endpoint: observational attach (the view was ensured at the
-		// activation site — A5; ensure it idempotently).
+		// Live endpoint: observational attach (the capture was adopted at
+		// the launch site — A5 strengthened; ensure it idempotently).
 		d.ensureEndpointView(row)
 	case "working", "waking", "starting":
 		switch {
 		case d.sessions.PTYMaster(row.InstanceID) != nil:
 			// A turn is driving the live endpoint: attach observationally
-			// (the view exists from the activation site; ensure
+			// (the capture exists from the launch site; ensure
 			// idempotently).
 			d.ensureEndpointView(row)
 		case d.turnInFlight(row.InstanceID):
@@ -3707,9 +3749,11 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 //
 // Outcomes:
 //   - success: the session events are reported (started/resumed), the
-//     instance is idle (a live endpoint, no turn in flight), and the view
-//     is ensured at this activation site (A5/G8). The session id is
-//     persisted on the row only when the session is MATERIALISED (it has
+//     instance is idle (a live endpoint, no turn in flight); the capture
+//     exists from the LAUNCH site (the driver's PTYAvailable hook adopted
+//     the master at registration — A5 strengthened), and the activation
+//     site only reconciles (ensureEndpointView backstop). The session id
+//     is persisted on the row only when the session is MATERIALISED (it
 //     had a real exchange — the Materialised invariant, Codex R3): a
 //     cold-started, never-exchanged session has no durable state to
 //     resume, and persisting its minted id would make a later daemon

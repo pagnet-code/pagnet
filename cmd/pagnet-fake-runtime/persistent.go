@@ -53,6 +53,15 @@ package main
 //     re-activated endpoint services the retry normally. It is the
 //     deterministic stand-in for a vendor crash / SIGKILL / OOM landing
 //     mid-turn.
+//   - PAGNET_FAKE_TUI_BOOT_BYTES=<n>: the endpoint renders n BYTES of TUI
+//     to its PTY (chunked, a real TUI's frame cadence) BEFORE emitting the
+//     activation (session.started / resumed) event — the real qwen/codex
+//     TUIs render before session_start. With no reader on the master those
+//     writes fill the kernel PTY buffer and block, so the activation event
+//     never reaches the machine plane: the deterministic fixture for the
+//     activation deadlock (a never-read endpoint PTY). Ignored when the
+//     endpoint has no TUI PTY (PAGNET_FAKE_TUI unset — the pre-Phase-3
+//     shape) — the machine plane alone never deadlocks on itself.
 //
 // TUI (Phase 3 terminal session unification): when the endpoint OWNS a
 // controlling terminal (the daemon launches it with a PTY), a
@@ -217,6 +226,45 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	sessionPath := filepath.Join(sessionDir, "session.json")
 	prev := loadSession(sessionPath)
 
+	// TUI (human plane): open the controlling terminal when the endpoint
+	// owns one (the daemon launches it with a PTY). tty == nil degrades
+	// the TUI OFF (pre-Phase-3 shape / test): the machine plane alone
+	// carries everything. Opened BEFORE the activation emit on purpose:
+	// the boot-render fixture below writes to the PTY first, exactly like
+	// a real TUI.
+	tty := openTUI()
+
+	// PAGNET_FAKE_TUI_BOOT_BYTES=<n>: render n bytes of TUI to the PTY
+	// BEFORE the activation event (the real qwen/codex TUIs render before
+	// session_start). Written in 1 KiB chunks — a real TUI's frame
+	// cadence — so a master with no reader fills the kernel PTY buffer
+	// and blocks in write() mid-render: the deterministic fixture for the
+	// activation deadlock. With a reader (the daemon's always-on capture)
+	// the chunks drain and the activation event follows immediately.
+	if n, perr := strconv.Atoi(os.Getenv("PAGNET_FAKE_TUI_BOOT_BYTES")); perr == nil && n > 0 && tty != nil {
+		// The render is a repeating distinctive marker (a TUI's boot
+		// banner) so the drain can be asserted on the capture's ring.
+		pattern := []byte("pagnet-boot-")
+		chunk := make([]byte, 1024)
+		for i := range chunk {
+			chunk[i] = pattern[i%len(pattern)]
+		}
+		for remaining := n; remaining > 0; {
+			w := chunk
+			if remaining < len(chunk) {
+				w = chunk[:remaining]
+			}
+			if _, werr := tty.Write(w); werr != nil {
+				// The master went away (endpoint stopped during boot):
+				// exit without an activation event — the driver observes
+				// the process death, exactly like a real TUI killed
+				// mid-render.
+				return
+			}
+			remaining -= len(w)
+		}
+	}
+
 	// Activation: cold start or resume. A resume of a session with no real
 	// exchange (turns == 0) is refused honestly — there is no durable state
 	// to resume (the "materialised" boundary).
@@ -247,11 +295,10 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	turnQueue := make(chan persistCmd, 16)
 	interactionCh := make(chan persistCmd, 1)
 
-	// TUI (human plane): open the controlling terminal when the endpoint
-	// owns one (the daemon launches it with a PTY). tty == nil degrades
-	// the TUI OFF (pre-Phase-3 shape / test): the machine plane alone
-	// carries everything.
-	tty := openTUI()
+	// TUI (human plane): tty was opened at the top of runPersistent (the
+	// boot-render fixture writes to it before the activation event). tty
+	// == nil degrades the TUI OFF (pre-Phase-3 shape / test): the machine
+	// plane alone carries everything.
 	var ttyMu sync.Mutex
 	ttyDead := false
 	ttyWrite := func(s string) {
