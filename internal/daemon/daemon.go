@@ -2988,7 +2988,8 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	interactionIDs := map[string]string{}
 	// E2EE (plan §12): the per-turn runtime-output stream id (object id for
 	// the encrypted output chunks). Minted only when the instance's network
-	// is an active private network; empty otherwise (plaintext output).
+	// is an active network; otherwise network output is dropped. Unscoped
+	// representative output uses the authenticated host relay.
 	var runtimeStreamID string
 	if st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID); ok && st.Status == "active" && st.EpochID != "" {
 		runtimeStreamID = newObjectID()
@@ -3226,7 +3227,8 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 
 	// E2EE (plan §12): the per-turn runtime-output stream id (object id for
 	// the encrypted output chunks). Minted only when the instance's network
-	// is an active private network; empty otherwise (plaintext output).
+	// is an active network; otherwise network output is dropped. Unscoped
+	// representative output uses the authenticated host relay.
 	var runtimeStreamID string
 	if st, ok := d.cryptoManager().NetworkCrypto(row.NetworkID); ok && st.Status == "active" && st.EpochID != "" {
 		runtimeStreamID = newObjectID()

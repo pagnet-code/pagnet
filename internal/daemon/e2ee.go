@@ -508,10 +508,15 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 // (messages/tasks/events) are durably encrypted separately, so the turn's
 // outcome is unaffected by a dropped stream chunk.
 func (d *Daemon) sendRuntimeOutput(conn *websocket.Conn, row *InstanceRow, streamID, output string) {
-	if row.NetworkID == "" || streamID == "" {
+	if row.NetworkID == "" {
 		_ = d.send(conn, transport.MsgRuntimeOutput, map[string]any{
 			"instanceId": row.InstanceID, "output": output,
 		})
+		return
+	}
+	if streamID == "" {
+		d.Log.Warn("runtime output dropped: encrypted network has no stream identity (no plaintext path)",
+			"instance", row.InstanceID, "network", row.NetworkID)
 		return
 	}
 	st, err := d.contentCryptoReady(row.NetworkID)
