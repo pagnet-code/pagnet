@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -181,10 +182,21 @@ var (
 // (fail closed on any failure). Landlock rules persist across exec and are
 // inherited by children, so the exec'd target — and its whole tree (shells,
 // the MCP bridge the runtime spawns) — runs sandboxed.
+//
+// After validation, Apply permanently pins the calling goroutine to its
+// current OS thread, including on partial failure. The caller must exec or
+// return from that goroutine; it must never call runtime.UnlockOSThread or
+// continue unrelated work on this irreversibly restricted thread.
 func Apply(spec *Spec) error {
 	if err := spec.Normalize(); err != nil {
 		return err
 	}
+	// no_new_privs, capability bounds and Landlock are per-thread. Keep
+	// this goroutine on the same thread through all restrictions and the
+	// caller's subsequent exec. Never unlock: even partial failure may
+	// leave irreversible restrictions, and that thread must not rejoin
+	// Go's pool. A returning goroutine retires its locked OS thread.
+	runtime.LockOSThread()
 	// 1. no_new_privs — the privilege boundary: the process (and its
 	// descendants) can never gain new privileges via exec (setuid/setgid
 	// binaries, file capabilities). MUST succeed — fail closed.

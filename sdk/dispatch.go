@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -197,7 +198,13 @@ func (c *Client) handleMessageDeliver(env transport.Envelope) {
 			c.delivMu.Unlock()
 			return
 		}
-		_ = json.Unmarshal(plain, &m.Parts) // malformed parts: empty (data, not control)
+		m.Parts, err = domain.DecodeMessageContent(plain)
+		if err != nil {
+			c.delivMu.Lock()
+			delete(c.inflightDeliveries, p.MessageID)
+			c.delivMu.Unlock()
+			return // malformed content stays durable; never ACK an empty substitute
+		}
 	}
 	m.ID = p.MessageID
 	m.NetworkID = p.NetworkID

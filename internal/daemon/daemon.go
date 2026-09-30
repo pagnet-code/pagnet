@@ -2634,6 +2634,13 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 			return fmt.Errorf("decrypt delivery: %w", err)
 		}
 		p.Body = plain
+		if kind == "ask" || kind == "reply" || (p.AAD.ObjectType == "message" && p.MessageID != "") {
+			parts, err := domain.DecodeMessageContent([]byte(plain))
+			if err != nil {
+				return fmt.Errorf("decode delivery message: %w", err)
+			}
+			p.Body = domain.RenderMessageParts(parts)
+		}
 		// For tasks the acceptance criteria ride inside the envelope (the
 		// plaintext already contains them), so the separate criteria list is
 		// left empty to avoid double-rendering.
@@ -2663,8 +2670,10 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 // carries protected content that MUST be encrypted on an always-encrypted
 // network: a non-empty body, acceptance criteria, or a task reference. An
 // empty envelope-less delivery (a no-op notice) has no content to protect.
+// ASK/REPLY are content-bearing even when the relay's plaintext Body is empty:
+// losing their envelope must never start an apparently empty runtime turn.
 func deliveryHasContent(p transport.NetworkEventPayload) bool {
-	return strings.TrimSpace(p.Body) != "" || len(p.AcceptanceCriteria) > 0 || p.TaskID != ""
+	return p.Kind == "ask" || p.Kind == "reply" || strings.TrimSpace(p.Body) != "" || len(p.AcceptanceCriteria) > 0 || p.TaskID != ""
 }
 
 func dashOr(s string) string {

@@ -441,7 +441,7 @@ func (c *Client) Send(ctx context.Context, m OutgoingMessage) (string, error) {
 	if recipient == "" {
 		recipient = m.RecipientGroupID
 	}
-	partsJSON, err := json.Marshal(m.Parts)
+	partsJSON, err := domain.EncodeMessageContent(m.Parts)
 	if err != nil {
 		return "", err
 	}

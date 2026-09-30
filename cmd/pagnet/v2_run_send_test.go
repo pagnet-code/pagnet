@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -472,7 +473,8 @@ func TestSendV2MessageBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt: %v", err)
 	}
-	if string(plain) != "hello world" {
+	parts, decodeErr := domain.DecodeMessageContent(plain)
+	if decodeErr != nil || domain.RenderMessageParts(parts) != "hello world" {
 		t.Errorf("decrypted = %q, want %q", plain, "hello world")
 	}
 }

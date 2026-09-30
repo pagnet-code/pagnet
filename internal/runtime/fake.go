@@ -187,7 +187,12 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		specWire["metadata"] = spec.Metadata
 	}
 	if err := json.NewEncoder(stdin).Encode(specWire); err != nil {
-		return err
+		// A wrapper or runtime may exit before consuming stdin. Reap before
+		// reading its bounded stderr capture so the actual refusal survives
+		// instead of reducing the failure to a generic broken pipe.
+		_ = stdin.Close()
+		h.Close()
+		return fmt.Errorf("fake runtime input: %w; stderr: %s", err, stderr.Text())
 	}
 	_ = stdin.Close()
 

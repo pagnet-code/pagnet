@@ -429,6 +429,9 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 			continue
 		}
 		result, errMsg := d.relayToServer(row.InstanceID, row.AgentPrincipalID, req.Tool, encArgs)
+		if errMsg == "" {
+			result, errMsg = d.decryptMessageToolResult(row, req.Tool, result)
+		}
 		// Track the rep's active network: the daemon needs it to encrypt a
 		// rep's control tool with no explicit networkId (the server resolves
 		// the network from the rep context, but the daemon must encrypt under

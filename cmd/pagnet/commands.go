@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 )
 
@@ -439,8 +440,12 @@ is woken to receive it.`,
 				return err
 			}
 			objectID := newClientObjectID()
+			content, err := domain.EncodeMessageContent([]domain.MessagePart{domain.TextPart(text)})
+			if err != nil {
+				return err
+			}
 			env, aad, err := c.encryptClientContent(st, kr,
-				e2ee.ObjectTypeMessage, objectID, def.PrincipalID, text)
+				e2ee.ObjectTypeMessage, objectID, def.PrincipalID, string(content))
 			if err != nil {
 				return err
 			}

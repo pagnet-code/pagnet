@@ -611,7 +611,8 @@ func TestDaemon_ActiveNetworkEncryptsContent(t *testing.T) {
 		t.Fatal("plaintext body survived the rewrite")
 	}
 	plain, err := d.decryptProtected(networkID, ask.Envelope, ask.AAD)
-	if err != nil || plain != "secret hello" {
+	parts, decodeErr := domain.DecodeMessageContent([]byte(plain))
+	if err != nil || decodeErr != nil || domain.RenderMessageParts(parts) != "secret hello" {
 		t.Fatalf("round-trip = %q (err %v), want \"secret hello\"", plain, err)
 	}
 
@@ -766,7 +767,8 @@ func TestDaemon_RepDefersCryptoDecisionToControlPlane(t *testing.T) {
 		t.Fatalf("active target: rep args missing messageId/envelope: %s", outActive)
 	}
 	plain, err := d.decryptProtected(networkID, ask.Envelope, ask.AAD)
-	if err != nil || plain != "relay 84: ok" {
+	parts, decodeErr := domain.DecodeMessageContent([]byte(plain))
+	if err != nil || decodeErr != nil || domain.RenderMessageParts(parts) != "relay 84: ok" {
 		t.Fatalf("rep round-trip = %q (err %v), want \"relay 84: ok\"", plain, err)
 	}
 

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
@@ -445,6 +446,11 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 	switch tool {
 	case "network_ask", "network_reply", "control_ask", "control_reply":
 		objectType = e2ee.ObjectTypeMessage
+		content, err := domain.EncodeMessageContent([]domain.MessagePart{domain.TextPart(plainContent)})
+		if err != nil {
+			return nil, err.Error()
+		}
+		plainContent = string(content)
 		recipient, _ = m["threadId"].(string)
 	case "network_delegate", "control_delegate":
 		objectType = e2ee.ObjectTypeTask
