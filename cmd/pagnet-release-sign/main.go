@@ -52,8 +52,8 @@ func main() {
 	flag.StringVar(&out, "out", "", "output manifest path (default <dir>/pagnet-release-manifest-<version>.json)")
 	flag.Parse()
 
-	if version == "" {
-		fatalf("--version is required")
+	if !release.ValidVersion(version) {
+		fatalf("--version must be valid SemVer (e.g. v1.2.3)")
 	}
 	seedB64 := os.Getenv("PAGNET_RELEASE_SIGNING_KEY")
 	if seedB64 == "" {

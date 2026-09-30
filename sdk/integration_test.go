@@ -1063,3 +1063,32 @@ func TestCapabilityUpdateDuringAuthenticationDispatchesPendingInvocation(t *test
 		t.Fatal("live endpoint did not advertise both capabilities")
 	}
 }
+
+func TestAgentReplyCarriesOriginalMessageCorrelation(t *testing.T) {
+	fs := newFakeServer(t)
+	network := fs.createNetwork("reply-correlation", true)
+	senderID, senderCredential := fs.createPrincipal("agent", "reply-sender", network)
+	receiverID, receiverCredential := fs.createPrincipal("agent", "reply-receiver", network)
+	receiver := mustConnect(t, fs, receiverCredential, t.TempDir())
+	waitForCryptoReady(t, fs, receiverID)
+	sender := mustConnect(t, fs, senderCredential, t.TempDir())
+	waitForCryptoReady(t, fs, senderID)
+	incoming := make(chan *Message, 1)
+	receiver.Agent("reply-receiver").OnMessage(func(ctx context.Context, m *Message) error { incoming <- m; return nil })
+	messageID, err := sender.Send(testCtx(t), OutgoingMessage{NetworkID: network, RecipientPrincipalID: receiverID, Parts: []MessagePart{TextPart("question")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original *Message
+	select {
+	case original = <-incoming:
+	case <-time.After(5 * time.Second):
+		t.Fatal("missing incoming message")
+	}
+	if err := receiver.Agent("reply-receiver").Reply(testCtx(t), original, "answer"); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(fs.wireBytes(), []byte(`"correlationId":"`+messageID+`"`)) {
+		t.Fatal("reply did not preserve explicit original message reference")
+	}
+}

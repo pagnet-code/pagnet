@@ -30,7 +30,7 @@ var serverURL string
 // version is stamped at release-build time (-X main.version=$(VERSION));
 // it rides on the enroll payload so the Hosts page shows a real build
 // identity from the first heartbeat.
-var version = "dev"
+var version = ""
 
 // defaultServerURL is the build-time default control plane (ldflags,
 // -X main.defaultServerURL=...). The STANDARD PRODUCTION BUILD DEFAULT is

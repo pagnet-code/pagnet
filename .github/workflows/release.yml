@@ -26,10 +26,6 @@ jobs:
     # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
     # runner billing is broken, so CI runs on the org's own infrastructure.
     runs-on: [self-hosted, self-hosted-linux, owl-deploy]
-    env:
-      # Empty on non-tag refs (dev lane keeps `git describe`); on a v* tag
-      # this becomes the make-override that pins VERSION to the tag name.
-      RELEASE_VERSION_FLAG: ${{ startsWith(github.ref, 'refs/tags/v') && format('VERSION={0}', github.ref_name) || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +37,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Resolve one SemVer build version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_VERSION="$(sh scripts/version.sh --stable "$GITHUB_REF_NAME")"
+          else
+            RELEASE_VERSION="$(sh scripts/version.sh)"
+          fi
+          sh scripts/version.sh --validate "$RELEASE_VERSION" >/dev/null
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+          echo "building $RELEASE_VERSION"
 
       # Release runs independently of CI, including tag pushes. Never sign
       # or publish a build whose own revision fails the correctness gates.
@@ -61,7 +69,7 @@ jobs:
         # (both lanes fire on one release push), and describe then resolves
         # "dev" — which mislabeled the v0.3.0 assets on 2026-09-21. The tag
         # name IS the version there, so pass it explicitly.
-        run: make release $RELEASE_VERSION_FLAG
+        run: make release VERSION="$RELEASE_VERSION"
 
       # ARCHITECTURE PROOF: `file` on the four release binaries. The
       # release contract is four native artifacts (linux/{amd64,arm64},
@@ -82,27 +90,22 @@ jobs:
             rm -rf "$d"
           done
 
-      # Sign the release manifest (the trust anchor for the client's
-      # auto-update). The manifest is signed with the Ed25519 key from the
-      # PAGNET_RELEASE_SIGNING_KEY repo secret and published alongside the
-      # tarballs. If the secret is absent the release still publishes
-      # (unsigned) with a prominent warning — the client then refuses
-      # auto-updates by default until a signed release is published (the
-      # intended safe state, not a failure to hide).
+      # Never publish an unsigned release: the installer and updater
+      # require this pinned-key manifest, including on the rolling lane.
       - name: Sign release manifest
         env:
           PAGNET_RELEASE_SIGNING_KEY: ${{ secrets.PAGNET_RELEASE_SIGNING_KEY }}
         run: |
           if [ -z "${PAGNET_RELEASE_SIGNING_KEY}" ]; then
-            echo "::warning::PAGNET_RELEASE_SIGNING_KEY is not set — publishing an UNSIGNED release. Clients will refuse auto-updates (and manual updates) until the key is set and a signed release is published. This is the intended safe state, not a failure."
-            exit 0
+            echo "::error::PAGNET_RELEASE_SIGNING_KEY is not set — refusing to publish unsigned artifacts."
+            exit 1
           fi
-          make release-sign $RELEASE_VERSION_FLAG
+          make release-sign VERSION="$RELEASE_VERSION"
 
       - name: List artifacts
         run: |
           ls -1 dist/pagnet-*.tar.gz
-          ls -1 dist/pagnet-release-manifest-*.json 2>/dev/null || echo "(no signed manifest — unsigned release)"
+          ls -1 dist/pagnet-release-manifest-*.json
 
       # The publish steps talk to the GitHub REST API directly (curl +
       # GITHUB_TOKEN, jq) instead of the gh CLI: the shared self-hosted
@@ -139,21 +142,25 @@ jobs:
           rel=$(api -X POST "${base}/releases" \
             -H "Content-Type: application/json" \
             -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" --arg body "pagnet ${GITHUB_REF_NAME}" \
-                 '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: false, prerelease: false, body: $body}')")
+                 '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: true, prerelease: false, body: $body}')")
           rel_id=$(echo "$rel" | jq -r .id)
           fi
           # Uploads go to uploads.github.com (not the API host). The API's
           # upload_url is a template for this same path; composing it
           # directly keeps both branches on one code path.
           upload_base="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets"
-          # nullglob: an unmatched manifest glob expands to nothing, so an
-          # unsigned release uploads only the tarballs.
+          # Both binaries and the mandatory signed manifests publish together.
           for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
             # -L: the asset upload URL redirects to the storage backend.
             api -L "${upload_base}?name=$(basename "$f")" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@${f}" -o /dev/null
           done
+          # Publish/promote only after every binary and signed manifest is
+          # uploaded. The previous latest release stays available meanwhile.
+          api -X PATCH "${base}/releases/${rel_id}" \
+            -H "Content-Type: application/json" \
+            -d '{"draft":false,"prerelease":false,"make_latest":"true"}' -o /dev/null
           echo "published ${GITHUB_REF_NAME}"
 
       - name: Publish rolling dev release

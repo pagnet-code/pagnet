@@ -110,6 +110,9 @@ func CanonicalJSON(m Manifest) ([]byte, error) {
 // CanonicalJSON(m) under the private key with seed (ed25519.SeedSize
 // bytes). Used by the release signing tool, not by the updater.
 func SignManifest(m *Manifest, seed []byte) error {
+	if !ValidVersion(m.Version) {
+		return fmt.Errorf("invalid SemVer release version %q", m.Version)
+	}
 	if len(seed) != ed25519.SeedSize {
 		return fmt.Errorf("signing key seed must be %d bytes, got %d", ed25519.SeedSize, len(seed))
 	}

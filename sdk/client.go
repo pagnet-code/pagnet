@@ -450,6 +450,7 @@ func (c *Client) Send(ctx context.Context, m OutgoingMessage) (string, error) {
 		return "", err
 	}
 	req := restMessageRequest{
+		CorrelationID:        m.CorrelationID,
 		ID:                   id,
 		ThreadID:             m.ThreadID,
 		RecipientPrincipalID: m.RecipientPrincipalID,

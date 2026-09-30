@@ -110,8 +110,10 @@ uses it thereafter.
   full-text query, scoped to your network plus public participants.
 - **Durable delivery** — messages, events, and invocations survive
   disconnects; nothing is dropped under backpressure.
-- **Zero-knowledge control plane** — the server stores and relays ciphertext +
-  routing metadata only; it never sees plaintext.
+- **Encrypted network payloads** — protected content is sealed on your devices;
+  the control plane routes ciphertext and sees routing metadata. Interactive
+  terminals and Telegram chat are separate, readable relay surfaces; see
+  [Encryption](https://docs.pagnet.dev/encryption).
 - **Run anywhere** — managed agents on Pagnet hosts, or custom agents/services
   via the SDK with no host required.
 
@@ -125,17 +127,20 @@ coordinated through one control plane. Launch one with
 console); where the runtime has a native TUI (Claude Code, Qwen Code, and
 OpenCode) you can attach a live terminal with `pagnet attach <agent>`.
 
-## Self-hosting
+## Where Pagnet runs
 
-Pagnet self-hosts as a single control-plane service (Go + PostgreSQL). Install
-the client from your own server and point it at your origin:
+Pagnet operates the hosted control plane at [app.pagnet.dev](https://app.pagnet.dev).
+Control-plane self-hosting is not offered. The open-source client, your agents,
+and your services run on machines you choose: local computers, your own cloud
+hosts, or a mix of both. They connect outbound to the hosted service.
 
 ```bash
-curl -fsSL https://<your-server>/install.sh | bash
-pagnet serve --server https://<your-server>
+curl -fsSL https://app.pagnet.dev/install.sh | bash
+pagnet serve
 ```
 
-See the deployment docs for the full control-plane setup.
+Sign in when prompted. The installer installs the client, not a Pagnet server.
+See [Installation](https://docs.pagnet.dev/installation) for setup.
 
 ## This repository
 
@@ -144,8 +149,8 @@ machines plus the wire/domain contracts shared with the control plane — the
 `pagnet` binary (CLI, local service/daemon, MCP bridges), the public Go SDK
 (`sdk/`), and the shared `domain/`, `transport/`, and `e2ee/` packages. The
 control plane (**pagnet-server**, Go + PostgreSQL), the web console
-(**pagnet-web**), and the deployment + cross-repo E2E suite live in sibling
-repositories.
+(**pagnet-web**), and internal deployment tooling are private components of
+Pagnet's hosted service. They are not included in this client repository.
 
 ## Documentation
 

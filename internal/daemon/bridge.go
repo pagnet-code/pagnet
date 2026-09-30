@@ -416,7 +416,11 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		// routes on metadata without decrypting). A call that carries content
 		// on a network whose crypto is not active is refused (no plaintext
 		// path); metadata-only calls pass through unchanged.
-		encArgs, encErr := d.encryptToolArgs(row, req.Tool, req.Args)
+		resolvedArgs, encErr := d.resolveToolReferences(row, req.Tool, req.Args)
+		var encArgs json.RawMessage
+		if encErr == "" {
+			encArgs, encErr = d.encryptToolArgs(row, req.Tool, resolvedArgs)
+		}
 		if encErr != "" {
 			resp := map[string]any{"id": req.ID, "ok": false, "error": encErr}
 			if _, err := writeBridge(c, resp); err != nil {

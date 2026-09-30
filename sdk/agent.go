@@ -105,6 +105,7 @@ func (a *Agent) Reply(ctx context.Context, m *Message, body string) error {
 		return errors.New("sdk: Reply requires the message being replied to")
 	}
 	_, err := a.Send(ctx, OutgoingMessage{
+		CorrelationID:        m.ID,
 		NetworkID:            m.NetworkID,
 		ThreadID:             m.ThreadID,
 		RecipientPrincipalID: m.SenderPrincipalID,

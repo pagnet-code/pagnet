@@ -563,6 +563,9 @@ type NetworkEventPayload struct {
 	TaskID string `json:"taskId,omitempty"`
 	// FromAgent is the logical sender name (for the rendered turn prompt).
 	FromAgent string `json:"fromAgent,omitempty"`
+	// FromPrincipalID lets the daemon preserve peer identity across name changes.
+	// It becomes a local short reference in prompts, not a displayed UUID.
+	FromPrincipalID string `json:"fromPrincipalId,omitempty"`
 	// ConversationID is set for channel deliveries (a human conversation
 	// with a representative).
 	ConversationID string `json:"conversationId,omitempty"`

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"testing"
 )
@@ -32,13 +33,13 @@ func TestReleaseTarballShape(t *testing.T) {
 	}
 	out := t.TempDir()
 	cmd := exec.Command("make", "-C", root, "release",
-		"RELEASE_DIR="+out, "RELEASE_TARGETS=linux/amd64", "VERSION=shapetest")
+		"RELEASE_DIR="+out, "RELEASE_TARGETS=linux/amd64", "VERSION=v0.0.0-shapetest")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("make release: %v\n%s", err, stderr.String())
 	}
-	tarPath := filepath.Join(out, "pagnet-shapetest-linux-amd64.tar.gz")
+	tarPath := filepath.Join(out, "pagnet-v0.0.0-shapetest-linux-amd64.tar.gz")
 	f, err := os.Open(tarPath)
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +66,15 @@ func TestReleaseTarballShape(t *testing.T) {
 		names = append(names, filepath.Base(hdr.Name))
 		if filepath.Base(hdr.Name) == BinaryName {
 			pagnetMode = hdr.FileInfo().Mode()
+			binary, err := os.OpenFile(filepath.Join(out, BinaryName), os.O_CREATE|os.O_WRONLY, 0o700)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, copyErr := io.Copy(binary, tr)
+			closeErr := binary.Close()
+			if copyErr != nil || closeErr != nil {
+				t.Fatalf("extract built binary: %v, %v", copyErr, closeErr)
+			}
 		}
 	}
 	sort.Strings(names)
@@ -74,5 +84,11 @@ func TestReleaseTarballShape(t *testing.T) {
 	}
 	if pagnetMode&0o111 == 0 {
 		t.Fatalf("the pagnet member is not executable: %v", pagnetMode)
+	}
+	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
+		got, err := exec.Command(filepath.Join(out, BinaryName), "--version").CombinedOutput()
+		if err != nil || string(got) != "pagnet v0.0.0-shapetest\n" {
+			t.Fatalf("packaged binary version = %q, %v", got, err)
+		}
 	}
 }

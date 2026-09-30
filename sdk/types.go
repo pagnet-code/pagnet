@@ -221,6 +221,8 @@ func (m *Message) TextBody() string {
 // control plane (zero-knowledge: the server stores and relays ciphertext
 // only).
 type OutgoingMessage struct {
+	// CorrelationID identifies the message this reply answers.
+	CorrelationID string
 	// NetworkID is the network (required).
 	NetworkID string
 	// ThreadID continues a thread ("" = new/no thread).

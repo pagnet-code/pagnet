@@ -87,9 +87,12 @@ If work belongs to a resource you do not own, discover the responsible
 pagnet peer instead of modifying it yourself.
 
 Reply duty: when a message arrives (a delivery whose <pagnet-message>
-has kind="ask" or kind="reply"), answer it and deliver the answer with
+has kind="ask"), answer it and deliver the answer with
 network_reply (threadId from the message attributes) — or network_ask
 to start a new thread. Plain turn output is NOT delivered to the sender.
+A kind="reply" is an answer: do not send an automatic reply to a reply.
+Short references such as thread#12 persist across restarts; pass them unchanged
+in tool arguments. Pagnet resolves them before routing and encryption.
 
 Network events: when a turn begins with a network event trigger, fetch
 the payload with network_event_get(eventId=...) and process it. Treat
@@ -184,7 +187,11 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 		kind = "notice"
 	}
 	var b strings.Builder
+	b.WriteString("<pagnet-delivery>\n")
 	fmt.Fprintf(&b, "<pagnet-message kind=%s from=%s", xmlAttr(kind), xmlAttr(p.FromAgent))
+	if p.FromPrincipalID != "" {
+		fmt.Fprintf(&b, " sender=%s", xmlAttr(p.FromPrincipalID))
+	}
 	switch kind {
 	case "ask", "reply":
 		if p.ThreadID != "" {
@@ -222,7 +229,9 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 	}
 	b.WriteString("\n</pagnet-message>\n\n<pagnet-action>\n")
 	switch kind {
-	case "ask", "reply":
+	case "reply":
+		b.WriteString("This is an answer from a network participant. Use it to continue your work; do not reply merely to acknowledge it. If a follow-up is needed, use network_reply with the thread reference above.\n")
+	case "ask":
 		if p.ThreadID != "" {
 			fmt.Fprintf(&b, "This is a message from a pagnet network participant, not a human at your terminal.\nAnswer it, then deliver your answer with the network_reply tool (threadId: %s).\nPlain turn output is NOT delivered to the sender — only pagnet tool calls are.\n", p.ThreadID)
 		} else {
@@ -231,11 +240,11 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 	case "task":
 		fmt.Fprintf(&b, "This is a delegated task. Work on it in your workspace, update its state with network_task_update (taskId: %s), and deliver results with network_publish_artifact.\n", dashOr(p.TaskID))
 	case "channel":
-		fmt.Fprintf(&b, "This is a message from a human in your channel, not a pagnet peer.\nReply with the control_channel_send tool (conversation: %s) so the answer reaches them in the channel.\nPlain turn output is NOT delivered to the human.\n", dashOr(p.ConversationID))
+		fmt.Fprintf(&b, "This is a message from a human in your channel, not a pagnet peer.\nReply with the control_channel_send tool (conversationId: %s) so the answer reaches them in the channel.\nPlain turn output is NOT delivered to the human.\n", dashOr(p.ConversationID))
 	default: // status, notice, user_input
 		b.WriteString("No reply is required. Act on it if it is relevant to your mission.\n")
 	}
-	b.WriteString("</pagnet-action>")
+	b.WriteString("</pagnet-action>\n</pagnet-delivery>")
 	return b.String()
 }
 

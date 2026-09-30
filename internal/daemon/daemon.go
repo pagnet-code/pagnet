@@ -2672,7 +2672,10 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	// routing attributes + the immediate action for this delivery kind,
 	// so the agent always knows this is a network message and HOW to
 	// answer it — not just the rendered text.
-	input := deliveryInput(row, p)
+	input, err := d.compactDeliveryInput(row, p)
+	if err != nil {
+		return err
+	}
 	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
 	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, kind))
 }

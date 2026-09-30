@@ -68,6 +68,13 @@ func OpenState(path string) (*State, error) {
 			detached_at TEXT NOT NULL,
 			PRIMARY KEY (instance_id, session_id)
 		);
+		CREATE TABLE IF NOT EXISTS message_references (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			owner TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			canonical TEXT NOT NULL,
+			UNIQUE(owner, kind, canonical)
+		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL

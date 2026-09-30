@@ -192,6 +192,7 @@ func (r *restClient) networks(ctx context.Context) ([]NetworkInfo, error) {
 // the ciphertext). The response is the full domain.Message (PascalCase ID).
 
 type restMessageRequest struct {
+	CorrelationID        string                  `json:"correlationId,omitempty"`
 	ID                   string                  `json:"id"`
 	ThreadID             string                  `json:"threadId,omitempty"`
 	RecipientPrincipalID string                  `json:"recipientPrincipalId,omitempty"`

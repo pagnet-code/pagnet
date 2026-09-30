@@ -235,7 +235,7 @@ func TestDeliveryInputEnvelope(t *testing.T) {
 	})
 	for _, want := range []string{
 		`conversation="conv-7"`,
-		"control_channel_send tool (conversation: conv-7)",
+		"control_channel_send tool (conversationId: conv-7)",
 		"NOT delivered to the human",
 	} {
 		if !strings.Contains(in, want) {
