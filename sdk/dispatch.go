@@ -126,6 +126,18 @@ func (c *Client) registerCapability(cap Capability, h CapHandler, typed reflect.
 			base.Metadata = old.capability.Metadata
 		}
 	}
+	// Validate before changing the registry or disconnecting a working endpoint.
+	// A malformed RawMessage otherwise makes every future registration fail.
+	if _, err := json.Marshal(base); err != nil {
+		c.handlerMu.Unlock()
+		return fmt.Errorf("sdk: invalid capability descriptor: %w", err)
+	}
+	for _, schema := range []json.RawMessage{base.InputSchema, base.OutputSchema} {
+		if _, err := c.schemas.compile(schema); err != nil {
+			c.handlerMu.Unlock()
+			return err
+		}
+	}
 	reg := capRegistration{capability: base, handler: h, typed: typed, inputType: inputType}
 	// A zero (invalid) reflect.Value means "no typed handler provided".
 	// IsValid() is used (not IsZero(), which panics on a zero Value).

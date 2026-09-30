@@ -82,6 +82,9 @@ func (c *schemaCache) compile(schema json.RawMessage) (*jsonschema.Schema, error
 		return nil, fmt.Errorf("sdk: capability schema is not valid JSON: %w", err)
 	}
 	compiler := jsonschema.NewCompiler()
+	// Schemas exchanged between participants must be self-contained. Built-in
+	// metaschemas and embedded $defs remain supported; no file or network I/O.
+	compiler.UseLoader(jsonschema.SchemeURLLoader{})
 	if err := compiler.AddResource("urn:pagnet:capability-schema", doc); err != nil {
 		return nil, fmt.Errorf("sdk: add capability schema: %w", err)
 	}

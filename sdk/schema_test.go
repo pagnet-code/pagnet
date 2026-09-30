@@ -2,6 +2,9 @@ package sdk
 
 import (
 	"encoding/json"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -69,5 +72,20 @@ func TestSchemaCacheReusesCompiledSchema(t *testing.T) {
 	c.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("schema cache holds %d entries, want 1 (compiled once)", n)
+	}
+}
+
+func TestSchemaRejectsExternalFilesAndKeepsEmbeddedDefinitions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private.json")
+	if err := os.WriteFile(path, []byte(`{"type":"string"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+	external, _ := json.Marshal(map[string]string{"$ref": fileURL})
+	if _, err := newSchemaCache().compile(external); err == nil {
+		t.Fatal("external file schema loaded")
+	}
+	if _, err := newSchemaCache().compile(json.RawMessage(`{"$defs":{"text":{"type":"string"}},"$ref":"#/$defs/text"}`)); err != nil {
+		t.Fatalf("embedded schema reference rejected: %v", err)
 	}
 }

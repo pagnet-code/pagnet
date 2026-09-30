@@ -281,7 +281,7 @@ func serviceCmd() *cobra.Command {
 		Use:   "service",
 		Short: "Create and connect services (onboarding) and manage their credentials",
 	}
-	cmd.AddCommand(serviceCreateCmd(), serviceConnectCmd(), credentialParentCmd(principalService))
+	cmd.AddCommand(serviceCreateCmd(), serviceConnectCmd(), credentialParentCmd(principalService), jevServiceCmd())
 	return cmd
 }
 
