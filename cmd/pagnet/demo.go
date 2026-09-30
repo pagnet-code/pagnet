@@ -116,10 +116,12 @@ func runDemo(c *cliCtx, network, webURL string) error {
 	fmt.Printf("workspace: %s\n", workspaceID)
 
 	// 3. Agents: resource + definition (idempotent) + fake instance launch.
+	//    The role is the name suffix (the V2 agent contract has no profile
+	//    field — the same reason `pagnet run` keeps --role name-only).
 	type demoAgent struct {
-		name, role string
+		name string
 	}
-	agents := []demoAgent{{"demo-planner", "planner"}, {"demo-coder", "coder"}, {"demo-reviewer", "reviewer"}}
+	agents := []demoAgent{{"demo-planner"}, {"demo-coder"}, {"demo-reviewer"}}
 	type launched struct {
 		name, defID, instID string
 	}
@@ -131,7 +133,7 @@ func runDemo(c *cliCtx, network, webURL string) error {
 		if err := c.post("/api/v1/networks/"+netID+"/resources", map[string]any{"key": "demo-software"}, &res); err != nil {
 			return fmt.Errorf("resource: %w", err)
 		}
-		defID, err := c.ensureAgentDef(netID, a.name, a.role, res.ID)
+		defID, err := c.ensureAgentDef(netID, a.name, res.ID)
 		if err != nil {
 			return err
 		}
@@ -231,8 +233,8 @@ func runDemo(c *cliCtx, network, webURL string) error {
 }
 
 // ensureAgentDef returns the agent definition id for name, creating it (bound
-// to resourceID) when absent.
-func (c *cliCtx) ensureAgentDef(netID, name, role, resourceID string) (string, error) {
+// to resourceID, fake runtime — the demo is a debug tool) when absent.
+func (c *cliCtx) ensureAgentDef(netID, name, resourceID string) (string, error) {
 	var agents []struct {
 		ID   string `json:"ID"`
 		Name string `json:"Name"`
@@ -248,18 +250,8 @@ func (c *cliCtx) ensureAgentDef(netID, name, role, resourceID string) (string, e
 	var created struct {
 		ID string `json:"ID"`
 	}
-	if err := c.post("/api/v1/networks/"+netID+"/agents", map[string]any{
-		"name":    name,
-		"runtime": "fake",
-		"profile": role,
-		"capabilities": []any{
-			map[string]any{"id": "code", "name": "code", "description": "reads and writes code in this repository"},
-		},
-		"executionSettings": map[string]any{"access": "read_write"},
-		"responsibilities": []any{
-			map[string]any{"resourceId": resourceID, "actions": []string{"implement", "review", "advise"}},
-		},
-	}, &created); err != nil {
+	if err := c.post("/api/v1/networks/"+netID+"/agents",
+		agentCreateBody(name, "fake", "read_write", resourceID), &created); err != nil {
 		return "", fmt.Errorf("create agent %s: %w", name, err)
 	}
 	return created.ID, nil

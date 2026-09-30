@@ -440,12 +440,19 @@ activation credential (one-time — save it now, it is shown only once):
 
 // --- client-side E2EE (D6) ---------------------------------------------------------
 
-// activeCryptoHost prepares a HOME-like state dir with an ACTIVE announced
-// network + the local keyring, and returns the state dir, network id, and
-// active epoch id.
+// activeCryptoHost prepares a fresh state dir with an ACTIVE announced
+// network + the local keyring (the state a crypto-active daemon leaves in
+// its state dir), and returns the state dir and the active epoch id.
 func activeCryptoHost(t *testing.T, networkID, tenantID string) (stateDir, epochID string) {
 	t.Helper()
-	stateDir = t.TempDir()
+	stateDir, epochID, _ = activateNetworkState(t, t.TempDir(), networkID, tenantID)
+	return stateDir, epochID
+}
+
+// activateNetworkState is activeCryptoHost with a caller-provided state dir
+// (and the epoch key, for decrypt assertions).
+func activateNetworkState(t *testing.T, stateDir, networkID, tenantID string) (string, string, [32]byte) {
+	t.Helper()
 	kr, err := crypto.ActivateNetwork(stateDir, tenantID, networkID, time.Now())
 	if err != nil {
 		t.Fatalf("ActivateNetwork: %v", err)
@@ -453,6 +460,10 @@ func activeCryptoHost(t *testing.T, networkID, tenantID string) (stateDir, epoch
 	epoch, err := kr.ActiveEpoch()
 	if err != nil {
 		t.Fatalf("ActiveEpoch: %v", err)
+	}
+	key, err := epoch.KeyArray()
+	if err != nil {
+		t.Fatalf("KeyArray: %v", err)
 	}
 	db, err := daemon.OpenState(filepath.Join(stateDir, "daemon.sqlite"))
 	if err != nil {
@@ -465,7 +476,7 @@ func activeCryptoHost(t *testing.T, networkID, tenantID string) (stateDir, epoch
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	return stateDir, epoch.ID
+	return stateDir, epoch.ID, key
 }
 
 func announceNetworkState(t *testing.T, stateDir, networkID, tenantID, status, epochID string) {

@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/pagnet-code/pagnet/e2ee"
 )
 
 func listCmd() *cobra.Command {
@@ -325,14 +327,88 @@ func statusCmd() *cobra.Command {
 	return cmd
 }
 
+// agentDefinitionView is the V2 agent definition as the control plane
+// renders it (store.AgentDefinitionView: the domain fields marshal their Go
+// names; Name/PrincipalID come from the agent principal).
+type agentDefinitionView struct {
+	ID          string `json:"ID"`
+	Name        string `json:"Name"`
+	PrincipalID string `json:"PrincipalID"`
+}
+
+func (c *cliCtx) agentDefinition(netID, nameOrID string) (*agentDefinitionView, error) {
+	var agents []agentDefinitionView
+	if err := c.get("/api/v1/networks/"+netID+"/agents", &agents); err != nil {
+		return nil, err
+	}
+	for i := range agents {
+		if agents[i].Name == nameOrID || agents[i].ID == nameOrID {
+			return &agents[i], nil
+		}
+	}
+	return nil, fmt.Errorf("%q is not an agent in this network (pagnet list agents)", nameOrID)
+}
+
+// agentInstanceView is one instance of a definition (domain.AgentInstance
+// marshals its Go field names).
+type agentInstanceView struct {
+	ID     string `json:"ID"`
+	Status string `json:"Status"`
+	HostID string `json:"HostID"`
+}
+
+func (c *cliCtx) definitionInstances(netID, defID string) ([]agentInstanceView, error) {
+	var insts []agentInstanceView
+	if err := c.get("/api/v1/networks/"+netID+"/agents/"+defID+"/instances", &insts); err != nil {
+		return nil, err
+	}
+	return insts, nil
+}
+
+// selectSendInstance applies the send addressing rule: exactly one instance
+// is the delivery target; several require --instance (the choices are
+// listed); none is a clear error (launch first). An explicit --instance must
+// name one of THIS agent's instances (the server would deliver an
+// instance-id to whatever agent owns it).
+func selectSendInstance(agentName, instance string, insts []agentInstanceView) (*agentInstanceView, error) {
+	if len(insts) == 0 {
+		return nil, fmt.Errorf("agent %s has no instance in this network — launch it first (`pagnet run <dir> --name %s`, or the console)", agentName, agentName)
+	}
+	if instance != "" {
+		for i := range insts {
+			if insts[i].ID == instance {
+				return &insts[i], nil
+			}
+		}
+		return nil, fmt.Errorf("instance %s is not one of agent %s's instances", instance, agentName)
+	}
+	if len(insts) == 1 {
+		return &insts[0], nil
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "agent %s has %d instances — choose one with --instance <id> (see `pagnet list instances`):\n", agentName, len(insts))
+	for _, i := range insts {
+		fmt.Fprintf(&sb, "  %s  %s\n", i.ID, i.Status)
+	}
+	return nil, errors.New(strings.TrimRight(sb.String(), "\n"))
+}
+
 func sendCmd() *cobra.Command {
-	var network, kind string
+	var network, kind, instance, stateDir string
 	cmd := &cobra.Command{
 		Use:   "send <agent> <message...>",
-		Short: "Send a network message to an agent",
-		Args:  cobra.MinimumNArgs(2),
+		Short: "Send a network message to an agent (encrypted end-to-end on this host)",
+		Long: `Send a durable message to an agent in the network. The text is encrypted
+on this host before it crosses the boundary (the V2 server rejects
+plaintext content); only the envelope + verbatim AAD travel.
+
+The agent's name is resolved to its instance(s): with exactly one instance
+it is the delivery target; with several, --instance <id> picks one; with
+none, launch the agent first. The message is durable: a sleeping instance
+is woken to receive it.`,
+		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newCLI("")
+			c, err := newCLI(stateDir)
 			if err != nil {
 				return err
 			}
@@ -340,16 +416,56 @@ func sendCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var m struct {
-				ID          string  `json:"ID"`
-				RecipientID *string `json:"RecipientInstanceID"`
-			}
-			if err := c.post("/api/v1/networks/"+netID+"/messages", map[string]any{
-				"recipientAgent": args[0],
-				"kind":           kind,
-				"text":           strings.Join(args[1:], " "),
-			}, &m); err != nil {
+			def, err := c.agentDefinition(netID, args[0])
+			if err != nil {
 				return err
+			}
+			insts, err := c.definitionInstances(netID, def.ID)
+			if err != nil {
+				return err
+			}
+			target, err := selectSendInstance(args[0], instance, insts)
+			if err != nil {
+				return err
+			}
+			text := strings.Join(args[1:], " ")
+			// Client-side E2EE (the same path as invoke / event publish):
+			// the content never crosses the boundary in plaintext. A
+			// network that is not crypto-active fails with the clear
+			// not-ready error. The AAD's recipient is the addressed
+			// principal (the binding the console and SDK use).
+			st, kr, err := c.clientCrypto(netID)
+			if err != nil {
+				return err
+			}
+			objectID := newClientObjectID()
+			env, aad, err := c.encryptClientContent(st, kr,
+				e2ee.ObjectTypeMessage, objectID, def.PrincipalID, text)
+			if err != nil {
+				return err
+			}
+			// The V2 message body (api_messages.go, strict decode): the
+			// recipient is the agent's principal, the delivery is pinned to
+			// the resolved instance (the server wakes it if sleeping), and
+			// the content rides the client-encrypted envelope. The sender is
+			// ALWAYS the authenticated actor — senderInstanceId is refused
+			// by the server and never sent.
+			body := map[string]any{
+				"kind":                 kind,
+				"recipientPrincipalId": def.PrincipalID,
+				"recipientInstanceId":  target.ID,
+				"id":                   objectID,
+				"envelope":             env,
+				"aad":                  aad,
+			}
+			var m struct {
+				ID string `json:"ID"`
+			}
+			if err := c.post("/api/v1/networks/"+netID+"/messages", body, &m); err != nil {
+				return err
+			}
+			if m.ID == "" {
+				m.ID = objectID // the client-minted id the server adopts
 			}
 			fmt.Printf("message %s sent to %s (delivery: durable; the agent is woken if sleeping)\n", m.ID, args[0])
 			return nil
@@ -357,6 +473,8 @@ func sendCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
 	cmd.Flags().StringVar(&kind, "kind", "ASK", "message kind: ASK|REPLY|NOTICE|STATUS")
+	cmd.Flags().StringVar(&instance, "instance", "", "deliver to this instance id (required when the agent has several instances)")
+	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir with the login (default ~/.pagnet)")
 	return cmd
 }
 

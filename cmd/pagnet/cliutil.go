@@ -267,19 +267,29 @@ type wsEntry struct {
 	ResourceID *string `json:"ResourceID"`
 }
 
+// hostRuntime is one runtime installation from the host's daemon inventory
+// (GET /hosts/{id} → "runtimes", the domain.RuntimeInstallation list — it
+// marshals its Go field names). The daemon reports only runtimes it can
+// actually drive; the fake runtimes appear only on a debug daemon.
+type hostRuntime struct {
+	Runtime string `json:"Runtime"`
+	Version string `json:"Version"`
+}
+
 type cliHost struct {
-	ID         string    `json:"ID"`
-	Name       string    `json:"Name"`
-	Status     string    `json:"Status"`
-	OS         string    `json:"OS"`
-	Arch       string    `json:"Arch"`
-	DaemonVer  string    `json:"DaemonVersion"`
-	CPUCount   int       `json:"CPUCount"`
-	CPULoad    float64   `json:"CPULoad"`
-	MemTotal   int64     `json:"MemTotalBytes"`
-	MemUsed    int64     `json:"MemUsedBytes"`
-	LastBeat   *string   `json:"LastHeartbeatAt"`
-	Workspaces []wsEntry `json:"workspaces"`
+	ID         string        `json:"ID"`
+	Name       string        `json:"Name"`
+	Status     string        `json:"Status"`
+	OS         string        `json:"OS"`
+	Arch       string        `json:"Arch"`
+	DaemonVer  string        `json:"DaemonVersion"`
+	CPUCount   int           `json:"CPUCount"`
+	CPULoad    float64       `json:"CPULoad"`
+	MemTotal   int64         `json:"MemTotalBytes"`
+	MemUsed    int64         `json:"MemUsedBytes"`
+	LastBeat   *string       `json:"LastHeartbeatAt"`
+	Workspaces []wsEntry     `json:"workspaces"`
+	Runtimes   []hostRuntime `json:"runtimes"`
 }
 
 // hostDetail fetches one host WITH its workspaces/roots/runtimes (the
@@ -291,7 +301,8 @@ func (c *cliCtx) hostDetail(hostID string) (*cliHost, error) {
 			Name   string `json:"Name"`
 			Status string `json:"Status"`
 		} `json:"host"`
-		Workspaces []wsEntry `json:"workspaces"`
+		Workspaces []wsEntry     `json:"workspaces"`
+		Runtimes   []hostRuntime `json:"runtimes"`
 	}
 	if err := c.get("/api/v1/hosts/"+hostID, &d); err != nil {
 		return nil, err
@@ -301,6 +312,7 @@ func (c *cliCtx) hostDetail(hostID string) (*cliHost, error) {
 		Name:       d.Host.Name,
 		Status:     d.Host.Status,
 		Workspaces: d.Workspaces,
+		Runtimes:   d.Runtimes,
 	}, nil
 }
 
