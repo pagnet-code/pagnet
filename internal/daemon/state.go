@@ -62,6 +62,12 @@ func OpenState(path string) (*State, error) {
 			agent_principal_id TEXT NOT NULL DEFAULT '',
 			capabilities TEXT NOT NULL DEFAULT ''
 		);
+		CREATE TABLE IF NOT EXISTS detached_terminals (
+			instance_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			detached_at TEXT NOT NULL,
+			PRIMARY KEY (instance_id, session_id)
+		);
 		CREATE TABLE IF NOT EXISTS kv (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -138,7 +144,26 @@ func (s *State) PruneProcessed(before time.Time) error {
 	_, err := s.db.Exec(
 		`DELETE FROM processed_commands WHERE processed_at < ?`,
 		before.UTC().Format(time.RFC3339))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`DELETE FROM detached_terminals WHERE detached_at < ?`, before.UTC().Format(time.RFC3339))
 	return err
+}
+
+// MarkTerminalDetached prevents an already-dispatched/deferred attach from
+// resurrecting a terminal after its browser has left, including on restart.
+func (s *State) MarkTerminalDetached(instanceID, sessionID string) error {
+	_, err := s.db.Exec(`INSERT INTO detached_terminals (instance_id, session_id, detached_at)
+		VALUES (?, ?, ?) ON CONFLICT (instance_id, session_id) DO UPDATE SET detached_at=excluded.detached_at`,
+		instanceID, sessionID, time.Now().UTC().Format(time.RFC3339))
+	return err
+}
+
+func (s *State) TerminalDetached(instanceID, sessionID string) (bool, error) {
+	var found int
+	err := s.db.QueryRow(`SELECT count(*) FROM detached_terminals WHERE instance_id=? AND session_id=?`, instanceID, sessionID).Scan(&found)
+	return found != 0, err
 }
 
 // InstanceRow is the daemon's local view of a managed instance.

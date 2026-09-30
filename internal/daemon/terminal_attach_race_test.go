@@ -276,11 +276,17 @@ func TestDaemon_AttachDuringInFlightActivation(t *testing.T) {
 		t.Fatal("the activation did not settle after the gate was released")
 	}
 
-	// (4) The re-sent attach SUCCEEDS (the activation is settled) and ends
-	// with a live capture bound to the settled endpoint's master (this
-	// double has no launch-site hook, so the capture is adopted by the
-	// ensureEndpointView backstop or by attachEndpoint's no-capture path —
-	// the same adoptEndpoint code path).
+	// A delayed retry for the canceled browser session must remain a no-op.
+	if err := d.doAttach(nil, attachP); err != nil {
+		t.Fatalf("canceled retry: %v", err)
+	}
+	if d.attached(instanceID) {
+		t.Fatal("a canceled deferred attach resurrected a ghost keep-awake view")
+	}
+	// A new browser session attaches to the settled endpoint normally.
+	attachP.SessionID = "sess-2"
+	attachP.CommandID = "cmd-race-fresh-attach"
+
 	err = d.doAttach(nil, attachP)
 	if err != nil {
 		t.Fatalf("re-sent attach after the activation settled = %v, want nil (a live capture)", err)

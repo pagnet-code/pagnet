@@ -42,6 +42,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Release runs independently of CI, including tag pushes. Never sign
+      # or publish a build whose own revision fails the correctness gates.
+      - name: Verify release revision
+        run: |
+          go vet ./...
+          go test -count=1 -race ./...
+
       # Cross-compiles the unified pagnet binary for
       # linux/{amd64,arm64} and darwin/{amd64,arm64} into dist/
       # (one executable + LICENSE + README per tarball), plus the stable

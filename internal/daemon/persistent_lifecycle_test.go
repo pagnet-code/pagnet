@@ -119,7 +119,7 @@ func driveLaunch(t *testing.T, d *Daemon, server *websocket.Conn, p transport.La
 }
 
 // waitForEndpointLive waits until the instance's session-driven endpoint is
-// live AND the background launch-time activation has SETTLED. The launch
+// live AND its initial background launch-time activation has SETTLED. The launch
 // acks before the activation settles, so a test that asserts endpoint or
 // status state after driveLaunch must wait for the settle first.
 //
@@ -133,15 +133,18 @@ func driveLaunch(t *testing.T, d *Daemon, server *websocket.Conn, p transport.La
 // the status write is final.
 func waitForEndpointLive(t *testing.T, d *Daemon, instanceID string) {
 	t.Helper()
-	base := d.settleGeneration(instanceID)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if d.settleGeneration(instanceID) > base {
+		// Activation may finish before this helper starts. Every caller
+		// waits on a freshly launched instance, whose initial generation
+		// is zero; sampling the current value would wait for a second
+		// activation that will never happen.
+		if d.settleGeneration(instanceID) > 0 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if d.settleGeneration(instanceID) <= base {
+	if d.settleGeneration(instanceID) == 0 {
 		t.Fatalf("endpoint for %s never settled", instanceID)
 	}
 	if pid := d.sup.EndpointPID(instanceID); pid == nil || !proc.ProcessAlive(*pid) {

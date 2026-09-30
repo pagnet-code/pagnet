@@ -3833,6 +3833,12 @@ func (d *Daemon) attached(instanceID string) bool {
 // so the (re)connecting client renders history before live output.
 // Detach later is observational: the PTY keeps running (§10).
 func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayload) error {
+	if detached, err := d.state.TerminalDetached(p.InstanceID, p.SessionID); err != nil {
+		return err
+	} else if detached {
+		return nil // canceled attach: ack it without reviving a keep-awake view
+	}
+
 	row, ok, err := d.state.GetInstance(p.InstanceID)
 	if err != nil {
 		return err
@@ -3889,6 +3895,10 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 // to normal hibernation only if no PTY is active (§35: do not hibernate
 // underneath an attached user or a live terminal).
 func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayload) error {
+	if err := d.state.MarkTerminalDetached(p.InstanceID, p.SessionID); err != nil {
+		return err
+	}
+
 	last := d.removeAttach(p.InstanceID, p.SessionID)
 	if !last {
 		// Either other clients still hold this instance's shared PTY, or

@@ -119,6 +119,9 @@ func TestDaemon_EndpointCapturePreventsActivationDeadlock(t *testing.T) {
 	// the boot write and never settle).
 	waitForRing(t, d, instanceID, []string{"pagnet-boot-"}, 10*time.Second)
 	waitForEndpointLive(t, d, instanceID)
+	// Waiting after activation has already settled must remain valid.
+	// This also covers a loaded CI worker that schedules the first wait late.
+	waitForEndpointLive(t, d, instanceID)
 	if pid := d.sup.EndpointPID(instanceID); pid == nil {
 		t.Fatal("no live endpoint after the activation (the boot render must not starve session_start)")
 	}
