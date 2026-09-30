@@ -12,7 +12,7 @@ import (
 
 // ValidateListen refuses wildcard, LAN and hostname binds. HTTP is only a
 // backend for a secure tunnel or TLS/OAuth gateway, not a public auth server.
-func ValidateListen(addr, token string) error {
+func ValidateBind(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("external MCP: listen requires an IP:port: %w", err)
@@ -20,6 +20,13 @@ func ValidateListen(addr, token string) error {
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("external MCP: HTTP listener must bind a literal loopback IP")
+	}
+	return nil
+}
+
+func ValidateListen(addr, token string) error {
+	if err := ValidateBind(addr); err != nil {
+		return err
 	}
 	if len(token) < 32 || strings.ContainsAny(token, " \t\r\n") {
 		return fmt.Errorf("external MCP: PAGNET_MCP_HTTP_TOKEN requires at least 32 characters without whitespace")
@@ -34,12 +41,7 @@ func HTTPHandler(s *server.MCPServer, token string) http.Handler {
 	next := server.NewStreamableHTTPServer(s)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() || r.Header.Get("Origin") != "" {
+		if !trustedBackendRequest(r) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
@@ -55,4 +57,13 @@ func HTTPHandler(s *server.MCPServer, token string) http.Handler {
 		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func trustedBackendRequest(r *http.Request) bool {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback() && r.Header.Get("Origin") == ""
 }

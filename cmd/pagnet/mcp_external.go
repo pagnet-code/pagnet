@@ -15,7 +15,7 @@ import (
 )
 
 func mcpExternalCmd() *cobra.Command {
-	var network, listen string
+	var network, listen, publicURL, issuer, introspection, subject string
 	var grants []string
 	cmd := &cobra.Command{Use: "external", Short: "Independent principal MCP bridge for external agents and plugins", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		cfg := externalbridge.Config{Network: network, Grants: grants}
@@ -24,8 +24,25 @@ func mcpExternalCmd() *cobra.Command {
 			return err
 		}
 		token := os.Getenv("PAGNET_MCP_HTTP_TOKEN")
+		oauth := externalbridge.OAuthConfig{ResourceURL: publicURL, Issuer: issuer, IntrospectionURL: introspection, Subject: subject, ClientID: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_ID"), ClientSecret: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_SECRET"), AllowInvoke: len(grants) > 0}
+		useOAuth := publicURL != "" || issuer != "" || introspection != "" || subject != ""
+		if useOAuth {
+			if listen == "" {
+				return errors.New("external MCP: OAuth requires --listen behind a public HTTPS proxy")
+			}
+			if token != "" {
+				return errors.New("external MCP: OAuth and shared bearer modes are mutually exclusive")
+			}
+			if err := oauth.Validate(); err != nil {
+				return err
+			}
+		}
 		if listen != "" {
-			if err := externalbridge.ValidateListen(listen, token); err != nil {
+			if useOAuth {
+				if err := externalbridge.ValidateBind(listen); err != nil {
+					return err
+				}
+			} else if err := externalbridge.ValidateListen(listen, token); err != nil {
 				return err
 			}
 		}
@@ -62,7 +79,14 @@ func mcpExternalCmd() *cobra.Command {
 		if listen == "" {
 			return server.ServeStdio(bridge.Server())
 		}
-		httpServer := &http.Server{Addr: listen, Handler: externalbridge.HTTPHandler(bridge.Server(), token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		handler := externalbridge.HTTPHandler(bridge.Server(), token)
+		if useOAuth {
+			handler, err = externalbridge.OAuthHTTPHandler(bridge.Server(), oauth)
+			if err != nil {
+				return err
+			}
+		}
+		httpServer := &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 		done := make(chan struct{})
 		defer close(done)
 		go func() {
@@ -83,5 +107,9 @@ func mcpExternalCmd() *cobra.Command {
 	cmd.Flags().StringVar(&network, "network", "", "fixed network UUID (required)")
 	cmd.Flags().StringSliceVar(&grants, "allow-invoke", nil, "exact PRINCIPAL_UUID/CAPABILITY_ID grant (repeatable; default discovery only)")
 	cmd.Flags().StringVar(&listen, "listen", "", "optional loopback IP:port for streamable HTTP at /mcp; requires PAGNET_MCP_HTTP_TOKEN")
+	cmd.Flags().StringVar(&publicURL, "oauth-resource", "", "canonical public HTTPS /mcp URL; enables established-provider OAuth mode")
+	cmd.Flags().StringVar(&issuer, "oauth-issuer", "", "exact OAuth authorization issuer URL")
+	cmd.Flags().StringVar(&introspection, "oauth-introspection", "", "HTTPS RFC7662 endpoint on issuer origin")
+	cmd.Flags().StringVar(&subject, "oauth-subject", "", "exact provider subject allowed to use this dedicated principal")
 	return cmd
 }
