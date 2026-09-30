@@ -566,30 +566,17 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		persistentFake.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		sessions.RegisterDriver(persistentFake)
 	}
-	// The Qwen Dual Output persistent driver (runtime-lifecycle
-	// refactor, Phase 4): ONE long-lived qwen TUI per instance, driven
-	// through the session core. It is registered when the qwen binary is
-	// resolvable (binary presence only — no --version subprocess at
-	// boot). Wave B removed the legacy process-per-turn Qwen adapter:
-	// qwen-code is session-driven whenever the binary resolves (the
-	// daemon routes a qwen instance to the persistent path when a
-	// session driver is registered for it).
+	// Register built-in persistent drivers independently of installation.
+	// Inventory and launch availability resolve the binary each time, so a
+	// runtime installed after startup becomes usable on the next host rescan
+	// without replacing drivers or disturbing their live sessions.
 	qwenPersistent := agentruntime.NewQwenPersistent("")
 	qwenPersistent.Env = cfg.RuntimeEnv
-	qwenPersistentRegistered := qwenPersistent.Available()
-	if qwenPersistentRegistered {
-		sessions.RegisterDriver(qwenPersistent)
-	}
-	// The Codex persistent driver (Wave 4): ONE long-lived
-	// `codex app-server --stdio` process per instance, driven over
-	// JSON-RPC through the session core. Registered when the codex
-	// binary is resolvable (binary presence only — same rule as qwen).
+	sessions.RegisterDriver(qwenPersistent)
+	// Codex owns one long-lived app-server process per instance.
 	codexPersistent := agentruntime.NewCodexPersistent("")
 	codexPersistent.Env = cfg.RuntimeEnv
-	codexPersistentRegistered := codexPersistent.Available()
-	if codexPersistentRegistered {
-		sessions.RegisterDriver(codexPersistent)
-	}
+	sessions.RegisterDriver(codexPersistent)
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
 	// registry/launch-gate/cleanup path for every turn process and PTY
 	// session this daemon owns. Limits come from the daemon Config (set by
@@ -611,15 +598,11 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	}
 	// The Qwen Dual Output driver owns its long-lived endpoint process
 	// through the supervisor's ClassEndpoint path (the same seam).
-	if qwenPersistentRegistered {
-		qwenPersistent.SetLifecycle(sup)
-	}
+	qwenPersistent.SetLifecycle(sup)
 	// The Codex persistent driver owns its long-lived app-server
 	// endpoint process through the supervisor's ClassEndpoint path
 	// (the same seam).
-	if codexPersistentRegistered {
-		codexPersistent.SetLifecycle(sup)
-	}
+	codexPersistent.SetLifecycle(sup)
 	// Bounded helper-command executor (§37) for git/version/worktree probes.
 	helper := proc.NewHelper(0)
 	turnCtx, turnCancel := context.WithCancel(context.Background())
@@ -662,12 +645,8 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if persistentFake != nil {
 		persistentFake.PTYAvailable = d.adoptEndpointPTY
 	}
-	if qwenPersistentRegistered {
-		qwenPersistent.PTYAvailable = d.adoptEndpointPTY
-	}
-	if codexPersistentRegistered {
-		codexPersistent.PTYAvailable = d.adoptEndpointPTY
-	}
+	qwenPersistent.PTYAvailable = d.adoptEndpointPTY
+	codexPersistent.PTYAvailable = d.adoptEndpointPTY
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
