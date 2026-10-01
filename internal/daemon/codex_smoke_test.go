@@ -299,6 +299,10 @@ func startWhoamiRelay(t *testing.T, server *websocket.Conn, instanceID, networkI
 }
 
 func TestCodexRealSmoke(t *testing.T) {
+	if os.Getenv("PAGNET_NATIVE_SMOKE") != "1" {
+		t.Skip("real provider smoke is opt-in; run PAGNET_NATIVE_SMOKE=1 go test ./internal/daemon -run '^TestCodexRealSmoke$' (may consume provider credits)")
+	}
+
 	codexBin := codexSmokeBinary()
 	if codexBin == "" {
 		t.Skip("real codex binary not resolvable; skipping the real smoke")
