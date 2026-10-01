@@ -28,3 +28,15 @@ func TestChannelPresentationAndTaskResume(t *testing.T) {
 		t.Fatal("resume missing honest workflow instructions")
 	}
 }
+
+func TestTaskOfferRequiresClaimBeforeWork(t *testing.T) {
+	row := &InstanceRow{Kind: "worker"}
+	text := deliveryInput(row, transport.NetworkEventPayload{Kind: "task", TaskID: "task-1"})
+	if !strings.Contains(text, "Before doing any task work, claim this offer") || !strings.Contains(text, "do not execute it") {
+		t.Fatal("task offer allows work without a successful claim")
+	}
+	text = deliveryInput(row, transport.NetworkEventPayload{Kind: "task", TaskID: "task-1", TaskResume: true})
+	if strings.Contains(text, "claim this offer") {
+		t.Fatal("already accepted resumed task asks for a second claim")
+	}
+}

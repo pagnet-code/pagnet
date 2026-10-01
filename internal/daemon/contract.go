@@ -243,6 +243,8 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 	case "task":
 		if p.TaskResume {
 			b.WriteString("The human requested resuming this blocked task. It is already accepted by you. Continue it; do not accept a new offer. Mark it working when you start, or explain a remaining blocker through network_task_update.\n")
+		} else {
+			b.WriteString("Before doing any task work, claim this offer with network_task_update (status: accepted). If the claim is rejected, the offer was withdrawn, reassigned or is no longer available: do not execute it. Mark working only after a successful claim when work starts.\n")
 		}
 		fmt.Fprintf(&b, "This is a delegated task. Work on it in your workspace, update its state with network_task_update (taskId: %s), and deliver results with network_publish_artifact.\n", dashOr(p.TaskID))
 	case "channel":
