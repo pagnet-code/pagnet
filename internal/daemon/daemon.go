@@ -1442,7 +1442,7 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		var p transport.WakeAgentPayload
 		if err := env.DecodePayload(&p); err != nil || p.WakeRequestID == "" {
 			d.Log.Warn("wake command undecodable or missing wakeRequestId", "type", env.Type,
-				"err", err.Error(), "wakeRequestId", p.WakeRequestID)
+				"err", err, "wakeRequestId", p.WakeRequestID)
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.WakeRequestID, func() {
