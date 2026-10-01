@@ -422,6 +422,9 @@ type SubmitRequest struct {
 // daemon translation is 1:1) and adds the busy/idle and identity-changed
 // events the persistent model needs (addendum §31).
 type SessionEvent struct {
+	// Plan is a full read-only native checklist snapshot; it never changes task state.
+	Plan *PlanSnapshot
+
 	// Type is one of the Event* constants below.
 	Type string
 	// SessionID is the native session the event belongs to.
@@ -463,6 +466,7 @@ const (
 	EventIdle                   = "runtime.idle"
 	EventTurnStarted            = "runtime.turn.started"
 	EventTurnOutput             = "runtime.turn.output"
+	EventPlanUpdated            = "runtime.plan.updated"
 	EventTurnCompleted          = "runtime.turn.completed"
 	EventTurnFailed             = "runtime.turn.failed"
 	EventInteractionStarted     = "runtime.interaction.started"

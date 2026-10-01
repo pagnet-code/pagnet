@@ -101,6 +101,11 @@ func runGrokACPFixture() int {
 				send(map[string]any{"jsonrpc": "2.0", "id": "permission-1", "method": "session/request_permission", "params": map[string]any{"sessionId": native, "toolCall": map[string]string{"title": "Fixture tool"}, "options": []map[string]string{{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}, {"optionId": "reject-once", "name": "Reject once", "kind": "reject_once"}}}})
 				continue
 			}
+			if params.Prompt[0].Text == "plan" {
+				send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "foreign", "update": map[string]any{"sessionUpdate": "plan", "entries": []map[string]string{{"content": "foreign checklist", "status": "pending", "priority": "high"}}}}})
+				send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": native, "update": map[string]any{"sessionUpdate": "plan", "entries": []map[string]string{{"content": "first", "status": "in_progress", "priority": "high"}, {"content": "second", "status": "pending", "priority": "low"}}}}})
+				send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": native, "update": map[string]any{"sessionUpdate": "plan", "entries": []map[string]string{{"content": "first", "status": "completed", "priority": "high"}}}}})
+			}
 			send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "foreign", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "FOREIGN"}}}})
 			send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": native, "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "echo: " + params.Prompt[0].Text}}}})
 			response(message.ID, map[string]string{"stopReason": "end_turn"})
@@ -301,4 +306,28 @@ func TestGrokACPReconnectReapsDeadEndpointBeforeHandshake(t *testing.T) {
 	}
 	s.NativeID = ""
 	activateGrokFixture(t, d, s)
+}
+
+func TestGrokACPPlanOwnedPromptFullSnapshots(t *testing.T) {
+	d, s := grokFixture(t, "")
+	activateGrokFixture(t, d, s)
+	replay, _ := json.Marshal(map[string]any{"sessionId": s.NativeID, "update": map[string]any{"sessionUpdate": "plan", "entries": []map[string]string{{"content": "stale activation replay", "status": "completed", "priority": "high"}}}})
+	d.get(s.InstanceID).conn.messages <- acpMessage{Method: "session/update", Params: replay}
+	events := make(chan session.SessionEvent, 32)
+	if err := d.Submit(context.Background(), s, session.SubmitRequest{Kind: session.SubmitPrompt, TurnID: "plan-turn", Input: "plan"}, events); err != nil {
+		t.Fatal(err)
+	}
+	close(events)
+	var plans []*session.PlanSnapshot
+	for ev := range events {
+		if ev.Type == session.EventPlanUpdated {
+			if ev.SessionID != s.NativeID || ev.TurnID != "plan-turn" {
+				t.Fatal("wrong native prompt binding")
+			}
+			plans = append(plans, ev.Plan)
+		}
+	}
+	if len(plans) != 2 || len(plans[0].Entries) != 2 || len(plans[1].Entries) != 1 || plans[1].Entries[0].Status != "completed" {
+		t.Fatalf("not full owned snapshots: %+v", plans)
+	}
 }

@@ -31,6 +31,27 @@ func (d *ACPDriver) Submit(ctx context.Context, s *session.RuntimeSession, req s
 	e.busy = true
 	e.mu.Unlock()
 	defer func() { e.mu.Lock(); e.busy = false; e.permissions = map[string]acpPermission{}; e.mu.Unlock() }()
+	// session/load can finish while older history notifications remain queued.
+	// ACP v1 has session-scoped updates, so discard replay before admitting a
+	// new prompt; only notifications inside this owned exchange are progress.
+	for drained := 0; ; drained++ {
+		if drained >= cap(e.conn.messages) {
+			return session.ErrBusy
+		}
+		select {
+		case old := <-e.conn.messages:
+			if len(old.ID) > 0 {
+				if err := e.conn.reject(ctx, old.ID, -32601); err != nil {
+					return session.ErrEndpointGone
+				}
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			goto replayDrained
+		}
+	}
+replayDrained:
 	call, err := e.conn.begin(ctx, "session/prompt", map[string]any{"sessionId": e.nativeID, "prompt": []map[string]string{{"type": "text", "text": req.Input}}})
 	if err != nil {
 		if errors.Is(err, errACPDeliveryUncertain) {
@@ -59,6 +80,36 @@ func (d *ACPDriver) Submit(ctx context.Context, s *session.RuntimeSession, req s
 			if json.Unmarshal(message.Params, &update) != nil {
 				e.handle.Abort("ACP invalid session update")
 				return session.ErrTurnInterrupted
+			}
+			if update.SessionID == e.nativeID && update.Update.Kind == "plan" {
+				// Bound before decoding entry arrays; other ACP update kinds
+				// never allocate unneeded plan entries.
+				if len(message.Params) > session.MaxPlanBytes {
+					return nil
+				}
+				var data struct {
+					Update struct {
+						Entries []struct {
+							Content  string `json:"content"`
+							Priority string `json:"priority"`
+							Status   string `json:"status"`
+						} `json:"entries"`
+					} `json:"update"`
+				}
+				if json.Unmarshal(message.Params, &data) != nil || data.Update.Entries == nil {
+					return nil
+				}
+				plan := &session.PlanSnapshot{Source: "acp", Entries: make([]session.PlanEntry, 0, len(data.Update.Entries))}
+				for _, entry := range data.Update.Entries {
+					plan.Entries = append(plan.Entries, session.PlanEntry{Text: entry.Content, Status: entry.Status, Priority: entry.Priority})
+				}
+				if session.ValidatePlan(plan) != nil {
+					return nil
+				}
+				if !acpEmit(ctx, ch, session.SessionEvent{Type: session.EventPlanUpdated, SessionID: e.nativeID, TurnID: req.TurnID, Plan: plan}) {
+					e.cancel()
+					return session.ErrTurnInterrupted
+				}
 			}
 			if update.SessionID == e.nativeID && update.Update.Kind == "agent_message_chunk" && update.Update.Content.Type == "text" {
 				if !emit(session.EventTurnOutput, update.Update.Content.Text, nil) {

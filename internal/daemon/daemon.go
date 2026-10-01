@@ -2810,6 +2810,10 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
 	spec := d.turnSpecFor(row, row.SessionID != "", input, kind)
 	spec.Metadata["deliveryCommandId"] = p.CommandID
+	if kind == "task" && p.TaskID != "" {
+		spec.Metadata["taskId"] = p.TaskID
+		spec.Metadata["taskNetworkId"] = netID
+	}
 	return d.runTurn(conn, spec)
 }
 
@@ -3407,8 +3411,32 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	var failedRetry *string
 	var sessionLost, completed bool
 	interactionIDs := map[string]string{}
+	var planRevision uint64
+	var plans taskPlanCoalescer
+	plansClosed := false
+	planTick := time.NewTicker(200 * time.Millisecond)
+	defer planTick.Stop()
+	flushPlan := func(force bool) {
+		if plan := plans.take(time.Now(), force); plan != nil {
+			planRevision++
+			d.sendTaskProgress(conn, spec, sessionID, planRevision, plan)
+		}
+	}
+turnEvents:
+	for {
+		var ev session.SessionEvent
+		select {
+		case next, ok := <-events:
+			if !ok {
+				flushPlan(true)
+				break turnEvents
+			}
+			ev = next
+		case <-planTick.C:
+			flushPlan(false)
+			continue
+		}
 
-	for ev := range events {
 		// Turn identity (Phase 2): the driver echoes the submit's logical
 		// turn id on every event it emits for that turn, so the event
 		// stream carries the logical identity end-to-end. An event that
@@ -3434,16 +3462,29 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 			// already in place, which it is).
 			d.ensureEndpointView(row)
 		case session.EventSessionLost:
+			plans.pending = nil
+			plansClosed = true
 			sessionLost = true
 		case session.EventTurnStarted:
 			d.sendTurn(conn, transport.MsgRuntimeTurnStarted, spec, sessionID, nil, nil, nil, "", "", nil)
 		case session.EventTurnOutput:
 			d.sendRuntimeOutput(conn, row, runtimeStreamID, ev.Output)
+		case session.EventPlanUpdated:
+			if !plansClosed && ev.TurnID == spec.TurnID && ev.SessionID == sessionID && ev.Plan != nil {
+				if session.ValidatePlan(ev.Plan) == nil {
+					plans.pending = ev.Plan
+					flushPlan(false)
+				}
+			}
 		case session.EventTurnCompleted:
+			flushPlan(true)
+			plansClosed = true
 			completed = true
 			d.sendTurn(conn, transport.MsgRuntimeTurnCompleted, spec, sessionID,
 				ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.Model, "", nil)
 		case session.EventTurnFailed:
+			flushPlan(true)
+			plansClosed = true
 			failedKind = ev.FailureKind
 			failedErr = ev.Error
 			failedRetry = ev.RetryAt
@@ -4201,6 +4242,9 @@ func (d *Daemon) sendTurn(conn *websocket.Conn, msgType string, spec agentruntim
 	switch msgType {
 	case transport.MsgRuntimeTurnStarted:
 		payload["inputKind"] = spec.InputKind
+		if task, ok := spec.Metadata["taskId"].(string); ok && spec.InputKind == "task" {
+			payload["taskId"] = task
+		}
 		if commandID, ok := spec.Metadata["deliveryCommandId"].(string); ok && commandID != "" {
 			payload["commandId"] = commandID
 		}

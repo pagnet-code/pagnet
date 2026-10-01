@@ -232,6 +232,37 @@ func (s *codexTurnState) processNotification(method string, params json.RawMessa
 			s.nativeActive = false
 		}
 		return nil
+	case "turn/plan/updated":
+		if len(params) > session.MaxPlanBytes {
+			return nil
+		}
+		var p struct {
+			TurnID string `json:"turnId"`
+			Plan   []struct {
+				Step   string `json:"step"`
+				Status string `json:"status"`
+			} `json:"plan"`
+		}
+		if json.Unmarshal(params, &p) != nil || p.Plan == nil {
+			return nil
+		}
+		plan := &session.PlanSnapshot{Source: "codex", NativeTurnID: p.TurnID, Entries: make([]session.PlanEntry, 0, len(p.Plan))}
+		for _, entry := range p.Plan {
+			status := entry.Status
+			if status == "inProgress" {
+				status = "in_progress"
+			}
+			plan.Entries = append(plan.Entries, session.PlanEntry{Text: entry.Step, Status: status})
+		}
+		if session.ValidatePlan(plan) != nil {
+			return nil
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.activated || !s.turnActive || !s.turnIsMachine || s.machineTurnID == "" || s.nativeTurnID == "" || p.TurnID != s.nativeTurnID {
+			return nil
+		}
+		return []session.SessionEvent{{Type: session.EventPlanUpdated, SessionID: s.threadID, TurnID: s.machineTurnID, Plan: plan}}
 	case "turn/started":
 		var p struct {
 			ThreadID string    `json:"threadId"`
