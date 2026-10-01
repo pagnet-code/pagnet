@@ -2662,6 +2662,12 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 			return fmt.Errorf("decrypt delivery: %w", err)
 		}
 		p.Body = plain
+		if p.AAD.ObjectType == "task" {
+			p.Body, err = d.materializeTaskContent(row, plain)
+			if err != nil {
+				return fmt.Errorf("decode delivery task: %w", err)
+			}
+		}
 		if kind == "ask" || kind == "reply" || (p.AAD.ObjectType == "message" && p.MessageID != "") {
 			parts, err := domain.DecodeMessageContent([]byte(plain))
 			if err != nil {

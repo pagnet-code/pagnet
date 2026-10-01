@@ -6,11 +6,32 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/pagnet-code/pagnet/internal/config"
 )
+
+func slugify(name string) string {
+	var slug strings.Builder
+	separator := false
+	for _, r := range strings.ToLower(name) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			if separator && slug.Len() > 0 {
+				slug.WriteByte('-')
+			}
+			slug.WriteRune(r)
+			separator = false
+		} else {
+			separator = true
+		}
+	}
+	if slug.Len() == 0 {
+		return "network"
+	}
+	return slug.String()
+}
 
 func networkCmd() *cobra.Command {
 	var slug, description string

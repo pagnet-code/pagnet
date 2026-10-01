@@ -454,6 +454,11 @@ func (d *Daemon) encryptToolArgs(row *InstanceRow, tool string, args json.RawMes
 		recipient, _ = m["threadId"].(string)
 	case "network_delegate", "control_delegate":
 		objectType = e2ee.ObjectTypeTask
+		content, err := domain.EncodeTaskContent(domain.TaskContent{Objective: plainContent})
+		if err != nil {
+			return nil, err.Error()
+		}
+		plainContent = content
 	case "network_task_update":
 		objectType = e2ee.ObjectTypeTask
 		objectID, _ = m["taskId"].(string)

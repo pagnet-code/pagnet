@@ -505,18 +505,43 @@ func delegateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if title == "" {
-				title = objective
+			def, err := c.agentDefinition(netID, args[0])
+			if err != nil {
+				return err
+			}
+			st, kr, err := c.clientCrypto(netID)
+			if err != nil {
+				return err
+			}
+			var content strings.Builder
+			if title != "" {
+				content.WriteString(title + "\n\n")
+			}
+			content.WriteString(objective)
+			if len(criteria) > 0 {
+				content.WriteString("\n\nAcceptance criteria:\n")
+				for _, criterion := range criteria {
+					content.WriteString("- " + criterion + "\n")
+				}
+			}
+			plain, err := domain.EncodeTaskContent(domain.TaskContent{Objective: content.String()})
+			if err != nil {
+				return err
+			}
+			objectID := newClientObjectID()
+			env, aad, err := c.encryptClientContent(st, kr, e2ee.ObjectTypeTask, objectID, "", plain)
+			if err != nil {
+				return err
 			}
 			var t struct {
 				ID     string `json:"ID"`
 				Status string `json:"Status"`
 			}
 			if err := c.post("/api/v1/networks/"+netID+"/tasks", map[string]any{
-				"targetAgent":        args[0],
-				"title":              title,
-				"objective":          objective,
-				"acceptanceCriteria": criteria,
+				"targetPrincipalId": def.PrincipalID,
+				"id":                objectID,
+				"envelope":          env,
+				"aad":               aad,
 			}, &t); err != nil {
 				return err
 			}
@@ -525,7 +550,7 @@ func delegateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
-	cmd.Flags().StringVar(&title, "title", "", "task title (default: the objective)")
+	cmd.Flags().StringVar(&title, "title", "", "optional private task title")
 	cmd.Flags().StringVar(&objective, "objective", "", "what the task must achieve (required)")
 	cmd.Flags().StringArrayVar(&criteria, "criteria", nil, "acceptance criterion (repeatable)")
 	return cmd

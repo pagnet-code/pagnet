@@ -189,7 +189,6 @@ func newRootCmd() *cobra.Command {
 		artifactCmd(),
 		attachCmd(),
 		chatCmd(),
-		demoCmd(),
 		// spec §55 command surface
 		agentsCmd(),
 		agentCmd(),

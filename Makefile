@@ -47,11 +47,6 @@ vet:
 tidy:
 	$(GO) mod tidy
 
-## demo: seed a demo network with fake agents and sample traffic
-## (requires a reachable control plane — see `pagnet login`)
-demo: build
-	$(BIN)/pagnet demo
-
 ## release: cross-compile the unified pagnet binary into dist/ as
 ## pagnet-<version>-<os>-<arch>.tar.gz, plus pagnet-latest-<os>-<arch>.tar.gz
 ## copies so `wget .../download/pagnet-latest-linux-amd64.tar.gz` stays

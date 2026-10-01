@@ -75,5 +75,8 @@ type TaskFilter struct {
 	InstanceID    *ID
 	ResourceID    *ID
 	CorrelationID *ID
-	Limit         int
+	// BeforeID is an exclusive, network-scoped keyset cursor ordered by
+	// creation time and ID. Task status changes cannot shift page boundaries.
+	BeforeID *ID
+	Limit    int
 }
