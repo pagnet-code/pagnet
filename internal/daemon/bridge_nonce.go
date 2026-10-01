@@ -15,14 +15,16 @@ package daemon
 // and its full control surface. The nonce is a capability the daemon
 // hands out at launch and re-rolls on every activation, so a stale or
 // stolen-elsewhere credential dies with the activation that minted it.
-// On Linux the nonce is backed by the SO_PEERCRED process-tree binding
-// (bridge_peer_linux.go); on platforms without peer credentials the
+// On Linux and Darwin the nonce is backed by kernel peer-PID process-tree
+// binding; on platforms without a supported peer-PID implementation the
 // nonce + "instance has a live process" check is the portable floor.
 //
 // The nonce is in-memory ONLY: it is never logged, never persisted, and
-// never placed in the runtime's own env (it travels inside the MCP
-// config string the runtime hands to the bridge — a sanctioned
-// PAGNET_*-shaped payload, like the identity vars). A daemon restart
+// not exported as a standalone runtime variable. It IS visible inside the
+// runtime's PAGNET_MCP_CONFIG environment/launch payload, which the runtime
+// hands to its bridge. It must therefore not be treated as a secret against
+// other same-UID code: supported platforms require kernel process binding.
+// A daemon restart
 // wipes the store: every surviving bridge's nonce is unknown to the new
 // process and is refused (fail closed; the restarted daemon re-mints on
 // the next activation).

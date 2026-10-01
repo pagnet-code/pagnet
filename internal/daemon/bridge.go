@@ -40,17 +40,17 @@ import (
 //   - kind: the bridge surface the client was spawned as; it must match
 //     the claimed instance's kind (a worker credential is valid only
 //     for its own worker instance).
-//   - process tree (Linux, after the checks above): SO_PEERCRED peer
-//     uid + the /proc ppid chain must reach the instance's current
+//   - process tree (Linux/Darwin, after the checks above): kernel socket peer
+//     uid + the kernel parent chain must reach the instance's current
 //     supervisor root process, with the peer no older than the root
-//     (pid-reuse refusal). See bridge_peer_linux.go.
+//     (pid-reuse refusal). See bridge_peer_linux.go/bridge_peer_darwin.go.
 // The networkId comparison below stays as defense-in-depth only — it
 // was VACUOUS for representatives (empty network) and is no longer a
 // security boundary.
 
 // bridgeIsolationProcessBound is the strongest bridge isolation state
-// (reported on the daemon heartbeat): the SO_PEERCRED process-tree
-// binding is enforced (Linux). The non-Linux state constant lives in
+// (reported on the daemon heartbeat): the kernel peer-PID process-tree
+// binding is enforced (Linux/Darwin). The unsupported-platform constant lives in
 // bridge_peer_other.go.
 const bridgeIsolationProcessBound = "process-bound"
 
@@ -141,7 +141,7 @@ func (d *Daemon) startBridgeSocket() error {
 	if mode := bridgeIsolationMode(); mode != bridgeIsolationProcessBound {
 		d.Log.Warn("agent bridge is NOT process-tree isolated on this platform",
 			"isolation", mode,
-			"note", "the per-activation nonce is still enforced; run on Linux for the SO_PEERCRED process-tree binding")
+			"note", "the per-activation nonce is still enforced; use a supported Linux or macOS host for kernel peer-PID binding")
 	}
 	go func() {
 		for {
@@ -308,7 +308,7 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	}
 	// The claimed instance must have a LIVE supervisor process (the
 	// bridge is spawned by that process, so none means the connector is
-	// not it). Portable floor on every platform; on Linux the tree
+	// not it). Portable floor on every platform; on Linux and Darwin the tree
 	// check below then proves the ancestry.
 	rootPID := d.instanceRootPID(row.InstanceID)
 	if rootPID == nil {
@@ -325,10 +325,9 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		return
 	}
 	instanceID = row.InstanceID
-	// Process-tree binding (Linux, S1): the accepted connection's peer
-	// (SO_PEERCRED) must be the daemon's uid and a descendant of the
-	// instance's current root process, no older than it. No such binding
-	// exists on non-Linux platforms (nonce-only, surfaced in status).
+	// Process-tree binding (Linux/Darwin): the kernel socket peer must be
+	// the daemon's uid and a descendant of the current instance root.
+	// Other platforms retain the explicitly reported nonce-only boundary.
 	if err := d.verifyBridgePeer(c, *rootPID); err != nil {
 		d.Log.Warn("bridge peer verification failed", "instance", row.InstanceID, "err", err.Error())
 		writeBridgeError(c, "peer process verification failed (identity rejected): "+err.Error())

@@ -1,8 +1,8 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package daemon
 
-// Non-Linux platforms (macOS development machines): no SO_PEERCRED.
+// Platforms without a supported peer-PID implementation (neither Linux nor Darwin).
 //
 // The owner-scoped contract for these platforms is NON-ISOLATED: the
 // process-tree binding is unavailable, so the portable layer is the
@@ -36,7 +36,7 @@ func runtimeSandboxMode() string {
 	return sandboxModeUnsupportedPlatform
 }
 
-// verifyBridgePeer is the non-Linux stand-in for the process-tree
+// verifyBridgePeer is the unsupported-platform stand-in for the process-tree
 // binding: a no-op, because the portable checks (nonce + live instance
 // process) already ran before this call. The isolation state on this
 // platform is "nonce-only" BY DESIGN — the same-UID boundary is not
