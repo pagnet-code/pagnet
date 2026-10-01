@@ -647,16 +647,18 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		}
 	}
 	t := &managedTurn{
-		s:         s,
-		Key:       key,
-		Class:     req.Class,
-		Runtime:   req.Runtime,
-		Marker:    req.Marker,
-		cmd:       req.Cmd,
-		startedAt: s.now(),
-		exitCh:    make(chan Exit, 1),
-		termDone:  make(chan struct{}),
+		s:             s,
+		Key:           key,
+		Class:         req.Class,
+		Runtime:       req.Runtime,
+		Marker:        req.Marker,
+		cmd:           req.Cmd,
+		startedAt:     s.now(),
+		exitCh:        make(chan Exit, 1),
+		termDone:      make(chan struct{}),
+		launchSettled: make(chan struct{}),
 	}
+	defer close(t.launchSettled)
 	s.turns[key] = t
 	switch req.Class {
 	case ClassTurn:
@@ -912,6 +914,8 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		s.launchFailedTotal.Add(1)
 		return nil, fmt.Errorf("ownership record: %w", err)
 	}
+
+	t.ownershipPublished = true
 
 	// Context watcher: cancellation terminates the GROUP (not just the
 	// direct child). The reaper reaps; this watcher only requests
@@ -1170,10 +1174,12 @@ type managedTurn struct {
 	// goroutines without s.mu. A plain int would be a data race (caught by
 	// -race). The value is set once and never changed, so a single atomic
 	// store/load is sufficient.
-	pid       atomic.Int32
-	pgid      atomic.Int32
-	identity  string
-	startedAt time.Time
+	pid                atomic.Int32
+	pgid               atomic.Int32
+	launchSettled      chan struct{}
+	ownershipPublished bool
+	identity           string
+	startedAt          time.Time
 
 	state atomic.Int32
 	// reaped: the process's lifecycle is COMPLETE — the reaper has

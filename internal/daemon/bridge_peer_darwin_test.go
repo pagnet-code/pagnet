@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"io"
 	"net"
 	"os"
@@ -68,8 +69,7 @@ func TestDarwinBridgeKernelDescendantAndSibling(t *testing.T) {
 	if _, err = io.ReadFull(conn, make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
-	d := &Daemon{}
-	if err = d.verifyBridgePeer(conn, cmd.Process.Pid); err != nil {
+	if err = localpeer.Verify(conn, cmd.Process.Pid); err != nil {
 		t.Fatalf("real grandchild rejected: %v", err)
 	}
 	// A second live child is a sibling, never an ancestor of the connected peer.
@@ -78,10 +78,10 @@ func TestDarwinBridgeKernelDescendantAndSibling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sibling.Process.Kill(); _ = sibling.Wait() }()
-	if err = d.verifyBridgePeer(conn, sibling.Process.Pid); err == nil {
+	if err = localpeer.Verify(conn, sibling.Process.Pid); err == nil {
 		t.Fatal("accepted unrelated same-UID root")
 	}
-	if err = d.verifyBridgePeer(conn, 0); err == nil {
+	if err = localpeer.Verify(conn, 0); err == nil {
 		t.Fatal("accepted absent runtime root")
 	}
 	_, _ = conn.Write([]byte{1})

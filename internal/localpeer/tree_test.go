@@ -1,4 +1,4 @@
-package daemon
+package localpeer
 
 import (
 	"errors"
@@ -8,7 +8,7 @@ import (
 func TestKernelProcessTreeBinding(t *testing.T) {
 	for _, scenario := range []string{"valid", "sibling", "owner", "older", "parent newer", "missing", "cycle", "wrong pid", "changed start", "changed owner", "changed parent", "invalid root", "changed root", "disappeared", "depth"} {
 		t.Run(scenario, func(t *testing.T) {
-			rows := map[int]bridgeProcessSnapshot{10: {PID: 10, Parent: 2, UID: 501, Start: 100}, 20: {PID: 20, Parent: 10, UID: 501, Start: 200}, 30: {PID: 30, Parent: 20, UID: 501, Start: 300}}
+			rows := map[int]ProcessSnapshot{10: {PID: 10, Parent: 2, UID: 501, Start: 100}, 20: {PID: 20, Parent: 10, UID: 501, Start: 200}, 30: {PID: 30, Parent: 20, UID: 501, Start: 300}}
 			peer := 30
 			switch scenario {
 			case "sibling":
@@ -45,14 +45,14 @@ func TestKernelProcessTreeBinding(t *testing.T) {
 			case "depth":
 				peer = 100
 				for pid := 40; pid <= 100; pid++ {
-					rows[pid] = bridgeProcessSnapshot{PID: pid, Parent: pid - 1, UID: 501, Start: int64(pid * 10)}
+					rows[pid] = ProcessSnapshot{PID: pid, Parent: pid - 1, UID: 501, Start: int64(pid * 10)}
 				}
 				row := rows[40]
 				row.Parent = 30
 				rows[40] = row
 			}
 			reads := map[int]int{}
-			read := func(pid int) (bridgeProcessSnapshot, error) {
+			read := func(pid int) (ProcessSnapshot, error) {
 				row, ok := rows[pid]
 				if !ok {
 					return row, errors.New("absent")
@@ -76,7 +76,7 @@ func TestKernelProcessTreeBinding(t *testing.T) {
 				}
 				return row, nil
 			}
-			err := verifyKernelProcessTree(peer, 10, 501, read)
+			err := VerifyProcessTree(peer, 10, 501, read)
 			if scenario == "valid" && err != nil {
 				t.Fatal(err)
 			}
