@@ -123,15 +123,18 @@ jobs:
           set -euo pipefail
           api() { curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"; }
           base="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-          # RERUN-SAFE: if a release already exists for this tag (a rerun of
-          # a run that failed after creation, or a manual republish), reuse
-          # it and replace same-named assets instead of POSTing a duplicate
-          # (the API answers 409/422 for an existing tag).
+          # Resume an incomplete draft after a failed upload. Published stable
+          # releases are immutable: deleting their assets on a rerun would
+          # interrupt installs and replace already trusted signed artifacts.
           rel=$(api "${base}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null || true)
           rel_id=$(echo "${rel}" | jq -r '.id // empty' 2>/dev/null || true)
           shopt -s nullglob
           if [ -n "${rel_id}" ]; then
-            echo "reusing existing release ${rel_id} for ${GITHUB_REF_NAME}"
+            if [ "$(echo "${rel}" | jq -r '.draft')" != "true" ]; then
+              echo "::error::${GITHUB_REF_NAME} is already published and immutable. Publish a new version instead."
+              exit 1
+            fi
+            echo "resuming draft release ${rel_id} for ${GITHUB_REF_NAME}"
             for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
               aid=$(api "${base}/releases/${rel_id}/assets" | jq -r --arg n "$(basename "$f")" '.[] | select(.name == $n) | .id' | head -1)
               if [ -n "${aid}" ]; then api -X DELETE "${base}/releases/assets/${aid}" >/dev/null; fi
