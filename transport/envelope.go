@@ -1157,8 +1157,8 @@ type CryptoUnwrapCekResult struct {
 
 // CryptoWrapCekPayload asks the key host to unwrap the browser's HPKE-wrapped
 // CEK (sealed to the host's static X25519 public key) and re-wrap it under
-// the CURRENT network epoch. ObjectType/ObjectID are routing metadata for the
-// browser's AAD (the daemon does not bind them — the browser does).
+// the committed epoch admitted for the browser session. ObjectType/ObjectID
+// must match the browser's AAD; the HPKE wrap also binds the exact object ID.
 type CryptoWrapCekPayload struct {
 	CommandID string `json:"commandId"`
 	TenantID  string `json:"tenantId"`
