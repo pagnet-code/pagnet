@@ -2721,7 +2721,9 @@ func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload
 		return err
 	}
 	d.Log.Info("delivery turn", "instance", p.InstanceID, "kind", kind)
-	return d.runTurn(conn, d.turnSpecFor(row, row.SessionID != "", input, kind))
+	spec := d.turnSpecFor(row, row.SessionID != "", input, kind)
+	spec.Metadata["deliveryCommandId"] = p.CommandID
+	return d.runTurn(conn, spec)
 }
 
 // deliveryHasContent reports whether a (pre-decryption) legacy delivery
@@ -4093,6 +4095,9 @@ func (d *Daemon) sendTurn(conn *websocket.Conn, msgType string, spec agentruntim
 	switch msgType {
 	case transport.MsgRuntimeTurnStarted:
 		payload["inputKind"] = spec.InputKind
+		if commandID, ok := spec.Metadata["deliveryCommandId"].(string); ok && commandID != "" {
+			payload["commandId"] = commandID
+		}
 		payload["inputSummary"] = spec.Input
 	case transport.MsgRuntimeTurnCompleted:
 		payload["model"] = model
