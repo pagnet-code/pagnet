@@ -592,6 +592,7 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 		emit(persistEvent{Event: "runtime.turn.output", TurnID: cmd.TurnID, SessionID: prev.SessionID, Output: out})
 		prev.Turns++
 		prev.LastInput = firstLine(cmd.Input)
+		capturePersistentInput(prev, cmd.Input)
 		prev.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		_ = saveSession(sessionPath, prev)
 		emit(persistEvent{
@@ -647,6 +648,7 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 	// Persist the session (materialises it on the first exchange).
 	prev.Turns++
 	prev.LastInput = firstLine(cmd.Input)
+	capturePersistentInput(prev, cmd.Input)
 	prev.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	_ = saveSession(sessionPath, prev)
 
@@ -654,4 +656,13 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 		Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1",
 	})
 	emit(persistEvent{Event: "runtime.idle", TurnID: cmd.TurnID, SessionID: prev.SessionID})
+}
+
+// Full native input is recorded only when an E2E fixture explicitly enables
+// capture. saveSession already writes this fake session atomically as 0600.
+func capturePersistentInput(s *session, input string) {
+	s.CapturedInput = ""
+	if os.Getenv("PAGNET_FAKE_CAPTURE_INPUT") == "1" {
+		s.CapturedInput = input
+	}
 }

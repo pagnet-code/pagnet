@@ -70,7 +70,9 @@ type session struct {
 	SessionID string `json:"sessionId"`
 	Turns     int    `json:"turns"`
 	LastInput string `json:"lastInput,omitempty"`
-	UpdatedAt string `json:"updatedAt"`
+	// CapturedInput is opt-in test evidence, never emitted to a transcript/log.
+	CapturedInput string `json:"capturedInput,omitempty"`
+	UpdatedAt     string `json:"updatedAt"`
 	// Vars is the endpoint's session memory (Phase 3 terminal session
 	// unification): `let <k> <v>` / `print <k>` persist here so the value
 	// survives hibernate/wake (the session file is the resume payload).
