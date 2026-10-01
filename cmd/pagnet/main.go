@@ -276,6 +276,17 @@ func enrollCmd() *cobra.Command {
 				if err := doEnroll(server, token, name, roots, rootsMode, accountConfigDir(root, account)); err != nil {
 					return err
 				}
+				// A one-time enrollment needs no sign-in, but its first account
+				// still needs an explicit selection for the subsequent daemon.
+				global, err := accounts.LoadGlobal(root)
+				if err != nil {
+					return err
+				}
+				if global.CurrentAccount == "" {
+					if err := accounts.SetCurrent(root, account); err != nil {
+						return err
+					}
+				}
 			}
 			if !silent {
 				fmt.Println("run `pagnet -d` to connect this host")
