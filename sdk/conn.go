@@ -15,11 +15,12 @@ import (
 // creates one per (re)connect; readLoop routes envelopes, heartbeat sends
 // liveness reports. dead is closed exactly once when the session ends.
 type conn struct {
-	ws     *websocket.Conn
-	c      *Client
-	authOK chan transport.EndpointAuthOKPayload
-	dead   chan struct{}
-	sendMu sync.Mutex
+	ws        *websocket.Conn
+	c         *Client
+	authOK    chan transport.EndpointAuthOKPayload
+	authReady chan bool // identity persistence and capability snapshot accepted
+	dead      chan struct{}
+	sendMu    sync.Mutex
 }
 
 // send writes one envelope (serialized: one concurrent writer).
@@ -70,6 +71,17 @@ func (pc *conn) readLoop() {
 			select {
 			case pc.authOK <- p:
 			default:
+			}
+			// The next frames may already be crypto challenges addressed to
+			// this endpoint. Wait until connectOnce commits the authenticated
+			// identity, and reject work on a superseded registration snapshot.
+			select {
+			case ready := <-pc.authReady:
+				if !ready {
+					return
+				}
+			case <-pc.c.closeCh:
+				return
 			}
 		case transport.MsgEndpointHeartbeatAck:
 			// liveness only

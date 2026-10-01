@@ -799,11 +799,23 @@ func (c *Client) connectOnce() error {
 		return fmt.Errorf("sdk: dial: %w", err)
 	}
 	pc := &conn{
-		ws:     ws,
-		c:      c,
-		authOK: make(chan transport.EndpointAuthOKPayload, 1),
-		dead:   make(chan struct{}),
+		ws:        ws,
+		c:         c,
+		authOK:    make(chan transport.EndpointAuthOKPayload, 1),
+		authReady: make(chan bool, 1),
+		dead:      make(chan struct{}),
 	}
+	defer func() {
+		select {
+		case pc.authReady <- false:
+		default:
+		}
+	}()
+	// A challenge from a dead endpoint must never be replayed as proof on
+	// its replacement connection. Invocation results remain durable.
+	c.pendingMu.Lock()
+	c.pendingChallenges = map[string]EndpointCryptoChallengePayload{}
+	c.pendingMu.Unlock()
 	// Make this the current conn NOW (before the read loop starts), so that
 	// setup-time messages processed by the read loop — the crypto enrollment
 	// (endpoint.crypto_challenge → endpoint.crypto_prove) — can send their
@@ -855,8 +867,10 @@ func (c *Client) connectOnce() error {
 	registrationChanged := c.capsRevision != revision
 	c.handlerMu.RUnlock()
 	if registrationChanged {
+		pc.authReady <- false
 		_ = pc.ws.Close()
 	} else {
+		pc.authReady <- true
 		go pc.heartbeat()
 		// Agents resume subscriptions (server is the source of truth).
 		c.onLive()
