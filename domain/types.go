@@ -252,6 +252,7 @@ const (
 	RuntimeClaudeCode RuntimeName = "claude-code"
 	RuntimeQwenCode   RuntimeName = "qwen-code"
 	RuntimeOpenCode   RuntimeName = "opencode"
+	RuntimeGrok       RuntimeName = "grok-code"
 	// RuntimeCodex is the Codex persistent runtime (Wave 4): one long-lived
 	// `codex app-server --stdio` process per instance, driven over
 	// JSON-RPC (thread/start + turn/start). It is session-driven (the
@@ -274,6 +275,8 @@ var runtimeAliases = map[string]RuntimeName{
 	"qwen":            RuntimeQwenCode,
 	"opencode":        RuntimeOpenCode,
 	"codex":           RuntimeCodex,
+	"grok":            RuntimeGrok,
+	"grok-code":       RuntimeGrok,
 	"generic":         RuntimeGeneric,
 	"fake":            RuntimeFake,
 	"fake-persistent": RuntimeFakePersistent,

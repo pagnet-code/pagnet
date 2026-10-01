@@ -59,7 +59,7 @@ func runtimeProfilesCmd() *cobra.Command {
 		_, err = fmt.Fprintf(cmd.OutOrStdout(), "Added runtime profile %s. Reload your Pagnet daemon to publish and use it.\n", p.Name)
 		return err
 	}}
-	add.Flags().StringVar(&runtime, "runtime", "", "base runtime: claude-code, qwen-code, codex, opencode")
+	add.Flags().StringVar(&runtime, "runtime", "", "base runtime: claude-code, qwen-code, codex, opencode, grok-code")
 	add.Flags().StringVar(&executable, "executable", "", "absolute native CLI or compatible wrapper path (default: native CLI from PATH)")
 	add.Flags().StringArrayVar(&env, "env", nil, "host-local non-secret KEY=VALUE (repeatable; keep secrets in the private JSON file)")
 	add.Flags().StringArrayVar(&args, "arg", nil, "structured argument before native managed-mode arguments (repeatable, no shell evaluation)")

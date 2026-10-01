@@ -35,6 +35,9 @@ func TestMain(m *testing.M) {
 	if len(os.Args) >= 2 && os.Args[1] == sandbox.Subcommand {
 		os.Exit(sandbox.RunWrapperMain(os.Args[2:]))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "grok-acp-fixture" {
+		os.Exit(runGrokACPFixture())
+	}
 	home, err := os.MkdirTemp("", "pagnet-runtime-test-home-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "runtime TestMain: temp home:", err)

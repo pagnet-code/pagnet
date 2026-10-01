@@ -128,6 +128,7 @@ func mcpExternalCmd() *cobra.Command {
 	cmd.Flags().StringVar(&network, "network", "", "fixed network UUID (required)")
 	cmd.Flags().StringSliceVar(&messagingTargets, "allow-message", nil, "exact agent UUID allowed for ASK and own replies")
 	cmd.Flags().StringSliceVar(&grants, "allow-invoke", nil, "exact PRINCIPAL_UUID/CAPABILITY_ID grant (repeatable; default discovery only)")
+	cmd.Flags().StringSliceVar(&messagingTargets, "allow-message", nil, "exact agent UUID allowed for encrypted ASK and this connector's own replies (repeatable)")
 	cmd.Flags().StringVar(&listen, "listen", "", "optional loopback IP:port for streamable HTTP at /mcp; requires PAGNET_MCP_HTTP_TOKEN")
 	cmd.Flags().StringVar(&publicURL, "oauth-resource", "", "canonical public HTTPS /mcp URL; enables established-provider OAuth mode")
 	cmd.Flags().StringVar(&issuer, "oauth-issuer", "", "exact OAuth authorization issuer URL")

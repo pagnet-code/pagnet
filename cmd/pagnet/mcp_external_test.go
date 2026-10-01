@@ -39,3 +39,16 @@ func TestExternalMCPOAuthConfigurationBeforeActivation(t *testing.T) {
 		t.Fatalf("incomplete OAuth policy consumed activation: %v", err)
 	}
 }
+
+func TestExternalMCPValidatesMessagingTargetsBeforeActivation(t *testing.T) {
+	t.Setenv("PAGNET_CREDENTIAL", "pgn_act_v1_should-never-be-consumed")
+	for _, args := range [][]string{{"--allow-message", "not-a-uuid"}, {"--allow-message", "01900000-0000-7000-8000-000000000002", "--allow-message", "01900000-0000-7000-8000-000000000002"}} {
+		cmd := mcpExternalCmd()
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+		cmd.SetArgs(append([]string{"--network", "01900000-0000-7000-8000-000000000001"}, args...))
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "messaging targets") {
+			t.Fatalf("messaging policy not validated before credential exchange: %v", err)
+		}
+	}
+}

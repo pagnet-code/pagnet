@@ -1,6 +1,6 @@
 # Host-local runtime profiles
 
-Profiles select a native executable, arguments and environment on one Pagnet host. They let accounts such as `claude-work` and `claude-shared` share the Claude adapter while keeping native state separate. Supported bases are Claude Code, Qwen Code, Codex and OpenCode on Linux and macOS.
+Profiles select a native executable, arguments and environment on one Pagnet host. They let accounts such as `claude-work` and `claude-shared` share the Claude adapter while keeping native state separate. Supported bases are Claude Code, Qwen Code, Codex, OpenCode and Grok Code on Linux and macOS.
 
 ```sh
 pagnet runtime-profile add claude-work --runtime claude-code --env CLAUDE_CONFIG_DIR=~/.claude-work
@@ -38,10 +38,13 @@ Omit `executable` to resolve the native CLI from the daemon's PATH. Arguments ar
 
 Use `--env` only for non-secret values. Edit the private file for secrets without putting them in shell history or process arguments. The control plane receives only names, canonical runtime and availability, never environment values, arguments or executable paths. Home overrides, shell startup overrides, loader injection and `PAGNET_*` overrides are prohibited.
 
-`CLAUDE_CONFIG_DIR` and `CODEX_HOME` select native sandbox directories automatically. `nativeDirs` can explicitly select absolute native directories for other compatible configurations. Profiles cannot grant access to daemon state. Only leading `~/` expands; shell substitutions and variable interpolation are not evaluated.
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `GROK_HOME` select native sandbox directories automatically. `nativeDirs` can explicitly select absolute native directories for other compatible configurations. Profiles cannot grant access to daemon state. Only leading `~/` expands; shell substitutions and variable interpolation are not evaluated.
 
 ## Resume and activity
 
 Each instance pins a digest of its private configuration. Changing it cannot silently resume with another executable or provider account: create a fresh instance after reloading. Stop an active instance before selecting another profile. Canonical runtime and native session identity remain intact.
 
 For persistent Qwen and Codex sessions, positive structured native activity drives working status, including human terminal turns. Exact completion restores idle without inventing a Pagnet task transition. A live endpoint alone is not work. Claude and OpenCode direct human activity currently lacks the equivalent structured reporter; this feature does not claim universal scheduler detection.
+
+Grok Code uses its documented ACP endpoint. Its `GROK_HOME` must stay in the
+daemon state root’s dedicated `runtimes/grok-code` subtree; see [Grok Code](GROK_RUNTIME.md).

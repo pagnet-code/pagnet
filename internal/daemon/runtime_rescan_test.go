@@ -28,7 +28,7 @@ func TestRuntimeRescanDiscoversInstallAfterStartupWithoutReplacingDrivers(t *tes
 		runtime domain.RuntimeName
 		name    string
 	}
-	runtimes := []runtimeBinary{{domain.RuntimeQwenCode, "qwen"}, {domain.RuntimeCodex, "codex"}}
+	runtimes := []runtimeBinary{{domain.RuntimeQwenCode, "qwen"}, {domain.RuntimeCodex, "codex"}, {domain.RuntimeGrok, "grok"}}
 	drivers := d.sessions.Drivers()
 	for _, runtime := range runtimes {
 		if drivers[runtime.runtime] == nil || !d.runtimeSupported(runtime.runtime) {

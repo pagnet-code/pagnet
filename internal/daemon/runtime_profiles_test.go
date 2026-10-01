@@ -76,7 +76,7 @@ func TestNativeProfileDriverKeysAndStateContainment(t *testing.T) {
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	file := runtimeprofile.File{Version: 1, Profiles: []runtimeprofile.Profile{{Name: "qwen-work", Runtime: domain.RuntimeQwenCode, Executable: binary}, {Name: "qwen-shared", Runtime: domain.RuntimeQwenCode, Executable: binary}, {Name: "codex-work", Runtime: domain.RuntimeCodex, Executable: binary}}}
+	file := runtimeprofile.File{Version: 1, Profiles: []runtimeprofile.Profile{{Name: "qwen-work", Runtime: domain.RuntimeQwenCode, Executable: binary}, {Name: "qwen-shared", Runtime: domain.RuntimeQwenCode, Executable: binary}, {Name: "codex-work", Runtime: domain.RuntimeCodex, Executable: binary}, {Name: "grok-work", Runtime: domain.RuntimeGrok, Executable: binary}, {Name: "grok-shared", Runtime: domain.RuntimeGrok, Executable: binary}}}
 	path := filepath.Join(d.StateDir, runtimeprofile.Filename)
 	if err := runtimeprofile.Save(path, file); err != nil {
 		t.Fatal(err)

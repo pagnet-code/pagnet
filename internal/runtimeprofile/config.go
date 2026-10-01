@@ -69,7 +69,7 @@ func (f File) Validate() error {
 		}
 		names[p.Name] = true
 		switch p.Runtime {
-		case domain.RuntimeClaudeCode, domain.RuntimeOpenCode, domain.RuntimeCodex, domain.RuntimeQwenCode:
+		case domain.RuntimeClaudeCode, domain.RuntimeOpenCode, domain.RuntimeCodex, domain.RuntimeQwenCode, domain.RuntimeGrok:
 		default:
 			return errors.New("runtime profile requires a supported canonical runtime")
 		}
@@ -97,7 +97,7 @@ func (f File) Validate() error {
 				return errors.New("profile native directories must be absolute host-local paths")
 			}
 		}
-		for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
+		for _, key := range []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"} {
 			if v := p.Env[key]; v != "" && !filepath.IsAbs(ExpandHome(v)) {
 				return errors.New("runtime configuration directory must be absolute")
 			}
@@ -126,6 +126,8 @@ func (p Profile) ResolvedExecutable() (string, bool) {
 			binary = "qwen"
 		case domain.RuntimeCodex:
 			binary = "codex"
+		case domain.RuntimeGrok:
+			binary = "grok"
 		}
 	}
 	resolved, err := exec.LookPath(binary)
@@ -144,7 +146,7 @@ func (p Profile) Environment() []string {
 	env := make([]string, 0, len(keys))
 	for _, k := range keys {
 		v := p.Env[k]
-		if k == "CLAUDE_CONFIG_DIR" || k == "CODEX_HOME" {
+		if k == "CLAUDE_CONFIG_DIR" || k == "CODEX_HOME" || k == "GROK_HOME" {
 			v = ExpandHome(v)
 		}
 		env = append(env, k+"="+v)
@@ -156,6 +158,9 @@ func (p Profile) Directories() []string {
 	if len(dirs) == 0 {
 		if p.Runtime == domain.RuntimeClaudeCode && p.Env["CLAUDE_CONFIG_DIR"] != "" {
 			dirs = []string{p.Env["CLAUDE_CONFIG_DIR"]}
+		}
+		if p.Runtime == domain.RuntimeGrok && p.Env["GROK_HOME"] != "" {
+			dirs = []string{p.Env["GROK_HOME"]}
 		}
 		if p.Runtime == domain.RuntimeCodex && p.Env["CODEX_HOME"] != "" {
 			dirs = []string{p.Env["CODEX_HOME"]}

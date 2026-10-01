@@ -32,6 +32,13 @@ type codexProfileDriver struct {
 }
 
 func (d *codexProfileDriver) Name() domain.RuntimeName { return d.key }
+
+type acpProfileDriver struct {
+	*agentruntime.ACPDriver
+	key domain.RuntimeName
+}
+
+func (d *acpProfileDriver) Name() domain.RuntimeName { return d.key }
 func (d *Daemon) loadRuntimeProfiles() error {
 	file, err := runtimeprofile.Load(filepath.Join(d.StateDir, runtimeprofile.Filename))
 	if err != nil {
@@ -85,6 +92,15 @@ func (d *Daemon) loadRuntimeProfiles() error {
 			drv.SetLifecycle(d.sup)
 			drv.PTYAvailable = d.adoptEndpointPTY
 			profile.driver = &qwenProfileDriver{drv, key}
+			d.sessions.RegisterDriver(profile.driver)
+		case domain.RuntimeGrok:
+			drv := agentruntime.NewGrok(binary)
+			drv.Env = env
+			drv.PrefixArgs = append([]string(nil), cfg.Args...)
+			drv.NativeDirs = dirs
+			drv.StateDir = d.StateDir
+			drv.SetLifecycle(d.sup)
+			profile.driver = &acpProfileDriver{drv, key}
 			d.sessions.RegisterDriver(profile.driver)
 		case domain.RuntimeCodex:
 			drv := agentruntime.NewCodexPersistent(binary)

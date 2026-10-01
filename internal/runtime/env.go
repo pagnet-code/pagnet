@@ -88,6 +88,7 @@ var allowedChildEnvExact = map[string]bool{
 	"ANTHROPIC_API_KEY": true, "ANTHROPIC_BASE_URL": true,
 	"DASHSCOPE_API_KEY": true, "DASHSCOPE_BASE_URL": true,
 	"OPENAI_API_KEY": true, "OPENAI_BASE_URL": true,
+	"XAI_API_KEY":        true,
 	"OPENROUTER_API_KEY": true, "OPENROUTER_BASE_URL": true,
 	"GEMINI_API_KEY": true, "GROQ_API_KEY": true, "MISTRAL_API_KEY": true,
 	"TOGETHER_API_KEY": true, "FIREWORKS_API_KEY": true,

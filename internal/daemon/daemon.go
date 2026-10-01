@@ -581,6 +581,10 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	codexPersistent := agentruntime.NewCodexPersistent("")
 	codexPersistent.Env = cfg.RuntimeEnv
 	sessions.RegisterDriver(codexPersistent)
+	grokPersistent := agentruntime.NewGrok("")
+	grokPersistent.Env = cfg.RuntimeEnv
+	grokPersistent.StateDir = cfg.StateDir
+	sessions.RegisterDriver(grokPersistent)
 	// Central turn-process supervisor (abuse addendum Part B §20): ONE
 	// registry/launch-gate/cleanup path for every turn process and PTY
 	// session this daemon owns. Limits come from the daemon Config (set by
@@ -607,6 +611,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// endpoint process through the supervisor's ClassEndpoint path
 	// (the same seam).
 	codexPersistent.SetLifecycle(sup)
+	grokPersistent.SetLifecycle(sup)
 	// Bounded helper-command executor (§37) for git/version/worktree probes.
 	helper := proc.NewHelper(0)
 	turnCtx, turnCancel := context.WithCancel(context.Background())
@@ -2101,7 +2106,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		// — qwen-code is session-driven since Wave B).
 		for _, name := range []domain.RuntimeName{
 			domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
-			domain.RuntimeCodex,
+			domain.RuntimeCodex, domain.RuntimeGrok,
 		} {
 			if d.runtimeAvailable(name) {
 				rn = name
@@ -2109,7 +2114,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			}
 		}
 		if rn == "" {
-			return fmt.Errorf("no runtime available on this host (install qwen, claude, opencode, or codex)")
+			return fmt.Errorf("no runtime available on this host (install qwen, claude, opencode, codex, or grok)")
 		}
 	}
 	// The runtime must be drivable on this host (an adapter OR a registered
@@ -2351,14 +2356,8 @@ func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 	}
 	if d.sessions != nil {
 		if drv := d.sessions.DriverFor(rn); drv != nil {
-			if pf, ok := drv.(*agentruntime.PersistentFake); ok {
-				return pf.Available()
-			}
-			if qp, ok := drv.(*agentruntime.QwenPersistent); ok {
-				return qp.Available()
-			}
-			if cp, ok := drv.(*agentruntime.CodexPersistent); ok {
-				return cp.Available()
+			if available, ok := drv.(interface{ Available() bool }); ok {
+				return available.Available()
 			}
 			return true
 		}
