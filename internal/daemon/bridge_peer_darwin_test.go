@@ -3,7 +3,6 @@
 package daemon
 
 import (
-	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"io"
 	"net"
 	"os"
@@ -11,6 +10,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/pagnet-code/pagnet/internal/localpeer"
+	"github.com/pagnet-code/pagnet/internal/proc"
 )
 
 // The helper is an actual child process; no peer PID or credentials are mocked.
@@ -59,6 +61,10 @@ func TestDarwinBridgeKernelDescendantAndSibling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	rootIdentity, err := proc.StartIdentity(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = listener.SetDeadline(time.Now().Add(5 * time.Second))
 	conn, err := listener.AcceptUnix()
 	if err != nil {
@@ -69,7 +75,7 @@ func TestDarwinBridgeKernelDescendantAndSibling(t *testing.T) {
 	if _, err = io.ReadFull(conn, make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err = localpeer.Verify(conn, cmd.Process.Pid); err != nil {
+	if err = localpeer.VerifyOwned(conn, cmd.Process.Pid, rootIdentity); err != nil {
 		t.Fatalf("real grandchild rejected: %v", err)
 	}
 	// A second live child is a sibling, never an ancestor of the connected peer.
@@ -78,10 +84,14 @@ func TestDarwinBridgeKernelDescendantAndSibling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sibling.Process.Kill(); _ = sibling.Wait() }()
-	if err = localpeer.Verify(conn, sibling.Process.Pid); err == nil {
+	siblingIdentity, err := proc.StartIdentity(sibling.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = localpeer.VerifyOwned(conn, sibling.Process.Pid, siblingIdentity); err == nil {
 		t.Fatal("accepted unrelated same-UID root")
 	}
-	if err = localpeer.Verify(conn, 0); err == nil {
+	if err = localpeer.VerifyOwned(conn, 0, ""); err == nil {
 		t.Fatal("accepted absent runtime root")
 	}
 	_, _ = conn.Write([]byte{1})

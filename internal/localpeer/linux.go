@@ -103,10 +103,3 @@ func Owner(c net.Conn) (int, uint32, error) {
 	}
 	return int(cred.Pid), cred.Uid, nil
 }
-func Verify(c net.Conn, rootPID int) error {
-	pid, uid, err := Owner(c)
-	if err != nil {
-		return err
-	}
-	return VerifyProcessTree(pid, rootPID, uid, ReadProcess)
-}
