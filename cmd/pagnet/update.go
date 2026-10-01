@@ -89,13 +89,12 @@ func runUpdate(cmd *cobra.Command, serverURL, stateDir string) error {
 		stateDir = filepath.Join(home, ".pagnet")
 	}
 	if daemonRunning(stateDir) {
-		fmt.Fprintln(cmd.OutOrStdout(), "a daemon is running — restart it to use the new version:")
-		fmt.Fprintln(cmd.OutOrStdout(), "  pkill -x pagnetd 2>/dev/null || true   # pre-unified daemon, if any")
-		fmt.Fprintln(cmd.OutOrStdout(), "  pkill -x pagnet 2>/dev/null || true")
-		fmt.Fprintln(cmd.OutOrStdout(), "  pagnet -d")
+		fmt.Fprintln(cmd.OutOrStdout(), "The installed binary is updated. Your running daemon and sessions continue using the existing process.")
+		fmt.Fprintln(cmd.OutOrStdout(), "If automatic updates are enabled, the daemon upgrades when the server advertises the release and all active turns, terminals and runtime processes have finished or hibernated.")
+		fmt.Fprintln(cmd.OutOrStdout(), "For a manual restart, wait for that safe idle state, then stop only this daemon gracefully: Ctrl+C for foreground serve; for a detached daemon, SIGTERM to its verified PID or its process manager.")
+		fmt.Fprintln(cmd.OutOrStdout(), "Start it again with its original command, state directory, account and server options. Keep the existing state directory.")
 	} else {
-		fmt.Fprintln(cmd.OutOrStdout(), "no daemon is running — start it with:")
-		fmt.Fprintln(cmd.OutOrStdout(), "  pagnet -d")
+		fmt.Fprintln(cmd.OutOrStdout(), "No daemon is running. Start with pagnet serve (foreground) or pagnet -d (background), using your existing state directory, account and server options.")
 	}
 	return nil
 }
