@@ -46,27 +46,29 @@ func TestEpochAttestationAuthenticatesStoredHistory(t *testing.T) {
 	}
 	p := transport.CryptoAttestEpochPayload{CommandID: "attest", Protocol: transport.NetworkEpochPossessionProtocol, TenantID: "tenant", NetworkID: network, EpochID: epoch.ID, AuthorityHostID: "host", AuthorityX25519: manifest.AuthorityX25519, AuthorityEd25519: manifest.AuthorityEd25519}
 	const secret = "PRIVATE_HISTORY_MUST_NEVER_LEAVE_HOST"
-	for _, version := range []int{1, transport.ProtocolVersion} {
-		aad := e2ee.AAD{ProtocolVersion: version, TenantID: "tenant", NetworkID: network, KeyEpochID: epoch.ID, ObjectType: "message", ObjectID: "object", Sender: "human", Recipient: "agent", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-		envelope, err := e2ee.Encrypt([]byte(secret), key, aad)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.Sample = &transport.NetworkEpochAttestationSample{Envelope: envelope, AAD: aad}
-		result, err := d.doCryptoAttestEpoch(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		checked := result.(*transport.CryptoAttestEpochResult)
-		if !checked.SampleVerified {
-			t.Error("native did not authenticate stored history")
-		}
-		if checked.Manifest != *manifest {
-			t.Fatal("history verification changed immutable manifest")
-		}
-		encoded, _ := json.Marshal(result)
-		if bytes.Contains(encoded, []byte(secret)) {
-			t.Fatal("plaintext returned to server")
+	for _, recipient := range []string{"agent", ""} {
+		for _, version := range []int{1, transport.ProtocolVersion} {
+			aad := e2ee.AAD{ProtocolVersion: version, TenantID: "tenant", NetworkID: network, KeyEpochID: epoch.ID, ObjectType: "message", ObjectID: "object", Sender: "human", Recipient: recipient, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+			envelope, err := e2ee.Encrypt([]byte(secret), key, aad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.Sample = &transport.NetworkEpochAttestationSample{Envelope: envelope, AAD: aad}
+			result, err := d.doCryptoAttestEpoch(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := result.(*transport.CryptoAttestEpochResult)
+			if !checked.SampleVerified {
+				t.Error("native did not authenticate stored history")
+			}
+			if checked.Manifest != *manifest {
+				t.Fatal("history verification changed immutable manifest")
+			}
+			encoded, _ := json.Marshal(result)
+			if bytes.Contains(encoded, []byte(secret)) {
+				t.Fatal("plaintext returned to server")
+			}
 		}
 	}
 	originalSample := *p.Sample

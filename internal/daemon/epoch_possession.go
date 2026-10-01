@@ -119,7 +119,7 @@ func verifyEpochAttestationSample(kr *crypto.Keyring, p transport.CryptoAttestEp
 	aad := sample.AAD
 	// Genuine protocol-1 history remains readable; this never admits old new
 	// writes. Authentication uses the exact persisted AAD without reconstruction.
-	if (aad.ProtocolVersion != 1 && aad.ProtocolVersion != transport.ProtocolVersion) || aad.ValidateScope() != nil || aad.ProtectedContext != nil || aad.TenantID != p.TenantID || aad.NetworkID != p.NetworkID || aad.KeyEpochID != p.EpochID || aad.ObjectType != "message" || aad.ObjectID == "" || aad.Sender == "" || aad.Recipient == "" {
+	if (aad.ProtocolVersion != 1 && aad.ProtocolVersion != transport.ProtocolVersion) || aad.ValidateScope() != nil || aad.ProtectedContext != nil || aad.TenantID != p.TenantID || aad.NetworkID != p.NetworkID || aad.KeyEpochID != p.EpochID || aad.ObjectType != "message" || aad.ObjectID == "" || aad.Sender == "" {
 		return fail
 	}
 	if _, err := time.Parse(time.RFC3339Nano, aad.CreatedAt); err != nil {
