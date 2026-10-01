@@ -465,3 +465,38 @@ func TestWrapperParseErrors(t *testing.T) {
 		t.Fatal("RunWrapperMain(unexpected arg before --): exit 0, want a refusal")
 	}
 }
+
+// A readable runtime-support ancestor must fail before target exec, while a
+// deliberately selected profile inside protected state remains usable without
+// disclosing the sibling account credentials.
+func TestWrapperSandboxed_ProtectedReadGrants(t *testing.T) {
+	skipNoLandlock(t)
+	rwDir, _, secretDir, _, _ := newProbeDirs(t)
+	protected := filepath.Dir(secretDir)
+	broad := &Spec{RW: []string{rwDir}, RO: []string{protected}, Denied: []string{secretDir}}
+	child, err := runWrapperChild(t, reexecInput{Spec: *broad, Target: "/bin/true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.code == 0 {
+		t.Fatal("wrapper executed target with readable protected ancestor")
+	}
+	// Put an intentionally selected profile beneath the protected root. A tight
+	// child grant is permissible; the root and other account files are not.
+	selected := filepath.Join(secretDir, "selected-profile")
+	if err := os.Mkdir(selected, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(selected, "rofile"), []byte("profile"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	spec := &Spec{RW: []string{rwDir}, RO: []string{selected, "/bin", "/usr", "/proc/self"}, Dev: []string{"/dev"}, Denied: []string{secretDir}}
+	res, child, err := runSandboxedProbe(t, spec, filepath.Join(rwDir, "result.json"), map[string]string{"PROBE_SECRET": filepath.Join(secretDir, "secret.txt"), "PROBE_EXEC": "/bin/true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.code != 0 {
+		t.Fatalf("selected profile child: %s", child.stderr)
+	}
+	assertProbe(t, res, "roRead", "ok", "secret", "EACCES", "exec", "ok")
+}

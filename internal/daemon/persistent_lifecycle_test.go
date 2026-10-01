@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -38,7 +39,9 @@ func newPersistentTestDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	// A fresh scratch dir forces a rebuild (p0FakeBinary's staleness check
 	// only tracks main.go, not persistent.go).
-	t.Setenv("PAGNET_P0_BIN_DIR", t.TempDir())
+	// Keep the executable support parent separate from private daemon state.
+	// Readable ancestor grants are forbidden just like writable grants.
+	t.Setenv("PAGNET_P0_BIN_DIR", filepath.Join(t.TempDir(), "bin"))
 	d := newTestDaemon(t)
 	pf, ok := d.sessions.DriverFor(domain.RuntimeFakePersistent).(*agentruntime.PersistentFake)
 	if !ok {

@@ -328,3 +328,18 @@ func TestNewSpec_AssemblesExpectedShape(t *testing.T) {
 		}
 	}
 }
+
+// Runtime support paths are readable grants; their ancestors must never
+// encompass the controller credentials or protected context keyrings.
+func TestNormalize_DeniedReadContainment(t *testing.T) {
+	for _, grant := range []string{"/private", "/private/worker"} {
+		s := &Spec{RO: []string{grant}, Denied: []string{"/private/worker"}}
+		if err := s.Normalize(); err == nil {
+			t.Fatalf("read grant %s exposed protected state", grant)
+		}
+	}
+	s := &Spec{RO: []string{"/private/workers-bin"}, RW: []string{"/private/worker/native"}, Denied: []string{"/private/worker"}}
+	if err := s.Normalize(); err != nil {
+		t.Fatalf("tight sibling and descendant grants: %v", err)
+	}
+}

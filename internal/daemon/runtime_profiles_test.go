@@ -20,7 +20,11 @@ func TestManagedProfilesExecuteSeparateEnvironmentAndLiteralArgs(t *testing.T) {
 	d.connMu.Lock()
 	d.curConn = client
 	d.connMu.Unlock()
-	binary := filepath.Join(t.TempDir(), "custom-claude")
+	binaryDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(binaryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(binaryDir, "custom-claude")
 	script := `#!/bin/sh
 printf '%s\n' "$CLAUDE_CONFIG_DIR" "$PROFILE_PRIVATE" "$@" > "$CLAUDE_CONFIG_DIR/trace"
 cat > /dev/null

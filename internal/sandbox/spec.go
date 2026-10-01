@@ -20,9 +20,9 @@
 // what it already knows (NewSpec). Coarse system read + tight per-instance
 // write; the daemon's state dir is reached only via READ_DIR on the bridge
 // socket's PARENT (entry names, never file contents), and a Denied entry
-// (the daemon's state dir itself) makes a spec that grants any RW subtree
+// (the daemon's state dir itself) makes a spec that grants any RW or RO subtree
 // covering it refuse the launch — the state dir can never be silently
-// swallowed by an over-broad RW grant (e.g. workspace = $HOME).
+// swallowed by an over-broad RW or RO grant (e.g. workspace = $HOME).
 //
 // Actual exposure (kernel-inherent, all ABIs): Landlock never gates
 // stat/lstat — a sandboxed process can learn the existence/size/mtime of
@@ -58,7 +58,7 @@ type Spec struct {
 	// dir (which holds the runtime's LLM auth + sessions: legitimately the
 	// runtime's own, allowed by the owner's allowlist).
 	RW []string
-	// Denied: paths that must NOT be equal to or path-beneath ANY RW grant
+	// Denied: paths that must NOT be equal to or path-beneath ANY RW or RO grant
 	// (F-CFG-1: the daemon's state dir). A workspace that contains a denied
 	// path (e.g. workspace = $HOME covering ~/.pagnet) would silently void
 	// the sandbox — the runtime would read the host key, account creds, and
@@ -66,8 +66,8 @@ type Spec struct {
 	// spec with an explicit error naming the offending grant and the denied
 	// path, so every launch path (the supervisor's single policy point and
 	// the wrapper itself) fails closed BEFORE any process starts. "" entries
-	// are ignored; the check is against RW only (RO grants never carry
-	// write authority and are never the state dir by construction).
+	// are ignored. Tight explicitly selected subdirectories remain allowed;
+	// ancestor read grants would disclose protected credentials too.
 	Denied []string
 	// RO: read-only subtrees — the coarse system paths a runtime needs to run
 	// at all (SystemRO) plus its interpreter/module support paths
@@ -113,8 +113,8 @@ type Spec struct {
 //   - a non-absolute path (the daemon/driver always pass absolute paths; a
 //     relative one is a caller bug we refuse, not silently resolve against
 //     an unknown CWD), and
-//   - a Denied path that is equal to or path-beneath any RW grant (F-CFG-1
-//     containment): such a spec would hand the runtime write access to a
+//   - a Denied path that is equal to or path-beneath any RW or RO grant (F-CFG-1
+//     containment): such a spec would hand the runtime read or write access to a
 //     protected path — the classic case is a workspace that contains the
 //     daemon's state dir. The refusal names the offending grant and the
 //     denied path. This is the single enforcement point: the supervisor
@@ -161,14 +161,18 @@ func (s *Spec) Normalize() error {
 		return err
 	}
 	s.RW, s.RO, s.Sockets, s.Dev, s.Denied = rw, ro, sock, dev, denied
-	// F-CFG-1 containment: a denied path equal to, or path-beneath, an RW
-	// grant gives the runtime write access to a protected path. Refuse,
-	// naming both sides (prefix-with-separator: /a/b must NOT match grant
-	// /a by plain prefix — only /a/b/... does).
+	// Landlock grants are additive: either readable or writable ancestor
+	// grants expose protected state. Denied is a fail-closed containment
+	// constraint, not a subtractive kernel rule.
 	for _, dn := range denied {
-		for _, g := range rw {
-			if dn == g || strings.HasPrefix(dn, g+string(filepath.Separator)) {
-				return fmt.Errorf("sandbox: denied path %q is equal to or beneath RW grant %q — the runtime would get write access to a protected path (refusing the launch)", dn, g)
+		for _, grants := range []struct {
+			name  string
+			paths []string
+		}{{"RW", rw}, {"RO", ro}} {
+			for _, g := range grants.paths {
+				if dn == g || strings.HasPrefix(dn, g+string(filepath.Separator)) {
+					return fmt.Errorf("sandbox: denied path %q is equal to or beneath %s grant %q — the runtime would get access to a protected path (refusing the launch)", dn, grants.name, g)
+				}
 			}
 		}
 	}
@@ -452,7 +456,7 @@ type Options struct {
 	// ExtraRO / ExtraRW: driver-specific additions.
 	ExtraRO []string
 	ExtraRW []string
-	// Denied: paths that must not be equal to or path-beneath any RW grant
+	// Denied: paths that must not be equal to or path-beneath any RW or RO grant
 	// (F-CFG-1). The daemon passes its OWN state dir here: a workspace that
 	// contains it (e.g. workspace = $HOME) would silently void the sandbox,
 	// and Normalize refuses such a spec — the launch fails with an explicit
@@ -469,7 +473,7 @@ type Options struct {
 // is NEVER placed in RW or RO — it is reached only through READ_DIR on the
 // socket's parent (entry NAMES visible, never file CONTENTS: Landlock
 // grants READ_DIR on the state dir for traversal but never READ_FILE), and
-// Options.Denied carries it as a containment set: a spec whose RW grants
+// Options.Denied carries it as a containment set: a spec whose RW or RO grants
 // cover a denied path (workspace = $HOME swallowing ~/.pagnet) is refused
 // by Normalize — the launch fails closed before any process starts.
 func NewSpec(o Options) *Spec {
