@@ -50,15 +50,16 @@ type Operation struct {
 }
 
 type NativeSnapshot struct {
-	Scope            Scope                `json:"scope"`
-	NativeGeneration string               `json:"nativeGeneration"`
-	NativeSessionID  string               `json:"nativeSessionId"`
-	Origin           json.RawMessage      `json:"origin,omitempty"`
-	PID              int                  `json:"pid"`
-	State            session.SessionState `json:"state"`
-	Pending          []Inspection         `json:"pending,omitempty"`
-	HasTerminal      bool                 `json:"hasTerminal"`
-	PublicError      string               `json:"publicError,omitempty"`
+	Scope               Scope                `json:"scope"`
+	NativeGeneration    string               `json:"nativeGeneration"`
+	NativeStartIdentity string               `json:"nativeStartIdentity,omitempty"`
+	NativeSessionID     string               `json:"nativeSessionId"`
+	Origin              json.RawMessage      `json:"origin,omitempty"`
+	PID                 int                  `json:"pid"`
+	State               session.SessionState `json:"state"`
+	Pending             []Inspection         `json:"pending,omitempty"`
+	HasTerminal         bool                 `json:"hasTerminal"`
+	PublicError         string               `json:"publicError,omitempty"`
 }
 
 type SessionOwner struct {
@@ -80,6 +81,9 @@ type SessionOwner struct {
 	terminal                *os.File
 	pending                 map[string]*nativeApproval
 	fatal                   error
+	nativeSink              bool
+	observationBlocked      error
+	observationWaiters      map[string]bool
 	relay                   *relayBroker
 }
 
@@ -112,6 +116,8 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*Session
 		d.StateDir = filepath.Join(j.dir, "native-state")
 		d.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		d.PTYAvailable = owner.captureTerminal
+		d.NativeEventObserverFactory = owner.nativeEventObserver
+		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeQwenCode:
 		d := agentruntime.NewQwenPersistent(spec.Binary)
@@ -119,6 +125,8 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*Session
 		d.PrefixArgs = spec.PrefixArgs
 		d.NativeDirs = spec.NativeDirs
 		d.PTYAvailable = owner.captureTerminal
+		d.NativeEventObserverFactory = owner.nativeEventObserver
+		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeCodex:
 		d := agentruntime.NewCodexPersistent(spec.Binary)
@@ -126,6 +134,8 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*Session
 		d.PrefixArgs = spec.PrefixArgs
 		d.NativeDirs = spec.NativeDirs
 		d.PTYAvailable = owner.captureTerminal
+		d.NativeEventObserverFactory = owner.nativeEventObserver
+		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeGrok:
 		d := agentruntime.NewGrok(spec.Binary)
@@ -191,6 +201,9 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			o.mu.Lock()
 			o.candidateOrigin = append(json.RawMessage(nil), op.Origin...)
 			fatal := o.fatal
+			if fatal == nil {
+				fatal = o.observationBlocked
+			}
 			o.mu.Unlock()
 			if fatal != nil {
 				err = errors.New("worker output persistence unavailable")
@@ -201,7 +214,9 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			go func() {
 				defer close(drained)
 				for event := range events {
-					o.observe(event)
+					if !o.nativeSink {
+						o.observe(event)
+					}
 				}
 			}()
 			if out.Kind == "activate" {
@@ -359,14 +374,25 @@ func (o *SessionOwner) Snapshot() NativeSnapshot {
 	native, _ := o.manager.TryNativeID(o.journal.scope.InstanceID)
 	state, _ := o.manager.State(o.journal.scope.InstanceID)
 	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state}
-	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil {
-		snap.PID = *pid
+	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil && native != "" && o.driver.Live(o.journal.scope.InstanceID) {
+		ctx, cancel := context.WithTimeout(o.ctx, 50*time.Millisecond)
+		captured, ownedErr := o.supervisor.OwnedStartIdentity(ctx, *pid)
+		cancel()
+		actual, actualErr := proc.StartIdentity(*pid)
+		driverPID := o.manager.PID(o.journal.scope.InstanceID)
+		if ownedErr == nil && actualErr == nil && captured != "" && actual == captured && driverPID != nil && *driverPID == *pid {
+			snap.PID = *pid
+			snap.NativeStartIdentity = captured
+		}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	snap.NativeGeneration = o.generation
 	snap.Origin = append(json.RawMessage(nil), o.origin...)
 	snap.HasTerminal = o.terminal != nil && snap.PID > 0
+	if o.observationBlocked != nil {
+		snap.PublicError = "Native event publication is paused until durable journal capacity is available."
+	}
 	if o.fatal != nil {
 		snap.PublicError = "Worker output persistence requires attention; new native work is paused."
 	}
@@ -397,6 +423,12 @@ type ownedDriver struct {
 
 func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
 	if !d.Driver.Live(sess.InstanceID) {
+		d.owner.mu.Lock()
+		originPresent := len(d.owner.candidateOrigin) > 0 && json.Valid(d.owner.candidateOrigin)
+		d.owner.mu.Unlock()
+		if d.owner.nativeSink && !originPresent {
+			return nil, errors.New("authenticated native activation origin required before launch")
+		}
 		generation, err := freshNonce()
 		if err != nil {
 			return nil, err
@@ -413,6 +445,7 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		o.pending = map[string]*nativeApproval{}
 		o.terminal = nil
 		o.mu.Unlock()
+		o.manager.ResetNativeActivity(sess.InstanceID)
 		o.relay.bindNative(generation)
 		// Manager holds its activation lock across this write and Activate. No
 		// controller can mutate launch environment/model on a live worker endpoint.

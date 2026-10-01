@@ -35,23 +35,26 @@ type handshake struct {
 }
 
 type Request struct {
-	Admission *Admission      `json:"admission,omitempty"`
-	Relay     *BridgeResult   `json:"relay,omitempty"`
-	Cursor    int64           `json:"cursor,omitempty"`
-	Limit     int             `json:"limit,omitempty"`
-	Type      string          `json:"type"`
-	Sequence  int64           `json:"sequence,omitempty"`
-	CommandID string          `json:"commandId,omitempty"`
-	Kind      string          `json:"kind,omitempty"`
-	Payload   json.RawMessage `json:"payload,omitempty"`
+	ObservationID string          `json:"observationId,omitempty"`
+	SourceDigest  string          `json:"sourceDigest,omitempty"`
+	Admission     *Admission      `json:"admission,omitempty"`
+	Relay         *BridgeResult   `json:"relay,omitempty"`
+	Cursor        int64           `json:"cursor,omitempty"`
+	Limit         int             `json:"limit,omitempty"`
+	Type          string          `json:"type"`
+	Sequence      int64           `json:"sequence,omitempty"`
+	CommandID     string          `json:"commandId,omitempty"`
+	Kind          string          `json:"kind,omitempty"`
+	Payload       json.RawMessage `json:"payload,omitempty"`
 }
 
 type Response struct {
-	Snapshot *NativeSnapshot `json:"snapshot,omitempty"`
-	Output   *OutputPage     `json:"output,omitempty"`
-	Bridge   *BridgeCall     `json:"bridge,omitempty"`
-	Outcome  *Outcome        `json:"outcome,omitempty"`
-	Error    string          `json:"error,omitempty"`
+	Observations []NativeObservation `json:"observations,omitempty"`
+	Snapshot     *NativeSnapshot     `json:"snapshot,omitempty"`
+	Output       *OutputPage         `json:"output,omitempty"`
+	Bridge       *BridgeCall         `json:"bridge,omitempty"`
+	Outcome      *Outcome            `json:"outcome,omitempty"`
+	Error        string              `json:"error,omitempty"`
 }
 
 // IntentExecutor must transfer ownership to the worker lifetime immediately.
@@ -371,6 +374,10 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		if err == nil {
 			response.Output = &page
 		}
+	case "observations":
+		response.Observations, err = o.journal.PendingObservations(ctx, req.Limit)
+	case "observation_ack":
+		err = o.journal.AcknowledgeObservation(ctx, req.ObservationID, req.SourceDigest)
 	case "admission":
 		if req.Admission == nil {
 			err = errors.New("fresh control-plane admission required")

@@ -49,6 +49,7 @@ const fakeActivationTimeout = 15 * time.Second
 // It is registered ONLY in debug mode (like the process-per-turn Fake) and
 // is NOT a real agent runtime.
 type PersistentFake struct {
+	NativeEventObserverFactory session.NativeEventObserverFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -342,10 +343,11 @@ func (f *PersistentFake) BinaryPath() (string, bool) {
 
 // persistEndpoint is one live fake persistent endpoint process.
 type persistEndpoint struct {
-	f          *PersistentFake // back-reference (the reader's EOF path drops this record)
-	instanceID string
-	sessionDir string
-	h          *proc.Handle // set once at launch, never nilled (immutable)
+	nativeObserver session.NativeEventObserver
+	f              *PersistentFake // back-reference (the reader's EOF path drops this record)
+	instanceID     string
+	sessionDir     string
+	h              *proc.Handle // set once at launch, never nilled (immutable)
 	// standingInstructions is the standing document the endpoint was
 	// launched with (a copy of the session's StandingInstructions at
 	// activation time — the reference implementation of the persistent
@@ -607,6 +609,9 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		activationCh:         make(chan session.SessionEvent, 1),
 		readerDone:           make(chan struct{}),
 	}
+	if f.NativeEventObserverFactory != nil {
+		e.nativeObserver = f.NativeEventObserverFactory(sess.InstanceID)
+	}
 	go e.readLoop()
 	f.mu.Lock()
 	f.endpoints[sess.InstanceID] = e
@@ -640,6 +645,11 @@ func (e *persistEndpoint) readLoop() {
 			continue
 		}
 		norm := normalizePersist(ev)
+		if e.nativeObserver != nil {
+			if err := e.nativeObserver(norm); err != nil {
+				break
+			}
+		}
 		if !activated {
 			activated = true
 			e.activationCh <- norm

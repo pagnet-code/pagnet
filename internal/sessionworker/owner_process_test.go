@@ -23,6 +23,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -226,7 +227,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 		t.Fatalf("native activation failed: %+v stderr=%s", out, workerStderr.String())
 	}
 	initial := a.snapshot(t)
-	if initial.PID <= 0 || initial.NativeGeneration == "" || initial.NativeSessionID == "" || !initial.HasTerminal {
+	if initial.PID <= 0 || initial.NativeStartIdentity == "" || initial.NativeGeneration == "" || initial.NativeSessionID == "" || !initial.HasTerminal {
 		t.Fatalf("actual native ownership missing: %+v", initial)
 	}
 	// The real native MCP subprocess forwards through the worker-owned socket.
@@ -419,6 +420,63 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	}
 	if nativeState.Turns != 3 || nativeState.Vars["keep"] != "preserved" || nativeState.Vars["via-terminal"] != "exactly-once" {
 		t.Fatalf("native effects duplicated or lost: %+v", nativeState)
+	}
+	// Human TUI events were never part of Submit's machine-turn channel. The
+	// worker observes them with the original activation identity nonetheless.
+	var observations []NativeObservation
+	humanCompleted := false
+	humanIdle := false
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		r := b.call(t, Request{Type: "observations", Limit: 32})
+		if r.Error != "" {
+			t.Fatal(r.Error)
+		}
+		observations = r.Observations
+		for _, observation := range observations {
+			if strings.HasPrefix(observation.Event.TurnID, "tui-") && observation.Event.Type == session.EventTurnCompleted {
+				humanCompleted = true
+			}
+			if strings.HasPrefix(observation.Event.TurnID, "tui-") && observation.Event.Type == session.EventIdle {
+				humanIdle = true
+			}
+		}
+		if humanCompleted && humanIdle {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !humanCompleted || !humanIdle {
+		t.Fatal("human native turn vanished outside machine Submit stream")
+	}
+	seen := map[string]bool{}
+	permissionResolved := false
+	for _, observation := range observations {
+		if seen[observation.ID] || observation.ObservedAt.IsZero() || observation.NativeGeneration != initial.NativeGeneration || !bytes.Equal(observation.Origin, origin) {
+			t.Fatal("native observation source was duplicated/replaced")
+		}
+		seen[observation.ID] = true
+		digest, digestErr := observationDigest(observation)
+		if digestErr != nil || digest != observation.SourceDigest {
+			t.Fatal("native observation immutable digest changed")
+		}
+		if interaction := observation.Event.Interaction; interaction != nil {
+			if (len(interaction.NativePayload) != 0 && !bytes.Equal(interaction.NativePayload, []byte("null"))) || interaction.Summary != "" || interaction.Answer != "" {
+				t.Fatal("native private approval details escaped encrypted inspection")
+			}
+			if interaction.Resolved && observation.InteractionID == originalInspection.InteractionID {
+				permissionResolved = true
+			}
+		}
+		if r := b.call(t, Request{Type: "observation_ack", ObservationID: observation.ID, SourceDigest: observation.SourceDigest}); r.Error != "" {
+			t.Fatal(r.Error)
+		}
+	}
+	if !permissionResolved {
+		t.Fatal("resolved approval lost original worker interaction identity")
+	}
+	if page := b.call(t, Request{Type: "observations", Limit: 32}); page.Error != "" || len(page.Observations) != 0 {
+		t.Fatal("controller durable ACK left observation pending")
 	}
 	var terminal strings.Builder
 	cursor := int64(0)

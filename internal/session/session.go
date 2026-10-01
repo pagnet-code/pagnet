@@ -248,6 +248,8 @@ type RuntimeSession struct {
 	Capabilities Capabilities
 	// LastActivity is the last observed exchange (for idle policy).
 	LastActivity time.Time
+	// NativeBusy is positively observed work outside the current logical submit.
+	NativeBusy bool
 	// ConfigFingerprint is the standing-config fingerprint (model / MCP /
 	// identity), preserved from the existing staleness concept.
 	ConfigFingerprint string

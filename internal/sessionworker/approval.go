@@ -11,7 +11,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
@@ -79,7 +78,10 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 		return
 	}
 	record := &nativeApproval{secret: secret, native: append(json.RawMessage(nil), native.NativePayload...), summary: native.Summary, expires: time.Now().UTC().Add(24 * time.Hour)}
-	id := uuid.NewString()
+	o.mu.Lock()
+	origin := append(json.RawMessage(nil), o.origin...)
+	o.mu.Unlock()
+	id := nativeInteractionIdentity(o.journal.scope, origin, generation, event.SessionID, native.NativeInteractionID)
 	detail := transport.OwnerInteractionDetail{Format: "pagnet.owner_interaction.v1", Summary: native.Summary, NativePayload: json.RawMessage(native.NativePayload), Inspection: transport.OwnerInspection{Secret: base64.StdEncoding.EncodeToString(secret), InstanceID: o.journal.scope.InstanceID, SessionID: event.SessionID, NativeInteractionID: native.NativeInteractionID}}
 	plain, err := json.Marshal(detail)
 	if err != nil || len(plain) > 64<<10 {

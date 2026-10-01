@@ -114,6 +114,7 @@ const startupDiagLineRunes = 200
 
 // QwenPersistent is the Qwen Dual Output persistent driver.
 type QwenPersistent struct {
+	NativeEventObserverFactory session.NativeEventObserverFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -484,13 +485,14 @@ func (q *QwenPersistent) PTYMaster(instanceID string) *os.File {
 
 // qwenEndpoint is one live qwen dual-output endpoint process.
 type qwenEndpoint struct {
-	f          *QwenPersistent // back-reference (the reader's exit path drops this record)
-	instanceID string
-	stateDir   string
-	h          *proc.Handle // set once at launch, never nilled (immutable)
-	eventsPath string
-	inputPath  string
-	state      *qwenTurnState
+	nativeObserver session.NativeEventObserver
+	f              *QwenPersistent // back-reference (the reader's exit path drops this record)
+	instanceID     string
+	stateDir       string
+	h              *proc.Handle // set once at launch, never nilled (immutable)
+	eventsPath     string
+	inputPath      string
+	state          *qwenTurnState
 
 	// activationCh carries the process's first (activation) event; closed
 	// by the reader after it is delivered.
@@ -976,6 +978,9 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		startupDeadline: startupDeadline,
 		readerDone:      make(chan struct{}),
 	}
+	if q.NativeEventObserverFactory != nil {
+		e.nativeObserver = q.NativeEventObserverFactory(sess.InstanceID)
+	}
 	go e.readLoop()
 	q.mu.Lock()
 	q.endpoints[sess.InstanceID] = e
@@ -1119,6 +1124,11 @@ func (e *qwenEndpoint) handleEventLine(line []byte) {
 // goes to activationCh; subsequent events go to the current turn (when the
 // TurnID matches).
 func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
+	if e.nativeObserver != nil {
+		if err := e.nativeObserver(ev); err != nil {
+			return
+		}
+	}
 	e.mu.Lock()
 	if !e.activationSent {
 		e.activationSent = true

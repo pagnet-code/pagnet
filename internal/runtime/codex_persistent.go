@@ -97,6 +97,7 @@ const (
 
 // CodexPersistent is the Codex app-server persistent driver.
 type CodexPersistent struct {
+	NativeEventObserverFactory session.NativeEventObserverFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -478,13 +479,14 @@ func (c *CodexPersistent) Live(instanceID string) bool {
 
 // codexEndpoint is one live codex app-server endpoint process.
 type codexEndpoint struct {
-	generation string
-	f          *CodexPersistent // back-reference (the reader's exit path drops this record)
-	instanceID string
-	h          *proc.Handle // set once at launch, never nilled (immutable)
-	state      *codexTurnState
-	stdin      io.WriteCloser
-	stdout     io.ReadCloser
+	nativeObserver session.NativeEventObserver
+	generation     string
+	f              *CodexPersistent // back-reference (the reader's exit path drops this record)
+	instanceID     string
+	h              *proc.Handle // set once at launch, never nilled (immutable)
+	state          *codexTurnState
+	stdin          io.WriteCloser
+	stdout         io.ReadCloser
 
 	// activationCh carries the (synthesized) activation event; closed by
 	// the driver after it is delivered.
@@ -764,6 +766,9 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		pending:      map[int64]*codexRPCWaiter{},
 	}
 	e.turnCond = sync.NewCond(&e.mu)
+	if c.NativeEventObserverFactory != nil {
+		e.nativeObserver = c.NativeEventObserverFactory(sess.InstanceID)
+	}
 	go e.readLoop()
 	c.mu.Lock()
 	c.endpoints[sess.InstanceID] = e
@@ -999,6 +1004,11 @@ func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
 		copied := *ev.Interaction
 		copied.NativeInteractionID = e.generation + ":" + copied.NativeInteractionID
 		ev.Interaction = &copied
+	}
+	if e.nativeObserver != nil {
+		if err := e.nativeObserver(ev); err != nil {
+			return
+		}
 	}
 	e.mu.Lock()
 	if !e.activationSent {

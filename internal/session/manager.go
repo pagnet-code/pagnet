@@ -474,6 +474,9 @@ func (m *Manager) ensureActive(ctx context.Context, sess *RuntimeSession, events
 	m.mu.Lock()
 	sess.Endpoint = ep
 	sess.State = StateIdle
+	if sess.NativeBusy {
+		sess.State = StateBusy
+	}
 	sess.LastActivity = m.now()
 	// Record the env, model AND standing context the endpoint was actually
 	// launched with, so a later turn's values can be compared against them
@@ -620,6 +623,9 @@ func (m *Manager) settlePrompt(sess *RuntimeSession, result *TurnResult) {
 		return
 	}
 	sess.State = StateIdle
+	if sess.NativeBusy {
+		sess.State = StateBusy
+	}
 	sess.LastActivity = m.now()
 	if result.Completed || result.Failed {
 		// Any completed-or-failed exchange that reached the runtime
@@ -864,7 +870,7 @@ func (m *Manager) ActiveWork(instanceID string) bool {
 		m.mu.Unlock()
 		return false
 	}
-	busy := sess.State == StateBusy
+	busy := sess.State == StateBusy || sess.NativeBusy
 	d := m.drivers[sess.Runtime]
 	m.mu.Unlock()
 	if busy {

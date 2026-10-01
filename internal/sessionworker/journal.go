@@ -123,6 +123,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if err = j.initializeOutput(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeObservations(); err != nil {
+		return fail(err)
+	}
 	if err = j.validateHistory(); err != nil {
 		return fail(err)
 	}
