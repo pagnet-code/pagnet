@@ -297,6 +297,7 @@ func (m *Manager) NativeID(instanceID string) (string, bool) {
 // resume that can only be lost (session.lost → blocked), bricking an
 // instance that never did any work.
 func (m *Manager) Materialised(instanceID string) (bool, bool) {
+	m.refreshNativeMaterialisation(instanceID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.sessions[instanceID]
@@ -331,6 +332,7 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	lock.Lock()
 	defer lock.Unlock()
 
+	m.refreshNativeMaterialisation(sess.InstanceID)
 	// Read the state AND the endpoint under the lock (the endpoint is
 	// mutated by activation/hibernation; a torn read would let a stale
 	// endpoint escape the liveness check below). This read happens AFTER
@@ -614,6 +616,15 @@ func (m *Manager) settleInterrupted(sess *RuntimeSession) {
 // concurrently with an in-flight activation for the same instance (the
 // state read below then reflects the settled activation).
 func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
+	// Submit owns this lock before activation, closing the idle window between
+	// EnsureActive and StateBusy. Do not wait for a turn and then kill its
+	// endpoint: the caller must observe refusal while work is in flight.
+	prompt := m.promptLock(sess.InstanceID)
+	if !prompt.TryLock() {
+		return ErrBusy
+	}
+	defer prompt.Unlock()
+
 	lock := m.activationLock(sess.InstanceID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -632,6 +643,10 @@ func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
 	if d == nil {
 		return nil
 	}
+	if activity, ok := d.(ActivityReporter); ok && activity.ActiveWork(sess.InstanceID) {
+		return ErrBusy
+	}
+	m.refreshNativeMaterialisation(sess.InstanceID)
 	m.setState(sess, StateHibernating)
 	if err := d.Hibernate(ctx, sess); err != nil {
 		m.setState(sess, StateIdle)
@@ -792,4 +807,58 @@ func (m *Manager) applyEvent(sess *RuntimeSession, result *TurnResult, ev Sessio
 	case EventInteractionResolved:
 		result.PendingInteraction = false
 	}
+}
+
+// ActiveWork includes both submitted and positively observed native activity.
+func (m *Manager) ActiveWork(instanceID string) bool {
+	m.mu.Lock()
+	sess := m.sessions[instanceID]
+	if sess == nil {
+		m.mu.Unlock()
+		return false
+	}
+	busy := sess.State == StateBusy
+	d := m.drivers[sess.Runtime]
+	m.mu.Unlock()
+	if busy {
+		return true
+	}
+	activity, ok := d.(ActivityReporter)
+	return ok && activity.ActiveWork(instanceID)
+}
+
+func (m *Manager) refreshNativeMaterialisation(instanceID string) {
+	m.mu.Lock()
+	sess := m.sessions[instanceID]
+	if sess == nil || sess.Materialised {
+		m.mu.Unlock()
+		return
+	}
+	d := m.drivers[sess.Runtime]
+	m.mu.Unlock()
+	reporter, ok := d.(MaterialisationReporter)
+	if !ok || !reporter.Materialised(instanceID) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[instanceID] == sess {
+		sess.Materialised = true
+	}
+}
+
+func (m *Manager) AutoSuspendSafe(instanceID string) bool {
+	if m.ActiveWork(instanceID) {
+		return false
+	}
+	m.mu.Lock()
+	sess := m.sessions[instanceID]
+	if sess == nil {
+		m.mu.Unlock()
+		return false
+	}
+	d := m.drivers[sess.Runtime]
+	m.mu.Unlock()
+	reporter, ok := d.(SuspendSafetyReporter)
+	return ok && reporter.AutoSuspendSafe(instanceID)
 }

@@ -100,6 +100,7 @@ type qwenTurnState struct {
 
 	// turn
 	turnActive    bool
+	materialised  bool
 	turnIsMachine bool
 	stallWarned   bool // the in-flight stall warning was emitted this turn
 
@@ -689,6 +690,7 @@ func (s *qwenTurnState) completeStepLocked() []session.SessionEvent {
 	if !s.turnActive {
 		return nil
 	}
+	s.materialised = true
 	if s.turnIsMachine {
 		turnID := s.machineTurnID
 		sid := s.sessionID
@@ -921,4 +923,10 @@ type qwenDOControlResponse struct {
 // qwenDOControlResponseInner is the control_response.response object.
 type qwenDOControlResponseInner struct {
 	Allowed bool `json:"allowed"`
+}
+
+func (s *qwenTurnState) activeWork() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnActive || len(s.interactions) > 0
 }

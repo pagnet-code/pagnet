@@ -423,6 +423,9 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 // recording persists the session on disk — invariant F). It is a no-op when
 // no endpoint is live.
 func (q *QwenPersistent) Hibernate(ctx context.Context, sess *session.RuntimeSession) error {
+	if q.ActiveWork(sess.InstanceID) {
+		return session.ErrBusy
+	}
 	return q.stopEndpoint(sess.InstanceID)
 }
 
@@ -1416,4 +1419,24 @@ func readNewLines(f *os.File, offset int64) ([][]byte, int64, error) {
 		}
 	}
 	return lines, offset + int64(rest), nil
+}
+
+// ActiveWork reads the native structured turn ledger, including human turns.
+func (q *QwenPersistent) ActiveWork(instanceID string) bool {
+	q.mu.Lock()
+	e := q.endpoints[instanceID]
+	q.mu.Unlock()
+	return e != nil && e.state.activeWork()
+}
+
+func (q *QwenPersistent) Materialised(instanceID string) bool {
+	q.mu.Lock()
+	e := q.endpoints[instanceID]
+	q.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.state.mu.Lock()
+	defer e.state.mu.Unlock()
+	return e.state.materialised
 }

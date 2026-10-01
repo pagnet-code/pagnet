@@ -899,3 +899,16 @@ func normalizePersist(ev persistWireEvent) session.SessionEvent {
 	}
 	return out
 }
+
+// The deterministic fixture has no scheduler or background-task feature.
+func (f *PersistentFake) AutoSuspendSafe(instanceID string) bool {
+	f.mu.Lock()
+	e := f.endpoints[instanceID]
+	f.mu.Unlock()
+	if e == nil {
+		return true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.currentTurnEvents == nil
+}

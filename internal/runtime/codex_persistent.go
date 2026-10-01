@@ -412,6 +412,9 @@ func (c *CodexPersistent) Submit(ctx context.Context, sess *session.RuntimeSessi
 // rollout persists on disk under CODEX_HOME — invariant F). It is a
 // no-op when no endpoint is live.
 func (c *CodexPersistent) Hibernate(ctx context.Context, sess *session.RuntimeSession) error {
+	if c.ActiveWork(sess.InstanceID) {
+		return session.ErrBusy
+	}
 	return c.stopEndpoint(sess.InstanceID)
 }
 
@@ -1519,4 +1522,24 @@ func tomlString(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// ActiveWork reads the native structured turn ledger, including human turns.
+func (c *CodexPersistent) ActiveWork(instanceID string) bool {
+	c.mu.Lock()
+	e := c.endpoints[instanceID]
+	c.mu.Unlock()
+	return e != nil && e.state.activeWork()
+}
+
+func (c *CodexPersistent) Materialised(instanceID string) bool {
+	c.mu.Lock()
+	e := c.endpoints[instanceID]
+	c.mu.Unlock()
+	if e == nil {
+		return false
+	}
+	e.state.mu.Lock()
+	defer e.state.mu.Unlock()
+	return e.state.materialised
 }

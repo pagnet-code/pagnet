@@ -2571,12 +2571,21 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 	if !ok {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
+	if d.turnInFlight(instanceID) {
+		return session.ErrBusy
+	}
 	// Only an IDLE instance is hibernatable: working = a turn is in flight
 	// (a busy session is never hibernated), blocked/failed/stopped are not
 	// hibernatable at all. Mirrors the legacy gate (the legacy call sites
 	// hibernate only when status == idle).
 	if row.Status != "idle" {
 		return fmt.Errorf("instance %s is %s; not hibernatable", instanceID, row.Status)
+	}
+	// Closing a view is not authority to destroy a native scheduler or
+	// background job. Unknown native schedule state is conservatively awake.
+	if reason == "attach_closed" && !d.sessions.AutoSuspendSafe(instanceID) {
+		d.Log.Info("terminal detached; endpoint kept awake (native suspension safety unknown)", "instance", instanceID)
+		return nil
 	}
 	// Never hibernate underneath an attached user or a live terminal (§35
 	// keep-awake; plan §20 "actively attached human terminal").
@@ -2596,6 +2605,11 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 	if sess := d.sessions.GetSession(instanceID); sess != nil {
 		if err := d.sessions.Hibernate(context.Background(), sess); err != nil {
 			return err
+		}
+	}
+	if materialised, ok := d.sessions.Materialised(instanceID); ok && materialised {
+		if nativeID, ok := d.sessions.NativeID(instanceID); ok && nativeID != "" {
+			row.SessionID = nativeID
 		}
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
@@ -2763,8 +2777,7 @@ func (d *Daemon) turnInFlight(instanceID string) bool {
 	if d.busy(instanceID) {
 		return true
 	}
-	st, ok := d.sessions.State(instanceID)
-	return ok && st == session.StateBusy
+	return d.sessions.ActiveWork(instanceID)
 }
 
 // sessionActivating reports whether the instance's session is currently

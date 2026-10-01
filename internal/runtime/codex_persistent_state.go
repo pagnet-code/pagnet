@@ -70,7 +70,9 @@ type codexTurnState struct {
 
 	// turn
 	turnActive    bool
+	materialised  bool
 	turnIsMachine bool
+	nativeActive  bool // thread/status/changed positive activity, independent of machine turn
 	machineTurnID string
 	nativeTurnID  string // the codex turn id (from turn/started)
 	turnAccepted  bool   // the acceptance signal (turn/started or turn/start response)
@@ -208,6 +210,28 @@ func (s *codexTurnState) isTurnAccepted() bool {
 // normalized events to emit (in order). It mutates the state.
 func (s *codexTurnState) processNotification(method string, params json.RawMessage) []session.SessionEvent {
 	switch method {
+	case "thread/status/changed":
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Status   struct {
+				Type string `json:"type"`
+			} `json:"status"`
+		}
+		if json.Unmarshal(params, &p) != nil {
+			return nil
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if p.ThreadID == "" || p.ThreadID != s.threadID {
+			return nil
+		}
+		switch p.Status.Type {
+		case "active":
+			s.nativeActive = true
+		case "idle", "notLoaded":
+			s.nativeActive = false
+		}
+		return nil
 	case "turn/started":
 		var p struct {
 			ThreadID string    `json:"threadId"`
@@ -275,19 +299,19 @@ func (s *codexTurnState) processNotification(method string, params json.RawMessa
 func (s *codexTurnState) processTurnStarted(threadID string, turn codexTurn) []session.SessionEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if threadID != "" && s.threadID != "" && threadID != s.threadID {
+	if !s.activated || (threadID != "" && threadID != s.threadID) {
 		return nil // a different thread's turn: not ours
 	}
 	s.turnAccepted = true
 	if s.machineTurnID == "" {
-		// No machine submit in flight: a human/external turn. Not part of
-		// the machine stream.
+		// Human/external work must still protect the endpoint from hibernation.
+		s.turnActive = true
+		s.turnIsMachine = false
+		s.nativeTurnID = turn.ID
 		return nil
 	}
-	if !s.turnActive {
-		s.turnActive = true
-		s.turnIsMachine = true
-	}
+	s.turnActive = true
+	s.turnIsMachine = true
 	s.nativeTurnID = turn.ID
 	return []session.SessionEvent{{
 		Type:      session.EventTurnStarted,
@@ -403,8 +427,15 @@ func (s *codexTurnState) processTurnCompleted(threadID string, turn codexTurn) [
 	if threadID != "" && s.threadID != "" && threadID != s.threadID {
 		return nil
 	}
-	if !s.turnActive || !s.turnIsMachine {
-		// A human/external turn ended: not part of the machine stream.
+	if !s.turnActive {
+		return nil
+	}
+	if s.nativeTurnID != "" && turn.ID != "" && turn.ID != s.nativeTurnID {
+		return nil
+	}
+	s.materialised = true
+	if !s.turnIsMachine {
+		s.endTurnLocked()
 		return nil
 	}
 	turnID := s.machineTurnID
@@ -753,4 +784,10 @@ type codexThreadStartResponse struct {
 // codexTurnStartResponse is the turn/start response.
 type codexTurnStartResponse struct {
 	Turn codexTurn `json:"turn"`
+}
+
+func (s *codexTurnState) activeWork() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.turnActive || s.nativeActive || len(s.interactions) > 0
 }
