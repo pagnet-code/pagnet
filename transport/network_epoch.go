@@ -1,6 +1,9 @@
 package transport
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"github.com/pagnet-code/pagnet/e2ee"
+)
 
 const NetworkEpochPossessionProtocol = "network-epoch-possession-v1"
 const MsgCryptoAttestEpoch = "host.crypto_attest_epoch"
@@ -46,18 +49,29 @@ type NetworkEpochProofBinding struct {
 
 func (b NetworkEpochProofBinding) SignatureBytes() []byte { p, _ := json.Marshal(b); return p }
 
+// NetworkEpochAttestationSample is selected from authenticated stored history
+// by the server. The host authenticates it without returning its plaintext.
+type NetworkEpochAttestationSample struct {
+	Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
+	AAD      e2ee.AAD                `json:"aad"`
+}
+
+const MaxNetworkEpochAttestationSampleBytes = 96 * 1024
+
 type CryptoAttestEpochPayload struct {
-	CommandID        string `json:"commandId"`
-	Protocol         string `json:"protocol"`
-	TenantID         string `json:"tenantId"`
-	NetworkID        string `json:"networkId"`
-	EpochID          string `json:"epochId"`
-	AuthorityHostID  string `json:"authorityHostId"`
-	AuthorityX25519  string `json:"authorityX25519"`
-	AuthorityEd25519 string `json:"authorityEd25519"`
+	Sample           *NetworkEpochAttestationSample `json:"sample,omitempty"`
+	CommandID        string                         `json:"commandId"`
+	Protocol         string                         `json:"protocol"`
+	TenantID         string                         `json:"tenantId"`
+	NetworkID        string                         `json:"networkId"`
+	EpochID          string                         `json:"epochId"`
+	AuthorityHostID  string                         `json:"authorityHostId"`
+	AuthorityX25519  string                         `json:"authorityX25519"`
+	AuthorityEd25519 string                         `json:"authorityEd25519"`
 }
 type CryptoAttestEpochResult struct {
-	Manifest NetworkEpochManifest `json:"manifest"`
+	Manifest       NetworkEpochManifest `json:"manifest"`
+	SampleVerified bool                 `json:"sampleVerified,omitempty"`
 }
 type CryptoProveEpochPayload struct {
 	Binding NetworkEpochProofBinding `json:"binding"`

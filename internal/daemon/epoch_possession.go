@@ -3,9 +3,11 @@ package daemon
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -18,15 +20,22 @@ func (d *Daemon) epochManifest(tenantID, networkID, epochID string) (*transport.
 	if err != nil {
 		return nil, err
 	}
+	identity, err := crypto.LoadHostIdentity(d.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	return d.epochManifestFromKeyring(tenantID, networkID, epochID, kr, identity)
+}
+
+func (d *Daemon) epochManifestFromKeyring(tenantID, networkID, epochID string, kr *crypto.Keyring, identity *crypto.HostIdentity) (*transport.NetworkEpochManifest, error) {
+	if tenantID == "" || networkID == "" || epochID == "" || d.stateID() == "" || kr == nil || kr.NetworkID != networkID {
+		return nil, errors.New("crypto: incomplete epoch manifest scope")
+	}
 	signer, err := crypto.EpochPossessionSigner(kr, epochID)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(signer)
-	identity, err := crypto.LoadHostIdentity(d.StateDir)
-	if err != nil {
-		return nil, err
-	}
 	m := &transport.NetworkEpochManifest{Protocol: transport.NetworkEpochPossessionProtocol, TenantID: tenantID, NetworkID: networkID, EpochID: epochID, VerifierPub: base64.StdEncoding.EncodeToString(signer.Public().(ed25519.PublicKey)), AuthorityHostID: d.stateID(), AuthorityX25519: base64.StdEncoding.EncodeToString(identity.X25519Pub), AuthorityEd25519: base64.StdEncoding.EncodeToString(identity.Ed25519Pub)}
 	m.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(identity.Ed25519Signer(), m.SignatureBytes()))
 	return m, nil
@@ -45,11 +54,20 @@ func (d *Daemon) doCryptoAttestEpoch(p transport.CryptoAttestEpochPayload) (any,
 	if p.AuthorityHostID != d.stateID() || p.AuthorityX25519 != base64.StdEncoding.EncodeToString(identity.X25519Pub) || p.AuthorityEd25519 != base64.StdEncoding.EncodeToString(identity.Ed25519Pub) {
 		return nil, errors.New("crypto: authority identity mismatch")
 	}
-	m, err := d.epochManifest(p.TenantID, p.NetworkID, p.EpochID)
+	kr, err := crypto.LoadKeyring(d.StateDir, p.NetworkID)
 	if err != nil {
 		return nil, err
 	}
-	return &transport.CryptoAttestEpochResult{Manifest: *m}, nil
+	if p.Sample != nil {
+		if err := verifyEpochAttestationSample(kr, p); err != nil {
+			return nil, err
+		}
+	}
+	m, err := d.epochManifestFromKeyring(p.TenantID, p.NetworkID, p.EpochID, kr, identity)
+	if err != nil {
+		return nil, err
+	}
+	return &transport.CryptoAttestEpochResult{Manifest: *m, SampleVerified: p.Sample != nil}, nil
 }
 
 func (d *Daemon) doCryptoProveEpoch(p transport.CryptoProveEpochPayload) (any, error) {
@@ -86,4 +104,46 @@ func (d *Daemon) doCryptoProveEpoch(p transport.CryptoProveEpochPayload) (any, e
 	}
 	defer clear(signer)
 	return &transport.CryptoProveEpochResult{Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(signer, b.SignatureBytes()))}, nil
+}
+
+func verifyEpochAttestationSample(kr *crypto.Keyring, p transport.CryptoAttestEpochPayload) error {
+	fail := errors.New("crypto: existing epoch could not authenticate stored history")
+	sample := p.Sample
+	if sample == nil || kr == nil || kr.NetworkID != p.NetworkID {
+		return fail
+	}
+	encoded, err := json.Marshal(sample)
+	if err != nil || len(encoded) > transport.MaxNetworkEpochAttestationSampleBytes {
+		return fail
+	}
+	aad := sample.AAD
+	// Genuine protocol-1 history remains readable; this never admits old new
+	// writes. Authentication uses the exact persisted AAD without reconstruction.
+	if (aad.ProtocolVersion != 1 && aad.ProtocolVersion != transport.ProtocolVersion) || aad.ValidateScope() != nil || aad.ProtectedContext != nil || aad.TenantID != p.TenantID || aad.NetworkID != p.NetworkID || aad.KeyEpochID != p.EpochID || aad.ObjectType != "message" || aad.ObjectID == "" || aad.Sender == "" || aad.Recipient == "" {
+		return fail
+	}
+	if _, err := time.Parse(time.RFC3339Nano, aad.CreatedAt); err != nil {
+		return fail
+	}
+	if sample.Envelope.KeyEpochID != p.EpochID || sample.Envelope.Validate() != nil {
+		return fail
+	}
+	if base64.StdEncoding.DecodedLen(len(sample.Envelope.Ciphertext)) > 64*1024+16 {
+		return fail
+	}
+	epoch, ok := kr.EpochByID(p.EpochID)
+	if !ok || epoch.State != crypto.EpochActive {
+		return fail
+	}
+	key, err := epoch.KeyArray()
+	if err != nil {
+		return fail
+	}
+	defer clear(key[:])
+	plaintext, err := e2ee.Decrypt(sample.Envelope, key, aad)
+	if err != nil {
+		return fail
+	}
+	clear(plaintext)
+	return nil
 }
