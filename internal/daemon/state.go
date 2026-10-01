@@ -35,6 +35,7 @@ func OpenState(path string) (*State, error) {
 	}
 	if _, err := db.Exec(`
 		PRAGMA journal_mode = WAL;
+ PRAGMA synchronous = FULL;
 		CREATE TABLE IF NOT EXISTS processed_commands (
 			command_id   TEXT PRIMARY KEY,
 			type         TEXT NOT NULL,
@@ -102,7 +103,12 @@ func OpenState(path string) (*State, error) {
 			return nil, fmt.Errorf("migrate state: %w", err)
 		}
 	}
-	return &State{db: db}, nil
+	state := &State{db: db}
+	if err := state.initNativeObservationOutbox(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate native observation journal: %w", err)
+	}
+	return state, nil
 }
 
 func (s *State) Close() error { return s.db.Close() }

@@ -1378,6 +1378,7 @@ type RuntimeProfileInstallation = domain.RuntimeProfileInstallation
 const MsgResolveRuntimeInteraction = "host.resolve_runtime_interaction"
 
 type ResolveRuntimeInteractionPayload struct {
+	NativeOriginID      string    `json:"nativeOriginId,omitempty"`
 	InspectionProof     string    `json:"inspectionProof,omitempty"`
 	CommandID           string    `json:"commandId"`
 	InteractionID       string    `json:"interactionId"`
