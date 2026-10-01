@@ -35,6 +35,7 @@ const (
 // EndpointCryptoKeyPackagePayload is the wire payload of
 // endpoint.crypto_key_package.
 type EndpointCryptoKeyPackagePayload struct {
+	TenantID  string `json:"tenantId"`
 	NetworkID string `json:"networkId"`
 	// EpochID is the epoch the wrapped key belongs to (validated by the
 	// SDK before storing).

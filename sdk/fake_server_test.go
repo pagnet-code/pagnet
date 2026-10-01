@@ -484,6 +484,7 @@ func (fs *fakeServer) enrollEndpoint(ep *fakeEndpoint, networkID string) {
 			return
 		}
 		kp := EndpointCryptoKeyPackagePayload{
+			TenantID:   fakeTenantID,
 			NetworkID:  networkID,
 			EpochID:    epochID,
 			WrappedKey: transport.CryptoHPKEWrap{Enc: enc, Ciphertext: ct},
@@ -1023,7 +1024,7 @@ func (fs *fakeServer) handleNetworks(w http.ResponseWriter, principalID string, 
 	if p != nil {
 		for n := range p.memberships {
 			if net, ok := fs.networks[n]; ok {
-				entry := map[string]any{"ID": net.id, "Name": net.name, "Slug": net.name, "Description": ""}
+				entry := map[string]any{"TenantID": fakeTenantID, "ID": net.id, "Name": net.name, "Slug": net.name, "Description": ""}
 				if net.cryptoActive {
 					entry["crypto"] = map[string]any{"status": "active", "epochId": fs.epochID}
 				} else {

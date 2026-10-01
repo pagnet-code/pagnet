@@ -68,10 +68,11 @@ type Client struct {
 	identityPub  []byte // X25519 public key (raw 32 bytes)
 
 	// dynamic identity (set at auth_ok)
-	principalID atomicString
-	endpointID  atomicString
-	tenantID    atomicString
-	credential  atomic.Value // string: current principal credential
+	principalID    atomicString
+	endpointID     atomicString
+	tenantID       atomicString
+	networkTenants sync.Map     // network ID -> immutable, authorized owning tenant
+	credential     atomic.Value // string: current principal credential
 
 	// connection
 	connMu    sync.Mutex
@@ -219,6 +220,9 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if id != nil {
 		c.setIdentity(id)
 	}
+	// Membership-scoped discovery supplies destination organization metadata.
+	// Enrollment can also establish it; failure never falls back to the home tenant.
+	_, _ = c.Networks(ctx)
 	return c, nil
 }
 
@@ -354,6 +358,11 @@ func (c *Client) Networks(ctx context.Context) ([]NetworkInfo, error) {
 		return nil, err
 	}
 	for i := range nets {
+		if nets[i].TenantID != "" {
+			if err := c.rememberNetworkTenant(nets[i].ID, nets[i].TenantID); err != nil {
+				return nil, err
+			}
+		}
 		nets[i].CryptoReady = c.cryptoReady(nets[i].ID)
 	}
 	return nets, nil

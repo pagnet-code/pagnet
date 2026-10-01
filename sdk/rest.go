@@ -162,6 +162,7 @@ func (r *restClient) whoAmI(ctx context.Context) (*Identity, error) {
 // sees only the networks it is an ACTIVE member of.
 
 type restNetwork struct {
+	TenantID    string `json:"TenantID"`
 	ID          string `json:"ID"`
 	Name        string `json:"Name"`
 	Slug        string `json:"Slug"`
@@ -177,6 +178,7 @@ func (r *restClient) networks(ctx context.Context) ([]NetworkInfo, error) {
 	for _, n := range nets {
 		out = append(out, NetworkInfo{
 			ID:          n.ID,
+			TenantID:    n.TenantID,
 			Name:        n.Name,
 			Slug:        n.Slug,
 			Description: n.Description,

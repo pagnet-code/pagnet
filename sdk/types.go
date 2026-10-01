@@ -106,6 +106,7 @@ func (m Membership) Active() bool { return m.State == "active" }
 
 // NetworkInfo is one network the principal is a member of (GET /networks).
 type NetworkInfo struct {
+	TenantID    string // Network owner, independent of the participant organization.
 	ID          string
 	Name        string
 	Slug        string

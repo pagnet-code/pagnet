@@ -67,7 +67,7 @@ func uuidV7Time(id string) (time.Time, bool) {
 func (c *Client) buildAAD(networkID, objectType, objectID, sender, recipient, epochID string) e2ee.AAD {
 	aad := e2ee.AAD{
 		ProtocolVersion: transport.ProtocolVersion,
-		TenantID:        c.tenantID.Load(),
+		TenantID:        c.authorizedNetworkTenant(networkID),
 		NetworkID:       networkID,
 		ObjectType:      objectType,
 		ObjectID:        objectID,
@@ -95,6 +95,9 @@ func (c *Client) encryptObject(networkID, objectType, objectID, sender, recipien
 		return e2ee.EncryptedPayloadV1{}, e2ee.AAD{}, err
 	}
 	aad := c.buildAAD(networkID, objectType, objectID, sender, recipient, epochID)
+	if aad.TenantID == "" {
+		return e2ee.EncryptedPayloadV1{}, e2ee.AAD{}, fmt.Errorf("sdk: %w: authorized network ownership has not been received", ErrNetworkCryptoNotReady)
+	}
 	env, err := e2ee.Encrypt(plaintext, key, aad)
 	if err != nil {
 		return e2ee.EncryptedPayloadV1{}, e2ee.AAD{}, fmt.Errorf("sdk: encrypt %s: %w", objectType, err)
@@ -157,6 +160,11 @@ func (c *Client) handleCryptoKeyPackage(p EndpointCryptoKeyPackagePayload) error
 	}
 	var key [32]byte
 	copy(key[:], plain)
+	if p.TenantID != "" {
+		if err := c.rememberNetworkTenant(p.NetworkID, p.TenantID); err != nil {
+			return err
+		}
+	}
 	if err := c.kr.StoreEpoch(p.NetworkID, p.EpochID, key); err != nil {
 		return err
 	}
@@ -191,6 +199,12 @@ func (c *Client) answerChallenge(networkID string, p EndpointCryptoChallengePayl
 	plain, err := c.decryptObject(networkID, p.Challenge.Envelope, p.Challenge.AAD)
 	if err != nil {
 		return fmt.Errorf("sdk: decrypt enrollment challenge: %w", err)
+	}
+	if p.Challenge.AAD.NetworkID != networkID || p.Challenge.AAD.TenantID == "" || p.Challenge.AAD.ObjectType != "e2ee_challenge" {
+		return fmt.Errorf("sdk: enrollment challenge has invalid network ownership context")
+	}
+	if err := c.rememberNetworkTenant(networkID, p.Challenge.AAD.TenantID); err != nil {
+		return err
 	}
 	mac := challengeMAC(plain, p.Challenge.Nonce)
 	proof := e2ee.Proof{MAC: mac}
@@ -238,4 +252,25 @@ func (c *Client) cryptoReady(networkID string) bool {
 	c.cryptoMu.Lock()
 	defer c.cryptoMu.Unlock()
 	return c.cryptoReadySet[networkID]
+}
+
+// Ownership comes only from authorized discovery or authenticated enrollment,
+// never from arbitrary incoming message AAD or the principal's home tenant.
+func (c *Client) authorizedNetworkTenant(networkID string) string {
+	value, ok := c.networkTenants.Load(networkID)
+	if !ok {
+		return ""
+	}
+	tenant, _ := value.(string)
+	return tenant
+}
+func (c *Client) rememberNetworkTenant(networkID, tenantID string) error {
+	if networkID == "" || tenantID == "" {
+		return fmt.Errorf("sdk: network ownership context is missing")
+	}
+	previous, loaded := c.networkTenants.LoadOrStore(networkID, tenantID)
+	if loaded && previous != tenantID {
+		return fmt.Errorf("sdk: authorized network ownership changed; reconnect after checking the network")
+	}
+	return nil
 }
