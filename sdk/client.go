@@ -121,11 +121,15 @@ type Client struct {
 	identity   *Identity
 
 	// lifecycle
-	closed      atomic.Bool
-	closeCh     chan struct{}
-	wg          sync.WaitGroup // supervisor + dispatcher
-	firstAuthOK chan struct{}
-	firstErrCh  chan error // fatal (credential dead)
+	closed       atomic.Bool
+	closeCh      chan struct{}
+	wg           sync.WaitGroup // supervisor + dispatcher
+	firstAuthOK  chan struct{}
+	firstErrCh   chan error // fatal (credential dead)
+	terminalOnce sync.Once
+	terminalMu   sync.Mutex
+	terminalErr  error
+	terminalCh   chan struct{}
 }
 
 // Connect authenticates with the principal credential, runs
@@ -186,6 +190,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		closeCh:              make(chan struct{}),
 		firstAuthOK:          make(chan struct{}),
 		firstErrCh:           make(chan error, 1),
+		terminalCh:           make(chan struct{}),
 	}
 	c.credential.Store(cfg.Credential)
 	c.rest = newRestClient(cfg.serverBase(), cfg.userAgent(), func() string { return c.credential.Load().(string) })
@@ -263,6 +268,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 	close(c.closeCh)
+	c.finish(nil)
 	c.connMu.Lock()
 	pc := c.cur
 	c.connMu.Unlock()
@@ -288,7 +294,30 @@ func (c *Client) checkOpen() error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.Err(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// Done closes when the client is closed or cannot recover (for example its
+// credential is revoked). Transient disconnects remain reconnectable.
+func (c *Client) Done() <-chan struct{} { return c.terminalCh }
+
+// Err returns the terminal connection failure, or nil on ordinary Close.
+func (c *Client) Err() error {
+	c.terminalMu.Lock()
+	defer c.terminalMu.Unlock()
+	return c.terminalErr
+}
+
+func (c *Client) finish(err error) {
+	c.terminalOnce.Do(func() {
+		c.terminalMu.Lock()
+		c.terminalErr = err
+		c.terminalMu.Unlock()
+		close(c.terminalCh)
+	})
 }
 
 // PrincipalID returns the authenticated principal's id ("" before the
@@ -696,7 +725,7 @@ func (c *Client) supervisor() {
 	defer c.wg.Done()
 	attempt := 0
 	for {
-		if c.closed.Load() {
+		if c.closed.Load() || c.Err() != nil {
 			return
 		}
 		err := c.connectOnce()
@@ -734,6 +763,13 @@ func (c *Client) supervisor() {
 
 // firstErr reports a fatal error to Connect (once).
 func (c *Client) firstErr(err error) {
+	c.finish(err)
+	c.connMu.Lock()
+	pc := c.cur
+	c.connMu.Unlock()
+	if pc != nil {
+		_ = pc.ws.Close()
+	}
 	select {
 	case c.firstErrCh <- err:
 	default:

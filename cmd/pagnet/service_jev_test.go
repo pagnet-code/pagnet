@@ -19,11 +19,11 @@ func TestJevProfileRestartAndExplicitOverrides(t *testing.T) {
 	dir := t.TempDir()
 	id := uuid.NewString()
 	path := filepath.Join(dir, "services", "jev", id+".json")
-	profile := savedJevService{Service: id, Server: "https://app.pagnet.dev", Activation: "pgn_act_v1_local_test", Model: "jev-1.13.0"}
-	if err := saveJevProfile(path, profile); err != nil {
+	profile := serviceRunnerProfile{Service: id, Server: "https://app.pagnet.dev", Credential: "pgn_act_v1_local_test", Model: "jev-1.13.0", Adapter: "jev"}
+	if err := saveServiceRunnerProfile(path, profile); err != nil {
 		t.Fatal(err)
 	}
-	got, err := loadJevProfile(path, id)
+	got, err := loadServiceRunnerProfile(path, id)
 	if err != nil || got != profile {
 		t.Fatalf("restart profile=%+v err=%v", got, err)
 	}
@@ -35,7 +35,7 @@ func TestJevProfileRestartAndExplicitOverrides(t *testing.T) {
 	if strings.Contains(string(raw), "typesafe-provider-key") {
 		t.Fatal("provider key persisted")
 	}
-	if _, err := loadJevProfile(path, uuid.NewString()); err == nil {
+	if _, err := loadServiceRunnerProfile(path, uuid.NewString()); err == nil {
 		t.Fatal("cross-service profile accepted")
 	}
 	t.Setenv("TYPESAFE_API_KEY", "typesafe-provider-key")
@@ -44,7 +44,7 @@ func TestJevProfileRestartAndExplicitOverrides(t *testing.T) {
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "model") {
 		t.Fatalf("explicit restart model not applied: %v", err)
 	}
-	unchanged, err := loadJevProfile(path, id)
+	unchanged, err := loadServiceRunnerProfile(path, id)
 	if err != nil || unchanged != profile {
 		t.Fatal("failed preflight overwrote working profile")
 	}
@@ -63,16 +63,16 @@ func TestJevProfileRejectsUnsafeAndMalformedFiles(t *testing.T) {
 		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadJevProfile(path, id); err == nil {
+		if _, err := loadServiceRunnerProfile(path, id); err == nil {
 			t.Fatal("invalid profile accepted")
 		}
 	}
 	if runtime.GOOS != "windows" {
-		if err := saveJevProfile(path, savedJevService{Service: id}); err != nil {
+		if err := saveServiceRunnerProfile(path, serviceRunnerProfile{Service: id}); err != nil {
 			t.Fatal(err)
 		}
 		_ = os.Chmod(path, 0644)
-		if _, err := loadJevProfile(path, id); err == nil {
+		if _, err := loadServiceRunnerProfile(path, id); err == nil {
 			t.Fatal("world-readable profile accepted")
 		}
 	}

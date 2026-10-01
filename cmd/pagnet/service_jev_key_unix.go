@@ -16,7 +16,7 @@ func validateJevKeyFileOwner(stat os.FileInfo) error {
 	return nil
 }
 
-func validateJevProfileOwner(info os.FileInfo) error {
+func validateServiceProfileOwner(info os.FileInfo) error {
 	if info.Mode().Perm()&0077 != 0 {
 		return errors.New("local Jev profile must be private (chmod 600)")
 	}

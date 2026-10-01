@@ -111,12 +111,19 @@ func (s *Service) ensureSubscriptions() { s.subs.reconcile() }
 // Serve blocks until ctx is done, keeping the endpoint live (the
 // connection, heartbeats, reconnects, and acks are owned by the Client and
 // run for its whole lifetime). It also reconciles the service's event
-// subscriptions (re-created on every (re)connect). Serve returns
-// ctx.Err().
+// subscriptions (re-created on every (re)connect). Serve returns ctx.Err(),
+// ErrClosed, or a terminal connection error such as a revoked credential.
 func (s *Service) Serve(ctx context.Context) error {
 	s.ensureSubscriptions()
-	<-ctx.Done()
-	return ctx.Err()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.client.Done():
+		if err := s.client.Err(); err != nil {
+			return err
+		}
+		return ErrClosed
+	}
 }
 
 // Network returns a per-network operations handle for this service
