@@ -2434,6 +2434,7 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 	if err := d.state.DeleteInstance(instanceID); err != nil {
 		return err
 	}
+	d.removeSessionGuidance(instanceID)
 	d.finishQueue(instanceID)
 	d.Log.Info("instance forgotten", "instance", instanceID)
 	return nil

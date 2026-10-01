@@ -152,8 +152,14 @@ func (d *Daemon) writeStandingDocument(row *InstanceRow) (string, string, error)
 		return "", "", err
 	}
 	text := overlay
+	if skillPath, err := d.writeSessionGuidance(row); err == nil {
+		text += "\nRead the session-local Pagnet coordination skill when using network or channel tools: " + skillPath + "\n"
+	} else {
+		d.Log.Warn("session guidance reference unavailable", "instance", row.InstanceID)
+		text += "\nPAGNET SESSION GUIDANCE\n\n" + coordinationSkillBody() + "\n"
+	}
 	if instr := strings.TrimSpace(row.Instruction); instr != "" {
-		text = overlay + "\nAGENT INSTRUCTIONS\n\n" + instr + "\n"
+		text += "\nAGENT INSTRUCTIONS\n\n" + instr + "\n"
 	}
 	// SEC-407 (defense in depth): the id becomes a path component — a
 	// non-UUID can never reach the join.
