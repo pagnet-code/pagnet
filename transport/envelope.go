@@ -660,11 +660,12 @@ type InstanceStatus struct {
 
 // InventoryPayload reports detected runtimes and workspaces.
 type InventoryPayload struct {
-	HostID          string                       `json:"hostId"`
-	Runtimes        []RuntimeInstallation        `json:"runtimes"`
-	RuntimeProfiles []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
-	Workspaces      []WorkspaceReport            `json:"workspaces"`
-	AllowedRoots    []string                     `json:"allowedRoots"`
+	OwnerContextProtocol string                       `json:"ownerContextProtocol,omitempty"`
+	HostID               string                       `json:"hostId"`
+	Runtimes             []RuntimeInstallation        `json:"runtimes"`
+	RuntimeProfiles      []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
+	Workspaces           []WorkspaceReport            `json:"workspaces"`
+	AllowedRoots         []string                     `json:"allowedRoots"`
 	// Crypto is the host's stable per-host E2EE public identity (plan
 	// §11.5), reported so the control plane knows the host is crypto-capable
 	// and can address it for Private Network activation/enrollment. Public
@@ -1059,9 +1060,10 @@ type CryptoShareEndpointResult struct {
 // BrowserPub is the browser's session ephemeral-static X25519 public key
 // (base64) — the unwrap target. It is public metadata, not a secret.
 type CryptoSessionStartPayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
+	ProtectedContext *e2ee.ProtectedContext `json:"protectedContext,omitempty"`
+	CommandID        string                 `json:"commandId"`
+	TenantID         string                 `json:"tenantId"`
+	NetworkID        string                 `json:"networkId"`
 	// SessionID is the server-minted session id (the daemon stores the
 	// record under it; the browser reuses it on every operation).
 	SessionID string `json:"sessionId"`
@@ -1105,6 +1107,7 @@ type CryptoHPKEWrap struct {
 // wrapped_content_key to unwrap the CEK). The control plane resolves the id
 // to the stored envelope and relays it byte-for-byte.
 type CryptoUnwrapCekObject struct {
+	AAD      *e2ee.AAD               `json:"aad,omitempty"`
 	ObjectID string                  `json:"objectId"`
 	Envelope e2ee.EncryptedPayloadV1 `json:"envelope"`
 }
@@ -1115,10 +1118,11 @@ type CryptoUnwrapCekObject struct {
 // verbatim; the daemon does not need it to unwrap — the CEK wrap carries no
 // AAD — and it echoes nothing back).
 type CryptoUnwrapCekPayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
-	SessionID string `json:"sessionId"`
+	ProtectedContext *e2ee.ProtectedContext `json:"protectedContext,omitempty"`
+	CommandID        string                 `json:"commandId"`
+	TenantID         string                 `json:"tenantId"`
+	NetworkID        string                 `json:"networkId"`
+	SessionID        string                 `json:"sessionId"`
 	// AAD is the browser's AAD (relayed verbatim; not used by the unwrap).
 	AAD e2ee.AAD `json:"aad"`
 	// Objects is the batch (≤ 100), each with its stored envelope.
@@ -1173,10 +1177,11 @@ type CryptoWrapCekResult struct {
 // (explicit teardown). Idempotent: an unknown or already-expired session is
 // a clean no-op ack.
 type CryptoSessionEndPayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
-	SessionID string `json:"sessionId"`
+	ProtectedContext *e2ee.ProtectedContext `json:"protectedContext,omitempty"`
+	CommandID        string                 `json:"commandId"`
+	TenantID         string                 `json:"tenantId"`
+	NetworkID        string                 `json:"networkId"`
+	SessionID        string                 `json:"sessionId"`
 }
 
 // --- protocol v2: endpoint WS (SDK participants) ---------------------------
@@ -1347,6 +1352,7 @@ type RuntimeProfileInstallation = domain.RuntimeProfileInstallation
 const MsgResolveRuntimeInteraction = "host.resolve_runtime_interaction"
 
 type ResolveRuntimeInteractionPayload struct {
+	InspectionProof     string    `json:"inspectionProof,omitempty"`
 	CommandID           string    `json:"commandId"`
 	InteractionID       string    `json:"interactionId"`
 	InstanceID          string    `json:"instanceId"`

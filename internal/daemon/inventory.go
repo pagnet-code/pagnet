@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -81,6 +82,7 @@ func (d *Daemon) doScanInventory() transport.InventoryPayload {
 	// identity omits the block (the host is simply not crypto-capable yet)
 	// and never fails the inventory report.
 	if id, err := d.cryptoManager().hostIdentity(); err == nil {
+		payload.OwnerContextProtocol = ownerContextProtocol()
 		payload.Crypto = &transport.InventoryCrypto{
 			X25519Pub:  base64.StdEncoding.EncodeToString(id.X25519Pub),
 			Ed25519Pub: base64.StdEncoding.EncodeToString(id.Ed25519Pub),
@@ -343,4 +345,11 @@ func (d *Daemon) gitOutput(dir string, args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func ownerContextProtocol() string {
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		return transport.OwnerContextProtocol
+	}
+	return ""
 }

@@ -1373,6 +1373,24 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case transport.MsgPrepareProtectedContext:
+		var p transport.PrepareProtectedContextPayload
+		if env.DecodePayload(&p) != nil || p.CommandID == "" {
+			return
+		}
+		d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, func() {
+			prepared := false
+			d.guardedResult(conn, p.CommandID, func() (any, error) {
+				result, err := d.doPrepareProtectedContext(p)
+				prepared = err == nil
+				return result, err
+			})
+			// Preparation ACK is ordered before observation replay; the server first
+			// commits the ready context, then accepts the protected content.
+			if prepared {
+				d.replayOwnerObservations(conn, p.InstanceID)
+			}
+		})
 	case transport.MsgResolveRuntimeInteraction:
 		var p transport.ResolveRuntimeInteractionPayload
 		if env.DecodePayload(&p) != nil || p.CommandID == "" {
@@ -4343,6 +4361,10 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 	// Networkless personal sessions have no network key context. Do not send
 	// private vendor tool arguments as a plaintext substitute for inspection.
 	if row, ok, _ := d.state.GetInstance(spec.InstanceID); ok && row.NetworkID == "" {
+		if protected, ready := d.observeOwnerInteraction(payload, ie); ready {
+			_ = d.send(conn, msgType, protected)
+			return
+		}
 		payload.NativePayload = nil
 		payload.Answer = ""
 		payload.Summary = "Native interaction"

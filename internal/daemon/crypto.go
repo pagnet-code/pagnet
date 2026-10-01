@@ -38,7 +38,8 @@ type cryptoManager struct {
 	// sessions is the in-memory browser key-session store (plan §13, p10).
 	// It is per-daemon (not per-network) and NOT durable: a daemon restart
 	// drops every session (a reused sessionId is a clean 410).
-	sessions *sessionStore
+	sessions      *sessionStore
+	ownerContexts *ownerContextManager
 }
 
 // NetworkCryptoState is the daemon's cached view of one network's E2EE

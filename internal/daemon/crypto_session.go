@@ -33,6 +33,9 @@ func (d *Daemon) sessionValid(pNetworkID, pSessionID string) (*browserSession, e
 // X25519 public key (the browser wraps write CEKs to it). The session is
 // in-memory: a daemon restart drops it.
 func (d *Daemon) doCryptoSessionStart(p transport.CryptoSessionStartPayload) (any, error) {
+	if p.ProtectedContext != nil {
+		return d.ownerSessionStart(p)
+	}
 	kr, err := crypto.LoadKeyring(d.StateDir, p.NetworkID)
 	if err != nil {
 		return nil, fmt.Errorf("crypto: session start: %w", err)
@@ -61,6 +64,9 @@ func (d *Daemon) doCryptoSessionStart(p transport.CryptoSessionStartPayload) (an
 // fail the batch). The daemon NEVER returns the network keyring or an
 // epoch key — only per-object CEKs re-wrapped to the browser.
 func (d *Daemon) doCryptoUnwrapCek(p transport.CryptoUnwrapCekPayload) (any, error) {
+	if p.ProtectedContext != nil {
+		return d.ownerUnwrap(p)
+	}
 	sess, err := d.sessionValid(p.NetworkID, p.SessionID)
 	if err != nil {
 		return nil, err
@@ -180,6 +186,9 @@ func (d *Daemon) doCryptoWrapCek(p transport.CryptoWrapCekPayload) (any, error) 
 // idempotent: ending an unknown session is a clean no-op (the session may
 // have already expired or been dropped by a restart).
 func (d *Daemon) doCryptoSessionEnd(p transport.CryptoSessionEndPayload) (any, error) {
+	if p.ProtectedContext != nil {
+		return d.ownerSessionEnd(p)
+	}
 	d.cryptoManager().sessions.delete(p.SessionID)
 	return nil, nil
 }
