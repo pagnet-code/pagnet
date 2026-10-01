@@ -84,9 +84,13 @@ func TestCryptoEnrollmentRoundTrip(t *testing.T) {
 		t.Fatalf("target keyring not persisted: %v", err)
 	}
 
-	// Leg 3: challenge (NKA issues for the target).
+	// Leg 3: challenge (NKA issues for the explicitly admitted epoch).
+	challengeRing, err := crypto.LoadKeyring(ka.StateDir, networkID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	chRes, err := ka.doCryptoChallenge(transport.CryptoChallengePayload{
-		TenantID: tenantID, NetworkID: networkID, TargetHostID: targetHostID,
+		TenantID: tenantID, NetworkID: networkID, TargetHostID: targetHostID, EpochID: challengeRing.Epochs[0].ID,
 	})
 	if err != nil {
 		t.Fatalf("doCryptoChallenge: %v", err)
@@ -142,8 +146,12 @@ func TestCryptoVerify_RejectsReplayedChallenge(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("doCryptoInstallKeyPackage: %v", err)
 	}
+	challengeRing, err := crypto.LoadKeyring(ka.StateDir, networkID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	chRes, err := ka.doCryptoChallenge(transport.CryptoChallengePayload{
-		TenantID: tenantID, NetworkID: networkID, TargetHostID: targetHostID,
+		TenantID: tenantID, NetworkID: networkID, TargetHostID: targetHostID, EpochID: challengeRing.Epochs[0].ID,
 	})
 	if err != nil {
 		t.Fatalf("doCryptoChallenge: %v", err)

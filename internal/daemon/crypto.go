@@ -223,7 +223,7 @@ func (d *Daemon) doCryptoChallenge(p transport.CryptoChallengePayload) (any, err
 	if err != nil {
 		return nil, err
 	}
-	ch, err := n.IssueChallenge(p.TargetHostID, time.Now().UTC())
+	ch, err := n.IssueChallenge(p.TargetHostID, p.EpochID, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}

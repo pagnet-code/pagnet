@@ -166,14 +166,14 @@ func OpenKeyPackage(pkg *e2ee.KeyPackage, hostPriv []byte) (*Keyring, error) {
 // challengeObjectType is the AAD object type for decryption challenges.
 const challengeObjectType = "e2ee_challenge"
 
-// IssueChallenge creates a decryption challenge under the current epoch. The
+// IssueChallenge creates a decryption challenge under the explicitly admitted epoch. The
 // NKA remembers the challenge plaintext (in memory) so it can verify the
 // host's proof later. The returned e2ee.Challenge is the wire type the
 // control plane relays opaquely (plan §11.7 step 7).
-func (n *NKA) IssueChallenge(newHostID string, now time.Time) (*e2ee.Challenge, error) {
-	epoch, err := n.keyring.ActiveEpoch()
-	if err != nil {
-		return nil, err
+func (n *NKA) IssueChallenge(newHostID, epochID string, now time.Time) (*e2ee.Challenge, error) {
+	epoch, ok := n.keyring.EpochByID(epochID)
+	if epochID == "" || !ok || (epoch.State != EpochActive && epoch.State != EpochRotated) {
+		return nil, fmt.Errorf("crypto: admitted challenge epoch unavailable")
 	}
 	epochKey, err := epoch.KeyArray()
 	if err != nil {

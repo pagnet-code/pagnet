@@ -15,8 +15,8 @@ func EpochPossessionSigner(kr *Keyring, epochID string) (ed25519.PrivateKey, err
 		return nil, errors.New("crypto: invalid possession scope")
 	}
 	epoch, ok := kr.EpochByID(epochID)
-	if !ok || epoch.State != EpochActive || len(epoch.Key) != 32 {
-		return nil, errors.New("crypto: active possession epoch unavailable")
+	if !ok || (epoch.State != EpochActive && epoch.State != EpochRotated) || len(epoch.Key) != 32 {
+		return nil, errors.New("crypto: requested possession epoch unavailable")
 	}
 	info, _ := json.Marshal(struct {
 		Domain    string `json:"domain"`

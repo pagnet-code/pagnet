@@ -132,7 +132,7 @@ func verifyEpochAttestationSample(kr *crypto.Keyring, p transport.CryptoAttestEp
 		return fail
 	}
 	epoch, ok := kr.EpochByID(p.EpochID)
-	if !ok || epoch.State != crypto.EpochActive {
+	if !ok || (epoch.State != crypto.EpochActive && epoch.State != crypto.EpochRotated) {
 		return fail
 	}
 	key, err := epoch.KeyArray()

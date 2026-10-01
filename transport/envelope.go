@@ -929,6 +929,7 @@ type CryptoChallengePayload struct {
 	CommandID    string `json:"commandId"`
 	TenantID     string `json:"tenantId"`
 	NetworkID    string `json:"networkId"`
+	EpochID      string `json:"epochId"` // exact committed enrollment epoch
 	TargetHostID string `json:"targetHostId"`
 }
 

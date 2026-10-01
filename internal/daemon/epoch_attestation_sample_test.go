@@ -14,6 +14,16 @@ import (
 )
 
 func TestEpochAttestationAuthenticatesStoredHistory(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		name := "active"
+		if retained {
+			name = "retained"
+		}
+		t.Run(name, func(t *testing.T) { testEpochAttestationAuthenticatesStoredHistory(t, retained) })
+	}
+}
+
+func testEpochAttestationAuthenticatesStoredHistory(t *testing.T, retained bool) {
 	d := newCryptoDaemon(t)
 	if err := d.state.KVSet("host_id", "host"); err != nil {
 		t.Fatal(err)
@@ -24,13 +34,18 @@ func TestEpochAttestationAuthenticatesStoredHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	manifest := raw.(*transport.CryptoActivateResult).Manifest
+	if retained {
+		if _, err := d.doCryptoRotate(transport.CryptoRotatePayload{TenantID: "tenant", NetworkID: network}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	kr, err := crypto.LoadKeyring(d.StateDir, network)
 	if err != nil {
 		t.Fatal(err)
 	}
-	epoch, err := kr.ActiveEpoch()
-	if err != nil {
-		t.Fatal(err)
+	epoch, ok := kr.EpochByID(manifest.EpochID)
+	if !ok {
+		t.Fatal("original epoch missing")
 	}
 	key, err := epoch.KeyArray()
 	if err != nil {

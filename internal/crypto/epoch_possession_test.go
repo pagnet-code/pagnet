@@ -17,6 +17,11 @@ func TestEpochPossessionDerivationScopeAndKey(t *testing.T) {
 	if err != nil || !bytes.Equal(signer, again) {
 		t.Fatal("unstable derivation")
 	}
+	kr.Epochs[0].State = EpochRotated
+	retained, err := EpochPossessionSigner(kr, "epoch")
+	if err != nil || !bytes.Equal(signer, retained) {
+		t.Fatal("retained admitted epoch lost its original verifier")
+	}
 	proof := ed25519.Sign(signer, []byte("fresh nonce binding"))
 	for _, name := range []string{"network", "epoch", "key", "revoked"} {
 		t.Run(name, func(t *testing.T) {

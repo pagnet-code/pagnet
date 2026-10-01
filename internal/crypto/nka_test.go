@@ -58,7 +58,7 @@ func TestNKAEnrollmentFlow(t *testing.T) {
 	}
 
 	// (c) The NKA issues a decryption challenge.
-	ch, err := nka.IssueChallenge(testNewHost, now.Add(time.Minute))
+	ch, err := nka.IssueChallenge(testNewHost, nka.keyring.Epochs[len(nka.keyring.Epochs)-1].ID, now.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestNKAChallengeWrongKeyring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNKA: %v", err)
 	}
-	ch, err := nka.IssueChallenge(testNewHost, testTime())
+	ch, err := nka.IssueChallenge(testNewHost, nka.keyring.Epochs[len(nka.keyring.Epochs)-1].ID, testTime())
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestNKAChallengeSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNKA: %v", err)
 	}
-	ch, err := nka.IssueChallenge(testNewHost, now)
+	ch, err := nka.IssueChallenge(testNewHost, nka.keyring.Epochs[len(nka.keyring.Epochs)-1].ID, now)
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestNKARotateThenChallenge(t *testing.T) {
 	kr2, _ := OpenKeyPackage(pkg2, newHost.X25519Priv)
 
 	// A challenge now uses the new (epoch 2) key.
-	ch, err := nka.IssueChallenge(testNewHost, now.Add(2*time.Hour))
+	ch, err := nka.IssueChallenge(testNewHost, nka.keyring.Epochs[len(nka.keyring.Epochs)-1].ID, now.Add(2*time.Hour))
 	if err != nil {
 		t.Fatalf("IssueChallenge: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestNKAChallengeIssueWiring(t *testing.T) {
 	// bounded at the cap (the oldest is dropped on each issue past the cap).
 	var first *e2ee.Challenge
 	for i := 0; i <= challengeCap; i++ {
-		ch, err := nka.IssueChallenge(fmt.Sprintf("host-%d", i), now.Add(time.Duration(i)*time.Second))
+		ch, err := nka.IssueChallenge(fmt.Sprintf("host-%d", i), nka.keyring.Epochs[len(nka.keyring.Epochs)-1].ID, now.Add(time.Duration(i)*time.Second))
 		if err != nil {
 			t.Fatalf("IssueChallenge (%d): %v", i, err)
 		}
