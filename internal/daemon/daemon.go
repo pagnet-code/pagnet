@@ -3141,7 +3141,31 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		runtimeStreamID = newObjectID()
 	}
 
-	for ev := range events {
+	var planRevision uint64
+	var plans taskPlanCoalescer
+	plansClosed := false
+	planTick := time.NewTicker(200 * time.Millisecond)
+	defer planTick.Stop()
+	flushPlan := func(force bool) {
+		if plan := plans.take(time.Now(), force); plan != nil {
+			planRevision++
+			d.sendTaskProgress(conn, spec, sessionID, planRevision, plan)
+		}
+	}
+legacyTurnEvents:
+	for {
+		var ev agentruntime.TurnEvent
+		select {
+		case next, ok := <-events:
+			if !ok {
+				flushPlan(true)
+				break legacyTurnEvents
+			}
+			ev = next
+		case <-planTick.C:
+			flushPlan(false)
+			continue
+		}
 		switch ev.Type {
 		case agentruntime.EventSessionStarted, agentruntime.EventSessionResumed:
 			sessionID = ev.SessionID
@@ -3149,16 +3173,27 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 				ev.Type == agentruntime.EventSessionResumed)
 			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 		case agentruntime.EventSessionLost:
+			plans.pending = nil
+			plansClosed = true
 			sessionLost = true
 		case agentruntime.EventTurnStarted:
 			d.sendTurn(conn, transport.MsgRuntimeTurnStarted, spec, sessionID, nil, nil, nil, "", "", nil)
 		case agentruntime.EventTurnOutput:
 			d.sendRuntimeOutput(conn, row, runtimeStreamID, ev.Output)
+		case agentruntime.EventPlanUpdated:
+			if !plansClosed && ev.SessionID == sessionID && sessionID != "" && session.ValidatePlan(ev.Plan) == nil {
+				plans.pending = ev.Plan
+				flushPlan(false)
+			}
 		case agentruntime.EventTurnCompleted:
+			flushPlan(true)
+			plansClosed = true
 			completed = true
 			d.sendTurn(conn, transport.MsgRuntimeTurnCompleted, spec, sessionID,
 				ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.Model, "", nil)
 		case agentruntime.EventTurnFailed:
+			flushPlan(true)
+			plansClosed = true
 			failedKind = string(ev.FailureKind)
 			failedErr = ev.Error
 			failedRetry = ev.RetryAt

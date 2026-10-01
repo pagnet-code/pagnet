@@ -23,6 +23,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/sandbox"
+	"github.com/pagnet-code/pagnet/internal/session"
 )
 
 // TurnSpec describes one turn to run. The adapter decides how to translate it
@@ -105,6 +106,7 @@ type TurnEvent struct {
 	// Interaction is set on EventInteractionStarted /
 	// EventInteractionResolved (nil for all other event types).
 	Interaction *InteractionEvent
+	Plan        *session.PlanSnapshot
 }
 
 // TurnEvent types (generic; NOT runtime-specific).
@@ -113,6 +115,7 @@ const (
 	EventSessionResumed = "runtime.session.resumed"
 	EventTurnStarted    = "runtime.turn.started"
 	EventTurnOutput     = "runtime.turn.output"
+	EventPlanUpdated    = "runtime.plan.updated"
 	EventTurnCompleted  = "runtime.turn.completed"
 	EventTurnFailed     = "runtime.turn.failed"
 	// EventSessionLost: a resume was requested but no usable session existed.

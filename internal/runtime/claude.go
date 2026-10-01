@@ -281,10 +281,16 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		}
 	}
 
+	var plans claudePlanTracker
 	for scanner.Scan() {
 		var ev claudeEvent
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
 			continue
+		}
+		if sessionID != "" && ev.SessionID == sessionID && ev.ParentID == "" {
+			if plan := plans.consume(ev); plan != nil {
+				emit(TurnEvent{Type: EventPlanUpdated, SessionID: sessionID, Plan: plan})
+			}
 		}
 		switch ev.Type {
 		case "system":
@@ -567,15 +573,17 @@ func (c *Claude) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 // --- claude stream-json wire shapes -------------------------------------------
 
 type claudeEvent struct {
-	Type      string      `json:"type"`
-	Subtype   string      `json:"subtype"`
-	SessionID string      `json:"session_id"`
-	IsError   bool        `json:"is_error"`
-	Result    string      `json:"result"`
-	Errors    []string    `json:"errors"`
-	Usage     claudeUsage `json:"usage"`
-	Message   claudeMsg   `json:"message"`
-	Model     string      `json:"model"`
+	ParentID      string          `json:"parent_tool_use_id"`
+	ToolUseResult json.RawMessage `json:"tool_use_result"`
+	Type          string          `json:"type"`
+	Subtype       string          `json:"subtype"`
+	SessionID     string          `json:"session_id"`
+	IsError       bool            `json:"is_error"`
+	Result        string          `json:"result"`
+	Errors        []string        `json:"errors"`
+	Usage         claudeUsage     `json:"usage"`
+	Message       claudeMsg       `json:"message"`
+	Model         string          `json:"model"`
 }
 
 type claudeUsage struct {
@@ -590,6 +598,10 @@ type claudeMsg struct {
 }
 
 type claudePart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ToolUseID string `json:"tool_use_id"`
+	IsError   bool   `json:"is_error"`
 }

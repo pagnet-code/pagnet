@@ -299,6 +299,12 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 				lastText = ev.Part.Text
 				emit(TurnEvent{Type: EventTurnOutput, Output: ev.Part.Text})
 			}
+		case "tool_use":
+			if ev.SessionID == sessionID && sessionID != "" {
+				if plan := opencodePlan(ev.Part, sessionID); plan != nil {
+					emit(TurnEvent{Type: EventPlanUpdated, SessionID: sessionID, Plan: plan})
+				}
+			}
 		case "error":
 			errText = opencodeErrorText(ev.Error)
 		}
@@ -565,8 +571,11 @@ type opencodeEvent struct {
 }
 
 type opencodePart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	SessionID string          `json:"sessionID"`
+	Tool      string          `json:"tool"`
+	State     json.RawMessage `json:"state"`
 }
 
 // opencodeErrorText extracts a human-readable message from an opencode

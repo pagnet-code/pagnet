@@ -24,7 +24,7 @@ type PlanEntry struct {
 }
 
 func ValidatePlan(p *PlanSnapshot) error {
-	if p == nil || (p.Source != "codex" && p.Source != "acp") || p.Entries == nil || len(p.Entries) > MaxPlanEntries || len(p.NativeTurnID) > 256 {
+	if p == nil || (p.Source != "codex" && p.Source != "acp" && p.Source != "claude" && p.Source != "opencode") || p.Entries == nil || len(p.Entries) > MaxPlanEntries || len(p.NativeTurnID) > 256 {
 		return errors.New("invalid runtime plan")
 	}
 	for _, e := range p.Entries {
