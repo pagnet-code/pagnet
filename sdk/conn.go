@@ -31,6 +31,7 @@ func (pc *conn) send(msgType string, payload any) error {
 	}
 	pc.sendMu.Lock()
 	defer pc.sendMu.Unlock()
+	_ = pc.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return pc.ws.WriteJSON(env)
 }
 
@@ -83,6 +84,8 @@ func (pc *conn) readLoop() {
 			case <-pc.c.closeCh:
 				return
 			}
+		case transport.MsgEndpointInvocationResultAck:
+			pc.c.handleInvocationResultAck(env)
 		case transport.MsgEndpointHeartbeatAck:
 			// liveness only
 		case MsgEndpointCryptoKeyPackage:
@@ -127,7 +130,14 @@ func (pc *conn) heartbeat() {
 		select {
 		case <-t.C:
 			inflight := int(atomic.LoadInt64(&pc.c.inflightCount))
+			pc.c.invMu.Lock()
+			accepted := len(pc.c.inflightInvocations)
+			pc.c.invMu.Unlock()
+			if accepted > inflight {
+				inflight = accepted
+			}
 			_ = pc.send(transport.MsgEndpointHeartbeat, transport.EndpointHeartbeatPayload{Inflight: inflight})
+			pc.c.retryPendingResults(false)
 		case <-pc.dead:
 			return
 		case <-pc.c.closeCh:

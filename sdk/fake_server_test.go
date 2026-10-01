@@ -132,10 +132,12 @@ type fakeServer struct {
 	t  *testing.T
 	ts *httptest.Server
 
-	mu               sync.Mutex
-	dispatchMu       sync.Mutex
-	authGate         <-chan struct{}
-	registerObserved chan string
+	mu                   sync.Mutex
+	dispatchMu           sync.Mutex
+	authGate             <-chan struct{}
+	registerObserved     chan string
+	dropResultReceipts   bool
+	omitDispatchProtocol bool
 
 	principals map[string]*fakePrincipal
 	networks   map[string]*fakeNetwork
@@ -717,12 +719,18 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 				<-gate
 			}
 			ok := transport.EndpointAuthOKPayload{
-				PrincipalID:     principalID,
-				EndpointID:      ep.id,
-				NetworkIDs:      netIDs,
-				Credential:      durableCred,
-				ProtocolVersion: transport.ProtocolVersion,
+				PrincipalID:      principalID,
+				EndpointID:       ep.id,
+				NetworkIDs:       netIDs,
+				Credential:       durableCred,
+				ProtocolVersion:  transport.ProtocolVersion,
+				ProtocolFeatures: []string{transport.EndpointDispatchProtocol},
 			}
+			fs.mu.Lock()
+			if fs.omitDispatchProtocol {
+				ok.ProtocolFeatures = nil
+			}
+			fs.mu.Unlock()
 			if err := fs.sendTo(ep, transport.MsgEndpointAuthOK, ok); err != nil {
 				return
 			}
@@ -773,6 +781,12 @@ func (fs *fakeServer) wsReadLoop(ep *fakeEndpoint, principalID string, netIDs []
 				continue
 			}
 			fs.handleInvocationResult(p)
+			fs.mu.Lock()
+			dropReceipt := fs.dropResultReceipts
+			fs.mu.Unlock()
+			if !dropReceipt {
+				_ = fs.sendTo(ep, transport.MsgEndpointInvocationResultAck, transport.EndpointInvocationResultAckPayload{InvocationID: p.InvocationID, DispatchID: p.DispatchID, Recorded: true})
+			}
 		case MsgEndpointCryptoProve:
 			var p EndpointCryptoProvePayload
 			if err := env.DecodePayload(&p); err != nil {
@@ -845,6 +859,7 @@ func (fs *fakeServer) pushEventDelivery(epID string, ev *fakeEvent, d *fakeDeliv
 		return fmt.Errorf("endpoint %s not connected", epID)
 	}
 	payload := transport.EndpointEventDeliverPayload{
+		DispatchID:          "event-dispatch-" + d.id,
 		EventID:             ev.id,
 		DeliveryID:          d.id,
 		NetworkID:           ev.networkID,
@@ -914,6 +929,7 @@ func (fs *fakeServer) dispatchPendingInvocations() {
 		}
 		selected.state, selected.endpointID = "dispatched", endpoint.id
 		payload := transport.EndpointInvocationDispatchPayload{
+			DispatchID:   "invocation-dispatch-" + selected.id,
 			InvocationID: selected.id, NetworkID: selected.networkID,
 			CapabilityID: selected.capability, CapabilityVersion: selected.version,
 			Envelope: &selected.input.Envelope, AAD: &selected.input.AAD,

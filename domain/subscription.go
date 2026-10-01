@@ -69,6 +69,8 @@ func (s EventDeliveryState) Valid() bool {
 // unit that survives disconnects (pending survives; a live push is only an
 // optimization on top of it).
 type EventDelivery struct {
+	// DispatchID identifies this exact server-assigned delivery attempt.
+	DispatchID            string `json:"dispatchId,omitempty"`
 	ID                    ID
 	SubscriptionID        ID
 	EventID               ID

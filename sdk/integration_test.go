@@ -950,7 +950,7 @@ func TestFlushPendingResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := transport.EndpointInvocationResultPayload{
-		InvocationID: inv.ID, OK: true, Envelope: &env, AAD: &aad, PublicResultCode: "completed",
+		InvocationID: inv.ID, DispatchID: inv.async.dispatchID, OK: true, Envelope: &env, AAD: &aad, PublicResultCode: "completed",
 	}
 	target.pendingMu.Lock()
 	target.pendingResults[inv.ID] = completedInvocation{result: payload}

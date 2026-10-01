@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -97,7 +98,7 @@ type Client struct {
 	inflightInvocations  map[string]*asyncInvocation
 	completedInvocations *lruMap // invocationID → completedInvocation
 	pendingMu            sync.Mutex
-	pendingResults       map[string]completedInvocation // result send failed on a dead session
+	pendingResults       map[string]completedInvocation // retained until an exact durable server receipt
 	connGeneration       atomic.Int64                   // bumped at every auth_ok
 
 	// handlers + capabilities
@@ -908,10 +909,11 @@ func (c *Client) registerPayloadVersioned() (transport.EndpointRegisterPayload, 
 		caps = append(caps, reg.capability)
 	}
 	return transport.EndpointRegisterPayload{
-		EndpointName: name,
-		PublicKey:    base64.StdEncoding.EncodeToString(c.identityPub),
-		SDKVersion:   Version,
-		Capabilities: caps,
+		EndpointName:     name,
+		ProtocolFeatures: []string{transport.EndpointDispatchProtocol},
+		PublicKey:        base64.StdEncoding.EncodeToString(c.identityPub),
+		SDKVersion:       Version,
+		Capabilities:     caps,
 	}, c.capsRevision
 }
 
@@ -956,6 +958,9 @@ func (c *Client) sendRegister() error {
 func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 	if p.ProtocolVersion != transport.ProtocolVersion {
 		return fmt.Errorf("sdk: protocol mismatch: server speaks %d, SDK speaks %d — update the SDK", p.ProtocolVersion, transport.ProtocolVersion)
+	}
+	if !slices.Contains(p.ProtocolFeatures, transport.EndpointDispatchProtocol) {
+		return fmt.Errorf("sdk: server lacks required %s support — upgrade the Pagnet server before connecting this SDK", transport.EndpointDispatchProtocol)
 	}
 	if _, err := domain.ParseID(p.PrincipalID); err != nil {
 		return fmt.Errorf("sdk: server returned a malformed principalId: %w", err)

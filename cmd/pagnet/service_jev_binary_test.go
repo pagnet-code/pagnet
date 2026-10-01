@@ -130,7 +130,7 @@ func TestJevBinaryFreshAndOtherAccountSetup(t *testing.T) {
 					if env.DecodePayload(&reg) != nil {
 						return
 					}
-					ack, _ := transport.NewEnvelope(transport.MsgEndpointAuthOK, transport.EndpointAuthOKPayload{PrincipalID: service, EndpointID: uuid.NewString(), Credential: durable, ProtocolVersion: transport.ProtocolVersion})
+					ack, _ := transport.NewEnvelope(transport.MsgEndpointAuthOK, transport.EndpointAuthOKPayload{PrincipalID: service, EndpointID: uuid.NewString(), Credential: durable, ProtocolVersion: transport.ProtocolVersion, ProtocolFeatures: []string{transport.EndpointDispatchProtocol}})
 					if ws.WriteJSON(ack) != nil {
 						return
 					}

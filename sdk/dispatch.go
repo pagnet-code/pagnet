@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
@@ -16,34 +19,58 @@ import (
 
 // lruMap is a bounded last-recently-used map (values), for the completed-
 // invocation cache (re-send the stored result on redelivery).
+const (
+	MaxInvocationResultBytes     = 256 << 10
+	MaxInvocationResultWireBytes = transport.EndpointInvocationResultMaxBytes
+	MaxPendingInvocationBytes    = 32 << 20
+	MaxCompletedInvocationBytes  = 8 << 20
+	MaxActiveInvocations         = MaxPendingInvocationBytes / MaxInvocationResultWireBytes
+)
+
 type lruMap struct {
-	mu    sync.Mutex
-	cap   int
-	items map[string]any
-	order []string
+	maxBytes int
+	bytes    int
+	sizes    map[string]int
+	mu       sync.Mutex
+	cap      int
+	items    map[string]any
+	order    []string
 }
 
 func newLRUMap(cap int) *lruMap {
 	if cap <= 0 {
 		cap = DefaultSeenCap
 	}
-	return &lruMap{cap: cap, items: map[string]any{}}
+	return &lruMap{cap: cap, items: map[string]any{}, maxBytes: MaxCompletedInvocationBytes, sizes: map[string]int{}}
 }
 
 // set inserts/updates key.
 func (m *lruMap) set(key string, v any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	size := 1
+	if result, ok := v.(completedInvocation); ok {
+		size = result.encodedBytes
+		if size == 0 {
+			raw, _ := json.Marshal(result.result)
+			size = len(raw)
+		}
+	}
+	m.bytes -= m.sizes[key]
+	m.sizes[key] = size
+	m.bytes += size
 	if _, ok := m.items[key]; ok {
 		m.items[key] = v
 		m.touchLocked(key)
-		return
+	} else {
+		m.items[key] = v
+		m.order = append(m.order, key)
 	}
-	m.items[key] = v
-	m.order = append(m.order, key)
-	if len(m.order) > m.cap {
+	for len(m.order) > m.cap || m.bytes > m.maxBytes {
 		old := m.order[0]
 		m.order = m.order[1:]
+		m.bytes -= m.sizes[old]
+		delete(m.sizes, old)
 		delete(m.items, old)
 	}
 }
@@ -255,11 +282,11 @@ func (c *Client) handleMessageDeliver(env transport.Envelope) {
 // re-acked without re-dispatching.
 func (c *Client) handleEventDeliver(env transport.Envelope) {
 	var p transport.EndpointEventDeliverPayload
-	if err := env.DecodePayload(&p); err != nil {
+	if err := env.DecodePayload(&p); err != nil || p.DispatchID == "" {
 		return
 	}
 	ack := func() {
-		_ = c.send(transport.MsgEndpointEventAck, transport.EndpointEventAckPayload{DeliveryID: p.DeliveryID, EventID: p.EventID})
+		_ = c.send(transport.MsgEndpointEventAck, transport.EndpointEventAckPayload{DeliveryID: p.DeliveryID, EventID: p.EventID, DispatchID: p.DispatchID})
 	}
 	finish := func(ackIt bool) {
 		c.delivMu.Lock()
@@ -335,17 +362,23 @@ func (c *Client) handleEventDeliver(env transport.Envelope) {
 // redelivery re-send (the server may re-dispatch after an uncertain
 // failure; the result is idempotent).
 type completedInvocation struct {
-	result transport.EndpointInvocationResultPayload
+	result       transport.EndpointInvocationResultPayload
+	generation   int64
+	retryAt      time.Time
+	attempts     int
+	encodedBytes int
 }
 
 // asyncInvocation is the target-side control for one in-flight invocation
 // (the Invocation.async back-reference).
 type asyncInvocation struct {
-	c            *Client
-	inv          *Invocation
-	networkID    string
-	capabilityID string
-	caller       string
+	c               *Client
+	inv             *Invocation
+	networkID       string
+	capabilityID    string
+	dispatchID      string
+	resultSubmitted atomic.Bool
+	caller          string
 	// acceptedGeneration is the connection generation at accept time: a
 	// later generation means the session dropped after the accept (the
 	// server may have given up on the invocation — Complete checks).
@@ -386,14 +419,21 @@ func (a *asyncInvocation) complete(ctx context.Context, result any, handlerErr e
 // the in-flight one produces the result).
 func (c *Client) handleInvocationDispatch(env transport.Envelope) {
 	var p transport.EndpointInvocationDispatchPayload
-	if err := env.DecodePayload(&p); err != nil {
+	if err := env.DecodePayload(&p); err != nil || p.DispatchID == "" || p.Envelope == nil || p.AAD == nil {
 		return
 	}
 	c.invMu.Lock()
 	if comp, ok := c.completedInvocations.get(p.InvocationID); ok {
 		c.invMu.Unlock()
-		// Redelivery after uncertain failure: re-send the result.
+		// Only the identical immutable dispatch can receive the cached outcome.
+		if comp.(completedInvocation).result.DispatchID != p.DispatchID {
+			return
+		}
 		_ = c.send(transport.MsgEndpointInvocationResult, comp.(completedInvocation).result)
+		return
+	}
+	if c.seenInvocations != nil && c.seenInvocations.Contains(p.InvocationID) {
+		c.invMu.Unlock()
 		return
 	}
 	if _, ok := c.inflightInvocations[p.InvocationID]; ok {
@@ -414,9 +454,15 @@ func (c *Client) handleInvocationDispatch(env transport.Envelope) {
 		inv:                inv,
 		networkID:          p.NetworkID,
 		capabilityID:       p.CapabilityID,
+		dispatchID:         p.DispatchID,
 		acceptedGeneration: c.connGeneration.Load(),
 	}
 	inv.async = ai
+	if len(c.inflightInvocations) >= MaxActiveInvocations {
+		c.invMu.Unlock()
+		_ = c.send(transport.MsgEndpointInvocationDefer, transport.EndpointInvocationDeferPayload{InvocationID: p.InvocationID, DispatchID: p.DispatchID})
+		return
+	}
 	c.inflightInvocations[p.InvocationID] = ai
 	c.invMu.Unlock()
 
@@ -434,12 +480,16 @@ func (c *Client) handleInvocationDispatch(env transport.Envelope) {
 	}
 	inv.InputRaw = inputRaw
 
-	// Accept: the endpoint owns this invocation now (it will produce a
-	// result). Sent BEFORE the handler so the server's state is durable.
-	if err := c.send(transport.MsgEndpointInvocationAccept, transport.EndpointInvocationAcceptPayload{InvocationID: p.InvocationID}); err != nil {
-		// The connection dropped mid-accept: the server will re-dispatch
-		// (it never saw the accept). We stay in-flight; the handler still
-		// runs and completes on the reconnected session.
+	// Send admission before the handler. A successful socket write can still
+	// precede the server commit; a lost admission has an uncertain outcome,
+	// never an automatic handler replay.
+	if err := c.send(transport.MsgEndpointInvocationAccept, transport.EndpointInvocationAcceptPayload{InvocationID: p.InvocationID, DispatchID: p.DispatchID}); err != nil {
+		// No provider work starts after a failed admission write. A successful
+		// write still has a crash window until the server durably records it.
+		c.invMu.Lock()
+		delete(c.inflightInvocations, p.InvocationID)
+		c.invMu.Unlock()
+		return
 	}
 
 	// Handler lookup (+ version check).
@@ -500,7 +550,7 @@ func (c *Client) handleInvocationDispatch(env transport.Envelope) {
 	}
 	if err := c.completeInvocation(context.Background(), ai, result, nil); err != nil {
 		// Send failed (connection dropped): stay in-flight so the handler
-		// (or an async Complete) can retry on the reconnected session.
+		// can send the saved encrypted outcome on the reconnected session.
 	}
 }
 
@@ -552,7 +602,9 @@ func (c *Client) completeInvocation(ctx context.Context, ai *asyncInvocation, re
 			case "completed", "cancelled":
 				return fmt.Errorf("sdk: invocation %s is already %s server-side (its TTL expired or it was cancelled) — the result was not recorded", ai.inv.ID, rec.State)
 			case "failed":
-				return fmt.Errorf("sdk: invocation %s already failed server-side", ai.inv.ID)
+				if rec.PublicResultCode != "outcome_unknown" {
+					return fmt.Errorf("sdk: invocation %s already failed server-side", ai.inv.ID)
+				}
 			}
 		}
 	}
@@ -564,8 +616,21 @@ func (c *Client) completeInvocation(ctx context.Context, ai *asyncInvocation, re
 }
 
 // completeInvocationWith builds, encrypts, and sends the invocation result,
-// then records it as completed (for redelivery re-send).
+// then retains the exact outcome until its durable server receipt.
 func (c *Client) completeInvocationWith(invocationID, code string, result any, handlerErr error) error {
+	c.invMu.Lock()
+	original := c.inflightInvocations[invocationID]
+	c.invMu.Unlock()
+	if original == nil || !original.resultSubmitted.CompareAndSwap(false, true) {
+		return fmt.Errorf("sdk: invocation result already submitted or unknown")
+	}
+	submitted := false
+	defer func() {
+		if !submitted {
+			original.resultSubmitted.Store(false)
+		}
+	}()
+
 	ok := handlerErr == nil
 	var objectType string
 	var plaintext []byte
@@ -602,55 +667,117 @@ func (c *Client) completeInvocationWith(invocationID, code string, result any, h
 		objectType = e2ee.ObjectTypeInvocationError
 		plaintext = []byte(handlerErr.Error())
 	}
+	if len(plaintext) > MaxInvocationResultBytes {
+		ok = false
+		code = "output_too_large"
+		objectType = e2ee.ObjectTypeInvocationError
+		plaintext = []byte("Invocation result exceeds the supported size limit.")
+	}
 	caller := c.callerFor(invocationID)
 	env, aad, err := c.encryptObject(c.networkFor(invocationID), objectType, invocationID, c.principalID.Load(), caller, plaintext)
 	if err != nil {
 		return err
 	}
+	c.invMu.Lock()
+	ai := c.inflightInvocations[invocationID]
+	c.invMu.Unlock()
+	if ai == nil || ai.dispatchID == "" {
+		return fmt.Errorf("sdk: missing original invocation dispatch assignment")
+	}
 	payload := transport.EndpointInvocationResultPayload{
+		DispatchID:       ai.dispatchID,
+		Reconcile:        ai.acceptedGeneration != c.connGeneration.Load(),
 		InvocationID:     invocationID,
 		OK:               ok,
 		Envelope:         &env,
 		AAD:              &aad,
 		PublicResultCode: code,
 	}
-	if err := c.send(transport.MsgEndpointInvocationResult, payload); err != nil {
-		// The session dropped: queue the result for re-send on the next
-		// live connection (onLive flushes pendingResults). The invocation
-		// stays in-flight until the result is actually sent.
-		c.pendingMu.Lock()
-		c.pendingResults[invocationID] = completedInvocation{result: payload}
-		c.pendingMu.Unlock()
+	wire, err := json.Marshal(payload)
+	if err != nil {
 		return err
 	}
-	c.markCompleted(invocationID, completedInvocation{result: payload})
-	return nil
+	if len(wire) > MaxInvocationResultWireBytes-1024 {
+		return fmt.Errorf("sdk: encrypted invocation result exceeds supported frame limit")
+	}
+	// Keep the exact encrypted bytes until the server confirms its commit.
+	c.pendingMu.Lock()
+	c.pendingResults[invocationID] = completedInvocation{result: payload, generation: ai.acceptedGeneration, retryAt: time.Now().Add(5 * time.Second), attempts: 1, encodedBytes: len(wire)}
+	c.pendingMu.Unlock()
+	submitted = true
+	return c.send(transport.MsgEndpointInvocationResult, payload)
 }
 
-// markCompleted records a sent result (bounded; redelivery re-sends it).
+// markCompleted retires acknowledged/rejected work into bounded duplicate protection.
 func (c *Client) markCompleted(invocationID string, comp completedInvocation) {
 	c.invMu.Lock()
 	delete(c.inflightInvocations, invocationID)
 	c.completedInvocations.set(invocationID, comp)
+	if c.seenInvocations != nil {
+		c.seenInvocations.Add(invocationID)
+	}
 	c.invMu.Unlock()
 }
 
-// flushPendingResults re-sends results whose send failed on a dead
-// session (called after each auth_ok).
+// flushPendingResults retries saved outcomes awaiting durable receipts after auth_ok.
 func (c *Client) flushPendingResults() {
+	c.retryPendingResults(true)
+}
+func (c *Client) retryPendingResults(force bool) {
+	type candidate struct {
+		id   string
+		comp completedInvocation
+	}
 	c.pendingMu.Lock()
-	pending := c.pendingResults
-	c.pendingResults = map[string]completedInvocation{}
-	c.pendingMu.Unlock()
-	for id, comp := range pending {
-		if err := c.send(transport.MsgEndpointInvocationResult, comp.result); err == nil {
-			c.markCompleted(id, comp)
-		} else {
-			c.pendingMu.Lock()
-			c.pendingResults[id] = comp
-			c.pendingMu.Unlock()
+	var candidates []candidate
+	for id, comp := range c.pendingResults {
+		if force || !time.Now().Before(comp.retryAt) {
+			candidates = append(candidates, candidate{id, comp})
 		}
 	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].comp.retryAt.Equal(candidates[j].comp.retryAt) {
+			return candidates[i].id < candidates[j].id
+		}
+		return candidates[i].comp.retryAt.Before(candidates[j].comp.retryAt)
+	})
+	if len(candidates) > 32 {
+		candidates = candidates[:32]
+	}
+	for i := range candidates {
+		comp := candidates[i].comp
+		comp.result.Reconcile = comp.generation != c.connGeneration.Load()
+		comp.attempts++
+		if comp.attempts > 5 {
+			comp.attempts = 5
+		}
+		comp.retryAt = time.Now().Add(time.Duration(5*(1<<min(comp.attempts-1, 4))) * time.Second)
+		c.pendingResults[candidates[i].id] = comp
+		candidates[i].comp = comp
+	}
+	c.pendingMu.Unlock()
+	for _, item := range candidates {
+		_ = c.send(transport.MsgEndpointInvocationResult, item.comp.result)
+	}
+}
+func (c *Client) handleInvocationResultAck(env transport.Envelope) {
+	var p transport.EndpointInvocationResultAckPayload
+	if err := env.DecodePayload(&p); err != nil || p.DispatchID == "" {
+		return
+	}
+	c.pendingMu.Lock()
+	comp, ok := c.pendingResults[p.InvocationID]
+	if !ok || comp.result.DispatchID != p.DispatchID {
+		c.pendingMu.Unlock()
+		return
+	}
+	if !p.Recorded && p.PublicResultCode != "dispatch_rejected" {
+		c.pendingMu.Unlock()
+		return
+	}
+	delete(c.pendingResults, p.InvocationID)
+	c.pendingMu.Unlock()
+	c.markCompleted(p.InvocationID, comp)
 }
 
 // callerFor / networkFor / outputSchemaFor look up dispatch context kept

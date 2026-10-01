@@ -67,7 +67,7 @@ func TestJevSetupUsesServiceCredentialWithoutAccountLogin(t *testing.T) {
 						t.Error("registration malformed")
 						return
 					}
-					ack, _ := transport.NewEnvelope(transport.MsgEndpointAuthOK, transport.EndpointAuthOKPayload{PrincipalID: service, EndpointID: uuid.NewString(), Credential: durable, ProtocolVersion: transport.ProtocolVersion})
+					ack, _ := transport.NewEnvelope(transport.MsgEndpointAuthOK, transport.EndpointAuthOKPayload{PrincipalID: service, EndpointID: uuid.NewString(), Credential: durable, ProtocolVersion: transport.ProtocolVersion, ProtocolFeatures: []string{transport.EndpointDispatchProtocol}})
 					if conn.WriteJSON(ack) != nil {
 						return
 					}

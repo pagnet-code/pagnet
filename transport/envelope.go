@@ -341,9 +341,11 @@ const (
 	// MsgEndpointInvocationAccept is c->s: the endpoint accepted the
 	// invocation (it will produce a result).
 	MsgEndpointInvocationAccept = "endpoint.invocation_accept"
+	MsgEndpointInvocationDefer  = "endpoint.invocation_defer"
 	// MsgEndpointInvocationResult is c->s: the invocation's outcome
 	// (encrypted output OR error, AAD-bound).
-	MsgEndpointInvocationResult = "endpoint.invocation_result"
+	MsgEndpointInvocationResult    = "endpoint.invocation_result"
+	MsgEndpointInvocationResultAck = "endpoint.invocation_result_ack"
 	// MsgEndpointHeartbeat is c->s: liveness + load (inflight). The
 	// control plane answers with MsgEndpointHeartbeatAck.
 	MsgEndpointHeartbeat = "endpoint.heartbeat"
@@ -1196,7 +1198,13 @@ type CryptoSessionEndPayload struct {
 // identity for network enrollment (rotation-capable). Capabilities are the
 // endpoint's self-declared capability descriptors (merged with the
 // principal's configured descriptors for discovery).
+const EndpointDispatchProtocol = "dispatch-id-v1"
+
+// Maximum encoded invocation result payload, excluding its transport envelope.
+const EndpointInvocationResultMaxBytes = 512 << 10
+
 type EndpointRegisterPayload struct {
+	ProtocolFeatures []string `json:"protocolFeatures,omitempty"`
 	// EndpointName is an operator-friendly name for the endpoint ("" =
 	// none; display only, not identity).
 	EndpointName string              `json:"endpointName,omitempty"`
@@ -1208,8 +1216,9 @@ type EndpointRegisterPayload struct {
 
 // EndpointAuthOKPayload is the server's registration acceptance.
 type EndpointAuthOKPayload struct {
-	PrincipalID string `json:"principalId"`
-	EndpointID  string `json:"endpointId"`
+	ProtocolFeatures []string `json:"protocolFeatures,omitempty"`
+	PrincipalID      string   `json:"principalId"`
+	EndpointID       string   `json:"endpointId"`
 	// NetworkIDs are the networks the principal is an active member of.
 	NetworkIDs []string `json:"networkIds"`
 	// Credential is the durable endpoint credential — returned ONLY on
@@ -1248,6 +1257,7 @@ type EndpointMessageAckedPayload struct {
 // envelope (object type event_payload); the plaintext fields are routing
 // metadata only (matching is metadata-only — never the payload).
 type EndpointEventDeliverPayload struct {
+	DispatchID string `json:"dispatchId"`
 	EventID    string `json:"eventId"`
 	DeliveryID string `json:"deliveryId"`
 	NetworkID  string `json:"networkId"`
@@ -1264,6 +1274,7 @@ type EndpointEventDeliverPayload struct {
 
 // EndpointEventAckPayload acknowledges one event delivery.
 type EndpointEventAckPayload struct {
+	DispatchID string `json:"dispatchId"`
 	DeliveryID string `json:"deliveryId"`
 	EventID    string `json:"eventId"`
 }
@@ -1273,6 +1284,7 @@ type EndpointEventAckPayload struct {
 // (object type invocation_input); the plaintext fields are routing
 // metadata only.
 type EndpointInvocationDispatchPayload struct {
+	DispatchID        string `json:"dispatchId"`
 	InvocationID      string `json:"invocationId"`
 	NetworkID         string `json:"networkId"`
 	CapabilityID      string `json:"capabilityId"`
@@ -1290,6 +1302,7 @@ type EndpointInvocationDispatchPayload struct {
 // EndpointInvocationAcceptPayload acknowledges that the endpoint accepted
 // the invocation (it will produce a result).
 type EndpointInvocationAcceptPayload struct {
+	DispatchID   string `json:"dispatchId"`
 	InvocationID string `json:"invocationId"`
 }
 
@@ -1297,6 +1310,10 @@ type EndpointInvocationAcceptPayload struct {
 // carries the encrypted output (object type invocation_output) when OK, or
 // the encrypted error detail (object type invocation_error) when not.
 type EndpointInvocationResultPayload struct {
+	// Reconcile presents an actual result from the original operation after reconnect.
+	// The server independently proves its immutable assignment and credential.
+	Reconcile    bool   `json:"reconcile,omitempty"`
+	DispatchID   string `json:"dispatchId"`
 	InvocationID string `json:"invocationId"`
 	OK           bool   `json:"ok"`
 	// Envelope is the E2EE envelope for the encrypted output or error.
@@ -1361,4 +1378,20 @@ type ResolveRuntimeInteractionPayload struct {
 	OptionID            string    `json:"optionId"`
 	Decision            string    `json:"decision"`
 	ExpiresAt           time.Time `json:"expiresAt"`
+}
+
+// EndpointInvocationResultAckPayload confirms a durable, assignment-fenced result
+// commit. A socket write alone is not proof that the outcome was recorded.
+type EndpointInvocationResultAckPayload struct {
+	InvocationID     string `json:"invocationId"`
+	DispatchID       string `json:"dispatchId"`
+	Recorded         bool   `json:"recorded"`
+	PublicResultCode string `json:"publicResultCode,omitempty"`
+}
+
+// EndpointInvocationDeferPayload explicitly declines admission before any
+// handler execution when the SDK cannot reserve bounded result space.
+type EndpointInvocationDeferPayload struct {
+	InvocationID string `json:"invocationId"`
+	DispatchID   string `json:"dispatchId"`
 }
