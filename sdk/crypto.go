@@ -247,11 +247,13 @@ func (c *Client) markCryptoReady(networkID string) {
 	c.cryptoMu.Unlock()
 }
 
-// cryptoReady reports the enrollment state for a network.
+// cryptoReady requires both an enrolled key and authenticated network ownership.
+// Older servers omit tenantId from key packages; their authorized HTTP network
+// response (or authenticated challenge) may arrive after the key.
 func (c *Client) cryptoReady(networkID string) bool {
 	c.cryptoMu.Lock()
 	defer c.cryptoMu.Unlock()
-	return c.cryptoReadySet[networkID]
+	return c.cryptoReadySet[networkID] && c.authorizedNetworkTenant(networkID) != ""
 }
 
 // Ownership comes only from authorized discovery or authenticated enrollment,
