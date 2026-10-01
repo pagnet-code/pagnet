@@ -10,7 +10,7 @@ package daemon
 // interactive UI (the ACTUAL CLI, §7) so a human can type into it directly.
 //
 // Wire shape (PROTOCOL §3):
-//   - input/resize are LIVE messages handled on a single ordered worker
+//   - input/resize are LIVE messages handled on an ordered worker per PTY
 //     (keystroke order matters; the durable command pipeline would add a
 //     Postgres round-trip and busy-deferral per keystroke);
 //   - output is host.terminal_output: base64 raw bytes, per-session
@@ -109,10 +109,14 @@ type ptySession struct {
 	// It is the view's exit signal (readLoop closes it; exitLoop waits on
 	// it). Legacy sessions leave it nil.
 	eofCh chan struct{}
+
+	// input is bound to this concrete PTY generation; tm.mu guards it.
+	input *terminalInputQueue
 }
 
 // terminalLiveMsg is one input/resize unit on the ordered live channel.
 type terminalLiveMsg struct {
+	expected *ptySession // internal resize restoration stays generation-bound
 	isResize bool
 	instance string
 	session  string
@@ -139,67 +143,205 @@ type terminalManager struct {
 	sessions map[string]*ptySession // instanceID -> live session
 	// lastSize: instanceID -> attachSessionID -> latest resize.
 	lastSize map[string]map[string]lastSize
+	reports  chan struct{} // bounds asynchronous rejection writes
+}
 
-	// Single ordered worker: keystroke order across ALL instances is
-	// preserved (it only matters per instance, but one FIFO is the
-	// simplest correct shape). Bounded: overflow drops with a warning
-	// (a lost keystroke beats a stalled read loop — live semantics,
-	// at-most-once).
-	liveCh chan terminalLiveMsg
+const (
+	terminalInputMessages     = 1024
+	terminalInputBytes        = 4 * 1024 * 1024
+	terminalInputWriteTimeout = 10 * time.Second
+)
+
+type terminalInputQueue struct {
+	messages chan terminalLiveMsg
+	stop     chan struct{}
+	done     chan struct{}
+	bytes    int // queued plus in-flight bytes, guarded by tm.mu
+	stopped  bool
+	rejected map[string]string
 }
 
 func newTerminalManager(d *Daemon) *terminalManager {
-	tm := &terminalManager{
-		d:        d,
-		sessions: map[string]*ptySession{},
-		lastSize: map[string]map[string]lastSize{},
-		liveCh:   make(chan terminalLiveMsg, 1024),
-	}
-	go tm.liveLoop()
-	return tm
+	return &terminalManager{d: d, sessions: map[string]*ptySession{}, lastSize: map[string]map[string]lastSize{}, reports: make(chan struct{}, 16)}
 }
 
-func (tm *terminalManager) liveLoop() {
-	for m := range tm.liveCh {
-		s := tm.get(m.instance)
-		if s == nil || s.f == nil {
-			// No live PTY yet (or a starting session whose master is not
-			// open): the byte has nowhere to go (external audit F-002).
-			// Log the drop: a silently lost keystroke is undiagnosable
-			// from the client side (the send succeeded, the TUI never
-			// saw it).
-			tm.d.Log.Warn("terminal live message dropped (no live PTY)",
-				"instance", m.instance, "resize", m.isResize, "bytes", len(m.data))
+// submit resolves the PTY before enqueueing. A later replacement never inherits
+// old input, and each PTY has its own bounded FIFO so one blocked consumer cannot
+// delay keystrokes or resizes for another agent.
+func (tm *terminalManager) submit(m terminalLiveMsg) bool {
+	tm.mu.Lock()
+	s := tm.sessions[m.instance]
+	if m.expected != nil && s != m.expected {
+		tm.mu.Unlock()
+		return false
+	}
+	if s == nil {
+		tm.mu.Unlock()
+		tm.reportInputDrop(m, "input_unavailable")
+		return false
+	}
+	select {
+	case <-s.live:
+	default:
+		tm.mu.Unlock()
+		tm.reportInputDrop(m, "input_unavailable")
+		return false
+	}
+	if s.startErr != nil || s.f == nil {
+		tm.mu.Unlock()
+		tm.reportInputDrop(m, "input_unavailable")
+		return false
+	}
+	q := s.input
+	if q == nil {
+		q = &terminalInputQueue{messages: make(chan terminalLiveMsg, terminalInputMessages), stop: make(chan struct{}), done: make(chan struct{}), rejected: map[string]string{}}
+		s.input = q
+		go tm.liveLoop(s, q)
+	}
+	// Discard stale rejection records only after the viewer has detached.
+	tm.d.attachMu.Lock()
+	for id := range q.rejected {
+		if _, active := tm.d.attaches[m.instance][id]; !active && id != "" {
+			delete(q.rejected, id)
+		}
+	}
+	_, attached := tm.d.attaches[m.instance][m.session]
+	tm.d.attachMu.Unlock()
+	if m.session != "" && !attached {
+		tm.mu.Unlock()
+		return false
+	}
+	if reason := q.rejected[m.session]; reason != "" {
+		tm.mu.Unlock()
+		// If all bounded notification slots were occupied, a subsequent key
+		// retries the rejection instead of leaving a permanently silent view.
+		tm.reportInputDrop(m, reason)
+		return false
+	}
+	accepted := false
+	if !q.stopped && len(m.data) <= terminalInputBytes-q.bytes {
+		select {
+		case q.messages <- m:
+			q.bytes += len(m.data)
+			if m.isResize && m.cols > 0 && m.rows > 0 {
+				if tm.lastSize[m.instance] == nil {
+					tm.lastSize[m.instance] = map[string]lastSize{}
+				}
+				tm.lastSize[m.instance][m.session] = lastSize{cols: m.cols, rows: m.rows, at: time.Now()}
+			}
+			accepted = true
+		default:
+		}
+	}
+	if !accepted {
+		q.rejected[m.session] = "input_backpressure"
+	}
+	tm.mu.Unlock()
+	if !accepted {
+		tm.reportInputDrop(m, "input_backpressure")
+	}
+
+	return accepted
+}
+
+func (tm *terminalManager) reportInputDrop(m terminalLiveMsg, reason string) {
+	tm.d.Log.Warn("terminal live message rejected", "instance", m.instance, "resize", m.isResize, "bytes", len(m.data), "reason", reason)
+	if m.session != "" {
+		select {
+		case tm.reports <- struct{}{}:
+			go func() {
+				defer func() { <-tm.reports }()
+				_ = tm.d.send(nil, transport.MsgTerminalOutput, transport.TerminalOutputPayload{InstanceID: m.instance, SessionID: m.session, ClosedReason: reason})
+			}()
+		default:
+			// A disconnected control plane already closes its viewers; never let
+			// rejection notifications create unbounded goroutines or stall input.
+		}
+	}
+}
+
+// stopInputLocked invalidates queued work and interrupts the current write. It
+// never closes a borrowed endpoint master: the runtime owns that descriptor.
+func (tm *terminalManager) stopInputLocked(s *ptySession) {
+	if q := s.input; q != nil && !q.stopped {
+		q.stopped = true
+		close(q.stop)
+		_ = s.f.SetWriteDeadline(time.Now())
+	}
+}
+
+func (tm *terminalManager) liveLoop(s *ptySession, q *terminalInputQueue) {
+	defer func() {
+		tm.mu.Lock()
+		// Release queued paste bytes even when a borrowed view remains alive
+		// after detach. The runtime owns its master and may not reach EOF soon.
+	drain:
+		for {
+			select {
+			case <-q.messages:
+			default:
+				break drain
+			}
+		}
+		q.bytes = 0
+		clear(q.rejected)
+		// Clear our deadline before any new lane can use the borrowed master.
+		current := tm.sessions[s.instanceID]
+		if current == nil || current == s || current.f != s.f || current.input == nil {
+			_ = s.f.SetWriteDeadline(time.Time{})
+		}
+		tm.mu.Unlock()
+		close(q.done)
+	}()
+	for {
+		var m terminalLiveMsg
+		select {
+		case <-q.stop:
+			return
+		case m = <-q.messages:
+		}
+		tm.mu.Lock()
+		if q.stopped || tm.sessions[s.instanceID] != s {
+			tm.mu.Unlock()
+			return
+		}
+		tm.d.attachMu.Lock()
+		_, attached := tm.d.attaches[m.instance][m.session]
+		tm.d.attachMu.Unlock()
+		if q.rejected[m.session] != "" || (m.session != "" && !attached) {
+			q.bytes -= len(m.data)
+			tm.mu.Unlock()
 			continue
 		}
 		if m.isResize {
 			if m.cols > 0 && m.rows > 0 {
 				_ = pty.Setsize(s.f, &pty.Winsize{Rows: m.rows, Cols: m.cols})
-				tm.recordSize(m.instance, m.session, m.cols, m.rows)
 			}
+			q.bytes -= len(m.data)
+			tm.mu.Unlock()
 			continue
 		}
-		if len(m.data) == 0 {
-			continue
+		// Synchronize setting the deadline with teardown: stop cannot be undone by
+		// a late worker extending the deadline after cancellation.
+		err := s.f.SetWriteDeadline(time.Now().Add(terminalInputWriteTimeout))
+		tm.mu.Unlock()
+		if err == nil && len(m.data) > 0 {
+			var n int
+			n, err = s.f.Write(m.data)
+			if err == nil && n != len(m.data) {
+				err = fmt.Errorf("short PTY write: %d of %d bytes", n, len(m.data))
+			}
 		}
-		// A stalled PTY consumer must not stall the live worker (every
-		// instance's input queues behind it): bounded write, drop on
-		// timeout.
-		_ = s.f.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := s.f.Write(m.data); err != nil {
-			tm.d.Log.Warn("pty input write dropped", "instance", m.instance, "err", err)
+		tm.mu.Lock()
+		q.bytes -= len(m.data)
+		stopped := q.stopped
+		if err != nil && !stopped {
+			q.rejected[m.session] = "input_write_failed"
 		}
-	}
-}
-
-// submit enqueues one live input/resize message (non-blocking).
-func (tm *terminalManager) submit(m terminalLiveMsg) bool {
-	select {
-	case tm.liveCh <- m:
-		return true
-	default:
-		tm.d.Log.Warn("terminal live message dropped (back-pressure)", "instance", m.instance)
-		return false
+		tm.mu.Unlock()
+		if err != nil && !stopped {
+			tm.reportInputDrop(m, "input_write_failed")
+		}
 	}
 }
 
@@ -207,17 +349,6 @@ func (tm *terminalManager) get(instanceID string) *ptySession {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	return tm.sessions[instanceID]
-}
-
-// recordSize remembers the attach session's latest requested geometry
-// (see reapplySize).
-func (tm *terminalManager) recordSize(instanceID, sessionID string, cols, rows uint16) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	if tm.lastSize[instanceID] == nil {
-		tm.lastSize[instanceID] = map[string]lastSize{}
-	}
-	tm.lastSize[instanceID][sessionID] = lastSize{cols: cols, rows: rows, at: time.Now()}
 }
 
 // reapplySize restores the shared PTY's geometry to a still-attached
@@ -229,6 +360,7 @@ func (tm *terminalManager) reapplySize(instanceID, excludeSession string) {
 	tm.mu.Lock()
 	s := tm.sessions[instanceID]
 	var bestSz lastSize
+	var bestSession string
 	found := false
 	for sess, sz := range tm.lastSize[instanceID] {
 		if sess == excludeSession {
@@ -236,6 +368,7 @@ func (tm *terminalManager) reapplySize(instanceID, excludeSession string) {
 		}
 		if !found || sz.at.After(bestSz.at) {
 			bestSz = sz
+			bestSession = sess
 			found = true
 		}
 	}
@@ -244,7 +377,7 @@ func (tm *terminalManager) reapplySize(instanceID, excludeSession string) {
 	if !found || s == nil || s.f == nil {
 		return
 	}
-	_ = pty.Setsize(s.f, &pty.Winsize{Rows: bestSz.rows, Cols: bestSz.cols})
+	tm.submit(terminalLiveMsg{expected: s, instance: instanceID, session: bestSession, isResize: true, rows: bestSz.rows, cols: bestSz.cols})
 	tm.d.Log.Info("pty size re-applied from surviving attach",
 		"instance", instanceID, "cols", bestSz.cols, "rows", bestSz.rows)
 }
@@ -303,6 +436,7 @@ func (tm *terminalManager) start(instanceID string, resume bool) (*ptySession, e
 	if err := tm.launchPTY(s, instanceID, resume); err != nil {
 		tm.mu.Lock()
 		if tm.sessions[instanceID] == s {
+			tm.stopInputLocked(s)
 			delete(tm.sessions, instanceID)
 		}
 		tm.mu.Unlock()
@@ -401,6 +535,7 @@ func (tm *terminalManager) adoptEndpoint(instanceID string, master *os.File) (*p
 		// is dropped, so the fresh PTY boots at the size a (still
 		// attached) client last asked for instead of the 24x80 default.
 		remembered, haveRemembered = tm.latestSizeLocked(instanceID)
+		tm.stopInputLocked(s)
 		delete(tm.sessions, instanceID)
 		delete(tm.lastSize, instanceID)
 	}
@@ -639,6 +774,7 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 				ended = append(ended, sessionID)
 			}
 			tm.d.attachMu.Unlock()
+			tm.stopInputLocked(s)
 			delete(tm.sessions, s.instanceID)
 			delete(tm.lastSize, s.instanceID)
 		}
@@ -660,6 +796,7 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 	tm.mu.Lock()
 	killed := false
 	if tm.sessions[s.instanceID] == s {
+		tm.stopInputLocked(s)
 		delete(tm.sessions, s.instanceID)
 		delete(tm.lastSize, s.instanceID)
 		killed = s.killed
@@ -716,10 +853,14 @@ func (tm *terminalManager) stop(instanceID string) {
 	tm.mu.Lock()
 	if tm.sessions[instanceID] == s {
 		s.killed = true
+		tm.stopInputLocked(s)
 		delete(tm.sessions, instanceID)
 		delete(tm.lastSize, instanceID)
 	}
 	tm.mu.Unlock()
+	if q := s.input; q != nil {
+		<-q.done // cancellation wakes pollable writes; never retain an input worker
+	}
 	// Phase 3 (G5): a view must NOT terminate the endpoint — the session
 	// core owns the endpoint's process stop (its driver runs the TERM →
 	// grace → KILL sequence). Stopping a view only drops the view; the

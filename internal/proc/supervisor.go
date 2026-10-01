@@ -756,7 +756,7 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 			ws = &pty.Winsize{Rows: 24, Cols: 80}
 		}
 		var master *os.File
-		master, startErr = pty.StartWithAttrs(req.Cmd, ws, SessionAttrs())
+		master, startErr = startPollablePTY(req.Cmd, ws)
 		t.ptyMaster.Store(master)
 	case ClassEndpoint:
 		if req.PTYSize != nil {
@@ -788,6 +788,14 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 			//     the G1 hazard does not apply because fd 0 IS the tty.
 			ws := req.PTYSize
 			master, slave, openErr := pty.Open()
+			if openErr == nil {
+				original := master
+				master, openErr = pollablePTYMaster(original)
+				if openErr != nil {
+					_ = original.Close()
+					_ = slave.Close()
+				}
+			}
 			if openErr != nil {
 				startErr = openErr
 			} else {

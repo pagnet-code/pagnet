@@ -1,8 +1,11 @@
+//go:build unix
+
 // Supervisor-level sandbox tests (S2): the single policy point at which
 // every launch class is wrapped, and the fail-closed gate that refuses a
 // launch the sandbox cannot be applied to (H2/H3). The platform-specific
 // behaviors are gated at runtime (sandbox.MustSandbox / sandbox.Available)
-// so the file runs on every platform the proc package builds on.
+// so the file runs on Unix platforms with the supervisor's process helpers
+// and /bin test commands available.
 package proc
 
 import (

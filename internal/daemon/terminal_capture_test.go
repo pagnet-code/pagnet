@@ -166,6 +166,7 @@ func TestDaemon_EndpointCaptureResizeDuringActivation(t *testing.T) {
 	}
 
 	// The resize arrives WHILE THE ENDPOINT IS STILL ACTIVATING.
+	d.addAttach(instanceID, "sess-resize")
 	d.terminal.submit(terminalLiveMsg{
 		isResize: true, instance: instanceID, session: "sess-resize",
 		cols: 132, rows: 45,

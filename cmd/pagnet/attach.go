@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"sync"
@@ -108,11 +109,22 @@ type ptyFrame struct {
 // outputPump drains the WS until it closes, writing PTY bytes to stdout.
 // Returns the reason a "closed" frame carried, if any.
 func outputPump(ws *websocket.Conn) (<-chan struct{}, func() string) {
+	return outputPumpTo(ws, os.Stdout)
+}
+
+func outputPumpTo(ws *websocket.Conn, output io.Writer) (<-chan struct{}, func() string) {
+	done, _, reason := outputPumpToReady(ws, output)
+	return done, reason
+}
+
+func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <-chan struct{}, func() string) {
 	done := make(chan struct{})
+	snapshotReady := make(chan struct{})
 	reason := ""
 	var reasonMu sync.Mutex
 	go func() {
 		defer close(done)
+		defer ws.Close()
 		var lastSeq uint64
 		var ready bool
 		for {
@@ -126,20 +138,55 @@ func outputPump(ws *websocket.Conn) (<-chan struct{}, func() string) {
 			}
 			switch f.Type {
 			case "terminal":
-				// Replay → live dedup (§11): after the snapshot, only
-				// frames with seq > lastSeq reach the screen.
+				// Sequence numbers count bytes, not frames. Validate before
+				// advancing the cursor so corrupt data cannot hide lost output.
+				const maxTerminalBytes = 256 * 1024 // daemon's bounded replay ring
+				end := f.Seq
 				if f.Snapshot {
-					ready = true
-					lastSeq = f.LastSeq
-				} else if !ready || f.Seq <= lastSeq {
-					continue
+					end = f.LastSeq
 				}
-				if !f.Snapshot {
-					lastSeq = f.Seq
+				var invalid string
+				var b []byte
+				if len(f.Data) > base64.StdEncoding.EncodedLen(maxTerminalBytes) {
+					invalid = "terminal output exceeds replay limit"
+				} else {
+					b, err = base64.StdEncoding.DecodeString(f.Data)
+					if err != nil || len(b) > maxTerminalBytes || end < uint64(len(b)) {
+						invalid = "invalid terminal output encoding or sequence"
+					}
 				}
-				if b, err := base64.StdEncoding.DecodeString(f.Data); err == nil {
-					_, _ = os.Stdout.Write(b)
+				if invalid == "" {
+					if !f.Snapshot && !ready {
+						invalid = "terminal output arrived before its snapshot"
+					} else if ready {
+						if end <= lastSeq {
+							continue
+						}
+						start := end - uint64(len(b))
+						if start > lastSeq {
+							invalid = "terminal output sequence gap; reconnect to restore the screen"
+						} else {
+							b = b[lastSeq-start:]
+						}
+					}
 				}
+				if invalid == "" {
+					if n, writeErr := output.Write(b); writeErr != nil || n != len(b) {
+						invalid = "terminal output write failed"
+					}
+				}
+				if invalid != "" {
+					reasonMu.Lock()
+					reason = invalid
+					reasonMu.Unlock()
+					_ = ws.Close()
+					return
+				}
+				if !ready {
+					close(snapshotReady)
+				}
+				ready = true
+				lastSeq = end
 			case "closed":
 				reasonMu.Lock()
 				reason = f.Reason
@@ -150,7 +197,23 @@ func outputPump(ws *websocket.Conn) (<-chan struct{}, func() string) {
 			}
 		}
 	}()
-	return done, func() string { reasonMu.Lock(); defer reasonMu.Unlock(); return reason }
+	return done, snapshotReady, func() string { reasonMu.Lock(); defer reasonMu.Unlock(); return reason }
+}
+
+// waitAttachReady prevents keystrokes and resizes from preceding PTY creation.
+func waitAttachReady(ws *websocket.Conn, done, ready <-chan struct{}, reason func() string) error {
+	select {
+	case <-ready:
+		return nil
+	case <-done:
+		if r := reason(); r != "" {
+			return fmt.Errorf("attach: %s", r)
+		}
+		return fmt.Errorf("attach: terminal closed before its initial snapshot")
+	case <-time.After(75 * time.Second):
+		_ = ws.Close()
+		return fmt.Errorf("attach: timed out waiting for the initial terminal snapshot")
+	}
 }
 
 // newAttachWriter serializes input and resize frames: Gorilla permits only
@@ -160,8 +223,13 @@ func newAttachWriter(ws *websocket.Conn) func(map[string]any) {
 	return func(m map[string]any) {
 		mu.Lock()
 		defer mu.Unlock()
-		_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		_ = ws.WriteJSON(m)
+		if err := ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			_ = ws.Close()
+			return
+		}
+		if err := ws.WriteJSON(m); err != nil {
+			_ = ws.Close()
+		}
 	}
 }
 
@@ -177,14 +245,17 @@ func runRawAttach(ws *websocket.Conn, fd int) (err error) {
 
 	fmt.Fprintln(os.Stderr, "\nattached (Ctrl-] to detach; the PTY keeps running on the host)")
 
-	// Initial size.
+	done, ready, closedReason := outputPumpToReady(ws, os.Stdout)
+	if err := waitAttachReady(ws, done, ready, closedReason); err != nil {
+		return err
+	}
+
+	// Initial size, sent only after the PTY snapshot confirms readiness.
 	if cols, rows, err := term.GetSize(fd); err == nil {
 		sendFrame(map[string]any{
 			"type": "resize", "cols": cols, "rows": rows,
 		})
 	}
-
-	done, closedReason := outputPump(ws)
 
 	stopResize := watchTerminalResize(fd, func(cols, rows int) {
 		sendFrame(map[string]any{"type": "resize", "cols": cols, "rows": rows})
@@ -245,7 +316,10 @@ func isDone(ch <-chan struct{}) bool {
 func runLineAttach(ws *websocket.Conn) (err error) {
 	sendFrame := newAttachWriter(ws)
 	fmt.Fprintln(os.Stderr, "attached (line mode; the PTY keeps running on the host)")
-	done, closedReason := outputPump(ws)
+	done, ready, closedReason := outputPumpToReady(ws, os.Stdout)
+	if err := waitAttachReady(ws, done, ready, closedReason); err != nil {
+		return err
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
