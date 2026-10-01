@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -69,7 +69,7 @@ const (
 )
 
 const (
-	bridgeSocketName     = "pagnetd.sock"
+	bridgeSocketName     = localipc.BridgeSocketName
 	bridgeAuthTimeout    = 5 * time.Second
 	bridgeRequestTimeout = 60 * time.Second
 	bridgeMaxLine        = 1 << 20 // 1 MiB per JSON line
@@ -104,7 +104,13 @@ var bridgeConnReadTimeoutNs int64 = int64(30 * time.Second)
 
 // startBridgeSocket opens the local Unix socket. Called once from Run.
 func (d *Daemon) startBridgeSocket() error {
-	sockPath := filepath.Join(d.StateDir, bridgeSocketName)
+	sockPath, err := localipc.BridgeSocketPath(d.StateDir)
+	if err != nil {
+		return fmt.Errorf("bridge socket: %w", err)
+	}
+	if sockPath != d.bridgePath {
+		return fmt.Errorf("bridge socket address changed since daemon construction")
+	}
 	// Double-start guard: a LIVE daemon already owns this socket? Refuse
 	// to start. Two daemons on one host fight over the host identity —
 	// each new connection supersedes the other, in an endless
@@ -163,7 +169,7 @@ func (d *Daemon) stopBridgeSocket() {
 		return
 	}
 	_ = d.bridgeL.Close()
-	_ = os.Remove(filepath.Join(d.StateDir, bridgeSocketName))
+	_ = os.Remove(d.bridgePath)
 	d.bridgeL = nil
 }
 

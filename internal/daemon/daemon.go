@@ -23,6 +23,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
@@ -280,8 +281,9 @@ type Daemon struct {
 	pending   map[string]chan transport.AgentResponsePayload
 
 	// Bridge Unix socket listener (agent MCP bridge, PROTOCOL §6).
-	bridgeMu sync.Mutex
-	bridgeL  net.Listener
+	bridgeMu   sync.Mutex
+	bridgeL    net.Listener
+	bridgePath string
 	// Bridge connection accounting (external audit F-010): caps on
 	// concurrent bridge connections, global and per-instance, so a
 	// misbehaving or hostile agent cannot exhaust daemon resources by
@@ -521,6 +523,10 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
+	bridgePath, err := localipc.BridgeSocketPath(cfg.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve local bridge socket: %w", err)
+	}
 	st, err := OpenState(filepath.Join(cfg.StateDir, "daemon.sqlite"))
 	if err != nil {
 		return nil, err
@@ -616,6 +622,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	helper := proc.NewHelper(0)
 	turnCtx, turnCancel := context.WithCancel(context.Background())
 	d := &Daemon{
+		bridgePath:      bridgePath,
 		Config:          cfg,
 		Log:             log,
 		state:           st,
@@ -2920,11 +2927,11 @@ func (d *Daemon) mcpConfig(row *InstanceRow) string {
 	if row.Kind == "representative" {
 		name, args = "pagnet-control", []string{"mcp", "control"}
 	}
-	args = append(args, "--socket", filepath.Join(d.StateDir, "pagnetd.sock"))
+	args = append(args, "--socket", d.bridgePath)
 	// S1: the bridge's per-activation nonce ships inside the MCP config
-	// (the daemon-generated payload the RUNTIME hands to the bridge — it
-	// never enters the runtime's own env, which the child-env allowlist
-	// keeps fail-closed). Omitted when no nonce is stored for the
+	// (the daemon-generated payload visible in the runtime's
+	// PAGNET_MCP_CONFIG env/launch arguments and passed to its bridge).
+	// Omitted when no nonce is stored for the
 	// instance (never activated / invalidated): a bridge that starts
 	// without one refuses to run.
 	bridgeEnv := map[string]string{

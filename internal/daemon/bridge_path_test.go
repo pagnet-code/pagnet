@@ -122,7 +122,7 @@ func TestMCPConfigSelfSpawnNoPATH(t *testing.T) {
 		if srv.Command != self {
 			t.Fatalf("%s command = %q, want the daemon's own executable %q", tc.kind, srv.Command, self)
 		}
-		wantArgs := append(append([]string{}, tc.sub...), "--socket", filepath.Join(d.StateDir, "pagnetd.sock"))
+		wantArgs := append(append([]string{}, tc.sub...), "--socket", d.bridgePath)
 		if !reflect.DeepEqual(srv.Args, wantArgs) {
 			t.Fatalf("%s args = %v, want %v", tc.kind, srv.Args, wantArgs)
 		}
@@ -153,7 +153,7 @@ func TestMCPConfigShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(d.StateDir, "pagnetd.sock")
+	sock := d.bridgePath
 
 	for _, tc := range []struct {
 		kind, server string

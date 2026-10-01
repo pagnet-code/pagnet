@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +43,7 @@ func startBridgeForTest(t *testing.T) (*Daemon, string) {
 	if err := d.startBridgeSocket(); err != nil {
 		t.Fatalf("startBridgeSocket: %v", err)
 	}
-	return d, filepath.Join(d.StateDir, bridgeSocketName)
+	return d, d.bridgePath
 }
 
 // upsertBridgeInstance records a local instance the bridge auths against.

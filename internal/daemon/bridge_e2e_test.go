@@ -411,7 +411,7 @@ func TestBridgeE2E_PerInstanceConnCap(t *testing.T) {
 		d.bridgeConnMu.Unlock()
 	})
 
-	c := bridgeDial(t, filepath.Join(d.StateDir, bridgeSocketName))
+	c := bridgeDial(t, d.bridgePath)
 	resp := c.authFull(t, instanceID, row.NetworkID, nonce, "worker")
 	assertBridgeError(t, resp, "bridge connection limit reached for this instance")
 }

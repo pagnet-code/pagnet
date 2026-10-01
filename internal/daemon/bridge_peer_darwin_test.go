@@ -97,7 +97,7 @@ func TestDarwinBridgeTreeRejectsUnrelatedNonceHolder(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatal("missing instance")
 	}
-	c := bridgeDial(t, filepath.Join(d.StateDir, bridgeSocketName))
+	c := bridgeDial(t, d.bridgePath)
 	response := c.authFull(t, instanceID, row.NetworkID, d.currentBridgeNonce(instanceID), "worker")
 	assertBridgeError(t, response, "peer process verification failed")
 }

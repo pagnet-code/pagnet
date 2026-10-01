@@ -24,6 +24,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/internal/release"
 )
 
@@ -137,7 +138,10 @@ func newVersionAt(path string) string {
 // LIVE daemon answers the auth probe; a stale socket file (crashed
 // daemon) has no listener and does not.
 func daemonRunning(stateDir string) bool {
-	sock := filepath.Join(stateDir, "pagnetd.sock")
+	sock, err := localipc.BridgeSocketPath(stateDir)
+	if err != nil {
+		return false
+	}
 	probe, err := net.Dial("unix", sock)
 	if err != nil {
 		return false

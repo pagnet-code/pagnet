@@ -34,3 +34,11 @@ unrelated processes. Supervisor tests separately verify process-group creation,
 termination, PTY cleanup, identity and resource-pressure refusal. Cross-compiling
 a test binary is not evidence that these kernel operations passed; run that
 binary on macOS to verify them.
+
+Normal bridge sockets remain under the state directory. When a macOS state
+path exceeds its 104-byte Unix socket limit, every listener and client uses a
+full SHA-256 digest of the canonical state path in `/private/tmp/pagnet-UID`
+(the canonical location of `/tmp`). This directory must be real, owned by the
+current user, and mode `0700`; sockets remain mode `0600`. Unsafe existing
+directories reject startup. This is local IPC only: state and credentials remain
+in the configured state directory, and cleanup removes only the chosen socket.
