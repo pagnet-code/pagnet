@@ -36,7 +36,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          # Keep the persistent runner's native Go caches; do not restore
+          # an archive over existing read-only module files.
+          cache: false
 
       - name: Resolve one SemVer build version
         run: |
