@@ -239,46 +239,47 @@ func (d *Daemon) performAutoUpdate(latest string) {
 		d.Log.Error("auto-update failed: "+err.Error()+"; backing off 1h", "latest", latest)
 		return
 	}
-	// IDLE GATE (final): the download took seconds; a turn or PTY may
-	// have started in that window. The re-exec must not orphan it.
-	if n := d.activeWorkCount(); n > 0 {
-		d.Log.Info("deferring auto-update to "+latest+": worker not idle", "active", n)
-		return
-	}
-	// ATOMIC SELF-REPLACE: the daemon replaces its OWN executable — the
-	// staged binary is written into the self path's directory and
-	// renamed over it (same directory: the rename is atomic, and on
-	// Linux it replaces even a running executable, the live process
-	// keeps its inode). Best-effort: a read-only install dir must not
-	// break the update — the re-exec then uses the staged copy, and the
-	// on-disk install keeps the old build until a writable update.
-	execPath := d.selfExe
-	if err := release.ReplaceBinary(newBin, d.selfExe); err != nil {
-		d.Log.Warn("auto-update: installed binary not replaced (re-exec uses the staged copy)", "err", err)
-		execPath = newBin
-	}
-	d.Log.Info("auto-updating to " + latest + " (idle)")
-	// Carry the serve lock across the re-exec: the flock is held by the
-	// open file description, and Go opens every file with O_CLOEXEC —
-	// at exec the lock fd would be closed and the lock silently
-	// released, opening a window in which a second `pagnet serve` can
-	// take over the state dir before the new image re-acquires it.
-	// Clearing CLOEXEC + passing the fd lets the new image adopt the
-	// SAME lock (acquireServeLock); the lock is never released.
-	execEnv := os.Environ()
-	if envVar, err := d.serveLockExecEnv(); err != nil {
-		// Never re-exec without the lock carried: that would recreate
-		// the release window. Fail the attempt (1h backoff) and keep
-		// running the current build.
-		d.Log.Error("auto-update failed: "+err.Error()+"; backing off 1h", "latest", latest)
-		return
-	} else if envVar != "" {
-		execEnv = append(execEnv, envVar)
-	}
-	if err := reexecDaemon(execPath, os.Args, execEnv); err != nil {
-		// Exec only fails on a broken binary/OS error: log + back off,
-		// the daemon keeps running its current build.
-		d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)
+	// Reserve exclusive admission before the final idle snapshot. A launch
+	// already preparing work defers this attempt; later arrivals cannot start
+	// until finalization fails or the new process image takes over.
+	if !d.finalizeIdleUpdate(func() {
+		// ATOMIC SELF-REPLACE: the daemon replaces its OWN executable — the
+		// staged binary is written into the self path's directory and
+		// renamed over it (same directory: the rename is atomic, and on
+		// Linux it replaces even a running executable, the live process
+		// keeps its inode). Best-effort: a read-only install dir must not
+		// break the update — the re-exec then uses the staged copy, and the
+		// on-disk install keeps the old build until a writable update.
+		execPath := d.selfExe
+		if err := release.ReplaceBinary(newBin, d.selfExe); err != nil {
+			d.Log.Warn("auto-update: installed binary not replaced (re-exec uses the staged copy)", "err", err)
+			execPath = newBin
+		}
+		d.Log.Info("auto-updating to " + latest + " (idle)")
+		// Carry the serve lock across the re-exec: the flock is held by the
+		// open file description, and Go opens every file with O_CLOEXEC —
+		// at exec the lock fd would be closed and the lock silently
+		// released, opening a window in which a second `pagnet serve` can
+		// take over the state dir before the new image re-acquires it.
+		// Clearing CLOEXEC + passing the fd lets the new image adopt the
+		// SAME lock (acquireServeLock); the lock is never released.
+		execEnv := os.Environ()
+		if envVar, err := d.serveLockExecEnv(); err != nil {
+			// Never re-exec without the lock carried: that would recreate
+			// the release window. Fail the attempt (1h backoff) and keep
+			// running the current build.
+			d.Log.Error("auto-update failed: "+err.Error()+"; backing off 1h", "latest", latest)
+			return
+		} else if envVar != "" {
+			execEnv = append(execEnv, envVar)
+		}
+		if err := reexecDaemon(execPath, os.Args, execEnv); err != nil {
+			// Exec only fails on a broken binary/OS error: log + back off,
+			// the daemon keeps running its current build.
+			d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)
+		}
+	}) {
+		d.Log.Info("deferring auto-update to " + latest + ": worker not idle or admission busy")
 	}
 }
 
@@ -294,17 +295,18 @@ func (d *Daemon) performAutoUpdate(latest string) {
 func (d *Daemon) activeWorkCount() int {
 	n := 0
 	d.turnMu.Lock()
-	n += len(d.activeTurns)
+	n += len(d.activeTurns) + len(d.turnsInFlight)
 	d.turnMu.Unlock()
 	n += d.terminal.activeCount()
 	n += d.sup.EndpointCount()
 	insts, err := d.state.ListInstances()
-	if err == nil {
-		for _, i := range insts {
-			switch i.Status {
-			case "working", "starting", "waking":
-				n++
-			}
+	if err != nil {
+		return n + 1 // Unknown state must never authorize replacing a live daemon.
+	}
+	for _, i := range insts {
+		switch i.Status {
+		case "working", "starting", "waking":
+			n++
 		}
 	}
 	return n

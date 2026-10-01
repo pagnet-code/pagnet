@@ -414,11 +414,27 @@ const (
 	wsWriteTimeout = 10 * time.Second
 )
 
+type admittedCommand struct {
+	run     func()
+	release func()
+	discard func()
+}
+
+// cancel releases a discarded queue entry without executing its command. Its
+// unprocessed dedup claim must also go: durable redelivery owns the next attempt.
+func (job admittedCommand) cancel() {
+	job.release()
+	if job.discard != nil {
+		job.discard()
+	}
+}
+
 // instQueue is a single-consumer FIFO for one instance's commands.
 type instQueue struct {
-	mu   sync.Mutex
-	ch   chan func()
-	live bool
+	mu      sync.Mutex
+	ch      chan admittedCommand
+	live    bool
+	stopped bool
 	// done is closed by finishQueue when the instance is stopped/forgotten:
 	// the worker exits instead of ranging on a never-closed channel forever
 	// (one dormant goroutine per instance id is an unbounded leak in a
@@ -700,34 +716,60 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 // read loop — heartbeats, other instances, the bridge relay — until the
 // busy worker drained, which for a real-runtime turn is minutes.)
 func (d *Daemon) enqueueInstance(instanceID string, fn func()) bool {
+	return d.enqueueInstanceWithCancel(instanceID, fn, nil)
+}
+
+func (d *Daemon) enqueueInstanceWithCancel(instanceID string, fn func(), discard func()) bool {
+	releaseAdmission := d.admitWork()
+	job := admittedCommand{run: fn, release: releaseAdmission, discard: discard}
 	d.queueMu.Lock()
 	q, ok := d.instQueues[instanceID]
 	if !ok {
-		q = &instQueue{ch: make(chan func(), 64), done: make(chan struct{})}
+		q = &instQueue{ch: make(chan admittedCommand, 64), done: make(chan struct{})}
 		d.instQueues[instanceID] = q
 	}
 	d.queueMu.Unlock()
 
 	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		releaseAdmission()
+		return false
+	}
 	if !q.live {
 		q.live = true
 		go func() {
 			for {
 				select {
 				case <-q.done:
-					return
+					for {
+						select {
+						case abandoned := <-q.ch:
+							abandoned.cancel()
+						default:
+							return
+						}
+					}
 				case job := <-q.ch:
-					job()
+					q.mu.Lock()
+					stopped := q.stopped
+					q.mu.Unlock()
+					if stopped {
+						job.cancel()
+						continue
+					}
+					func() { defer job.release(); job.run() }()
 				}
 			}
 		}()
 	}
 	select {
-	case q.ch <- fn:
+	case q.ch <- job:
 		q.mu.Unlock()
 		return true
 	default:
 		q.mu.Unlock()
+		releaseAdmission()
 		d.Log.Warn("instance command queue full; dropping (server re-send retries)",
 			"instance", instanceID)
 		return false
@@ -746,7 +788,10 @@ func (d *Daemon) finishQueue(instanceID string) {
 	}
 	d.queueMu.Unlock()
 	if ok {
+		q.mu.Lock()
+		q.stopped = true
 		close(q.done)
+		q.mu.Unlock()
 	}
 }
 
@@ -1716,7 +1761,7 @@ func (d *Daemon) enqueueCommand(conn *websocket.Conn, instanceID, commandID stri
 		}
 		d.seenMu.Unlock()
 	}
-	if !d.enqueueInstance(instanceID, job) {
+	if !d.enqueueInstanceWithCancel(instanceID, job, func() { d.releaseClaim(commandID) }) {
 		d.releaseClaim(commandID)
 	}
 }
@@ -1753,7 +1798,8 @@ func (d *Daemon) enqueueCommandConcurrent(conn *websocket.Conn, instanceID, comm
 		}
 		d.seenMu.Unlock()
 	}
-	go job()
+	releaseAdmission := d.admitWork()
+	go func() { defer releaseAdmission(); job() }()
 }
 
 // reAckProcessed re-acks an already-processed command (a server re-send after
@@ -2078,6 +2124,8 @@ func (d *Daemon) resolveLaunchContent(p transport.LaunchAgentPayload) (mission, 
 }
 
 func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	// Boundary check (SEC-407): the instance id is server-provided and
 	// becomes filesystem path components (representatives/, sessions/,
 	// contracts/, worktrees/). A non-UUID value — from a buggy or
@@ -2308,7 +2356,11 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			return err
 		}
 		if ok {
-			go d.activateSessionIdle(conn, row)
+			releaseActivation := d.admitWork()
+			go func() {
+				defer releaseActivation()
+				_ = d.activateSessionIdle(conn, row)
+			}()
 		}
 	}
 	return nil
@@ -2490,6 +2542,8 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 }
 
 func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	row, ok, err := d.state.GetInstance(instanceID)
 	if err != nil {
 		return err
@@ -2989,6 +3043,8 @@ func resolveSelfExecutable() (string, error) {
 // events into host protocol events, then hibernates the instance when the
 // process exits (process-per-turn).
 func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	row, ok, _ := d.state.GetInstance(spec.InstanceID)
 	if !ok {
 		return fmt.Errorf("unknown instance %s", spec.InstanceID)
@@ -3290,6 +3346,8 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 // so the PID is stable across turns. Hibernation (stopping the endpoint,
 // preserving the session) is a separate, explicit operation.
 func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnSpec, row *InstanceRow) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	started := time.Now()
 
 	// In-flight guard (see the turnsInFlight field): marked BEFORE the
@@ -3638,6 +3696,8 @@ func (d *Daemon) ensureEndpointView(row *InstanceRow) {
 // instance is woken/resumed through the SAME activation path a turn uses
 // (EnsureActive), and a live instance is attached to observationally.
 func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalAttachPayload, row *InstanceRow) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	// Capability gate: the terminal surface exists only when the runtime
 	// has a native TUI. Refuse BEFORE any attach bookkeeping (no
 	// addAttach for a refused attach) — an honest "no terminal surface",
@@ -3773,6 +3833,8 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 //   - any other error: the activation is refused (the instance status is
 //     left for the turn/hibernate paths to settle).
 func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	if err := d.checkRuntimeProfile(row, false); err != nil {
 		return err
 	}
@@ -3875,6 +3937,8 @@ func (d *Daemon) settleGeneration(instanceID string) int {
 // idle-activation path (activateSessionIdle): prepareSession + EnsureActive
 // — no separate wake machinery, no second process.
 func (d *Daemon) activateSessionForAttach(conn *websocket.Conn, row *InstanceRow) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	return d.activateSessionIdle(conn, row)
 }
 
@@ -3925,6 +3989,8 @@ func (d *Daemon) attached(instanceID string) bool {
 // so the (re)connecting client renders history before live output.
 // Detach later is observational: the PTY keeps running (§10).
 func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayload) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
 	if detached, err := d.state.TerminalDetached(p.InstanceID, p.SessionID); err != nil {
 		return err
 	} else if detached {

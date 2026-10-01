@@ -386,6 +386,8 @@ type EndpointLifecycle interface {
 // Supervisor is the central turn-process supervisor (§20): one registry,
 // one launch gate, one cleanup path, one set of counters.
 type Supervisor struct {
+	admission sync.RWMutex
+
 	cfg Config
 	log *slog.Logger
 	now func() time.Time
@@ -544,6 +546,8 @@ func (s *Supervisor) Log() *slog.Logger { return s.log }
 //	launch circuit → pressure backoff → host pressure →
 //	owned-process ceiling → process start → register → record
 func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, error) {
+	release := s.AdmitWork()
+	defer release()
 	if req.Cmd == nil {
 		return nil, errors.New("proc: Launch requires a Cmd")
 	}
