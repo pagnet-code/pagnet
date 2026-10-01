@@ -1071,6 +1071,9 @@ type CryptoSessionStartPayload struct {
 	CommandID        string                 `json:"commandId"`
 	TenantID         string                 `json:"tenantId"`
 	NetworkID        string                 `json:"networkId"`
+	// EpochID is the control plane's committed network epoch. A locally
+	// generated rotation candidate cannot select a browser's write key.
+	EpochID string `json:"epochId,omitempty"`
 	// SessionID is the server-minted session id (the daemon stores the
 	// record under it; the browser reuses it on every operation).
 	SessionID string `json:"sessionId"`
@@ -1161,7 +1164,7 @@ type CryptoWrapCekPayload struct {
 	TenantID  string `json:"tenantId"`
 	NetworkID string `json:"networkId"`
 	SessionID string `json:"sessionId"`
-	// AAD is the browser's AAD (relayed verbatim; not used by the wrap).
+	// AAD binds the exact admitted network, committed epoch and object.
 	AAD        e2ee.AAD `json:"aad"`
 	ObjectType string   `json:"objectType"`
 	ObjectID   string   `json:"objectId"`

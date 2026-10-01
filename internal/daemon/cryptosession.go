@@ -34,6 +34,7 @@ type browserSession struct {
 	SessionID  string
 	UserID     string
 	NetworkID  string
+	EpochID    string // committed network write epoch at session admission
 	BrowserPub string // base64 X25519 public key
 	createdAt  time.Time
 	expiresAt  time.Time
@@ -62,7 +63,7 @@ const maxBrowserSessions = 4096
 
 // create records a separate browser session, evicting the oldest session only
 // at the configured resource bounds. Callers have already authorized its owner.
-func (s *sessionStore) create(sessionID, userID, networkID, browserPub string, now time.Time) *browserSession {
+func (s *sessionStore) create(sessionID, userID, networkID, browserPub, epochID string, now time.Time) *browserSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if old := s.sessions[sessionID]; old != nil {
@@ -82,6 +83,7 @@ func (s *sessionStore) create(sessionID, userID, networkID, browserPub string, n
 		SessionID:  sessionID,
 		UserID:     userID,
 		NetworkID:  networkID,
+		EpochID:    epochID,
 		BrowserPub: browserPub,
 		createdAt:  now,
 		expiresAt:  now.Add(sessionTTL),

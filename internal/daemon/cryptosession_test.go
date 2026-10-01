@@ -12,7 +12,7 @@ import (
 func TestSessionStoreTTLExpiry(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-1", "user-1", "net-1", "pub", now)
+	s.create("sess-1", "user-1", "net-1", "pub", "epoch", now)
 	// Past the TTL (no intervening use): gone.
 	if _, ok := s.get("sess-1", now.Add(sessionTTL+time.Second)); ok {
 		t.Fatal("session present past TTL, want gone")
@@ -24,7 +24,7 @@ func TestSessionStoreTTLExpiry(t *testing.T) {
 func TestSessionStoreRefreshOnUse(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-1", "user-1", "net-1", "pub", now)
+	s.create("sess-1", "user-1", "net-1", "pub", "epoch", now)
 	// Used just before the original expiry: the TTL is refreshed.
 	if _, ok := s.get("sess-1", now.Add(sessionTTL-time.Second)); !ok {
 		t.Fatal("session present on use, want ok")
@@ -39,8 +39,8 @@ func TestSessionStoreRefreshOnUse(t *testing.T) {
 func TestSessionStoreBrowserTabsCoexist(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("tab-1", "user", "network", "pub-1", now)
-	s.create("tab-2", "user", "network", "pub-2", now)
+	s.create("tab-1", "user", "network", "pub-1", "epoch", now)
+	s.create("tab-2", "user", "network", "pub-2", "epoch", now)
 	for _, id := range []string{"tab-1", "tab-2"} {
 		if _, ok := s.get(id, now); !ok {
 			t.Fatalf("tab %s replaced", id)
@@ -56,7 +56,7 @@ func TestSessionStoreBoundedPerAccountAndGlobal(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
 	for i := 0; i < maxBrowserSessionsPerAccount+1; i++ {
-		s.create(fmt.Sprintf("tab-%03d", i), "user", "network", "pub", now.Add(time.Duration(i)*time.Nanosecond))
+		s.create(fmt.Sprintf("tab-%03d", i), "user", "network", "pub", "epoch", now.Add(time.Duration(i)*time.Nanosecond))
 	}
 	if len(s.sessions) != maxBrowserSessionsPerAccount {
 		t.Fatal("account bound exceeded")
@@ -65,7 +65,7 @@ func TestSessionStoreBoundedPerAccountAndGlobal(t *testing.T) {
 		t.Fatal("oldest account session not evicted")
 	}
 	for i := 0; i < maxBrowserSessions+1; i++ {
-		s.create(fmt.Sprintf("global-%04d", i), fmt.Sprintf("user-%04d", i), "network", "pub", now.Add(time.Duration(i+100)*time.Nanosecond))
+		s.create(fmt.Sprintf("global-%04d", i), fmt.Sprintf("user-%04d", i), "network", "pub", "epoch", now.Add(time.Duration(i+100)*time.Nanosecond))
 	}
 	if len(s.sessions) != maxBrowserSessions {
 		t.Fatal("global bound exceeded")
@@ -82,9 +82,9 @@ func TestSessionStoreBoundedPerAccountAndGlobal(t *testing.T) {
 func TestSessionStoreDifferentUserNet(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-a", "user-1", "net-1", "pub-a", now)
-	s.create("sess-b", "user-1", "net-2", "pub-b", now)
-	s.create("sess-c", "user-2", "net-1", "pub-c", now)
+	s.create("sess-a", "user-1", "net-1", "pub-a", "epoch", now)
+	s.create("sess-b", "user-1", "net-2", "pub-b", "epoch", now)
+	s.create("sess-c", "user-2", "net-1", "pub-c", "epoch", now)
 	for _, id := range []string{"sess-a", "sess-b", "sess-c"} {
 		if _, ok := s.get(id, now.Add(time.Second)); !ok {
 			t.Fatalf("session %s does not resolve, want ok", id)
@@ -96,7 +96,7 @@ func TestSessionStoreDifferentUserNet(t *testing.T) {
 func TestSessionStoreDelete(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-1", "user-1", "net-1", "pub", now)
+	s.create("sess-1", "user-1", "net-1", "pub", "epoch", now)
 	s.delete("sess-1")
 	if _, ok := s.get("sess-1", now.Add(time.Second)); ok {
 		t.Fatal("session present after delete, want gone")
@@ -111,8 +111,8 @@ func TestSessionStoreDelete(t *testing.T) {
 func TestSessionStoreSweep(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-live", "user-1", "net-1", "pub", now)
-	s.create("sess-expired", "user-2", "net-2", "pub", now.Add(-2*sessionTTL))
+	s.create("sess-live", "user-1", "net-1", "pub", "epoch", now)
+	s.create("sess-expired", "user-2", "net-2", "pub", "epoch", now.Add(-2*sessionTTL))
 	s.sweep(now)
 	if _, ok := s.get("sess-live", now); !ok {
 		t.Fatal("live session dropped by sweep, want kept")
@@ -127,7 +127,7 @@ func TestSessionStoreSweep(t *testing.T) {
 func TestSessionStoreNetworkMismatch(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-1", "user-1", "net-1", "pub", now)
+	s.create("sess-1", "user-1", "net-1", "pub", "epoch", now)
 	sess, ok := s.get("sess-1", now.Add(time.Second))
 	if !ok {
 		t.Fatal("session does not resolve, want ok")

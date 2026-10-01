@@ -36,6 +36,9 @@ func (d *Daemon) doCryptoSessionStart(p transport.CryptoSessionStartPayload) (an
 	if p.ProtectedContext != nil {
 		return d.ownerSessionStart(p)
 	}
+	if p.EpochID == "" {
+		return nil, fmt.Errorf("crypto: session start requires committed network epoch")
+	}
 	kr, err := crypto.LoadKeyring(d.StateDir, p.NetworkID)
 	if err != nil {
 		return nil, fmt.Errorf("crypto: session start: %w", err)
@@ -44,12 +47,12 @@ func (d *Daemon) doCryptoSessionStart(p transport.CryptoSessionStartPayload) (an
 	if err != nil {
 		return nil, err
 	}
-	epoch, err := kr.ActiveEpoch()
-	if err != nil {
-		return nil, err
+	epoch, ok := kr.EpochByID(p.EpochID)
+	if !ok || epoch.State == crypto.EpochRevoked {
+		return nil, fmt.Errorf("%s: committed epoch not available", errKeyEpochUnavailable)
 	}
 	d.cryptoManager().sessions.sweep(time.Now().UTC())
-	d.cryptoManager().sessions.create(p.SessionID, p.UserID, p.NetworkID, p.BrowserPub, time.Now().UTC())
+	d.cryptoManager().sessions.create(p.SessionID, p.UserID, p.NetworkID, p.BrowserPub, epoch.ID, time.Now().UTC())
 	return &transport.CryptoSessionStartResult{
 		HostX25519: base64.StdEncoding.EncodeToString(id.X25519Pub),
 		EpochID:    epoch.ID,
@@ -127,8 +130,12 @@ func unwrapCekToBrowser(kr *crypto.Keyring, browserPub []byte, networkID, sessio
 // it through the normal protected-field write path (authorization enforced
 // there).
 func (d *Daemon) doCryptoWrapCek(p transport.CryptoWrapCekPayload) (any, error) {
-	if _, err := d.sessionValid(p.NetworkID, p.SessionID); err != nil {
+	sess, err := d.sessionValid(p.NetworkID, p.SessionID)
+	if err != nil {
 		return nil, err
+	}
+	if sess.EpochID == "" || p.AAD.KeyEpochID != sess.EpochID || p.AAD.NetworkID != sess.NetworkID || p.AAD.ValidateScope() != nil || p.AAD.ProtectedContext != nil || p.AAD.ObjectID != p.ObjectID || p.AAD.ObjectType != p.ObjectType {
+		return nil, fmt.Errorf("crypto: browser write does not match committed session scope")
 	}
 	id, err := d.cryptoManager().hostIdentity()
 	if err != nil {
@@ -147,24 +154,11 @@ func (d *Daemon) doCryptoWrapCek(p transport.CryptoWrapCekPayload) (any, error) 
 	if err != nil {
 		return nil, err
 	}
-	// Wrap under the epoch the browser bound into the AAD (the announced
-	// epoch from the session-start ack), so the envelope's key_epoch_id
-	// matches the AAD the browser used to seal the payload. Fall back to the
-	// active epoch when the AAD names none. An unknown named epoch is a clean
-	// availability failure (the browser retries once the key package lands).
-	var epoch crypto.KeyEpoch
-	if p.AAD.KeyEpochID != "" {
-		e, ok := kr.EpochByID(p.AAD.KeyEpochID)
-		if !ok {
-			return nil, fmt.Errorf("%s: epoch %s not in local keyring", errKeyEpochUnavailable, p.AAD.KeyEpochID)
-		}
-		epoch = e
-	} else {
-		e, err := kr.ActiveEpoch()
-		if err != nil {
-			return nil, err
-		}
-		epoch = e
+	// Every write uses the explicitly committed epoch admitted at session
+	// start. A newer local rotation candidate is never a write fallback.
+	epoch, ok := kr.EpochByID(sess.EpochID)
+	if !ok || epoch.State == crypto.EpochRevoked {
+		return nil, fmt.Errorf("%s: committed epoch not available", errKeyEpochUnavailable)
 	}
 	key, err := epoch.KeyArray()
 	if err != nil {
