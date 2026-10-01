@@ -228,14 +228,25 @@ func TestDaemon_PersistentHibernateCycle(t *testing.T) {
 	if sess.NativeID != sessionID1 {
 		t.Fatalf("Manager native id after wake = %q, want %q", sess.NativeID, sessionID1)
 	}
-	// In-session state CONTINUES: the fake's on-disk turn count is now 2
-	// (the wake turn ran in the resumed session, not a fresh one).
+	// Activation resumes the session without inventing a model turn. Real
+	// queued work then continues the same on-disk conversation on that endpoint.
+	beforeWork := readDaemonFakeSession(t, instanceID)
+	if beforeWork.Turns != 1 {
+		t.Fatalf("wake submitted a synthetic model turn: turns=%d", beforeWork.Turns)
+	}
+	driveDeliver(t, d, server, transport.NetworkEventPayload{
+		CommandID: "hc-real-work-after-wake", InstanceID: instanceID,
+		Kind: "channel", ConversationID: "hc-conversation", Body: "continue our earlier conversation",
+	})
+	if after := d.sup.EndpointPID(instanceID); after == nil || *after != *pid2 {
+		t.Fatal("real delivery replaced the awakened endpoint")
+	}
 	sf := readDaemonFakeSession(t, instanceID)
 	if sf.SessionID != sessionID1 {
 		t.Fatalf("session file id after wake = %q, want %q", sf.SessionID, sessionID1)
 	}
 	if sf.Turns < 2 {
-		t.Fatalf("in-session state did not continue after wake: turns=%d (want >=2)", sf.Turns)
+		t.Fatalf("in-session state did not continue with real work after wake: turns=%d (want >=2)", sf.Turns)
 	}
 	t.Logf("hibernate cycle: session %q; endpoint pid %d -> %d; on-disk turns=%d",
 		sessionID1, *pid1, *pid2, sf.Turns)
