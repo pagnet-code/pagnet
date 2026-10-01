@@ -48,7 +48,7 @@ type acpEndpoint struct {
 }
 type acpPermission struct {
 	id      json.RawMessage
-	options map[string]bool
+	options map[string]string
 }
 
 func (d *ACPDriver) Name() domain.RuntimeName      { return d.Runtime }

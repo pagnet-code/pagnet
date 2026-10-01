@@ -1328,6 +1328,14 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case transport.MsgResolveRuntimeInteraction:
+		var p transport.ResolveRuntimeInteractionPayload
+		if env.DecodePayload(&p) != nil || p.CommandID == "" {
+			return
+		}
+		d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error { return d.doResolveRuntimeInteraction(p) })
+		})
 	case transport.MsgLaunchAgent:
 		var p transport.LaunchAgentPayload
 		if err := env.DecodePayload(&p); err != nil {
@@ -3522,6 +3530,7 @@ func sessionInteractionToAdapter(ie *session.InteractionEvent) *agentruntime.Int
 	}
 	return &agentruntime.InteractionEvent{
 		NativeInteractionID: ie.NativeInteractionID,
+		Options:             ie.Options,
 		Kind:                ie.Kind,
 		Summary:             ie.Summary,
 		NativePayload:       ie.NativePayload,
@@ -4177,6 +4186,7 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 		SessionID:           sessionID,
 		Runtime:             runtime,
 		NativeInteractionID: ie.NativeInteractionID,
+		Options:             ie.Options,
 		Kind:                ie.Kind,
 		Summary:             ie.Summary,
 		NativePayload:       ie.NativePayload,
@@ -4184,6 +4194,16 @@ func (d *Daemon) sendInteraction(conn *websocket.Conn, msgType string, spec agen
 		Resolved:            ie.Resolved,
 		Decision:            ie.Decision,
 		Answer:              ie.Answer,
+	}
+	// Networkless personal sessions have no network key context. Do not send
+	// private vendor tool arguments as a plaintext substitute for inspection.
+	if row, ok, _ := d.state.GetInstance(spec.InstanceID); ok && row.NetworkID == "" {
+		payload.NativePayload = nil
+		payload.Answer = ""
+		payload.Summary = "Native interaction"
+		if payload.Kind == "permission" {
+			payload.Summary = "Native tool approval"
+		}
 	}
 	// E2EE (plan §12.3): on an active private network the interaction's
 	// protected detail (summary + native payload + answer) crosses only as an

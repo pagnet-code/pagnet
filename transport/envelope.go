@@ -835,6 +835,7 @@ type AgentResponsePayload struct {
 // around it. The vendor payload stays opaque — never parsed server-side
 // for correctness.
 type InteractionEventPayload struct {
+	Options []domain.RuntimeInteractionOption `json:"options,omitempty"`
 	// InteractionID is the pagnet-side id (daemon-minted; idempotency key).
 	InteractionID string `json:"interactionId"`
 	InstanceID    string `json:"instanceId"`
@@ -1340,3 +1341,18 @@ type EndpointStatusPayload struct {
 // RuntimeProfileInstallation deliberately excludes executable paths, args and
 // environment values; profile execution settings remain on their owning host.
 type RuntimeProfileInstallation = domain.RuntimeProfileInstallation
+
+// ResolveRuntimeInteractionPayload is pinned to the live native session and
+// permission generation. Delivery must never activate a replacement endpoint.
+const MsgResolveRuntimeInteraction = "host.resolve_runtime_interaction"
+
+type ResolveRuntimeInteractionPayload struct {
+	CommandID           string    `json:"commandId"`
+	InteractionID       string    `json:"interactionId"`
+	InstanceID          string    `json:"instanceId"`
+	SessionID           string    `json:"sessionId"`
+	NativeInteractionID string    `json:"nativeInteractionId"`
+	OptionID            string    `json:"optionId"`
+	Decision            string    `json:"decision"`
+	ExpiresAt           time.Time `json:"expiresAt"`
+}

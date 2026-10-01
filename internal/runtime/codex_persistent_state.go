@@ -565,6 +565,7 @@ func (s *codexTurnState) processServerRequest(rpcID, method string, params json.
 		TurnID:    s.machineTurnID,
 		Interaction: &session.InteractionEvent{
 			NativeInteractionID: rpcID,
+			Options:             codexApprovalOptions(method, params),
 			Kind:                kind,
 			Summary:             summary,
 			NativePayload:       params,
@@ -577,45 +578,60 @@ func (s *codexTurnState) processServerRequest(rpcID, method string, params json.
 // generic interaction kind + a public-safe summary.
 func classifyCodexServerRequest(method string, params json.RawMessage) (string, string) {
 	switch method {
-	case "item/commandExecution/requestApproval":
-		var p struct {
-			Command string `json:"command"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return "permission", "codex command approval: " + trunc(p.Command)
-	case "item/fileChange/requestApproval":
-		return "permission", "codex file change approval"
-	case "item/permissions/requestApproval":
-		var p struct {
-			Reason string `json:"reason"`
-		}
-		_ = json.Unmarshal(params, &p)
-		summary := "codex permission request"
-		if p.Reason != "" {
-			summary += ": " + trunc(p.Reason)
-		}
-		return "permission", summary
-	case "item/tool/requestUserInput":
-		var p struct {
-			Questions []struct {
-				ID   string `json:"id"`
-				Text string `json:"text"`
-			} `json:"questions"`
-		}
-		_ = json.Unmarshal(params, &p)
-		if len(p.Questions) > 0 && p.Questions[0].Text != "" {
-			return "question", "codex input request: " + trunc(p.Questions[0].Text)
-		}
-		return "question", "codex input request"
-	case "mcpServer/elicitation/request", "openai/form":
-		var p struct {
-			ServerName string `json:"serverName"`
-		}
-		_ = json.Unmarshal(params, &p)
-		return "question", "codex mcp elicitation: " + p.ServerName
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval":
+		return "permission", "Native tool approval"
+	case "item/tool/requestUserInput", "mcpServer/elicitation/request", "openai/form":
+		return "question", "Native input request"
 	default:
-		return "other", "codex request: " + method
+		return "other", "Native interaction"
 	}
+}
+
+// Only documented string decisions are supported. An explicit vendor list is
+// an allowlist; unknown policy-amendment objects cannot widen it.
+func codexApprovalOptions(method string, params json.RawMessage) []domain.RuntimeInteractionOption {
+	if method != "item/commandExecution/requestApproval" && method != "item/fileChange/requestApproval" {
+		return nil
+	}
+	var request map[string]json.RawMessage
+	if json.Unmarshal(params, &request) != nil {
+		return nil
+	}
+	decisions := []string{"accept", "acceptForSession", "decline", "cancel"}
+	if raw, exists := request["availableDecisions"]; exists {
+		var entries []json.RawMessage
+		if json.Unmarshal(raw, &entries) != nil {
+			return nil
+		}
+		decisions = nil
+		for _, entry := range entries {
+			var decision string
+			if json.Unmarshal(entry, &decision) == nil {
+				decisions = append(decisions, decision)
+			}
+		}
+	}
+	out := []domain.RuntimeInteractionOption{}
+	seen := map[string]bool{}
+	for _, decision := range decisions {
+		if seen[decision] {
+			continue
+		}
+		seen[decision] = true
+		kind := ""
+		switch decision {
+		case "accept":
+			kind = "allow_once"
+		case "acceptForSession":
+			kind = "allow_always"
+		case "decline", "cancel":
+			kind = "reject_once"
+		}
+		if kind != "" {
+			out = append(out, domain.RuntimeInteractionOption{ID: decision, Kind: kind})
+		}
+	}
+	return out
 }
 
 // resolveInteraction builds the JSON-RPC response for a pending server
@@ -634,9 +650,18 @@ func (s *codexTurnState) resolveInteraction(rpcID, decision, answer string) (res
 	if !ok {
 		return nil, nil, false
 	}
-	// The FIRST resolution wins; subsequent ones are ignored (dedup).
-	delete(s.interactions, rpcID)
 	res := s.buildInteractionResponseLocked(inte, decision, answer)
+	if res == nil && (inte.method == "item/commandExecution/requestApproval" || inte.method == "item/fileChange/requestApproval") {
+		return nil, nil, false
+	}
+	// The first valid choice wins. Invalid input must not consume the prompt.
+	delete(s.interactions, rpcID)
+	if answer == "decline" {
+		decision = "declined"
+	}
+	if answer == "cancel" {
+		decision = "cancelled"
+	}
 	return res, s.resolvedEventsLocked(inte, decision), true
 }
 
@@ -672,14 +697,24 @@ func (s *codexTurnState) resolvedEventsLocked(inte *codexInteraction, decision s
 func (s *codexTurnState) buildInteractionResponseLocked(inte *codexInteraction, decision, answer string) json.RawMessage {
 	switch inte.method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
-		switch decision {
-		case "resolved":
-			return json.RawMessage(`{"decision":"accept"}`)
-		case "cancelled":
-			return json.RawMessage(`{"decision":"cancel"}`)
-		case "declined":
-			return json.RawMessage(`{"decision":"decline"}`)
+		selected := answer
+		if selected == "" {
+			switch decision {
+			case "resolved":
+				selected = "accept"
+			case "declined":
+				selected = "decline"
+			case "cancelled":
+				selected = "cancel"
+			}
 		}
+		for _, option := range codexApprovalOptions(inte.method, inte.payload) {
+			if option.ID == selected {
+				raw, _ := json.Marshal(map[string]string{"decision": selected})
+				return raw
+			}
+		}
+		return nil
 	case "item/permissions/requestApproval":
 		// Granting: an empty profile with turn scope — the narrowest
 		// expressible grant (the requested extra permissions are NOT

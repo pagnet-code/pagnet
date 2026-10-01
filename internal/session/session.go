@@ -483,6 +483,7 @@ func isTerminalEvent(ty string) bool {
 // interaction (question, permission, plan approval, ...). The vendor
 // payload stays opaque (addendum §8.2).
 type InteractionEvent struct {
+	Options []domain.RuntimeInteractionOption
 	// NativeInteractionID is the runtime's own id for the interaction.
 	NativeInteractionID string
 	// Kind: question | permission | plan_approval | authentication |

@@ -55,3 +55,16 @@ Sources checked 2026-10-01: [native ACP](https://docs.x.ai/build/cli/headless-sc
 [browser connectors](https://docs.x.ai/grok/connectors),
 [ACP session setup](https://agentclientprotocol.com/protocol/v1/session-setup).
 Tests use real supervised mock ACP subprocesses; no paid Grok execution is claimed.
+
+## Native approval handling
+
+Pagnet offers only the option IDs and permission kinds that the native runtime
+reports. Choosing an option queues a command for that exact live native session;
+the interaction stays pending until that runner confirms delivery. A stale
+permission cannot wake or approve a replacement session.
+
+Network-scoped requests can be inspected by explicitly decrypting their protected
+detail in the browser. An unscoped representative has no network encryption key
+context, so private native tool arguments are not uploaded as a plaintext
+fallback. Its remote approval controls offer refusal only until secure personal
+inspection is supported. Pagnet does not invent broad native approval defaults.

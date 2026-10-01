@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/session"
 )
 
@@ -194,9 +195,10 @@ func (e *acpEndpoint) permission(ctx context.Context, message acpMessage) (*sess
 	if len(request.Options) == 0 || len(request.Options) > 64 {
 		return nil, errors.New("invalid ACP permission options")
 	}
-	options := map[string]bool{}
+	options := map[string]string{}
+	publicOptions := []domain.RuntimeInteractionOption{}
 	for _, o := range request.Options {
-		if o.ID == "" || len(o.ID) > 1024 || options[o.ID] {
+		if o.ID == "" || len(o.ID) > 1024 || options[o.ID] != "" {
 			return nil, errors.New("invalid ACP permission option")
 		}
 		switch o.Kind {
@@ -204,7 +206,8 @@ func (e *acpEndpoint) permission(ctx context.Context, message acpMessage) (*sess
 		default:
 			return nil, errors.New("unknown ACP permission option")
 		}
-		options[o.ID] = true
+		options[o.ID] = o.Kind
+		publicOptions = append(publicOptions, domain.RuntimeInteractionOption{ID: o.ID, Kind: o.Kind})
 	}
 	id := fmt.Sprintf("%s:%x", e.id, sha256.Sum256(message.ID))
 	e.mu.Lock()
@@ -216,7 +219,7 @@ func (e *acpEndpoint) permission(ctx context.Context, message acpMessage) (*sess
 		return nil, errors.New("duplicate ACP permission")
 	}
 	e.permissions[id] = acpPermission{id: append(json.RawMessage{}, message.ID...), options: options}
-	return &session.InteractionEvent{NativeInteractionID: id, Kind: "permission", Summary: "Native tool approval", NativePayload: append(json.RawMessage{}, message.Params...)}, nil
+	return &session.InteractionEvent{NativeInteractionID: id, Kind: "permission", Summary: "Native tool approval", Options: publicOptions, NativePayload: append(json.RawMessage{}, message.Params...)}, nil
 }
 func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -233,7 +236,7 @@ func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) er
 		if option == "" {
 			option = req.Decision
 		}
-		if !p.options[option] {
+		if p.options[option] == "" {
 			return errors.New("select an explicit native ACP permission optionId")
 		}
 		outcome = map[string]string{"outcome": "selected", "optionId": option}
@@ -245,6 +248,12 @@ func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) er
 		return err
 	}
 	delete(e.permissions, req.InteractionID)
-	e.resolutions <- &session.InteractionEvent{NativeInteractionID: req.InteractionID, Kind: "permission", Resolved: true, Decision: req.Decision, Answer: req.Answer}
+	decision := "resolved"
+	if req.Decision == "cancel" {
+		decision = "cancelled"
+	} else if p.options[req.Answer] == "reject_once" || p.options[req.Answer] == "reject_always" {
+		decision = "declined"
+	}
+	e.resolutions <- &session.InteractionEvent{NativeInteractionID: req.InteractionID, Kind: "permission", Resolved: true, Decision: decision, Answer: req.Answer}
 	return nil
 }

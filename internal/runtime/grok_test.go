@@ -204,6 +204,9 @@ func TestGrokACPPermissionsRequireExplicitNativeOption(t *testing.T) {
 		case ev := <-events:
 			if ev.Type == session.EventInteractionStarted {
 				id = ev.Interaction.NativeInteractionID
+				if len(ev.Interaction.Options) != 2 || ev.Interaction.Options[0].ID != "allow-once" || ev.Interaction.Options[1].Kind != "reject_once" {
+					t.Fatalf("native choices lost: %+v", ev.Interaction.Options)
+				}
 			}
 		case <-ctx.Done():
 			t.Fatal("native permission was not exposed")

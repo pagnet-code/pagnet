@@ -283,12 +283,32 @@ func (c *CodexPersistent) Submit(ctx context.Context, sess *session.RuntimeSessi
 		// JSON-RPC response (the ONLY way the resolution reaches the
 		// runtime — pagnet never auto-approves). The in-flight turn's
 		// stream carries the interaction.resolved.
-		res, evs, found := e.state.resolveInteraction(req.InteractionID, req.Decision, req.Answer)
+		nativeID := strings.TrimPrefix(req.InteractionID, e.generation+":")
+		if e.generation != "" && nativeID == req.InteractionID {
+			return errors.New("codex permission generation changed")
+		}
+		boundedCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		writeFinished := make(chan struct{})
+		defer close(writeFinished)
+		go func() {
+			select {
+			case <-boundedCtx.Done():
+				select {
+				case <-writeFinished:
+					return
+				default:
+				}
+				e.h.Abort("native approval delivery timeout")
+			case <-writeFinished:
+			}
+		}()
+		res, evs, found := e.state.resolveInteraction(nativeID, req.Decision, req.Answer)
 		if !found {
 			// The interaction is stale (already resolved, or the endpoint
 			// was re-activated and the request is gone): nothing to
 			// answer.
-			return nil
+			return errors.New("codex permission is stale or choice unavailable")
 		}
 		// Route the resolution events onto the in-flight turn's stream
 		// BEFORE sending the JSON-RPC response. At this moment the app-
@@ -306,7 +326,7 @@ func (c *CodexPersistent) Submit(ctx context.Context, sess *session.RuntimeSessi
 		for _, ev := range evs {
 			e.routeEvent(ev)
 		}
-		id, err := strconv.ParseInt(req.InteractionID, 10, 64)
+		id, err := strconv.ParseInt(nativeID, 10, 64)
 		var werr error
 		if err == nil {
 			if res != nil {
@@ -455,6 +475,7 @@ func (c *CodexPersistent) Live(instanceID string) bool {
 
 // codexEndpoint is one live codex app-server endpoint process.
 type codexEndpoint struct {
+	generation string
 	f          *CodexPersistent // back-reference (the reader's exit path drops this record)
 	instanceID string
 	h          *proc.Handle // set once at launch, never nilled (immutable)
@@ -729,7 +750,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 
 	resuming := sess.NativeID != ""
 	e := &codexEndpoint{
-		f:            c,
+		generation: domain.NewID().String(), f: c,
 		instanceID:   sess.InstanceID,
 		h:            h,
 		state:        newCodexTurnState(resuming, sess.NativeID),
@@ -971,6 +992,11 @@ func (e *codexEndpoint) dispatchMessage(msg *codexRPCMessage) {
 // thread/started broadcast, MCP startup status, ...); after, events go
 // to the current turn (when the TurnID matches).
 func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
+	if ev.Interaction != nil && e.generation != "" {
+		copied := *ev.Interaction
+		copied.NativeInteractionID = e.generation + ":" + copied.NativeInteractionID
+		ev.Interaction = &copied
+	}
 	e.mu.Lock()
 	if !e.activationSent {
 		e.mu.Unlock()

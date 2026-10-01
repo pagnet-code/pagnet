@@ -295,6 +295,7 @@ func (c *capturedStderr) Text() string {
 // it into the host protocol. The vendor payload stays opaque — the server
 // never parses it for correctness (plan §8.2).
 type InteractionEvent struct {
+	Options []domain.RuntimeInteractionOption
 	// Runtime is the canonical runtime name (the daemon fills it from the
 	// instance when the adapter leaves it empty).
 	Runtime domain.RuntimeName
