@@ -120,6 +120,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if protocol != Protocol || stored != string(encoded) {
 		return fail(errors.New("worker journal scope or protocol mismatch"))
 	}
+	if err = j.initializeOutput(); err != nil {
+		return fail(err)
+	}
 	if err = j.validateHistory(); err != nil {
 		return fail(err)
 	}

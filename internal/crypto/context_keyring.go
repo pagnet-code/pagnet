@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -122,6 +123,13 @@ func SaveContextKeyring(state string, k *ContextKeyring) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	release, err := lockContextKeyring(ctx, path, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	raw, err := json.Marshal(k)
 	if err != nil {
 		return err
@@ -129,6 +137,38 @@ func SaveContextKeyring(state string, k *ContextKeyring) error {
 	return writeFileAtomic(path, raw)
 }
 func LoadContextKeyring(state string, c e2ee.ProtectedContext) (*ContextKeyring, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var ring *ContextKeyring
+	err := WithContextKeyring(ctx, state, c, func(k *ContextKeyring) error { ring = k; return nil })
+	return ring, err
+}
+
+// WithContextKeyring keeps the shared process-safe authority gate held through
+// the caller's native action. It only reads existing epochs: no activation,
+// rotation or key creation is implicit. The callback must not rotate/save this
+// context or recursively acquire its exclusive lock.
+func WithContextKeyring(ctx context.Context, state string, c e2ee.ProtectedContext, fn func(*ContextKeyring) error) error {
+	if fn == nil {
+		return errors.New("protected context operation unavailable")
+	}
+	path, err := contextKeyringPath(state, c)
+	if err != nil {
+		return err
+	}
+	release, err := lockContextKeyring(ctx, path, false)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ring, err := loadContextKeyringUnlocked(state, c)
+	if err != nil {
+		return err
+	}
+	return fn(ring)
+}
+
+func loadContextKeyringUnlocked(state string, c e2ee.ProtectedContext) (*ContextKeyring, error) {
 	path, err := contextKeyringPath(state, c)
 	if err != nil {
 		return nil, err

@@ -114,6 +114,9 @@ const startupDiagLineRunes = 200
 
 // QwenPersistent is the Qwen Dual Output persistent driver.
 type QwenPersistent struct {
+	// StateDir is immutable host-local storage owned by this driver instance.
+	// Explicit ownership avoids process-global environment routing across workers.
+	StateDir string
 	// Binary is the path to the qwen executable. When empty it is resolved
 	// from PATH / next to the current executable.
 	Binary string
@@ -1325,6 +1328,9 @@ func (q *QwenPersistent) modelFor(sess *session.RuntimeSession) string {
 // stateDir is where the qwen dual-output endpoint keeps its sidecar files
 // (under the pagnet state dir, never the workspace — §44).
 func (q *QwenPersistent) stateDir() string {
+	if q.StateDir != "" {
+		return q.StateDir
+	}
 	if d := os.Getenv("PAGNET_STATE_DIR"); d != "" {
 		return d
 	}

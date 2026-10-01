@@ -97,6 +97,9 @@ const (
 
 // CodexPersistent is the Codex app-server persistent driver.
 type CodexPersistent struct {
+	// StateDir is immutable host-local storage owned by this driver instance.
+	// Explicit ownership avoids process-global environment routing across workers.
+	StateDir string
 	// Binary is the path to the codex executable. When empty it is
 	// resolved from PATH / next to the current executable.
 	Binary string
@@ -1236,6 +1239,9 @@ func (c *CodexPersistent) dropEndpointRef(e *codexEndpoint) {
 // state dir when PAGNET_STATE_DIR is set, else the default pagnet state
 // base.
 func (c *CodexPersistent) stateDir() string {
+	if c.StateDir != "" {
+		return c.StateDir
+	}
 	if d := os.Getenv("PAGNET_STATE_DIR"); d != "" {
 		return d
 	}

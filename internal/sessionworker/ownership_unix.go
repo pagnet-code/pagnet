@@ -3,9 +3,11 @@
 package sessionworker
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 
@@ -67,3 +69,28 @@ func removeStaleSocket(path string) error {
 	return os.Remove(path)
 }
 func privateSocket(path string) error { return os.Chmod(path, 0600) }
+
+func readPrivateFile(path string, bound int) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), "private-worker-file")
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Getuid()) || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() < 0 || info.Size() > int64(bound) {
+		return nil, errors.New("worker bootstrap file is not private or exceeds bound")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(bound)+1))
+	if err != nil || len(data) > bound {
+		return nil, errors.New("worker bootstrap file exceeds bound")
+	}
+	return data, nil
+}
+func workerSignals(ctx context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(ctx, syscall.SIGTERM)
+}

@@ -24,6 +24,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/accounts"
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/sandbox"
+	"github.com/pagnet-code/pagnet/internal/sessionworker"
 )
 
 var serverURL string
@@ -94,6 +95,9 @@ func envOrDefault(key, def string) string {
 }
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == sessionworker.Subcommand {
+		os.Exit(sessionworker.RunMain(os.Args[2:], version))
+	}
 	// The hidden sandbox wrapper (S2) is intercepted BEFORE the CLI command
 	// tree: the wrapper's pre-sandbox path must stay minimal and must never
 	// touch the CLI's flag/credential plumbing. No new binary — it is a

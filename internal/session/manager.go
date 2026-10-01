@@ -287,6 +287,24 @@ func (m *Manager) NativeID(instanceID string) (string, bool) {
 	return s.NativeID, true
 }
 
+// TryNativeID returns settled native identity without waiting for a launch
+// handshake. Inspection/status must not hold a controller socket until a
+// vendor startup budget expires. A changing session returns ok=false.
+func (m *Manager) TryNativeID(instanceID string) (id string, ok bool) {
+	lock := m.activationLock(instanceID)
+	if !lock.TryLock() {
+		return "", false
+	}
+	defer lock.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sessions[instanceID]
+	if s == nil {
+		return "", false
+	}
+	return s.NativeID, true
+}
+
 // Materialised returns the instance's session materialised flag (locked
 // read). ok is false when the instance has no session. A session is
 // materialised once it has had its first real exchange — only then is its

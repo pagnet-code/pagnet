@@ -3,6 +3,7 @@
 package sessionworker
 
 import (
+	"context"
 	"errors"
 	"io"
 )
@@ -15,3 +16,10 @@ func removeStaleSocket(string) error {
 	return errors.New("private session worker transport unsupported")
 }
 func privateSocket(string) error { return errors.New("private session worker transport unsupported") }
+
+func readPrivateFile(string, int) ([]byte, error) {
+	return nil, errors.New("private session worker bootstrap unsupported")
+}
+func workerSignals(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(ctx)
+}

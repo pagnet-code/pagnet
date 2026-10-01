@@ -97,6 +97,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/pagnet-code/pagnet/domain"
 )
 
 type persistCmd struct {
@@ -110,20 +112,21 @@ type persistCmd struct {
 }
 
 type persistEvent struct {
-	Event               string          `json:"event"`
-	SessionID           string          `json:"sessionId,omitempty"`
-	TurnID              string          `json:"turnId,omitempty"`
-	Output              string          `json:"output,omitempty"`
-	Model               string          `json:"model,omitempty"`
-	Kind                string          `json:"kind,omitempty"`
-	Error               string          `json:"error,omitempty"`
-	RetryAt             *string         `json:"retryAt,omitempty"`
-	NativeInteractionID string          `json:"nativeInteractionId,omitempty"`
-	InteractionKind     string          `json:"interactionKind,omitempty"`
-	Summary             string          `json:"summary,omitempty"`
-	NativePayload       json.RawMessage `json:"nativePayload,omitempty"`
-	Decision            string          `json:"decision,omitempty"`
-	Answer              string          `json:"answer,omitempty"`
+	Options             []domain.RuntimeInteractionOption `json:"options,omitempty"`
+	Event               string                            `json:"event"`
+	SessionID           string                            `json:"sessionId,omitempty"`
+	TurnID              string                            `json:"turnId,omitempty"`
+	Output              string                            `json:"output,omitempty"`
+	Model               string                            `json:"model,omitempty"`
+	Kind                string                            `json:"kind,omitempty"`
+	Error               string                            `json:"error,omitempty"`
+	RetryAt             *string                           `json:"retryAt,omitempty"`
+	NativeInteractionID string                            `json:"nativeInteractionId,omitempty"`
+	InteractionKind     string                            `json:"interactionKind,omitempty"`
+	Summary             string                            `json:"summary,omitempty"`
+	NativePayload       json.RawMessage                   `json:"nativePayload,omitempty"`
+	Decision            string                            `json:"decision,omitempty"`
+	Answer              string                            `json:"answer,omitempty"`
 }
 
 func emitPersist(e persistEvent) {
@@ -345,6 +348,29 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	// channel is never "ready" in a select, so once stopping is closed the
 	// select always resolves to the drop path, never a panic.
 	stopping := make(chan struct{})
+	// A real native timer independently renders while no controller is attached.
+	// Acceptance-only: it does not fabricate machine-plane turn completion.
+	if raw := os.Getenv("PAGNET_FAKE_TUI_TICK_MS"); raw != "" {
+		milliseconds, err := strconv.Atoi(raw)
+		if err != nil || milliseconds < 25 || milliseconds > 10000 {
+			fmt.Fprintln(os.Stderr, "invalid native timer fixture interval")
+			os.Exit(2)
+		}
+		go func() {
+			ticker := time.NewTicker(time.Duration(milliseconds) * time.Millisecond)
+			defer ticker.Stop()
+			count := 0
+			for {
+				select {
+				case <-stopping:
+					return
+				case <-ticker.C:
+					count++
+					ttyWrite(fmt.Sprintf("native-tick %d\n", count))
+				}
+			}
+		}()
+	}
 
 	// S2 e2e fixture: the scripted secret-read probe (runs BEFORE the
 	// bridge fixtures so the sandbox-denial evidence precedes the bridge
@@ -619,13 +645,20 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 				"prompt":  "fake native question (opaque vendor payload)",
 			})
 		}
+		var options []domain.RuntimeInteractionOption
+		if raw := os.Getenv("PAGNET_FAKE_INTERACTION_OPTIONS"); raw != "" {
+			if json.Unmarshal([]byte(raw), &options) != nil || !domain.ValidRuntimeInteractionOptions(options) {
+				fmt.Fprintln(os.Stderr, "invalid fake native permission options")
+				os.Exit(2)
+			}
+		}
 		summary := os.Getenv("PAGNET_FAKE_INTERACTION_SUMMARY")
 		if summary == "" {
 			summary = "fake " + kind + " (simulated)"
 		}
 		emit(persistEvent{
 			Event: "runtime.interaction.started", TurnID: cmd.TurnID, SessionID: prev.SessionID,
-			NativeInteractionID: nativeID, InteractionKind: kind, Summary: summary, NativePayload: payload,
+			NativeInteractionID: nativeID, InteractionKind: kind, Summary: summary, NativePayload: payload, Options: options,
 		})
 		// Block until the interaction is answered externally (via the
 		// submit path), or the process is told to stop.

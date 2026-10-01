@@ -49,6 +49,9 @@ const fakeActivationTimeout = 15 * time.Second
 // It is registered ONLY in debug mode (like the process-per-turn Fake) and
 // is NOT a real agent runtime.
 type PersistentFake struct {
+	// StateDir is immutable host-local storage owned by this driver instance.
+	// Explicit ownership avoids process-global environment routing across workers.
+	StateDir string
 	// Binary is the path to the pagnet-fake-runtime helper. When empty it
 	// is resolved from PATH / next to the current executable.
 	Binary string
@@ -786,6 +789,9 @@ func (f *PersistentFake) dropEndpointRef(e *persistEndpoint) {
 // stateDir is where the fake persistent endpoint keeps its session files
 // (under the pagnet state dir, never the workspace — addendum §44).
 func (f *PersistentFake) stateDir() string {
+	if f.StateDir != "" {
+		return f.StateDir
+	}
 	if d := os.Getenv("PAGNET_STATE_DIR"); d != "" {
 		return d
 	}
@@ -828,20 +834,21 @@ type persistCmd struct {
 // persistWireEvent is the helper's stdout event (the --persistent
 // vocabulary, which carries a turnId for routing).
 type persistWireEvent struct {
-	Event               string          `json:"event"`
-	SessionID           string          `json:"sessionId,omitempty"`
-	TurnID              string          `json:"turnId,omitempty"`
-	Output              string          `json:"output,omitempty"`
-	Model               string          `json:"model,omitempty"`
-	Kind                string          `json:"kind,omitempty"`
-	Error               string          `json:"error,omitempty"`
-	RetryAt             *string         `json:"retryAt,omitempty"`
-	NativeInteractionID string          `json:"nativeInteractionId,omitempty"`
-	InteractionKind     string          `json:"interactionKind,omitempty"`
-	Summary             string          `json:"summary,omitempty"`
-	NativePayload       json.RawMessage `json:"nativePayload,omitempty"`
-	Decision            string          `json:"decision,omitempty"`
-	Answer              string          `json:"answer,omitempty"`
+	Options             []domain.RuntimeInteractionOption `json:"options,omitempty"`
+	Event               string                            `json:"event"`
+	SessionID           string                            `json:"sessionId,omitempty"`
+	TurnID              string                            `json:"turnId,omitempty"`
+	Output              string                            `json:"output,omitempty"`
+	Model               string                            `json:"model,omitempty"`
+	Kind                string                            `json:"kind,omitempty"`
+	Error               string                            `json:"error,omitempty"`
+	RetryAt             *string                           `json:"retryAt,omitempty"`
+	NativeInteractionID string                            `json:"nativeInteractionId,omitempty"`
+	InteractionKind     string                            `json:"interactionKind,omitempty"`
+	Summary             string                            `json:"summary,omitempty"`
+	NativePayload       json.RawMessage                   `json:"nativePayload,omitempty"`
+	Decision            string                            `json:"decision,omitempty"`
+	Answer              string                            `json:"answer,omitempty"`
 }
 
 // isTerminalSessionEvent reports whether the event ends a turn's stream.
@@ -888,6 +895,7 @@ func normalizePersist(ev persistWireEvent) session.SessionEvent {
 	}
 	if ev.Event == session.EventInteractionStarted || ev.Event == session.EventInteractionResolved {
 		out.Interaction = &session.InteractionEvent{
+			Options:             append([]domain.RuntimeInteractionOption(nil), ev.Options...),
 			NativeInteractionID: ev.NativeInteractionID,
 			Kind:                ev.InteractionKind,
 			Summary:             ev.Summary,
