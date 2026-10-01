@@ -328,6 +328,11 @@ func (m *Manager) Materialised(instanceID string) (bool, bool) {
 // m.mu is released before Driver.Activate; the lock that bounds
 // concurrent activations is the per-instance one, not m.mu.
 func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent) (*RuntimeEndpoint, error) {
+	return m.ensureActive(ctx, sess, events, false)
+}
+
+// ownsPrompt is true only for submitPrompt, which already holds promptLock.
+func (m *Manager) ensureActive(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent, ownsPrompt bool) (*RuntimeEndpoint, error) {
 	lock := m.activationLock(sess.InstanceID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -356,28 +361,42 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 		// from what the live endpoint was launched with, the endpoint must
 		// be RESTARTED (stopped + re-activated) so the new value takes
 		// effect — the session is preserved (a materialised session resumes
-		// the same native session on re-activation). The one exception is a
-		// session with an unresolved interaction: restarting it would lose
-		// the in-flight interaction (plan §20: never hibernate a session
-		// with an unresolved interaction), so the change is DEFERRED —
-		// the live endpoint is returned and it is applied at the next
-		// restart opportunity.
+		// the same native session on re-activation). Active work and unresolved
+		// interactions defer replacement: return the live endpoint now and
+		// apply the configuration at the next safe activation opportunity.
 		staleLaunch := live && ep != nil &&
 			(!sameEnv(wantEnv, ep.LaunchEnv) || wantModel != ep.LaunchModel ||
 				wantStanding != ep.LaunchStandingInstructions)
 		if live && !staleLaunch {
 			return ep, nil
 		}
-		if staleLaunch && pending {
+		if staleLaunch && (pending || st == StateBusy) {
 			return ep, nil
 		}
 		if staleLaunch {
+			// An attach/config refresh must not stop an admitted prompt, even
+			// before that prompt has published StateBusy. TryLock avoids lock
+			// inversion: submit takes promptLock then activationLock, while
+			// this path already owns activationLock.
+			if !ownsPrompt {
+				prompt := m.promptLock(sess.InstanceID)
+				if !prompt.TryLock() {
+					return ep, nil
+				}
+				defer prompt.Unlock()
+			}
+			if activity, ok := d.(ActivityReporter); ok && activity.ActiveWork(sess.InstanceID) {
+				return ep, nil
+			}
 			// Stop the (still-live) endpoint, preserving the session —
 			// the driver's hibernate is the graceful stop (the runtime
 			// persists its native session state on the way out). Then fall
 			// through to re-activation with the new env/model/standing
 			// context.
 			if err := d.Hibernate(ctx, sess); err != nil {
+				if errors.Is(err, ErrBusy) {
+					return ep, nil
+				}
 				return nil, err
 			}
 		}
@@ -491,7 +510,7 @@ func (m *Manager) submitPrompt(ctx context.Context, sess *RuntimeSession, req Su
 
 	result := &TurnResult{}
 	for attempt := 0; attempt < 2; attempt++ {
-		if _, err := m.EnsureActive(ctx, sess, events); err != nil {
+		if _, err := m.ensureActive(ctx, sess, events, true); err != nil {
 			// Activation failed: the events channel already carries the
 			// session.lost / not-materialised signal (when the driver
 			// emitted one). Settle the result accordingly.
