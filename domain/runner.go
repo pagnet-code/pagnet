@@ -51,8 +51,3 @@ type Runner struct {
 	DrainingAt   *time.Time
 	CreatedAt    time.Time
 }
-
-// DefaultBootID is the boot identity of the synthetic runner every host
-// gets at migration time (and that legacy daemons — no connect handshake —
-// register under), so single-daemon installs keep working.
-const DefaultBootID = "default"

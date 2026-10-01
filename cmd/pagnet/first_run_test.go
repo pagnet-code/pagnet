@@ -178,20 +178,19 @@ func TestUserCredentialForServeTokenShortCircuit(t *testing.T) {
 // identity never overwrite each other.
 func TestTwoAccountsSeparateCredentials(t *testing.T) {
 	server := "https://cp.example"
-	if credentialKey("personal", server) == credentialKey("work", server) {
-		t.Fatal("personal and work share a keyring key — they must be distinct")
-	}
-	// The default account keeps the legacy server-scoped key (backward
-	// compat: existing keyring entries survive the migration).
-	if credentialKey(accounts.DefaultAccount, server) != "pagnet-token-"+server {
-		t.Fatalf("default key = %q, want the legacy server-scoped key", credentialKey(accounts.DefaultAccount, server))
-	}
-	if credentialKey("", server) != "pagnet-token-"+server {
-		t.Fatalf("worker (account=\"\") key = %q, want the legacy server-scoped key", credentialKey("", server))
-	}
-
-	// And the on-disk configs are separate files.
 	root := t.TempDir()
+	keys := []string{credentialKey(root, "personal", server), credentialKey(root, "work", server), credentialKey(root, accounts.DefaultAccount, server), credentialKey(root, "", server), credentialKey(t.TempDir(), "", server), credentialKey(root, "personal", "https://another.example")}
+	seen := map[string]bool{}
+	for _, key := range keys {
+		if seen[key] {
+			t.Fatal("account, worker, or server keyring contexts collided")
+		}
+		seen[key] = true
+		if !strings.HasPrefix(key, "pagnet-user-v2-") {
+			t.Fatal("obsolete keyring namespace retained")
+		}
+	}
+	// And the on-disk configs are separate files.
 	if accountConfigDir(root, "personal") == accountConfigDir(root, "work") {
 		t.Fatal("personal and work share a config dir")
 	}
@@ -206,6 +205,9 @@ func TestEnsureServerSwitchNonInteractive(t *testing.T) {
 	root := t.TempDir()
 	// An account enrolled on server A (credential + hostId + serverUrl).
 	accDir := accountConfigDir(root, "default")
+	if err := accounts.SetCurrent(root, "default"); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(accDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -430,6 +432,9 @@ func TestZeroNetworksReminder(t *testing.T) {
 	withFileFallback(t)
 	root := t.TempDir()
 	accDir := accountConfigDir(root, "default")
+	if err := accounts.SetCurrent(root, "default"); err != nil {
+		t.Fatal(err)
+	}
 	// Store a user bearer (so loadUserToken returns non-empty).
 	if err := os.MkdirAll(accDir, 0o700); err != nil {
 		t.Fatal(err)

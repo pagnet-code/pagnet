@@ -53,9 +53,9 @@ func authenticateUserFresh(stateDir, account, server string, interactive, fresh 
 	client := netpolicy.NewHTTPClient(60*time.Second, insecureRemoteHTTP)
 	// The credential slot is the ACCOUNT's config dir — the one `pagnet login`
 	// writes, `pagnet status` reads, and loginWithPastedToken documents. The
-	// machine dir is not a fallback: the one-time account migration moves the
-	// legacy flat token out of it, so reading the root would miss every
-	// credential whenever the OS keyring is unavailable.
+	// The global machine config is selection only; credential material is
+	// read from this explicit account directory (or independent worker).
+
 	accDir := accountConfigDir(stateDir, account)
 	// 1. Reuse the stored credential (no prompt).
 	if !fresh {

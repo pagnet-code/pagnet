@@ -19,6 +19,7 @@ import (
 
 	"github.com/99designs/keyring"
 
+	"github.com/pagnet-code/pagnet/internal/accounts"
 	"github.com/pagnet-code/pagnet/internal/config"
 )
 
@@ -716,8 +717,10 @@ func TestStoredServerURL(t *testing.T) {
 	if got := storedServerURL(dir); got != "" {
 		t.Fatalf("empty state dir: storedServerURL = %q, want \"\"", got)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "config.yaml"),
-		[]byte("serverUrl: http://127.0.0.1:19999\n"), 0o600); err != nil {
+	if err := mergeConfigFile(accountConfigDir(dir, "default"), map[string]any{"serverUrl": "http://127.0.0.1:19999"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.SetCurrent(dir, "default"); err != nil {
 		t.Fatal(err)
 	}
 	if got := storedServerURL(dir); got != "http://127.0.0.1:19999" {

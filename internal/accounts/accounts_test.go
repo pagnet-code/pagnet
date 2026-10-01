@@ -18,123 +18,60 @@ func writeLegacy(t *testing.T, root, content string) {
 	}
 }
 
-// TestMigrateLegacy: a legacy flat config migrates to the default account
-// context with EVERY field preserved (no credential loss), and the
-// machine-wide config is rewritten to hold only the current account.
-func TestMigrateLegacy(t *testing.T) {
-	root := t.TempDir()
-	legacy := "serverUrl: https://cp.example\n" +
-		"credential: hostcred-secret\n" +
-		"hostId: h-123\n" +
-		"hostName: lince\n" +
-		"token: pgn-derived-secret\n" +
-		"currentNetwork: backend\n"
-	writeLegacy(t, root, legacy)
-
-	migrated, err := MigrateLegacy(root)
-	if err != nil {
-		t.Fatalf("MigrateLegacy: %v", err)
-	}
-	if !migrated {
-		t.Fatal("MigrateLegacy = false, want true (legacy state present)")
-	}
-
-	// The legacy bytes are preserved verbatim in accounts/default/config.yaml.
-	defPath := ConfigPath(root, DefaultAccount)
-	got, err := os.ReadFile(defPath)
-	if err != nil {
-		t.Fatalf("read migrated config: %v", err)
-	}
-	if string(got) != legacy {
-		t.Fatalf("migrated config = %q,\nwant the legacy bytes verbatim:\n%q", got, legacy)
-	}
-	// 0600 (the credential lives here).
-	info, err := os.Stat(defPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("migrated config perms = %o, want 0600", perm)
-	}
-
-	// The machine-wide config now holds ONLY the current account (no
-	// credential, no host identity).
-	g, err := LoadGlobal(root)
-	if err != nil {
-		t.Fatalf("LoadGlobal: %v", err)
-	}
-	if g.CurrentAccount != DefaultAccount {
-		t.Fatalf("currentAccount = %q, want %q", g.CurrentAccount, DefaultAccount)
-	}
-	globalBytes, _ := os.ReadFile(filepath.Join(root, "config.yaml"))
-	for _, secret := range []string{"hostcred-secret", "pgn-derived-secret", "h-123"} {
-		if strings.Contains(string(globalBytes), secret) {
-			t.Fatalf("machine-wide config leaked %q: %s", secret, globalBytes)
+func TestGlobalAccountStateRejectsFlatAndMalformedConfig(t *testing.T) {
+	for _, raw := range []string{"serverUrl: https://cp.example\ncredential: host-secret\n", "currentAccount: [broken", "currentAccount: default\n---\ncurrentAccount: another\n"} {
+		root := t.TempDir()
+		writeLegacy(t, root, raw)
+		if _, err := ActiveAccount(root, ""); err == nil {
+			t.Fatal("obsolete or malformed global state silently selected account")
+		}
+		after, _ := os.ReadFile(filepath.Join(root, "config.yaml"))
+		if string(after) != raw {
+			t.Fatal("account lookup rewrote old state")
+		}
+		if Exists(root, DefaultAccount) {
+			t.Fatal("flat credentials were migrated")
 		}
 	}
 }
 
-// TestMigrateLegacyIdempotent: a second run is a no-op (accounts exist).
-func TestMigrateLegacyIdempotent(t *testing.T) {
-	root := t.TempDir()
-	writeLegacy(t, root, "serverUrl: https://cp.example\ncredential: c1\n")
-	if _, err := MigrateLegacy(root); err != nil {
-		t.Fatal(err)
-	}
-	migrated, err := MigrateLegacy(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if migrated {
-		t.Fatal("second MigrateLegacy = true, want false (already migrated)")
-	}
-}
-
-// TestMigrateLegacyNoLegacy: an empty state dir is left untouched.
-func TestMigrateLegacyNoLegacy(t *testing.T) {
-	root := t.TempDir()
-	migrated, err := MigrateLegacy(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if migrated {
-		t.Fatal("MigrateLegacy on an empty dir = true, want false")
-	}
-}
-
-// TestMigrateLegacyNonLegacy: a config that already holds only the global
-// fields (currentAccount/labels) is not legacy and is left alone.
-func TestMigrateLegacyNonLegacy(t *testing.T) {
-	root := t.TempDir()
-	writeLegacy(t, root, "currentAccount: default\n")
-	migrated, err := MigrateLegacy(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if migrated {
-		t.Fatal("MigrateLegacy on a non-legacy config = true, want false")
-	}
-}
-
-// TestActiveAccount: the --account override wins, then currentAccount, then
-// the default.
 func TestActiveAccount(t *testing.T) {
 	root := t.TempDir()
-	if got := ActiveAccount(root, "work"); got != "work" {
-		t.Fatalf("override = %q, want work", got)
-	}
-	if got := ActiveAccount(root, ""); got != DefaultAccount {
-		t.Fatalf("no current = %q, want %q", got, DefaultAccount)
+	for _, tc := range []struct{ override, want string }{{"work", "work"}, {"", DefaultAccount}} {
+		got, err := ActiveAccount(root, tc.override)
+		if err != nil || got != tc.want {
+			t.Fatalf("account=%q err=%v", got, err)
+		}
 	}
 	if err := SetCurrent(root, "work"); err != nil {
 		t.Fatal(err)
 	}
-	if got := ActiveAccount(root, ""); got != "work" {
-		t.Fatalf("current = %q, want work", got)
+	for _, tc := range []struct{ override, want string }{{"", "work"}, {"personal", "personal"}} {
+		got, err := ActiveAccount(root, tc.override)
+		if err != nil || got != tc.want {
+			t.Fatalf("account=%q err=%v", got, err)
+		}
 	}
-	// The override still wins over the current account.
-	if got := ActiveAccount(root, "personal"); got != "personal" {
-		t.Fatalf("override over current = %q, want personal", got)
+	if _, err := ActiveAccount(root, "../../escape"); err == nil {
+		t.Fatal("unsafe explicit account accepted")
+	}
+	writeLegacy(t, root, "currentAccount: ../../escape\n")
+	if _, err := ActiveAccount(root, ""); err == nil {
+		t.Fatal("unsafe stored account accepted")
+	}
+}
+
+func TestExistingAccountsRequireExplicitSelection(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(ConfigDir(root, "work"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ActiveAccount(root, ""); err == nil {
+		t.Fatal("existing account state silently selected default")
+	}
+	got, err := ActiveAccount(root, "work")
+	if err != nil || got != "work" {
+		t.Fatalf("explicit account unavailable %q %v", got, err)
 	}
 }
 

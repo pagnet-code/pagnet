@@ -22,6 +22,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/accounts"
+	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/sandbox"
 )
 
@@ -253,10 +254,10 @@ func enrollCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := machineStateDir(stateDir)
-			if _, err := accounts.MigrateLegacy(root); err != nil {
+			account, err := accounts.ActiveAccount(root, accountFlag)
+			if err != nil {
 				return err
 			}
-			account := accounts.ActiveAccount(root, accountFlag)
 			if token == "" {
 				// No enrollment token: token-first sign-in (the hidden
 				// paste), mint a one-time token for this host, and enroll
@@ -417,10 +418,12 @@ func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string
 // account config > build default, via resolveServerURL), then an interactive
 // prompt (a dev build has no default), then a clean error (non-interactive).
 func resolveEnrollServer(root, account string) (string, error) {
-	if cfg, _, err := loadAccountConfig(root); err == nil {
-		if s := resolveServerURL(cfg); s != "" {
-			return s, nil
-		}
+	cfg, err := config.LoadDaemon(accountConfigDir(root, account))
+	if err != nil {
+		return "", err
+	}
+	if s := resolveServerURL(cfg); s != "" {
+		return s, nil
 	}
 	if interactiveMode() {
 		for attempt := 0; attempt < 2; attempt++ {

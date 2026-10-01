@@ -28,6 +28,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/accounts"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -102,6 +103,9 @@ func (s *recordServer) noCall(method, path string) bool {
 func seedHostConfig(t *testing.T, stateDir, serverURL, hostID string) {
 	t.Helper()
 	accDir := filepath.Join(stateDir, "accounts", "default")
+	if err := accounts.SetCurrent(stateDir, "default"); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(accDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

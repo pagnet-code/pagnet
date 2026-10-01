@@ -38,7 +38,7 @@ func isWorkerDir(dir string) bool {
 // loadAccountConfig loads the daemon config for the machine-wide state dir
 // root: the ACTIVE account's config (serverUrl, credential, hostId, ...)
 // with root as cfg.StateDir (the daemon's machine-wide state: sqlite, sock,
-// log). It performs the one-time legacy migration first. For a worker dir
+// log). For a worker dir
 // (no account contexts) it loads the flat config directly.
 //
 // It returns the config and the active account name ("" for workers).
@@ -47,10 +47,10 @@ func loadAccountConfig(root string) (config.Daemon, string, error) {
 		cfg, err := config.LoadDaemon(root)
 		return cfg, "", err
 	}
-	if _, err := accounts.MigrateLegacy(root); err != nil {
+	acc, err := accounts.ActiveAccount(root, accountFlag)
+	if err != nil {
 		return config.Daemon{}, "", err
 	}
-	acc := accounts.ActiveAccount(root, accountFlag)
 	accDir := accounts.ConfigDir(root, acc)
 	cfg, err := config.LoadDaemon(accDir)
 	if err != nil {

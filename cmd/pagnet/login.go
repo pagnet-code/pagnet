@@ -76,12 +76,15 @@ listings, and CI logs.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := machineStateDir(stateDir)
-			if _, err := accounts.MigrateLegacy(root); err != nil {
+			account, err := accounts.ActiveAccount(root, accountFlag)
+			if err != nil {
 				return err
 			}
-			account := accounts.ActiveAccount(root, accountFlag)
 			accDir := accountConfigDir(root, account)
-			cfg, _, _ := loadAccountConfig(root)
+			cfg, _, err := loadAccountConfig(root)
+			if err != nil {
+				return err
+			}
 			server := resolveServerURL(cfg)
 			if server == "" {
 				return errors.New("no control plane URL — set --server / $PAGNET_SERVER, or run 'pagnet enroll --server <url>' first")
@@ -234,16 +237,20 @@ func bearerMe(client *http.Client, base, token string) (bool, error) {
 // --- token storage (user bearer in the shared state file) ---------------------
 
 // credentialKey is the OS-keyring key for an account's user token. It is
-// scoped per (account, server) so two accounts on the same control plane
-// keep separate credentials and never overwrite each other. The default
-// account keeps the legacy server-scoped key so existing keyring entries
-// survive the account migration untouched.
-func credentialKey(account, server string) string {
-	s := strings.TrimSuffix(server, "/")
-	if account == "" || account == accounts.DefaultAccount {
-		return "pagnet-token-" + s
+// scoped per explicit account and server. Workers use their canonical local
+// state directory as a separate namespace, never the default account key.
+func credentialKey(stateDir, account, server string) string {
+	contextName := "account:" + account
+	if account == "" {
+		workerPath, _ := filepath.Abs(stateDir)
+		if canonical, err := filepath.EvalSymlinks(workerPath); err == nil {
+			workerPath = canonical
+		}
+		contextName = "worker:" + workerPath
 	}
-	return "pagnet-token-" + account + "-" + s
+	encoded, _ := json.Marshal([]string{contextName, strings.TrimSuffix(server, "/")})
+	sum := sha256.Sum256(encoded)
+	return fmt.Sprintf("pagnet-user-v2-%x", sum)
 }
 
 // openKeyringFn opens the OS keyring (a test seam: replace it to force the
@@ -256,11 +263,11 @@ var openKeyringFn = func() (keyring.Keyring, error) {
 // loadUserToken reads the stored user bearer ("" when absent). The OS keyring
 // is preferred when available; the 0600 account config file is the fallback.
 // stateDir is the account's config dir (or a worker dir); account scopes the
-// keyring key ("" = server-scoped, for workers/legacy).
+// keyring key ("" = isolated worker directory).
 func loadUserToken(stateDir, account, server string) string {
 	if server != "" {
 		if kr, err := openKeyringFn(); err == nil {
-			if item, err := kr.Get(credentialKey(account, server)); err == nil {
+			if item, err := kr.Get(credentialKey(stateDir, account, server)); err == nil {
 				return string(item.Data)
 			}
 		}

@@ -10,16 +10,13 @@
 // One account may have its own enrollment of this machine (personal → Host
 // A, work → Host B on the same box is legitimate); host IDs/credentials
 // never leak across accounts.
-//
-// Backward compatibility: existing users have a legacy FLAT
-// <state-dir>/config.yaml (serverUrl, credential, hostId, ...). MigrateLegacy
-// performs a small lazy/one-time migration: when legacy state exists and no
-// account contexts do, the current state becomes the "default" account
-// context, preserving every field (no credential loss, no manual moves).
 package accounts
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,9 +26,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultAccount is the account context the legacy flat state migrates to
-// and the fallback when no current account is recorded.
+// DefaultAccount is the initial context created by first sign-in. Existing
+// accounts require an explicitly recorded current context or --account.
 const DefaultAccount = "default"
+
+// ErrNoCurrentAccount requires the caller to select an existing context.
+var ErrNoCurrentAccount = errors.New("no current account selected; run pagnet account use <name> or pass --account")
 
 // accountsDirName is the subdirectory of the state dir holding account
 // contexts.
@@ -81,7 +81,7 @@ func globalPath(root string) string {
 
 // LoadGlobal reads the machine-wide config (currentAccount, labels). A
 // missing or empty file yields a zero Global (CurrentAccount empty → the
-// caller falls back to DefaultAccount).
+// first sign-in creates the initial context).
 func LoadGlobal(root string) (Global, error) {
 	var g Global
 	b, err := os.ReadFile(globalPath(root))
@@ -91,8 +91,13 @@ func LoadGlobal(root string) (Global, error) {
 		}
 		return g, err
 	}
-	if err := yaml.Unmarshal(b, &g); err != nil {
-		return g, err
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&g); err != nil && err != io.EOF {
+		return g, fmt.Errorf("invalid global account config: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return g, errors.New("global account config must contain one document")
 	}
 	return g, nil
 }
@@ -109,17 +114,34 @@ func SaveGlobal(root string, g Global) error {
 	return writeFileAtomic0600(globalPath(root), b)
 }
 
-// ActiveAccount resolves the active account name: the explicit override
-// (the --account flag, when set), else the global config's currentAccount,
-// else DefaultAccount.
-func ActiveAccount(root, override string) string {
+// ActiveAccount selects an explicit account, a valid current account, or the
+// first-sign-in context when no accounts exist. Corrupt or ambiguous state is
+// never silently interpreted as a different account.
+func ActiveAccount(root, override string) (string, error) {
 	if override != "" {
-		return override
+		if err := ValidateName(override); err != nil {
+			return "", err
+		}
+		return override, nil
 	}
-	if g, err := LoadGlobal(root); err == nil && g.CurrentAccount != "" {
-		return g.CurrentAccount
+	g, err := LoadGlobal(root)
+	if err != nil {
+		return "", err
 	}
-	return DefaultAccount
+	if g.CurrentAccount != "" {
+		if err := ValidateName(g.CurrentAccount); err != nil {
+			return "", err
+		}
+		return g.CurrentAccount, nil
+	}
+	names, err := List(root)
+	if err != nil {
+		return "", err
+	}
+	if len(names) > 0 {
+		return "", ErrNoCurrentAccount
+	}
+	return DefaultAccount, nil
 }
 
 // SetCurrent records account as the current account in the global config,
@@ -181,68 +203,6 @@ func List(root string) ([]string, error) {
 func Exists(root, name string) bool {
 	info, err := os.Stat(ConfigDir(root, name))
 	return err == nil && info.IsDir()
-}
-
-// MigrateLegacy performs the one-time legacy migration. When the state dir
-// holds a legacy FLAT config.yaml (server/credential/host fields) and no
-// account contexts exist, the legacy state becomes the DefaultAccount
-// context: its config.yaml is copied to accounts/default/config.yaml (every
-// field preserved, including the user credential fallback and metadata),
-// and the machine-wide config.yaml is rewritten to hold only the current
-// account. The migration is idempotent: once accounts/default exists it is
-// a no-op, and a state dir with no legacy content is left untouched.
-//
-// It returns true when it migrated, false otherwise.
-func MigrateLegacy(root string) (bool, error) {
-	// Already migrated (or the user created account contexts): no-op.
-	if names, err := List(root); err != nil {
-		return false, err
-	} else if len(names) > 0 {
-		return false, nil
-	}
-	// Read the legacy flat config.
-	b, err := os.ReadFile(globalPath(root))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil // no legacy config, nothing to migrate
-		}
-		return false, err
-	}
-	var legacy map[string]any
-	if err := yaml.Unmarshal(b, &legacy); err != nil {
-		return false, nil // not a mapping; leave it alone
-	}
-	if len(legacy) == 0 {
-		return false, nil
-	}
-	// Only migrate a config that looks like the legacy flat daemon config
-	// (it carries a server, a host credential/identity, or a user token).
-	// A config that already holds only currentAccount/labels is not legacy.
-	isLegacy := false
-	for _, k := range []string{"serverUrl", "credential", "hostId", "hostName", "token"} {
-		if _, ok := legacy[k]; ok {
-			isLegacy = true
-			break
-		}
-	}
-	if !isLegacy {
-		return false, nil
-	}
-	// Create accounts/default/config.yaml with the legacy content verbatim
-	// (a copy, not a move — the original bytes are preserved exactly).
-	defDir := ConfigDir(root, DefaultAccount)
-	if err := os.MkdirAll(defDir, 0o700); err != nil {
-		return false, err
-	}
-	if err := os.WriteFile(ConfigPath(root, DefaultAccount), b, 0o600); err != nil {
-		return false, err
-	}
-	// Rewrite the machine-wide config to hold only the current account.
-	g := Global{CurrentAccount: DefaultAccount}
-	if err := SaveGlobal(root, g); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // writeFileAtomic0600 writes b to path atomically (temp file in the same

@@ -11,6 +11,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -42,7 +43,10 @@ func accountRows(root string) ([]accountRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	current := accounts.ActiveAccount(root, accountFlag)
+	current, err := accounts.ActiveAccount(root, accountFlag)
+	if err != nil && !errors.Is(err, accounts.ErrNoCurrentAccount) {
+		return nil, err
+	}
 	rows := make([]accountRow, 0, len(names))
 	for _, n := range names {
 		row := accountRow{Account: n, Current: n == current}
@@ -62,9 +66,6 @@ func accountListCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := machineStateDir(stateDir)
-			if _, err := accounts.MigrateLegacy(root); err != nil {
-				return err
-			}
 			rows, err := accountRows(root)
 			if err != nil {
 				return err
@@ -100,10 +101,10 @@ func accountCurrentCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := machineStateDir(stateDir)
-			if _, err := accounts.MigrateLegacy(root); err != nil {
+			cur, err := accounts.ActiveAccount(root, accountFlag)
+			if err != nil {
 				return err
 			}
-			cur := accounts.ActiveAccount(root, accountFlag)
 			if jsonOut {
 				return writeJSON(cmd, map[string]string{"account": cur})
 			}
@@ -124,13 +125,10 @@ func accountUseCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root := machineStateDir(stateDir)
 			name := args[0]
-			if _, err := accounts.MigrateLegacy(root); err != nil {
-				return err
-			}
 			if !accounts.Exists(root, name) {
 				return fmt.Errorf("account %q does not exist (run `pagnet account list`)", name)
 			}
-			prev := accounts.ActiveAccount(root, "")
+			prev, _ := accounts.ActiveAccount(root, "")
 			if err := accounts.SetCurrent(root, name); err != nil {
 				return err
 			}

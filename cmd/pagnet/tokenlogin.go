@@ -29,9 +29,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/99designs/keyring"
+	"github.com/pagnet-code/pagnet/internal/accounts"
 	"golang.org/x/term"
 )
 
@@ -405,17 +407,37 @@ func saveCredential(stateDir, account, server, bearer string, meta credentialMet
 	}
 	if kr, err := openKeyringFn(); err == nil {
 		if err := kr.Set(keyring.Item{
-			Key:   credentialKey(account, server),
+			Key:   credentialKey(stateDir, account, server),
 			Data:  []byte(bearer),
 			Label: "Pagnet client credential",
 		}); err == nil {
 			// Keyring holds the bearer: drop the file copy (a previous
 			// fallback login may have left one there).
 			fields["token"] = nil
-			return mergeConfigFile(stateDir, fields)
+			return persistCredentialConfig(stateDir, account, fields)
 		}
 		// Keyring set failed: fall through to the file fallback.
 	}
 	fields["token"] = bearer
-	return mergeConfigFile(stateDir, fields)
+	return persistCredentialConfig(stateDir, account, fields)
+}
+
+// A successful first sign-in records its selected context. Merely finding an
+// old directory never selects it; worker state remains independent.
+func persistCredentialConfig(stateDir, account string, fields map[string]any) error {
+	if err := mergeConfigFile(stateDir, fields); err != nil {
+		return err
+	}
+	if account == "" || filepath.Base(stateDir) != account || filepath.Base(filepath.Dir(stateDir)) != "accounts" {
+		return nil
+	}
+	root := filepath.Dir(filepath.Dir(stateDir))
+	global, err := accounts.LoadGlobal(root)
+	if err != nil {
+		return err
+	}
+	if global.CurrentAccount == "" {
+		return accounts.SetCurrent(root, account)
+	}
+	return nil
 }
