@@ -68,10 +68,11 @@ func (d *Daemon) doScanInventory() transport.InventoryPayload {
 		workspaces = d.scanWorkspaces()
 	}
 	payload := transport.InventoryPayload{
-		HostID:       d.stateID(),
-		Runtimes:     d.detectRuntimes(),
-		Workspaces:   workspaces,
-		AllowedRoots: d.allowedRoots(),
+		HostID:          d.stateID(),
+		Runtimes:        d.detectRuntimes(),
+		RuntimeProfiles: d.detectRuntimeProfiles(),
+		Workspaces:      workspaces,
+		AllowedRoots:    d.allowedRoots(),
 	}
 	// Report the host's stable E2EE public identity (plan §11.5) so the
 	// control plane knows the host is crypto-capable and can address it for
@@ -145,6 +146,9 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 	// non-debug builds). Additive: the wire shape is unchanged.
 	if d.sessions != nil {
 		for name, drv := range d.sessions.Drivers() {
+			if strings.Contains(string(name), "@") {
+				continue
+			}
 			if reported[name] {
 				continue
 			}

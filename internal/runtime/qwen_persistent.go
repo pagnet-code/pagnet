@@ -117,6 +117,9 @@ type QwenPersistent struct {
 	// Binary is the path to the qwen executable. When empty it is resolved
 	// from PATH / next to the current executable.
 	Binary string
+	// PrefixArgs and NativeDirs are immutable host-local execution profile settings.
+	PrefixArgs []string
+	NativeDirs []string
 	// Model overrides the model for managed endpoints (empty = the
 	// session's launch model, then the PAGNET_QWEN_MODEL env, then the
 	// user's default).
@@ -781,7 +784,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	// S2: the runtime's own native state dir (~/.qwen — the SAME list the
 	// launch spec grants) is a mandatory RW grant; the launch path
 	// guarantees its existence (H3), including on first use.
-	if err := ensureNativeDirs(homeNativeDirs(".qwen")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(q.NativeDirs, homeNativeDirs(".qwen"))...); err != nil {
 		return nil, err
 	}
 	eventsPath := filepath.Join(stateDir, "events.jsonl")
@@ -863,7 +866,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		args = append(args, "--mcp-config", mcpJSON)
 	}
 
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), q.PrefixArgs...), args...)...)
 	cmd.Dir = sess.Workspace
 	// Launch env (Phase 2 / R8): the endpoint child receives the session's
 	// launch environment (the generic spec pairs the daemon injects for the
@@ -922,7 +925,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 	sb := driverSandbox(driverSandboxOpts{
 		workspace:  sess.Workspace,
 		stateDir:   stateDir,
-		nativeDirs: homeNativeDirs(".qwen"),
+		nativeDirs: profileNativeDirs(q.NativeDirs, homeNativeDirs(".qwen")),
 		binary:     bin,
 		env:        sess.Env,
 		denied:     sess.SandboxDenied,

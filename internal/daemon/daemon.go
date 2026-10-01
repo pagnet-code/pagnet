@@ -135,8 +135,9 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	state    *State
-	adapters map[domain.RuntimeName]agentruntime.Adapter
+	state           *State
+	adapters        map[domain.RuntimeName]agentruntime.Adapter
+	runtimeProfiles map[string]*loadedRuntimeProfile
 
 	// selfExe is this process's canonicalized own executable path,
 	// resolved ONCE at construction (New). The agent runtimes spawn the
@@ -650,6 +651,10 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	}
 	qwenPersistent.PTYAvailable = d.adoptEndpointPTY
 	codexPersistent.PTYAvailable = d.adoptEndpointPTY
+	if err := d.loadRuntimeProfiles(); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("load host runtime profiles: %w", err)
+	}
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
@@ -1279,11 +1284,11 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 		for _, i := range insts {
 			ist := transport.InstanceStatus{
 				InstanceID: i.InstanceID,
-				Status:     i.Status,
+				Status:     d.observedInstanceStatus(i),
 			}
 			// §59: the running turn's process id (process-per-turn: set
 			// only while a turn is in flight).
-			if ad, ok := d.adapters[domain.RuntimeName(i.Runtime)]; ok {
+			if ad, ok := d.adapterFor(&i); ok {
 				if p := ad.PID(i.InstanceID); p != nil {
 					ist.PID = *p
 				}
@@ -2073,6 +2078,19 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	p.Mission = mission
 	p.AgentMD = agentMD
 	rn := domain.CanonicalRuntime(p.Runtime)
+	if p.Profile != "" {
+		profile := d.runtimeProfiles[p.Profile]
+		if profile == nil {
+			return fmt.Errorf("runtime profile %q is not configured on this host", p.Profile)
+		}
+		if rn != "" && rn != profile.config.Runtime {
+			return fmt.Errorf("runtime profile %q belongs to a different runtime", p.Profile)
+		}
+		rn = profile.config.Runtime
+		if err := d.checkRuntimeProfile(&InstanceRow{InstanceID: p.InstanceID, Runtime: string(rn), Profile: p.Profile}, true); err != nil {
+			return err
+		}
+	}
 	if rn == "" {
 		// No runtime requested: pick the first available REAL runtime.
 		// The fake runtime is debug-only and is never auto-selected, so a
@@ -2105,7 +2123,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if !d.runtimeSupported(rn) {
 		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
-	if !d.runtimeAvailable(rn) {
+	if p.Profile == "" && !d.runtimeAvailable(rn) {
 		// Fail the launch now, not at the first turn: a host without the
 		// runtime CLI must not ack a clean launch and idle until work
 		// arrives.
@@ -2309,7 +2327,7 @@ func (d *Daemon) sessionDriverFor(row *InstanceRow) session.Driver {
 	if d.sessions == nil {
 		return nil
 	}
-	return d.sessions.DriverFor(domain.RuntimeName(row.Runtime))
+	return d.sessions.DriverFor(d.sessionRuntimeFor(row))
 }
 
 // runtimeSupported reports whether rn is drivable on this host: a
@@ -2357,7 +2375,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
 	d.terminal.stop(instanceID) // a stopped agent has no live terminal
-	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
+	if ad, ok := d.adapterFor(row); ok {
 		_ = ad.Stop(instanceID)
 	}
 	// Phase 1 (runtime-lifecycle refactor): a persistent runtime's endpoint
@@ -2398,7 +2416,7 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 	}
 	if ok {
 		d.terminal.stop(instanceID) // the forgotten instance keeps no process
-		if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
+		if ad, ok := d.adapterFor(row); ok {
 			_ = ad.Stop(instanceID)
 		}
 		// Phase 1: stop the persistent endpoint AND drop the session state
@@ -2430,7 +2448,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
 	d.terminal.stop(instanceID) // cold start: the old PTY session dies with it
-	if ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]; ok {
+	if ad, ok := d.adapterFor(row); ok {
 		_ = ad.Stop(instanceID)
 	}
 	// Phase 1: stop the persistent endpoint AND clear the in-memory session
@@ -2960,6 +2978,9 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	if !ok {
 		return fmt.Errorf("unknown instance %s", spec.InstanceID)
 	}
+	if err := d.checkRuntimeProfile(row, false); err != nil {
+		return err
+	}
 	// The session this turn starts from; a shutdown-interrupted turn rolls
 	// back to exactly this (see the context.Canceled branch below).
 	preTurnSession := row.SessionID
@@ -2977,11 +2998,11 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 	// has NO adapter (it lives in the session core), so the adapter lookup
 	// would fail for it. For a legacy runtime the check is a no-op (no
 	// driver registered), so the legacy path below is byte-identical.
-	if d.sessions != nil && d.sessions.DriverFor(domain.RuntimeName(row.Runtime)) != nil {
+	if d.sessionDriverFor(row) != nil {
 		return d.runTurnPersistent(conn, spec, row)
 	}
 
-	ad, ok := d.adapters[domain.RuntimeName(row.Runtime)]
+	ad, ok := d.adapterFor(row)
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
 	}
@@ -3523,7 +3544,7 @@ func sessionInteractionToAdapter(ie *session.InteractionEvent) *agentruntime.Int
 // R8: fixed at spawn; a change restarts the endpoint —
 // session.RuntimeSession.Env semantics).
 func (d *Daemon) prepareSession(row *InstanceRow, spec agentruntime.TurnSpec) *session.RuntimeSession {
-	sess := d.sessions.Session(spec.InstanceID, domain.RuntimeName(row.Runtime), spec.Workspace)
+	sess := d.sessions.Session(spec.InstanceID, d.sessionRuntimeFor(row), spec.Workspace)
 	d.sessions.RestoreNativeState(spec.InstanceID, row.SessionID)
 	d.sessions.SetLaunchEnv(sess, spec.Env)
 	// The launch model (Phase 4 / B9): fixed at spawn; a change restarts
@@ -3736,6 +3757,9 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 //   - any other error: the activation is refused (the instance status is
 //     left for the turn/hibernate paths to settle).
 func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) error {
+	if err := d.checkRuntimeProfile(row, false); err != nil {
+		return err
+	}
 	spec := d.turnSpecFor(row, row.SessionID != "", "", "terminal")
 	sess := d.prepareSession(row, spec)
 	events := make(chan session.SessionEvent, 16)

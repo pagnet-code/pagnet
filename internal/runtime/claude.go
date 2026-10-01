@@ -51,6 +51,9 @@ type Claude struct {
 	// Binary is the path to the claude executable. When empty it is
 	// resolved from PATH / next to the current executable.
 	Binary string
+	// PrefixArgs and NativeDirs are immutable host-local execution profile settings.
+	PrefixArgs []string
+	NativeDirs []string
 	// Model overrides the model for managed turns (empty = user default).
 	Model string
 	// Env is appended to the inherited environment for spawned processes.
@@ -157,7 +160,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 	// SandboxSpec grants) is a mandatory RW grant — the launch path
 	// guarantees its existence (H3), including on first use (the empty dir
 	// the CLI would create itself).
-	if err := ensureNativeDirs(homeNativeDirs(".claude")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(c.NativeDirs, homeNativeDirs(".claude"))...); err != nil {
 		return err
 	}
 	sessionPath := filepath.Join(spec.SessionDir, claudeSessionFile)
@@ -213,7 +216,7 @@ func (c *Claude) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnE
 		args = append(args, "--mcp-config", mcpJSON)
 	}
 
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), c.PrefixArgs...), args...)...)
 	cmd.Dir = spec.Workspace
 	// TMPDIR is the per-instance scratch (an explicit pair — it overrides
 	// any inherited TMPDIR whose target is not in the sandbox allowlist).
@@ -480,7 +483,7 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	}
 	// S2: the runtime's own native state dir (~/.claude — the SAME list
 	// SandboxSpec grants) must exist (H3), including on first use.
-	if err := ensureNativeDirs(homeNativeDirs(".claude")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(c.NativeDirs, homeNativeDirs(".claude"))...); err != nil {
 		return nil, err
 	}
 	// NO --permission-mode here (external audit F-014): the interactive
@@ -526,7 +529,7 @@ func (c *Claude) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 		}
 		args = append(args, "--mcp-config", mcpJSON)
 	}
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), c.PrefixArgs...), args...)...)
 	cmd.Dir = spec.Workspace
 	// TMPDIR is the per-instance scratch (same rule as a turn: the
 	// explicit pair overrides any inherited TMPDIR the sandbox denies).
@@ -554,7 +557,7 @@ func (c *Claude) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 	return driverSandbox(driverSandboxOpts{
 		workspace:  spec.Workspace,
 		stateDir:   spec.SessionDir,
-		nativeDirs: homeNativeDirs(".claude"),
+		nativeDirs: profileNativeDirs(c.NativeDirs, homeNativeDirs(".claude")),
 		binary:     bin,
 		env:        spec.Env,
 		denied:     spec.SandboxDenied,

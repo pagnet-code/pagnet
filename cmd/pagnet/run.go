@@ -33,7 +33,7 @@ import (
 func runCmd() *cobra.Command {
 	var (
 		network, name, role, access, stateDir string
-		runtimeName                           string
+		runtimeName, runtimeProfile           string
 		host, workspace                       string
 	)
 	cmd := &cobra.Command{
@@ -112,6 +112,22 @@ func runCmd() *cobra.Command {
 				return fmt.Errorf("host %s is %s — start `pagnet -d` there first", td.Name, td.Status)
 			}
 
+			if runtimeProfile != "" {
+				if !domain.ValidRuntimeProfileName(runtimeProfile) {
+					return fmt.Errorf("invalid runtime profile name")
+				}
+				matched := false
+				for _, p := range td.RuntimeProfiles {
+					if p.Name == runtimeProfile && p.Available && (runtimeName == "" || domain.CanonicalRuntime(runtimeName) == domain.RuntimeName(p.Runtime)) {
+						runtimeName = p.Runtime
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return fmt.Errorf("runtime profile %q is not available on host %s", runtimeProfile, td.Name)
+				}
+			}
 			// 5. Pick the workspace on the target host.
 			workspaceID := ""
 			switch {
@@ -266,6 +282,9 @@ func runCmd() *cobra.Command {
 				Status string `json:"Status"`
 			}
 			launchBody := map[string]any{"hostId": targetID, "workspaceId": workspaceID}
+			if runtimeProfile != "" {
+				launchBody["profile"] = runtimeProfile
+			}
 			launchRuntime := runtimeName
 			if createdNow && launchRuntime == "" {
 				launchRuntime = createRuntime
@@ -312,6 +331,7 @@ func runCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network id, name, or slug (default: the saved/only network)")
 	cmd.Flags().StringVar(&name, "name", "", "agent name (default: <repo>[-<role>])")
+	cmd.Flags().StringVar(&runtimeProfile, "profile", "", "named runtime execution profile configured on the target host")
 	cmd.Flags().StringVarP(&runtimeName, "runtime", "r", "",
 		"runtime for the agent (qwen|claude|opencode|codex|fake); empty = resolved from the host's reported runtimes (real runtimes first, the console's Auto behavior; fake is debug-only)")
 	cmd.Flags().StringVarP(&role, "role", "p", "",

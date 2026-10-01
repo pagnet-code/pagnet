@@ -173,6 +173,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		loginCmd(),
 		accountCmd(),
+		runtimeProfilesCmd(),
 		enrollCmd(),
 		unenrollCmd(),
 		workerCmd(),

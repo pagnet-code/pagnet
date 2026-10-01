@@ -660,10 +660,11 @@ type InstanceStatus struct {
 
 // InventoryPayload reports detected runtimes and workspaces.
 type InventoryPayload struct {
-	HostID       string                `json:"hostId"`
-	Runtimes     []RuntimeInstallation `json:"runtimes"`
-	Workspaces   []WorkspaceReport     `json:"workspaces"`
-	AllowedRoots []string              `json:"allowedRoots"`
+	HostID          string                       `json:"hostId"`
+	Runtimes        []RuntimeInstallation        `json:"runtimes"`
+	RuntimeProfiles []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
+	Workspaces      []WorkspaceReport            `json:"workspaces"`
+	AllowedRoots    []string                     `json:"allowedRoots"`
 	// Crypto is the host's stable per-host E2EE public identity (plan
 	// §11.5), reported so the control plane knows the host is crypto-capable
 	// and can address it for Private Network activation/enrollment. Public
@@ -1335,3 +1336,7 @@ type EndpointStatusPayload struct {
 	// Nil when the instance declared nothing yet.
 	Capabilities []domain.Capability `json:"capabilities,omitempty"`
 }
+
+// RuntimeProfileInstallation deliberately excludes executable paths, args and
+// environment values; profile execution settings remain on their owning host.
+type RuntimeProfileInstallation = domain.RuntimeProfileInstallation

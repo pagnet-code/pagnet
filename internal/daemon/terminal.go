@@ -33,7 +33,6 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -658,7 +657,10 @@ func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bo
 	if !ok {
 		return fmt.Errorf("unknown instance %s", instanceID)
 	}
-	ad, ok := tm.d.adapters[domain.RuntimeName(row.Runtime)]
+	if err := tm.d.checkRuntimeProfile(row, false); err != nil {
+		return err
+	}
+	ad, ok := tm.d.adapterFor(row)
 	if !ok {
 		return fmt.Errorf("no adapter for runtime %q", row.Runtime)
 	}

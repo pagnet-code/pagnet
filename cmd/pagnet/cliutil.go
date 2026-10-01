@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
@@ -277,19 +278,20 @@ type hostRuntime struct {
 }
 
 type cliHost struct {
-	ID         string        `json:"ID"`
-	Name       string        `json:"Name"`
-	Status     string        `json:"Status"`
-	OS         string        `json:"OS"`
-	Arch       string        `json:"Arch"`
-	DaemonVer  string        `json:"DaemonVersion"`
-	CPUCount   int           `json:"CPUCount"`
-	CPULoad    float64       `json:"CPULoad"`
-	MemTotal   int64         `json:"MemTotalBytes"`
-	MemUsed    int64         `json:"MemUsedBytes"`
-	LastBeat   *string       `json:"LastHeartbeatAt"`
-	Workspaces []wsEntry     `json:"workspaces"`
-	Runtimes   []hostRuntime `json:"runtimes"`
+	ID              string                              `json:"ID"`
+	Name            string                              `json:"Name"`
+	Status          string                              `json:"Status"`
+	OS              string                              `json:"OS"`
+	Arch            string                              `json:"Arch"`
+	DaemonVer       string                              `json:"DaemonVersion"`
+	CPUCount        int                                 `json:"CPUCount"`
+	CPULoad         float64                             `json:"CPULoad"`
+	MemTotal        int64                               `json:"MemTotalBytes"`
+	MemUsed         int64                               `json:"MemUsedBytes"`
+	LastBeat        *string                             `json:"LastHeartbeatAt"`
+	Workspaces      []wsEntry                           `json:"workspaces"`
+	Runtimes        []hostRuntime                       `json:"runtimes"`
+	RuntimeProfiles []domain.RuntimeProfileInstallation `json:"runtimeProfiles"`
 }
 
 // hostDetail fetches one host WITH its workspaces/roots/runtimes (the
@@ -301,18 +303,20 @@ func (c *cliCtx) hostDetail(hostID string) (*cliHost, error) {
 			Name   string `json:"Name"`
 			Status string `json:"Status"`
 		} `json:"host"`
-		Workspaces []wsEntry     `json:"workspaces"`
-		Runtimes   []hostRuntime `json:"runtimes"`
+		Workspaces      []wsEntry                           `json:"workspaces"`
+		Runtimes        []hostRuntime                       `json:"runtimes"`
+		RuntimeProfiles []domain.RuntimeProfileInstallation `json:"runtimeProfiles"`
 	}
 	if err := c.get("/api/v1/hosts/"+hostID, &d); err != nil {
 		return nil, err
 	}
 	return &cliHost{
-		ID:         d.Host.ID,
-		Name:       d.Host.Name,
-		Status:     d.Host.Status,
-		Workspaces: d.Workspaces,
-		Runtimes:   d.Runtimes,
+		ID:              d.Host.ID,
+		Name:            d.Host.Name,
+		Status:          d.Host.Status,
+		Workspaces:      d.Workspaces,
+		Runtimes:        d.Runtimes,
+		RuntimeProfiles: d.RuntimeProfiles,
 	}, nil
 }
 

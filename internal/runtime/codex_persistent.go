@@ -100,6 +100,9 @@ type CodexPersistent struct {
 	// Binary is the path to the codex executable. When empty it is
 	// resolved from PATH / next to the current executable.
 	Binary string
+	// PrefixArgs and NativeDirs are immutable host-local execution profile settings.
+	PrefixArgs []string
+	NativeDirs []string
 	// Model overrides the model for managed endpoints (empty = the
 	// session's launch model, then the PAGNET_CODEX_MODEL env, then the
 	// user's default).
@@ -621,7 +624,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	// S2: the runtime's own native state dir (~/.codex — the SAME list the
 	// launch spec grants) is a mandatory RW grant; the launch path
 	// guarantees its existence (H3), including on first use.
-	if err := ensureNativeDirs(homeNativeDirs(".codex")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(c.NativeDirs, homeNativeDirs(".codex"))...); err != nil {
 		return nil, session.SessionEvent{}, err
 	}
 	// MCP injection (process start, -c overrides): the daemon-rendered
@@ -636,7 +639,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	args := []string{"app-server", "--stdio"}
 	args = append(args, mcpArgs...)
 
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), c.PrefixArgs...), args...)...)
 	cmd.Dir = sess.Workspace
 	// Launch env: the endpoint child receives the session's launch
 	// environment (the generic spec pairs the daemon injects for the
@@ -705,7 +708,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 	sb := driverSandbox(driverSandboxOpts{
 		workspace:  sess.Workspace,
 		stateDir:   stateDir,
-		nativeDirs: homeNativeDirs(".codex"),
+		nativeDirs: profileNativeDirs(c.NativeDirs, homeNativeDirs(".codex")),
 		binary:     bin,
 		env:        sess.Env,
 		denied:     sess.SandboxDenied,

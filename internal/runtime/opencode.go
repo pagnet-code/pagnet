@@ -58,6 +58,9 @@ type OpenCode struct {
 	// Binary is the path to the opencode executable. When empty it is
 	// resolved from PATH / next to the current executable.
 	Binary string
+	// PrefixArgs and NativeDirs are immutable host-local execution profile settings.
+	PrefixArgs []string
+	NativeDirs []string
 	// Model overrides the model for managed turns (empty = user default).
 	Model string
 	// Env is appended to the inherited environment for spawned processes.
@@ -147,7 +150,7 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	// S2: the runtime's own native state dirs (see SandboxSpec's nativeDirs —
 	// the SAME list) are mandatory RW grants; the launch path guarantees
 	// their existence (H3), including on first use.
-	if err := ensureNativeDirs(homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(o.NativeDirs, homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode"))...); err != nil {
 		return err
 	}
 	sessionPath := filepath.Join(spec.SessionDir, opencodeSessionFile)
@@ -199,7 +202,7 @@ func (o *OpenCode) StartTurn(ctx context.Context, spec TurnSpec, events chan Tur
 	// sandbox allowlist).
 	extraEnv = append(extraEnv, "TMPDIR="+scratch)
 
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), o.PrefixArgs...), args...)...)
 	cmd.Dir = spec.Workspace
 	cmd.Env = EnsureTurnMarker(ChildEnv(extraEnv, spec.Env), spec.TurnID)
 	stdout, err := cmd.StdoutPipe()
@@ -403,7 +406,7 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	}
 	// S2: the runtime's own native state dirs (the SAME list SandboxSpec
 	// grants) must exist (H3), including on first use.
-	if err := ensureNativeDirs(homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode")...); err != nil {
+	if err := ensureNativeDirs(profileNativeDirs(o.NativeDirs, homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode"))...); err != nil {
 		return nil, err
 	}
 	var args []string
@@ -436,7 +439,7 @@ func (o *OpenCode) InteractiveCmd(spec TurnSpec) (*exec.Cmd, error) {
 	}
 	// S2: TMPDIR is the per-instance scratch (same rule as a turn).
 	extraEnv = append(extraEnv, "TMPDIR="+scratchPath(spec.SessionDir))
-	cmd := exec.Command(bin, args...)
+	cmd := exec.Command(bin, append(append([]string(nil), o.PrefixArgs...), args...)...)
 	cmd.Dir = spec.Workspace
 	cmd.Env = ChildEnv(extraEnv, spec.Env)
 	return cmd, nil
@@ -461,7 +464,7 @@ func (o *OpenCode) SandboxSpec(spec TurnSpec) *sandbox.Spec {
 	return driverSandbox(driverSandboxOpts{
 		workspace:  spec.Workspace,
 		stateDir:   spec.SessionDir,
-		nativeDirs: homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode"),
+		nativeDirs: profileNativeDirs(o.NativeDirs, homeNativeDirs(".config/opencode", ".local/share/opencode", ".cache/opencode")),
 		binary:     bin,
 		env:        spec.Env,
 		denied:     spec.SandboxDenied,
