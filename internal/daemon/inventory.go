@@ -84,8 +84,9 @@ func (d *Daemon) doScanInventory() transport.InventoryPayload {
 	if id, err := d.cryptoManager().hostIdentity(); err == nil {
 		payload.OwnerContextProtocol = ownerContextProtocol()
 		payload.Crypto = &transport.InventoryCrypto{
-			X25519Pub:  base64.StdEncoding.EncodeToString(id.X25519Pub),
-			Ed25519Pub: base64.StdEncoding.EncodeToString(id.Ed25519Pub),
+			PossessionProtocol: transport.NetworkEpochPossessionProtocol,
+			X25519Pub:          base64.StdEncoding.EncodeToString(id.X25519Pub),
+			Ed25519Pub:         base64.StdEncoding.EncodeToString(id.Ed25519Pub),
 		}
 	}
 	return payload

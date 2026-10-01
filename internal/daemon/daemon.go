@@ -1614,6 +1614,22 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// enrollment legs run strictly in order (the WSS read loop only enqueues
 	// — it never blocks on the local cryptography). The ack carries the leg's
 	// result in the ack's `result` field (guardedResult).
+	case transport.MsgCryptoAttestEpoch:
+		var p transport.CryptoAttestEpochPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.NetworkID, p.CommandID, func() { d.guardedResult(conn, p.CommandID, func() (any, error) { return d.doCryptoAttestEpoch(p) }) })
+	case transport.MsgCryptoProveEpoch:
+		var p transport.CryptoProveEpochPayload
+		if err := env.DecodePayload(&p); err != nil {
+			d.Log.Warn("command payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		d.enqueueCommand(conn, "crypto:"+p.Binding.NetworkID, p.Binding.CommandID, func() {
+			d.guardedResult(conn, p.Binding.CommandID, func() (any, error) { return d.doCryptoProveEpoch(p) })
+		})
 	case transport.MsgCryptoActivate:
 		var p transport.CryptoActivatePayload
 		if err := env.DecodePayload(&p); err != nil {

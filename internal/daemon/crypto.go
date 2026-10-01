@@ -18,7 +18,8 @@ import (
 // enrollment round-trip (issue challenge → verify proof): the challenge
 // plaintexts are held in the NKA's memory, so a fresh NKA per command could
 // not verify the proof. A daemon restart drops the cache (and any in-flight
-// challenge); the documented recovery is re-enrollment (a fresh 5-leg relay).
+// challenge). The possession protocol independently proves persisted epoch
+// keys after reconnect; it does not depend on this cache or another live host.
 //
 // The NKA's in-memory keyring stays consistent with disk: Rotate/Activate
 // mutate the same *Keyring the NKA holds and persist it, so no reload is
@@ -142,6 +143,12 @@ func (d *Daemon) doCryptoActivate(p transport.CryptoActivatePayload) (any, error
 	if err != nil {
 		return nil, err
 	}
+	if p.PossessionProtocol != "" && p.PossessionProtocol != transport.NetworkEpochPossessionProtocol {
+		return nil, fmt.Errorf("crypto: unsupported possession protocol")
+	}
+	if p.PossessionProtocol == transport.NetworkEpochPossessionProtocol && (p.TenantID == "" || p.NetworkID == "" || d.stateID() == "") {
+		return nil, fmt.Errorf("crypto: incomplete epoch manifest scope")
+	}
 	now := time.Now().UTC()
 	kr, err := crypto.ActivateNetwork(d.StateDir, p.TenantID, p.NetworkID, now)
 	if err != nil {
@@ -161,6 +168,12 @@ func (d *Daemon) doCryptoActivate(p transport.CryptoActivatePayload) (any, error
 		// Sanitized: the self-test error is a generic crypto failure, never
 		// key material.
 		d.Log.Warn("crypto self-test failed", "network", p.NetworkID, "err", err)
+	}
+	if p.PossessionProtocol == transport.NetworkEpochPossessionProtocol && res.SelfTestOK {
+		res.Manifest, err = d.epochManifest(p.TenantID, p.NetworkID, epoch.ID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return res, nil
 }
@@ -250,6 +263,12 @@ func (d *Daemon) doCryptoVerify(p transport.CryptoVerifyPayload) (any, error) {
 // epoch, marking the previous one rotated (retained customer-side to read
 // history). The control plane records only the new epoch id.
 func (d *Daemon) doCryptoRotate(p transport.CryptoRotatePayload) (any, error) {
+	if p.PossessionProtocol != "" && p.PossessionProtocol != transport.NetworkEpochPossessionProtocol {
+		return nil, fmt.Errorf("crypto: unsupported possession protocol")
+	}
+	if p.PossessionProtocol == transport.NetworkEpochPossessionProtocol && (p.TenantID == "" || p.NetworkID == "" || d.stateID() == "") {
+		return nil, fmt.Errorf("crypto: incomplete epoch manifest scope")
+	}
 	n, err := d.cryptoManager().nka(p.TenantID, p.NetworkID)
 	if err != nil {
 		return nil, err
@@ -258,7 +277,14 @@ func (d *Daemon) doCryptoRotate(p transport.CryptoRotatePayload) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &transport.CryptoRotateResult{EpochID: epoch.ID}, nil
+	res := &transport.CryptoRotateResult{EpochID: epoch.ID}
+	if p.PossessionProtocol == transport.NetworkEpochPossessionProtocol {
+		res.Manifest, err = d.epochManifest(p.TenantID, p.NetworkID, epoch.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
 }
 
 // doCryptoShareEndpoint is endpoint crypto enrollment (plan D6): the

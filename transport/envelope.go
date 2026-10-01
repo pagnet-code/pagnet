@@ -680,6 +680,7 @@ type InventoryPayload struct {
 // and the signing key), base64-encoded. It is a property of the stable Host,
 // not the ephemeral Runner, and is stable across daemon restarts.
 type InventoryCrypto struct {
+	PossessionProtocol string `json:"possessionProtocol,omitempty"`
 	// X25519Pub is the HPKE receiver public key (base64, 32 bytes).
 	X25519Pub string `json:"x25519Pub"`
 	// Ed25519Pub is the signing public key (base64, 32 bytes).
@@ -894,9 +895,10 @@ type InteractionEventPayload struct {
 // Key Authority / key epoch for the network, run the crypto self-test, and
 // report its public identity + epoch id (plan §11.6 step 4–6).
 type CryptoActivatePayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
+	PossessionProtocol string `json:"possessionProtocol,omitempty"`
+	CommandID          string `json:"commandId"`
+	TenantID           string `json:"tenantId"`
+	NetworkID          string `json:"networkId"`
 }
 
 // CryptoKeyPackagePayload asks the NKA host to build the HPKE key package
@@ -954,9 +956,10 @@ type CryptoVerifyPayload struct {
 // customer-side to read history; the control plane records only the new
 // epoch id.
 type CryptoRotatePayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
+	PossessionProtocol string `json:"possessionProtocol,omitempty"`
+	CommandID          string `json:"commandId"`
+	TenantID           string `json:"tenantId"`
+	NetworkID          string `json:"networkId"`
 }
 
 // --- crypto ack results ------------------------------------------------------
@@ -978,9 +981,10 @@ type CryptoHostPublic struct {
 // with SelfTestOK=true is what flips the network to active (plan §11.6
 // step 6: the state flips ONLY after the self-test round trip succeeds).
 type CryptoActivateResult struct {
-	HostPub    CryptoHostPublic `json:"hostPub"`
-	EpochID    string           `json:"epochId"`
-	SelfTestOK bool             `json:"selfTestOk"`
+	Manifest   *NetworkEpochManifest `json:"manifest,omitempty"`
+	HostPub    CryptoHostPublic      `json:"hostPub"`
+	EpochID    string                `json:"epochId"`
+	SelfTestOK bool                  `json:"selfTestOk"`
 }
 
 // CryptoKeyPackageResult is the ack result of host.crypto_key_package: the
@@ -1004,7 +1008,8 @@ type CryptoProveResult struct {
 // CryptoRotateResult is the ack result of host.crypto_rotate: the id of the
 // newly minted epoch.
 type CryptoRotateResult struct {
-	EpochID string `json:"epochId"`
+	Manifest *NetworkEpochManifest `json:"manifest,omitempty"`
+	EpochID  string                `json:"epochId"`
 }
 
 // CryptoShareEndpointPayload asks the crypto-authority host to wrap the
