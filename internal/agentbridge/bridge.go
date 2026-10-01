@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -36,8 +37,8 @@ type Bridge struct {
 	conn     net.Conn
 	instance string
 
-	writeMu sync.Mutex
-	nextID  int
+	writeGate chan struct{}
+	nextID    int
 
 	pendingMu  sync.Mutex
 	pending    map[string]chan bridgeResponse
@@ -98,9 +99,10 @@ func Dial(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 	}
 	_ = conn.SetDeadline(time.Time{})
 	b := &Bridge{
-		conn:     conn,
-		instance: instanceID,
-		pending:  map[string]chan bridgeResponse{},
+		conn:      conn,
+		instance:  instanceID,
+		pending:   map[string]chan bridgeResponse{},
+		writeGate: make(chan struct{}, 1),
 	}
 	go b.readLoop(r)
 	return b, nil
@@ -111,6 +113,7 @@ func Dial(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 // canceled or the bridge is closing) are dropped. A read error fails every
 // pending call exactly once.
 func (b *Bridge) readLoop(r *bufio.Reader) {
+	defer b.conn.Close()
 	for {
 		line, err := readLine(r)
 		if err != nil {
@@ -173,18 +176,34 @@ func (b *Bridge) failPending(err error) {
 }
 
 // Call forwards one tool call and waits for the correlated result. Safe
-// for concurrent calls; canceling ctx unblocks this call only — the
-// response, when it arrives, is dropped by the reader (id correlation).
+// for concurrent calls. Cancellation while awaiting a response drops only that
+// waiter. Cancellation during a write closes the stream because framing may
+// already be partial; callers must never automatically replay a mutating tool.
 func (b *Bridge) Call(ctx context.Context, tool string, args any) (json.RawMessage, error) {
-	b.writeMu.Lock()
+	select {
+	case b.writeGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			<-b.writeGate
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	b.nextID++
 	id := strconv.Itoa(b.nextID)
 	req, err := json.Marshal(map[string]any{"id": id, "tool": tool, "args": args})
 	if err != nil {
-		b.writeMu.Unlock()
 		return nil, err
 	}
 
+	if len(req) > 1<<20 {
+		return nil, errors.New("bridge request exceeds 1 MiB")
+	}
 	ch := make(chan bridgeResponse, 1)
 	// The waiter must be registered BEFORE the write: the response cannot
 	// arrive before the request, and a response arriving after a failed
@@ -193,21 +212,23 @@ func (b *Bridge) Call(ctx context.Context, tool string, args any) (json.RawMessa
 	if b.readClosed {
 		readErr := b.readErr
 		b.pendingMu.Unlock()
-		b.writeMu.Unlock()
 		return nil, readErr
 	}
 	b.pending[id] = ch
 	b.pendingMu.Unlock()
-	_, err = b.conn.Write(append(req, '\n'))
-	b.writeMu.Unlock()
+	err = b.writeRequest(ctx, append(req, '\n'))
 	if err != nil {
 		b.pendingMu.Lock()
 		delete(b.pending, id)
 		b.pendingMu.Unlock()
+		_ = b.conn.Close()
 		b.failPending(err)
 		return nil, err
 	}
 
+	// Release serialized write admission before waiting for this response.
+	<-b.writeGate
+	gateHeld = false
 	select {
 	case out := <-ch:
 		return out.result, out.err
@@ -217,6 +238,37 @@ func (b *Bridge) Call(ctx context.Context, tool string, args any) (json.RawMessa
 		b.pendingMu.Unlock()
 		return nil, ctx.Err()
 	}
+}
+
+// writeRequest bounds local socket backpressure as well as caller cancellation.
+// A failed/partial write invalidates framing; Call closes the connection rather
+// than replaying a possibly executed tool. The cancellation callback is joined
+// before clearing the deadline, so it cannot poison a subsequent writer.
+func (b *Bridge) writeRequest(ctx context.Context, request []byte) error {
+	deadline := time.Now().Add(5 * time.Second)
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
+	if err := b.conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	cancelled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = b.conn.SetWriteDeadline(time.Now()); close(cancelled) })
+	n, err := b.conn.Write(request)
+	if !stop() {
+		<-cancelled
+	}
+	_ = b.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	if n != len(request) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 // Close closes the bridge connection; pending calls fail with the close

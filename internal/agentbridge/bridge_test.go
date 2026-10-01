@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,5 +185,101 @@ func TestBridgeClose_FailsPending(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("pending call did not unblock on Close")
+	}
+}
+
+// A serial daemon can stop reading while waiting for an upstream tool. Socket
+// backpressure must not defeat MCP cancellation or trap unrelated queued calls.
+func TestBridgeWriteBackpressureCancellation(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	b := &Bridge{conn: client, pending: map[string]chan bridgeResponse{}, writeGate: make(chan struct{}, 1)}
+	defer b.Close()
+	go b.readLoop(bufio.NewReader(client))
+	writing, cancelWrite := context.WithCancel(context.Background())
+	defer cancelWrite()
+	first := make(chan error, 1)
+	go func() { _, err := b.Call(writing, "first", map[string]any{"marker": "private"}); first <- err }()
+	// Observing the request byte proves the first writer is inside Write; leave
+	// the rest unread to make backpressure deterministic rather than timing-based.
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	var prefix [1]byte
+	if _, err := peer.Read(prefix[:]); err != nil {
+		t.Fatal(err)
+	}
+	queued, cancelQueued := context.WithCancel(context.Background())
+	cancelQueued()
+	next := make(chan error, 1)
+	go func() { _, err := b.Call(queued, "must-not-send", nil); next <- err }()
+	select {
+	case err := <-next:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued cancellation blocked behind socket writer")
+	}
+	cancelWrite()
+	select {
+	case err := <-first:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("socket write ignored cancellation")
+	}
+	// Partial framing invalidates the connection. No next call may silently
+	// append to the partial request or replay the possibly executed operation.
+	if _, err := b.Call(context.Background(), "after-partial", nil); err == nil {
+		t.Fatal("partial request left bridge usable")
+	}
+	b.pendingMu.Lock()
+	left := len(b.pending)
+	b.pendingMu.Unlock()
+	if left != 0 {
+		t.Fatalf("pending calls leaked: %d", left)
+	}
+}
+
+func TestBridgeMalformedResponseClosesTransport(t *testing.T) {
+	client, peer := net.Pipe()
+	defer peer.Close()
+	b := &Bridge{conn: client, pending: map[string]chan bridgeResponse{}, writeGate: make(chan struct{}, 1)}
+	defer b.Close()
+	_ = peer.SetWriteDeadline(time.Now().Add(time.Second))
+	ended := make(chan struct{})
+	go func() { b.readLoop(bufio.NewReader(client)); close(ended) }()
+	if _, err := peer.Write([]byte("{bad-json}\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("malformed response did not end reader")
+	}
+	if _, err := peer.Write([]byte("another response\n")); err == nil {
+		t.Fatal("malformed bridge kept transport open")
+	}
+	if _, err := b.Call(context.Background(), "later", nil); err == nil {
+		t.Fatal("malformed bridge accepted call")
+	}
+}
+
+// Oversize requests must fail before entering the socket so the next normal
+// tool still has a complete, synchronized stream.
+func TestBridgeOversizeRequestPreservesConnection(t *testing.T) {
+	socket, _ := fakeBridgeServer(t)
+	b, err := Dial(socket, "inst-1", "net-1", "nonce-1", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err = b.Call(context.Background(), "too-large", map[string]any{"body": strings.Repeat("x", 1<<20)}); err == nil {
+		t.Fatal("oversize request accepted")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err = b.Call(ctx, "echo", map[string]any{"marker": 42}); err != nil {
+		t.Fatalf("valid call after size rejection: %v", err)
 	}
 }
