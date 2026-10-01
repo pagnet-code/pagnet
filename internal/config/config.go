@@ -11,6 +11,7 @@ package config
 
 import (
 	"bufio"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -145,14 +146,16 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 			cfg.AutoUpdate = false
 		}
 	}
-	if file := filepath.Join(stateDir, "config.yaml"); exists(file) {
-		if err := loadDaemonYAML(file, &cfg); err == nil {
-			// file values fill gaps only (hostName fills the empty
-			// default above; an explicit PAGNET_HOST_NAME still wins)
-		}
+	if err := loadDaemonYAML(filepath.Join(stateDir, "config.yaml"), &cfg); err != nil && !os.IsNotExist(err) {
+		// Never silently broaden roots or discard credentials/settings when
+		// a state file is corrupt. Parser errors can contain secret values.
+		return Daemon{}, errors.New("cannot load daemon config: config.yaml is invalid or unreadable")
 	}
 	if cfg.HostName == "" {
 		cfg.HostName = defaultHostName()
+	}
+	if cfg.RootsMode != "" && cfg.RootsMode != "allow_all" && cfg.RootsMode != "allow_list" {
+		return Daemon{}, errors.New("invalid daemon rootsMode: use allow_all or allow_list")
 	}
 	// SEC-410: runtime env pairs are appended AFTER the ChildEnv filter,
 	// so they must pass the blocklist or the daemon refuses to start
@@ -170,11 +173,6 @@ func defaultHostName() string {
 		return hostname
 	}
 	return "pagnet-host"
-}
-
-func exists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
 }
 
 // loadEnvFileMap parses KEY=VALUE lines from p into a map without touching

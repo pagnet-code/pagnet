@@ -497,6 +497,9 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	if log == nil {
 		log = slog.Default()
 	}
+	if !domain.ValidRootsMode(cfg.RootsMode) {
+		return nil, fmt.Errorf("invalid roots mode")
+	}
 	// HTTPS-required-for-non-loopback (client-hardening wave 2): a
 	// non-loopback control plane over plain HTTP is refused at
 	// construction, so a misconfigured daemon fails fast instead of
@@ -1504,6 +1507,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.guarded(conn, p.CommandID, func() error {
+			if !domain.ValidRootsMode(p.Mode) {
+				return fmt.Errorf("invalid roots mode")
+			}
 			d.SetAllowedRoots(p.Roots)
 			d.SetRootsMode(p.Mode)
 			d.Log.Info("allowed roots updated", "roots", p.Roots, "mode", p.Mode)
@@ -1909,7 +1915,11 @@ func (d *Daemon) workspaceAllowed(path string) bool {
 	if err != nil {
 		return false
 	}
-	if d.rootsMode() != domain.RootsModeAllowList {
+	mode := d.rootsMode()
+	if mode != "" && mode != domain.RootsModeAllowAll && mode != domain.RootsModeAllowList {
+		return false
+	}
+	if mode != domain.RootsModeAllowList {
 		// allow_all (default): any absolute, existing path (pathResolved
 		// already returns an absolute path).
 		if _, err := os.Stat(clean); err != nil {

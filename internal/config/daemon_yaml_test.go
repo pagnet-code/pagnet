@@ -9,6 +9,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestLoadDaemonRejectsCorruptStateWithoutSecretDisclosure(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := LoadDaemon(dir); err != nil {
+		t.Fatal(err)
+	}
+	secret := "private-credential-sentinel"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("credential: ["+secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDaemon(dir); err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("invalid config not safely rejected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("rootsMode: allow_lsit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDaemon(dir); err == nil {
+		t.Fatal("invalid roots mode silently accepted")
+	}
+}
+
 // TestSaveCurrentNetworkPreservesUnknownKeys (external audit F-007): the
 // state file is user-owned and may carry keys this version does not know
 // about. SaveCurrentNetwork must set currentNetwork WITHOUT dropping the
