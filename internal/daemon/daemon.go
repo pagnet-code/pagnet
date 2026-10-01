@@ -2470,7 +2470,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 	// has nothing to wake: the session is already active, so the wake is a
 	// NO-OP (plan Phase 2: "Wake of an active/idle instance = no-op (already
 	// live)"). Only a HIBERNATED session-driven instance (endpoint stopped,
-	// session preserved) is woken: the wake turn's EnsureActive re-activates
+	// session preserved) is woken: idle activation via EnsureActive re-activates
 	// the endpoint, resuming the stored native session. (d.busy above only
 	// tracks the legacy activeTurns map, which the persistent path does not
 	// set, so the session's own liveness is the authoritative check here.)
@@ -2489,6 +2489,34 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 			d.Log.Info("instance already live; wake is a no-op (view ensured)", "instance", instanceID)
 			return nil
 		}
+		// Wake establishes the endpoint; it is not a user prompt. Submitting
+		// a fabricated wake turn consumes provider work and holds the FIFO
+		// ahead of the durable message/task that actually caused this wake.
+		if err := d.state.SetInstanceStatus(instanceID, "waking", ""); err != nil {
+			return err
+		}
+		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": "waking"})
+		d.Log.Info("wake endpoint without submitting a prompt", "instance", instanceID, "reason", reason)
+		if err := d.activateSessionIdle(conn, row); err != nil {
+			// A failed activation has consumed no user work. Preserve the
+			// session-lost block set by the shared helper; otherwise settle
+			// the failure rather than leaving heartbeat status stuck waking.
+			current, found, readErr := d.state.GetInstance(instanceID)
+			if readErr == nil && found {
+				status := current.Status
+				if status != "blocked" {
+					status = "failed"
+					if errors.Is(err, context.Canceled) {
+						status = row.Status
+					}
+					_ = d.state.SetInstanceStatus(instanceID, status, "")
+				}
+				_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": status})
+				d.reportEndpointStatus(conn, instanceID)
+			}
+			return err
+		}
+		return nil
 	}
 	resume := row.SessionID != ""
 	input := "You were woken. Reason: " + reason
