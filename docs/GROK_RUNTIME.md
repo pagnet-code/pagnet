@@ -64,7 +64,11 @@ the interaction stays pending until that runner confirms delivery. A stale
 permission cannot wake or approve a replacement session.
 
 Network-scoped requests can be inspected by explicitly decrypting their protected
-detail in the browser. An unscoped representative has no network encryption key
-context, so private native tool arguments are not uploaded as a plaintext
-fallback. Its remote approval controls offer refusal only until secure personal
-inspection is supported. Pagnet does not invent broad native approval defaults.
+detail in the browser. A personal representative outside any network uses a
+separate account-and-host protected context. Only its owning account can prepare
+that context and inspect its encrypted permission details; network grants do not
+grant access. Allow requires inspection and a proof bound to the exact native
+request and option. Refusal does not require inspection. Missing keys or an
+unavailable originating host never permit blind approval or a plaintext fallback.
+See [owner content contexts](OWNER_CONTENT_CONTEXTS.md). Pagnet does not invent
+broad native approval defaults.
