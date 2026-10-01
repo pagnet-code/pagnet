@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -34,23 +35,45 @@ func TestSessionStoreRefreshOnUse(t *testing.T) {
 	}
 }
 
-// TestSessionStoreReplace verifies a new session for the same user+network
-// replaces the previous one (single-flight): the old sessionId stops
-// resolving, the new one resolves.
-func TestSessionStoreReplace(t *testing.T) {
+// Independent tabs must not force each other into repeated 410 recovery.
+func TestSessionStoreBrowserTabsCoexist(t *testing.T) {
 	s := newSessionStore()
 	now := time.Now().UTC()
-	s.create("sess-old", "user-1", "net-1", "pub-old", now)
-	s.create("sess-new", "user-1", "net-1", "pub-new", now)
-	if _, ok := s.get("sess-old", now.Add(time.Second)); ok {
-		t.Fatal("old session still resolves after replacement, want gone")
+	s.create("tab-1", "user", "network", "pub-1", now)
+	s.create("tab-2", "user", "network", "pub-2", now)
+	for _, id := range []string{"tab-1", "tab-2"} {
+		if _, ok := s.get(id, now); !ok {
+			t.Fatalf("tab %s replaced", id)
+		}
 	}
-	sess, ok := s.get("sess-new", now.Add(time.Second))
-	if !ok {
-		t.Fatal("new session does not resolve, want ok")
+	s.delete("tab-1")
+	if sess, ok := s.get("tab-2", now); !ok || sess.BrowserPub != "pub-2" {
+		t.Fatal("closing one tab closed the other")
 	}
-	if sess.BrowserPub != "pub-new" {
-		t.Fatalf("new session browserPub = %q, want pub-new", sess.BrowserPub)
+}
+
+func TestSessionStoreBoundedPerAccountAndGlobal(t *testing.T) {
+	s := newSessionStore()
+	now := time.Now().UTC()
+	for i := 0; i < maxBrowserSessionsPerAccount+1; i++ {
+		s.create(fmt.Sprintf("tab-%03d", i), "user", "network", "pub", now.Add(time.Duration(i)*time.Nanosecond))
+	}
+	if len(s.sessions) != maxBrowserSessionsPerAccount {
+		t.Fatal("account bound exceeded")
+	}
+	if _, ok := s.get("tab-000", now); ok {
+		t.Fatal("oldest account session not evicted")
+	}
+	for i := 0; i < maxBrowserSessions+1; i++ {
+		s.create(fmt.Sprintf("global-%04d", i), fmt.Sprintf("user-%04d", i), "network", "pub", now.Add(time.Duration(i+100)*time.Nanosecond))
+	}
+	if len(s.sessions) != maxBrowserSessions {
+		t.Fatal("global bound exceeded")
+	}
+	for key, ids := range s.byUserNet {
+		if len(ids) == 0 {
+			t.Fatalf("empty owner index retained: %s", key)
+		}
 	}
 }
 

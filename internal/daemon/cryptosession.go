@@ -40,32 +40,43 @@ type browserSession struct {
 }
 
 // sessionStore is the daemon's in-memory browser key-session store. It is
-// keyed by sessionID, with a single-flight index by (userID, networkID): a
-// new session for the same user+network REPLACES the previous one (the
-// browser's keypair is per-session, so the old one is orphaned and its
-// sessionId stops resolving).
+// keyed by sessionID. Independent browser tabs and devices coexist, bounded
+// per account/network and globally; only expiry or explicit teardown ends them.
 type sessionStore struct {
 	mu        sync.Mutex
 	sessions  map[string]*browserSession
-	byUserNet map[string]string // "userID\x00networkID" -> sessionID
+	byUserNet map[string]map[string]struct{} // account/network -> session IDs
 }
 
 func newSessionStore() *sessionStore {
 	return &sessionStore{
 		sessions:  map[string]*browserSession{},
-		byUserNet: map[string]string{},
+		byUserNet: map[string]map[string]struct{}{},
 	}
 }
 
 func userNetKey(userID, networkID string) string { return userID + "\x00" + networkID }
 
-// create records a new session, replacing any existing session for the same
-// user+network (single-flight). It returns the recorded session.
+const maxBrowserSessionsPerAccount = 64
+const maxBrowserSessions = 4096
+
+// create records a separate browser session, evicting the oldest session only
+// at the configured resource bounds. Callers have already authorized its owner.
 func (s *sessionStore) create(sessionID, userID, networkID, browserPub string, now time.Time) *browserSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if oldID, ok := s.byUserNet[userNetKey(userID, networkID)]; ok && oldID != sessionID {
-		delete(s.sessions, oldID)
+	if old := s.sessions[sessionID]; old != nil {
+		s.dropLocked(old)
+	}
+	key := userNetKey(userID, networkID)
+	if len(s.byUserNet[key]) >= maxBrowserSessionsPerAccount {
+		s.dropOldestLocked(s.byUserNet[key])
+	}
+	if len(s.sessions) >= maxBrowserSessions {
+		s.dropOldestLocked(nil)
+	}
+	if s.byUserNet[key] == nil {
+		s.byUserNet[key] = map[string]struct{}{}
 	}
 	sess := &browserSession{
 		SessionID:  sessionID,
@@ -76,7 +87,7 @@ func (s *sessionStore) create(sessionID, userID, networkID, browserPub string, n
 		expiresAt:  now.Add(sessionTTL),
 	}
 	s.sessions[sessionID] = sess
-	s.byUserNet[userNetKey(userID, networkID)] = sessionID
+	s.byUserNet[key][sessionID] = struct{}{}
 	return sess
 }
 
@@ -120,11 +131,35 @@ func (s *sessionStore) sweep(now time.Time) {
 	}
 }
 
-// dropLocked removes a session and, if it is still the current one for its
-// user+network, its index entry. Callers hold s.mu.
+// dropOldestLocked makes pressure deterministic and bounded. A nil set means
+// the global bound; otherwise examine only this account/network's sessions.
+func (s *sessionStore) dropOldestLocked(set map[string]struct{}) {
+	var oldest *browserSession
+	consider := func(sess *browserSession) {
+		if sess != nil && (oldest == nil || sess.createdAt.Before(oldest.createdAt) || sess.createdAt.Equal(oldest.createdAt) && sess.SessionID < oldest.SessionID) {
+			oldest = sess
+		}
+	}
+	if set == nil {
+		for _, sess := range s.sessions {
+			consider(sess)
+		}
+	} else {
+		for id := range set {
+			consider(s.sessions[id])
+		}
+	}
+	if oldest != nil {
+		s.dropLocked(oldest)
+	}
+}
+
+// dropLocked removes only this tab's session and its index entry.
 func (s *sessionStore) dropLocked(sess *browserSession) {
 	delete(s.sessions, sess.SessionID)
-	if cur, ok := s.byUserNet[userNetKey(sess.UserID, sess.NetworkID)]; ok && cur == sess.SessionID {
-		delete(s.byUserNet, userNetKey(sess.UserID, sess.NetworkID))
+	key := userNetKey(sess.UserID, sess.NetworkID)
+	delete(s.byUserNet[key], sess.SessionID)
+	if len(s.byUserNet[key]) == 0 {
+		delete(s.byUserNet, key)
 	}
 }
