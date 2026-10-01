@@ -413,8 +413,8 @@ func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[s
 }
 
 // addPathRule adds one path_beneath rule granting access to the subtree
-// rooted at path (which must exist and be a directory — the Landlock
-// requirement). A missing path is a deterministic LAUNCH FAILURE (H3): the
+// rooted at path. Read-only regular files receive only file-compatible
+// read/execute bits; writable and device grants remain directory-only. A missing path is a deterministic LAUNCH FAILURE (H3): the
 // daemon created the paths it believes exist, so a missing one is never
 // silently skipped.
 func addPathRule(rulesetFd int, path string, access uint64) error {
@@ -428,7 +428,10 @@ func addPathRule(rulesetFd int, path string, access uint64) error {
 		return fmt.Errorf("allowlist path %s: %w", path, err)
 	}
 	if !st.IsDir() {
-		return fmt.Errorf("allowlist path %s is not a directory (rw/ro grants are subtrees; sockets take their parent)", path)
+		if !st.Mode().IsRegular() || access & ^roAccess != 0 {
+			return fmt.Errorf("allowlist path %s is not a directory or an exact read-only regular file", path)
+		}
+		access &= bReadFile | bExecute
 	}
 	var rule unix.LandlockPathBeneathAttr
 	rule.Allowed_access = access

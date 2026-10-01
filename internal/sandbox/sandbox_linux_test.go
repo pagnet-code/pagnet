@@ -500,3 +500,60 @@ func TestWrapperSandboxed_ProtectedReadGrants(t *testing.T) {
 	}
 	assertProbe(t, res, "roRead", "ok", "secret", "EACCES", "exec", "ok")
 }
+
+func TestWrapperSandboxed_CustomHomeExecutableKeepsCredentialsPrivate(t *testing.T) {
+	skipNoLandlock(t)
+	for _, name := range []string{"custom-runtime", "bin/custom-runtime", "bin/linked-runtime"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			workspace := t.TempDir()
+			protected := filepath.Join(home, ".pagnet")
+			if err := os.Mkdir(protected, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(protected, "secret"), []byte("fixture-private"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			binary := filepath.Join(home, name)
+			if err := os.MkdirAll(filepath.Dir(binary), 0700); err != nil {
+				t.Fatal(err)
+			}
+			script := []byte("#!/bin/sh\nif cat \"$HOME/.pagnet/secret\" >/dev/null 2>&1; then exit 42; fi\nif printf changed >> \"$0\" 2>/dev/null; then exit 43; fi\nprintf ok > \"$1\"\n")
+			writeTarget := binary
+			if name == "bin/linked-runtime" {
+				writeTarget = filepath.Join(home, "modules", "vendor", "dist", "cli")
+				if err := os.MkdirAll(filepath.Dir(writeTarget), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(writeTarget, binary); err != nil {
+					t.Fatal(err)
+				}
+				dependency := filepath.Join(home, "modules", "vendor", "dependency")
+				if err := os.WriteFile(dependency, []byte("dependency"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				script = append(script, []byte("cat "+dependency+" > \"$1\"\n")...)
+			}
+			if err := os.WriteFile(writeTarget, script, 0700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(workspace, "marker")
+			spec := NewSpec(Options{Workspace: workspace, Binary: binary, Home: home, Denied: []string{protected}})
+			child, err := runWrapperChild(t, reexecInput{Spec: *spec, Target: binary, Args: []string{marker}}, map[string]string{"HOME": home})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if child.code != 0 {
+				t.Fatalf("custom executable failed or exposed credentials: code=%d %s", child.code, child.stderr)
+			}
+			raw, err := os.ReadFile(marker)
+			expected := "ok"
+			if name == "bin/linked-runtime" {
+				expected = "dependency"
+			}
+			if err != nil || string(raw) != expected {
+				t.Fatalf("custom native not executed: %q %v", raw, err)
+			}
+		})
+	}
+}

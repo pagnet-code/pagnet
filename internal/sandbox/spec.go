@@ -47,8 +47,8 @@ import (
 // distributed — it is a subcommand of the existing pagnet binary.
 const Subcommand = "sandbox-exec"
 
-// Spec is the per-instance filesystem allowlist. RW/RO are absolute
-// directory subtrees; Sockets are absolute unix socket file paths; Denied
+// Spec is the per-instance filesystem allowlist. RW is absolute directory subtrees; RO is absolute
+// directory subtrees or exact regular files; Sockets are absolute unix socket file paths; Denied
 // is the containment set (F-CFG-1). Execute is implied by both RW and RO
 // (a runtime must be able to run its own binary and its dependencies
 // inside the allowed subtrees).
@@ -338,10 +338,16 @@ func ResolvRO() []string {
 func RuntimeSupportRO(binary, home string) []string {
 	var out []string
 	if binary != "" {
+		// Follow installed CLI symlinks to their real module tree, rather than
+		// assuming all sibling files in the user's home are runtime support.
+		if resolved, err := filepath.EvalSymlinks(binary); err == nil {
+			binary = resolved
+		}
+		out = append(out, binary) // exact executable supports home-level CLIs
 		dir := filepath.Dir(binary)
 		for _, p := range []string{dir, filepath.Dir(dir)} {
-			if p == "" || p == "/" {
-				continue // never grant the filesystem root
+			if p == "" || p == "/" || (home != "" && (p == filepath.Clean(home) || strings.HasPrefix(filepath.Clean(home), p+string(filepath.Separator)))) {
+				continue // never infer the filesystem root or user home
 			}
 			out = append(out, p)
 		}

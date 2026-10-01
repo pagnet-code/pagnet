@@ -343,3 +343,21 @@ func TestNormalize_DeniedReadContainment(t *testing.T) {
 		t.Fatalf("tight sibling and descendant grants: %v", err)
 	}
 }
+
+func TestRuntimeSupportRO_CustomHomeExecutables(t *testing.T) {
+	for _, binary := range []string{"/home/customer/bin/custom-claude", "/home/customer/custom-claude"} {
+		grants := RuntimeSupportRO(binary, "/home/customer")
+		exact := false
+		for _, grant := range grants {
+			if grant == "/home/customer" || grant == "/" {
+				t.Fatalf("broad home support grant: %v", grants)
+			}
+			if grant == binary {
+				exact = true
+			}
+		}
+		if !exact {
+			t.Fatalf("executable support missing: %v", grants)
+		}
+	}
+}
