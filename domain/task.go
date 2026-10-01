@@ -63,6 +63,9 @@ type TaskStatusHistory struct {
 	Reason          string
 	ActorInstanceID *ID
 	At              time.Time
+	// Metadata preserves this transition's protected reason independently
+	// of the task's latest reason. The server stores only ciphertext/AAD.
+	Metadata map[string]any
 }
 
 // TaskFilter narrows ListTasks.

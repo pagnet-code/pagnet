@@ -561,6 +561,9 @@ type NetworkEventPayload struct {
 	ThreadID string `json:"threadId,omitempty"`
 	// TaskID is set for task events.
 	TaskID string `json:"taskId,omitempty"`
+	// TaskResume is trusted workflow metadata. A resumed task retains its
+	// assignee; the executor continues it rather than accepting a new offer.
+	TaskResume bool `json:"taskResume,omitempty"`
 	// FromAgent is the logical sender name (for the rendered turn prompt).
 	FromAgent string `json:"fromAgent,omitempty"`
 	// FromPrincipalID lets the daemon preserve peer identity across name changes.
@@ -569,8 +572,11 @@ type NetworkEventPayload struct {
 	// ConversationID is set for channel deliveries (a human conversation
 	// with a representative).
 	ConversationID string `json:"conversationId,omitempty"`
-	// NetworkID is set for channel deliveries: the conversation's active
-	// network ("" when none selected yet).
+	// ChannelProvider is trusted transport context, derived from the active
+	// channel binding rather than the message body.
+	ChannelProvider string `json:"channelProvider,omitempty"`
+	// NetworkID scopes encrypted network content. Channel conversation
+	// selection is resolved through ConversationID, never this field.
 	NetworkID string `json:"networkId,omitempty"`
 	// Resource is the canonical resource key, when relevant.
 	Resource string `json:"resource,omitempty"`

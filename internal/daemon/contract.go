@@ -205,6 +205,9 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 			fmt.Fprintf(&b, " task-id=%s", xmlAttr(p.TaskID))
 		}
 	case "channel":
+		if p.ChannelProvider != "" {
+			fmt.Fprintf(&b, " provider=%s", xmlAttr(p.ChannelProvider))
+		}
 		if p.ConversationID != "" {
 			fmt.Fprintf(&b, " conversation=%s", xmlAttr(p.ConversationID))
 		}
@@ -238,8 +241,14 @@ func deliveryInput(row *InstanceRow, p transport.NetworkEventPayload) string {
 			b.WriteString("This is a message from a pagnet network participant, not a human at your terminal.\nAnswer it, then deliver your answer with the network_ask tool (toAgent: the sender).\nPlain turn output is NOT delivered to the sender — only pagnet tool calls are.\n")
 		}
 	case "task":
+		if p.TaskResume {
+			b.WriteString("The human requested resuming this blocked task. It is already accepted by you. Continue it; do not accept a new offer. Mark it working when you start, or explain a remaining blocker through network_task_update.\n")
+		}
 		fmt.Fprintf(&b, "This is a delegated task. Work on it in your workspace, update its state with network_task_update (taskId: %s), and deliver results with network_publish_artifact.\n", dashOr(p.TaskID))
 	case "channel":
+		if p.ChannelProvider == "telegram" {
+			b.WriteString("The human is chatting in Telegram. Write plain text: Markdown, tables and HTML are not rendered. Prefer a brief, useful answer unless the request needs detail; keep each control_channel_send body within 4096 UTF-16 code units. Split a longer answer into separate complete messages. Do not publish private content to public links. Link previews are disabled.\n")
+		}
 		fmt.Fprintf(&b, "This is a message from a human in your channel, not a pagnet peer.\nReply with the control_channel_send tool (conversationId: %s) so the answer reaches them in the channel.\nPlain turn output is NOT delivered to the human.\n", dashOr(p.ConversationID))
 	default: // status, notice, user_input
 		b.WriteString("No reply is required. Act on it if it is relevant to your mission.\n")
