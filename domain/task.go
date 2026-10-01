@@ -34,6 +34,7 @@ type Task struct {
 	AcceptedAt         *time.Time
 	StartedAt          *time.Time
 	CompletedAt        *time.Time
+	ArchivedAt         *time.Time
 	UpdatedAt          time.Time
 	// Human provenance (§10): when a representative created this task on a
 	// human's behalf, InitiatorUserID is that human and Source/SourceRef
@@ -70,6 +71,8 @@ type TaskStatusHistory struct {
 
 // TaskFilter narrows ListTasks.
 type TaskFilter struct {
+	// Archived selects only archived tasks; empty/exclude selects active history.
+	Archived      string
 	Status        *TaskStatus
 	DefinitionID  *ID
 	InstanceID    *ID
