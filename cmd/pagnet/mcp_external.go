@@ -15,16 +15,33 @@ import (
 )
 
 func mcpExternalCmd() *cobra.Command {
-	var network, listen, publicURL, issuer, introspection, subject string
-	var grants []string
+	var network, listen, publicURL, issuer, introspection, subject, profile, stateDir string
+	var grants, messagingTargets []string
 	cmd := &cobra.Command{Use: "external", Short: "Independent principal MCP bridge for external agents and plugins", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		cfg := externalbridge.Config{Network: network, Grants: grants}
+		sdkConfig := sdk.ConfigFromEnv()
+		var expectedPrincipal string
+		if profile != "" {
+			for _, flag := range []string{"network", "allow-invoke", "allow-message", "listen", "oauth-resource", "oauth-issuer", "oauth-introspection", "oauth-subject"} {
+				if cmd.Flags().Changed(flag) {
+					return errors.New("external profile cannot be combined with policy or HTTP overrides")
+				}
+			}
+			p, saved, err := externalProfileConfig(machineStateDir(stateDir), profile)
+			if err != nil {
+				return err
+			}
+			if err := verifyExternalProfile(cmd.Context(), p, saved); err != nil {
+				return err
+			}
+			network, grants, messagingTargets, sdkConfig, expectedPrincipal = p.Network, p.Grants, p.MessagingTargets, saved, p.Principal
+		}
+		cfg := externalbridge.Config{Network: network, Grants: grants, MessagingTargets: messagingTargets}
 		// Validate all local policy before consuming a one-time activation.
 		if _, err := externalbridge.New(nil, cfg); err != nil {
 			return err
 		}
 		token := os.Getenv("PAGNET_MCP_HTTP_TOKEN")
-		oauth := externalbridge.OAuthConfig{ResourceURL: publicURL, Issuer: issuer, IntrospectionURL: introspection, Subject: subject, ClientID: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_ID"), ClientSecret: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_SECRET"), AllowInvoke: len(grants) > 0}
+		oauth := externalbridge.OAuthConfig{ResourceURL: publicURL, Issuer: issuer, IntrospectionURL: introspection, Subject: subject, ClientID: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_ID"), ClientSecret: os.Getenv("PAGNET_MCP_OAUTH_CLIENT_SECRET"), AllowInvoke: len(grants) > 0 || len(messagingTargets) > 0}
 		useOAuth := publicURL != "" || issuer != "" || introspection != "" || subject != ""
 		if useOAuth {
 			if listen == "" {
@@ -48,7 +65,6 @@ func mcpExternalCmd() *cobra.Command {
 		}
 		ctx := cmd.Context()
 		connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		sdkConfig := sdk.ConfigFromEnv()
 		if !strings.HasPrefix(sdkConfig.Credential, "pgn_act_v1_") && !strings.HasPrefix(sdkConfig.Credential, "pgn_epd_v1_") {
 			cancel()
 			return errors.New("external MCP: PAGNET_CREDENTIAL must be an activation or endpoint principal credential")
@@ -62,6 +78,9 @@ func mcpExternalCmd() *cobra.Command {
 		identity, err := client.WhoAmI(ctx)
 		if err != nil {
 			return err
+		}
+		if expectedPrincipal != "" && identity.PrincipalID != expectedPrincipal {
+			return errors.New("external bridge authenticated another principal")
 		}
 		active := false
 		for _, m := range identity.Memberships {
@@ -104,7 +123,10 @@ func mcpExternalCmd() *cobra.Command {
 		}
 		return err
 	}}
+	cmd.Flags().StringVar(&profile, "profile", "", "private local external profile name (stdio only)")
+	cmd.Flags().StringVar(&stateDir, "state-dir", "", "private profile state directory")
 	cmd.Flags().StringVar(&network, "network", "", "fixed network UUID (required)")
+	cmd.Flags().StringSliceVar(&messagingTargets, "allow-message", nil, "exact agent UUID allowed for ASK and own replies")
 	cmd.Flags().StringSliceVar(&grants, "allow-invoke", nil, "exact PRINCIPAL_UUID/CAPABILITY_ID grant (repeatable; default discovery only)")
 	cmd.Flags().StringVar(&listen, "listen", "", "optional loopback IP:port for streamable HTTP at /mcp; requires PAGNET_MCP_HTTP_TOKEN")
 	cmd.Flags().StringVar(&publicURL, "oauth-resource", "", "canonical public HTTPS /mcp URL; enables established-provider OAuth mode")
