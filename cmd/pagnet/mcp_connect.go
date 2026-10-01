@@ -64,7 +64,7 @@ func mcpConnectCmd() *cobra.Command {
 			}
 			saved.Server = serverURL
 			saved.Activation = setup
-			if _, err := externalbridge.New(nil, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants}); err != nil {
+			if _, err := externalbridge.New(nil, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets}); err != nil {
 				return err
 			}
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -107,7 +107,7 @@ func mcpConnectCmd() *cobra.Command {
 			return err
 		}
 		defer client.Close()
-		bridge, err := externalbridge.New(client, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants})
+		bridge, err := externalbridge.New(client, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets})
 		if err != nil {
 			return err
 		}

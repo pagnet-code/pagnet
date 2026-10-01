@@ -29,21 +29,23 @@ type Client interface {
 // Grants are exact principal/capability pairs. Empty grants means discovery only.
 // Network is pinned at startup and cannot be overridden by MCP input.
 type Config struct {
-	Network string
-	Grants  []string
+	Network          string
+	Grants           []string
+	MessagingTargets []string
 }
 
 type Bridge struct {
-	client  Client
-	network string
-	grants  map[string]bool
+	client           Client
+	network          string
+	grants           map[string]bool
+	messagingTargets map[string]bool
 }
 
 func New(client Client, cfg Config) (*Bridge, error) {
 	if _, err := uuid.Parse(cfg.Network); err != nil {
 		return nil, errors.New("external MCP: --network must be a network UUID")
 	}
-	b := &Bridge{client: client, network: cfg.Network, grants: map[string]bool{}}
+	b := &Bridge{client: client, network: cfg.Network, grants: map[string]bool{}, messagingTargets: map[string]bool{}}
 	for _, grant := range cfg.Grants {
 		parts := strings.Split(grant, "/")
 		if len(parts) != 2 || parts[1] == "" || strings.ContainsAny(parts[1], "* \t\r\n") {
@@ -53,6 +55,12 @@ func New(client Client, cfg Config) (*Bridge, error) {
 			return nil, fmt.Errorf("external MCP: invalid principal in grant %q", grant)
 		}
 		b.grants[grant] = true
+	}
+	for _, target := range cfg.MessagingTargets {
+		if _, err := uuid.Parse(target); err != nil || b.messagingTargets[target] {
+			return nil, errors.New("messaging targets must be unique agent UUIDs")
+		}
+		b.messagingTargets[target] = true
 	}
 	return b, nil
 }
@@ -80,7 +88,12 @@ func (b *Bridge) Server() *server.MCPServer {
 			grants = append(grants, grant)
 		}
 		sort.Strings(grants)
-		return result(map[string]any{"principalId": id.PrincipalID, "name": id.Name, "kind": id.Kind, "networkId": b.network, "invokeGrants": grants}, nil)
+		targets := make([]string, 0, len(b.messagingTargets))
+		for target := range b.messagingTargets {
+			targets = append(targets, target)
+		}
+		sort.Strings(targets)
+		return result(map[string]any{"principalId": id.PrincipalID, "name": id.Name, "kind": id.Kind, "networkId": b.network, "invokeGrants": grants, "messagingTargets": targets}, nil)
 	})
 	s.AddTool(mcp.NewTool("pagnet_search", mcp.WithDescription("Discover participants in the configured Pagnet network. Search does not grant permission to invoke them."+untrusted), mcp.WithReadOnlyHintAnnotation(true), mcp.WithString("query"), mcp.WithString("capabilityId"), mcp.WithString("cursor")), func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		hits, cursor, err := b.client.Search(ctx, b.network, sdk.Query{Text: r.GetString("query", ""), Capability: r.GetString("capabilityId", ""), Cursor: r.GetString("cursor", ""), Limit: 20})
@@ -103,6 +116,7 @@ func (b *Bridge) Server() *server.MCPServer {
 			return invocationResult(out, nil)
 		})
 	}
+	b.addMessagingTools(s)
 	return s
 }
 

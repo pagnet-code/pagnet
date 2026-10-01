@@ -28,6 +28,8 @@ func (b *Bridge) HandleHosted(ctx context.Context, body json.RawMessage) (json.R
 		switch rpc.Params.Name {
 		case "pagnet_identity", "pagnet_search":
 			allowed = true
+		case "pagnet_ask", "pagnet_ask_get":
+			allowed = len(b.messagingTargets) > 0
 		case "pagnet_invoke", "pagnet_invocation_get":
 			allowed = len(b.grants) > 0
 		}
