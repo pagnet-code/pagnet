@@ -18,6 +18,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // NativeSpec contains immutable host-local configuration. Env is memory-only:
@@ -35,18 +36,19 @@ type NativeSpec struct {
 }
 
 type Operation struct {
-	SourceAdmissionID string `json:"sourceAdmissionId,omitempty"`
-	SourceCommandID   string `json:"sourceCommandId,omitempty"`
-	Input             string `json:"input,omitempty"`
-	InputKind         string `json:"inputKind,omitempty"`
-	NativeGeneration  string `json:"nativeGeneration,omitempty"`
-	NativeSessionID   string `json:"nativeSessionId,omitempty"`
-	InteractionID     string `json:"interactionId,omitempty"`
-	OptionID          string `json:"optionId,omitempty"`
-	InspectionProof   string `json:"inspectionProof,omitempty"`
-	Data              []byte `json:"data,omitempty"`
-	Rows              uint16 `json:"rows,omitempty"`
-	Cols              uint16 `json:"cols,omitempty"`
+	SourceAdmissionID string                      `json:"sourceAdmissionId,omitempty"`
+	SourceCommandID   string                      `json:"sourceCommandId,omitempty"`
+	SourceTask        *transport.NativeTaskSource `json:"sourceTask,omitempty"`
+	Input             string                      `json:"input,omitempty"`
+	InputKind         string                      `json:"inputKind,omitempty"`
+	NativeGeneration  string                      `json:"nativeGeneration,omitempty"`
+	NativeSessionID   string                      `json:"nativeSessionId,omitempty"`
+	InteractionID     string                      `json:"interactionId,omitempty"`
+	OptionID          string                      `json:"optionId,omitempty"`
+	InspectionProof   string                      `json:"inspectionProof,omitempty"`
+	Data              []byte                      `json:"data,omitempty"`
+	Rows              uint16                      `json:"rows,omitempty"`
+	Cols              uint16                      `json:"cols,omitempty"`
 }
 
 type NativeSnapshot struct {
@@ -211,7 +213,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			o.mu.Lock()
 			o.candidateAdmission = out.SourceAdmission
 			o.candidateCommandID = op.SourceCommandID
-			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind}
+			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind, SourceTask: cloneNativeTaskSource(op.SourceTask)}
 			fatal := o.fatal
 			if fatal == nil {
 				fatal = o.observationBlocked

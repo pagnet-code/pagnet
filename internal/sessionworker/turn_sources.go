@@ -3,21 +3,26 @@ package sessionworker
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 type NativeTurnSource struct {
-	InputKind         string `json:"inputKind,omitempty"`
-	Sequence          int64  `json:"sequence"`
-	LogicalTurnID     string `json:"logicalTurnId"`
-	NativeGeneration  string `json:"nativeGeneration"`
-	NativeSessionID   string `json:"nativeSessionId"`
-	SourceCommandID   string `json:"sourceCommandId,omitempty"`
-	SourceAdmissionID string `json:"sourceAdmissionId,omitempty"`
+	SourceTask        *transport.NativeTaskSource `json:"sourceTask,omitempty"`
+	InputKind         string                      `json:"inputKind,omitempty"`
+	Sequence          int64                       `json:"sequence"`
+	LogicalTurnID     string                      `json:"logicalTurnId"`
+	NativeGeneration  string                      `json:"nativeGeneration"`
+	NativeSessionID   string                      `json:"nativeSessionId"`
+	SourceCommandID   string                      `json:"sourceCommandId,omitempty"`
+	SourceAdmissionID string                      `json:"sourceAdmissionId,omitempty"`
 }
 
 func logicalWorkerTurn(sequence int64) string { return fmt.Sprintf("pagnet-worker-turn-%d", sequence) }
@@ -34,7 +39,7 @@ func (j *Journal) initializeTurnSources() error {
 	if err != nil {
 		return err
 	}
-	hasKind := false
+	hasKind, hasTask := false, false
 	for columns.Next() {
 		var cid, notNull, pk int
 		var name, typ string
@@ -42,6 +47,9 @@ func (j *Journal) initializeTurnSources() error {
 		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 			columns.Close()
 			return err
+		}
+		if name == "source_task" {
+			hasTask = true
 		}
 		if name == "input_kind" {
 			hasKind = true
@@ -54,6 +62,11 @@ func (j *Journal) initializeTurnSources() error {
 	}
 	if !hasKind {
 		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN input_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !hasTask {
+		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN source_task TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -77,6 +90,10 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
+	if source.SourceTask != nil && (source.InputKind != "task" || source.SourceCommandID == "" || source.SourceTask.TaskID == "" || source.SourceTask.InputAAD.ObjectType != e2ee.ObjectTypeTask || source.SourceTask.InputAAD.ObjectID != source.SourceTask.TaskID || source.SourceTask.InputAAD.KeyEpochID == "" || source.SourceTask.InputAAD.NativeContent != nil || source.SourceTask.InputAAD.ValidateScope() != nil) {
+		return errors.New("invalid original task source descriptor")
+	}
+	source.SourceTask = cloneNativeTaskSource(source.SourceTask)
 	if (source.InputKind != "" && !ValidNativeInputKind(source.InputKind)) || source.Sequence <= 0 || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.NativeGeneration == "" || source.NativeSessionID == "" || len(source.NativeSessionID) > 1024 || len(source.NativeGeneration) > 256 || (source.SourceCommandID == "") != (source.SourceAdmissionID == "") || len(source.SourceCommandID) > 256 || len(source.SourceAdmissionID) > 256 {
 		return errors.New("invalid accepted native turn source")
 	}
@@ -90,7 +107,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	var previous NativeTurnSource
 	previous, err = readNativeTurn(ctx, tx, source.NativeGeneration, source.LogicalTurnID)
 	if err == nil {
-		if previous != source {
+		if !reflect.DeepEqual(previous, source) {
 			return ErrConflict
 		}
 		return nil
@@ -118,7 +135,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	if count >= maxCommands {
 		return ErrFull
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind) VALUES(?,?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID, source.InputKind)
+	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task) VALUES(?,?,?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID, source.InputKind, taskSourceJSON(source.SourceTask))
 	if err != nil {
 		return err
 	}
@@ -126,7 +143,11 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 }
 func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	err := tx.QueryRowContext(ctx, `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`, generation, turn).Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind)
+	var task string
+	err := tx.QueryRowContext(ctx, `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`, generation, turn).Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task)
+	if err == nil && task != "" {
+		err = json.Unmarshal([]byte(task), &source.SourceTask)
+	}
 	return source, err
 }
 
@@ -235,4 +256,22 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 		return err
 	}
 	return d.Driver.Submit(ctx, sess, req, events)
+}
+
+// Clone before acceptance: caller-owned nested AAD pointers must not change the
+// original command descriptor while a native callback commits its source.
+func cloneNativeTaskSource(source *transport.NativeTaskSource) *transport.NativeTaskSource {
+	if source == nil {
+		return nil
+	}
+	var copy transport.NativeTaskSource
+	_ = json.Unmarshal([]byte(taskSourceJSON(source)), &copy)
+	return &copy
+}
+func taskSourceJSON(source *transport.NativeTaskSource) string {
+	if source == nil {
+		return ""
+	}
+	encoded, _ := json.Marshal(source)
+	return string(encoded)
 }

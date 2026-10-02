@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
+	"reflect"
 )
 
 func TestOriginalInputKindBoundBeforeNativeCaptureAndNeverRelabelled(t *testing.T) {
@@ -127,5 +130,45 @@ func TestUnsupportedTurnClassificationDoesNotAllocateSourceSequence(t *testing.T
 		if NativeSourceType(o) != "" {
 			t.Fatal("unsupported original turn consumed durable stream sequence")
 		}
+	}
+}
+
+func TestOriginalTaskCryptoDescriptorSurvivesReopenAndCannotBeRelabelled(t *testing.T) {
+	j, dir := testJournal(t)
+	ctx := context.Background()
+	a := lease(t, j)
+	if _, _, err := j.Admit(ctx, a, 1, "original-task-intent", "prompt", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	source := NativeTurnSource{Sequence: 1, LogicalTurnID: logicalWorkerTurn(1), NativeGeneration: "generation", NativeSessionID: "native-session", SourceCommandID: "command-A", SourceAdmissionID: "admission-A", InputKind: "task", SourceTask: &transport.NativeTaskSource{TaskID: "original-task", InputAAD: e2ee.AAD{ProtocolVersion: 1, TenantID: "tenant-A", NetworkID: "network-A", ObjectType: e2ee.ObjectTypeTask, ObjectID: "original-task", KeyEpochID: "epoch-A"}}}
+	original := cloneNativeTaskSource(source.SourceTask)
+	if err := j.BindNativeTurn(ctx, source); err != nil {
+		t.Fatal(err)
+	}
+	source.SourceTask.InputAAD.KeyEpochID = "epoch-B"
+	if err := j.BindNativeTurn(ctx, source); !errors.Is(err, ErrConflict) {
+		t.Fatal("rewrote accepted task epoch", err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err := OpenJournal(dir, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	observed, unavailable, err := j.NativeEventSource(ctx, "generation", session.SessionEvent{Type: session.EventTurnStarted, SessionID: "native-session", TurnID: source.LogicalTurnID})
+	if err != nil || unavailable || observed == nil || !reflect.DeepEqual(observed.SourceTask, original) {
+		t.Fatal("original task descriptor lost across replacement", err)
+	}
+	observed.SourceTask.InputAAD.NetworkID = "caller-network"
+	again, _, err := j.NativeEventSource(ctx, "generation", session.SessionEvent{SessionID: "native-session", TurnID: source.LogicalTurnID})
+	if err != nil || !reflect.DeepEqual(again.SourceTask, original) {
+		t.Fatal("caller mutated original persisted descriptor", err)
+	}
+	source.SourceTask = cloneNativeTaskSource(original)
+	source.SourceTask.TaskID = "wrong-task"
+	if err := j.BindNativeTurn(ctx, source); err == nil {
+		t.Fatal("contradictory task AAD accepted")
 	}
 }
