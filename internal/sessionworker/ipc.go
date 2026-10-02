@@ -187,7 +187,7 @@ func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, 
 		case <-quit:
 		}
 	}()
-	slots := make(chan struct{}, 4)
+	slots := make(chan struct{}, 36)
 	controllers := &currentController{}
 	var wg sync.WaitGroup
 	defer func() { cancel(); wg.Wait() }()
@@ -502,7 +502,7 @@ type currentController struct {
 	mu       sync.Mutex
 	lease    int64
 	identity string
-	stream   *net.UnixConn
+	streams  map[*net.UnixConn]struct{}
 	conn     *net.UnixConn
 }
 
@@ -518,10 +518,10 @@ func (c *currentController) advanceAndInstall(ctx context.Context, j *Journal, i
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
-	if c.stream != nil {
-		_ = c.stream.Close()
-		c.stream = nil
+	for stream := range c.streams {
+		_ = stream.Close()
 	}
+	c.streams = nil
 	c.lease = lease
 	c.identity = id
 	c.conn = conn
@@ -533,23 +533,25 @@ func (c *currentController) installStream(lease int64, id string, conn *net.Unix
 	if c.lease != lease || c.identity != id || c.conn == nil {
 		return false
 	}
-	if c.stream != nil {
-		_ = c.stream.Close()
+	if len(c.streams) >= 32 {
+		return false
 	}
-	c.stream = conn
+	if c.streams == nil {
+		c.streams = map[*net.UnixConn]struct{}{}
+	}
+	c.streams[conn] = struct{}{}
 	return true
 }
 func (c *currentController) releaseStream(conn *net.UnixConn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stream == conn {
-		c.stream = nil
-	}
+	delete(c.streams, conn)
 }
 func (c *currentController) terminalEffect(lease int64, conn *net.UnixConn, do func() error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.lease != lease || c.conn == nil || c.stream != conn {
+	_, present := c.streams[conn]
+	if c.lease != lease || c.conn == nil || !present {
 		return ErrFenced
 	}
 	return do()
@@ -559,9 +561,9 @@ func (c *currentController) release(lease int64, conn *net.UnixConn) {
 	defer c.mu.Unlock()
 	if c.lease == lease && c.conn == conn {
 		c.conn = nil
-		if c.stream != nil {
-			_ = c.stream.Close()
-			c.stream = nil
+		for stream := range c.streams {
+			_ = stream.Close()
 		}
+		c.streams = nil
 	}
 }

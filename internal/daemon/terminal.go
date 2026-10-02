@@ -139,7 +139,8 @@ type lastSize struct {
 }
 
 type terminalManager struct {
-	d *Daemon
+	native *nativeTerminalManager
+	d      *Daemon
 
 	mu       sync.Mutex
 	sessions map[string]*ptySession // instanceID -> live session
@@ -919,6 +920,7 @@ func (tm *terminalManager) stop(instanceID string) {
 
 // stopAll kills every PTY (daemon shutdown: never orphan the processes).
 func (tm *terminalManager) stopAll() {
+	tm.closeNative()
 	tm.mu.Lock()
 	ids := make([]string, 0, len(tm.sessions))
 	for id := range tm.sessions {
