@@ -338,12 +338,16 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 		// Remote resolution: append a confirmation_response (the ONLY two
 		// expressible outcomes are proceed_once / cancel — R10). The
 		// in-flight turn's stream carries the interaction.resolved.
-		if req.Decision != "resolved" {
-			return errors.New("qwen permission requires an exact observed native choice")
-		}
 		allowed, err := e.state.permissionOption(req.InteractionID, req.Answer)
 		if err != nil {
 			return err
+		}
+		expectedDecision := "declined"
+		if allowed {
+			expectedDecision = "resolved"
+		}
+		if req.Decision != expectedDecision {
+			return errors.New("qwen permission requires an exact observed native choice")
 		}
 		cmd := qwenInputCmd{
 			Type:      "confirmation_response",

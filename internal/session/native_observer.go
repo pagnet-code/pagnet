@@ -46,12 +46,14 @@ func (m *Manager) ObserveNativeActivity(instanceID string, event SessionEvent) {
 				sess.PendingInteractions = map[string]bool{}
 			}
 			sess.PendingInteractions[event.Interaction.NativeInteractionID] = true
+			observePermissionChoicesLocked(sess, event)
 			sess.NativeBusy = true
 			sess.State = StateBusy
 		}
 	case EventInteractionResolved:
 		if event.Interaction != nil {
 			delete(sess.PendingInteractions, event.Interaction.NativeInteractionID)
+			observePermissionChoicesLocked(sess, event)
 		}
 	}
 	sess.LastActivity = m.now()
@@ -65,5 +67,6 @@ func (m *Manager) ResetNativeActivity(instanceID string) {
 	if sess := m.sessions[instanceID]; sess != nil {
 		sess.NativeBusy = false
 		sess.PendingInteractions = map[string]bool{}
+		sess.pendingPermissionChoices = nil
 	}
 }

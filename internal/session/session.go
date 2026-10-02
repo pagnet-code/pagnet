@@ -297,6 +297,8 @@ type RuntimeSession struct {
 	// hosted the interaction is gone (a dead endpoint's interaction is
 	// stale — it cannot be resolved against a re-activated session).
 	PendingInteractions map[string]bool
+	// Observed permission choices are private, immutable native input metadata.
+	pendingPermissionChoices map[string]pendingPermissionChoice
 	// SandboxDenied is the sandbox containment set (F-CFG-1) for the
 	// endpoint's launch spec: paths that must not be equal to or
 	// path-beneath any RW grant (the daemon sets it to its own state dir).

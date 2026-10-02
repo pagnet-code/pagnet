@@ -386,6 +386,7 @@ func (m *Manager) StartFresh(ctx context.Context, sess *RuntimeSession, events c
 	sess.Endpoint = nil
 	sess.NativeBusy = false
 	sess.PendingInteractions = map[string]bool{}
+	sess.pendingPermissionChoices = nil
 	m.mu.Unlock()
 	return m.ensureActiveLocked(ctx, sess, events, true, true)
 }
@@ -495,6 +496,7 @@ func (m *Manager) ensureActiveLocked(ctx context.Context, sess *RuntimeSession, 
 		// A dead endpoint's pending interactions are stale: they cannot be
 		// resolved against a re-activated session.
 		sess.PendingInteractions = map[string]bool{}
+		sess.pendingPermissionChoices = nil
 		m.mu.Unlock()
 	}
 	d := m.driverLocked(sess.Runtime)
@@ -705,6 +707,7 @@ func (m *Manager) settleInterrupted(sess *RuntimeSession) {
 	// A dead endpoint's pending interactions are stale: they cannot be
 	// resolved against a re-activated session.
 	sess.PendingInteractions = map[string]bool{}
+	sess.pendingPermissionChoices = nil
 	sess.LastActivity = m.now()
 }
 
@@ -867,12 +870,15 @@ func (m *Manager) applyEvent(sess *RuntimeSession, result *TurnResult, ev Sessio
 		if ev.Interaction != nil && ev.Interaction.NativeInteractionID != "" {
 			if sess.PendingInteractions == nil {
 				sess.PendingInteractions = map[string]bool{}
+				sess.pendingPermissionChoices = nil
 			}
 			sess.PendingInteractions[ev.Interaction.NativeInteractionID] = true
+			observePermissionChoicesLocked(sess, ev)
 		}
 	case EventInteractionResolved:
 		if ev.Interaction != nil && ev.Interaction.NativeInteractionID != "" {
 			delete(sess.PendingInteractions, ev.Interaction.NativeInteractionID)
+			observePermissionChoicesLocked(sess, ev)
 		}
 	}
 	m.mu.Unlock()

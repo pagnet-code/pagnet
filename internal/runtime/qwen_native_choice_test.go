@@ -153,6 +153,8 @@ func TestQwenNativeChoiceRefusesWrongDecisionQuestionOrStaleRequest(t *testing.T
 	}
 	for _, req := range []session.SubmitRequest{
 		{InteractionID: "permission", Decision: "cancelled", Answer: "allow_once"},
+		{InteractionID: "permission", Decision: "declined", Answer: "allow_once"},
+		{InteractionID: "permission", Decision: "resolved", Answer: "reject_once"},
 		{InteractionID: "permission", Decision: "resolved", Answer: ""},
 		{InteractionID: "question", Decision: "resolved", Answer: "allow_once"},
 		{InteractionID: "already-resolved", Decision: "resolved", Answer: "allow_once"},
