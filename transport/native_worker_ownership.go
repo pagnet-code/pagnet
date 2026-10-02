@@ -47,6 +47,7 @@ type NativeOwnershipDeletionProof struct {
 	NativeSessionID       string              `json:"nativeSessionId"`
 	StoppedObservationID  string              `json:"stoppedObservationId"`
 	StoppedDigest         string              `json:"stoppedDigest"`
+	StoppedDisposition    string              `json:"stoppedDisposition"`
 	StoppedSourceSequence int64               `json:"stoppedSourceSequence"`
 	StoppedObservedAt     time.Time           `json:"stoppedObservedAt"`
 	StoppedExpiresAt      time.Time           `json:"stoppedExpiresAt"`
