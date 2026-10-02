@@ -82,9 +82,12 @@ func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, p
 			rows.Close()
 			return ErrConflict
 		}
-		if id == proof.StoppedObservationID && (observation.Event.Type != session.EventSessionStopped || origin.ID != proof.OriginID || observation.NativeGeneration != proof.NativeGeneration || observation.NativeSessionID != proof.NativeSessionID || privateDigest != proof.StoppedDigest || sequence != proof.StoppedSourceSequence || !observation.ObservedAt.Equal(proof.StoppedObservedAt) || terminal.Disposition != proof.StoppedDisposition) {
-			rows.Close()
-			return ErrConflict
+		if id == proof.StoppedObservationID {
+			wire, wireErr := NativeBackendObservation(observation)
+			if wireErr != nil || observation.Event.Type != session.EventSessionStopped || origin.ID != proof.OriginID || observation.NativeGeneration != proof.NativeGeneration || observation.NativeSessionID != proof.NativeSessionID || wire.Digest != proof.StoppedDigest || sequence != proof.StoppedSourceSequence || !wire.ObservedAt.Equal(proof.StoppedObservedAt) || !wire.ExpiresAt.Equal(proof.StoppedExpiresAt) || terminal.Disposition != proof.StoppedDisposition {
+				rows.Close()
+				return ErrConflict
+			}
 		}
 		ids = append(ids, id)
 	}

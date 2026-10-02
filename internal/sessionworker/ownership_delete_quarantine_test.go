@@ -15,7 +15,7 @@ import (
 )
 
 func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
-	for _, variant := range []string{"expired", "stale_origin", "missing-proof", "missing-disposition", "invalid-disposition", "proof-points-to-nonstopped", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
+	for _, variant := range []string{"expired", "stale_origin", "original-stopped", "missing-proof", "missing-disposition", "invalid-disposition", "proof-points-to-nonstopped", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
 		t.Run(variant, func(t *testing.T) {
 			j, _ := testJournal(t)
 			defer j.Close()
@@ -41,6 +41,9 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 				t.Fatal(err)
 			}
 			observation := NativeObservation{ID: domain.NewID().String(), Origin: raw, NativeGeneration: origin.NativeGeneration, NativeSessionID: "original-session", ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventBusy}}
+			if variant == "original-stopped" {
+				observation.Event.Type = session.EventSessionStopped
+			}
 			observation.SourceDigest, _ = observationDigest(observation)
 			if err = j.journalCapturedObservation(t.Context(), producer, observation, nil); err != nil {
 				t.Fatal(err)
@@ -71,6 +74,19 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 			now := time.Now().UTC()
 			proof := &transport.NativeOwnershipDeletionProof{DeleteRequestID: domain.NewID().String(), StopProof: stop, OriginID: "latest-original-stop-origin", NativeGeneration: "latest-activation", NativeSessionID: "latest-session", StoppedObservationID: domain.NewID().String(), StoppedDigest: strings.Repeat("a", 64), StoppedSourceSequence: 3, StoppedDisposition: "committed", StoppedObservedAt: now, StoppedExpiresAt: now.Add(time.Hour)}
 			switch variant {
+			case "original-stopped":
+				proof.StoppedObservationID = observation.ID
+				proof.OriginID = origin.ID
+				proof.NativeGeneration = observation.NativeGeneration
+				proof.NativeSessionID = observation.NativeSessionID
+				proof.StoppedDigest = wire.Digest
+				proof.StoppedSourceSequence = pending[0].SourceSequence
+				proof.StoppedObservedAt = wire.ObservedAt
+				proof.StoppedExpiresAt = wire.ExpiresAt
+				proof.StoppedDisposition = receipt.Disposition
+				if wire.Digest == observation.SourceDigest {
+					t.Fatal("fixture must distinguish canonical backend digest from private source digest")
+				}
 			case "missing-proof":
 				proof = nil
 			case "missing-disposition":
@@ -101,7 +117,7 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 			}
 			err = j.CollectDeletionQuarantines(t.Context(), l, proof)
 			retained := sourceCount(t, j, "worker_observations")
-			if variant == "expired" || variant == "stale_origin" {
+			if variant == "expired" || variant == "stale_origin" || variant == "original-stopped" {
 				if err != nil || retained != 0 || sourceCount(t, j, "worker_source_dispositions") != 0 {
 					t.Fatal("exact terminal quarantine blocks deletion", err, retained)
 				}
