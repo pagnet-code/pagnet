@@ -828,9 +828,10 @@ type TerminalOutputPayload struct {
 // reaches the agent). The control plane derives the acting instance from
 // the host connection and validates it against the payload.
 type AgentRequestPayload struct {
-	InstanceID string          `json:"instanceId"`
-	Tool       string          `json:"tool"` // fixed network_* tool name (PROTOCOL §6)
-	Args       json.RawMessage `json:"args"`
+	NativeSource *NativeAgentSource `json:"nativeSource,omitempty"`
+	InstanceID   string             `json:"instanceId"`
+	Tool         string             `json:"tool"` // fixed network_* tool name (PROTOCOL §6)
+	Args         json.RawMessage    `json:"args"`
 	// PrincipalID is the instance's agent principal (V2): the daemon maps
 	// the bridge-authenticated instance to its principal from the launch
 	// context; the control plane authorizes the tool call against that
