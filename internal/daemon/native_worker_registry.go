@@ -220,10 +220,21 @@ func (r *NativeWorkerRegistry) Reserve(scope sessionworker.Scope, spec sessionwo
 func (r *NativeWorkerRegistry) BindOwnership(record NativeWorkerRecord, ownership transport.NativeWorkerOwnership) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	current, err := r.Lookup(record.Scope.InstanceID)
+	tx, err := r.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	var stored []byte
+	var state string
+	if err = tx.QueryRow(`SELECT payload,launch_state FROM native_workers WHERE instance_id=?`, record.Scope.InstanceID).Scan(&stored, &state); err != nil {
+		return err
+	}
+	var current NativeWorkerRecord
+	if len(stored) > 256<<10 || json.Unmarshal(stored, &current) != nil || current.Dir != r.Dir(current.Scope) || current.ProfileFingerprint != sessionworker.NativeProfileFingerprint(current.Spec) {
+		return errors.New("native registry identity corrupt")
+	}
+	current.LaunchState = state
 	if validateOwnership(current.Scope, current.Spec, current.Profile, &ownership) != nil || current.Scope != record.Scope || current.ProfileFingerprint != record.ProfileFingerprint || ownership.ID == "" || ownership.InstanceID != current.Scope.InstanceID || ownership.OwnershipGeneration != current.Scope.Generation || ownership.ProfileFingerprint != current.ProfileFingerprint || ownership.Runtime != string(current.Spec.Runtime) || ownership.Profile != current.Profile || ownership.State != "active" {
 		return errors.New("native ownership receipt conflicts with original registry")
 	}
@@ -231,12 +242,19 @@ func (r *NativeWorkerRegistry) BindOwnership(record NativeWorkerRecord, ownershi
 		return errors.New("original native ownership cannot be replaced")
 	}
 	if current.Ownership != nil {
-		a, _ := json.Marshal(current.Ownership)
-		b, _ := json.Marshal(ownership)
+		if ownership.LastDispatchSequence < current.Ownership.LastDispatchSequence || ownership.RetiredFloor < current.Ownership.RetiredFloor {
+			return errors.New("original ownership receipt counters regressed")
+		}
+		previous, next := *current.Ownership, ownership
+		previous.LastDispatchSequence = 0
+		previous.RetiredFloor = 0
+		next.LastDispatchSequence = 0
+		next.RetiredFloor = 0
+		a, _ := json.Marshal(previous)
+		b, _ := json.Marshal(next)
 		if string(a) != string(b) {
 			return errors.New("original native ownership receipt cannot be mutated")
 		}
-		return nil
 	}
 	current.OriginalOwnershipID = ownership.ID
 	current.Ownership = &ownership
@@ -244,8 +262,10 @@ func (r *NativeWorkerRegistry) BindOwnership(record NativeWorkerRecord, ownershi
 	if err != nil {
 		return err
 	}
-	_, err = r.db.Exec(`UPDATE native_workers SET payload=? WHERE instance_id=?`, raw, current.Scope.InstanceID)
-	return err
+	if _, err = tx.Exec(`UPDATE native_workers SET payload=? WHERE instance_id=?`, raw, current.Scope.InstanceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (r *NativeWorkerRegistry) prepare(record NativeWorkerRecord) error {
 	if err := os.Mkdir(record.Dir, 0700); err != nil && !os.IsExist(err) {

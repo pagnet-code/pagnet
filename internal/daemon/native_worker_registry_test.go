@@ -5,11 +5,13 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -72,6 +74,20 @@ func TestNativeWorkerRegistryDurableOriginalAuthority(t *testing.T) {
 	}
 	if err := r.BindOwnership(record, ownership); err != nil {
 		t.Fatal("identical receipt not idempotent", err)
+	}
+	advanced := ownership
+	advanced.LastDispatchSequence = 4
+	advanced.RetiredFloor = 2
+	if err := r.BindOwnership(record, advanced); err != nil {
+		t.Fatal("fresh server receipt rejected", err)
+	}
+	if err := r.BindOwnership(record, ownership); err == nil {
+		t.Fatal("server receipt regression accepted")
+	}
+	changedAdmission := advanced
+	changedAdmission.OriginalAdmissionID = domain.NewID().String()
+	if err := r.BindOwnership(record, changedAdmission); err == nil {
+		t.Fatal("original admission mutated")
 	}
 	ownership.ID = domain.NewID().String()
 	if err := r.BindOwnership(record, ownership); err == nil {
@@ -213,4 +229,30 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 	if _, err := replacement.Call(fresh, sessionworker.Request{Type: "snapshot"}); err != nil {
 		t.Fatal("failed authentication evicted owner", err)
 	}
+}
+
+func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) {
+	r, s, spec := nativeRegistryFixture(t)
+	binary := filepath.Join(t.TempDir(), "stalled-private-worker")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 0.3\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	record, err := r.Reserve(s, spec, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This subprocess never reads fd3. A frame larger than pipe capacity leaves
+	// the writer genuinely blocked when cancellation clears private memory.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err = EnsureNativeWorker(ctx, r, record, binary, []string{"PRIVATE_FIXTURE=" + strings.Repeat("s", 120<<10)})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("stalled private pipe did not cancel safely", err)
+	}
+	loaded, err := r.Lookup(s.InstanceID)
+	if err != nil || loaded.LaunchState != "launched" {
+		t.Fatal("cancellation made original owner replaceable", err)
+	}
+	// The synthetic child exits naturally; the helper never kills uncertain PIDs.
+	time.Sleep(320 * time.Millisecond)
 }
