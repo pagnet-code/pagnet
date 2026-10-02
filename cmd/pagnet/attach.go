@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pagnet-code/pagnet/transport"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -52,14 +53,20 @@ func attachCmd() *cobra.Command {
 			}
 
 			var att struct {
-				AttachSessionID string `json:"attachSessionId"`
-				WSTicket        string `json:"wsTicket"`
+				AttachSessionID string            `json:"attachSessionId"`
+				TerminalCrypto  *cliTerminalScope `json:"terminalCrypto"`
+				WSTicket        string            `json:"wsTicket"`
 			}
 			if err := c.post("/api/v1/networks/"+netID+"/agents/"+defID+"/instances/"+inst.ID+"/attach",
 				map[string]any{}, &att); err != nil {
 				return fmt.Errorf("attach: %w", err)
 			}
 			session := att.AttachSessionID
+			channel, err := c.newCLITerminalChannel(att.TerminalCrypto, netID, inst.ID, session)
+			if err != nil {
+				return err
+			}
+			defer channel.close()
 
 			u, err := url.Parse(c.base)
 			if err != nil {
@@ -83,11 +90,13 @@ func attachCmd() *cobra.Command {
 			}
 			defer func() { _ = ws.Close() }()
 
+			stopCrypto := channel.watch(ws)
+			defer stopCrypto()
 			fd := int(os.Stdin.Fd())
 			if term.IsTerminal(fd) {
-				return runRawAttach(ws, fd)
+				return runRawAttach(ws, fd, channel)
 			}
-			return runLineAttach(ws)
+			return runLineAttach(ws, channel)
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network of the agent (default: the saved/only network)")
@@ -97,6 +106,7 @@ func attachCmd() *cobra.Command {
 
 // ptyFrame is one attach-WS frame (terminal bytes or control).
 type ptyFrame struct {
+	transport.TerminalSessionKeyPayload
 	Type     string `json:"type"`
 	Data     string `json:"data,omitempty"`
 	Seq      uint64 `json:"seq,omitempty"`
@@ -117,10 +127,15 @@ func outputPumpTo(ws *websocket.Conn, output io.Writer) (<-chan struct{}, func()
 	return done, reason
 }
 
-func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <-chan struct{}, func() string) {
+func outputPumpToReady(ws *websocket.Conn, output io.Writer, private ...*cliTerminalChannel) (<-chan struct{}, <-chan struct{}, func() string) {
+	ws.SetReadLimit(512 * 1024)
 	done := make(chan struct{})
 	snapshotReady := make(chan struct{})
 	reason := ""
+	var channel *cliTerminalChannel
+	if len(private) > 0 {
+		channel = private[0]
+	}
 	var reasonMu sync.Mutex
 	go func() {
 		defer close(done)
@@ -137,6 +152,14 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <
 				continue
 			}
 			switch f.Type {
+			case "terminal_key":
+				if channel == nil || channel.open(f) != nil {
+					reasonMu.Lock()
+					reason = "private terminal bootstrap could not be verified"
+					reasonMu.Unlock()
+					return
+				}
+				continue
 			case "terminal":
 				// Sequence numbers count bytes, not frames. Validate before
 				// advancing the cursor so corrupt data cannot hide lost output.
@@ -147,7 +170,14 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <
 				}
 				var invalid string
 				var b []byte
-				if len(f.Data) > base64.StdEncoding.EncodedLen(maxTerminalBytes) {
+				if channel != nil {
+					b, err = channel.output(f)
+					if err != nil {
+						invalid = "private terminal output could not be verified"
+					}
+				} else if f.Envelope != nil || f.AAD != nil {
+					invalid = "protected terminal has no authenticated descriptor"
+				} else if len(f.Data) > base64.StdEncoding.EncodedLen(maxTerminalBytes) {
 					invalid = "terminal output exceeds replay limit"
 				} else {
 					b, err = base64.StdEncoding.DecodeString(f.Data)
@@ -155,11 +185,13 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <
 						invalid = "invalid terminal output encoding or sequence"
 					}
 				}
+				original := b
 				if invalid == "" {
 					if !f.Snapshot && !ready {
 						invalid = "terminal output arrived before its snapshot"
 					} else if ready {
 						if end <= lastSeq {
+							clear(original)
 							continue
 						}
 						start := end - uint64(len(b))
@@ -175,6 +207,7 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <
 						invalid = "terminal output write failed"
 					}
 				}
+				clear(original)
 				if invalid != "" {
 					reasonMu.Lock()
 					reason = invalid
@@ -188,6 +221,9 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer) (<-chan struct{}, <
 				ready = true
 				lastSeq = end
 			case "closed":
+				if channel != nil && !channel.matches(f) {
+					continue
+				}
 				reasonMu.Lock()
 				reason = f.Reason
 				reasonMu.Unlock()
@@ -218,7 +254,7 @@ func waitAttachReady(ws *websocket.Conn, done, ready <-chan struct{}, reason fun
 
 // newAttachWriter serializes input and resize frames: Gorilla permits only
 // one concurrent writer, including write-deadline updates.
-func newAttachWriter(ws *websocket.Conn) func(map[string]any) {
+func newAttachWriter(ws *websocket.Conn, private ...*cliTerminalChannel) func(map[string]any) {
 	var mu sync.Mutex
 	return func(m map[string]any) {
 		mu.Lock()
@@ -227,16 +263,52 @@ func newAttachWriter(ws *websocket.Conn) func(map[string]any) {
 			_ = ws.Close()
 			return
 		}
-		if err := ws.WriteJSON(m); err != nil {
-			_ = ws.Close()
+		var frames []any
+		if len(private) > 0 && private[0] != nil && m["type"] == "input" {
+			encoded, ok := m["data"].(string)
+			if !ok {
+				ws.Close()
+				return
+			}
+			data, err := base64.StdEncoding.Strict().DecodeString(encoded)
+			if err != nil {
+				ws.Close()
+				return
+			}
+			defer clear(data)
+			for len(data) > 0 {
+				n := len(data)
+				if n > 4096 {
+					n = 4096
+				}
+				frame, err := private[0].input(data[:n])
+				if err != nil {
+					ws.Close()
+					return
+				}
+				frames = append(frames, struct {
+					Type string `json:"type"`
+					transport.TerminalInputPayload
+				}{"input", frame})
+				data = data[n:]
+			}
+		} else {
+			frames = []any{m}
 		}
+		for _, frame := range frames {
+			if err := ws.WriteJSON(frame); err != nil {
+				ws.Close()
+				return
+			}
+		}
+
 	}
 }
 
 // runRawAttach is the TTY path: raw stdin mirroring, SIGWINCH resizes,
 // Ctrl-] to detach.
-func runRawAttach(ws *websocket.Conn, fd int) (err error) {
-	sendFrame := newAttachWriter(ws)
+func runRawAttach(ws *websocket.Conn, fd int, private ...*cliTerminalChannel) (err error) {
+	sendFrame := newAttachWriter(ws, private...)
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
 		return fmt.Errorf("raw terminal: %w", err)
@@ -245,7 +317,7 @@ func runRawAttach(ws *websocket.Conn, fd int) (err error) {
 
 	fmt.Fprintln(os.Stderr, "\nattached (Ctrl-] to detach; the PTY keeps running on the host)")
 
-	done, ready, closedReason := outputPumpToReady(ws, os.Stdout)
+	done, ready, closedReason := outputPumpToReady(ws, os.Stdout, private...)
 	if err := waitAttachReady(ws, done, ready, closedReason); err != nil {
 		return err
 	}
@@ -313,10 +385,10 @@ func isDone(ch <-chan struct{}) bool {
 // runLineAttach is the non-TTY path (piped stdin): each line is sent as
 // input + newline; EOF detaches. No resize frames are sent (the PTY
 // keeps its default size).
-func runLineAttach(ws *websocket.Conn) (err error) {
-	sendFrame := newAttachWriter(ws)
+func runLineAttach(ws *websocket.Conn, private ...*cliTerminalChannel) (err error) {
+	sendFrame := newAttachWriter(ws, private...)
 	fmt.Fprintln(os.Stderr, "attached (line mode; the PTY keeps running on the host)")
-	done, ready, closedReason := outputPumpToReady(ws, os.Stdout)
+	done, ready, closedReason := outputPumpToReady(ws, os.Stdout, private...)
 	if err := waitAttachReady(ws, done, ready, closedReason); err != nil {
 		return err
 	}

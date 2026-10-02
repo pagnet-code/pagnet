@@ -45,8 +45,12 @@ func main() {
 	encoder := json.NewEncoder(os.Stdout)
 	_ = encoder.Encode(map[string]any{"controllerBuild": build, "workerBuild": controller.WorkerBuild, "lease": controller.Lease})
 	var terminal *sessionworker.TerminalStream
+	var secondView *sessionworker.TerminalStream
 	var admissionID string
 	defer func() {
+		if secondView != nil {
+			_ = secondView.Close()
+		}
 		if terminal != nil {
 			_ = terminal.Close()
 		}
@@ -79,6 +83,16 @@ func main() {
 			var op sessionworker.Operation
 			if err = json.Unmarshal(req.Payload, &op); err == nil {
 				terminal, err = controller.OpenTerminalStream(ctx, dir, boot.Scope, key, op.NativeGeneration)
+			}
+		case "terminal_view_open":
+			var op sessionworker.Operation
+			if err = json.Unmarshal(req.Payload, &op); err == nil {
+				secondView, err = controller.OpenTerminalStream(ctx, dir, boot.Scope, key, op.NativeGeneration)
+			}
+		case "terminal_view_close":
+			if secondView != nil {
+				err = secondView.Close()
+				secondView = nil
 			}
 		case "terminal_input", "terminal_resize":
 			var op sessionworker.Operation

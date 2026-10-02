@@ -332,6 +332,23 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if response := a.call(t, Request{Type: "terminal_open", Payload: rawStream}); response.Error != "" {
 		t.Fatal(response.Error)
 	}
+	// Two real viewers share the original native PTY and lease. Closing the
+	// second stream must not evict the first or replace the native process.
+	if response := a.call(t, Request{Type: "terminal_view_open", Payload: rawStream}); response.Error != "" {
+		t.Fatal(response.Error)
+	}
+	if response := a.call(t, Request{Type: "terminal_status"}); response.Error != "" {
+		t.Fatal("second viewer evicted first", response.Error)
+	}
+	if response := a.call(t, Request{Type: "terminal_view_close"}); response.Error != "" {
+		t.Fatal(response.Error)
+	}
+	if response := a.call(t, Request{Type: "terminal_status"}); response.Error != "" {
+		t.Fatal("viewer detach evicted first", response.Error)
+	}
+	if actual := a.snapshot(t); actual.PID != initial.PID || actual.NativeGeneration != initial.NativeGeneration || actual.NativeStartIdentity != initial.NativeStartIdentity {
+		t.Fatal("view attach/detach changed original process")
+	}
 	for i := 0; i < 30; i++ {
 		raw, _ := json.Marshal(Operation{Rows: uint16(24 + i), Cols: uint16(80 + i)})
 		if response := a.call(t, Request{Type: "terminal_resize", Payload: raw}); response.Error != "" {
