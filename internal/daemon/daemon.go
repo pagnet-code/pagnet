@@ -222,8 +222,9 @@ type Daemon struct {
 	// underneath an attached user). In-memory: a daemon restart drops
 	// the tracking, which is safe — worst case the instance hibernates
 	// and the next attach re-wakes it.
-	attachMu sync.Mutex
-	attaches map[string]map[string]time.Time // instanceID -> attachSessionID
+	attachMu       sync.Mutex
+	attaches       map[string]map[string]time.Time // instanceID -> attachSessionID
+	attachRevision uint64                          // detach mutations; optimistic registration fence, guarded by attachMu
 
 	// settleMu guards settleGens: a per-instance monotonically increasing
 	// settle generation, bumped by activateSessionIdle after the idle
@@ -3888,15 +3889,15 @@ func (d *Daemon) attachSessionDriven(conn *websocket.Conn, p transport.TerminalA
 		// any other status (e.g. "hibernating") is not attachable.
 		return fmt.Errorf("instance %s is %s; attach refused", p.InstanceID, row.Status)
 	}
-	d.addAttach(p.InstanceID, p.SessionID)
 	master := d.sessions.PTYMaster(row.InstanceID)
 	if master == nil {
-		d.removeAttach(p.InstanceID, p.SessionID)
 		return fmt.Errorf("instance %s endpoint is not active; attach refused", p.InstanceID)
 	}
 	s, _, err := d.terminal.attachEndpoint(p.InstanceID, master)
 	if err != nil {
-		d.removeAttach(p.InstanceID, p.SessionID)
+		return err
+	}
+	if registered, err := d.registerTerminalAttach(s, p); err != nil || !registered {
 		return err
 	}
 	// The snapshot is sent right after the attach (durable command →
@@ -4057,6 +4058,10 @@ func (d *Daemon) activateSessionForAttach(conn *websocket.Conn, row *InstanceRow
 func (d *Daemon) addAttach(instanceID, sessionID string) {
 	d.attachMu.Lock()
 	defer d.attachMu.Unlock()
+	d.addAttachLocked(instanceID, sessionID)
+}
+
+func (d *Daemon) addAttachLocked(instanceID, sessionID string) {
 	if d.attaches[instanceID] == nil {
 		d.attaches[instanceID] = map[string]time.Time{}
 	}
@@ -4075,6 +4080,11 @@ func (d *Daemon) addAttach(instanceID, sessionID string) {
 func (d *Daemon) removeAttach(instanceID, sessionID string) bool {
 	d.attachMu.Lock()
 	defer d.attachMu.Unlock()
+	return d.removeAttachLocked(instanceID, sessionID)
+}
+
+// removeAttachLocked requires attachMu.
+func (d *Daemon) removeAttachLocked(instanceID, sessionID string) bool {
 	sess := d.attaches[instanceID]
 	if _, ok := sess[sessionID]; !ok {
 		return false
@@ -4082,14 +4092,45 @@ func (d *Daemon) removeAttach(instanceID, sessionID string) bool {
 	delete(sess, sessionID)
 	if len(sess) == 0 {
 		delete(d.attaches, instanceID)
+		return true
 	}
-	return true
+	return false
 }
 
 func (d *Daemon) attached(instanceID string) bool {
 	d.attachMu.Lock()
 	defer d.attachMu.Unlock()
 	return len(d.attaches[instanceID]) > 0
+}
+
+// registerTerminalAttach binds only a current, uncancelled terminal generation.
+// Durable reads remain outside locks; detach revisions fence registration.
+func (d *Daemon) registerTerminalAttach(s *ptySession, p transport.TerminalAttachPayload) (bool, error) {
+	// Query durable cancellation outside the terminal lock. The revision
+	// fences a detach that completes between this read and registration.
+	d.attachMu.Lock()
+	revision := d.attachRevision
+	d.attachMu.Unlock()
+	detached, err := d.state.TerminalDetached(p.InstanceID, p.SessionID)
+	if err != nil {
+		return false, err
+	}
+	if detached {
+		return false, nil
+	}
+	d.terminal.mu.Lock()
+	d.attachMu.Lock()
+	current := d.terminal.sessions[p.InstanceID] == s && !s.killed && s.exitSettled == nil && d.attachRevision == revision
+	if current {
+		d.addAttachLocked(p.InstanceID, p.SessionID)
+	}
+	d.attachMu.Unlock()
+	d.terminal.mu.Unlock()
+	if !current {
+		return false, ErrDeferred
+	}
+
+	return true, nil
 }
 
 // doAttach opens a terminal attach session (addendum §10/§11): it records
@@ -4130,16 +4171,8 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	if err != nil {
 		return err
 	}
-	// Bind the viewer to the current generation atomically with exit
-	// claiming. A retiring PTY cannot capture a replacement's viewer.
-	d.terminal.mu.Lock()
-	current := d.terminal.sessions[p.InstanceID] == s && !s.killed && s.exitSettled == nil
-	if current {
-		d.addAttach(p.InstanceID, p.SessionID)
-	}
-	d.terminal.mu.Unlock()
-	if !current {
-		return ErrDeferred
+	if registered, err := d.registerTerminalAttach(s, p); err != nil || !registered {
+		return err
 	}
 
 	// Wake semantics: a hibernated instance becomes awake (idle) once its
@@ -4176,7 +4209,10 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 		return err
 	}
 
-	last := d.removeAttach(p.InstanceID, p.SessionID)
+	d.attachMu.Lock()
+	d.attachRevision++
+	last := d.removeAttachLocked(p.InstanceID, p.SessionID)
+	d.attachMu.Unlock()
 	if !last {
 		// Either other clients still hold this instance's shared PTY, or
 		// NO attach was recorded for this session (a spurious/late detach
