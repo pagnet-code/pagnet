@@ -1,8 +1,10 @@
 package crypto
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -239,6 +241,13 @@ func SaveKeyring(stateDir string, kr *Keyring) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("crypto: mkdir keyring dir: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	release, err := lockNetworkKeyring(ctx, path, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	b, err := json.Marshal(kr)
 	if err != nil {
 		return fmt.Errorf("crypto: marshal keyring: %w", err)
@@ -272,4 +281,33 @@ func LoadKeyring(stateDir, networkID string) (*Keyring, error) {
 		}
 	}
 	return &kr, nil
+}
+
+// WithNetworkKeyring holds existing network authority across a native action.
+// The callback must not save or recursively acquire this authority lock.
+func WithNetworkKeyring(ctx context.Context, stateDir, networkID string, fn func(*Keyring) error) error {
+	if fn == nil {
+		return errors.New("network authority operation unavailable")
+	}
+	path, err := KeyringPath(stateDir, networkID)
+	if err != nil {
+		return err
+	}
+	release, err := lockNetworkKeyring(ctx, path, false)
+	if err != nil {
+		return err
+	}
+	defer release()
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 1<<20 || validateContextFileOwner(info) != nil {
+		return errors.New("network authority key file is not private")
+	}
+	ring, err := LoadKeyring(stateDir, networkID)
+	if err != nil {
+		return err
+	}
+	return fn(ring)
 }

@@ -16,9 +16,17 @@ import (
 // mutex cannot fence rotation against a native approval in another process.
 func lockContextKeyring(ctx context.Context, path string, exclusive bool) (func(), error) {
 	dir := filepath.Dir(path)
+	return lockAuthorityKeyring(ctx, path, exclusive, []string{filepath.Dir(filepath.Dir(dir)), filepath.Dir(dir), dir})
+}
+func lockNetworkKeyring(ctx context.Context, path string, exclusive bool) (func(), error) {
+	dir := filepath.Dir(path)
+	return lockAuthorityKeyring(ctx, path, exclusive, []string{filepath.Dir(dir), dir})
+}
+func lockAuthorityKeyring(ctx context.Context, path string, exclusive bool, directories []string) (func(), error) {
+	dir := filepath.Dir(path)
 	// Validate each authority directory before creating the lock file. An
 	// ancestor symlink must not cause side effects in another key store.
-	for _, candidate := range []string{filepath.Dir(filepath.Dir(dir)), filepath.Dir(dir), dir} {
+	for _, candidate := range directories {
 		info, err := os.Lstat(candidate)
 		if err != nil {
 			return nil, err

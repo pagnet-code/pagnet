@@ -78,8 +78,11 @@ func OwnerBrowserSessionAAD(c ProtectedContext, session, object string) []byte {
 // ApprovalProof authenticates inspected content and the exact chosen native
 // option. Its secret is delivered only inside the encrypted inspection object.
 func ApprovalProof(secret []byte, aad AAD, instance, session, native, option string) ([]byte, error) {
-	if len(secret) != 32 || aad.ProtectedContext == nil || aad.ValidateScope() != nil || instance == "" || session == "" || native == "" || option == "" {
+	if len(secret) != 32 || aad.ValidateScope() != nil || instance == "" || session == "" || native == "" || option == "" {
 		return nil, errors.New("invalid inspected approval binding")
+	}
+	if aad.ProtectedContext == nil && (aad.TenantID == "" || aad.NetworkID == "" || aad.KeyEpochID == "" || aad.ObjectType != ObjectTypeRuntimeInteraction || aad.ObjectID == "" || aad.Sender != instance) {
+		return nil, errors.New("invalid inspected network approval binding")
 	}
 	b, err := canonicalJSON(struct {
 		Purpose  string `json:"purpose"`

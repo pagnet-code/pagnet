@@ -66,3 +66,29 @@ func TestOwnerContextPublicCanonicalVectorAndNetworkCompatibility(t *testing.T) 
 		t.Fatal("approval proof did not bind exact option")
 	}
 }
+
+func TestNetworkApprovalProofBindsOriginalScopeAndExactChoice(t *testing.T) {
+	secret := bytes.Repeat([]byte{7}, 32)
+	aad := AAD{TenantID: "tenant", NetworkID: "network", ObjectType: ObjectTypeRuntimeInteraction, ObjectID: "interaction", Sender: "instance", KeyEpochID: "original-epoch"}
+	proof, err := ApprovalProof(secret, aad, "instance", "native-session", "native-request", "allow-once")
+	if err != nil || len(proof) != 32 {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*AAD){func(a *AAD) { a.NetworkID = "foreign" }, func(a *AAD) { a.KeyEpochID = "fresh" }, func(a *AAD) { a.ObjectID = "other-interaction" }} {
+		altered := aad
+		change(&altered)
+		other, err := ApprovalProof(secret, altered, "instance", "native-session", "native-request", "allow-once")
+		if err != nil || bytes.Equal(proof, other) {
+			t.Fatal("network proof omitted original scope", err)
+		}
+	}
+	aad.ObjectType = ObjectTypeTask
+	if _, err = ApprovalProof(secret, aad, "instance", "native-session", "native-request", "allow-once"); err == nil {
+		t.Fatal("task envelope became permission proof")
+	}
+	aad.ObjectType = ObjectTypeRuntimeInteraction
+	aad.Sender = "foreign-instance"
+	if _, err = ApprovalProof(secret, aad, "instance", "native-session", "native-request", "allow-once"); err == nil {
+		t.Fatal("foreign instance became permission proof")
+	}
+}

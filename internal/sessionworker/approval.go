@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"time"
 
@@ -45,7 +47,7 @@ type nativeApproval struct {
 
 func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation string, original ...NativeObservation) {
 	native := event.Interaction
-	if native == nil || native.NativeInteractionID == "" || native.Kind != "permission" || len(native.NativePayload) > 16<<20 || !domain.ValidRuntimeInteractionOptions(native.Options) || o.spec.ProtectedContext == nil {
+	if native == nil || native.NativeInteractionID == "" || native.Kind != "permission" || len(native.NativePayload) > 16<<20 || !domain.ValidRuntimeInteractionOptions(native.Options) {
 		return
 	}
 	if policy, ok := o.driver.(session.RemoteResolvable); ok && !policy.SupportsRemoteResolve(native.Kind) {
@@ -66,11 +68,24 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 	o.mu.Unlock()
 	// Reading the actual existing content authority is mandatory. No missing
 	// key or unsupported context ever creates an epoch just to enable approval.
-	ring, err := crypto.LoadContextKeyring(o.spec.ContextStateDir, *o.spec.ProtectedContext)
-	if err != nil {
-		return
+	var epoch crypto.KeyEpoch
+	var err error
+	if o.spec.ProtectedContext != nil {
+		ring, loadErr := crypto.LoadContextKeyring(o.spec.ContextStateDir, *o.spec.ProtectedContext)
+		if loadErr != nil {
+			return
+		}
+		epoch, err = ring.ActiveEpoch()
+	} else {
+		if o.spec.NetworkID == "" || o.spec.NetworkTenantID == "" || !filepath.IsAbs(o.spec.NetworkStateDir) {
+			return
+		}
+		ring, loadErr := crypto.LoadKeyring(o.spec.NetworkStateDir, o.spec.NetworkID)
+		if loadErr != nil {
+			return
+		}
+		epoch, err = ring.ActiveEpoch()
 	}
-	epoch, err := ring.ActiveEpoch()
 	if err != nil {
 		return
 	}
@@ -95,7 +110,14 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 		return
 	}
 	defer clear(plain)
-	aad := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: o.spec.TenantID, ObjectType: e2ee.ObjectTypeRuntimeInteraction, ObjectID: id, Sender: o.journal.scope.InstanceID, Recipient: o.spec.ProtectedContext.OwnerUserID, CreatedAt: time.Now().UTC().Format(time.RFC3339), KeyEpochID: epoch.ID, ProtectedContext: o.spec.ProtectedContext}
+	aad := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: o.spec.TenantID, ObjectType: e2ee.ObjectTypeRuntimeInteraction, ObjectID: id, Sender: o.journal.scope.InstanceID, CreatedAt: time.Now().UTC().Format(time.RFC3339), KeyEpochID: epoch.ID, ProtectedContext: o.spec.ProtectedContext}
+	if o.spec.ProtectedContext != nil {
+		aad.Recipient = o.spec.ProtectedContext.OwnerUserID
+	} else {
+		aad.TenantID = o.spec.NetworkTenantID
+		aad.NetworkID = o.spec.NetworkID
+	}
+
 	if len(plain) > 64<<10 {
 		if len(original) != 1 {
 			clear(secret)
@@ -157,14 +179,10 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 		o.mu.Unlock()
 		return errors.New("native inspected choice proof is invalid")
 	}
-	epochID := record.inspection.DetailAAD.KeyEpochID
 	o.mu.Unlock()
 	ctx, cancel := context.WithTimeout(o.ctx, 15*time.Second)
 	defer cancel()
-	return crypto.WithContextKeyring(ctx, o.spec.ContextStateDir, *o.spec.ProtectedContext, func(ring *crypto.ContextKeyring) error {
-		if _, valid := ring.EpochByID(epochID); !valid {
-			return errors.New("native inspection authority was revoked")
-		}
+	return o.withInspectionEpoch(ctx, record.inspection.DetailAAD, func(epoch crypto.KeyEpoch) error {
 		o.mu.Lock()
 		if o.pending[op.InteractionID] != record || record.consumed || o.generation != op.NativeGeneration {
 			o.mu.Unlock()
@@ -187,15 +205,11 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 // Large or currently unavailable answers remain complete in the private source
 // capture for the purpose-specific content manifest path.
 func (o *SessionOwner) encryptResolution(event session.SessionEvent, inspection *Inspection, observedAt time.Time) *NativeResolution {
-	if inspection == nil || o.spec.ProtectedContext == nil || event.Interaction == nil || !event.Interaction.Resolved || len(event.Interaction.Answer) > 64<<10 {
+	if inspection == nil || event.Interaction == nil || !event.Interaction.Resolved || len(event.Interaction.Answer) > 64<<10 {
 		return nil
 	}
 	var resolution *NativeResolution
-	_ = crypto.WithContextKeyring(o.ctx, o.spec.ContextStateDir, *o.spec.ProtectedContext, func(ring *crypto.ContextKeyring) error {
-		epoch, ok := ring.EpochByID(inspection.DetailAAD.KeyEpochID)
-		if !ok {
-			return errors.New("original resolution content authority unavailable")
-		}
+	_ = o.withInspectionEpoch(o.ctx, inspection.DetailAAD, func(epoch crypto.KeyEpoch) error {
 		key, err := epoch.KeyArray()
 		if err != nil {
 			return err
@@ -218,16 +232,12 @@ func (o *SessionOwner) encryptOriginalResolution(event session.SessionEvent, ins
 	if event.Interaction == nil || len(event.Interaction.Answer) <= 64<<10 {
 		return o.encryptResolution(event, inspection, observation.ObservedAt), nil
 	}
-	if inspection == nil || o.spec.ProtectedContext == nil || !event.Interaction.Resolved {
+	if inspection == nil || !event.Interaction.Resolved {
 		return nil, nil
 	}
 	var result *NativeResolution
 	var transfer *nativecontent.Transfer
-	_ = crypto.WithContextKeyring(o.ctx, o.spec.ContextStateDir, *o.spec.ProtectedContext, func(ring *crypto.ContextKeyring) error {
-		epoch, ok := ring.EpochByID(inspection.DetailAAD.KeyEpochID)
-		if !ok {
-			return errors.New("original resolution content authority unavailable")
-		}
+	_ = o.withInspectionEpoch(o.ctx, inspection.DetailAAD, func(epoch crypto.KeyEpoch) error {
 		key, err := epoch.KeyArray()
 		if err != nil {
 			return err
@@ -242,4 +252,34 @@ func (o *SessionOwner) encryptOriginalResolution(event session.SessionEvent, ins
 		return nil
 	})
 	return result, transfer
+}
+
+// Preserve the original inspection scope and epoch through proof delivery and
+// answer encryption; a fresh epoch never grants an old native capability.
+func (o *SessionOwner) withInspectionEpoch(ctx context.Context, aad e2ee.AAD, fn func(crypto.KeyEpoch) error) error {
+	if aad.ValidateScope() != nil || aad.KeyEpochID == "" {
+		return errors.New("original inspection scope unavailable")
+	}
+	check := func(epoch crypto.KeyEpoch, found bool) error {
+		if !found || epoch.State == crypto.EpochRevoked {
+			return errors.New("native inspection authority was revoked")
+		}
+		return fn(epoch)
+	}
+	if aad.ProtectedContext != nil {
+		if !reflect.DeepEqual(aad.ProtectedContext, o.spec.ProtectedContext) || !filepath.IsAbs(o.spec.ContextStateDir) {
+			return errors.New("original inspection context differs")
+		}
+		return crypto.WithContextKeyring(ctx, o.spec.ContextStateDir, *aad.ProtectedContext, func(ring *crypto.ContextKeyring) error {
+			epoch, found := ring.EpochByID(aad.KeyEpochID)
+			return check(epoch, found)
+		})
+	}
+	if o.spec.ProtectedContext != nil || aad.NetworkID == "" || aad.NetworkID != o.spec.NetworkID || aad.TenantID != o.spec.NetworkTenantID || !filepath.IsAbs(o.spec.NetworkStateDir) {
+		return errors.New("original inspection network differs")
+	}
+	return crypto.WithNetworkKeyring(ctx, o.spec.NetworkStateDir, aad.NetworkID, func(ring *crypto.Keyring) error {
+		epoch, found := ring.EpochByID(aad.KeyEpochID)
+		return check(epoch, found)
+	})
 }
