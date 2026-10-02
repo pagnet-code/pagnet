@@ -389,7 +389,13 @@ func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation st
 		return nil
 	}
 	source, unavailable, err := o.journal.NativeEventSource(ctx, generation, session.SessionEvent{SessionID: sid, TurnID: logicalWorkerTurn(candidate.Sequence)})
-	if err != nil || unavailable || source == nil || source.SourceTask == nil {
+	if err != nil || unavailable || source == nil {
+		return nil
+	}
+	if source.InputKind != "task" {
+		return source
+	}
+	if source.SourceTask == nil {
 		return nil
 	}
 	key, available := o.originalTaskContentPin(source)

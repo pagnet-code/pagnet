@@ -61,3 +61,34 @@ func TestBridgeTaskSourceRequiresActualBoundTurnAndOriginalProducerPin(t *testin
 		t.Fatal("settled native callback resurrected original task authority")
 	}
 }
+
+func TestBridgeNonTaskSourceRetainsActualAcceptedAdmission(t *testing.T) {
+	for _, kind := range []string{"ask", "notice", "status", "wake", "user_input"} {
+		t.Run(kind, func(t *testing.T) {
+			j, _ := testJournal(t)
+			defer j.Close()
+			current := lease(t, j)
+			owner := &SessionOwner{journal: j, manager: session.NewManager(), generation: "original-generation"}
+			sess := owner.manager.Session(j.scope.InstanceID, domain.RuntimeFakePersistent, "workspace")
+			sess.NativeID = "actual-original-session"
+			source := NativeTurnSource{Sequence: 1, LogicalTurnID: logicalWorkerTurn(1), NativeGeneration: owner.generation, NativeSessionID: sess.NativeID, SourceCommandID: "original-command", SourceAdmissionID: "original-admission", InputKind: kind}
+			owner.candidateTurnSource = source
+			if got := owner.activeBridgeTurnSource(t.Context(), owner.generation); got != nil {
+				t.Fatal("unbound candidate granted source")
+			}
+			if _, _, err := j.Admit(t.Context(), current, 1, "original-command", "prompt", json.RawMessage(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			if err := j.BindNativeTurn(t.Context(), source); err != nil {
+				t.Fatal(err)
+			}
+			got := owner.activeBridgeTurnSource(t.Context(), owner.generation)
+			if got == nil || got.SourceCommandID != source.SourceCommandID || got.InputKind != kind || got.SourceTask != nil {
+				t.Fatal("non-task admission lost its original source")
+			}
+			if got := owner.activeBridgeTurnSource(t.Context(), "replacement-generation"); got != nil {
+				t.Fatal("foreign native generation inherited source")
+			}
+		})
+	}
+}
