@@ -305,13 +305,13 @@ capabilities:
     description: echoes its input
 subscriptions:
   - event: "build.*"
-    mode: push
+    mode: deliver
 permissions:
-  requested: [invoke]
+  requested: [invoke, event_subscribe]
 `
 
 func TestParseRecipeValidKinds(t *testing.T) {
-	for _, kind := range []string{"Recipe", "Service", "AgentTemplate"} {
+	for _, kind := range []string{"Recipe", "Service"} {
 		t.Run(kind, func(t *testing.T) {
 			raw := strings.Replace(recipeServiceYAML, "kind: Service", "kind: "+kind, 1)
 			m, err := parseRecipe([]byte(raw))
@@ -339,11 +339,11 @@ func TestParseRecipeErrors(t *testing.T) {
 		want string // exact error (nil = substring check via wantSub)
 	}{
 		{"bad apiVersion", "apiVersion: pagnet.dev/v0\nkind: Service\nmetadata:\n  name: x\n", `unsupported apiVersion "pagnet.dev/v0" (want pagnet.dev/v1)`},
-		{"bad kind", "apiVersion: pagnet.dev/v1\nkind: Pod\nmetadata:\n  name: x\n", `unsupported kind "Pod" (want Recipe | Service | AgentTemplate)`},
+		{"bad kind", "apiVersion: pagnet.dev/v1\nkind: Pod\nmetadata:\n  name: x\n", `unsupported kind "Pod" (want Recipe | Service)`},
 		{"missing name", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  description: no name\n", `recipe metadata.name is required`},
 		{"capability not dot-separated", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  name: x\ncapabilities:\n  - id: extract\n", `capability ids are dot-separated (e.g. documents.extract); got "extract"`},
 		{"missing capability id", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  name: x\ncapabilities:\n  - description: no id\n", `capabilities[0].id is required`},
-		{"missing subscription event", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  name: x\nsubscriptions:\n  - mode: push\n", `subscriptions[0].event is required`},
+		{"missing subscription event", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  name: x\nsubscriptions:\n  - mode: deliver\n", `subscriptions[0].event is required`},
 		{"bad permission", "apiVersion: pagnet.dev/v1\nkind: Service\nmetadata:\n  name: x\npermissions:\n  requested: [fly]\n", `unknown permission "fly" (discover|communicate|invoke|event_publish|event_subscribe|task_read|task_write|operate)`},
 	}
 	for _, tc := range cases {
@@ -399,13 +399,8 @@ func TestRecipeApplyFailFastNoNetwork(t *testing.T) {
 // one-time activation credential is printed.
 func TestRecipeApplyNonInteractiveApplies(t *testing.T) {
 	ts := newStubV2Server(t, map[string]string{
-		"/api/v1/networks": `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
-		// The real POST /services shape (api_services.go): the principal is
-		// nested under "principal" and marshals domain.Principal's exported
-		// field names, and the activation credential is an object.
-		"/api/v1/services":                     `{"principal":{"ID":"svc-1","Name":"svc-echo"},"activationCredential":{"credential":"pgn_epd_v1_test","expiresAt":"2026-01-01T00:00:00Z"}}`,
-		"/api/v1/networks/net-1/services":      `{}`,
-		"/api/v1/networks/net-1/subscriptions": `{"id":"sub-9"}`,
+		"/api/v1/networks":                       `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+		"/api/v1/networks/net-1/service-recipes": `{"id":"svc-1","activationCredential":"pgn_act_v1_test","subscriptions":["build.*"]}`,
 	})
 	cliEnv(t, ts.ts) // silent: the non-interactive path skips the summary
 	withNoPrompts(t)
@@ -416,22 +411,21 @@ func TestRecipeApplyNonInteractiveApplies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recipe apply: %v", err)
 	}
-	// The D12 call sequence: create the service, join the network, subscribe.
-	if !ts.hasCall(`POST /api/v1/services `) || !ts.hasCall(`"name":"svc-echo"`) {
-		t.Error("the service was not created with the manifest's name")
+	// One authenticated atomic declaration, without impersonating a participant.
+	if !ts.hasCall(`POST /api/v1/networks/net-1/service-recipes `) || !ts.hasCall(`"name":"svc-echo"`) || !ts.hasCall(`"eventPattern":"build.*"`) || !ts.hasCall(`"deliveryMode":"deliver"`) || !ts.hasCall(`"permissions":["invoke","event_subscribe"]`) {
+		t.Error("missing immutable recipe declarations")
 	}
-	if !ts.hasCall(`POST /api/v1/networks/net-1/services `) || !ts.hasCall(`"principalId":"svc-1"`) {
-		t.Error("the service was not added to the network with its id")
-	}
-	if !ts.hasCall(`POST /api/v1/networks/net-1/subscriptions `) || !ts.hasCall(`"eventPattern":"build.*"`) || !ts.hasCall(`"mode":"push"`) {
-		t.Error("the subscription was not created from the manifest")
+	if ts.hasCall(`POST /api/v1/services `) || ts.hasCall(`POST /api/v1/networks/net-1/subscriptions `) {
+		t.Error("partial creation or participant impersonation attempted")
 	}
 	want := `applied Service "svc-echo" to network default
 capabilities: svc.echo
-subscription: build.* (mode push)
+subscription: build.* (mode deliver)
+
+service declarations saved; connect the service SDK with the activation credential to run it.
 
 activation credential (one-time — save it now, it is shown only once):
-  pgn_epd_v1_test
+  pgn_act_v1_test
 `
 	if out != want {
 		t.Fatalf("apply output mismatch:\n--- got ---\n%s\n--- want ---\n%s", out, want)
@@ -957,4 +951,68 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func TestRecipeRejectsUnsupportedOrInvalidDeclarationsBeforeWrites(t *testing.T) {
+	for _, tt := range []struct{ name, manifest string }{
+		{"account-template", strings.Replace(recipeServiceYAML, "kind: Service", "kind: AgentTemplate", 1)},
+		{"missing-subscribe-permission", strings.Replace(recipeServiceYAML, "invoke, event_subscribe", "invoke", 1)},
+		{"wake-service", strings.Replace(recipeServiceYAML, "mode: deliver", "mode: wake", 1)},
+		{"unknown-field", recipeServiceYAML + "runtime: fake\n"},
+		{"multiple-documents", recipeServiceYAML + "---\n" + recipeServiceYAML},
+		{"negative-version", strings.Replace(recipeServiceYAML, "id: svc.echo", "id: svc.echo\n    version: -1", 1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newStubV2Server(t, map[string]string{})
+			cliEnv(t, ts.ts)
+			withNoPrompts(t)
+			f := filepath.Join(t.TempDir(), "recipe.yaml")
+			if err := os.WriteFile(f, []byte(tt.manifest), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := recipeCmd()
+			cmd.SetArgs([]string{"apply", f})
+			if err := cmd.Execute(); err == nil {
+				t.Fatal("invalid recipe accepted")
+			}
+			if ts.hasCall("POST") {
+				t.Fatal("invalid recipe mutated server")
+			}
+		})
+	}
+}
+
+func TestServiceCreateAtomicNetworkAndJSON(t *testing.T) {
+	ts := newStubV2Server(t, map[string]string{"/api/v1/networks": `[{"ID":"net-1","Name":"default","Slug":"default"}]`, "/api/v1/networks/net-1/service-recipes": `{"id":"svc-1","activationCredential":"pgn_act_v1_test"}`})
+	cliEnv(t, ts.ts)
+	withNoPrompts(t)
+	jsonOut = true
+	t.Cleanup(func() { jsonOut = false })
+	cmd := serviceCreateCmd()
+	cmd.SetArgs([]string{"atomic-echo", "--network", "default", "--capability", "echo.say", "--permission", "discover"})
+	out, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct{ ID, Name, ActivationCredential string }
+	if json.Unmarshal([]byte(out), &result) != nil || result.ID != "svc-1" || result.ActivationCredential != "pgn_act_v1_test" {
+		t.Fatal("service JSON result lost atomic credential")
+	}
+	if !ts.hasCall(`POST /api/v1/networks/net-1/service-recipes `) || !ts.hasCall(`"permissions":["discover"]`) || !ts.hasCall(`"id":"echo.say"`) || ts.hasCall(`POST /api/v1/services `) {
+		t.Fatal("service not declared atomically")
+	}
+}
+
+func TestServiceCreateUnknownNetworkCreatesNothing(t *testing.T) {
+	ts := newStubV2Server(t, map[string]string{"/api/v1/networks": `[]`})
+	cliEnv(t, ts.ts)
+	withNoPrompts(t)
+	cmd := serviceCreateCmd()
+	cmd.SetArgs([]string{"no-orphan", "--network", "missing"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("unknown network accepted")
+	}
+	if ts.hasCall("POST") {
+		t.Fatal("unknown network orphaned participant or lost one-use credential")
+	}
 }

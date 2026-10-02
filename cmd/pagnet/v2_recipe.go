@@ -1,8 +1,8 @@
 package main
 
 // `pagnet recipe apply <path-or-url>` (plan D10 / D12 / D13): import a
-// declarative recipe manifest (pagnet.dev/v1 YAML) — a service, an agent
-// template, or a recipe — as normal API calls. Interactive runs show a
+// declarative recipe manifest (pagnet.dev/v1 YAML) — a service
+// or a recipe — as one atomic service declaration. Interactive runs show a
 // summary and confirm; --non-interactive applies deterministically and
 // fails fast when any input is missing (never prompts, never waits).
 
@@ -17,13 +17,14 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
 // recipeManifest is the pagnet.dev/v1 manifest (D13 — small on purpose).
 type recipeManifest struct {
 	APIVersion string `yaml:"apiVersion"`
-	Kind       string `yaml:"kind"` // Recipe | Service | AgentTemplate
+	Kind       string `yaml:"kind"` // Recipe | Service
 	Metadata   struct {
 		Name        string `yaml:"name"`
 		Description string `yaml:"description"`
@@ -89,7 +90,7 @@ func recipeCmd() *cobra.Command {
 				if !ok {
 					return fmt.Errorf("apply cancelled (nothing was created)")
 				}
-			} else if !silent {
+			} else if !silent && !jsonOut {
 				fmt.Println(summary)
 			}
 
@@ -109,6 +110,7 @@ func recipeCmd() *cobra.Command {
 			}
 			if created.ActivationCredential != "" {
 				// The one-time rule: printed ONCE here, never stored.
+				fmt.Println("\nservice declarations saved; connect the service SDK with the activation credential to run it.")
 				fmt.Printf("\nactivation credential (one-time — save it now, it is shown only once):\n  %s\n", created.ActivationCredential)
 			}
 			return nil
@@ -190,20 +192,32 @@ func readRecipeSource(src string) ([]byte, error) {
 // an invalid manifest never half-applies).
 func parseRecipe(raw []byte) (*recipeManifest, error) {
 	var m recipeManifest
-	if err := yaml.Unmarshal(raw, &m); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(raw)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&m); err != nil {
 		return nil, fmt.Errorf("recipe is not valid YAML: %v", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("recipe must contain exactly one YAML document")
 	}
 	if m.APIVersion != "pagnet.dev/v1" {
 		return nil, fmt.Errorf("unsupported apiVersion %q (want pagnet.dev/v1)", m.APIVersion)
 	}
 	switch m.Kind {
-	case "Recipe", "Service", "AgentTemplate":
+	case "Recipe", "Service":
+	case "AgentTemplate":
+		return nil, fmt.Errorf("AgentTemplate recipes are not supported: use account agent templates with an explicit runtime and encrypted instructions")
 	default:
-		return nil, fmt.Errorf("unsupported kind %q (want Recipe | Service | AgentTemplate)", m.Kind)
+		return nil, fmt.Errorf("unsupported kind %q (want Recipe | Service)", m.Kind)
 	}
-	if m.Metadata.Name == "" {
+	if strings.TrimSpace(m.Metadata.Name) == "" {
 		return nil, fmt.Errorf("recipe metadata.name is required")
 	}
+	if len(m.Capabilities) > 64 || len(m.Subscriptions) > 64 || len(m.Permissions.Requested) > 8 || len(m.Metadata.Name) > 128 || len(m.Metadata.Description) > 4096 {
+		return nil, fmt.Errorf("recipe exceeds declaration bounds")
+	}
+	seenCapabilities := map[string]bool{}
 	for i, cp := range m.Capabilities {
 		if cp.ID == "" {
 			return nil, fmt.Errorf("capabilities[%d].id is required", i)
@@ -214,16 +228,37 @@ func parseRecipe(raw []byte) (*recipeManifest, error) {
 		if v := cp.Version; v == 0 {
 			m.Capabilities[i].Version = 1
 		}
+		key := fmt.Sprintf("%s/%d", cp.ID, m.Capabilities[i].Version)
+		if m.Capabilities[i].Version < 1 || len(cp.ID) > 256 || seenCapabilities[key] {
+			return nil, fmt.Errorf("invalid or duplicate capability %s", cp.ID)
+		}
+		seenCapabilities[key] = true
 	}
+	seenSubscriptions := map[string]bool{}
 	for i, s := range m.Subscriptions {
 		if s.Event == "" {
 			return nil, fmt.Errorf("subscriptions[%d].event is required", i)
 		}
+		if s.Mode == "" {
+			m.Subscriptions[i].Mode = "deliver"
+		}
+		if m.Subscriptions[i].Mode != "deliver" || len(s.Event) > 256 || strings.ContainsAny(s.Event, " \t\r\n") || seenSubscriptions[s.Event] {
+			return nil, fmt.Errorf("service subscriptions require distinct event patterns and mode deliver")
+		}
+		seenSubscriptions[s.Event] = true
 	}
+	seenPermissions := map[string]bool{}
 	for _, p := range m.Permissions.Requested {
 		if err := validPermission(p); err != nil {
 			return nil, err
 		}
+		if seenPermissions[p] {
+			return nil, fmt.Errorf("duplicate permission %s", p)
+		}
+		seenPermissions[p] = true
+	}
+	if len(m.Subscriptions) > 0 && !seenPermissions[string(domain.PermEventSubscribe)] {
+		return nil, fmt.Errorf("subscriptions require requested permission event_subscribe")
 	}
 	return &m, nil
 }
@@ -239,7 +274,7 @@ type recipeApplied struct {
 }
 
 // applyRecipe turns the manifest into normal API calls (D12: declarative →
-// normal API calls).
+// one atomic account-authorized service declaration).
 func applyRecipe(c *cliCtx, netID string, m *recipeManifest) (*recipeApplied, error) {
 	out := &recipeApplied{Kind: m.Kind, Name: m.Metadata.Name, Network: netID}
 
@@ -261,66 +296,21 @@ func applyRecipe(c *cliCtx, netID string, m *recipeManifest) (*recipeApplied, er
 		caps = append(caps, entry)
 	}
 
-	switch m.Kind {
-	case "AgentTemplate":
-		body := map[string]any{"name": m.Metadata.Name}
-		if m.Metadata.Description != "" {
-			body["description"] = m.Metadata.Description
-		}
-		if len(caps) > 0 {
-			body["capabilities"] = caps
-		}
-		var created struct {
-			ID       string `json:"id"`
-			IDLegacy string `json:"ID"`
-		}
-		if err := c.post("/api/v1/networks/"+netID+"/agents", body, &created); err != nil {
-			return nil, fmt.Errorf("create agent: %w", err)
-		}
-		if created.ID != "" {
-			out.ID = created.ID
-		} else {
-			out.ID = created.IDLegacy
-		}
-	default: // Recipe | Service: a service participant.
-		body := map[string]any{"name": m.Metadata.Name}
-		if m.Metadata.Description != "" {
-			body["description"] = m.Metadata.Description
-		}
-		if len(caps) > 0 {
-			body["capabilities"] = caps
-		}
-		// Same response shape as `pagnet service create`: the principal is
-		// nested under "principal" (its id marshals as "ID") and the
-		// activation credential is an object carrying its expiry.
-		var created struct {
-			Principal struct {
-				ID string `json:"ID"`
-			} `json:"principal"`
-			ActivationCredential struct {
-				Credential string `json:"credential"`
-			} `json:"activationCredential"`
-		}
-		if err := c.post("/api/v1/services", body, &created); err != nil {
-			return nil, fmt.Errorf("create service: %w", err)
-		}
-		out.ID = created.Principal.ID
-		out.ActivationCredential = created.ActivationCredential.Credential
-		if err := c.post("/api/v1/networks/"+netID+"/services", map[string]any{"principalId": out.ID}, nil); err != nil {
-			return nil, fmt.Errorf("add service to network: %w", err)
-		}
+	subscriptions := make([]map[string]string, 0, len(m.Subscriptions))
+	for _, sub := range m.Subscriptions {
+		subscriptions = append(subscriptions, map[string]string{"eventPattern": sub.Event, "deliveryMode": sub.Mode})
 	}
-
-	// Subscriptions (the participant's event patterns).
-	for _, s := range m.Subscriptions {
-		body := map[string]any{"eventPattern": s.Event}
-		if s.Mode != "" {
-			body["mode"] = s.Mode
-		}
-		if err := c.post("/api/v1/networks/"+netID+"/subscriptions", body, nil); err != nil {
-			return nil, fmt.Errorf("subscribe %s: %w", s.Event, err)
-		}
-		out.Subscriptions = append(out.Subscriptions, s.Event)
+	body := map[string]any{"name": m.Metadata.Name, "description": m.Metadata.Description, "capabilities": caps, "permissions": m.Permissions.Requested, "subscriptions": subscriptions}
+	var created struct {
+		ID                   string   `json:"id"`
+		ActivationCredential string   `json:"activationCredential"`
+		Subscriptions        []string `json:"subscriptions"`
 	}
+	if err := c.post("/api/v1/networks/"+netID+"/service-recipes", body, &created); err != nil {
+		return nil, fmt.Errorf("apply service declarations: %w", err)
+	}
+	out.ID = created.ID
+	out.ActivationCredential = created.ActivationCredential
+	out.Subscriptions = created.Subscriptions
 	return out, nil
 }

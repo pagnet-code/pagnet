@@ -295,6 +295,7 @@ func serviceCreateCmd() *cobra.Command {
 		tags        []string
 		public      bool
 		network     string
+		permissions []string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -326,60 +327,53 @@ func serviceCreateCmd() *cobra.Command {
 			if len(caps) > 0 {
 				body["capabilities"] = caps
 			}
-			// The server answers {principal: {ID, Name, …}, activationCredential:
-			// {credential, expiresAt}}. The credential is an OBJECT (it carries
-			// its expiry) and the principal's fields are nested under "principal"
-			// — domain.Principal marshals its exported field names, so the id is
-			// "ID", not "id". Decoding this as a flat {id, name} plus a string
-			// credential failed the POST outright:
-			// "cannot unmarshal object into Go struct field .activationCredential
-			// of type string".
-			var created struct {
-				Principal struct {
-					ID   string `json:"ID"`
-					Name string `json:"Name"`
-				} `json:"principal"`
-				// The one-time activation credential (returned ONCE, D3).
-				ActivationCredential struct {
-					Credential string `json:"credential"`
-					ExpiresAt  string `json:"expiresAt"`
-				} `json:"activationCredential"`
+			// Resolve and validate before any creation; declarations and membership
+			// share one transaction so a failed join cannot lose a one-use credential.
+			for _, permission := range permissions {
+				if err := validPermission(permission); err != nil {
+					return err
+				}
 			}
-			if err := c.post("/api/v1/services", body, &created); err != nil {
-				return err
-			}
-			id := created.Principal.ID
-			if jsonOut {
-				return printJSON(map[string]any{"id": id, "name": created.Principal.Name,
-					"activationCredential": created.ActivationCredential.Credential})
-			}
-			if !silent {
-				fmt.Printf("service:  %s (%s)\n", orDash(created.Principal.Name), id)
-			}
-			// Join the resolved network when one is given (the service is
-			// created tenant-wide; membership is a separate step).
+			path := "/api/v1/service-recipes"
+			netID := ""
 			if network != "" {
-				netID, _, err := c.resolveNetwork(network)
+				var err error
+				netID, _, err = c.resolveNetwork(network)
 				if err != nil {
 					return err
 				}
-				if err := c.post("/api/v1/networks/"+netID+"/services", map[string]any{"principalId": id}, nil); err != nil {
-					return err
-				}
-				if !silent {
+				path = "/api/v1/networks/" + netID + "/service-recipes"
+			} else if len(permissions) > 0 {
+				return fmt.Errorf("--permission requires --network")
+			}
+			body["permissions"] = permissions
+			var applied struct {
+				ID                   string `json:"id"`
+				ActivationCredential string `json:"activationCredential"`
+			}
+			if err := c.post(path, body, &applied); err != nil {
+				return err
+			}
+			id := applied.ID
+			if jsonOut {
+				return printJSON(map[string]any{"id": id, "name": args[0], "activationCredential": applied.ActivationCredential})
+			}
+			if !silent {
+				fmt.Printf("service:  %s (%s)\n", args[0], id)
+				if netID != "" {
 					fmt.Printf("joined:   network %s\n", netID)
 				}
 			}
-			if created.ActivationCredential.Credential == "" {
+			if applied.ActivationCredential == "" {
 				if !silent {
 					fmt.Println("activation credential: not returned by the server (re-create to obtain one)")
 				}
 				return nil
 			}
 			// The one-time rule: printed ONCE here, never stored.
-			fmt.Printf("\nactivation credential (one-time — save it now, it is shown only once):\n  %s\n\n", created.ActivationCredential.Credential)
+			fmt.Printf("\nactivation credential (one-time — save it now, it is shown only once):\n  %s\n\n", applied.ActivationCredential)
 			if !silent {
-				fmt.Println("connect the service with: pagnet service connect " + orDash(created.Principal.Name))
+				fmt.Println("connect the service with: pagnet service connect " + orDash(args[0]))
 			}
 			return nil
 		},
@@ -389,7 +383,8 @@ func serviceCreateCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&capDescs, "capability-desc", nil, "description per --capability (same order)")
 	cmd.Flags().StringSliceVar(&tags, "tag", nil, "tags for the offered capabilities")
 	cmd.Flags().BoolVar(&public, "public", false, "discoverable by anyone (default: private)")
-	cmd.Flags().StringVarP(&network, "network", "n", "", "also join this network after creating")
+	cmd.Flags().StringVarP(&network, "network", "n", "", "atomically join this network (permissions granted only with --permission)")
+	cmd.Flags().StringSliceVar(&permissions, "permission", nil, "network permission to grant (repeatable; requires --network)")
 	return cmd
 }
 
