@@ -3,8 +3,6 @@ package sessionworker
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -395,9 +393,7 @@ func (o *SessionOwner) Snapshot() NativeSnapshot {
 	o.mu.Unlock()
 	native, _ := o.manager.TryNativeID(o.journal.scope.InstanceID)
 	state, _ := o.manager.State(o.journal.scope.InstanceID)
-	profileRaw, _ := json.Marshal(o.spec) // Env is memory-only and deliberately excluded.
-	profileHash := sha256.Sum256(profileRaw)
-	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state, ActualRuntime: o.spec.Runtime, ProfileFingerprint: hex.EncodeToString(profileHash[:])}
+	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state, ActualRuntime: o.spec.Runtime, ProfileFingerprint: NativeProfileFingerprint(o.spec)}
 	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil && native != "" && o.driver.Live(o.journal.scope.InstanceID) {
 		ctx, cancel := context.WithTimeout(o.ctx, 50*time.Millisecond)
 		captured, ownedErr := o.supervisor.OwnedStartIdentity(ctx, *pid)

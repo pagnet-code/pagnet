@@ -86,8 +86,19 @@ and remain until a transactionally fenced controller ciphertext-journal receipt.
 The actual native/two-controller subprocess fixture verifies uninterrupted PID,
 PTY, session, timer and approvals across replacement and a controller-free gap.
 
-The production daemon proxy and server admission/receipt integration are still
-under construction. Darwin native runtimes intentionally share the owner's OS trust boundary. A
+The daemon has an inactive, authenticated existing-worker proxy: discovery
+does not create state or acquire worker ownership; it checks immutable authority
+and execution profile, obtains fresh server admission before acquiring a local
+lease, and relinquishes that lease when its exact remote connection closes.
+Activation reconciliation preserves the accepted original source, while renewal
+requires fresh snapshots of the actual native PID birth/session. Real subprocess
+tests cover the idle worker/controller-free interval; they are not a complete
+`pagnet serve` handoff gate. Non-regular bootstrap/key files fail promptly,
+including FIFOs, rather than blocking discovery.
+
+Production command routing, durable controller intent ordinals, complete source
+delivery and server admission/receipt integration are still under construction.
+Darwin native runtimes intentionally share the owner's OS trust boundary. A
 0600 control key restricts other users, but does not isolate an untrusted native
 process with the same UID. Trusted local runtimes remain useful on Darwin; a
 developer who needs mutual isolation can select an external execution boundary.

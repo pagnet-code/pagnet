@@ -71,7 +71,7 @@ func removeStaleSocket(path string) error {
 func privateSocket(path string) error { return os.Chmod(path, 0600) }
 
 func readPrivateFile(path string, bound int) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
