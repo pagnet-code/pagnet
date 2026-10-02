@@ -548,7 +548,7 @@ func (e *claudeEndpoint) readLoop() {
 					e.mu.Unlock()
 				}
 				if part.Type == "text" && part.Text != "" {
-					if err := e.publish(session.SessionEvent{Type: session.EventTurnOutput, SessionID: e.nativeID, TurnID: turn, Output: part.Text, Model: event.Message.Model}); err != nil {
+					if err := e.publish(session.SessionEvent{Type: session.EventTurnOutput, NativeOutput: true, SessionID: e.nativeID, TurnID: turn, Output: part.Text, Model: event.Message.Model}); err != nil {
 						e.shutdown(err)
 						return
 					}

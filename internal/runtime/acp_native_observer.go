@@ -63,7 +63,7 @@ func (e *acpEndpoint) captureNativeMessage(message *acpMessage) error {
 			events = append(events, session.SessionEvent{Type: kind})
 		}
 		if data.Update.Kind == "agent_message_chunk" && data.Update.Content.Type == "text" {
-			events = append(events, session.SessionEvent{Type: session.EventTurnOutput, Output: data.Update.Content.Text})
+			events = append(events, session.SessionEvent{Type: session.EventTurnOutput, NativeOutput: true, Output: data.Update.Content.Text})
 		}
 		if data.Update.Kind == "plan" && len(message.Params) <= session.MaxPlanBytes {
 			var bounded struct {
