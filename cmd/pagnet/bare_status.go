@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -53,7 +54,7 @@ func runBareStatus(cmd *cobra.Command) error {
 	runtimes := 0
 	if tok := loadUserToken(accountConfigDir(root, account), account, server); tok != "" {
 		client := netpolicy.NewHTTPClient(3*time.Second, insecureRemoteHTTP)
-		base := server + "/"
+		base := strings.TrimSuffix(server, "/") + "/api/v1/"
 		var me struct {
 			Username string `json:"username"`
 		}
@@ -63,7 +64,7 @@ func runBareStatus(cmd *cobra.Command) error {
 		var d struct {
 			Runtimes []struct{} `json:"runtimes"`
 		}
-		if bareGet(client, base+"api/v1/hosts/"+cfg.HostID, tok, &d) == nil {
+		if bareGet(client, base+"hosts/"+cfg.HostID, tok, &d) == nil {
 			runtimes = len(d.Runtimes)
 		}
 	}
