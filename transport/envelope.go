@@ -548,10 +548,11 @@ type RestartAgentPayload struct {
 // control plane: stop any process, remove the isolated worktree (branch
 // kept), drop the local row.
 type ForgetInstancePayload struct {
-	NativeOwnership *NativeWorkerOwnership `json:"nativeOwnership,omitempty"`
-	DeleteRequestID string                 `json:"deleteRequestId,omitempty"`
-	CommandID       string                 `json:"commandId"`
-	InstanceID      string                 `json:"instanceId"`
+	DeletionProof   *NativeOwnershipDeletionProof `json:"deletionProof,omitempty"`
+	NativeOwnership *NativeWorkerOwnership        `json:"nativeOwnership,omitempty"`
+	DeleteRequestID string                        `json:"deleteRequestId,omitempty"`
+	CommandID       string                        `json:"commandId"`
+	InstanceID      string                        `json:"instanceId"`
 }
 
 // NetworkEventPayload is an inbound work/notification for a managed agent
