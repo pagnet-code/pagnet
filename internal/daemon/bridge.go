@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/transport"
@@ -375,94 +377,58 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 				"error": "bad request (need non-empty id + tool)"})
 			continue
 		}
-		// Per-identity tool surface (S1): auth bound the connection to an
-		// instance of a kind, and dispatch enforces that kind's surface —
-		// worker connections may relay network_* ONLY, representative
-		// connections control_* ONLY. (The bridge binaries themselves
-		// register only their own surface; this is the daemon-side
-		// enforcement for a socket client that authenticates with a
-		// valid identity but calls outside its surface.)
-		surfacePrefix := "network_"
-		if row.Kind == "representative" {
-			surfacePrefix = "control_"
-		}
-		if !strings.HasPrefix(req.Tool, surfacePrefix) {
-			writeBridge(c, map[string]any{"id": req.ID, "ok": false,
-				"error": "tool " + req.Tool + " is not on this identity's surface"})
-			continue
-		}
-		if req.Args == nil {
-			req.Args = json.RawMessage("{}")
-		}
-		// V2: network_register_capabilities is handled LOCALLY by the daemon
-		// (not relayed to the server): the agent's self-declared capability
-		// set (version 1) is persisted on the instance row and reported via
-		// host.endpoint_status, from which the control plane upserts
-		// endpoint_capabilities. It carries no protected content (metadata),
-		// so it runs on any network state.
-		if req.Tool == "network_register_capabilities" {
-			result, errMsg := d.registerInstanceCapabilities(row, req.Args)
-			resp := map[string]any{"id": req.ID}
-			if errMsg == "" {
-				resp["ok"] = true
-				resp["result"] = result
-			} else {
-				resp["ok"] = false
-				resp["error"] = errMsg
-			}
-			if _, err := writeBridge(c, resp); err != nil {
-				return
-			}
-			continue
-		}
-		// E2EE (plan §12) + D6 (always-encrypted): the daemon encrypts the
-		// tool call's protected fields before they cross the cloud boundary
-		// (the server stores/relays the opaque envelope + verbatim AAD and
-		// routes on metadata without decrypting). A call that carries content
-		// on a network whose crypto is not active is refused (no plaintext
-		// path); metadata-only calls pass through unchanged.
-		resolvedArgs, encErr := d.resolveToolReferences(row, req.Tool, req.Args)
-		var encArgs json.RawMessage
-		if encErr == "" {
-			encArgs, encErr = d.encryptToolArgs(row, req.Tool, resolvedArgs)
-		}
-		if encErr != "" {
-			resp := map[string]any{"id": req.ID, "ok": false, "error": encErr}
-			if _, err := writeBridge(c, resp); err != nil {
-				return
-			}
-			continue
-		}
-		result, errMsg := d.relayToServer(row.InstanceID, row.AgentPrincipalID, req.Tool, encArgs)
+		result, errMsg := d.executeBridgeTool(row, req.Tool, req.Args, func(tool string, args json.RawMessage) (json.RawMessage, string) {
+			return d.relayToServer(row.InstanceID, row.AgentPrincipalID, tool, args)
+		})
+		resp := map[string]any{"id": req.ID, "ok": errMsg == ""}
 		if errMsg == "" {
-			result, errMsg = d.decryptMessageToolResult(row, req.Tool, result)
-		}
-		// Track the rep's active network: the daemon needs it to encrypt a
-		// rep's control tool with no explicit networkId (the server resolves
-		// the network from the rep context, but the daemon must encrypt under
-		// the same network's crypto). Any control tool that names a network
-		// explicitly updates the tracking (control_use_network, control_ask
-		// with networkId, ...).
-		if errMsg == "" && row.NetworkID == "" {
-			var nu struct {
-				NetworkID string `json:"networkId"`
-			}
-			if json.Unmarshal(req.Args, &nu) == nil && nu.NetworkID != "" {
-				d.setRepNetwork(row.InstanceID, nu.NetworkID)
-			}
-		}
-		resp := map[string]any{"id": req.ID}
-		if errMsg == "" {
-			resp["ok"] = true
 			resp["result"] = result
 		} else {
-			resp["ok"] = false
 			resp["error"] = errMsg
 		}
 		if _, err := writeBridge(c, resp); err != nil {
 			return
 		}
 	}
+}
+
+// executeBridgeTool applies the same identity surface, reference mapping and
+// encryption policy to both daemon-local and independently owned bridges.
+func (d *Daemon) executeBridgeTool(row *InstanceRow, tool string, args json.RawMessage, relay func(string, json.RawMessage) (json.RawMessage, string)) (json.RawMessage, string) {
+	prefix := "network_"
+	if row.Kind == "representative" {
+		prefix = "control_"
+	}
+	if !strings.HasPrefix(tool, prefix) {
+		return nil, "tool " + tool + " is not on this identity's surface"
+	}
+	if args == nil {
+		args = json.RawMessage("{}")
+	}
+	if tool == "network_register_capabilities" {
+		return d.registerInstanceCapabilities(row, args)
+	}
+	resolved, errMsg := d.resolveToolReferences(row, tool, args)
+	if errMsg != "" {
+		return nil, errMsg
+	}
+	encrypted, errMsg := d.encryptToolArgs(row, tool, resolved)
+	if errMsg != "" {
+		return nil, errMsg
+	}
+	result, errMsg := relay(tool, encrypted)
+	if errMsg == "" {
+		result, errMsg = d.decryptMessageToolResult(row, tool, result)
+	}
+	if errMsg == "" && row.NetworkID == "" {
+		var selected struct {
+			NetworkID string `json:"networkId"`
+		}
+		if json.Unmarshal(args, &selected) == nil && selected.NetworkID != "" {
+			d.setRepNetwork(row.InstanceID, selected.NetworkID)
+		}
+	}
+	return result, errMsg
 }
 
 // toolArgsWire renames the agent-facing bridge tool arguments onto the control
@@ -525,7 +491,6 @@ func wireArgs(tool string, args json.RawMessage) json.RawMessage {
 // so the control plane authorizes and routes on the PRINCIPAL (representative
 // re-authorization, plan §17-18), not on the instance.
 func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.RawMessage) (json.RawMessage, string) {
-	args = wireArgs(tool, args)
 	d.connMu.Lock()
 	conn := d.curConn
 	d.connMu.Unlock()
@@ -534,6 +499,16 @@ func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.R
 		// reconnecting). Concise, honest, agent-facing message.
 		return nil, errConnInterrupted
 	}
+	return d.relayToConnection(context.Background(), conn, instanceID, principalID, tool, args)
+}
+
+// relayToConnection binds native tool calls to the fresh controller socket;
+// a pending call cannot silently move to a replacement connection.
+func (d *Daemon) relayToConnection(ctx context.Context, conn *websocket.Conn, instanceID, principalID, tool string, args json.RawMessage) (json.RawMessage, string) {
+	if err := ctx.Err(); err != nil {
+		return nil, errConnInterrupted
+	}
+	args = wireArgs(tool, args)
 	env, err := transport.NewEnvelope(transport.MsgAgentRequest, transport.AgentRequestPayload{
 		InstanceID:  instanceID,
 		PrincipalID: principalID,
@@ -586,6 +561,8 @@ func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.R
 			return nil, resp.Error
 		}
 		return resp.Result, ""
+	case <-ctx.Done():
+		return nil, errConnInterrupted
 	case <-time.After(bridgeRequestTimeout):
 		return nil, "control plane did not respond (timeout)"
 	}

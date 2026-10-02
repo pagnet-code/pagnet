@@ -60,6 +60,7 @@ type Request struct {
 }
 
 type Response struct {
+	Dispatches      []NativeDispatchRecord           `json:"dispatches,omitempty"`
 	Retryable       bool                             `json:"retryable,omitempty"`
 	ObservationPage *NativeObservationPage           `json:"observationPage,omitempty"`
 	ContentFragment *transport.NativeContentFragment `json:"contentFragment,omitempty"`
@@ -432,6 +433,8 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		} else if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
 			err = o.journal.BindDispatchOwnership(ctx, lease, *req.Ownership, string(o.spec.Runtime), NativeProfileFingerprint(o.spec))
 		}
+	case "dispatches":
+		response.Dispatches, err = o.journal.DispatchRecords(ctx, lease)
 	case "dispatch_retire":
 		if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
 			err = o.journal.RetireDispatches(ctx, lease, req.Sequence)

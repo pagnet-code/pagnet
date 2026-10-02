@@ -14,15 +14,17 @@ import (
 // never launches/adopts a PID or changes an execution profile. Production
 // command routing still requires durable intent mapping and source delivery.
 type NativeWorkerProxy struct {
-	connection   *NativeObservationConnection
-	controller   *sessionworker.Controller
-	scope        sessionworker.Scope
-	profile      string
-	bootstrap    sessionworker.Bootstrap
-	done         chan struct{}
-	closeOnce    sync.Once
-	sourceMu     sync.Mutex
-	sourceCursor int64
+	connection                          *NativeObservationConnection
+	controller                          *sessionworker.Controller
+	scope                               sessionworker.Scope
+	profile                             string
+	bootstrap                           sessionworker.Bootstrap
+	done                                chan struct{}
+	closeOnce                           sync.Once
+	confirmedMu                         sync.Mutex
+	confirmedGeneration, confirmedStart string
+	sourceMu                            sync.Mutex
+	sourceCursor                        int64
 }
 
 func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnection, dir string, expected sessionworker.Scope, controllerID string) (*NativeWorkerProxy, error) {
@@ -179,5 +181,15 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 	if json.Unmarshal(snapshot.Origin, &origin) != nil {
 		return ErrNativeObservationConflict
 	}
-	return p.connection.ConfirmNativeWorkerSession(ctx, p.scope, origin, p.profile, p.Snapshot)
+	p.confirmedMu.Lock()
+	defer p.confirmedMu.Unlock()
+	if p.confirmedGeneration == snapshot.NativeGeneration && p.confirmedStart == snapshot.NativeStartIdentity {
+		return nil
+	}
+	if err := p.connection.ConfirmNativeWorkerSession(ctx, p.scope, origin, p.profile, p.Snapshot); err != nil {
+		return err
+	}
+	p.confirmedGeneration = snapshot.NativeGeneration
+	p.confirmedStart = snapshot.NativeStartIdentity
+	return nil
 }

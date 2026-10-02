@@ -241,3 +241,51 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	}
 	return tx.Commit()
 }
+
+// NativeDispatchRecord retains only immutable routing metadata and settlement.
+// It survives local outcome acknowledgement until backend retirement commits.
+type NativeDispatchRecord struct {
+	Proof             transport.NativeDispatchProof `json:"proof"`
+	OperationSequence int64                         `json:"operationSequence"`
+	State             string                        `json:"state"`
+}
+
+func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDispatchRecord, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, _, err = checkLease(ctx, tx, lease); err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM worker_dispatches ORDER BY dispatch_sequence LIMIT ?`, maxCommands)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []NativeDispatchRecord
+	for rows.Next() {
+		var r NativeDispatchRecord
+		var raw []byte
+		if err = rows.Scan(&raw, &r.OperationSequence, &r.State); err != nil {
+			return nil, err
+		}
+		if decodeClosed(raw, &r.Proof) != nil {
+			return nil, ErrConflict
+		}
+		records = append(records, r)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return records, nil
+}

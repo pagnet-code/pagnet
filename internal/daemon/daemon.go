@@ -136,6 +136,9 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
+	nativeRegistry  *NativeWorkerRegistry
+	nativeWorkersMu sync.Mutex
+	nativeWorkers   map[string]*nativeWorkerLink
 	state           *State
 	adapters        map[domain.RuntimeName]agentruntime.Adapter
 	runtimeProfiles map[string]*loadedRuntimeProfile
@@ -2170,16 +2173,14 @@ func (d *Daemon) resolveLaunchContent(p transport.LaunchAgentPayload) (mission, 
 	return doc.Mission, doc.Instruction, nil
 }
 
-func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
-	releaseAdmission := d.admitWork()
-	defer releaseAdmission()
+func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, string, bool, error) {
 	// Boundary check (SEC-407): the instance id is server-provided and
 	// becomes filesystem path components (representatives/, sessions/,
 	// contracts/, worktrees/). A non-UUID value — from a buggy or
 	// compromised control plane, or a spoofer holding a stolen host
 	// credential — must not steer paths out of the daemon state dir.
 	if _, err := domain.ParseID(p.InstanceID); err != nil {
-		return fmt.Errorf("launch command carries an invalid instance id")
+		return nil, "", false, fmt.Errorf("launch command carries an invalid instance id")
 	}
 	// E2EE launch content (W-H1): on an active private network the mission
 	// / standing instruction cross the boundary only as envelope + verbatim
@@ -2188,7 +2189,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	// (no instance registered, no turn started, no plaintext fallback).
 	mission, agentMD, err := d.resolveLaunchContent(p)
 	if err != nil {
-		return err
+		return nil, "", false, err
 	}
 	p.Mission = mission
 	p.AgentMD = agentMD
@@ -2196,14 +2197,14 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	if p.Profile != "" {
 		profile := d.runtimeProfiles[p.Profile]
 		if profile == nil {
-			return fmt.Errorf("runtime profile %q is not configured on this host", p.Profile)
+			return nil, "", false, fmt.Errorf("runtime profile %q is not configured on this host", p.Profile)
 		}
 		if rn != "" && rn != profile.config.Runtime {
-			return fmt.Errorf("runtime profile %q belongs to a different runtime", p.Profile)
+			return nil, "", false, fmt.Errorf("runtime profile %q belongs to a different runtime", p.Profile)
 		}
 		rn = profile.config.Runtime
 		if err := d.checkRuntimeProfile(&InstanceRow{InstanceID: p.InstanceID, Runtime: string(rn), Profile: p.Profile}, true); err != nil {
-			return err
+			return nil, "", false, err
 		}
 	}
 	if rn == "" {
@@ -2224,7 +2225,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			}
 		}
 		if rn == "" {
-			return fmt.Errorf("no runtime available on this host (install qwen, claude, opencode, codex, or grok)")
+			return nil, "", false, fmt.Errorf("no runtime available on this host (install qwen, claude, opencode, codex, or grok)")
 		}
 	}
 	// The runtime must be drivable on this host (an adapter OR a registered
@@ -2236,13 +2237,13 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 	// task the first turn's EnsureActive establishes it. A
 	// process-per-turn runtime runs no process until the first turn.
 	if !d.runtimeSupported(rn) {
-		return fmt.Errorf("runtime %q not supported on this host", p.Runtime)
+		return nil, "", false, fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
 	if p.Profile == "" && !d.runtimeAvailable(rn) {
 		// Fail the launch now, not at the first turn: a host without the
 		// runtime CLI must not ack a clean launch and idle until work
 		// arrives.
-		return fmt.Errorf("runtime %q is not installed on this host", p.Runtime)
+		return nil, "", false, fmt.Errorf("runtime %q is not installed on this host", p.Runtime)
 	}
 	access := p.Access
 	if access != domain.AccessReadOnly {
@@ -2258,11 +2259,11 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		// stable runtime directory inside the daemon state.
 		wsPath = filepath.Join(d.StateDir, "representatives", p.InstanceID)
 		if err := os.MkdirAll(wsPath, 0o700); err != nil {
-			return err
+			return nil, "", false, err
 		}
 	} else {
 		if !d.workspaceAllowed(p.WorkspacePath) {
-			return fmt.Errorf("workspace %q is not under an allowed root", p.WorkspacePath)
+			return nil, "", false, fmt.Errorf("workspace %q is not under an allowed root", p.WorkspacePath)
 		}
 		// §29 race: the "first RW agent keeps the checkout" decision and
 		// the instance registration below must be atomic per repository —
@@ -2279,7 +2280,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		wsPath, err = d.resolveWorkspace(p, access)
 		if err != nil {
 			lock.Unlock()
-			return err
+			return nil, "", false, err
 		}
 		worktree = wsPath != p.WorkspacePath
 		// CWD override: run the agent in a subdirectory of the workspace
@@ -2290,7 +2291,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 			wsPath, err = d.applyCWD(p.WorkspacePath, wsPath, p.CWD)
 			if err != nil {
 				lock.Unlock()
-				return err
+				return nil, "", false, err
 			}
 		}
 	}
@@ -2326,7 +2327,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		if lock != nil {
 			lock.Unlock()
 		}
-		return err
+		return nil, "", false, err
 	} else {
 		row.AgentMDPath = path
 	}
@@ -2334,11 +2335,25 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		if lock != nil {
 			lock.Unlock()
 		}
-		return err
+		return nil, "", false, err
 	}
 	if lock != nil {
 		lock.Unlock()
 	}
+	return &row, p.Mission, worktree, nil
+}
+
+func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) error {
+	releaseAdmission := d.admitWork()
+	defer releaseAdmission()
+	prepared, mission, worktree, err := d.prepareLaunch(p)
+	if err != nil {
+		return err
+	}
+	row := *prepared
+	rn := domain.RuntimeName(row.Runtime)
+	p.Mission = mission
+
 	// A session-driven runtime establishes its runtime/session at launch
 	// (the endpoint is activated below when no initial task is given); a
 	// process-per-turn runtime runs no process until work arrives.
@@ -2354,7 +2369,7 @@ func (d *Daemon) doLaunch(conn *websocket.Conn, p transport.LaunchAgentPayload) 
 		}
 	}
 	d.Log.Info(msg,
-		"instance", p.InstanceID, "runtime", rn, "workspace", wsPath, "access", access)
+		"instance", p.InstanceID, "runtime", rn, "workspace", row.Workspace, "access", row.Access)
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": p.InstanceID})
 	// V2: report the managed agent's endpoint liveness (online — it is now
 	// idle and can accept work), carrying the agent principal + declared

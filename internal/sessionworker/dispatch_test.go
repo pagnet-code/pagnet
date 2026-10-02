@@ -224,3 +224,40 @@ func TestDispatchCanonicalInputBindsOriginalTaskAndAdmission(t *testing.T) {
 		}
 	}
 }
+
+func TestDispatchRecordsRetainSettledMappingUntilBackendRetirement(t *testing.T) {
+	j, err := OpenJournal(filepath.Join(t.TempDir(), "worker"), testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	a := lease(t, j)
+	o := dispatchOwnership(t, j, a)
+	p := dispatchProof(o, 1)
+	out, _, err := j.admitDispatch(t.Context(), a, 0, p.SourceCommandID, "prompt", json.RawMessage(`{"input":"original"}`), func() (*Admission, error) {
+		return &Admission{Scope: j.scope, NativeAdmissionID: p.SourceAdmissionID, RunnerID: p.SourceRunnerID, RunnerEpoch: p.SourceRunnerEpoch, BootID: p.SourceBootID}, nil
+	}, &p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Settle(t.Context(), out.Sequence, "completed", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Acknowledge(t.Context(), a, out.Sequence); err != nil {
+		t.Fatal(err)
+	}
+	records, err := j.DispatchRecords(t.Context(), a)
+	if err != nil || len(records) != 1 || records[0].Proof != p || records[0].OperationSequence != out.Sequence || records[0].State != "completed" {
+		t.Fatal("settled original mapping lost", records, err)
+	}
+	b := lease(t, j)
+	if _, err = j.DispatchRecords(t.Context(), a); !errors.Is(err, ErrFenced) {
+		t.Fatal("old controller read retained records", err)
+	}
+	if err = j.RetireDispatches(t.Context(), b, 1); err != nil {
+		t.Fatal(err)
+	}
+	if records, err = j.DispatchRecords(t.Context(), b); err != nil || len(records) != 0 {
+		t.Fatal("retired mapping remains", err)
+	}
+}
