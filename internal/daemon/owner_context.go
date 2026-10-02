@@ -84,6 +84,9 @@ func (d *Daemon) doPrepareProtectedContext(p transport.PrepareProtectedContextPa
 		return nil, errors.New("protected context binding invalid")
 	}
 	row, ok, err := d.state.GetInstance(p.InstanceID)
+	if err == nil && !ok && d.nativeRegistry != nil {
+		return nil, ErrDeferred
+	}
 	if err != nil || !ok || row.NetworkID != "" {
 		return nil, errors.New("protected context instance unavailable")
 	}

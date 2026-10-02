@@ -137,12 +137,13 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	nativeRegistry  *NativeWorkerRegistry
-	nativeWorkersMu sync.Mutex
-	nativeWorkers   map[string]*nativeWorkerLink
-	state           *State
-	adapters        map[domain.RuntimeName]agentruntime.Adapter
-	runtimeProfiles map[string]*loadedRuntimeProfile
+	nativeRegistry     *NativeWorkerRegistry
+	nativeWorkersMu    sync.Mutex
+	nativeConnectLocks [16]sync.Mutex
+	nativeWorkers      map[string]*nativeWorkerLink
+	state              *State
+	adapters           map[domain.RuntimeName]agentruntime.Adapter
+	runtimeProfiles    map[string]*loadedRuntimeProfile
 
 	// selfExe is this process's canonicalized own executable path,
 	// resolved ONCE at construction (New). The agent runtimes spawn the
@@ -1474,6 +1475,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error {
 				if p.NativeDispatch != nil {
+					if p.NativeDispatch.SourceCommandID != p.CommandID {
+						return ErrNativeObservationConflict
+					}
 					mission, _, err := d.resolveLaunchContent(p)
 					if err != nil {
 						return err
@@ -1503,6 +1507,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error {
 				if p.NativeDispatch != nil {
+					if p.NativeDispatch.SourceCommandID != p.CommandID {
+						return ErrNativeObservationConflict
+					}
 					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "stop", sessionworker.Operation{})
 				}
 				if d.nativeOwned(p.InstanceID) {
@@ -1524,6 +1531,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
 			d.guarded(conn, p.CommandID, func() error {
 				if p.NativeDispatch != nil {
+					if p.NativeDispatch.SourceCommandID != p.CommandID {
+						return ErrNativeObservationConflict
+					}
 					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "restart", sessionworker.Operation{InputKind: "wake"})
 				}
 				if d.nativeOwned(p.InstanceID) {
@@ -1543,6 +1553,9 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		d.enqueueCommand(conn, p.InstanceID, p.WakeRequestID, func() {
 			d.guarded(conn, p.WakeRequestID, func() error {
 				if p.NativeDispatch != nil {
+					if p.NativeDispatch.SourceCommandID != p.WakeRequestID {
+						return ErrNativeObservationConflict
+					}
 					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "activate", sessionworker.Operation{InputKind: "wake"})
 				}
 				if d.nativeOwned(p.InstanceID) {

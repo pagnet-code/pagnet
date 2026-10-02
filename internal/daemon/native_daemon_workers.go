@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"path/filepath"
 	"sync"
 	"time"
@@ -194,6 +195,11 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 }
 
 func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObservationConnection, record NativeWorkerRecord) error {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(record.Scope.InstanceID))
+	lock := &d.nativeConnectLocks[hash.Sum32()%uint32(len(d.nativeConnectLocks))]
+	lock.Lock()
+	defer lock.Unlock()
 	if existing, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err == nil && existing.scope == record.Scope {
 		return nil
 	}
@@ -314,12 +320,46 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 		if err != nil {
 			return
 		}
+		jobs := make(chan NativeWorkerRecord, 16)
+		var workers sync.WaitGroup
+		for range 16 {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for record := range jobs {
+					select {
+					case <-connection.closed:
+						return
+					case <-d.turnCtx.Done():
+						return
+					default:
+					}
+					if _, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err != nil {
+						_ = d.connectNativeWorker(conn, connection, record)
+					}
+				}
+			}()
+		}
+		stopped := false
 		for _, record := range records {
 			if _, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err == nil {
 				continue
 			}
-			original := record
-			d.enqueueInstance(original.Scope.InstanceID, func() { _ = d.connectNativeWorker(conn, connection, original) })
+			select {
+			case jobs <- record:
+			case <-connection.closed:
+				stopped = true
+			case <-d.turnCtx.Done():
+				stopped = true
+			}
+			if stopped {
+				break
+			}
+		}
+		close(jobs)
+		workers.Wait()
+		if stopped {
+			return
 		}
 		select {
 		case <-d.turnCtx.Done():
