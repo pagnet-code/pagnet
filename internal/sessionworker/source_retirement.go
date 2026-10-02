@@ -104,15 +104,19 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 	}
 	defer tx.Rollback()
 	var pending, total int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&pending, &total); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&pending, &total); err != nil {
 		return nil, err
 	}
 	var unmarked int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
 		return nil, err
 	}
+	terminalRows, terminalBytes, _, err := terminalReservationsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	reserved := j.sourceStopReservationsLocked() + 1
-	if pending+reserved > maxPendingObservations || total+unmarked*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
+	if pending+reserved+terminalRows > maxPendingObservations || total+unmarked*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes+terminalBytes > maxPendingObservationBytes {
 		return nil, ErrFull
 	}
 	var count int
@@ -173,10 +177,10 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE completed=1 AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.quiesced=1 AND r.native_generation=t.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE completed=1 AND NOT EXISTS(SELECT 1 FROM worker_terminal_reservations q WHERE q.sequence=t.sequence) AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions q WHERE q.sequence=t.sequence) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=t.sequence) AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.quiesced=1 AND r.native_generation=t.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT r.origin_id FROM worker_source_registration r WHERE r.quiesced=1 AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.origin.id')=r.origin_id OR json_extract(o.payload,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_intent w WHERE json_valid(w.result) AND json_extract(w.result,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observation_sequence s WHERE s.origin_id=r.origin_id) AND NOT EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_source_captures c LEFT JOIN worker_observations o ON o.id=c.id WHERE o.id IS NULL) AND NOT EXISTS(SELECT 1 FROM worker_content_fragments f LEFT JOIN worker_observations o ON o.id=f.observation_id WHERE o.id IS NULL) ORDER BY r.origin_id LIMIT 32`)
+	rows, err := tx.QueryContext(ctx, `SELECT r.origin_id FROM worker_source_registration r WHERE r.quiesced=1 AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions q WHERE q.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.origin.id')=r.origin_id OR json_extract(o.payload,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_intent w WHERE json_valid(w.result) AND json_extract(w.result,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observation_sequence s WHERE s.origin_id=r.origin_id) AND NOT EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_source_captures c LEFT JOIN worker_observations o ON o.id=c.id WHERE o.id IS NULL) AND NOT EXISTS(SELECT 1 FROM worker_content_fragments f LEFT JOIN worker_observations o ON o.id=f.observation_id WHERE o.id IS NULL) ORDER BY r.origin_id LIMIT 32`)
 	if err != nil {
 		return err
 	}

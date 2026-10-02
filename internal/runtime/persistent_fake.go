@@ -660,6 +660,9 @@ func (e *persistEndpoint) readLoop() {
 		}
 		if e.nativeObserver != nil {
 			if err := e.nativeObserver(norm); err != nil {
+				if errors.Is(err, session.ErrNativeResourceLimit) && e.h != nil {
+					_ = e.h.Terminate("native-source-resource-limit")
+				}
 				break
 			}
 		}

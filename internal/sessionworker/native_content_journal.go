@@ -94,7 +94,11 @@ func insertOriginalTransfer(ctx context.Context, tx *sql.Tx, observation NativeO
 		rows[i] = raw
 		retained += int64(len(raw))
 	}
-	if retained > maxWorkerContentBytes {
+	_, _, reserved, err := terminalReservationsTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if retained+int64(reserved) > maxWorkerContentBytes {
 		return ErrFull
 	}
 	for i, raw := range rows {

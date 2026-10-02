@@ -615,7 +615,7 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 					kindOr(cmd.InputKind, "turn"), mem.key, mem.key)
 			}
 		}
-		emit(persistEvent{Event: "runtime.turn.output", TurnID: cmd.TurnID, SessionID: prev.SessionID, Output: out})
+		emitPersistentOutput(emit, cmd.TurnID, prev.SessionID, out)
 		prev.Turns++
 		prev.LastInput = firstLine(cmd.Input)
 		capturePersistentInput(prev, cmd.Input)
@@ -682,7 +682,13 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 		full := strings.Repeat(cmd.Input, repeat)
 		out = fmt.Sprintf("[fake-persist %s] handled %s: %s", kindOr(cmd.InputKind, "turn"), full, full)
 	}
-	emit(persistEvent{Event: "runtime.turn.output", TurnID: cmd.TurnID, SessionID: prev.SessionID, Output: out})
+	if os.Getenv("PAGNET_FAKE_FULL_OUTPUT") == "1" {
+		out = fmt.Sprintf("[fake-persist %s] handled %s: %s", kindOr(cmd.InputKind, "turn"), cmd.Input, cmd.Input)
+	}
+	if repeat, err := strconv.Atoi(os.Getenv("PAGNET_FAKE_OUTPUT_REPEAT")); err == nil && repeat > 1 && repeat <= 256 && len(out)*repeat <= 32<<20 {
+		out = strings.Repeat(out, repeat)
+	}
+	emitPersistentOutput(emit, cmd.TurnID, prev.SessionID, out)
 
 	// Persist the session (materialises it on the first exchange).
 	prev.Turns++
@@ -703,5 +709,25 @@ func capturePersistentInput(s *session, input string) {
 	s.CapturedInput = ""
 	if os.Getenv("PAGNET_FAKE_CAPTURE_INPUT") == "1" {
 		s.CapturedInput = input
+	}
+}
+
+// Explicit synthetic parser-delta fixture. This remains genuine native process
+// output, including its exact concatenation; no worker observation is invented.
+func emitPersistentOutput(emit func(persistEvent), turn, sid, output string) {
+	size, err := strconv.Atoi(os.Getenv("PAGNET_FAKE_OUTPUT_CHUNK_BYTES"))
+	if err != nil || size < 1 || size > 64<<10 {
+		size = len(output)
+	}
+	for len(output) > 0 {
+		end := min(size, len(output))
+		for end < len(output) && end > 0 && output[end]&0xc0 == 0x80 {
+			end--
+		}
+		if end == 0 {
+			end = min(size, len(output))
+		}
+		emit(persistEvent{Event: "runtime.turn.output", TurnID: turn, SessionID: sid, Output: output[:end]})
+		output = output[end:]
 	}
 }

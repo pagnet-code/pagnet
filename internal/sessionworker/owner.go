@@ -94,6 +94,7 @@ type SessionOwner struct {
 	candidateCommandID       string
 	candidateTurnSource      NativeTurnSource
 	taskContentPins          map[string]nativeTaskContentPin
+	outputMu                 sync.Mutex
 	terminal                 *os.File
 	pending                  map[string]*nativeApproval
 	fatal                    error
@@ -208,6 +209,12 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 		denied = append(denied, spec.NetworkStateDir)
 	}
 	owner.manager.SetSandboxDenied(owner.sess, denied)
+	if err := owner.recoverCapturedNativeOutput(); err != nil {
+		cancel()
+		sup.StopAll(5 * time.Second)
+		clear(owner.captureKey)
+		return nil, err
+	}
 	return owner, nil
 }
 

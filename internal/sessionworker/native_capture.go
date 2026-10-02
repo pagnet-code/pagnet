@@ -2,6 +2,7 @@ package sessionworker
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
+	"io"
 	"path/filepath"
 )
 
@@ -24,6 +26,7 @@ const maxPrivateSourceBytes = 20 << 20
 const NativeSourceCaptureFormat = "pagnet.worker-native-source.v2"
 
 type NativeSourceCapture struct {
+	OutputStream                 *NativeOutputStreamProof          `json:"outputStream,omitempty"`
 	OriginalTurnOutputContent    *transport.NativeContentReference `json:"originalTurnOutputContent,omitempty"`
 	OriginalTurnPlanContent      *transport.NativeContentReference `json:"originalTurnPlanContent,omitempty"`
 	Format                       string                            `json:"format"`
@@ -78,6 +81,7 @@ func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error)
 func captureAAD(scope Scope, directory string, observation NativeObservation) ([]byte, error) {
 	// Origin bytes are retained exactly, rather than reconstructed on retry.
 	return canonicalNativeJSON(struct {
+		ResourceInterruption              *transport.NativeResourceInterruption `json:",omitempty"`
 		OriginalNativePayloadContent      *transport.NativeContentReference
 		TurnSource                        *NativeTurnSource
 		SourceUnavailable                 bool
@@ -92,7 +96,8 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 		OutputContent                     *transport.NativeContentReference `json:",omitempty"`
 		PlanContent                       *transport.NativeContentReference `json:",omitempty"`
 		SourceContentUnavailable          bool                              `json:",omitempty"`
-	}{observation.OriginalNativePayloadContent, observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v2", 2, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), observation.OutputContent, observation.PlanContent, observation.SourceContentUnavailable})
+		OutputStream                      *NativeOutputStreamProof          `json:",omitempty"`
+	}{observation.ResourceInterruption, observation.OriginalNativePayloadContent, observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v2", 2, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), observation.OutputContent, observation.PlanContent, observation.SourceContentUnavailable, observation.OutputStream})
 }
 
 func sealNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
@@ -103,6 +108,23 @@ func sealNativeCapture(key []byte, scope Scope, directory string, observation Na
 	defer clear(raw)
 	if len(raw) > maxPrivateSourceBytes {
 		return nil, nil, errors.New("private native source exceeds pending capture bound")
+	}
+	version := 2
+	if observation.OutputStream != nil {
+		version = 3
+		var compressed bytes.Buffer
+		writer, err := gzip.NewWriterLevel(&compressed, gzip.BestSpeed)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err = writer.Write(raw); err != nil {
+			return nil, nil, err
+		}
+		if err = writer.Close(); err != nil {
+			return nil, nil, err
+		}
+		raw = compressed.Bytes()
+		defer clear(raw)
 	}
 	aead, err := captureAEAD(key, scope, directory)
 	if err != nil {
@@ -118,14 +140,14 @@ func sealNativeCapture(key []byte, scope Scope, directory string, observation Na
 	}
 	encrypted := aead.Seal(nonce, nonce, raw, aad)
 	digest := sha256.Sum256(encrypted)
-	return &NativeCaptureRef{Version: 2, CiphertextBytes: len(encrypted), CiphertextDigest: hex.EncodeToString(digest[:])}, encrypted, nil
+	return &NativeCaptureRef{Version: version, CiphertextBytes: len(encrypted), CiphertextDigest: hex.EncodeToString(digest[:])}, encrypted, nil
 }
 
 // OpenNativeCapture is controller-local. Nothing here authorizes publication or
 // native actuation; the exact original source is authenticated before use.
 func OpenNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, encrypted []byte) (json.RawMessage, error) {
 	ref := observation.Capture
-	if ref == nil || ref.Version != 2 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 {
+	if ref == nil || (ref.Version != 2 && ref.Version != 3) || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 {
 		return nil, errors.New("invalid private capture reference")
 	}
 	digest := sha256.Sum256(encrypted)
@@ -146,6 +168,25 @@ func OpenNativeCapture(key []byte, scope Scope, directory string, observation Na
 	raw, err := aead.Open(nil, encrypted[:aead.NonceSize()], encrypted[aead.NonceSize():], aad)
 	if err != nil {
 		return nil, err
+	}
+	if ref.Version == 3 {
+		if observation.OutputStream == nil {
+			clear(raw)
+			return nil, ErrConflict
+		}
+		reader, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			clear(raw)
+			return nil, err
+		}
+		decoded, err := io.ReadAll(io.LimitReader(reader, maxPrivateSourceBytes+1))
+		_ = reader.Close()
+		clear(raw)
+		if err != nil || len(decoded) > maxPrivateSourceBytes {
+			clear(decoded)
+			return nil, ErrConflict
+		}
+		raw = decoded
 	}
 	if !json.Valid(raw) {
 		clear(raw)
@@ -200,7 +241,7 @@ func verifyCapture(ref *NativeCaptureRef, encrypted []byte) error {
 		}
 		return nil
 	}
-	if ref.Version != 2 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 || len(encrypted) < 28 {
+	if (ref.Version != 2 && ref.Version != 3) || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 || len(encrypted) < 28 {
 		return errors.New("invalid private source capture")
 	}
 	digest := sha256.Sum256(encrypted)
@@ -223,7 +264,7 @@ func (j *Journal) initializeCaptures() error {
 		return errors.New("orphaned private source capture")
 	}
 	var count, size int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_source_captures`).Scan(&count, &size); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_source_captures`).Scan(&count, &size); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || size > maxPendingObservationBytes {

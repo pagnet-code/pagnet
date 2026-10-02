@@ -110,14 +110,18 @@ func (j *Journal) RecordNativeSourceDisposition(ctx context.Context, lease int64
 		return err
 	}
 	var total int
-	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)`).Scan(&total); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)`).Scan(&total); err != nil {
 		return err
 	}
 	var unmarked int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
 		return err
 	}
-	if total+len(raw)+(unmarked-1)*sourceDispositionReserveBytes+j.sourceStopReservationsLocked()*sourceStopReserveBytes > maxPendingObservationBytes {
+	_, reserved, _, err := terminalReservationsTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if total+len(raw)+(unmarked-1)*sourceDispositionReserveBytes+j.sourceStopReservationsLocked()*sourceStopReserveBytes+reserved > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_dispositions VALUES(?,?,?,?)`, id, digest, raw, len(raw)); err != nil {

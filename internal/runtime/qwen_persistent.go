@@ -1141,6 +1141,9 @@ func (e *qwenEndpoint) handleEventLine(line []byte) {
 func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 	if e.nativeObserver != nil {
 		if err := e.nativeObserver(ev); err != nil {
+			if errors.Is(err, session.ErrNativeResourceLimit) && e.h != nil {
+				_ = e.h.Terminate("native-source-resource-limit")
+			}
 			return
 		}
 	}

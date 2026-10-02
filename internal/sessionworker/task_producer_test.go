@@ -50,6 +50,16 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	if err = j.BindNativeTurn(ctx, source); err != nil {
 		t.Fatal(err)
 	}
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = j.reserveTerminalTx(ctx, tx, source.Sequence, "prompt"); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	owner.pinOriginalTaskContent(source)
 	registration := owner.nativeEventRegistration(scope.InstanceID)
 	emit := func(event session.SessionEvent) {
@@ -79,7 +89,7 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 		t.Fatal("terminal/retired producer retained task key")
 	}
 	rows, err := j.PendingObservations(ctx, 32)
-	if err != nil || len(rows) != 4 {
+	if err != nil || len(rows) != 5 {
 		t.Fatal("native text/plan capture invented or dropped events", err, len(rows))
 	}
 	for i, o := range rows {
@@ -87,7 +97,7 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 			t.Fatal("original source or sequence changed")
 		}
 	}
-	if rows[1].OutputContent == nil || rows[2].PlanContent == nil || rows[1].Event.Output != "" || rows[2].Event.Plan != nil {
+	if rows[1].OutputContent == nil || rows[3].PlanContent == nil || rows[1].Event.Output != "" || rows[3].Event.Plan != nil {
 		t.Fatal("private task content projection leaked or lost original references")
 	}
 	originals := make([][]byte, len(rows))
@@ -104,10 +114,11 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	defer j.Close()
 	current = lease(t, j)
 	rows, err = j.PendingObservationsForLease(ctx, current, 32)
-	if err != nil || len(rows) != 4 {
+	if err != nil || len(rows) != 5 {
 		t.Fatal(err)
 	}
 	key, _ := epoch.KeyArray()
+	var reconstructed bytes.Buffer
 	for i, o := range rows {
 		raw, _ := json.Marshal(o)
 		if !bytes.Equal(raw, originals[i]) {
@@ -135,8 +146,14 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 		if err != nil {
 			t.Fatal(err)
 		}
-		if o.OutputContent != nil && (!bytes.Equal(opened, secret) || mime != "text/plain; charset=utf-8") {
-			t.Fatal("full original native text changed")
+		if o.OutputContent != nil {
+			if mime != "text/plain; charset=utf-8" {
+				t.Fatal("original text MIME changed")
+			}
+			if o.OutputStream == nil || o.OutputStream.ByteOffset != int64(reconstructed.Len()) || o.OutputStream.ByteLength != len(opened) {
+				t.Fatal("original captured batch order/provenance lost")
+			}
+			reconstructed.Write(opened)
 		}
 		if o.PlanContent != nil {
 			var recovered session.PlanSnapshot
@@ -155,6 +172,9 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 		if original.Event.Output != "" || original.Event.Plan != nil {
 			t.Fatal("source duplicated full content instead of authenticated complete reference")
 		}
+	}
+	if !bytes.Equal(reconstructed.Bytes(), secret) {
+		t.Fatal("full original concatenated native text changed")
 	}
 	for _, name := range []string{"intents.sqlite", "intents.sqlite-wal"} {
 		raw, _ := os.ReadFile(filepath.Join(dir, name))

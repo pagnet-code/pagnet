@@ -136,6 +136,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if protocol != Protocol || stored != string(encoded) {
 		return fail(errors.New("worker journal scope or protocol mismatch"))
 	}
+	if err = j.initializeOutputSpools(); err != nil {
+		return fail(err)
+	}
 	if err = j.initializeObservations(); err != nil {
 		return fail(err)
 	}
@@ -146,6 +149,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 		return fail(err)
 	}
 	if err = j.initializeContentTransfers(); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeTerminalReservations(); err != nil {
 		return fail(err)
 	}
 	if err = j.initializeTurnSources(); err != nil {
@@ -355,6 +361,11 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	}
 	if count >= maxCommands {
 		return out, false, ErrFull
+	}
+	if out.SourceAdmission != nil {
+		if err = j.reserveTerminalTx(ctx, tx, sequence, kind); err != nil {
+			return out, false, err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_intent(sequence,command_id,digest,kind,state) VALUES(?,?,?,?,'admitted')`, sequence, commandID, digest, kind); err != nil {
 		return out, false, fmt.Errorf("intent identity conflict: %w", err)

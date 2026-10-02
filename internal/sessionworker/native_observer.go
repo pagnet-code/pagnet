@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/nativecontent"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // The factory runs before the endpoint reader starts. Each closure retains the
@@ -25,12 +26,22 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		generation = producer.generation
 		origin = append(json.RawMessage(nil), producer.origin...)
 	}
-	return func(event session.SessionEvent) error {
+	observer, _ := o.nativeCapturedSourceObservers(instanceID, producer, generation, origin)
+	return observer
+}
+
+// Recovery can project only an already FULL-captured encrypted tail. It does
+// not register a producer or authorize native callbacks for its old generation.
+func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer *nativeSourceProducer, generation string, origin json.RawMessage) (session.NativeEventObserver, nativeOutputProjectionObserver) {
+	observe := func(event session.SessionEvent, stream *NativeOutputStreamProof, projection *outputSpoolProjection) error {
 		observeCtx := o.ctx
-		if event.Type == session.EventSessionStopped {
+		if stream != nil || event.Type == session.EventSessionStopped || event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed {
 			var cancel context.CancelFunc
 			observeCtx, cancel = context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
 			defer cancel()
+		}
+		if projection != nil && projection.Ready != nil {
+			return o.commitReadyNativeOutput(observeCtx, producer, projection)
 		}
 		observedAt := time.Now().UTC()
 		o.mu.Lock()
@@ -52,10 +63,20 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		}
 		originalEvent := event
 		var transfers []nativecontent.Transfer
-		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
+		observation := NativeObservation{OutputStream: stream, outputProjection: projection, ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
 		source, unavailable, err := o.journal.NativeEventSource(observeCtx, generation, event)
 		if err != nil {
 			return err
+		}
+		if stream != nil {
+			observation.ID = stream.BatchID
+			observation.ObservedAt = stream.FirstObservedAt
+		}
+		if event.Type == session.EventSessionStopped {
+			observation.ResourceInterruption, err = o.journal.nativeResourceInterruption(observeCtx, generation)
+			if err != nil {
+				return err
+			}
 		}
 		observation.TurnSource = source
 		observation.SourceUnavailable = unavailable
@@ -100,7 +121,7 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			copy.Answer = ""
 			event.Interaction = &copy
 		}
-		captureSource := NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent, OriginalTurnOutputContent: observation.OutputContent, OriginalTurnPlanContent: observation.PlanContent}
+		captureSource := NativeSourceCapture{OutputStream: stream, Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent, OriginalTurnOutputContent: observation.OutputContent, OriginalTurnPlanContent: observation.PlanContent}
 		if observation.OutputContent != nil {
 			captureSource.Event.Output = ""
 		}
@@ -146,6 +167,14 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			return err
 		}
 		observation.SourceDigest = digest
+		if projection != nil {
+			ready := &nativeOutputReady{Observation: observation, Capture: encrypted, Transfers: transfers, Remaining: projection.Remaining}
+			ready.Observation.outputProjection = nil
+			if err = o.journal.prepareOutputReady(observeCtx, o.captureKey, projection, ready); err != nil {
+				return err
+			}
+			return o.commitReadyNativeOutput(observeCtx, producer, projection)
+		}
 		if err = o.journal.pinSourceRetry(observation.ID, digest); err != nil {
 			return err
 		}
@@ -156,6 +185,9 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			err = o.journal.journalCapturedObservation(observeCtx, producer, observation, encrypted, transfers...)
 			if err == nil {
 				break
+			}
+			if nativeSourceResourceLimit(err) {
+				return err
 			}
 			o.mu.Lock()
 			o.observationBlocked = err
@@ -221,6 +253,52 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		}
 		return nil
 	}
+	observer := func(event session.SessionEvent) error {
+		o.outputMu.Lock()
+		defer o.outputMu.Unlock()
+		o.journal.mu.Lock()
+		fenced := producer != nil && (producer.closed || !o.journal.sourceProducers[producer])
+		o.journal.mu.Unlock()
+		if fenced {
+			return ErrFenced
+		}
+		if (event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed) && len(event.Output) > transport.NativeContentMaxPlaintextBytes {
+			source, _, err := o.journal.NativeEventSource(context.WithoutCancel(o.ctx), generation, event)
+			if err != nil {
+				return err
+			}
+			return o.nativeOutputResourceLimit(producer, source, ErrNativeOutputLimit)
+		}
+		if event.Type == session.EventTurnOutput && event.NativeOutput {
+			captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
+			defer captureCancel()
+			source, unavailable, err := o.journal.NativeEventSource(captureCtx, generation, event)
+			if err != nil {
+				return err
+			}
+			if source != nil && !unavailable && source.SourceCommandID != "" && source.SourceAdmissionID != "" {
+				err := o.observeOutputDelta(producer, *source, event, observe)
+				if nativeSourceResourceLimit(err) {
+					return o.nativeOutputResourceLimit(producer, source, err)
+				}
+				return err
+			}
+		} else if durableNativeEvent(event) {
+			if err := o.flushNativeOutputGeneration(generation, observe); err != nil {
+				return err
+			}
+		}
+		err := observe(event, nil, nil)
+		if nativeSourceResourceLimit(err) {
+			source, _, sourceErr := o.journal.NativeEventSource(context.WithoutCancel(o.ctx), generation, event)
+			if sourceErr != nil {
+				return sourceErr
+			}
+			return o.nativeOutputResourceLimit(producer, source, err)
+		}
+		return err
+	}
+	return observer, observe
 }
 
 // Origin.ID is authority minted; fixed semantic fields avoid raw-JSON field

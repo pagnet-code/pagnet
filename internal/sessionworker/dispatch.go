@@ -240,7 +240,7 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 		return ErrConflict
 	}
 	var unsafe int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed') OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=d.operation_sequence AND v.committed=0) OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed') OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=d.operation_sequence AND v.committed=0) OR EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_resource_interruptions r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
 		return err
 	}
 	if unsafe != 0 {

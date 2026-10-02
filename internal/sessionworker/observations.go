@@ -26,6 +26,9 @@ type NativeResolution struct {
 	DetailAAD      e2ee.AAD                          `json:"detailAAD"`
 }
 type NativeObservation struct {
+	ResourceInterruption     *transport.NativeResourceInterruption `json:"resourceInterruption,omitempty"`
+	outputProjection         *outputSpoolProjection
+	OutputStream             *NativeOutputStreamProof          `json:"outputStream,omitempty"`
 	OutputContent            *transport.NativeContentReference `json:"outputContent,omitempty"`
 	PlanContent              *transport.NativeContentReference `json:"planContent,omitempty"`
 	SourceContentUnavailable bool                              `json:"sourceContentUnavailable,omitempty"`
@@ -67,7 +70,7 @@ func (j *Journal) initializeObservations() error {
 		return err
 	}
 	var count, bytes int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&count, &bytes); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&count, &bytes); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || bytes > maxPendingObservationBytes {
@@ -121,7 +124,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if j.strictSourceProducer && (producer == nil || producer.closed || !j.sourceProducers[producer] || producer.generation != observation.NativeGeneration || !producer.owns(observation.Origin)) {
+	if j.strictSourceProducer && observation.outputProjection == nil && (producer == nil || producer.closed || !j.sourceProducers[producer] || producer.generation != observation.NativeGeneration || !producer.owns(observation.Origin)) {
 		return ErrFenced
 	}
 	tx, err := j.db.BeginTx(ctx, nil)
@@ -155,11 +158,47 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		}
 	}
 	var count, total int
-	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&count, &total); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
 	var unmarked int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
+		return err
+	}
+	if observation.outputProjection != nil {
+		projection := observation.outputProjection
+		if observation.TurnSource == nil || observation.OutputStream == nil || projection.Sequence != observation.TurnSource.Sequence || projection.Generation != observation.NativeGeneration || observation.OutputStream.BatchID != observation.ID || observation.Event.Type != session.EventTurnOutput || !observation.Event.NativeOutput {
+			return ErrConflict
+		}
+		if err = j.projectOutputSpoolTx(ctx, tx, observation.outputProjection); err != nil {
+			return err
+		}
+		// The original tail was included in total above; replace its contribution.
+		var tailBytes int
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0) FROM worker_output_spools`).Scan(&tailBytes); err != nil {
+			return err
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&total); err != nil {
+			return err
+		}
+		total += tailBytes
+	}
+	contentBytes := 0
+	for _, transfer := range transfers {
+		for _, fragment := range transfer.Fragments {
+			encoded, marshalErr := json.Marshal(fragment)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			contentBytes += len(encoded)
+		}
+	}
+	_, err = consumeTerminalReservationTx(ctx, tx, observation, len(raw)+len(encrypted)+sourceDispositionReserveBytes, contentBytes)
+	if err != nil {
+		return err
+	}
+	termRows, termBytes, _, err := terminalReservationsTx(ctx, tx)
+	if err != nil {
 		return err
 	}
 	reserved := j.sourceStopReservationsLocked()
@@ -170,7 +209,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 			return ErrFull
 		}
 	}
-	if count+reserved >= maxPendingObservations || total+len(raw)+len(encrypted)+(unmarked+1)*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
+	if count+reserved+termRows >= maxPendingObservations || total+len(raw)+len(encrypted)+(unmarked+1)*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes+termBytes > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {
@@ -323,6 +362,12 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_source_captures WHERE id=?`, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_output_spools WHERE sequence IN(SELECT sequence FROM worker_terminal_reservations WHERE observation_id=?)`, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_reservations WHERE observation_id=?`, id); err != nil {
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `DELETE FROM worker_observations WHERE id=? AND digest=?`, id, digest)

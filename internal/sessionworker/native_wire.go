@@ -55,15 +55,22 @@ func NativeBackendObservation(o NativeObservation) (transport.NativeObservationP
 			return transport.NativeObservationPayload{}, ErrConflict
 		}
 		p := struct {
-			InstanceID       string `json:"instanceId"`
-			NativeGeneration string `json:"nativeGeneration"`
-			Runtime          string `json:"runtime"`
-			SessionID        string `json:"sessionId"`
-			SourceSequence   int64  `json:"sourceSequence"`
-			Status           string `json:"status,omitempty"`
-			State            string `json:"state,omitempty"`
-			Resumed          bool   `json:"resumed,omitempty"`
+			InstanceID           string                                `json:"instanceId"`
+			NativeGeneration     string                                `json:"nativeGeneration"`
+			Runtime              string                                `json:"runtime"`
+			SessionID            string                                `json:"sessionId"`
+			SourceSequence       int64                                 `json:"sourceSequence"`
+			Status               string                                `json:"status,omitempty"`
+			State                string                                `json:"state,omitempty"`
+			Resumed              bool                                  `json:"resumed,omitempty"`
+			ResourceInterruption *transport.NativeResourceInterruption `json:"resourceInterruption,omitempty"`
 		}{InstanceID: origin.InstanceID, NativeGeneration: o.NativeGeneration, Runtime: origin.Runtime, SessionID: o.NativeSessionID, SourceSequence: o.SourceSequence}
+		if o.ResourceInterruption != nil {
+			if o.Event.Type != session.EventSessionStopped {
+				return transport.NativeObservationPayload{}, ErrConflict
+			}
+			p.ResourceInterruption = o.ResourceInterruption
+		}
 		switch o.Event.Type {
 		case session.EventBusy:
 			p.Status = "working"

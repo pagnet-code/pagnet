@@ -91,6 +91,15 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			if json.Unmarshal(o.Origin, &original) != nil || original.HostID != c.hostID {
 				return after, ErrNativeObservationConflict
 			}
+			if o.ResourceInterruption != nil {
+				admission, err := c.AuthenticatedNativeHostSession()
+				if err != nil {
+					return after, err
+				}
+				if !slices.Contains(admission.ProtocolFeatures, transport.NativeResourceInterruptionProtocol) {
+					return after, ErrNativeOriginAdmissionDeferred
+				}
+			}
 			p, err := NativeWorkerWireObservation(o)
 			if errors.Is(err, ErrNativeSourceUnsupported) {
 				continue
