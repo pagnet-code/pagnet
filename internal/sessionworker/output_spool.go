@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,21 +67,67 @@ func outputSpoolAAD(scope Scope, directory, generation string, sequence int64) [
 	}{NativeOutputStreamCaptureFormat, scope, directory, generation, sequence})
 	return raw
 }
+
+// Compression scratch belongs to one private journal, never to a global pool.
+// Reset starts an independent gzip stream for every authenticated capture.
+// Reusing its bounded workspace avoids rebuilding megabytes of match-finding
+// state for each small native delta while preserving FULL per-delta commits.
+type nativeOutputEncoder struct {
+	mu     sync.Mutex
+	writer *gzip.Writer
+	buffer bytes.Buffer
+	closed bool
+}
+
+func (c *nativeOutputEncoder) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	clear(c.buffer.Bytes())
+	c.buffer = bytes.Buffer{}
+	c.writer = nil
+}
+
 func sealOutputSpool(key []byte, scope Scope, directory string, s nativeOutputSpool) ([]byte, error) {
+	var encoder nativeOutputEncoder
+	defer encoder.close()
+	return encoder.seal(key, scope, directory, s)
+}
+
+func (c *nativeOutputEncoder) seal(key []byte, scope Scope, directory string, s nativeOutputSpool) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, ErrFenced
+	}
 	raw, err := canonicalNativeJSON(s)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(raw)
-	var buffer bytes.Buffer
-	writer, _ := gzip.NewWriterLevel(&buffer, gzip.BestSpeed)
-	if _, err = writer.Write(raw); err != nil {
+	c.buffer.Reset()
+	defer func() {
+		clear(c.buffer.Bytes())
+		// A prepared projection can be larger than the normal stream tail.
+		// Do not retain that peak allocation for an otherwise idle journal.
+		if c.buffer.Cap() > 4*nativeOutputBatchBytes {
+			c.buffer = bytes.Buffer{}
+		}
+	}()
+	if c.writer == nil {
+		c.writer, err = gzip.NewWriterLevel(&c.buffer, gzip.BestSpeed)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		c.writer.Reset(&c.buffer)
+	}
+	if _, err = c.writer.Write(raw); err != nil {
 		return nil, err
 	}
-	if err = writer.Close(); err != nil {
+	if err = c.writer.Close(); err != nil {
 		return nil, err
 	}
-	defer clear(buffer.Bytes())
 	aead, err := captureAEAD(key, scope, directory)
 	if err != nil {
 		return nil, err
@@ -89,7 +136,7 @@ func sealOutputSpool(key []byte, scope Scope, directory string, s nativeOutputSp
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return aead.Seal(nonce, nonce, buffer.Bytes(), outputSpoolAAD(scope, directory, s.Source.NativeGeneration, s.Source.Sequence)), nil
+	return aead.Seal(nonce, nonce, c.buffer.Bytes(), outputSpoolAAD(scope, directory, s.Source.NativeGeneration, s.Source.Sequence)), nil
 }
 func openOutputSpool(key []byte, scope Scope, directory, generation string, sequence int64, ciphertext []byte) (nativeOutputSpool, error) {
 	var result nativeOutputSpool
@@ -185,7 +232,7 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	result.LastObservedAt = nativeSourceTime(time.Now())
 	result.Text += event.Output
 	result.LastDeltaID, result.LastDeltaDigest = deltaID, deltaDigest
-	sealed, err := sealOutputSpool(key, j.scope, j.dir, result)
+	sealed, err := j.outputEncoder.seal(key, j.scope, j.dir, result)
 	if err != nil {
 		clear(result.Key)
 		return nativeOutputSpool{}, err
@@ -357,7 +404,7 @@ func (o *SessionOwner) flushNativeOutput(generation string, sequence int64, forc
 		data.Text = data.Text[count:]
 		data.ByteOffset += int64(count)
 		data.BatchID = uuid.NewString()
-		remaining, err := sealOutputSpool(o.captureKey, o.journal.scope, o.journal.dir, data)
+		remaining, err := o.journal.outputEncoder.seal(o.captureKey, o.journal.scope, o.journal.dir, data)
 		if err != nil {
 			clear(data.Key)
 			return err
@@ -465,7 +512,7 @@ func (j *Journal) prepareOutputReady(ctx context.Context, key []byte, p *outputS
 		return ErrConflict
 	}
 	data.Ready = ready
-	encrypted, err := sealOutputSpool(key, j.scope, j.dir, data)
+	encrypted, err := j.outputEncoder.seal(key, j.scope, j.dir, data)
 	if err != nil {
 		return err
 	}

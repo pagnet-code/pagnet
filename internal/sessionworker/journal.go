@@ -59,6 +59,7 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
+	outputEncoder        nativeOutputEncoder
 	sourceRetries        map[string]*nativeSourceRetry
 	sourceProducers      map[*nativeSourceProducer]bool
 	strictSourceProducer bool
@@ -221,6 +222,7 @@ func privateDirectory(dir string) error {
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.outputEncoder.close()
 	err := j.db.Close()
 	lockErr := j.owner.Close()
 	if err != nil {
