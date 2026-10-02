@@ -281,9 +281,8 @@ func SystemRO() []string {
 
 // SystemDev returns the device subtrees every sandboxed launch gets
 // read+write+truncate on (Spec.Dev). See the Spec.Dev doc for the rationale
-// (Landlock cannot grant a single device file; the subtree grant is safe
-// because Landlock sits on top of DAC, so only devices the user's DAC
-// already allows writing — /dev/null, own ttys — are actually writable).
+// (this policy grants the /dev subtree; actual device access remains
+// bounded by OS user/group permissions, and device IOCTL is not handled).
 func SystemDev() []string {
 	return []string{"/dev"}
 }
