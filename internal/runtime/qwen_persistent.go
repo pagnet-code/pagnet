@@ -1035,29 +1035,44 @@ func (e *qwenEndpoint) readLoop() {
 	offset := int64(0)
 	for {
 		// Read new complete lines.
+		previousOffset := offset
 		lines, newOffset, readErr := readNewLines(f, offset)
-		if readErr == nil {
-			offset = newOffset
-			for _, line := range lines {
-				e.handleEventLine(line)
-			}
+		offset = newOffset
+		for _, line := range lines {
+			e.handleEventLine(line)
 		}
 		// Watchdog (B6 / B7): check the time-based conditions (submit
 		// correlation deadline, in-flight stall).
 		for _, ev := range e.state.tick() {
 			e.routeEvent(ev)
 		}
-		// Process exit or file gone: best-effort final read, then clean up.
-		if readErr != nil || e.processGone() {
-			if readErr == nil {
-				if flines, _, ferr := readNewLines(f, offset); ferr == nil {
-					for _, line := range flines {
-						e.handleEventLine(line)
-					}
+		if readErr != nil {
+			// Stop this exact owned generation before cleanup observes its reap.
+			// A live process must not wedge the native reader in Handle.Wait.
+			e.f.requestEndpointStop(e)
+			e.cleanupOnExit()
+			return
+		}
+
+		if e.processGone() {
+			// Bounded batches preserve every complete backlog line, including the
+			// final turn completion; no second-read-only truncation on natural exit.
+			for {
+				remaining, next, err := readNewLines(f, offset)
+				for _, line := range remaining {
+					e.handleEventLine(line)
 				}
+				if err != nil || next == offset {
+					break
+				}
+				offset = next
 			}
 			e.cleanupOnExit()
 			return
+		}
+
+		if newOffset > previousOffset {
+			continue
 		}
 		time.Sleep(eventPollInterval)
 	}
@@ -1253,8 +1268,10 @@ func (q *QwenPersistent) requestEndpointStop(e *qwenEndpoint) {
 	if e == nil {
 		return
 	}
-	if el, ok := q.life.get().(proc.EndpointLifecycle); ok {
-		el.StopEndpoint(e.instanceID)
+	if e.h != nil {
+		// The immutable handle fences the process generation. A delayed old reader
+		// must never stop a replacement endpoint selected only by instance ID.
+		_ = e.h.Terminate("native_endpoint_stop")
 	}
 }
 
@@ -1391,37 +1408,68 @@ func isUUID(s string) bool {
 // left for the next call. A short read is handled: the offset is advanced
 // only by the bytes actually consumed, so the unread bytes are re-read on
 // the next call.
+const maxQwenNativeLineBytes = 16 << 20
+const qwenNativeReadBatchBytes = 4 << 10
+const maxQwenNativeBatchLines = 256
+
+var errQwenNativeLineTooLarge = errors.New("qwen native event exceeds the 16 MiB frame limit")
+
 func readNewLines(f *os.File, offset int64) ([][]byte, int64, error) {
+	if offset < 0 {
+		return nil, offset, errors.New("invalid qwen event cursor")
+	}
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, offset, err
 	}
 	size := fi.Size()
 	if size < offset {
-		// The file shrank (should not happen for the events file): reset.
-		offset = 0
+		// A sidecar is append-only for this native generation. Resetting the
+		// cursor would replay old effects into an already-live turn ledger.
+		return nil, offset, errors.New("qwen native event file shrank behind its cursor")
 	}
 	if size == offset {
 		return nil, offset, nil
 	}
-	n := int(size - offset)
-	data := make([]byte, n)
-	m, rerr := f.ReadAt(data, offset)
-	if m > 0 {
-		data = data[:m]
-	}
-	if rerr != nil && rerr != io.EOF {
-		return nil, offset, rerr
-	}
-	var lines [][]byte
-	rest := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == '\n' {
-			lines = append(lines, data[rest:i])
-			rest = i + 1
+	// Read a small batch first. Only one incomplete valid large frame can grow
+	// this buffer; the whole unread file and millions of empty lines never do.
+	target := int64(qwenNativeReadBatchBytes)
+	for {
+		count := min(size-offset, target)
+		data := make([]byte, int(count))
+		read, err := f.ReadAt(data, offset)
+		data = data[:read]
+		if err != nil && err != io.EOF {
+			return nil, offset, err
 		}
+		lines := make([][]byte, 0, min(maxQwenNativeBatchLines, read/2))
+		start := 0
+		for index, value := range data {
+			if index-start > maxQwenNativeLineBytes {
+				return lines, offset + int64(start), errQwenNativeLineTooLarge
+			}
+			if value == '\n' {
+				if index-start > maxQwenNativeLineBytes {
+					return lines, offset + int64(start), errQwenNativeLineTooLarge
+				}
+				lines = append(lines, data[start:index])
+				start = index + 1
+				if len(lines) == maxQwenNativeBatchLines {
+					return lines, offset + int64(start), nil
+				}
+			}
+		}
+		if start > 0 {
+			return lines, offset + int64(start), nil
+		}
+		if len(data) > maxQwenNativeLineBytes {
+			return nil, offset, errQwenNativeLineTooLarge
+		}
+		if int64(read) < target || size-offset <= target {
+			return nil, offset, nil
+		}
+		target = min(target*2, int64(maxQwenNativeLineBytes+1))
 	}
-	return lines, offset + int64(rest), nil
 }
 
 // ActiveWork reads the native structured turn ledger, including human turns.
