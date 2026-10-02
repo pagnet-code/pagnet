@@ -111,14 +111,15 @@ func (h *nativeBackendHelper) call(t *testing.T, p any, result any) {
 }
 
 type nativeBackendPeer struct {
-	agentDaemon       atomic.Pointer[Daemon]
-	socket            *websocket.Conn
-	connection        *NativeObservationConnection
-	session           transport.HostSessionPayload
-	done              chan struct{}
-	writes            sync.Mutex
-	dropReceipt       bool
-	dropObservationID atomic.Pointer[string]
+	agentDaemon        atomic.Pointer[Daemon]
+	socket             *websocket.Conn
+	connection         *NativeObservationConnection
+	session            transport.HostSessionPayload
+	done               chan struct{}
+	writes             sync.Mutex
+	dropReceipt        bool
+	dropObservationID  atomic.Pointer[string]
+	dropCancellationID atomic.Pointer[string]
 }
 
 func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceipt bool) *nativeBackendPeer {
@@ -131,6 +132,7 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 	q.Set("native_task_content", transport.NativeTaskContentProtocol)
 	q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
 	q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
+	q.Set("native_dispatch_cancellation", transport.NativeDispatchCancellationProtocol)
 	u.RawQuery = q.Encode()
 	header := http.Header{"Authorization": []string{"Bearer " + fixture.Credential}}
 	socket, _, err := websocket.DefaultDialer.DialContext(t.Context(), u.String(), header)
@@ -180,6 +182,17 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 				var p transport.NativeOwnershipRegisteredPayload
 				if env.DecodePayload(&p) == nil {
 					peer.connection.OwnershipDisposition(p)
+				}
+			case transport.MsgNativeDispatchCancelProposed, transport.MsgNativeDispatchCancelled:
+				var response transport.NativeDispatchCancelledPayload
+				drop := false
+				if env.Type == transport.MsgNativeDispatchCancelled && env.DecodePayload(&response) == nil {
+					if id := peer.dropCancellationID.Load(); id != nil && *id == response.RequestID {
+						drop = true
+					}
+				}
+				if !drop {
+					_ = peer.connection.CancellationDisposition(env)
 				}
 			case transport.MsgNativeTaskInputRead:
 				_, _ = peer.connection.HandleEnvelope(env)

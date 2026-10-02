@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--server-helper", required=True, type=Path)
     parser.add_argument("--overlay", type=Path)
     parser.add_argument("--turns", action="store_true", help="prove actual native turn delivery")
+    parser.add_argument("--cancellations", action="store_true", help="prove actual owned cancellation wire and lost commit reply")
     parser.add_argument("--task-input", action="store_true", help="prove original task read through real native bridge")
     args = parser.parse_args()
     binary = args.server_helper.resolve()
@@ -66,7 +67,7 @@ def main():
         command.extend(
             [
                 "./internal/daemon",
-                "-run", "^TestNativeOriginalTaskInputActualBridgeThroughReplacement$" if args.task_input else "^TestNativeTurnDrainerActualOwnerBackendOriginalSourceAndRollback$" if args.turns else "^TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof$",
+                "-run", "^TestNativeCancellationActualBackendLostReplyAndOriginalWorkerFence$" if args.cancellations else "^TestNativeOriginalTaskInputActualBridgeThroughReplacement$" if args.task_input else "^TestNativeTurnDrainerActualOwnerBackendOriginalSourceAndRollback$" if args.turns else "^TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof$",
                 "-count=1", "-timeout=120s", "-v",
             ]
         )
