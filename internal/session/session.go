@@ -454,6 +454,9 @@ type SessionEvent struct {
 	RetryAt *string
 	// Interaction is set on interaction.started / interaction.resolved.
 	Interaction *InteractionEvent
+	// NativeOutput is set only by genuine native text parsers, before observers.
+	// Diagnostic notes and controller-submitted events cannot create task output.
+	NativeOutput bool `json:",omitempty"`
 }
 
 // SessionEvent types (generic; NOT runtime-specific). The string values
