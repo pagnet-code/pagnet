@@ -289,6 +289,9 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 	if err != nil {
 		return errors.Join(ErrDeferred, err)
 	}
+	if snapshot.IdentityPending {
+		return ErrDeferred
+	}
 	if !snapshot.HasTerminal {
 		dispatches, dispatchErr := proxy.call(ctx, sessionworker.Request{Type: "dispatches"})
 		if dispatchErr != nil {

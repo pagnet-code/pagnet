@@ -62,7 +62,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
-		if snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
+		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
 			return ErrDeferred
 		}
 		retired, err := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, *settled, settled.RetiredFloor, nil, true)

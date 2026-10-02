@@ -63,6 +63,7 @@ type NativeSnapshot struct {
 	PID                 int                  `json:"pid"`
 	State               session.SessionState `json:"state"`
 	Pending             []Inspection         `json:"pending,omitempty"`
+	IdentityPending     bool                 `json:"identityPending,omitempty"`
 	HasTerminal         bool                 `json:"hasTerminal"`
 	PublicError         string               `json:"publicError,omitempty"`
 }
@@ -516,20 +517,25 @@ func (o *SessionOwner) Snapshot() NativeSnapshot {
 	native, _ := o.manager.TryNativeID(o.journal.scope.InstanceID)
 	state, _ := o.manager.State(o.journal.scope.InstanceID)
 	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state, ActualRuntime: o.spec.Runtime, ProfileFingerprint: NativeProfileFingerprint(o.spec)}
-	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil && native != "" && o.driver.Live(o.journal.scope.InstanceID) {
-		ctx, cancel := context.WithTimeout(o.ctx, 50*time.Millisecond)
-		captured, ownedErr := o.supervisor.OwnedStartIdentity(ctx, *pid)
-		cancel()
-		actual, actualErr := proc.StartIdentity(*pid)
-		driverPID := o.manager.PID(o.journal.scope.InstanceID)
-		if ownedErr == nil && actualErr == nil && captured != "" && actual == captured && driverPID != nil && *driverPID == *pid {
-			snap.PID = *pid
-			snap.NativeStartIdentity = captured
+	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil {
+		snap.IdentityPending = true
+		if native != "" && o.driver.Live(o.journal.scope.InstanceID) {
+			ctx, cancel := context.WithTimeout(o.ctx, 50*time.Millisecond)
+			captured, ownedErr := o.supervisor.OwnedStartIdentity(ctx, *pid)
+			cancel()
+			actual, actualErr := proc.StartIdentity(*pid)
+			driverPID := o.manager.PID(o.journal.scope.InstanceID)
+			if ownedErr == nil && actualErr == nil && captured != "" && actual == captured && driverPID != nil && *driverPID == *pid {
+				snap.IdentityPending = false
+				snap.PID = *pid
+				snap.NativeStartIdentity = captured
+			}
 		}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if observedGeneration != o.generation {
+		snap.IdentityPending = true
 		snap.PID = 0
 		snap.NativeStartIdentity = ""
 		snap.NativeSessionID = ""

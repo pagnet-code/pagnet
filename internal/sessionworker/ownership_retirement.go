@@ -75,7 +75,7 @@ func (o *SessionOwner) prepareOwnershipRetirement(ctx context.Context, lease int
 		return ErrConflict
 	}
 	snapshot := o.Snapshot()
-	if snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
+	if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
 		return ErrNativeBusy
 	}
 	o.relay.mu.Lock()
