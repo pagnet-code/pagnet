@@ -15,7 +15,7 @@ var ErrDispatchGap = errors.New("earlier native dispatch must arrive first")
 // prepareDispatchOperation takes source labels from the immutable server
 // proof. The private caller cannot relabel a task or an original admission.
 func prepareDispatchOperation(req Request) (json.RawMessage, error) {
-	if req.NativeDispatch == nil || (req.Kind != "activate" && req.Kind != "prompt" && req.Kind != "stop" && req.Kind != "hibernate" && req.Kind != "attach" && req.Kind != "restart") {
+	if req.NativeDispatch == nil || (req.Kind != "activate" && req.Kind != "prompt" && req.Kind != "stop" && req.Kind != "hibernate" && req.Kind != "attach" && req.Kind != "restart" && req.Kind != "resolve") {
 		return nil, ErrConflict
 	}
 	var op Operation
@@ -29,6 +29,12 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 	op.SourceCommandID = p.SourceCommandID
 	op.SourceAdmissionID = p.SourceAdmissionID
 	op.SourceTask = cloneNativeTaskSource(p.TaskSource)
+	if req.Kind == "resolve" {
+		if p.TaskSource != nil || ValidateNativeResolveOperation(op) != nil {
+			return nil, ErrConflict
+		}
+		return json.Marshal(op)
+	}
 	if op.SourceTask != nil {
 		op.InputKind = "task"
 	}

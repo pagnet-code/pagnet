@@ -971,6 +971,7 @@ func (d *Daemon) wsURL() string {
 	if d.nativeRegistry != nil {
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
+		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
 	}
 	u.RawQuery = q.Encode()
 	return u.String()
@@ -1462,7 +1463,18 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doResolveRuntimeInteraction(p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeDispatch != nil {
+					if p.NativeDispatch.SourceCommandID != p.CommandID || p.NativeGeneration == "" || p.NativeOriginID == "" || !time.Now().Before(p.ExpiresAt) {
+						return ErrNativeObservationConflict
+					}
+					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "resolve", sessionworker.Operation{NativeGeneration: p.NativeGeneration, NativeSessionID: p.SessionID, InteractionID: p.NativeInteractionID, OptionID: p.OptionID, InspectionProof: p.InspectionProof})
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doResolveRuntimeInteraction(p)
+			})
 		})
 	case transport.MsgLaunchAgent:
 		var p transport.LaunchAgentPayload

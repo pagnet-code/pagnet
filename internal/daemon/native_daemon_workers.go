@@ -300,7 +300,7 @@ func (d *Daemon) pumpNativeBridge(ctx context.Context, link *nativeWorkerLink) {
 				result.Error = "native bridge scope unavailable"
 			} else {
 				result.Result, result.Error = d.executeBridgeToolWithRead(row, call.Tool, call.Args, func(tool string, args json.RawMessage) (json.RawMessage, string) {
-					return d.relayToConnection(ctx, link.conn, row.InstanceID, row.AgentPrincipalID, tool, args)
+					return d.relayNativeBridge(ctx, link, row, call, tool, args)
 				}, func(args, raw json.RawMessage) (json.RawMessage, string) {
 					return d.nativeTaskReadForBridge(ctx, link.proxy, row, call, args, raw)
 				})

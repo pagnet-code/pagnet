@@ -70,7 +70,7 @@ func TestDispatchOriginalSourceAndOrdinalSurviveReplacementAndReopen(t *testing.
 	if _, _, err = j.admitDispatch(t.Context(), a, 0, p.SourceCommandID, "prompt", payload, nil, &p); !errors.Is(err, ErrFenced) {
 		t.Fatal("A not fenced", err)
 	}
-	for _, kind := range []string{"prompt", "activate", "attach", "stop", "hibernate", "restart"} {
+	for _, kind := range []string{"prompt", "activate", "attach", "stop", "hibernate", "restart", "resolve"} {
 		if _, _, err = j.Admit(t.Context(), b, 3, "unbound-"+kind, kind, payload); err == nil {
 			t.Fatal("bound ownership permitted ordinal-free lifecycle", kind)
 		}
@@ -302,5 +302,25 @@ func TestOriginalNativeDispatchDefersNextTurnButReacknowledgesAcceptedWork(t *te
 	next, run, err := j.admitDispatch(t.Context(), l, 0, b.SourceCommandID, "prompt", payload, authorize, &b)
 	if err != nil || !run || next.Sequence != first.Sequence+1 {
 		t.Fatal("deferred next work lost", next.Sequence, run, err)
+	}
+}
+
+func TestOwnedResolveTakesOnlyOriginalChoiceSource(t *testing.T) {
+	proof := transport.NativeDispatchProof{SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String()}
+	operation := Operation{NativeGeneration: "actual-original-generation", NativeSessionID: "original-native-session", InteractionID: "actual-native-choice", OptionID: "reject_once"}
+	payload, _ := json.Marshal(operation)
+	request := Request{NativeDispatch: &proof, Kind: "resolve", Payload: payload}
+	raw, err := prepareDispatchOperation(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bound Operation
+	if json.Unmarshal(raw, &bound) != nil || bound.SourceCommandID != proof.SourceCommandID || bound.SourceAdmissionID != proof.SourceAdmissionID || bound.InteractionID != operation.InteractionID {
+		t.Fatal("original choice relabeled", bound)
+	}
+	operation.Input = "synthetic prompt"
+	request.Payload, _ = json.Marshal(operation)
+	if _, err = prepareDispatchOperation(request); err == nil {
+		t.Fatal("resolution submitted unrelated native prompt")
 	}
 }

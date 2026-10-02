@@ -512,18 +512,28 @@ func (d *Daemon) relayToServer(instanceID, principalID, tool string, args json.R
 // relayToConnection binds native tool calls to the fresh controller socket;
 // a pending call cannot silently move to a replacement connection.
 func (d *Daemon) relayToConnection(ctx context.Context, conn *websocket.Conn, instanceID, principalID, tool string, args json.RawMessage) (json.RawMessage, string) {
-	if err := ctx.Err(); err != nil {
-		return nil, errConnInterrupted
-	}
-	args = wireArgs(tool, args)
-	env, err := transport.NewEnvelope(transport.MsgAgentRequest, transport.AgentRequestPayload{
-		InstanceID:  instanceID,
-		PrincipalID: principalID,
-		Tool:        tool,
-		Args:        args,
-	})
+	response, err := d.relayConnectionResponse(ctx, conn, transport.AgentRequestPayload{InstanceID: instanceID, PrincipalID: principalID, Tool: tool, Args: args})
 	if err != nil {
 		return nil, err.Error()
+	}
+	if !response.OK {
+		if response.Error == "" {
+			return nil, "control plane error (no detail)"
+		}
+		return nil, response.Error
+	}
+	return response.Result, ""
+}
+
+func (d *Daemon) relayConnectionResponse(ctx context.Context, conn *websocket.Conn, request transport.AgentRequestPayload) (transport.AgentResponsePayload, error) {
+	if err := ctx.Err(); err != nil {
+		return transport.AgentResponsePayload{}, errors.New(errConnInterrupted)
+	}
+	request.Args = wireArgs(request.Tool, request.Args)
+	instanceID, tool := request.InstanceID, request.Tool
+	env, err := transport.NewEnvelope(transport.MsgAgentRequest, request)
+	if err != nil {
+		return transport.AgentResponsePayload{}, err
 	}
 	// The server echoes the request envelope's id back as the response's
 	// RequestID, so the correlation key IS env.ID.
@@ -536,7 +546,7 @@ func (d *Daemon) relayToConnection(ctx context.Context, conn *websocket.Conn, in
 	d.pendingMu.Lock()
 	if len(d.pending) >= bridgeMaxPending {
 		d.pendingMu.Unlock()
-		return nil, "too many in-flight bridge requests; retry shortly"
+		return transport.AgentResponsePayload{}, errors.New("too many in-flight bridge requests; retry shortly")
 	}
 	respCh := make(chan transport.AgentResponsePayload, 1)
 	d.pending[env.ID] = respCh
@@ -549,7 +559,7 @@ func (d *Daemon) relayToConnection(ctx context.Context, conn *websocket.Conn, in
 
 	raw, err := json.Marshal(env)
 	if err != nil {
-		return nil, err.Error()
+		return transport.AgentResponsePayload{}, err
 	}
 	if err := d.write(conn, raw); err != nil {
 		// The write failed (timeout / broken pipe): the connection is
@@ -557,21 +567,15 @@ func (d *Daemon) relayToConnection(ctx context.Context, conn *websocket.Conn, in
 		// loop takes over). The agent gets the concise message, not the raw
 		// i/o timeout; the detail stays in the log.
 		d.Log.Warn("bridge relay write failed", "instance", instanceID, "tool", tool, "err", err)
-		return nil, errConnInterrupted
+		return transport.AgentResponsePayload{}, errors.New(errConnInterrupted)
 	}
 	select {
 	case resp := <-respCh:
-		if !resp.OK {
-			if resp.Error == "" {
-				return nil, "control plane error (no detail)"
-			}
-			return nil, resp.Error
-		}
-		return resp.Result, ""
+		return resp, nil
 	case <-ctx.Done():
-		return nil, errConnInterrupted
+		return transport.AgentResponsePayload{}, errors.New(errConnInterrupted)
 	case <-time.After(bridgeRequestTimeout):
-		return nil, "control plane did not respond (timeout)"
+		return transport.AgentResponsePayload{}, errors.New("control plane did not respond (timeout)")
 	}
 }
 

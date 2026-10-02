@@ -272,7 +272,7 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 		if sequence, newDispatch, err = j.prepareDispatchTx(ctx, tx, next, sequence, commandID, *dispatch); err != nil {
 			return out, false, err
 		}
-	} else if kind == "activate" || kind == "prompt" || kind == "stop" || kind == "hibernate" || kind == "restart" || kind == "attach" {
+	} else if kind == "activate" || kind == "prompt" || kind == "stop" || kind == "hibernate" || kind == "restart" || kind == "attach" || kind == "resolve" {
 		var bound int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatch_meta`).Scan(&bound); err != nil {
 			return out, false, err
