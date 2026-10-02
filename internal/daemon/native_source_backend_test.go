@@ -31,6 +31,7 @@ import (
 )
 
 type nativeBackendFixture struct {
+	PrincipalID       string `json:"principalId"`
 	Ready             bool   `json:"ready"`
 	URL               string `json:"endpoint"`
 	Credential        string `json:"credential"`
@@ -110,6 +111,7 @@ func (h *nativeBackendHelper) call(t *testing.T, p any, result any) {
 }
 
 type nativeBackendPeer struct {
+	agentDaemon       atomic.Pointer[Daemon]
 	socket            *websocket.Conn
 	connection        *NativeObservationConnection
 	session           transport.HostSessionPayload
@@ -127,6 +129,8 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 	q.Set("boot_id", boot)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	q.Set("native_task_content", transport.NativeTaskContentProtocol)
+	q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
+	q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 	u.RawQuery = q.Encode()
 	header := http.Header{"Authorization": []string{"Bearer " + fixture.Credential}}
 	socket, _, err := websocket.DefaultDialer.DialContext(t.Context(), u.String(), header)
@@ -168,6 +172,17 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 				}
 				peer.session = p
 				admitted <- peer.connection.Admit(p)
+			case transport.MsgAgentResponse:
+				if d := peer.agentDaemon.Load(); d != nil {
+					d.deliverAgentResponse(env)
+				}
+			case transport.MsgNativeOwnershipRegistered, transport.MsgNativeOwnershipRetired:
+				var p transport.NativeOwnershipRegisteredPayload
+				if env.DecodePayload(&p) == nil {
+					peer.connection.OwnershipDisposition(p)
+				}
+			case transport.MsgNativeTaskInputRead:
+				_, _ = peer.connection.HandleEnvelope(env)
 			case transport.MsgNativeOriginRegistered:
 				var p transport.NativeOriginRegisteredPayload
 				if env.DecodePayload(&p) == nil {

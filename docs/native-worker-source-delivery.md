@@ -78,3 +78,28 @@ fails that proof. The paired PostgreSQL/WebSocket turn fixture now commits and
 ACKs actual stopped evidence before expecting settled source watermark cleanup;
 both completed and failed native turns pass. These remain inactive fixture
 proofs, not live user-provider verification.
+
+### Original task input through the source-aware native bridge
+
+`TestNativeOriginalTaskInputActualBridgeThroughReplacement` runs a race-built
+`pagnet session-worker` subprocess, its actual fake native process and private
+bridge, and an isolated PostgreSQL backend over real WebSockets. It registers
+ownership and uses original server-issued dispatch proofs, commits the genuine
+started turn, then reconnects through B without changing A's native process,
+session, generation, origin, command, admission, or task descriptor.
+
+The current task is edited first with different valid ciphertext under the SAME
+AAD, then under a later active epoch. The worker-created bridge call retains the
+original accepted task source; actual source-aware AgentRequest authorization
+and original-input RPC return A's immutable encrypted snapshot for local
+private decryption. Foreign command/admission/turn/AAD, original-key revocation,
+and current grant revocation are denied. Removing the unconditional snapshot
+read makes the same-AAD mutation assertion fail. No private key goes to the
+server, and no decrypted task input is persisted there.
+
+Run `scripts/test-native-source-backend.py --task-input --server-helper <binary>`
+with a dedicated `TEST_DATABASE_URL`; the script creates and drops a unique
+schema and passes the actual `PAGNET_TEST_DSN` to the helper privately. The
+matching helper includes server fixture commits `a45eba9` and `3ccc82b` (tenant
+binding and actual owned-dispatch proofs). This automated isolated proof does
+not cover full `pagnet serve` or live provider verification.
