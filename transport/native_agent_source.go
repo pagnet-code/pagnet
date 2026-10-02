@@ -1,5 +1,7 @@
 package transport
 
+const NativeAgentSourceProtocol = "native-agent-source-v1"
+
 // NativeAgentSource is the actual turn capability derived by the independent
 // worker bridge. Source command/admission and private operation ordinal remain
 // original across replacement transports. It contains no body or task key/AAD.

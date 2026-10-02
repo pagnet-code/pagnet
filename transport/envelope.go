@@ -844,6 +844,8 @@ type AgentRequestPayload struct {
 // request envelope's id; the daemon correlates it with the waiting
 // bridge-socket client.
 type AgentResponsePayload struct {
+	ErrorCode string          `json:"errorCode,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
 	RequestID string          `json:"requestId"`
 	OK        bool            `json:"ok"`
 	Result    json.RawMessage `json:"result,omitempty"`
