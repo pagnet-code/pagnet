@@ -33,6 +33,7 @@ type NativeSpec struct {
 	NetworkTenantID                          string
 	ProtectedContext                         *e2ee.ProtectedContext
 	ContextStateDir                          string
+	NetworkStateDir                          string `json:",omitempty"`
 }
 
 type Operation struct {
@@ -88,6 +89,7 @@ type SessionOwner struct {
 	candidateAdmission       *Admission
 	candidateCommandID       string
 	candidateTurnSource      NativeTurnSource
+	taskContentPins          map[string]nativeTaskContentPin
 	terminal                 *os.File
 	pending                  map[string]*nativeApproval
 	fatal                    error

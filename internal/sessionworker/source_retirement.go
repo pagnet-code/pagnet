@@ -219,6 +219,7 @@ func (o *SessionOwner) nativeEventRegistration(instanceID string) session.Native
 	}
 	observer := o.nativeSourceObserver(instanceID, producer)
 	return nativeObserverRegistration(observer, func() {
+		o.releaseNativeTaskPins(generation)
 		if err := o.journal.retireNativeSource(context.Background(), producer); err != nil {
 			o.failPersistence(err)
 		}

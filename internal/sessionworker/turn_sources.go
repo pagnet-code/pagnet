@@ -255,6 +255,7 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	if err := o.journal.BindNativeTurn(ctx, source); err != nil {
 		return err
 	}
+	o.pinOriginalTaskContent(source)
 	return d.Driver.Submit(ctx, sess, req, events)
 }
 

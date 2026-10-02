@@ -195,6 +195,9 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			o.observationBlocked = nil
 		}
 		o.mu.Unlock()
+		if event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed || event.Type == session.EventSessionLost {
+			o.releaseNativeTaskTurnPin(source)
+		}
 		o.record("session", event, generation, origin)
 		if o.ctx.Err() != nil {
 			return o.ctx.Err()
