@@ -111,6 +111,30 @@ func (c *nativeTerminalCapture) run(d *Daemon, manager *nativeTerminalManager) {
 			cancel()
 			return
 		}
+		// An idle native terminal must release keys on authority/epoch revoke
+		// even when there are no new PTY bytes to trigger an output check.
+		c.mu.Lock()
+		views := make([]*nativeTerminalWindow, 0, len(c.windows))
+		for _, window := range c.windows {
+			views = append(views, window)
+		}
+		c.mu.Unlock()
+		for _, window := range views {
+			current, err := d.nativeWorkerFor(window.conn, window.meta.InstanceID)
+			if err == nil && current != window.proxy {
+				err = ErrNativeOriginAdmissionDeferred
+			}
+			if err == nil {
+				window.mu.Lock()
+				if !window.closed {
+					err = window.currentEpoch(d)
+				}
+				window.mu.Unlock()
+			}
+			if err != nil {
+				c.detach(d, window.meta.SessionID, "input_unavailable")
+			}
+		}
 		for batch := 0; batch < 4; batch++ {
 			page, err := c.proxy.NativeTerminalOutput(ctx, c.replay, c.cursor)
 			if err != nil {

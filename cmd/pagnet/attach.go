@@ -221,7 +221,7 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer, private ...*cliTerm
 				ready = true
 				lastSeq = end
 			case "closed":
-				if channel != nil && !channel.matches(f) {
+				if channel != nil && (f.NativeGeneration != "" || f.SessionKeyID != "") && !channel.matches(f) {
 					continue
 				}
 				reasonMu.Lock()
