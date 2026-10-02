@@ -42,3 +42,9 @@ func (*NativeWorkerRegistry) BindOwnership(NativeWorkerRecord, transport.NativeW
 func EnsureNativeWorker(context.Context, *NativeWorkerRegistry, NativeWorkerRecord, string, []string) error {
 	return errNativeWorkerPlatform
 }
+
+type nativeWorkerGC struct{ Phase string }
+
+func (*NativeWorkerRegistry) lookupGC(string) (nativeWorkerGC, error) {
+	return nativeWorkerGC{}, errNativeWorkerPlatform
+}

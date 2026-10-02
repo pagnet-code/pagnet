@@ -131,3 +131,43 @@ func TestAuthenticatedRetirementClosesOwnedListenerAfterResponse(t *testing.T) {
 		t.Fatal("retired original owner accepts new controller")
 	}
 }
+
+func TestCollectionRequiresExclusiveCommittedOriginalReceipt(t *testing.T) {
+	j, dir := testJournal(t)
+	current := lease(t, j)
+	original := dispatchOwnership(t, j, current)
+	retired := original
+	retired.State = "retired"
+	authorized := false
+	approve := func() error { authorized = true; return nil }
+	if err := CollectRetiredWorker(t.Context(), dir, j.scope, retired, approve); err == nil || authorized {
+		t.Fatal("live owner collected")
+	}
+	scope := j.scope
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := CollectRetiredWorker(t.Context(), dir, scope, retired, approve); err == nil || authorized {
+		t.Fatal("uncommitted cloud receipt collected")
+	}
+	j, err := OpenJournal(dir, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = j.CommitOwnershipRetirement(t.Context(), lease(t, j), retired); err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	denied := errors.New("fixture registry fsync failed")
+	if err = CollectRetiredWorker(t.Context(), dir, scope, retired, func() error { return denied }); !errors.Is(err, denied) {
+		t.Fatal("collection passed failed registry commit", err)
+	}
+	if err = CollectRetiredWorker(t.Context(), dir, scope, retired, approve); err != nil || !authorized {
+		t.Fatal("committed exclusive retirement not collected", err)
+	}
+	if err = CompleteRetiredWorkerCollection(dir); err != nil {
+		t.Fatal("post-unlink replay failed", err)
+	}
+}

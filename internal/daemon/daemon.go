@@ -973,6 +973,7 @@ func (d *Daemon) wsURL() string {
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
 		q.Set("native_dispatch_cancellation", transport.NativeDispatchCancellationProtocol)
+		q.Set("native_owned_deletion", transport.NativeOwnedDeletionProtocol)
 	}
 	u.RawQuery = q.Encode()
 	return u.String()
@@ -1723,6 +1724,14 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			})
 		})
 
+	case transport.MsgNativeInstanceForgotten:
+		var p transport.NativeInstanceForgottenPayload
+		if env.DecodePayload(&p) == nil {
+			if err := d.confirmNativeForgotten(conn, p); err == nil {
+				_ = d.send(conn, transport.MsgNativeInstanceForgottenAck, p)
+			}
+		}
+
 	case transport.MsgForgetInstance:
 		var p transport.ForgetInstancePayload
 		if err := env.DecodePayload(&p); err != nil {
@@ -1733,7 +1742,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doForget(conn, p.InstanceID) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeOwnership != nil {
+					if err := d.doNativeForget(conn, p); err != nil {
+						return errors.Join(ErrDeferred, err)
+					}
+					return nil
+				}
+				return d.doForget(conn, p.InstanceID)
+			})
 		})
 
 	case transport.MsgRequestInventory:

@@ -195,6 +195,10 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 }
 
 func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObservationConnection, record NativeWorkerRecord) error {
+	if gc, gcErr := d.nativeRegistry.lookupGC(record.Scope.InstanceID); !errors.Is(gcErr, sql.ErrNoRows) && (gcErr != nil || gc.Phase != "waiting") {
+		return ErrNativeOriginAdmissionDeferred
+	}
+
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(record.Scope.InstanceID))
 	lock := &d.nativeConnectLocks[hash.Sum32()%uint32(len(d.nativeConnectLocks))]
