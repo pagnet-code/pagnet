@@ -185,3 +185,42 @@ func TestDispatchAdmissionRollbackAndConcurrentReplay(t *testing.T) {
 		t.Fatal("deferred original ordinal lost", run, err)
 	}
 }
+
+func TestDispatchCanonicalInputBindsOriginalTaskAndAdmission(t *testing.T) {
+	p := transport.NativeDispatchProof{SourceCommandID: "command-A", SourceAdmissionID: "admission-A", TaskSource: &transport.NativeTaskSource{TaskID: "task-A"}}
+	body := json.RawMessage(`{"input":"original private body","inputKind":"event"}`)
+	req := Request{Type: "intent", Kind: "prompt", Payload: body, NativeDispatch: &p}
+	raw, err := prepareDispatchOperation(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var op Operation
+	if err = json.Unmarshal(raw, &op); err != nil {
+		t.Fatal(err)
+	}
+	if op.Input != "original private body" || op.InputKind != "task" || op.SourceCommandID != "command-A" || op.SourceAdmissionID != "admission-A" || op.SourceTask.TaskID != "task-A" {
+		t.Fatal("original accepted source changed")
+	}
+	p.TaskSource.TaskID = "changed-after-prepare"
+	if op.SourceTask.TaskID != "task-A" {
+		t.Fatal("source aliases mutable proof")
+	}
+	for _, bad := range []json.RawMessage{json.RawMessage(`{"input":"private","sourceCommandId":"command-B"}`), json.RawMessage(`{"input":"private","sourceAdmissionId":"admission-B"}`), json.RawMessage(`{"input":"private","sourceTask":{"taskId":"other"}}`), json.RawMessage(`{"input":"","inputKind":"task"}`)} {
+		req.Payload = bad
+		if _, err = prepareDispatchOperation(req); err == nil {
+			t.Fatal("conflicting or empty source accepted")
+		}
+	}
+	req.NativeDispatch = &transport.NativeDispatchProof{SourceCommandID: "command-A", SourceAdmissionID: "admission-A"}
+	for _, tc := range []struct{ input, expected string }{{"event", "notice"}, {"channel", "user_input"}, {"ask", "ask"}} {
+		req.Payload = json.RawMessage(`{"input":"original private body","inputKind":"` + tc.input + `"}`)
+		raw, err = prepareDispatchOperation(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		op = Operation{}
+		if err = json.Unmarshal(raw, &op); err != nil || op.InputKind != tc.expected || op.SourceTask != nil {
+			t.Fatal("bad input normalization", tc, err)
+		}
+	}
+}

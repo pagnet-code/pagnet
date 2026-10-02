@@ -12,6 +12,38 @@ import (
 
 var ErrDispatchGap = errors.New("earlier native dispatch must arrive first")
 
+// prepareDispatchOperation takes source labels from the immutable server
+// proof. The private caller cannot relabel a task or an original admission.
+func prepareDispatchOperation(req Request) (json.RawMessage, error) {
+	if req.NativeDispatch == nil || (req.Kind != "activate" && req.Kind != "prompt") {
+		return nil, ErrConflict
+	}
+	var op Operation
+	if decodeClosed(req.Payload, &op) != nil {
+		return nil, ErrConflict
+	}
+	p := req.NativeDispatch
+	if (op.SourceCommandID != "" && op.SourceCommandID != p.SourceCommandID) || (op.SourceAdmissionID != "" && op.SourceAdmissionID != p.SourceAdmissionID) || (op.SourceTask != nil && taskSourceJSON(op.SourceTask) != taskSourceJSON(p.TaskSource)) {
+		return nil, ErrConflict
+	}
+	op.SourceCommandID = p.SourceCommandID
+	op.SourceAdmissionID = p.SourceAdmissionID
+	op.SourceTask = cloneNativeTaskSource(p.TaskSource)
+	if op.SourceTask != nil {
+		op.InputKind = "task"
+	}
+	if op.InputKind == "event" {
+		op.InputKind = "notice"
+	}
+	if op.InputKind == "channel" {
+		op.InputKind = "user_input"
+	}
+	if req.Kind == "prompt" && (!ValidNativeInputKind(op.InputKind) || op.Input == "" || len(op.Input) > 128<<10) {
+		return nil, ErrConflict
+	}
+	return json.Marshal(op)
+}
+
 func (j *Journal) initializeDispatches() error {
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS worker_dispatch_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),ownership TEXT NOT NULL,last_sequence INTEGER NOT NULL,retired INTEGER NOT NULL)`,
