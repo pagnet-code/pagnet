@@ -39,7 +39,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
-		if err = proxy.DrainSources(ctx); err != nil {
+		if err = proxy.DrainDeletionSources(ctx, p.DeleteRequestID); err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
 		d.nativeWorkersMu.Lock()

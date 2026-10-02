@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -23,9 +24,12 @@ type NativeWorkerProxy struct {
 	closeOnce                           sync.Once
 	confirmedMu                         sync.Mutex
 	confirmedGeneration, confirmedStart string
+	confirmedAt                         time.Time
 	sourceMu                            sync.Mutex
 	sourceCursor                        int64
 	cancellationCursor                  int64
+	deletionSourceCursor                int64
+	deletionSourceJob                   string
 }
 
 func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnection, dir string, expected sessionworker.Scope, controllerID string) (*NativeWorkerProxy, error) {
@@ -115,6 +119,20 @@ func (p *NativeWorkerProxy) DrainSources(ctx context.Context) error {
 	return err
 }
 
+// DrainDeletionSources is available only to an authenticated typed Forget job.
+// Its independent cursor cannot alter ordinary source publication authority.
+func (p *NativeWorkerProxy) DrainDeletionSources(ctx context.Context, jobID string) error {
+	p.sourceMu.Lock()
+	defer p.sourceMu.Unlock()
+	if p.deletionSourceJob != jobID {
+		p.deletionSourceCursor = 0
+		p.deletionSourceJob = jobID
+	}
+	next, err := p.connection.DrainDeletionSourcesPage(ctx, p.SourceCall, p.deletionSourceCursor, jobID)
+	p.deletionSourceCursor = next
+	return err
+}
+
 func (p *NativeWorkerProxy) RefreshAdmission(ctx context.Context) error {
 	admission, err := p.connection.NativeWorkerAdmission(p.scope, p.bootstrap.Native.NetworkID, p.bootstrap.Native.Kind)
 	if err != nil {
@@ -184,7 +202,9 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 	}
 	p.confirmedMu.Lock()
 	defer p.confirmedMu.Unlock()
-	if p.confirmedGeneration == snapshot.NativeGeneration && p.confirmedStart == snapshot.NativeStartIdentity {
+	// A live origin is renewed from fresh original endpoint snapshots, so a
+	// long-lived session does not keep a permanently stale retention clock.
+	if p.confirmedGeneration == snapshot.NativeGeneration && p.confirmedStart == snapshot.NativeStartIdentity && time.Since(p.confirmedAt) < time.Minute {
 		return nil
 	}
 	if err := p.connection.ConfirmNativeWorkerSession(ctx, p.scope, origin, p.profile, p.Snapshot); err != nil {
@@ -192,5 +212,6 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 	}
 	p.confirmedGeneration = snapshot.NativeGeneration
 	p.confirmedStart = snapshot.NativeStartIdentity
+	p.confirmedAt = time.Now()
 	return nil
 }
