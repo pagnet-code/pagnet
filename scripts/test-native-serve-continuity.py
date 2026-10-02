@@ -12,6 +12,7 @@ from pathlib import Path
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-helper", required=True, type=Path)
+    parser.add_argument("--delete", action="store_true", help="also prove actual owned deletion after controller replacement")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     binary = args.server_helper.resolve()
@@ -60,7 +61,7 @@ def main():
         )
         result = subprocess.run(
             ["go", "test", "-race", "./internal/daemon", "-run",
-             "^TestActualPagnetServeControllerReplacementPrivateTerminal$",
+             "^TestActualPagnetServeOwnedDeletion$" if args.delete else "^TestActualPagnetServeControllerReplacementPrivateTerminal$",
              "-count=1", "-timeout=120s", "-v"],
             cwd=root, env=testenv,
         )

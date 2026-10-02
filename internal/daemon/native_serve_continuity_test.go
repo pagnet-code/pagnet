@@ -5,8 +5,10 @@ package daemon
 import (
 	"bytes"
 	"crypto/ed25519"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/url"
 	"os"
@@ -42,6 +44,14 @@ type serveProofStatus struct {
 }
 
 func TestActualPagnetServeControllerReplacementPrivateTerminal(t *testing.T) {
+	runActualPagnetServeContinuity(t, false)
+}
+
+func TestActualPagnetServeOwnedDeletion(t *testing.T) {
+	runActualPagnetServeContinuity(t, true)
+}
+
+func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 	if os.Getenv("PAGNET_NATIVE_SERVE_PROOF") != "1" {
 		t.Skip("requires explicit isolated PostgreSQL production serve proof")
 	}
@@ -63,7 +73,7 @@ func TestActualPagnetServeControllerReplacementPrivateTerminal(t *testing.T) {
 	}
 	build := func(name, pkg, version string) string {
 		target := filepath.Join(bin, name)
-		args := []string{"build", "-o", target}
+		args := []string{"build", "-race", "-o", target}
 		if version != "" {
 			args = append(args, "-ldflags=-X main.version="+version)
 		}
@@ -431,6 +441,17 @@ func TestActualPagnetServeControllerReplacementPrivateTerminal(t *testing.T) {
 		if frame.AAD == nil || frame.Data != "" || frame.NativeGeneration != metaB.NativeGeneration || frame.SessionKeyID != metaB.SessionKeyID {
 			t.Fatal("replacement terminal leaked or relabeled source")
 		}
+		sequence := frame.Seq
+		if frame.Snapshot {
+			sequence = frame.LastSeq
+		}
+		expectedAAD := *metaB.AAD
+		expectedAAD.ObjectType = e2ee.ObjectTypeRuntimeTerminal
+		expectedAAD.KeyEpochID = metaB.SessionKeyID
+		expectedAAD.ObjectID, err = e2ee.TerminalFrameObjectID(metaB.InstanceID, metaB.SessionID, metaB.NativeGeneration, metaB.SessionKeyID, "output", frame.Snapshot, sequence)
+		if err != nil || !bytes.Equal(expectedAAD.CanonicalBytes(), frame.AAD.CanonicalBytes()) {
+			t.Fatal("original output changed authorized window scope")
+		}
 		plain, err := e2ee.Decrypt(*frame.Envelope, outputKey, *frame.AAD)
 		if err != nil {
 			t.Fatal("original terminal output integrity failed", err)
@@ -459,4 +480,82 @@ func TestActualPagnetServeControllerReplacementPrivateTerminal(t *testing.T) {
 		t.Fatal("controller replacement changed original native PID/birth")
 	}
 	t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal source; fresh private view keys and locally encrypted input/output")
+	if !deleteOriginal {
+		return
+	}
+	var deleted struct {
+		OK         bool `json:"ok"`
+		StatusCode int  `json:"statusCode"`
+	}
+	helper.call(t, map[string]any{"action": "delete_agent"}, &deleted)
+	if !deleted.OK || deleted.StatusCode != 202 {
+		t.Fatal("actual owned deletion did not return durable pending job")
+	}
+	t.Log("phase: actual DELETE accepted; awaiting original ownership retirement and collection")
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		var remote struct {
+			OK                bool   `json:"ok"`
+			DeletionState     string `json:"deletionState"`
+			InstancePresent   bool   `json:"instancePresent"`
+			DefinitionPresent bool   `json:"definitionPresent"`
+			PrincipalPresent  bool   `json:"principalPresent"`
+		}
+		helper.call(t, map[string]any{"action": "delete_status"}, &remote)
+		_, recordErr := registry.Lookup(launch.InstanceID)
+		_, gcErr := registry.lookupGC(launch.InstanceID)
+		_, dirErr := os.Lstat(record.Dir)
+		_, socketErr := os.Lstat(socket)
+		workerCurrent, workerErr := proc.StartIdentity(workerPID)
+		nativeCurrent, nativeErr := proc.StartIdentity(originalNativePID)
+		// A zombie has physically exited; an orphan may await the container's
+		// init reaper. A failed identity query alone never proves process exit.
+		workerExited := os.IsNotExist(workerErr) || workerErr == nil && workerCurrent != workerBirth || proc.ProcessIsZombie(workerPID)
+		nativeExited := os.IsNotExist(nativeErr) || nativeErr == nil && nativeCurrent != secretB.NativeStartIdentity || proc.ProcessIsZombie(originalNativePID)
+		if remote.OK && remote.DeletionState == "completed" && !remote.InstancePresent && !remote.DefinitionPresent && !remote.PrincipalPresent && errors.Is(recordErr, sql.ErrNoRows) && errors.Is(gcErr, sql.ErrNoRows) && os.IsNotExist(dirErr) && os.IsNotExist(socketErr) && workerExited && nativeExited {
+			t.Log("actual DELETE 202 stops original runtime, retires worker, collects private files, commits server deletion and reclaims local registry marker")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var final struct {
+		DeletionState       string                          `json:"deletionState"`
+		OwnershipState      string                          `json:"ownershipState"`
+		StoppedReceiptCount int                             `json:"stoppedReceiptCount"`
+		Commands            []struct{ Type, Status string } `json:"commands"`
+	}
+	helper.call(t, map[string]any{"action": "delete_status"}, &final)
+	t.Log("bounded deletion state", final.DeletionState, final.OwnershipState, final.StoppedReceiptCount)
+	for _, command := range final.Commands {
+		t.Log("bounded deletion command", command.Type, command.Status)
+	}
+	if gc, err := registry.lookupGC(launch.InstanceID); err == nil {
+		t.Log("bounded local collection phase", gc.Phase)
+	}
+	t.Log("bounded original worker physical state", proc.ProcessAlive(workerPID), proc.ProcessIsZombie(workerPID))
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(record.Dir, "intents.sqlite")+"?mode=ro")
+	if err == nil {
+		defer db.Close()
+		for _, table := range []string{"worker_intent", "worker_dispatches", "worker_dispatch_cancellations", "worker_observations", "worker_turn_sources"} {
+			var count int
+			if db.QueryRow("SELECT count(*) FROM "+table).Scan(&count) == nil {
+				t.Log("bounded worker pending count", table, count)
+			}
+		}
+		if rows, err := db.Query("SELECT COALESCE(json_extract(payload,'$.event.Type'),json_extract(payload,'$.event.type'),'unknown'),count(*) FROM worker_observations GROUP BY COALESCE(json_extract(payload,'$.event.Type'),json_extract(payload,'$.event.type'),'unknown')"); err == nil {
+			for rows.Next() {
+				var typ string
+				var n int
+				if rows.Scan(&typ, &n) == nil {
+					t.Log("bounded pending native event types", typ, n)
+				}
+			}
+			rows.Close()
+		}
+		var count int
+		if db.QueryRow("SELECT count(*) FROM worker_source_registration WHERE quiesced=0").Scan(&count) == nil {
+			t.Log("bounded worker live source registrations", count)
+		}
+	}
+	t.Fatal("owned deletion did not finish physical retirement and confirmed private collection")
 }
