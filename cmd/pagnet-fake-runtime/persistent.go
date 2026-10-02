@@ -392,35 +392,22 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 		go bridgeControlFixture(stopping)
 	}
 
+	// Install shutdown handling before the first human terminal byte.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sigCh)
+
 	tuiDone := make(chan struct{})
 	if tty != nil {
 		go func() {
 			defer close(tuiDone)
-			r := bufio.NewReader(tty)
-			for {
-				line, err := r.ReadString('\n')
-				if err != nil {
-					// tty closed (shutdown) or EOF (master closed): the
-					// TUI is done; the machine plane keeps running.
-					return
-				}
-				line = strings.TrimRight(line, "\r\n")
-				if line == "" {
-					continue
-				}
-				ttyWrite("you> " + line + "\n")
-				cmd := persistCmd{
-					Type:      "submit",
-					TurnID:    "tui-" + strconv.FormatInt(time.Now().UnixNano(), 10),
-					Input:     line,
-					InputKind: "user_input",
-				}
+			runPersistentHumanTTY(tty, prev.SessionID, ttyWrite, stopping, func(line string) {
+				cmd := persistCmd{Type: "submit", TurnID: "tui-" + strconv.FormatInt(time.Now().UnixNano(), 10), Input: line, InputKind: "user_input"}
 				select {
 				case turnQueue <- cmd:
 				case <-stopping:
-					return
 				}
-			}
+			})
 		}()
 	}
 	// stopTUI closes the tty (unblocking the reader if it is waiting on a
@@ -449,9 +436,6 @@ func runPersistent(instanceID, sessionDir, resumeID string) {
 	// the session and exits cleanly. The session file is the resume
 	// payload; saving on the way out is what makes hibernate preserve the
 	// native session (invariant F).
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(sigCh)
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
