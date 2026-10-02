@@ -116,6 +116,7 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	for _, q := range []string{
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
 		`CREATE TABLE IF NOT EXISTS worker_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), protocol TEXT NOT NULL, scope TEXT NOT NULL, lease INTEGER NOT NULL, next_sequence INTEGER NOT NULL, retired INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS worker_ownership_retirement(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS worker_intent_admission(sequence INTEGER PRIMARY KEY, admission BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS worker_intent(sequence INTEGER PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, result BLOB, acknowledged INTEGER NOT NULL DEFAULT 0)`,
 	} {
@@ -272,6 +273,13 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	next, retired, err := checkLease(ctx, tx, lease)
 	if err != nil {
 		return out, false, err
+	}
+	var ownedRetired bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_ownership_retirement)`).Scan(&ownedRetired); err != nil {
+		return out, false, err
+	}
+	if ownedRetired {
+		return out, false, ErrRetired
 	}
 	var newDispatch bool
 	if dispatch != nil {

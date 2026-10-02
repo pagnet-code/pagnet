@@ -124,6 +124,11 @@ func runMain(args []string, build string) error {
 	if workerCtx.Err() != nil {
 		return nil
 	}
+	select {
+	case <-owner.retirement:
+		return nil
+	default:
+	}
 	if cause == nil {
 		return errors.New("required worker listener terminated unexpectedly")
 	}

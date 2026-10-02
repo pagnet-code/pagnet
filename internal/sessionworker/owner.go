@@ -68,6 +68,8 @@ type NativeSnapshot struct {
 }
 
 type SessionOwner struct {
+	retirement               chan struct{}
+	retirementOnce           sync.Once
 	cancel                   context.CancelFunc
 	wg                       sync.WaitGroup
 	nativeObserverWG         sync.WaitGroup
@@ -127,7 +129,7 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 	cfg := proc.DefaultConfig()
 	cfg.StateDir = j.dir
 	sup := proc.NewSupervisor(cfg, slog.New(slog.DiscardHandler))
-	owner := &SessionOwner{ctx: ctx, cancel: cancel, journal: j, captureKey: append([]byte(nil), controlKey...), spec: spec, manager: session.NewManager(), supervisor: sup, pending: map[string]*nativeApproval{}, relay: newRelayBroker(j.scope, spec)}
+	owner := &SessionOwner{retirement: make(chan struct{}), ctx: ctx, cancel: cancel, journal: j, captureKey: append([]byte(nil), controlKey...), spec: spec, manager: session.NewManager(), supervisor: sup, pending: map[string]*nativeApproval{}, relay: newRelayBroker(j.scope, spec)}
 	var driver session.Driver
 	switch spec.Runtime {
 	case domain.RuntimeFakePersistent:

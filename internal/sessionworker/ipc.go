@@ -182,10 +182,17 @@ func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, 
 	if err := privateSocket(path); err != nil {
 		return err
 	}
+	var retired <-chan struct{}
+	if owner != nil {
+		retired = owner.retirement
+	}
 	quit := make(chan struct{})
 	defer close(quit)
 	go func() {
 		select {
+		case <-retired:
+			cancel()
+			_ = listener.Close()
 		case <-ctx.Done():
 			_ = listener.Close()
 		case <-quit:
@@ -343,6 +350,10 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		if writeFrame(c, response) != nil {
 			return
 		}
+		if req.Type == "worker_retire" && response.Error == "" && owner != nil {
+			owner.retirementOnce.Do(func() { close(owner.retirement) })
+			return
+		}
 	}
 }
 
@@ -435,6 +446,8 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "worker_retire":
+		err = o.prepareOwnershipRetirement(ctx, lease, req.Ownership)
 	case "ownership_bind":
 		if req.Ownership == nil {
 			err = ErrConflict
