@@ -3,6 +3,8 @@ package sessionworker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +36,7 @@ type NativeSpec struct {
 }
 
 type Operation struct {
+	SourceCommandID  string `json:"sourceCommandId,omitempty"`
 	Input            string `json:"input,omitempty"`
 	InputKind        string `json:"inputKind,omitempty"`
 	NativeGeneration string `json:"nativeGeneration,omitempty"`
@@ -44,12 +47,11 @@ type Operation struct {
 	Data             []byte `json:"data,omitempty"`
 	Rows             uint16 `json:"rows,omitempty"`
 	Cols             uint16 `json:"cols,omitempty"`
-	// Origin is an authenticated controller's exact, server-registered source
-	// descriptor. A new command never replaces the origin of an existing endpoint.
-	Origin json.RawMessage `json:"origin,omitempty"`
 }
 
 type NativeSnapshot struct {
+	ActualRuntime       domain.RuntimeName   `json:"actualRuntime"`
+	ProfileFingerprint  string               `json:"profileFingerprint"`
 	Scope               Scope                `json:"scope"`
 	NativeGeneration    string               `json:"nativeGeneration"`
 	NativeStartIdentity string               `json:"nativeStartIdentity,omitempty"`
@@ -63,33 +65,37 @@ type NativeSnapshot struct {
 }
 
 type SessionOwner struct {
-	cancel                  context.CancelFunc
-	wg                      sync.WaitGroup
-	closing                 bool
-	ctx                     context.Context
-	journal                 *Journal
-	spec                    NativeSpec
-	manager                 *session.Manager
-	driver                  session.Driver
-	supervisor              *proc.Supervisor
-	sess                    *session.RuntimeSession
-	prompt                  sync.Mutex
-	terminalWrite           sync.Mutex
-	mu                      sync.Mutex
-	generation, nonce       string
-	origin, candidateOrigin json.RawMessage
-	terminal                *os.File
-	pending                 map[string]*nativeApproval
-	fatal                   error
-	nativeSink              bool
-	observationBlocked      error
-	observationWaiters      map[string]bool
-	relay                   *relayBroker
+	cancel             context.CancelFunc
+	wg                 sync.WaitGroup
+	closing            bool
+	ctx                context.Context
+	journal            *Journal
+	spec               NativeSpec
+	manager            *session.Manager
+	driver             session.Driver
+	supervisor         *proc.Supervisor
+	sess               *session.RuntimeSession
+	prompt             sync.Mutex
+	terminalWrite      sync.Mutex
+	mu                 sync.Mutex
+	generation, nonce  string
+	origin             json.RawMessage
+	candidateCommandID string
+	terminal           *os.File
+	pending            map[string]*nativeApproval
+	fatal              error
+	nativeSink         bool
+	observationBlocked error
+	observationWaiters map[string]bool
+	relay              *relayBroker
 }
 
 func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*SessionOwner, error) {
 	if !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) || (spec.Kind != "worker" && spec.Kind != "representative") || (spec.Kind == "worker" && spec.NetworkID == "") {
 		return nil, errors.New("incomplete worker native scope or execution profile")
+	}
+	if spec.TenantID != j.scope.TenantID {
+		return nil, errors.New("native tenant does not match immutable worker authority")
 	}
 	if err := agentruntime.ValidateExtraEnv(spec.Env); err != nil {
 		return nil, err
@@ -194,12 +200,8 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 				break
 			}
 			defer o.prompt.Unlock()
-			if len(op.Origin) > 8192 || (len(op.Origin) > 0 && !json.Valid(op.Origin)) {
-				err = errors.New("invalid native activation origin")
-				break
-			}
 			o.mu.Lock()
-			o.candidateOrigin = append(json.RawMessage(nil), op.Origin...)
+			o.candidateCommandID = op.SourceCommandID
 			fatal := o.fatal
 			if fatal == nil {
 				fatal = o.observationBlocked
@@ -371,9 +373,14 @@ func (o *SessionOwner) resize(op Operation) error {
 	return pty.Setsize(master, &pty.Winsize{Rows: op.Rows, Cols: op.Cols})
 }
 func (o *SessionOwner) Snapshot() NativeSnapshot {
+	o.mu.Lock()
+	observedGeneration := o.generation
+	o.mu.Unlock()
 	native, _ := o.manager.TryNativeID(o.journal.scope.InstanceID)
 	state, _ := o.manager.State(o.journal.scope.InstanceID)
-	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state}
+	profileRaw, _ := json.Marshal(o.spec) // Env is memory-only and deliberately excluded.
+	profileHash := sha256.Sum256(profileRaw)
+	snap := NativeSnapshot{Scope: o.journal.scope, NativeSessionID: native, State: state, ActualRuntime: o.spec.Runtime, ProfileFingerprint: hex.EncodeToString(profileHash[:])}
 	if pid := o.supervisor.EndpointPID(o.journal.scope.InstanceID); pid != nil && native != "" && o.driver.Live(o.journal.scope.InstanceID) {
 		ctx, cancel := context.WithTimeout(o.ctx, 50*time.Millisecond)
 		captured, ownedErr := o.supervisor.OwnedStartIdentity(ctx, *pid)
@@ -387,6 +394,11 @@ func (o *SessionOwner) Snapshot() NativeSnapshot {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if observedGeneration != o.generation {
+		snap.PID = 0
+		snap.NativeStartIdentity = ""
+		snap.NativeSessionID = ""
+	}
 	snap.NativeGeneration = o.generation
 	snap.Origin = append(json.RawMessage(nil), o.origin...)
 	snap.HasTerminal = o.terminal != nil && snap.PID > 0
@@ -423,12 +435,6 @@ type ownedDriver struct {
 
 func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
 	if !d.Driver.Live(sess.InstanceID) {
-		d.owner.mu.Lock()
-		originPresent := len(d.owner.candidateOrigin) > 0 && json.Valid(d.owner.candidateOrigin)
-		d.owner.mu.Unlock()
-		if d.owner.nativeSink && !originPresent {
-			return nil, errors.New("authenticated native activation origin required before launch")
-		}
 		generation, err := freshNonce()
 		if err != nil {
 			return nil, err
@@ -439,9 +445,16 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		}
 		o := d.owner
 		o.mu.Lock()
+		commandID := o.candidateCommandID
+		o.mu.Unlock()
+		origin, err := o.awaitActivationOrigin(ctx, commandID, generation)
+		if err != nil {
+			return nil, err
+		}
+		o.mu.Lock()
 		o.generation = generation
 		o.nonce = nonce
-		o.origin = append(json.RawMessage(nil), o.candidateOrigin...)
+		o.origin = append(json.RawMessage(nil), origin...)
 		o.pending = map[string]*nativeApproval{}
 		o.terminal = nil
 		o.mu.Unlock()

@@ -35,20 +35,22 @@ type handshake struct {
 }
 
 type Request struct {
-	ObservationID string          `json:"observationId,omitempty"`
-	SourceDigest  string          `json:"sourceDigest,omitempty"`
-	Admission     *Admission      `json:"admission,omitempty"`
-	Relay         *BridgeResult   `json:"relay,omitempty"`
-	Cursor        int64           `json:"cursor,omitempty"`
-	Limit         int             `json:"limit,omitempty"`
-	Type          string          `json:"type"`
-	Sequence      int64           `json:"sequence,omitempty"`
-	CommandID     string          `json:"commandId,omitempty"`
-	Kind          string          `json:"kind,omitempty"`
-	Payload       json.RawMessage `json:"payload,omitempty"`
+	ActivationOrigin *ActivationOrigin `json:"activationOrigin,omitempty"`
+	ObservationID    string            `json:"observationId,omitempty"`
+	SourceDigest     string            `json:"sourceDigest,omitempty"`
+	Admission        *Admission        `json:"admission,omitempty"`
+	Relay            *BridgeResult     `json:"relay,omitempty"`
+	Cursor           int64             `json:"cursor,omitempty"`
+	Limit            int               `json:"limit,omitempty"`
+	Type             string            `json:"type"`
+	Sequence         int64             `json:"sequence,omitempty"`
+	CommandID        string            `json:"commandId,omitempty"`
+	Kind             string            `json:"kind,omitempty"`
+	Payload          json.RawMessage   `json:"payload,omitempty"`
 }
 
 type Response struct {
+	Activation   *ActivationRequest  `json:"activation,omitempty"`
 	Observations []NativeObservation `json:"observations,omitempty"`
 	Snapshot     *NativeSnapshot     `json:"snapshot,omitempty"`
 	Output       *OutputPage         `json:"output,omitempty"`
@@ -131,7 +133,7 @@ func Serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor) 
 	return serve(ctx, j, key, execute, nil, "")
 }
 
-const NativeOwnershipProtocol = "pagnet-whole-native-session-v1"
+const NativeOwnershipProtocol = "pagnet-whole-native-session-v2"
 
 func ServeOwner(ctx context.Context, owner *SessionOwner, key []byte, build string) error {
 	return serve(ctx, owner.journal, key, owner.Execute, owner, build)
@@ -365,6 +367,14 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "activation_poll":
+		response.Activation, err = o.relay.pollActivation(lease)
+	case "activation_origin":
+		if req.ActivationOrigin == nil {
+			err = errors.New("activation origin missing")
+		} else {
+			err = o.relay.completeActivation(lease, *req.ActivationOrigin)
+		}
 	case "snapshot":
 		snap := o.Snapshot()
 		response.Snapshot = &snap

@@ -16,7 +16,7 @@ import (
 )
 
 func testScope() Scope {
-	return Scope{AccountID: "account", HostID: "host", InstanceID: "instance", Generation: "generation"}
+	return Scope{ServerURL: "https://control.invalid", TenantID: "tenant", AccountID: "account", HostID: "host", InstanceID: "instance", Generation: "generation"}
 }
 func testJournal(t *testing.T) (*Journal, string) {
 	t.Helper()
@@ -179,11 +179,13 @@ func TestJournalScopePrivacyAndCorruptionRefuseActivation(t *testing.T) {
 	// Different account, instance, or generation can never adopt a journal.
 	j, dir2 := testJournal(t)
 	_ = j.Close()
-	wrong := testScope()
-	wrong.AccountID = "different"
-	if other, err := OpenJournal(dir2, wrong); err == nil {
-		_ = other.Close()
-		t.Fatal("different account inherited worker")
+	for _, mutate := range []func(*Scope){func(s *Scope) { s.AccountID = "other" }, func(s *Scope) { s.ServerURL = "https://other.invalid" }, func(s *Scope) { s.TenantID = "other" }, func(s *Scope) { s.Generation = "other" }} {
+		wrong := testScope()
+		mutate(&wrong)
+		if other, err := OpenJournal(dir2, wrong); err == nil {
+			_ = other.Close()
+			t.Fatal("different authority inherited worker")
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir2, "intents.sqlite"), []byte("not sqlite"), 0600); err != nil {
 		t.Fatal(err)

@@ -21,13 +21,14 @@ import (
 // and enforce its current grants before servicing a forwarded call. Worker
 // possession never bypasses that authenticated control-plane transport.
 type Admission struct {
-	Scope       Scope     `json:"scope"`
-	TenantID    string    `json:"tenantId"`
-	NetworkID   string    `json:"networkId"`
-	Kind        string    `json:"kind"`
-	RunnerID    string    `json:"runnerId"`
-	RunnerEpoch time.Time `json:"runnerEpoch"`
-	BootID      string    `json:"bootId"`
+	NativeAdmissionID string    `json:"nativeAdmissionId"`
+	Scope             Scope     `json:"scope"`
+	TenantID          string    `json:"tenantId"`
+	NetworkID         string    `json:"networkId"`
+	Kind              string    `json:"kind"`
+	RunnerID          string    `json:"runnerId"`
+	RunnerEpoch       time.Time `json:"runnerEpoch"`
+	BootID            string    `json:"bootId"`
 }
 type BridgeCall struct {
 	ID               string          `json:"id"`
@@ -52,6 +53,7 @@ type relayTicket struct {
 }
 type relayBroker struct {
 	nativeGeneration string
+	activation       *activationTicket
 	mu               sync.Mutex
 	scope            Scope
 	spec             NativeSpec
@@ -84,6 +86,10 @@ func (b *relayBroker) disconnect(lease int64) {
 	}
 }
 func (b *relayBroker) invalidateIssued() {
+	if b.activation != nil {
+		b.activation.issued = false
+		b.activation.lease = 0
+	}
 	for id, ticket := range b.pending {
 		if ticket.issued {
 			ticket.done <- BridgeResult{ID: id, Error: "Pagnet controller changed; this operation may already have been applied. Inspect its result before retrying."}
@@ -107,7 +113,7 @@ func (b *relayBroker) admit(lease int64, a Admission) error {
 	if b.closed || lease != b.lease {
 		return ErrFenced
 	}
-	if a.Scope != b.scope || a.TenantID != b.spec.TenantID || a.NetworkID != b.spec.NetworkID || a.Kind != b.spec.Kind || a.RunnerID == "" || len(a.RunnerID) > 256 || a.RunnerEpoch.IsZero() || a.BootID == "" || len(a.BootID) > 256 {
+	if a.NativeAdmissionID == "" || len(a.NativeAdmissionID) > 256 || a.Scope != b.scope || a.TenantID != b.spec.TenantID || a.NetworkID != b.spec.NetworkID || a.Kind != b.spec.Kind || a.RunnerID == "" || len(a.RunnerID) > 256 || a.RunnerEpoch.IsZero() || a.BootID == "" || len(a.BootID) > 256 {
 		return errors.New("control-plane admission does not match worker scope")
 	}
 	copy := a

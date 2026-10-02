@@ -181,8 +181,8 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	testBinary(t, root, nativeBinary, "./cmd/pagnet-fake-runtime", "")
 	testBinary(t, root, controllerA, "./internal/sessionworker/testdata/controller", "-X main.build=controller-a")
 	testBinary(t, root, controllerB, "./internal/sessionworker/testdata/controller", "-X main.build=controller-b")
-	scope := Scope{AccountID: uuid.NewString(), HostID: uuid.NewString(), InstanceID: uuid.NewString(), Generation: uuid.NewString()}
 	tenant := uuid.NewString()
+	scope := Scope{ServerURL: "https://control.invalid", TenantID: tenant, AccountID: uuid.NewString(), HostID: uuid.NewString(), InstanceID: uuid.NewString(), Generation: uuid.NewString()}
 	protected := e2ee.ProtectedContext{Kind: e2ee.OwnerContextKind, ID: uuid.NewString(), TenantID: tenant, OwnerUserID: uuid.NewString(), HostID: scope.HostID}
 	epoch := crypto.KeyEpoch{ID: uuid.NewString(), State: crypto.EpochActive, Key: bytes.Repeat([]byte{7}, 32), CreatedAt: time.Now().UTC()}
 	if err = crypto.SaveContextKeyring(contextState, &crypto.ContextKeyring{Context: protected, Epochs: []crypto.KeyEpoch{epoch}}); err != nil {
@@ -215,12 +215,34 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	waitPath(t, filepath.Join(state, "controller.sock"))
 	waitPath(t, filepath.Join(state, "native.sock"))
 	a := startController(t, controllerA, state)
-	admission := Admission{Scope: scope, TenantID: tenant, NetworkID: bootstrap.Native.NetworkID, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
+	admission := Admission{NativeAdmissionID: uuid.NewString(), Scope: scope, TenantID: tenant, NetworkID: bootstrap.Native.NetworkID, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
 	if r := a.call(t, Request{Type: "admission", Admission: &admission}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
-	origin := json.RawMessage(fmt.Sprintf(`{"id":%q,"commandId":"activate-one","tenantId":%q,"hostId":%q,"instanceId":%q,"runtime":"fake-persistent","runnerId":%q,"runnerEpoch":%q,"bootId":%q,"createdAt":%q}`, uuid.NewString(), tenant, scope.HostID, scope.InstanceID, admission.RunnerID, admission.RunnerEpoch.Format(time.RFC3339Nano), admission.BootID, time.Now().UTC().Format(time.RFC3339Nano)))
-	if r := a.intent(t, 1, "activate-one", "activate", Operation{Origin: origin}); r.Error != "" {
+	if r := a.intent(t, 1, "activate-one", "activate", Operation{SourceCommandID: "activate-one"}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	var activation *ActivationRequest
+	activationDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(activationDeadline) {
+		r := a.call(t, Request{Type: "activation_poll"})
+		if r.Error != "" {
+			t.Fatal(r.Error)
+		}
+		if r.Activation != nil {
+			activation = r.Activation
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if activation == nil || activation.SourceCommandID != "activate-one" || activation.NativeGeneration == "" {
+		t.Fatalf("missing exact native activation request: %+v", activation)
+	}
+	if premature := a.snapshot(t); premature.PID != 0 || premature.NativeSessionID != "" {
+		t.Fatalf("native launched before authority origin: %+v", premature)
+	}
+	origin := json.RawMessage(fmt.Sprintf(`{"id":%q,"commandId":"activate-one","tenantId":%q,"hostId":%q,"instanceId":%q,"runtime":"fake-persistent","nativeGeneration":%q,"nativeAdmissionId":%q,"runnerId":%q,"runnerEpoch":%q,"bootId":%q,"createdAt":%q}`, uuid.NewString(), tenant, scope.HostID, scope.InstanceID, activation.NativeGeneration, admission.NativeAdmissionID, admission.RunnerID, admission.RunnerEpoch.Format(time.RFC3339Nano), admission.BootID, time.Now().UTC().Format(time.RFC3339Nano)))
+	if r := a.call(t, Request{Type: "activation_origin", ActivationOrigin: &ActivationOrigin{ID: activation.ID, NativeGeneration: activation.NativeGeneration, Origin: origin}}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
 	if out := a.outcome(t, 1); out.State != "completed" {
@@ -260,7 +282,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 			t.Fatal("native process read its worker's private control key")
 		}
 	}
-	if r := a.intent(t, 2, "memory-one", "prompt", Operation{Input: "let keep preserved", InputKind: "task", Origin: json.RawMessage(`{"id":"another-delivery"}`)}); r.Error != "" {
+	if r := a.intent(t, 2, "memory-one", "prompt", Operation{Input: "let keep preserved", InputKind: "task", SourceCommandID: "another-delivery"}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
 	if out := a.outcome(t, 2); out.State != "completed" {
@@ -331,6 +353,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if recovered.PID != initial.PID || recovered.NativeGeneration != initial.NativeGeneration || len(recovered.Pending) != 1 {
 		t.Fatal("native state depended on a controller process")
 	}
+	admission.NativeAdmissionID = uuid.NewString()
 	admission.RunnerID = uuid.NewString()
 	admission.RunnerEpoch = time.Now().UTC()
 	admission.BootID = uuid.NewString()

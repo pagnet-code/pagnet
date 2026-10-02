@@ -35,6 +35,8 @@ var (
 // Scope is immutable for the lifetime of a worker. Generation identifies this
 // durable ownership lifetime, not a native PID, controller connection, or bridge nonce.
 type Scope struct {
+	ServerURL  string `json:"serverUrl"`
+	TenantID   string `json:"tenantId"`
 	AccountID  string `json:"accountId"`
 	HostID     string `json:"hostId"`
 	InstanceID string `json:"instanceId"`
@@ -61,6 +63,10 @@ type Journal struct {
 }
 
 func OpenJournal(dir string, scope Scope) (*Journal, error) {
+	server, serverErr := url.Parse(scope.ServerURL)
+	if serverErr != nil || (server.Scheme != "https" && server.Scheme != "http") || server.Host == "" || server.User != nil || server.RawQuery != "" || server.Fragment != "" || scope.TenantID == "" || len(scope.TenantID) > 256 || len(scope.ServerURL) > 2048 {
+		return nil, errors.New("worker authority scope is incomplete")
+	}
 	if scope.AccountID == "" || scope.HostID == "" || scope.InstanceID == "" || scope.Generation == "" || len(scope.AccountID) > 256 || len(scope.HostID) > 256 || len(scope.InstanceID) > 256 || len(scope.Generation) > 256 {
 		return nil, errors.New("worker scope is incomplete")
 	}
