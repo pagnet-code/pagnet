@@ -24,6 +24,14 @@ Native provider credentials are deliberately allowed so the runtime can use
 its provider. Configured runtime profiles explicitly add their own environment;
 do not place Pagnet control-plane keys in a runtime profile.
 
+Managed Linux runtimes require Landlock ABI3 or newer (normally Linux 6.2+
+with Landlock enabled); feature detection is authoritative. Older kernels are
+refused because they cannot protect files from truncation. Pathname Unix socket
+connections are not restricted by this policy, including on newer kernels;
+bridge and private control listeners must authenticate requests separately.
+The device subtree grant also retains device access allowed by OS user/group
+permissions; this policy does not restrict device IOCTL operations.
+
 Bridge authentication and filesystem containment are separate. macOS reports
 filesystem sandboxing as `unsupported_platform`; process binding does not
 provide Linux Landlock filesystem isolation. Other unsupported operating

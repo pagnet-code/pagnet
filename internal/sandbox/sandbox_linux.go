@@ -20,10 +20,20 @@ import (
 func MustSandbox() bool { return true }
 
 // Available reports whether the filesystem sandbox can be applied right now
-// (the kernel supports Landlock). Callers check MustSandbox() first: on
+// (Landlock ABI3 or newer, including truncation protection). Callers check
+// MustSandbox() first: on
 // non-Linux, Available() is false by design ("non-isolated", H5), while here
 // false is a FAILURE that must stop the launch.
-func Available() bool { return LandlockAvailable() }
+func Available() bool { return requireKernelABI(getABI()) == nil }
+
+// requireKernelABI enforces complete filesystem integrity, not just read
+// denial: older ABIs cannot prevent truncating protected files.
+func requireKernelABI(a landlockABI) error {
+	if a.version < 3 {
+		return fmt.Errorf("unsupported Linux sandbox: Landlock ABI3 or newer is required for truncation protection (detected ABI%d, kernel %s; Linux 6.2+ with Landlock enabled)", a.version, kernelRelease())
+	}
+	return nil
+}
 
 // LandlockAvailable probes whether the running kernel supports Landlock by
 // issuing a side-effect-free ABI version query. A kernel without Landlock
@@ -34,30 +44,17 @@ func LandlockAvailable() bool { return getABI().version > 0 }
 // ---------------------------------------------------------------------------
 // Kernel ABI detection
 //
-// landlock_create_ruleset changed shape between kernel series:
-//
-//   - ABI v1–v3 (Linux 5.13–6.6): SYSCALL_DEFINE2(attr, flags). A version
-//     query is (attr=NULL, flags=LANDLOCK_CREATE_RULESET_VERSION) and the
-//     kernel reads exactly its own struct size from attr.
-//   - ABI v4+ (Linux 6.7+, this host: 6.8): SYSCALL_DEFINE3(attr, size,
-//     flags). A version query is (attr=NULL, size=0,
-//     flags=LANDLOCK_CREATE_RULESET_VERSION); a normal create copies
-//     min(kernel struct size, size) bytes from attr, with size ≥
-//     offsetofend(handled_access_fs) = 8.
-//
-// The two version queries are mutually harmless: on a 3-arg kernel the
-// legacy-shaped query passes (attr=NULL, size=VERSION, flags=0) → the kernel
-// rejects the NULL attr (EFAULT, no side effect); on a 2-arg kernel the
-// modern-shaped query passes (attr=NULL, flags=0) → same EFAULT.
+// landlock_create_ruleset has used (attr, size, flags) since Linux 5.13
+// (ABI v1). The version query is (NULL, 0, VERSION). The supplied size
+// provides forwards/backwards-compatible struct extension.
 //
 // x/sys v0.47.0 provides the Landlock types/constants/sysnums but NO
 // wrapper functions, so the syscalls are issued with unix.Syscall/Syscall6.
 
 // landlockABI describes the Landlock interface of the running kernel.
 type landlockABI struct {
-	version  int    // ABI version reported by the version query (0 = none)
-	threeArg bool   // true on kernels ≥6.7 (SYSCALL_DEFINE3)
-	fsMask   uint64 // the kernel's filesystem access mask for this ABI
+	version int    // ABI version reported by the version query (0 = none)
+	fsMask  uint64 // the kernel's filesystem access mask for this ABI
 }
 
 var (
@@ -73,36 +70,25 @@ func getABI() landlockABI {
 
 // probeABI queries the running kernel for its Landlock ABI (no side effects).
 func probeABI() landlockABI {
-	// Modern (≥6.7): 3-arg version query.
 	if v, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0,
 		unix.LANDLOCK_CREATE_RULESET_VERSION); errno == 0 && v > 0 {
-		return landlockABI{version: int(v), threeArg: true, fsMask: landlockFSMask(int(v))}
-	}
-	// Legacy (5.13–6.6): 2-arg version query.
-	if v, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0,
-		unix.LANDLOCK_CREATE_RULESET_VERSION, 0); errno == 0 && v > 0 {
-		return landlockABI{version: int(v), threeArg: false, fsMask: landlockFSMask(int(v))}
+		return landlockABI{version: int(v), fsMask: landlockFSMask(int(v))}
 	}
 	return landlockABI{}
 }
 
-// landlockFSMask returns the kernel's LANDLOCK_MASK_ACCESS_FS (the access
-// bits a ruleset may name) for the given ABI version. Values follow the
-// kernel's (LAST_ACCESS_FS << 1) - 1 formula per ABI:
-//
-//	v1 (5.13–5.18): execute, write_file, read_file, read_dir
-//	v2 (5.19–6.2): + make_*, remove_*
-//	v3 (6.3–6.6):  + truncate
-//	v4 (6.7+, this host 6.8): + refer; mask up to truncate = 0x7FFF.
-//	(v5+ add bits above this set; 0x7FFF remains a valid subset.)
+// landlockFSMask returns the supported filesystem subset used by this policy.
+// ABI v1 already includes all execute/read/write/remove/make bits (0x1FFF).
+// ABI v2 adds REFER; ABI v3 adds TRUNCATE. Later filesystem rights are not
+// claimed as handled until the policy implements their grants.
 func landlockFSMask(v int) uint64 {
 	switch {
-	case v <= 1:
-		return uint64(bExecute | bWriteFile | bReadFile | bReadDir)
-	case v == 2:
+	case v < 1:
+		return 0
+	case v == 1:
 		return 0x1FFF
-	case v == 3:
-		return 0x5FFF
+	case v == 2:
+		return 0x3FFF
 	default:
 		return 0x7FFF
 	}
@@ -140,10 +126,8 @@ var (
 	// plant entries at daemon-state locations). With them granted on the
 	// RW subtrees, creation inside them is unchanged (it succeeded while
 	// unhandled too — it is now an explicit grant) and creation OUTSIDE
-	// them is denied (EACCES). On ABI v1 kernels (5.13–5.18) the kernel
-	// mask has no MAKE bits: `grant & abiMask` drops them and creation is
-	// ungated there — a kernel-inherent residual (the same class as the
-	// unix-socket-connect limitation), documented, not fixable in userspace.
+	// them is denied (EACCES), including on ABI v1 kernels (5.13–5.18),
+	// which already support every REMOVE/MAKE right used here.
 	// Making a file executable (chmod +x) is not gated by a Landlock bit,
 	// so no extra bit is needed for it.
 	rwAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate |
@@ -161,18 +145,9 @@ var (
 	// user: /dev/null + own ttys; /dev/mem, /dev/sda, ... stay denied).
 	// See the Spec.Dev doc.
 	devAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate)
-	// traverseAccess: READ_DIR, granted to (a) the parent of a granted
-	// socket (to resolve the socket file) and (b) on ABI v1–v3 kernels only,
-	// to EVERY ancestor of every grant up to / — the kernel there gates
-	// each path component of an absolute-path resolution, so a subtree
-	// grant is unreachable without its ancestor chain. READ_DIR reveals a
-	// directory's entry NAMES but never file contents (no READ_FILE).
-	//
-	// The ancestor-chain exposure is kernel-inherent on v1–v3 and is the
-	// reason v4+ does NOT pay it: on ABI v4 (verified empirically on this
-	// host, 6.8), absolute-path resolution INTO a granted subtree succeeds
-	// with ONLY the subtree rule — no ancestor grants — so computeRules
-	// adds no ancestor rules there (see the function doc).
+	// traverseAccess grants directory entry names, never file contents.
+	// The policy grants it on socket parents and conservatively on grant
+	// ancestors for ABI1–3. Modern ABI4 native tests need no ancestor grants.
 	traverseAccess = uint64(bReadDir)
 )
 
@@ -189,6 +164,9 @@ var (
 // continue unrelated work on this irreversibly restricted thread.
 func Apply(spec *Spec) error {
 	if err := spec.Normalize(); err != nil {
+		return err
+	}
+	if err := requireKernelABI(getABI()); err != nil {
 		return err
 	}
 	// no_new_privs, capability bounds and Landlock are per-thread. Keep
@@ -236,8 +214,8 @@ func dropCapabilitiesBestEffort() {
 
 func applyLandlock(spec *Spec) error {
 	a := getABI()
-	if a.version == 0 {
-		return fmt.Errorf("kernel %s supports no Landlock", kernelRelease())
+	if err := requireKernelABI(a); err != nil {
+		return err
 	}
 	rules, accessFs, mandatory, err := computeRules(spec, a)
 	if err != nil {
@@ -245,21 +223,10 @@ func applyLandlock(spec *Spec) error {
 	}
 	var attr unix.LandlockRulesetAttr
 	attr.Access_fs = accessFs
-	var fd uintptr
-	var errno unix.Errno
-	if a.threeArg {
-		// ≥6.7: (attr, size, flags). size=16 = the {handled_access_fs,
-		// handled_access_net} fields; the kernel zero-fills the rest of its
-		// own struct (and any future struct), so passing exactly the fields
-		// we set is forward-compatible.
-		fd, _, errno = unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
-			uintptr(unsafe.Pointer(&attr)), 16, 0)
-	} else {
-		// 5.13–6.6: (attr, flags). The kernel reads exactly its own (smaller)
-		// struct size from attr — the first 8 bytes (handled_access_fs).
-		fd, _, errno = unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
-			uintptr(unsafe.Pointer(&attr)), 0, 0)
-	}
+	// Only handled_access_fs is configured; the kernel zero-fills newer
+	// fields. Eight bytes is the original supported ABI v1 struct size.
+	fd, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
+		uintptr(unsafe.Pointer(&attr)), 8, 0)
 	if errno != 0 {
 		return fmt.Errorf("landlock_create_ruleset: %w (kernel %s, ABI v%d)", errno, kernelRelease(), a.version)
 	}
@@ -306,42 +273,22 @@ func applyLandlock(spec *Spec) error {
 // subtree (RW/RO/Dev) it records the grant on the subtree root; for each
 // socket it records READ_DIR (traversal) on the socket's parent subtree.
 //
-// Ancestor traversal is ABI-dependent (the kernel's path-resolution
-// gating, settled empirically on this host — ABI v4 / 6.8):
+// The current policy adds conservative ancestor READ_DIR grants on ABI1–3
+// and omits them on ABI4+ (verified on this host's ABI4). This is a policy
+// compatibility choice, not a guarantee that older kernels require it.
+// READ_DIR on / exposes entry names beneath it; it never grants READ_FILE.
+// stat/lstat metadata is not restricted by Landlock on any ABI.
 //
-//   - ABI v1–v3 (5.13–6.6): the kernel gates each component of an
-//     absolute-path resolution, so a subtree grant is unreachable without
-//     READ_DIR on every ancestor up to /. computeRules therefore adds the
-//     ancestor chain there. THE EXPOSURE (kernel-inherent, documented):
-//     a path_beneath rule on / grants READ_DIR to the whole filesystem —
-//     a sandboxed runtime can readdir (entry NAMES) of ANY directory
-//     (~/.ssh, ~/.aws, the daemon's accounts/ ...) and stat/lstat any path
-//     (existence/size/mtime of secret files). File CONTENTS remain denied
-//     (no READ_FILE on ancestors), and stat is ungated by Landlock on ALL
-//     ABIs (kernel-inherent — it cannot be fixed in userspace).
-//   - ABI v4+ (6.7+, this host 6.8): absolute-path resolution INTO a
-//     granted subtree succeeds with ONLY the subtree rule (verified: an
-//     open of a file — direct and nested — and a unix-socket connect, both
-//     by absolute path, in a leaf subtree whose ancestors carry no rule).
-//     No ancestor rules are added, so the runtime sees only the granted
-//     subtrees' entry names; the stat-metadata exposure above remains
-//     (Landlock never gates stat).
+// Grants are intersected with the rights supported by the detected ABI.
+// ABI1/2 cannot restrict truncation; unsupported operations remain residual
+// limitations, rather than becoming more restrictive through bit omission.
 //
-// abi is the detected kernel ABI: grants are intersected with abi.fsMask
-// (the kernel's access mask) so the policy stays valid on legacy kernels
-// (5.13–6.6 lack truncate/remove/make bits — the result there is MORE
-// restrictive, never less; a zeroed grant is refused, never silently
-// dropped), and abi.version selects the ancestor-traversal behavior above.
-//
-// Unix-socket CONNECT is deliberately NOT in the handled set: no kernel in
-// the supported range (ABI v1–v4, 5.13–6.8) has a connect-unix access bit
-// (it arrives in ABI v5 / 6.10), and 6.8 registers no path-lookup hook, so
-// a connect is not gated by Landlock at all on these kernels — the daemon
-// bridge socket stays reachable (the required behavior), bounded by DAC,
-// with bridge authorization enforced by S1 (SO_PEERCRED + nonce). On a
-// future ABI v5+ kernel the CONNECT_UNIX bit could gate connects precisely;
-// omitting it keeps the bridge reachable there too (an unhandled access is
-// never gated).
+// Pathname Unix socket connections are not currently handled by this policy.
+// Linux added LANDLOCK_ACCESS_FS_RESOLVE_UNIX in ABI v9, not ABI v5 (which
+// added IOCTL_DEV). ABI v6 separately scopes abstract Unix sockets/signals.
+// Until explicit socket rules and scoped attributes are installed, connects
+// remain possible wherever DAC permits; bridge/control authentication must
+// enforce authority independently of filesystem containment.
 func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[string]bool, error) {
 	rules := map[string]uint64{}
 	var accessFs uint64
@@ -352,9 +299,7 @@ func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[s
 	// paths are best-effort (a missing one is a no-op grant, skipped).
 	mandatory := map[string]bool{}
 	abiMask := abi.fsMask
-	// Ancestors up to / get READ_DIR traversal only where the kernel's
-	// path resolution requires it (ABI v1–v3). See the function doc for
-	// the per-ABI behavior and the exposure each branch implies.
+	// Preserve the existing conservative ancestor grants on ABI1–3.
 	legacyTraversal := abi.version >= 1 && abi.version < 4
 	add := func(p string, selfAccess uint64, isMandatory bool) error {
 		p = filepath.Clean(p)

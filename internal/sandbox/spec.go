@@ -12,7 +12,8 @@
 // no_new_privs + a capability bounding-set drop, applied by a wrapper that
 // EXECs the target IN PLACE (the child's PID stays the runtime's PID, so the
 // supervisor's root-PID tracking and the S1 bridge process-tree binding keep
-// working). It FAILS CLOSED on Linux when the sandbox cannot be applied. On
+// working). Managed Linux runtimes require Landlock ABI3 or newer and fail
+// closed when the sandbox cannot be applied. On
 // platforms without Landlock (darwin) the launch is NOT sandboxed and the
 // platform is reported as non-isolated (owner-scoped dev machines).
 //
@@ -27,7 +28,7 @@
 // Actual exposure (kernel-inherent, all ABIs): Landlock never gates
 // stat/lstat — a sandboxed process can learn the existence/size/mtime of
 // any path, but never file contents. On ABI v1–v3 kernels the ancestor
-// traversal chain (required for path resolution there) additionally
+// traversal chain (a conservative policy compatibility choice) additionally
 // exposes directory entry NAMES system-wide; on ABI v4+ no ancestor grants
 // are added, so only the granted subtrees' entry names are visible.
 package sandbox
@@ -76,34 +77,28 @@ type Spec struct {
 	// Sockets: unix socket paths the runtime must be able to reach (the
 	// daemon bridge socket). The sandbox grants READ_DIR (traversal) on the
 	// socket's parent — and, on ABI v1–v3 kernels only, on its ancestors up
-	// to / (their path resolution requires the chain; on ABI v4+ the
+	// to / (a conservative compatibility policy; on ABI v4+ the
 	// parent rule alone suffices — verified empirically) — so any file
 	// access toward that path walks a granted chain. No read/write on the
 	// surrounding dir contents.
 	//
-	// KNOWN KERNEL LIMITATION (documented, not a sandbox bug): on the
-	// supported kernels (Landlock ABI v1–v4, Linux 5.13–6.8) unix-socket
-	// CONNECT is NOT gateable by Landlock at all — there is no
-	// connect-unix access bit before ABI v5 (Linux 6.10), and 6.8 registers
-	// no path-lookup hook, so even the path walk of a connect is unchecked.
-	// Connect reachability is therefore bounded by DAC (same-UID sockets
-	// only), and authorization ON the daemon bridge is enforced by the S1
-	// layer (SO_PEERCRED process-tree binding + per-activation nonce), not
-	// by the sandbox. The Sockets field is the spec-level statement of that
-	// intent; on a future ABI v5+ kernel the CONNECT_UNIX bit could gate it
-	// precisely.
+	// Pathname Unix socket connections are gateable since Landlock ABI v9
+	// through LANDLOCK_ACCESS_FS_RESOLVE_UNIX. This policy does not yet handle
+	// that right; connects remain possible wherever DAC permits. ABI v6
+	// separately supports abstract-socket and signal scopes, without per-path
+	// exceptions. Filesystem containment is not IPC authorization: the bridge
+	// authenticates process ancestry and nonce, and private control listeners
+	// must authenticate their own authority independently.
 	Sockets []string
 	// Dev: device subtrees granted read+write+truncate (DAC-gated) — /dev.
 	// Runtimes and their shell commands must WRITE /dev/null (the universal
 	// output sink: `> /dev/null`, `2>/dev/null` — bash opens it
 	// O_WRONLY|O_CREAT|O_TRUNC, so the grant carries the TRUNCATE bit) and
-	// READ /dev/urandom, /dev/zero, /dev/tty. A Landlock path_beneath rule
-	// can only target a DIRECTORY, so a single device file cannot be
-	// granted — the grant is necessarily on the /dev subtree. That is safe
-	// because Landlock sits ON TOP of DAC: a device is writable only if the
-	// user's DAC already allows writing it (a normal user: /dev/null and
-	// their own ttys); privileged devices (/dev/mem, /dev/sda, /dev/kmsg,
-	// ...) stay DAC-denied.
+	// READ /dev/urandom, /dev/zero, /dev/tty. The current policy uses a
+	// /dev subtree grant. Device access remains subject to the OS user/group
+	// permissions; this is not a denylist of every device interface. This
+	// policy does not handle IOCTL_DEV (added in ABI5), so device ioctls
+	// remain possible where device/DAC permissions allow them.
 	Dev []string
 }
 
@@ -451,7 +446,7 @@ type Options struct {
 	Binary string
 	// Home: the user's home ("" = os.UserHomeDir()).
 	Home string
-	// Socket: the daemon bridge socket (CONNECT_UNIX).
+	// Socket: the daemon bridge socket path (IPC authorization is separate).
 	Socket string
 	// BridgeDir: the directory containing the daemon bridge worker binary
 	// (the pagnet MCP server the runtime spawns as its child). RO grant
