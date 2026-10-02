@@ -198,7 +198,7 @@ func retainNativeEventSource(ctx context.Context, tx *sql.Tx, observation Native
 		if err != nil {
 			return err
 		}
-		if stored != *observation.TurnSource {
+		if !reflect.DeepEqual(stored, *observation.TurnSource) {
 			return ErrConflict
 		}
 	}
