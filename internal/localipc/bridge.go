@@ -28,6 +28,10 @@ func BridgeSocketPath(stateDir string) (string, error) {
 }
 
 func shortBridgeSocketPath(stateDir, privateDir string, limit int) (string, error) {
+	return shortNamedSocketPath(stateDir, privateDir, BridgeSocketName, "", limit)
+}
+
+func shortNamedSocketPath(stateDir, privateDir, name, domain string, limit int) (string, error) {
 	absolute, err := filepath.Abs(stateDir)
 	if err != nil {
 		return "", err
@@ -36,11 +40,11 @@ func shortBridgeSocketPath(stateDir, privateDir string, limit int) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("resolve bridge state directory: %w", err)
 	}
-	direct := filepath.Join(canonical, BridgeSocketName)
+	direct := filepath.Join(canonical, name)
 	if len(direct) < limit {
 		return direct, nil
 	}
-	sum := sha256.Sum256([]byte(canonical))
+	sum := sha256.Sum256([]byte(domain + canonical))
 	path := filepath.Join(privateDir, hex.EncodeToString(sum[:])+".sock")
 	if len(path) >= limit {
 		return "", fmt.Errorf("private bridge socket path exceeds platform limit")

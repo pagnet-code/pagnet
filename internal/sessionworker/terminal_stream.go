@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -41,7 +40,11 @@ func (c *Controller) OpenTerminalStream(ctx context.Context, dir string, scope S
 	if c.Ownership != NativeOwnershipProtocol || c.identity == "" || c.Lease <= 0 || len(key) != 32 || generation == "" {
 		return nil, errors.New("whole native terminal authority missing")
 	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(dir, "controller.sock"))
+	path, err := SocketPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, err
 	}

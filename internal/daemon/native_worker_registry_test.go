@@ -31,6 +31,10 @@ func nativeRegistryFixture(t *testing.T) (*NativeWorkerRegistry, sessionworker.S
 	if err := os.Chmod(root, 0700); err != nil {
 		t.Fatal(err)
 	}
+	root = filepath.Join(root, strings.Repeat("long-owner-state-", 8))
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	r, err := OpenNativeWorkerRegistry(root)
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +166,11 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 	originalBuild := a.WorkerBuild
 	// Lifecycle cleanup signals only the mutually authenticated worker through
 	// its original bootstrap process identity (PID inspected via private socket).
-	peer, err := net.Dial("unix", filepath.Join(record.Dir, "controller.sock"))
+	socket, err := sessionworker.SocketPath(record.Dir)
+	if err != nil || len(socket) >= 104 {
+		t.Fatal("original endpoint not bounded", err)
+	}
+	peer, err := net.Dial("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +213,7 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replacement.Close()
-	nextPeer, err := net.Dial("unix", filepath.Join(recovered.Dir, "controller.sock"))
+	nextPeer, err := net.Dial("unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}

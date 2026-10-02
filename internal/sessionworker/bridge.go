@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -207,9 +206,9 @@ func (b *relayBroker) close() {
 // Native clients stay connected across controller changes and daemon socket
 // replacement, while each subsequent call requires a current fenced admission.
 func (o *SessionOwner) serveBridge(ctx context.Context, ready chan<- struct{}) error {
-	path := filepath.Join(o.journal.dir, "native.sock")
-	if len(path) > 100 {
-		return errors.New("native bridge path exceeds supported platform limit")
+	path, err := NativeSocketPath(o.journal.dir)
+	if err != nil {
+		return err
 	}
 	if err := removeStaleSocket(path); err != nil {
 		return err

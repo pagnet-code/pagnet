@@ -164,7 +164,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	state := filepath.Join(dir, "s")
+	state := filepath.Join(dir, strings.Repeat("original-state-", 10))
 	workspace := filepath.Join(dir, "w")
 	contextState := filepath.Join(dir, "c")
 	binaries := filepath.Join(dir, "b", "bin")
@@ -212,8 +212,19 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = writeEnv.Close()
-	waitPath(t, filepath.Join(state, "controller.sock"))
-	waitPath(t, filepath.Join(state, "native.sock"))
+	controllerSocket, err := SocketPath(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPath(t, controllerSocket)
+	nativeSocket, err := NativeSocketPath(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(controllerSocket) >= 104 || len(nativeSocket) >= 104 || controllerSocket == nativeSocket {
+		t.Fatal("long worker endpoints not distinct and bounded")
+	}
+	waitPath(t, nativeSocket)
 	a := startController(t, controllerA, state)
 	admission := Admission{NativeAdmissionID: uuid.NewString(), Scope: scope, TenantID: tenant, NetworkID: bootstrap.Native.NetworkID, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
 	if r := a.call(t, Request{Type: "admission", Admission: &admission}); r.Error != "" {

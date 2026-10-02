@@ -12,7 +12,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -166,9 +165,9 @@ func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, 
 	key = append([]byte(nil), key...)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	path := filepath.Join(j.dir, "controller.sock")
-	if len(path) > 100 {
-		return errors.New("worker socket path exceeds supported platform limit")
+	path, err := SocketPath(j.dir)
+	if err != nil {
+		return err
 	}
 	// Do not remove an arbitrary existing path. An interrupted worker's stale
 	// socket is cleaned by its exclusive owner only after verifying its type.
@@ -361,7 +360,11 @@ func DialController(ctx context.Context, dir string, scope Scope, key []byte, id
 	if len(key) != 32 || id == "" || len(id) > 256 {
 		return nil, errors.New("invalid private controller identity")
 	}
-	c, err := (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(dir, "controller.sock"))
+	path, err := SocketPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	c, err := (&net.Dialer{}).DialContext(ctx, "unix", path)
 	if err != nil {
 		return nil, err
 	}

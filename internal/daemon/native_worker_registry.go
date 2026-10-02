@@ -176,9 +176,6 @@ func (r *NativeWorkerRegistry) Reserve(scope sessionworker.Scope, spec sessionwo
 	defer r.mu.Unlock()
 	record := NativeWorkerRecord{Scope: scope, Dir: r.Dir(scope), Spec: spec, Profile: profile, OriginalOwnershipID: originalOwnershipID, ProfileFingerprint: sessionworker.NativeProfileFingerprint(spec), LaunchState: "reserved"}
 	record.Spec.Env = nil
-	if len(filepath.Join(record.Dir, "controller.sock")) > 103 {
-		return NativeWorkerRecord{}, errors.New("native worker state path exceeds Unix socket limit")
-	}
 	if scope.ServerURL == "" || scope.TenantID == "" || scope.AccountID == "" || scope.HostID == "" || scope.InstanceID == "" || scope.Generation == "" || spec.TenantID != scope.TenantID || !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) {
 		return NativeWorkerRecord{}, errors.New("incomplete original native worker authority")
 	}

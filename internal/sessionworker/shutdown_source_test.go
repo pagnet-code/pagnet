@@ -35,7 +35,10 @@ func TestActualNativeShutdownWithFullOrdinaryOutboxRetainsOriginalEOFOnReopen(t 
 	defer owner.Close()
 	owner.generation = "actual-original-generation"
 	owner.origin = json.RawMessage(`{"id":"` + uuid.NewString() + `","nativeGeneration":"actual-original-generation"}`)
-	owner.sess.Env = owner.launchEnvironment("fixture-only-nonce")
+	owner.sess.Env, err = owner.launchEnvironment("fixture-only-nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if _, err = owner.driver.Activate(ctx, owner.sess, make(chan session.SessionEvent, 64)); err != nil {

@@ -606,7 +606,10 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		o.relay.bindNative(generation)
 		// Manager holds its activation lock across this write and Activate. No
 		// controller can mutate launch environment/model on a live worker endpoint.
-		sess.Env = o.launchEnvironment(nonce)
+		sess.Env, err = o.launchEnvironment(nonce)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return d.Driver.Activate(ctx, sess, events)
 }
@@ -637,13 +640,17 @@ func (d *ownedDriver) AutoSuspendSafe(id string) bool {
 	}
 	return false
 }
-func (o *SessionOwner) launchEnvironment(nonce string) []string {
+func (o *SessionOwner) launchEnvironment(nonce string) ([]string, error) {
+	socket, err := NativeSocketPath(o.journal.dir)
+	if err != nil {
+		return nil, err
+	}
 	name, surface := "pagnet", "worker"
 	if o.spec.Kind == "representative" {
 		name, surface = "pagnet-control", "control"
 	}
-	cfg := map[string]any{"mcpServers": map[string]any{name: map[string]any{"command": o.spec.MCPExecutable, "args": []string{"mcp", surface, "--socket", filepath.Join(o.journal.dir, "native.sock")}, "env": map[string]string{"PAGNET_INSTANCE_ID": o.journal.scope.InstanceID, "PAGNET_NETWORK_ID": o.spec.NetworkID, "PAGNET_BRIDGE_NONCE": nonce}}}}
+	cfg := map[string]any{"mcpServers": map[string]any{name: map[string]any{"command": o.spec.MCPExecutable, "args": []string{"mcp", surface, "--socket", socket}, "env": map[string]string{"PAGNET_INSTANCE_ID": o.journal.scope.InstanceID, "PAGNET_NETWORK_ID": o.spec.NetworkID, "PAGNET_BRIDGE_NONCE": nonce}}}}
 	raw, _ := json.Marshal(cfg)
 	env := append([]string(nil), o.spec.Env...)
-	return append(env, "PAGNET_INSTANCE_ID="+o.journal.scope.InstanceID, "PAGNET_NETWORK_ID="+o.spec.NetworkID, "PAGNET_STATE_DIR="+filepath.Join(o.journal.dir, "native-state"), "PAGNET_MCP_CONFIG="+string(raw))
+	return append(env, "PAGNET_INSTANCE_ID="+o.journal.scope.InstanceID, "PAGNET_NETWORK_ID="+o.spec.NetworkID, "PAGNET_STATE_DIR="+filepath.Join(o.journal.dir, "native-state"), "PAGNET_MCP_CONFIG="+string(raw)), nil
 }

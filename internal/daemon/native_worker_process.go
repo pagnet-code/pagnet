@@ -107,12 +107,16 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			}
 		}
 	}
+	path, err := sessionworker.SocketPath(current.Dir)
+	if err != nil {
+		return err
+	}
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		info, err := os.Lstat(filepath.Join(current.Dir, "controller.sock"))
+		info, err := os.Lstat(path)
 		if err == nil {
 			stat, ok := info.Sys().(*syscall.Stat_t)
 			if !ok || stat.Uid != uint32(os.Getuid()) || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0600 {
