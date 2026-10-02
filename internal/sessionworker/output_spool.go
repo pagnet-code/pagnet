@@ -283,9 +283,11 @@ func (o *SessionOwner) observeOutputDelta(p *nativeSourceProducer, source Native
 	defer clear(originalKey[:])
 	deltaID := uuid.NewString()
 	var err error
+	var needsProjection bool
 	for {
 		var data nativeOutputSpool
 		data, err = o.journal.appendOutputDelta(ctx, p, o.captureKey, source, event, deltaID, originalKey, available)
+		needsProjection = data.Ready != nil || len(data.Text) >= nativeOutputBatchBytes
 		clear(data.Key)
 		if err == nil {
 			break
@@ -298,6 +300,12 @@ func (o *SessionOwner) observeOutputDelta(p *nativeSourceProducer, source Native
 			return err
 		case <-time.After(50 * time.Millisecond):
 		}
+	}
+	// The committed append already authenticated this tail. Below the batch
+	// threshold there is nothing to project; avoid loading and decrypting the
+	// same growing ciphertext a second time for every small native delta.
+	if !needsProjection {
+		return nil
 	}
 	return o.flushNativeOutput(source.NativeGeneration, source.Sequence, false, observe)
 }
