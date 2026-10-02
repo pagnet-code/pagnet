@@ -481,6 +481,10 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		err = o.journal.CommitTerminalView(ctx, lease, req.NativeDispatch)
 	case "dispatches":
 		response.Dispatches, err = o.journal.DispatchRecords(ctx, lease)
+	case "dispatch_retire_check":
+		if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
+			err = o.journal.CheckDispatchRetirement(ctx, lease, req.Sequence)
+		}
 	case "dispatch_retire":
 		if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
 			err = o.journal.RetireDispatches(ctx, lease, req.Sequence)

@@ -70,6 +70,12 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 	if floor == ownership.RetiredFloor {
 		return &ownership, nil
 	}
+	// Local completion is not yet permission to retire its original source:
+	// pending capture/transfer/receipt references must drain first. Advancing
+	// the cloud floor before this check would revoke a still-running cloud turn.
+	if _, err = p.call(ctx, sessionworker.Request{Type: "dispatch_retire_check", Sequence: floor}); err != nil {
+		return nil, err
+	}
 	// LastDispatchSequence in a replayed register response may lag newer
 	// admissions; exact authenticated local proofs bound this metadata advance.
 	if floor > ownership.LastDispatchSequence {

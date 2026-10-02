@@ -252,10 +252,10 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 	return next, true, nil
 }
 
-// RetireDispatches follows the matching backend retirement COMMIT. A worker
-// rejects premature pruning even from its authenticated controller: outcomes
-// must be settled and acknowledged, with all original turn evidence drained.
-func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) error {
+// CheckDispatchRetirement verifies the same original-source drain guards as
+// pruning, before the controller advances the backend floor. It never erases
+// mappings or evidence, so a lost cloud reply can replay the original proof.
+func (j *Journal) CheckDispatchRetirement(ctx context.Context, lease, floor int64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	tx, err := j.db.BeginTx(ctx, nil)
@@ -263,6 +263,13 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 		return err
 	}
 	defer tx.Rollback()
+	if err = validateDispatchRetirementTx(ctx, tx, lease, floor); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func validateDispatchRetirementTx(ctx context.Context, tx *sql.Tx, lease, floor int64) error {
 	_, operationFloor, err := checkLease(ctx, tx, lease)
 	if err != nil {
 		return err
@@ -280,6 +287,23 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	}
 	if unsafe != 0 {
 		return ErrConflict
+	}
+	return nil
+}
+
+// RetireDispatches follows the matching backend retirement COMMIT. A worker
+// rejects premature pruning even from its authenticated controller: outcomes
+// must be settled and acknowledged, with all original turn evidence drained.
+func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = validateDispatchRetirementTx(ctx, tx, lease, floor); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_view_commits WHERE operation_sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
