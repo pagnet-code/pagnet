@@ -740,7 +740,7 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 				s.log.Error("launch refused: Landlock unavailable (fail closed)",
 					"instance", key.InstanceID, "turn", key.TurnID, "runtime", req.Runtime,
 					"kernel", sandbox.KernelRelease())
-				return fail(fmt.Errorf("%w: refusing to launch: sandbox could not be applied — kernel %s supports no Landlock (fail closed)",
+				return fail(fmt.Errorf("%w: refusing to launch: sandbox could not be applied — kernel %s requires Landlock ABI3 or newer with truncation protection (normally Linux 6.2+ with Landlock enabled; fail closed)",
 					ErrSandboxUnavailable, sandbox.KernelRelease()))
 			}
 			if err := wrapSandboxed(&req, s.cfg.SandboxWrapper); err != nil {

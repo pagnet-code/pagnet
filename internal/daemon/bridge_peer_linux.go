@@ -20,7 +20,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/sandbox"
 	"log/slog"
 	"net"
-	"sync/atomic"
+	"sync"
 )
 
 // bridgeIsolationMode reports this platform's bridge isolation state
@@ -28,6 +28,8 @@ import (
 func bridgeIsolationMode() string {
 	return bridgeIsolationProcessBound
 }
+
+var runtimeSandboxUnavailableWarning sync.Once
 
 // runtimeSandboxMode reports this platform's runtime filesystem-sandbox
 // state (S2, the S1 heartbeat-pattern extension): "landlock" when the
@@ -40,11 +42,10 @@ func runtimeSandboxMode() string {
 	if sandbox.Available() {
 		return sandboxModeLandlock
 	}
-	var warned int32
-	if atomic.CompareAndSwapInt32(&warned, 0, 1) {
-		slog.Error("runtime sandbox unavailable: Landlock not supported by this kernel — managed runtimes will be refused (fail closed)",
+	runtimeSandboxUnavailableWarning.Do(func() {
+		slog.Error("runtime sandbox unavailable: Landlock ABI3 or newer is required — managed runtimes will be refused (fail closed)",
 			"kernel", sandbox.KernelRelease())
-	}
+	})
 	return sandboxModeFailClosed
 }
 
