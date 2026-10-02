@@ -1,5 +1,7 @@
 package transport
 
+const NativeDispatchCancellationProtocol = "native-dispatch-cancellation-v1"
+
 const MsgNativeDispatchCancelProposals = "host.native_dispatch_cancel_proposals"
 const MsgNativeDispatchCancelProposed = "host.native_dispatch_cancel_proposed"
 const MsgNativeDispatchCancel = "host.native_dispatch_cancel"
