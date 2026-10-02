@@ -2,6 +2,7 @@ package e2ee
 
 import (
 	"encoding/json"
+	"github.com/google/uuid"
 	"testing"
 )
 
@@ -39,6 +40,39 @@ func TestNativeContentAADRejectsUnknownFieldsAndContradictoryIdentity(t *testing
 			}
 			if err := copy.ValidateScope(); err == nil {
 				t.Fatal("contradictory AAD accepted")
+			}
+		})
+	}
+}
+
+func TestNativeTaskTurnAADPinsOriginalCommandAdmissionAndSubject(t *testing.T) {
+	origin := "00000000-0000-0000-0000-000000000007"
+	logical := "pagnet-worker-turn-8"
+	subject := uuid.NewSHA1(uuid.NameSpaceOID, []byte("pagnet-native-turn:"+origin+":"+logical)).String()
+	a := AAD{TenantID: "tenant", NetworkID: "network", Sender: "00000000-0000-0000-0000-000000000004", ObjectType: "runtime_turn", ObjectID: subject, NativeContent: &NativeContentBinding{Format: NativeContentBindingFormat, ContentID: "00000000-0000-0000-0000-000000000005", ObservationID: "00000000-0000-0000-0000-000000000006", OriginID: origin, InstanceID: "00000000-0000-0000-0000-000000000004", NativeGeneration: "generation", NativeSessionID: "session", SubjectType: "runtime_turn", SubjectID: subject, Purpose: "native_turn_output", FragmentCount: 1, SourceCommandID: "00000000-0000-0000-0000-000000000008", SourceAdmissionID: "00000000-0000-0000-0000-000000000009", LogicalTurnID: logical}}
+	if err := a.ValidateScope(); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"command", "admission", "logical", "subject", "legacy"} {
+		t.Run(scenario, func(t *testing.T) {
+			copy := a
+			b := *a.NativeContent
+			copy.NativeContent = &b
+			switch scenario {
+			case "command":
+				b.SourceCommandID = ""
+			case "admission":
+				b.SourceAdmissionID = ""
+			case "logical":
+				b.LogicalTurnID = "pagnet-worker-turn-08"
+			case "subject":
+				b.SubjectID = b.ContentID
+				copy.ObjectID = b.ContentID
+			case "legacy":
+				b.Purpose = "runtime_error"
+			}
+			if copy.ValidateScope() == nil {
+				t.Fatal("unbound original source authority accepted")
 			}
 		})
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -276,5 +277,48 @@ func TestNativeContentStreamingCommitmentRequiresExactEndAndPropagatesStorageErr
 	failure := errors.New("stored fragment cursor failed")
 	if _, err := CiphertextCommitmentStream(transfer.Reference, next(transfer.Fragments, failure)); !errors.Is(err, failure) {
 		t.Fatal("storage error hidden", err)
+	}
+}
+
+func TestNativeTurnCiphertextCannotMoveToFreshCommandAdmission(t *testing.T) {
+	origin := "00000000-0000-0000-0000-000000000007"
+	logical := "pagnet-worker-turn-1"
+	subject := uuid.NewSHA1(uuid.NameSpaceOID, []byte("pagnet-native-turn:"+origin+":"+logical)).String()
+	aad := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: "tenant", NetworkID: "network", ObjectType: "runtime_turn", ObjectID: subject, Sender: "00000000-0000-0000-0000-000000000004", KeyEpochID: "original-epoch-A", CreatedAt: "2026-10-02T01:00:00Z"}
+	binding := e2ee.NativeContentBinding{ContentID: "00000000-0000-0000-0000-000000000005", ObservationID: "00000000-0000-0000-0000-000000000006", OriginID: origin, InstanceID: aad.Sender, NativeGeneration: "generation", NativeSessionID: "session", SubjectType: aad.ObjectType, SubjectID: subject, Purpose: "native_turn_output", SourceCommandID: "00000000-0000-0000-0000-000000000008", SourceAdmissionID: "00000000-0000-0000-0000-000000000009", LogicalTurnID: logical}
+	plain := []byte(strings.Repeat("private original output\n", 5000))
+	transfer, err := Build(plain, [32]byte{7}, aad, binding, "text/plain; charset=utf-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, _, err := Open(transfer.Reference, transfer.Fragments, [32]byte{7})
+	if err != nil || !bytes.Equal(opened, plain) {
+		t.Fatal("original encrypted output unavailable", err)
+	}
+	for _, scenario := range []string{"command", "admission"} {
+		t.Run(scenario, func(t *testing.T) {
+			altered := transfer
+			altered.Fragments = append([]transport.NativeContentFragment(nil), transfer.Fragments...)
+			change := func(a *e2ee.AAD) {
+				b := *a.NativeContent
+				a.NativeContent = &b
+				if scenario == "command" {
+					b.SourceCommandID = "00000000-0000-0000-0000-000000000010"
+				} else {
+					b.SourceAdmissionID = "00000000-0000-0000-0000-000000000011"
+				}
+			}
+			change(&altered.Reference.ManifestAAD)
+			for i := range altered.Fragments {
+				change(&altered.Fragments[i].AAD)
+			}
+			altered.Reference.CiphertextDigest, err = CiphertextCommitment(altered.Reference, altered.Fragments)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err = Open(altered.Reference, altered.Fragments, [32]byte{7}); err == nil {
+				t.Fatal("fresh command/admission decrypted original ciphertext")
+			}
+		})
 	}
 }
