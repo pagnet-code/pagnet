@@ -149,6 +149,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if err = j.initializeTurnSources(); err != nil {
 		return fail(err)
 	}
+	if err = j.validateSourceDispositions(); err != nil {
+		return fail(err)
+	}
 	if err = j.initializeDispatches(); err != nil {
 		return fail(err)
 	}

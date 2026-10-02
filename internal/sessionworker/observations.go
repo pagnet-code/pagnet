@@ -63,8 +63,11 @@ func (j *Journal) initializeObservations() error {
 	if err != nil {
 		return err
 	}
+	if err = j.createSourceDispositions(); err != nil {
+		return err
+	}
 	var count, bytes int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0) FROM worker_observations`).Scan(&count, &bytes); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&count, &bytes); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || bytes > maxPendingObservationBytes {
@@ -152,7 +155,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		}
 	}
 	var count, total int
-	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
 	reserved := j.sourceStopReservationsLocked()
@@ -236,7 +239,7 @@ func (j *Journal) pendingObservationPage(ctx context.Context, lease, after int64
 			return page, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.sequence>? ORDER BY o.sequence LIMIT ?`, after, limit)
+	rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.sequence>? AND NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id) ORDER BY o.sequence LIMIT ?`, after, limit)
 	if err != nil {
 		return page, err
 	}
@@ -266,7 +269,7 @@ func (j *Journal) pendingObservationPage(ctx context.Context, lease, after int64
 	if err = rows.Close(); err != nil {
 		return page, err
 	}
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_observations WHERE sequence>?)`, page.NextCursor).Scan(&page.More); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_observations o WHERE sequence>? AND NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id))`, page.NextCursor).Scan(&page.More); err != nil {
 		return page, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -300,6 +303,13 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 		return err
 	}
 	if previous != digest {
+		return ErrConflict
+	}
+	var quarantined bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_source_dispositions WHERE observation_id=?)`, id).Scan(&quarantined); err != nil {
+		return err
+	}
+	if quarantined {
 		return ErrConflict
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_observation_sequence WHERE observation_id=?`, id); err != nil {

@@ -311,3 +311,49 @@ func TestNativeTaskContentCapabilityRequiredBeforeAnyBackendWrite(t *testing.T) 
 		t.Fatal("missing original encryption authority became supported", err)
 	}
 }
+
+func TestNativeWorkerTerminalReceiptDurableMarkBeforeNextSource(t *testing.T) {
+	for _, disposition := range []string{"expired", "stale_origin"} {
+		t.Run(disposition, func(t *testing.T) {
+			var c *NativeObservationConnection
+			var written []string
+			c, first := deliveryFixture(t, func(_ context.Context, typ string, value any) error {
+				p := value.(transport.NativeObservationPayload)
+				written = append(written, p.ObservationID)
+				result := "committed"
+				if len(written) == 1 {
+					result = disposition
+				}
+				c.NativeWorkerObservationDisposition(transport.MsgNativeObservationReceipt, transport.NativeObservationReceiptPayload{ObservationID: p.ObservationID, OriginID: p.OriginID, Digest: p.Digest, Disposition: result})
+				return nil
+			})
+			second := first
+			second.ID = domain.NewID().String()
+			second.SourceSequence++
+			marked, acks := 0, 0
+			call := func(_ context.Context, r sessionworker.Request) (sessionworker.Response, error) {
+				switch r.Type {
+				case "observations":
+					return sessionworker.Response{Observations: []sessionworker.NativeObservation{first, second}}, nil
+				case "source_disposition":
+					if r.ObservationID != first.ID || r.SourceDigest != first.SourceDigest || r.SourceReceipt == nil || r.SourceReceipt.Disposition != disposition {
+						t.Fatal("terminal provenance rewritten")
+					}
+					marked++
+					return sessionworker.Response{}, nil
+				case "observation_ack":
+					if marked != 1 || r.ObservationID != second.ID {
+						t.Fatal("ACK deleted terminal source or preceded durable mark")
+					}
+					acks++
+					return sessionworker.Response{}, nil
+				}
+				t.Fatal("unexpected request", r.Type)
+				return sessionworker.Response{}, nil
+			}
+			if err := c.DrainNativeWorkerSources(t.Context(), call); err != nil || marked != 1 || acks != 1 || len(written) != 2 {
+				t.Fatal("terminal source blocked later commit", err)
+			}
+		})
+	}
+}

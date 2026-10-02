@@ -223,7 +223,7 @@ func (j *Journal) initializeCaptures() error {
 		return errors.New("orphaned private source capture")
 	}
 	var count, size int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations) FROM worker_source_captures`).Scan(&count, &size); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_source_captures`).Scan(&count, &size); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || size > maxPendingObservationBytes {

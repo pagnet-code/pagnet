@@ -55,8 +55,10 @@ func (c *NativeObservationConnection) NativeWorkerObservationDisposition(typ str
 	if typ != transport.MsgNativeObservationReceipt && typ != transport.MsgNativeObservationRejected {
 		return
 	}
-	if typ == transport.MsgNativeObservationRejected && p.Disposition == "committed" {
-		return
+	if typ == transport.MsgNativeObservationRejected {
+		// A rejection frame is not a durable receipt, even if its public
+		// reason resembles a terminal committed disposition.
+		p.Disposition = "rejected"
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
