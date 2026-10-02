@@ -46,6 +46,15 @@ echo is retained only in a bounded 2 MiB worker-owned memory ring, never as a
 SQLite output transcript. Replacing a worker reports a distinct replay generation
 and an explicit gap; replacing its controller preserves the ring.
 
+Every actual submitted machine turn commits its original source command and
+source-admission identity before native work. Native interaction resolution
+retains the first turn binding even if the runtime reports a later logical turn.
+Human/background turns never inherit a delivery source. Retired mappings are
+reclaimed only after settled intent retirement, acknowledged original source
+observations and absence of pending interaction references. Missing retired
+machine provenance is marked unavailable rather than replaced with a current
+controller admission.
+
 The terminal input lane mutually authenticates with the exact current controller
 identity and lease without acquiring another lease. It uses a separate socket
 from slower controller RPCs, a bounded 256 KiB ephemeral queue, small input

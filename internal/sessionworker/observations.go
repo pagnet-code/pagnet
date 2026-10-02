@@ -23,17 +23,19 @@ type NativeResolution struct {
 	DetailAAD      e2ee.AAD                `json:"detailAAD"`
 }
 type NativeObservation struct {
-	InteractionID    string               `json:"interactionId,omitempty"`
-	ID               string               `json:"id"`
-	NativeGeneration string               `json:"nativeGeneration"`
-	NativeSessionID  string               `json:"nativeSessionId,omitempty"`
-	Origin           json.RawMessage      `json:"origin"`
-	ObservedAt       time.Time            `json:"observedAt"`
-	SourceDigest     string               `json:"sourceDigest"`
-	Event            session.SessionEvent `json:"event"`
-	Resolution       *NativeResolution    `json:"resolution,omitempty"`
-	Capture          *NativeCaptureRef    `json:"capture,omitempty"`
-	Inspection       *Inspection          `json:"inspection,omitempty"`
+	TurnSource        *NativeTurnSource    `json:"turnSource,omitempty"`
+	SourceUnavailable bool                 `json:"sourceUnavailable,omitempty"`
+	InteractionID     string               `json:"interactionId,omitempty"`
+	ID                string               `json:"id"`
+	NativeGeneration  string               `json:"nativeGeneration"`
+	NativeSessionID   string               `json:"nativeSessionId,omitempty"`
+	Origin            json.RawMessage      `json:"origin"`
+	ObservedAt        time.Time            `json:"observedAt"`
+	SourceDigest      string               `json:"sourceDigest"`
+	Event             session.SessionEvent `json:"event"`
+	Resolution        *NativeResolution    `json:"resolution,omitempty"`
+	Capture           *NativeCaptureRef    `json:"capture,omitempty"`
+	Inspection        *Inspection          `json:"inspection,omitempty"`
 }
 
 func observationDigest(observation NativeObservation) (string, error) {
@@ -127,6 +129,9 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {
+		return err
+	}
+	if err = retainNativeEventSource(ctx, tx, observation); err != nil {
 		return err
 	}
 	if len(encrypted) > 0 {

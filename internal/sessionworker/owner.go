@@ -37,17 +37,18 @@ type NativeSpec struct {
 }
 
 type Operation struct {
-	SourceCommandID  string `json:"sourceCommandId,omitempty"`
-	Input            string `json:"input,omitempty"`
-	InputKind        string `json:"inputKind,omitempty"`
-	NativeGeneration string `json:"nativeGeneration,omitempty"`
-	NativeSessionID  string `json:"nativeSessionId,omitempty"`
-	InteractionID    string `json:"interactionId,omitempty"`
-	OptionID         string `json:"optionId,omitempty"`
-	InspectionProof  string `json:"inspectionProof,omitempty"`
-	Data             []byte `json:"data,omitempty"`
-	Rows             uint16 `json:"rows,omitempty"`
-	Cols             uint16 `json:"cols,omitempty"`
+	SourceAdmissionID string `json:"sourceAdmissionId,omitempty"`
+	SourceCommandID   string `json:"sourceCommandId,omitempty"`
+	Input             string `json:"input,omitempty"`
+	InputKind         string `json:"inputKind,omitempty"`
+	NativeGeneration  string `json:"nativeGeneration,omitempty"`
+	NativeSessionID   string `json:"nativeSessionId,omitempty"`
+	InteractionID     string `json:"interactionId,omitempty"`
+	OptionID          string `json:"optionId,omitempty"`
+	InspectionProof   string `json:"inspectionProof,omitempty"`
+	Data              []byte `json:"data,omitempty"`
+	Rows              uint16 `json:"rows,omitempty"`
+	Cols              uint16 `json:"cols,omitempty"`
 }
 
 type NativeSnapshot struct {
@@ -66,31 +67,32 @@ type NativeSnapshot struct {
 }
 
 type SessionOwner struct {
-	cancel             context.CancelFunc
-	wg                 sync.WaitGroup
-	closing            bool
-	ctx                context.Context
-	journal            *Journal
-	captureKey         []byte
-	output             *OutputReplay
-	spec               NativeSpec
-	manager            *session.Manager
-	driver             session.Driver
-	supervisor         *proc.Supervisor
-	sess               *session.RuntimeSession
-	prompt             sync.Mutex
-	terminalWrite      sync.Mutex
-	mu                 sync.Mutex
-	generation, nonce  string
-	origin             json.RawMessage
-	candidateCommandID string
-	terminal           *os.File
-	pending            map[string]*nativeApproval
-	fatal              error
-	nativeSink         bool
-	observationBlocked error
-	observationWaiters map[string]bool
-	relay              *relayBroker
+	cancel              context.CancelFunc
+	wg                  sync.WaitGroup
+	closing             bool
+	ctx                 context.Context
+	journal             *Journal
+	captureKey          []byte
+	output              *OutputReplay
+	spec                NativeSpec
+	manager             *session.Manager
+	driver              session.Driver
+	supervisor          *proc.Supervisor
+	sess                *session.RuntimeSession
+	prompt              sync.Mutex
+	terminalWrite       sync.Mutex
+	mu                  sync.Mutex
+	generation, nonce   string
+	origin              json.RawMessage
+	candidateCommandID  string
+	candidateTurnSource NativeTurnSource
+	terminal            *os.File
+	pending             map[string]*nativeApproval
+	fatal               error
+	nativeSink          bool
+	observationBlocked  error
+	observationWaiters  map[string]bool
+	relay               *relayBroker
 }
 
 func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKey []byte) (*SessionOwner, error) {
@@ -208,6 +210,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			defer o.prompt.Unlock()
 			o.mu.Lock()
 			o.candidateCommandID = op.SourceCommandID
+			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID}
 			fatal := o.fatal
 			if fatal == nil {
 				fatal = o.observationBlocked
@@ -236,7 +239,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 					close(events)
 					err = errors.New("invalid or oversized prompt")
 				} else {
-					result, err = o.manager.Submit(o.ctx, o.sess, session.SubmitRequest{TurnID: out.CommandID, Input: op.Input, InputKind: op.InputKind, Kind: session.SubmitPrompt}, events)
+					result, err = o.manager.Submit(o.ctx, o.sess, session.SubmitRequest{TurnID: logicalWorkerTurn(out.Sequence), Input: op.Input, InputKind: op.InputKind, Kind: session.SubmitPrompt}, events)
 				}
 			}
 			<-drained

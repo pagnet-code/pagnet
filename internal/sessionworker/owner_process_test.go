@@ -288,7 +288,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if out := a.outcome(t, 2); out.State != "completed" {
 		t.Fatal(out)
 	}
-	if r := a.intent(t, 3, "long-turn-one", "prompt", Operation{Input: "continue native work across controller replacement", InputKind: "task"}); r.Error != "" {
+	if r := a.intent(t, 3, "long-turn-one", "prompt", Operation{Input: "continue native work across controller replacement", InputKind: "task", SourceCommandID: "long-delivery-A"}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
 	var waiting NativeSnapshot
@@ -408,6 +408,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if recovered.PID != initial.PID || recovered.NativeGeneration != initial.NativeGeneration || len(recovered.Pending) != 1 {
 		t.Fatal("native state depended on a controller process")
 	}
+	originalSourceAdmissionID := admission.NativeAdmissionID
 	admission.NativeAdmissionID = uuid.NewString()
 	admission.RunnerID = uuid.NewString()
 	admission.RunnerEpoch = time.Now().UTC()
@@ -544,6 +545,9 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 			}
 			if interaction.Resolved && observation.InteractionID == originalInspection.InteractionID {
 				permissionResolved = true
+				if observation.TurnSource == nil || observation.TurnSource.SourceCommandID != "long-delivery-A" || observation.TurnSource.SourceAdmissionID != originalSourceAdmissionID {
+					t.Fatalf("native resolution lost original delivery admission across controller replacement: source=%+v eventTurn=%s expectedAdmission=%s", observation.TurnSource, observation.Event.TurnID, originalSourceAdmissionID)
+				}
 			}
 		}
 		if r := b.call(t, Request{Type: "observation_ack", ObservationID: observation.ID, SourceDigest: observation.SourceDigest}); r.Error != "" {

@@ -45,6 +45,7 @@ func main() {
 	encoder := json.NewEncoder(os.Stdout)
 	_ = encoder.Encode(map[string]any{"controllerBuild": build, "workerBuild": controller.WorkerBuild, "lease": controller.Lease})
 	var terminal *sessionworker.TerminalStream
+	var admissionID string
 	defer func() {
 		if terminal != nil {
 			_ = terminal.Close()
@@ -60,6 +61,19 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		response := sessionworker.Response{}
 		var err error
+		if req.Type == "admission" && req.Admission != nil {
+			admissionID = req.Admission.NativeAdmissionID
+		}
+		if req.Type == "intent" && req.Kind == "prompt" {
+			var op sessionworker.Operation
+			if err = json.Unmarshal(req.Payload, &op); err != nil {
+				fatal(err)
+			}
+			if op.SourceCommandID != "" && op.SourceAdmissionID == "" {
+				op.SourceAdmissionID = admissionID
+				req.Payload, _ = json.Marshal(op)
+			}
+		}
 		switch req.Type {
 		case "terminal_open":
 			var op sessionworker.Operation

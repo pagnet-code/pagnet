@@ -32,6 +32,12 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		}
 		originalEvent := event
 		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
+		source, unavailable, err := o.journal.NativeEventSource(o.ctx, generation, event)
+		if err != nil {
+			return err
+		}
+		observation.TurnSource = source
+		observation.SourceUnavailable = unavailable
 		ref, encrypted, err := sealNativeCapture(o.captureKey, o.journal.scope, o.journal.dir, observation, originalEvent)
 		if err != nil {
 			return err

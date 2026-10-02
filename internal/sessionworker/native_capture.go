@@ -66,6 +66,8 @@ func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error)
 func captureAAD(scope Scope, directory string, observation NativeObservation) ([]byte, error) {
 	// Origin bytes are retained exactly, rather than reconstructed on retry.
 	return canonicalNativeJSON(struct {
+		TurnSource                        *NativeTurnSource
+		SourceUnavailable                 bool
 		Domain                            string
 		Version                           int
 		Scope                             Scope
@@ -74,7 +76,7 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 		Origin                            []byte
 		NativeGeneration, NativeSessionID string
 		ObservedAt                        string
-	}{"pagnet-worker-private-source-aad-v1", 1, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")})
+	}{observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v1", 1, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")})
 }
 
 func sealNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
