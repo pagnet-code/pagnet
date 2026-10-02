@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/transport"
@@ -150,7 +151,13 @@ func TestNativeContentMaximumSourceFitsEveryEncodedFrame(t *testing.T) {
 	if len(transfer.Fragments) != e2ee.NativeContentMaxFragments {
 		t.Fatal("maximum source fragment count incorrect")
 	}
-	frames := []any{transfer.Reference}
+	interaction := transport.InteractionEventPayload{InteractionID: binding.SubjectID, InstanceID: binding.InstanceID, SessionID: binding.NativeSessionID, NativeGeneration: binding.NativeGeneration, Runtime: "codex", Kind: "permission", Resolved: true, Decision: "resolved", DetailContent: &transfer.Reference}
+	interactionRaw, err := json.Marshal(interaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := transport.NativeObservationPayload{ObservationID: binding.ObservationID, OriginID: binding.OriginID, MessageType: transport.MsgInteractionResolved, Digest: strings.Repeat("0", 64), ObservedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour), Payload: interactionRaw}
+	frames := []any{transfer.Reference, observation}
 	for _, fragment := range transfer.Fragments {
 		frames = append(frames, fragment)
 	}

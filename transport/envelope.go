@@ -875,6 +875,10 @@ type InteractionEventPayload struct {
 	// DetailAAD is the associated-data the DetailEnvelope was bound to,
 	// relayed verbatim (the AAD server obligation, PROTOCOL §3).
 	DetailAAD *e2ee.AAD `json:"detailAAD,omitempty"`
+	// DetailContent replaces the small detail envelope for a complete bounded
+	// encrypted manifest. It is part of the immutable observation payload;
+	// staged fragments alone never establish an observation receipt.
+	DetailContent *NativeContentReference `json:"detailContent,omitempty"`
 }
 
 // --- E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8) --------
