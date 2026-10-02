@@ -166,7 +166,7 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 				}
 				continue
 			}
-			ack, err := call(ctx, sessionworker.Request{Type: "observation_ack", ObservationID: o.ID, SourceDigest: o.SourceDigest})
+			ack, err := call(ctx, sessionworker.Request{Type: "observation_ack", ObservationID: o.ID, SourceDigest: o.SourceDigest, SourceReceipt: &receipt})
 			if err != nil {
 				return after, err
 			}

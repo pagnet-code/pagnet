@@ -68,7 +68,7 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 		return err
 	}
 	var pending bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent) OR EXISTS(SELECT 1 FROM worker_dispatches) OR EXISTS(SELECT 1 FROM worker_dispatch_cancellations) OR EXISTS(SELECT 1 FROM worker_observations) OR EXISTS(SELECT 1 FROM worker_turn_sources) OR EXISTS(SELECT 1 FROM worker_source_registration WHERE quiesced=0)`).Scan(&pending); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_resource_settlements) OR EXISTS(SELECT 1 FROM worker_intent) OR EXISTS(SELECT 1 FROM worker_dispatches) OR EXISTS(SELECT 1 FROM worker_dispatch_cancellations) OR EXISTS(SELECT 1 FROM worker_observations) OR EXISTS(SELECT 1 FROM worker_turn_sources) OR EXISTS(SELECT 1 FROM worker_source_registration WHERE quiesced=0)`).Scan(&pending); err != nil {
 		return err
 	}
 	if pending {

@@ -104,7 +104,7 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 	}
 	defer tx.Rollback()
 	var pending, total int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&pending, &total); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_observations`).Scan(&pending, &total); err != nil {
 		return nil, err
 	}
 	var unmarked int

@@ -58,7 +58,7 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 		if r.Proof.OwnershipID != ownership.ID || r.Proof.OwnershipGeneration != p.scope.Generation {
 			return nil, ErrNativeObservationConflict
 		}
-		if r.Proof.DispatchSequence != floor+1 || (r.State != "completed" && r.State != "failed" && r.State != "cancelled") {
+		if r.Proof.DispatchSequence != floor+1 || (r.State != "completed" && r.State != "failed" && r.State != "cancelled" && r.State != sessionworker.ResourceInterrupted) {
 			break
 		}
 		if r.State != "cancelled" {

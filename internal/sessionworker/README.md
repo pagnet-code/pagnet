@@ -109,3 +109,13 @@ Only actual worker/native and two-controller subprocess acceptance, followed by
 daemon routing migration and bridge/inspection/receipt integration, can justify
 changing production update admission. No user-visible enablement flag or
 supervisor-only PID adoption substitutes for whole ownership.
+
+Resource limits use a distinct local `resource_interrupted` outcome only after
+FULL persistence of the exact original resource marker, genuine stopped capture,
+and matching committed backend receipt. The original command, admission, native
+session, generation and dispatch binding must all match; the reader must have
+quiesced and no unpublished output may be discarded. This is not a vendor failed
+or completed event and never permits replay of earlier native effects. Late local
+finish cannot overwrite the proof, and its completion is required before outcome
+ACK. The bounded settlement evidence survives transport loss and worker reopen,
+then is reclaimed only with the matching committed contiguous dispatch floor.

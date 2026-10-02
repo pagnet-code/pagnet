@@ -516,7 +516,7 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 			err = o.journal.FinalizeDispatchCancellation(ctx, lease, *req.CancelReceipt)
 		}
 	case "observation_ack":
-		err = o.journal.AcknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest)
+		err = o.journal.acknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest, req.SourceReceipt, o.captureKey)
 	case "admission_revoke":
 		o.relay.disconnect(lease)
 	case "admission":

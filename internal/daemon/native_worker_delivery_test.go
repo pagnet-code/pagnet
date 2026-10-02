@@ -72,6 +72,10 @@ func TestNativeWorkerDrainACKOnlyMatchingCommit(t *testing.T) {
 					if r.SourceDigest != o.SourceDigest || r.ObservationID != o.ID {
 						t.Fatal("worker ACK identity rewritten")
 					}
+					wire, wireErr := sessionworker.NativeBackendObservation(o)
+					if wireErr != nil || r.SourceReceipt == nil || r.SourceReceipt.ObservationID != wire.ObservationID || r.SourceReceipt.OriginID != wire.OriginID || r.SourceReceipt.Digest != wire.Digest || r.SourceReceipt.Disposition != "committed" {
+						t.Fatal("worker ACK lost the exact committed receipt", wireErr)
+					}
 					ack++
 					return sessionworker.Response{}, nil
 				}

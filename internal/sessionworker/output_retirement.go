@@ -8,11 +8,11 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// Called only inside the explicit ownership-deletion transaction AFTER its
-// authenticated original stopped receipt/proof has been checked. The key is
+// Called inside a proof-bound original stopped transaction: explicit owner
+// deletion or the exact resource-interruption receipt. The private key is
 // supplied by the worker owner, never an IPC request. Unprojected ciphertext
 // and uncertain native operations are blockers, not deletion candidates.
-func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sql.Tx, captureKey []byte, generation, sessionID, originID string) error {
+func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sql.Tx, captureKey []byte, generation, sessionID, originID string, onlySequence ...int64) error {
 	if generation == "" || sessionID == "" || originID == "" {
 		return ErrConflict
 	}
@@ -23,7 +23,14 @@ func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sq
 	if live {
 		return ErrConflict
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT t.sequence,t.logical_turn,t.native_session,t.source_command,t.source_admission,t.input_kind,COALESCE(p.ciphertext,X''),COALESCE(q.payload,X'') FROM worker_turn_sources t LEFT JOIN worker_output_spools p ON p.sequence=t.sequence LEFT JOIN worker_resource_interruptions q ON q.sequence=t.sequence WHERE t.native_generation=? AND (EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=t.sequence) OR p.sequence IS NOT NULL OR q.sequence IS NOT NULL)`, generation)
+	sequence := int64(0)
+	if len(onlySequence) > 1 || (len(onlySequence) == 1 && onlySequence[0] <= 0) {
+		return ErrConflict
+	}
+	if len(onlySequence) == 1 {
+		sequence = onlySequence[0]
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT t.sequence,t.logical_turn,t.native_session,t.source_command,t.source_admission,t.input_kind,COALESCE(p.ciphertext,X''),COALESCE(q.payload,X'') FROM worker_turn_sources t LEFT JOIN worker_output_spools p ON p.sequence=t.sequence LEFT JOIN worker_resource_interruptions q ON q.sequence=t.sequence WHERE t.native_generation=? AND (?=0 OR t.sequence=?) AND (EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=t.sequence) OR p.sequence IS NOT NULL OR q.sequence IS NOT NULL)`, generation, sequence, sequence)
 	if err != nil {
 		return err
 	}
@@ -52,7 +59,7 @@ func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sq
 		if s.NativeSessionID != sessionID {
 			return ErrConflict
 		}
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent WHERE sequence=? AND state IN ('completed','failed')) OR ?<=(SELECT retired FROM worker_meta WHERE singleton=1)`, s.Sequence, s.Sequence).Scan(&settled); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent WHERE sequence=? AND state IN ('completed','failed','resource_interrupted')) OR ?<=(SELECT retired FROM worker_meta WHERE singleton=1)`, s.Sequence, s.Sequence).Scan(&settled); err != nil {
 			return err
 		}
 		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_observations WHERE json_extract(payload,'$.turnSource.sequence')=?) OR EXISTS(SELECT 1 FROM worker_interaction_sources WHERE native_generation=? AND logical_turn=?)`, s.Sequence, generation, s.LogicalTurnID).Scan(&pending); err != nil {

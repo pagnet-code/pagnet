@@ -139,6 +139,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if err = j.initializeOutputSpools(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeResourceSettlements(); err != nil {
+		return fail(err)
+	}
 	if err = j.initializeObservations(); err != nil {
 		return fail(err)
 	}
@@ -418,11 +421,20 @@ func (j *Journal) Settle(ctx context.Context, sequence int64, state string, resu
 		return err
 	}
 	if n != 1 {
-		return ErrConflict
+		var proven bool
+		if readErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent w JOIN worker_resource_settlements r ON r.sequence=w.sequence WHERE w.sequence=? AND w.state=?)`, sequence, ResourceInterrupted).Scan(&proven); readErr != nil {
+			return readErr
+		}
+		if !proven {
+			return ErrConflict
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE worker_resource_settlements SET finished=1 WHERE sequence=?`, sequence); err != nil {
+			return err
+		}
 	}
-	if state != "uncertain" {
-		// A trusted worker outcome before ANY native binding/evidence used no
-		// producer reservation. No accepted source or uncertain effect is erased.
+	if n == 1 && state != "uncertain" {
+		// A trusted worker outcome before any native binding used no reservation.
+		// Accepted sources and uncertain effects remain retained.
 		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_reservations WHERE sequence=? AND NOT EXISTS(SELECT 1 FROM worker_turn_sources WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_output_spools WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_observations WHERE json_extract(payload,'$.turnSource.sequence')=?)`, sequence, sequence, sequence, sequence, sequence); err != nil {
 			return err
 		}
@@ -468,6 +480,13 @@ func (j *Journal) Acknowledge(ctx context.Context, lease, sequence int64) error 
 	}
 	if sequence <= floor {
 		return tx.Commit()
+	}
+	var unfinishedInterruption bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_resource_settlements WHERE sequence=? AND finished=0)`, sequence).Scan(&unfinishedInterruption); err != nil {
+		return err
+	}
+	if unfinishedInterruption {
+		return ErrConflict
 	}
 	var pendingView bool
 	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_terminal_view_commits WHERE operation_sequence=? AND committed=0)`, sequence).Scan(&pendingView); err != nil {
@@ -530,7 +549,7 @@ func (j *Journal) validateHistory() error {
 	if lease < 0 || next < 1 || retired < 0 || retired >= next || count < 0 || count > maxCommands || next-retired-1 != count {
 		return errors.New("worker journal sequence history is incomplete")
 	}
-	rows, err := j.db.Query(`SELECT sequence,command_id,digest,kind,state,result,acknowledged FROM worker_intent ORDER BY sequence`)
+	rows, err := j.db.Query(`SELECT sequence,command_id,digest,kind,state,result,acknowledged,EXISTS(SELECT 1 FROM worker_resource_settlements r WHERE r.sequence=worker_intent.sequence) FROM worker_intent ORDER BY sequence`)
 	if err != nil {
 		return err
 	}
@@ -540,12 +559,13 @@ func (j *Journal) validateHistory() error {
 		var sequence, ack int64
 		var id, digest, kind, state string
 		var result []byte
-		if err := rows.Scan(&sequence, &id, &digest, &kind, &state, &result, &ack); err != nil {
+		var interruptedProof bool
+		if err := rows.Scan(&sequence, &id, &digest, &kind, &state, &result, &ack, &interruptedProof); err != nil {
 			return err
 		}
 		_, digestErr := hex.DecodeString(digest)
-		validState := state == "admitted" || state == "completed" || state == "failed" || state == "uncertain"
-		if sequence != expected || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
+		validState := state == "admitted" || state == "completed" || state == "failed" || state == "uncertain" || state == ResourceInterrupted
+		if sequence != expected || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || (state == ResourceInterrupted && !interruptedProof) || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
 			return errors.New("worker journal contains an invalid intent")
 		}
 		expected++

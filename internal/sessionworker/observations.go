@@ -70,7 +70,7 @@ func (j *Journal) initializeObservations() error {
 		return err
 	}
 	var count, bytes int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&count, &bytes); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_observations`).Scan(&count, &bytes); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || bytes > maxPendingObservationBytes {
@@ -158,7 +158,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		}
 	}
 	var count, total int
-	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&count, &total); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
 	var unmarked int
@@ -178,7 +178,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0) FROM worker_output_spools`).Scan(&tailBytes); err != nil {
 			return err
 		}
-		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions) FROM worker_observations`).Scan(&total); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_observations`).Scan(&total); err != nil {
 			return err
 		}
 		total += tailBytes
@@ -324,6 +324,10 @@ func (j *Journal) pendingObservationPage(ctx context.Context, lease, after int64
 // A controller acknowledges only after a matching durable backend commit receipt.
 // Staging receipts, writes and local projections never retire original evidence.
 func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, digest string) error {
+	return j.acknowledgeObservation(ctx, lease, id, digest, nil, nil)
+}
+
+func (j *Journal) acknowledgeObservation(ctx context.Context, lease int64, id, digest string, receipt *transport.NativeObservationReceiptPayload, captureKey []byte) error {
 	if id == "" || len(id) > 256 || len(digest) != 64 {
 		return errors.New("invalid native observation acknowledgement")
 	}
@@ -338,9 +342,11 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 		return err
 	}
 	var previous string
-	err = tx.QueryRowContext(ctx, `SELECT digest FROM worker_observations WHERE id=?`, id).Scan(&previous)
+	var payload []byte
+	var sourceSequence int64
+	err = tx.QueryRowContext(ctx, `SELECT o.digest,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.id=?`, id).Scan(&previous, &payload, &sourceSequence)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return resourceSettlementReplayTx(ctx, tx, id, digest, receipt)
 	}
 	if err != nil {
 		return err
@@ -354,6 +360,14 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	}
 	if quarantined {
 		return ErrConflict
+	}
+	var observation NativeObservation
+	if json.Unmarshal(payload, &observation) != nil {
+		return ErrConflict
+	}
+	observation.SourceSequence = sourceSequence
+	if err = j.settleResourceObservationTx(ctx, tx, observation, receipt, captureKey); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_observation_sequence WHERE observation_id=?`, id); err != nil {
 		return err
