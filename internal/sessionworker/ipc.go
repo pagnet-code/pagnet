@@ -39,28 +39,31 @@ type handshake struct {
 }
 
 type Request struct {
-	SourceReceipt    *transport.NativeObservationReceiptPayload `json:"sourceReceipt,omitempty"`
-	Ownership        *transport.NativeWorkerOwnership           `json:"ownership,omitempty"`
-	NativeDispatch   *transport.NativeDispatchProof             `json:"nativeDispatch,omitempty"`
-	ContentID        string                                     `json:"contentId,omitempty"`
-	ContentOrdinal   int                                        `json:"contentOrdinal,omitempty"`
-	CaptureOffset    int                                        `json:"captureOffset,omitempty"`
-	ReplayGeneration string                                     `json:"replayGeneration,omitempty"`
-	ActivationOrigin *ActivationOrigin                          `json:"activationOrigin,omitempty"`
-	ObservationID    string                                     `json:"observationId,omitempty"`
-	SourceDigest     string                                     `json:"sourceDigest,omitempty"`
-	Admission        *Admission                                 `json:"admission,omitempty"`
-	Relay            *BridgeResult                              `json:"relay,omitempty"`
-	Cursor           int64                                      `json:"cursor,omitempty"`
-	Limit            int                                        `json:"limit,omitempty"`
-	Type             string                                     `json:"type"`
-	Sequence         int64                                      `json:"sequence,omitempty"`
-	CommandID        string                                     `json:"commandId,omitempty"`
-	Kind             string                                     `json:"kind,omitempty"`
-	Payload          json.RawMessage                            `json:"payload,omitempty"`
+	CancelProposal   *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
+	CancelReceipt    *transport.NativeDispatchCancelledPayload     `json:"cancelReceipt,omitempty"`
+	SourceReceipt    *transport.NativeObservationReceiptPayload    `json:"sourceReceipt,omitempty"`
+	Ownership        *transport.NativeWorkerOwnership              `json:"ownership,omitempty"`
+	NativeDispatch   *transport.NativeDispatchProof                `json:"nativeDispatch,omitempty"`
+	ContentID        string                                        `json:"contentId,omitempty"`
+	ContentOrdinal   int                                           `json:"contentOrdinal,omitempty"`
+	CaptureOffset    int                                           `json:"captureOffset,omitempty"`
+	ReplayGeneration string                                        `json:"replayGeneration,omitempty"`
+	ActivationOrigin *ActivationOrigin                             `json:"activationOrigin,omitempty"`
+	ObservationID    string                                        `json:"observationId,omitempty"`
+	SourceDigest     string                                        `json:"sourceDigest,omitempty"`
+	Admission        *Admission                                    `json:"admission,omitempty"`
+	Relay            *BridgeResult                                 `json:"relay,omitempty"`
+	Cursor           int64                                         `json:"cursor,omitempty"`
+	Limit            int                                           `json:"limit,omitempty"`
+	Type             string                                        `json:"type"`
+	Sequence         int64                                         `json:"sequence,omitempty"`
+	CommandID        string                                        `json:"commandId,omitempty"`
+	Kind             string                                        `json:"kind,omitempty"`
+	Payload          json.RawMessage                               `json:"payload,omitempty"`
 }
 
 type Response struct {
+	Cancellation       *DispatchCancellationPreparation `json:"cancellation,omitempty"`
 	SourceDispositions *NativeSourceDispositionPage     `json:"sourceDispositions,omitempty"`
 	Dispatches         []NativeDispatchRecord           `json:"dispatches,omitempty"`
 	Retryable          bool                             `json:"retryable,omitempty"`
@@ -470,6 +473,22 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		response.ContentFragment, err = o.journal.ReadContentFragment(ctx, lease, req.ObservationID, req.SourceDigest, req.ContentID, req.ContentOrdinal)
 	case "source_capture":
 		response.Capture, err = o.journal.ReadCaptureChunk(ctx, lease, req.ObservationID, req.SourceDigest, req.CaptureOffset)
+	case "cancel_prepare":
+		if req.CancelProposal == nil {
+			err = ErrConflict
+		} else {
+			var prepared DispatchCancellationPreparation
+			prepared, err = o.journal.PrepareDispatchCancellation(ctx, lease, *req.CancelProposal)
+			if err == nil {
+				response.Cancellation = &prepared
+			}
+		}
+	case "cancel_finalize":
+		if req.CancelReceipt == nil {
+			err = ErrConflict
+		} else {
+			err = o.journal.FinalizeDispatchCancellation(ctx, lease, *req.CancelReceipt)
+		}
 	case "observation_ack":
 		err = o.journal.AcknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest)
 	case "admission_revoke":
