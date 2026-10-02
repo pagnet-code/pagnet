@@ -74,10 +74,11 @@ func TestPrivateOriginalResolutionCaptureSurvivesControllerAndReopen(t *testing.
 		t.Fatal(err)
 	}
 	defer clear(plain)
-	var recovered session.SessionEvent
-	if err = json.Unmarshal(plain, &recovered); err != nil {
+	var source NativeSourceCapture
+	if err = json.Unmarshal(plain, &source); err != nil {
 		t.Fatal(err)
 	}
+	recovered := source.Event
 	if recovered.Interaction.Answer != answer || recovered.Interaction.Summary != original.Interaction.Summary || !bytes.Equal(recovered.Interaction.NativePayload, original.Interaction.NativePayload) {
 		t.Fatal("original resolved native content changed")
 	}
@@ -198,17 +199,21 @@ func TestAggregatePrivateCaptureBoundAndAcknowledgedReclamation(t *testing.T) {
 	if err := j.JournalCapturedObservation(ctx, first, firstCipher); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.JournalCapturedObservation(ctx, second, secondCipher); !errors.Is(err, ErrFull) {
+	if err := j.JournalCapturedObservation(ctx, second, secondCipher); err != nil {
+		t.Fatal(err)
+	}
+	third, thirdCipher := build("third")
+	if err := j.JournalCapturedObservation(ctx, third, thirdCipher); !errors.Is(err, ErrFull) {
 		t.Fatalf("aggregate source storage was unbounded: %v", err)
 	}
 	pending, err := j.PendingObservations(ctx, 32)
-	if err != nil || len(pending) != 1 || pending[0].ID != first.ID {
+	if err != nil || len(pending) != 2 || pending[0].ID != first.ID {
 		t.Fatal("full source queue deleted still-needed evidence")
 	}
 	if err = j.AcknowledgeObservation(ctx, lease(t, j), first.ID, first.SourceDigest); err != nil {
 		t.Fatal(err)
 	}
-	if err = j.JournalCapturedObservation(ctx, second, secondCipher); err != nil {
+	if err = j.JournalCapturedObservation(ctx, third, thirdCipher); err != nil {
 		t.Fatal("ack did not reclaim pending capture capacity", err)
 	}
 	var total int

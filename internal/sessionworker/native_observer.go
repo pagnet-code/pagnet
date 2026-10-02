@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/nativecontent"
 )
 
 // The factory runs before the endpoint reader starts. Each closure retains the
@@ -24,12 +26,21 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		if o.generation == generation {
 			o.manager.ObserveNativeActivity(instanceID, event)
 		}
+		duplicate := false
+		if native := event.Interaction; native != nil && !native.Resolved && event.Type == session.EventInteractionStarted {
+			pending := o.pending[native.NativeInteractionID]
+			duplicate = pending != nil && pending.committed && pending.inspection != nil && pending.inspection.NativeGeneration == generation && pending.inspection.NativeSessionID == event.SessionID && pending.inspection.Kind == native.Kind && slices.Equal(pending.inspection.Options, native.Options) && pending.payloadDigest == sha256.Sum256(native.NativePayload) && pending.summaryDigest == sha256.Sum256([]byte(native.Summary))
+		}
 		o.mu.Unlock()
+		if duplicate {
+			return o.ctx.Err()
+		}
 		if !durableNativeEvent(event) {
 			o.recordLiveEvent(event, generation, origin)
 			return o.ctx.Err()
 		}
 		originalEvent := event
+		var transfers []nativecontent.Transfer
 		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
 		source, unavailable, err := o.journal.NativeEventSource(o.ctx, generation, event)
 		if err != nil {
@@ -37,11 +48,6 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		}
 		observation.TurnSource = source
 		observation.SourceUnavailable = unavailable
-		ref, encrypted, err := sealNativeCapture(o.captureKey, o.journal.scope, o.journal.dir, observation, originalEvent)
-		if err != nil {
-			return err
-		}
-		observation.Capture = ref
 		// Original private details are captured above; the journal projection is metadata only.
 		event.Plan = nil
 		event.Output = ""
@@ -49,13 +55,22 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		var inspection *Inspection
 		if event.Interaction != nil {
 			if !event.Interaction.Resolved {
-				o.prepareInspection(event, generation)
+				o.prepareInspection(event, generation, observation)
 			}
 			o.mu.Lock()
 			if pending := o.pending[event.Interaction.NativeInteractionID]; pending != nil && pending.inspection != nil && pending.inspection.NativeGeneration == generation {
 				copy := *pending.inspection
 				copy.Options = append(copy.Options[:0:0], pending.inspection.Options...)
 				inspection = &copy
+				if !event.Interaction.Resolved && pending.transfer != nil {
+					transfers = append(transfers, *pending.transfer)
+				}
+			}
+			if event.Interaction.Resolved {
+				pending := o.pending[event.Interaction.NativeInteractionID]
+				if pending != nil && inspection != nil && inspection.DetailContent != nil && pending.payloadDigest == sha256.Sum256(originalEvent.Interaction.NativePayload) {
+					observation.OriginalNativePayloadContent = inspection.DetailContent
+				}
 			}
 			if event.Interaction.Resolved && o.generation == generation {
 				pending := o.pending[event.Interaction.NativeInteractionID]
@@ -70,6 +85,17 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			copy.Answer = ""
 			event.Interaction = &copy
 		}
+		captureSource := NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent}
+		if observation.OriginalNativePayloadContent != nil {
+			copy := *originalEvent.Interaction
+			copy.NativePayload = nil
+			captureSource.Event.Interaction = &copy
+		}
+		ref, encrypted, err := sealNativeCapture(o.captureKey, o.journal.scope, o.journal.dir, observation, captureSource)
+		if err != nil {
+			return err
+		}
+		observation.Capture = ref
 		eventRaw, err := json.Marshal(event)
 		if err != nil {
 			o.failPersistence(err)
@@ -84,7 +110,11 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		observation.Event = event
 		observation.Inspection = inspection
 		if originalEvent.Interaction != nil && originalEvent.Interaction.Resolved {
-			observation.Resolution = o.encryptResolution(originalEvent, inspection, observedAt)
+			var answerTransfer *nativecontent.Transfer
+			observation.Resolution, answerTransfer = o.encryptOriginalResolution(originalEvent, inspection, observation)
+			if answerTransfer != nil {
+				transfers = append(transfers, *answerTransfer)
+			}
 		}
 		if event.Interaction != nil {
 			observation.InteractionID = nativeInteractionIdentity(o.journal.scope, origin, generation, event.SessionID, event.Interaction.NativeInteractionID)
@@ -98,7 +128,7 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		backoff := 250 * time.Millisecond
 		for {
 			available := o.journal.ObservationCapacity()
-			err = o.journal.JournalCapturedObservation(o.ctx, observation, encrypted)
+			err = o.journal.JournalCapturedObservation(o.ctx, observation, encrypted, transfers...)
 			if err == nil {
 				break
 			}
@@ -142,6 +172,16 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			}
 		}
 		o.mu.Lock()
+		if event.Interaction != nil && !event.Interaction.Resolved {
+			if pending := o.pending[event.Interaction.NativeInteractionID]; pending != nil && pending.inspection != nil && pending.inspection.NativeGeneration == generation {
+				// Complete ciphertext is now durable. Keep only local private commitments
+				// for duplicate/source association, not another huge request/transfer copy.
+				pending.committed = true
+				pending.native = nil
+				pending.summary = ""
+				pending.transfer = nil
+			}
+		}
 		delete(o.observationWaiters, observation.ID)
 		if len(o.observationWaiters) == 0 {
 			o.observationBlocked = nil

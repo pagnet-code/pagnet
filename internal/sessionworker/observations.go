@@ -11,31 +11,35 @@ import (
 
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/nativecontent"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 const maxPendingObservations = 4096
-const maxPendingObservationBytes = 32 << 20
+const maxPendingObservationBytes = 48 << 20
 
 // ObservedAt and SourceDigest belong to the original native source. Neither
 // reconnect nor replacement of the controller creates a new observation.
 type NativeResolution struct {
-	DetailEnvelope e2ee.EncryptedPayloadV1 `json:"detailEnvelope"`
-	DetailAAD      e2ee.AAD                `json:"detailAAD"`
+	DetailContent  *transport.NativeContentReference `json:"detailContent,omitempty"`
+	DetailEnvelope e2ee.EncryptedPayloadV1           `json:"detailEnvelope"`
+	DetailAAD      e2ee.AAD                          `json:"detailAAD"`
 }
 type NativeObservation struct {
-	TurnSource        *NativeTurnSource    `json:"turnSource,omitempty"`
-	SourceUnavailable bool                 `json:"sourceUnavailable,omitempty"`
-	InteractionID     string               `json:"interactionId,omitempty"`
-	ID                string               `json:"id"`
-	NativeGeneration  string               `json:"nativeGeneration"`
-	NativeSessionID   string               `json:"nativeSessionId,omitempty"`
-	Origin            json.RawMessage      `json:"origin"`
-	ObservedAt        time.Time            `json:"observedAt"`
-	SourceDigest      string               `json:"sourceDigest"`
-	Event             session.SessionEvent `json:"event"`
-	Resolution        *NativeResolution    `json:"resolution,omitempty"`
-	Capture           *NativeCaptureRef    `json:"capture,omitempty"`
-	Inspection        *Inspection          `json:"inspection,omitempty"`
+	OriginalNativePayloadContent *transport.NativeContentReference `json:"originalNativePayloadContent,omitempty"`
+	TurnSource                   *NativeTurnSource                 `json:"turnSource,omitempty"`
+	SourceUnavailable            bool                              `json:"sourceUnavailable,omitempty"`
+	InteractionID                string                            `json:"interactionId,omitempty"`
+	ID                           string                            `json:"id"`
+	NativeGeneration             string                            `json:"nativeGeneration"`
+	NativeSessionID              string                            `json:"nativeSessionId,omitempty"`
+	Origin                       json.RawMessage                   `json:"origin"`
+	ObservedAt                   time.Time                         `json:"observedAt"`
+	SourceDigest                 string                            `json:"sourceDigest"`
+	Event                        session.SessionEvent              `json:"event"`
+	Resolution                   *NativeResolution                 `json:"resolution,omitempty"`
+	Capture                      *NativeCaptureRef                 `json:"capture,omitempty"`
+	Inspection                   *Inspection                       `json:"inspection,omitempty"`
 }
 
 func observationDigest(observation NativeObservation) (string, error) {
@@ -90,7 +94,7 @@ func (j *Journal) JournalObservation(ctx context.Context, observation NativeObse
 	return j.JournalCapturedObservation(ctx, observation, nil)
 }
 
-func (j *Journal) JournalCapturedObservation(ctx context.Context, observation NativeObservation, encrypted []byte) error {
+func (j *Journal) JournalCapturedObservation(ctx context.Context, observation NativeObservation, encrypted []byte, transfers ...nativecontent.Transfer) error {
 	if err := verifyCapture(observation.Capture, encrypted); err != nil {
 		return err
 	}
@@ -136,6 +140,11 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 	}
 	if len(encrypted) > 0 {
 		if _, err = tx.Exec(`INSERT INTO worker_source_captures(id,ciphertext,size) VALUES(?,?,?)`, observation.ID, encrypted, len(encrypted)); err != nil {
+			return err
+		}
+	}
+	for _, transfer := range transfers {
+		if err = insertOriginalTransfer(ctx, tx, observation, transfer); err != nil {
 			return err
 		}
 	}
@@ -227,6 +236,9 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	}
 	if previous != digest {
 		return ErrConflict
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_content_fragments WHERE observation_id=?`, id); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_source_captures WHERE id=?`, id); err != nil {
 		return err

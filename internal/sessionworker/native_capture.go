@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 	"path/filepath"
 )
 
@@ -18,6 +20,14 @@ const captureChunkBytes = 64 << 10
 
 // Local pending capture is not a transcript or a control-plane receipt.
 const maxPrivateSourceBytes = 20 << 20
+
+const NativeSourceCaptureFormat = "pagnet.worker-native-source.v2"
+
+type NativeSourceCapture struct {
+	Format                       string                            `json:"format"`
+	Event                        session.SessionEvent              `json:"event"`
+	OriginalNativePayloadContent *transport.NativeContentReference `json:"originalNativePayloadContent,omitempty"`
+}
 
 type NativeCaptureRef struct {
 	Version          int    `json:"version"`
@@ -47,7 +57,7 @@ func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error)
 		Domain    string
 		Scope     Scope
 		Directory string
-	}{"pagnet-worker-private-source-key-v1", scope, filepath.Clean(directory)})
+	}{"pagnet-worker-private-source-key-v2", scope, filepath.Clean(directory)})
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +76,7 @@ func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error)
 func captureAAD(scope Scope, directory string, observation NativeObservation) ([]byte, error) {
 	// Origin bytes are retained exactly, rather than reconstructed on retry.
 	return canonicalNativeJSON(struct {
+		OriginalNativePayloadContent      *transport.NativeContentReference
 		TurnSource                        *NativeTurnSource
 		SourceUnavailable                 bool
 		Domain                            string
@@ -76,7 +87,7 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 		Origin                            []byte
 		NativeGeneration, NativeSessionID string
 		ObservedAt                        string
-	}{observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v1", 1, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")})
+	}{observation.OriginalNativePayloadContent, observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v2", 2, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")})
 }
 
 func sealNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
@@ -102,14 +113,14 @@ func sealNativeCapture(key []byte, scope Scope, directory string, observation Na
 	}
 	encrypted := aead.Seal(nonce, nonce, raw, aad)
 	digest := sha256.Sum256(encrypted)
-	return &NativeCaptureRef{Version: 1, CiphertextBytes: len(encrypted), CiphertextDigest: hex.EncodeToString(digest[:])}, encrypted, nil
+	return &NativeCaptureRef{Version: 2, CiphertextBytes: len(encrypted), CiphertextDigest: hex.EncodeToString(digest[:])}, encrypted, nil
 }
 
 // OpenNativeCapture is controller-local. Nothing here authorizes publication or
 // native actuation; the exact original source is authenticated before use.
 func OpenNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, encrypted []byte) (json.RawMessage, error) {
 	ref := observation.Capture
-	if ref == nil || ref.Version != 1 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 {
+	if ref == nil || ref.Version != 2 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 {
 		return nil, errors.New("invalid private capture reference")
 	}
 	digest := sha256.Sum256(encrypted)
@@ -184,7 +195,7 @@ func verifyCapture(ref *NativeCaptureRef, encrypted []byte) error {
 		}
 		return nil
 	}
-	if ref.Version != 1 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 || len(encrypted) < 28 {
+	if ref.Version != 2 || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 || len(encrypted) < 28 {
 		return errors.New("invalid private source capture")
 	}
 	digest := sha256.Sum256(encrypted)
@@ -236,4 +247,34 @@ func (j *Journal) initializeCaptures() error {
 		}
 	}
 	return rows.Err()
+}
+
+// A v2 source explicitly distinguishes complete original event fields from an
+// authenticated reference to a previously retained original request. Consumers
+// must retrieve/verify that exact detail; an absent request is never fabricated.
+func OpenNativeSourceCapture(key []byte, scope Scope, directory string, observation NativeObservation, encrypted []byte) (NativeSourceCapture, error) {
+	raw, err := OpenNativeCapture(key, scope, directory, observation, encrypted)
+	if err != nil {
+		return NativeSourceCapture{}, err
+	}
+	defer clear(raw)
+	var source NativeSourceCapture
+	if err = decodeClosed(raw, &source); err != nil || source.Format != NativeSourceCaptureFormat {
+		return NativeSourceCapture{}, errors.New("invalid private native source grammar")
+	}
+	expected, _ := canonicalNativeJSON(observation.OriginalNativePayloadContent)
+	actual, _ := canonicalNativeJSON(source.OriginalNativePayloadContent)
+	if !bytes.Equal(expected, actual) {
+		return NativeSourceCapture{}, errors.New("original request reference differs from captured source")
+	}
+	if ref := source.OriginalNativePayloadContent; ref != nil {
+		var origin struct {
+			ID string `json:"id"`
+		}
+		json.Unmarshal(observation.Origin, &origin)
+		if source.Event.Interaction == nil || !source.Event.Interaction.Resolved || len(source.Event.Interaction.NativePayload) > 0 || ref.Purpose != "interaction_detail" || ref.InstanceID != scope.InstanceID || ref.NativeGeneration != observation.NativeGeneration || ref.NativeSessionID != observation.NativeSessionID || ref.SubjectID != observation.InteractionID || ref.OriginID != origin.ID || ref.ManifestAAD.ValidateScope() != nil {
+			return NativeSourceCapture{}, errors.New("original request reference is not the same inspected source")
+		}
+	}
+	return source, nil
 }

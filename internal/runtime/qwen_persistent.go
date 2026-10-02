@@ -222,10 +222,10 @@ func (q *QwenPersistent) Capabilities() session.Capabilities {
 // optional interface). ask_user_question is HUMAN-ONLY (doc §6.3 / R3): the
 // daemon must never auto-resolve it — a generic allowed:true yields a
 // phantom "No valid answers were provided." answer, worse than a hang.
-// Everything else (can_use_tool kinds) is remotely resolvable (the only two
-// expressible outcomes are proceed_once / cancel — R10).
+// Only observed can_use_tool permissions are remotely resolvable. Their
+// expressible outcomes are proceed_once / cancel — R10.
 func (q *QwenPersistent) SupportsRemoteResolve(kind string) bool {
-	return kind != "question"
+	return kind == "permission"
 }
 
 // Available reports whether the qwen binary is resolvable (the session-core
@@ -337,7 +337,13 @@ func (q *QwenPersistent) Submit(ctx context.Context, sess *session.RuntimeSessio
 		// Remote resolution: append a confirmation_response (the ONLY two
 		// expressible outcomes are proceed_once / cancel — R10). The
 		// in-flight turn's stream carries the interaction.resolved.
-		allowed := req.Decision == "resolved"
+		if req.Decision != "resolved" {
+			return errors.New("qwen permission requires an exact observed native choice")
+		}
+		allowed, err := e.state.permissionOption(req.InteractionID, req.Answer)
+		if err != nil {
+			return err
+		}
 		cmd := qwenInputCmd{
 			Type:      "confirmation_response",
 			RequestID: req.InteractionID,

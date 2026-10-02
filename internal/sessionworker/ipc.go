@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/localpeer"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 const maxFrame = 1 << 20
@@ -38,6 +39,8 @@ type handshake struct {
 }
 
 type Request struct {
+	ContentID        string            `json:"contentId,omitempty"`
+	ContentOrdinal   int               `json:"contentOrdinal,omitempty"`
 	CaptureOffset    int               `json:"captureOffset,omitempty"`
 	ReplayGeneration string            `json:"replayGeneration,omitempty"`
 	ActivationOrigin *ActivationOrigin `json:"activationOrigin,omitempty"`
@@ -55,14 +58,15 @@ type Request struct {
 }
 
 type Response struct {
-	Capture      *NativeCaptureChunk `json:"capture,omitempty"`
-	Activation   *ActivationRequest  `json:"activation,omitempty"`
-	Observations []NativeObservation `json:"observations,omitempty"`
-	Snapshot     *NativeSnapshot     `json:"snapshot,omitempty"`
-	Output       *OutputPage         `json:"output,omitempty"`
-	Bridge       *BridgeCall         `json:"bridge,omitempty"`
-	Outcome      *Outcome            `json:"outcome,omitempty"`
-	Error        string              `json:"error,omitempty"`
+	ContentFragment *transport.NativeContentFragment `json:"contentFragment,omitempty"`
+	Capture         *NativeCaptureChunk              `json:"capture,omitempty"`
+	Activation      *ActivationRequest               `json:"activation,omitempty"`
+	Observations    []NativeObservation              `json:"observations,omitempty"`
+	Snapshot        *NativeSnapshot                  `json:"snapshot,omitempty"`
+	Output          *OutputPage                      `json:"output,omitempty"`
+	Bridge          *BridgeCall                      `json:"bridge,omitempty"`
+	Outcome         *Outcome                         `json:"outcome,omitempty"`
+	Error           string                           `json:"error,omitempty"`
 }
 
 // IntentExecutor must transfer ownership to the worker lifetime immediately.
@@ -425,6 +429,8 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		}
 	case "observations":
 		response.Observations, err = o.journal.PendingObservationsForLease(ctx, lease, req.Limit)
+	case "content_fragment":
+		response.ContentFragment, err = o.journal.ReadContentFragment(ctx, lease, req.ObservationID, req.SourceDigest, req.ContentID, req.ContentOrdinal)
 	case "source_capture":
 		response.Capture, err = o.journal.ReadCaptureChunk(ctx, lease, req.ObservationID, req.SourceDigest, req.CaptureOffset)
 	case "observation_ack":

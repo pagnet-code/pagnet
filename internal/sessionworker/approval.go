@@ -1,10 +1,10 @@
 package sessionworker
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,10 +15,12 @@ import (
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/nativecontent"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
 type Inspection struct {
+	DetailContent       *transport.NativeContentReference `json:"detailContent,omitempty"`
 	InteractionID       string                            `json:"interactionId"`
 	NativeGeneration    string                            `json:"nativeGeneration"`
 	NativeSessionID     string                            `json:"nativeSessionId"`
@@ -29,17 +31,21 @@ type Inspection struct {
 	DetailAAD           e2ee.AAD                          `json:"detailAAD"`
 }
 type nativeApproval struct {
-	inspection *Inspection
-	secret     []byte
-	native     json.RawMessage
-	summary    string
-	consumed   bool
-	expires    time.Time
+	committed     bool
+	payloadDigest [32]byte
+	summaryDigest [32]byte
+	transfer      *nativecontent.Transfer
+	inspection    *Inspection
+	secret        []byte
+	native        json.RawMessage
+	summary       string
+	consumed      bool
+	expires       time.Time
 }
 
-func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation string) {
+func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation string, original ...NativeObservation) {
 	native := event.Interaction
-	if native == nil || native.NativeInteractionID == "" || native.Kind != "permission" || len(native.NativePayload) > 64<<10 || len(native.Summary) > 4096 || !domain.ValidRuntimeInteractionOptions(native.Options) || o.spec.ProtectedContext == nil {
+	if native == nil || native.NativeInteractionID == "" || native.Kind != "permission" || len(native.NativePayload) > 16<<20 || !domain.ValidRuntimeInteractionOptions(native.Options) || o.spec.ProtectedContext == nil {
 		return
 	}
 	if policy, ok := o.driver.(session.RemoteResolvable); ok && !policy.SupportsRemoteResolve(native.Kind) {
@@ -53,7 +59,7 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 		o.mu.Unlock()
 		return
 	}
-	if current := o.pending[native.NativeInteractionID]; current != nil && bytes.Equal(current.native, native.NativePayload) && current.summary == native.Summary && current.inspection != nil && current.inspection.NativeSessionID == event.SessionID && current.inspection.Kind == native.Kind && slices.Equal(current.inspection.Options, native.Options) {
+	if current := o.pending[native.NativeInteractionID]; current != nil && current.payloadDigest == sha256.Sum256(native.NativePayload) && current.summaryDigest == sha256.Sum256([]byte(native.Summary)) && current.inspection != nil && current.inspection.NativeSessionID == event.SessionID && current.inspection.Kind == native.Kind && slices.Equal(current.inspection.Options, native.Options) {
 		o.mu.Unlock()
 		return
 	}
@@ -77,19 +83,40 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 	if _, err = rand.Read(secret); err != nil {
 		return
 	}
-	record := &nativeApproval{secret: secret, native: append(json.RawMessage(nil), native.NativePayload...), summary: native.Summary, expires: time.Now().UTC().Add(24 * time.Hour)}
+	record := &nativeApproval{payloadDigest: sha256.Sum256(native.NativePayload), summaryDigest: sha256.Sum256([]byte(native.Summary)), secret: secret, native: append(json.RawMessage(nil), native.NativePayload...), summary: native.Summary, expires: time.Now().UTC().Add(24 * time.Hour)}
 	o.mu.Lock()
 	origin := append(json.RawMessage(nil), o.origin...)
 	o.mu.Unlock()
 	id := nativeInteractionIdentity(o.journal.scope, origin, generation, event.SessionID, native.NativeInteractionID)
 	detail := transport.OwnerInteractionDetail{Format: "pagnet.owner_interaction.v1", Summary: native.Summary, NativePayload: json.RawMessage(native.NativePayload), Inspection: transport.OwnerInspection{Secret: base64.StdEncoding.EncodeToString(secret), InstanceID: o.journal.scope.InstanceID, SessionID: event.SessionID, NativeInteractionID: native.NativeInteractionID}}
-	plain, err := json.Marshal(detail)
-	if err != nil || len(plain) > 64<<10 {
+	plain, err := canonicalNativeJSON(detail)
+	if err != nil || len(plain) > transport.NativeContentMaxPlaintextBytes {
 		clear(secret)
 		return
 	}
 	defer clear(plain)
 	aad := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: o.spec.TenantID, ObjectType: e2ee.ObjectTypeRuntimeInteraction, ObjectID: id, Sender: o.journal.scope.InstanceID, Recipient: o.spec.ProtectedContext.OwnerUserID, CreatedAt: time.Now().UTC().Format(time.RFC3339), KeyEpochID: epoch.ID, ProtectedContext: o.spec.ProtectedContext}
+	if len(plain) > 64<<10 {
+		if len(original) != 1 {
+			clear(secret)
+			return
+		}
+		transfer, buildErr := buildOriginalContent(original[0], id, "interaction_detail", "application/json", plain, key, aad)
+		if buildErr != nil {
+			clear(secret)
+			return
+		}
+		record.transfer = &transfer
+		record.inspection = &Inspection{InteractionID: id, NativeGeneration: generation, NativeSessionID: event.SessionID, NativeInteractionID: native.NativeInteractionID, Kind: native.Kind, Options: append([]domain.RuntimeInteractionOption(nil), native.Options...), DetailContent: &transfer.Reference, DetailAAD: transfer.Reference.ManifestAAD}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.generation != generation {
+			clear(secret)
+			return
+		}
+		o.pending[native.NativeInteractionID] = record
+		return
+	}
 	envelope, err := e2ee.Encrypt(plain, key, aad)
 	if err != nil {
 		clear(secret)
@@ -175,6 +202,7 @@ func (o *SessionOwner) encryptResolution(event session.SessionEvent, inspection 
 		}
 		defer clear(key[:])
 		aad := inspection.DetailAAD
+		aad.NativeContent = nil
 		aad.CreatedAt = observedAt.UTC().Format(time.RFC3339)
 		envelope, err := e2ee.Encrypt([]byte(event.Interaction.Answer), key, aad)
 		if err != nil {
@@ -184,4 +212,34 @@ func (o *SessionOwner) encryptResolution(event session.SessionEvent, inspection 
 		return nil
 	})
 	return resolution
+}
+
+func (o *SessionOwner) encryptOriginalResolution(event session.SessionEvent, inspection *Inspection, observation NativeObservation) (*NativeResolution, *nativecontent.Transfer) {
+	if event.Interaction == nil || len(event.Interaction.Answer) <= 64<<10 {
+		return o.encryptResolution(event, inspection, observation.ObservedAt), nil
+	}
+	if inspection == nil || o.spec.ProtectedContext == nil || !event.Interaction.Resolved {
+		return nil, nil
+	}
+	var result *NativeResolution
+	var transfer *nativecontent.Transfer
+	_ = crypto.WithContextKeyring(o.ctx, o.spec.ContextStateDir, *o.spec.ProtectedContext, func(ring *crypto.ContextKeyring) error {
+		epoch, ok := ring.EpochByID(inspection.DetailAAD.KeyEpochID)
+		if !ok {
+			return errors.New("original resolution content authority unavailable")
+		}
+		key, err := epoch.KeyArray()
+		if err != nil {
+			return err
+		}
+		defer clear(key[:])
+		built, err := buildOriginalContent(observation, inspection.InteractionID, "interaction_answer", "text/plain; charset=utf-8", []byte(event.Interaction.Answer), key, inspection.DetailAAD)
+		if err != nil {
+			return err
+		}
+		transfer = &built
+		result = &NativeResolution{DetailContent: &built.Reference, DetailAAD: built.Reference.ManifestAAD}
+		return nil
+	})
+	return result, transfer
 }
