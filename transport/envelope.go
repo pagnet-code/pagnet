@@ -1403,16 +1403,18 @@ type RuntimeProfileInstallation = domain.RuntimeProfileInstallation
 const MsgResolveRuntimeInteraction = "host.resolve_runtime_interaction"
 
 type ResolveRuntimeInteractionPayload struct {
-	NativeOriginID      string    `json:"nativeOriginId,omitempty"`
-	InspectionProof     string    `json:"inspectionProof,omitempty"`
-	CommandID           string    `json:"commandId"`
-	InteractionID       string    `json:"interactionId"`
-	InstanceID          string    `json:"instanceId"`
-	SessionID           string    `json:"sessionId"`
-	NativeInteractionID string    `json:"nativeInteractionId"`
-	OptionID            string    `json:"optionId"`
-	Decision            string    `json:"decision"`
-	ExpiresAt           time.Time `json:"expiresAt"`
+	NativeDispatch      *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	NativeGeneration    string               `json:"nativeGeneration,omitempty"`
+	NativeOriginID      string               `json:"nativeOriginId,omitempty"`
+	InspectionProof     string               `json:"inspectionProof,omitempty"`
+	CommandID           string               `json:"commandId"`
+	InteractionID       string               `json:"interactionId"`
+	InstanceID          string               `json:"instanceId"`
+	SessionID           string               `json:"sessionId"`
+	NativeInteractionID string               `json:"nativeInteractionId"`
+	OptionID            string               `json:"optionId"`
+	Decision            string               `json:"decision"`
+	ExpiresAt           time.Time            `json:"expiresAt"`
 }
 
 // EndpointInvocationResultAckPayload confirms a durable, assignment-fenced result
