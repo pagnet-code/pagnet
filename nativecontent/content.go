@@ -164,7 +164,23 @@ func ordinal(hash hash.Hash, index int) {
 // CiphertextCommitment hashes only randomized ciphertext and public AAD. The
 // canonical ordered, length-prefixed encoding is shared with browser consumers.
 func CiphertextCommitment(ref transport.NativeContentReference, fragments []transport.NativeContentFragment) (string, error) {
-	if ValidateReference(ref) != nil || len(fragments) != ref.FragmentCount {
+	index := 0
+	return CiphertextCommitmentStream(ref, func() (transport.NativeContentFragment, bool, error) {
+		if index >= len(fragments) {
+			return transport.NativeContentFragment{}, false, nil
+		}
+		fragment := fragments[index]
+		index++
+		return fragment, true, nil
+	})
+}
+
+// CiphertextCommitmentStream verifies exact ordered ciphertext with one fragment
+// in memory. Server admission must not materialize a whole large transfer just
+// to verify public ciphertext integrity. The iterator must report end-of-stream
+// after exactly the declared fragment count; extra/missing records fail closed.
+func CiphertextCommitmentStream(ref transport.NativeContentReference, next func() (transport.NativeContentFragment, bool, error)) (string, error) {
+	if ValidateReference(ref) != nil || next == nil {
 		return "", ErrInvalid
 	}
 	hash := sha256.New()
@@ -180,7 +196,14 @@ func CiphertextCommitment(ref transport.NativeContentReference, fragments []tran
 	if err != nil {
 		return "", err
 	}
-	for index, fragment := range fragments {
+	for index := 0; index < ref.FragmentCount; index++ {
+		fragment, exists, err := next()
+		if err != nil {
+			return "", err
+		}
+		if !exists {
+			return "", ErrInvalid
+		}
 		if fragment.Ordinal != index || validateFragment(ref, fragment) != nil {
 			return "", ErrInvalid
 		}
@@ -196,6 +219,11 @@ func CiphertextCommitment(ref transport.NativeContentReference, fragments []tran
 			return "", err
 		}
 		total += n
+	}
+	if _, exists, err := next(); err != nil {
+		return "", err
+	} else if exists {
+		return "", ErrInvalid
 	}
 	if total != ref.CiphertextBytes {
 		return "", ErrInvalid

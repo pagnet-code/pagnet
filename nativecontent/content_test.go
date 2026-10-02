@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -228,5 +229,35 @@ func TestNativeContentCommittedCrossLanguageVectors(t *testing.T) {
 				t.Fatal("committed vector cannot authenticate whole original content", err)
 			}
 		})
+	}
+}
+
+func TestNativeContentStreamingCommitmentRequiresExactEndAndPropagatesStorageError(t *testing.T) {
+	transfer := contentFixture(t, bytes.Repeat([]byte("x"), transport.NativeContentFragmentPlaintextBytes+1))
+	next := func(fragments []transport.NativeContentFragment, failure error) func() (transport.NativeContentFragment, bool, error) {
+		index := 0
+		return func() (transport.NativeContentFragment, bool, error) {
+			if index >= len(fragments) {
+				return transport.NativeContentFragment{}, false, failure
+			}
+			fragment := fragments[index]
+			index++
+			return fragment, true, nil
+		}
+	}
+	commitment, err := CiphertextCommitmentStream(transfer.Reference, next(transfer.Fragments, nil))
+	if err != nil || commitment != transfer.Reference.CiphertextDigest {
+		t.Fatal("stream commitment differs", err)
+	}
+	if _, err := CiphertextCommitmentStream(transfer.Reference, next(transfer.Fragments[:1], nil)); err == nil {
+		t.Fatal("missing stream fragment accepted")
+	}
+	extra := append(append([]transport.NativeContentFragment(nil), transfer.Fragments...), transfer.Fragments[0])
+	if _, err := CiphertextCommitmentStream(transfer.Reference, next(extra, nil)); err == nil {
+		t.Fatal("extra stream fragment accepted")
+	}
+	failure := errors.New("stored fragment cursor failed")
+	if _, err := CiphertextCommitmentStream(transfer.Reference, next(transfer.Fragments, failure)); !errors.Is(err, failure) {
+		t.Fatal("storage error hidden", err)
 	}
 }
