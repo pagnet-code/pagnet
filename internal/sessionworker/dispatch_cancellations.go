@@ -236,6 +236,9 @@ func (j *Journal) FinalizeDispatchCancellation(ctx context.Context, lease int64,
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_cancellations SET payload=?,state='finalized' WHERE preparation_id=?`, raw, response.PreparationID); err != nil {
 		return err
 	}
+	if err = advanceFinalizedDispatchesTx(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

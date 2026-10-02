@@ -258,6 +258,7 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 	go d.pumpNativeBridge(ctx, link)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var nextCancellation time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -272,6 +273,10 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 		link.mu.Lock()
 		ownership := link.ownership
 		link.mu.Unlock()
+		if !time.Now().Before(nextCancellation) {
+			_ = link.proxy.ReconcileDispatchCancellations(ctx, ownership)
+			nextCancellation = time.Now().Add(2 * time.Second)
+		}
 		if updated, err := link.proxy.SettleDispatches(ctx, ownership); err == nil && updated != nil {
 			link.mu.Lock()
 			link.ownership = *updated

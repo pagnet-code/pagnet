@@ -61,7 +61,7 @@ func (j *Journal) initializeDispatches() error {
 		}
 	}
 	var last, retired, count int64
-	err := j.db.QueryRow(`SELECT last_sequence,retired,(SELECT COUNT(*) FROM worker_dispatches) FROM worker_dispatch_meta WHERE singleton=1`).Scan(&last, &retired, &count)
+	err := j.db.QueryRow(`SELECT last_sequence,retired,((SELECT COUNT(*) FROM worker_dispatches)+(SELECT COUNT(*) FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence>worker_dispatch_meta.retired AND dispatch_sequence<=worker_dispatch_meta.last_sequence)) FROM worker_dispatch_meta WHERE singleton=1`).Scan(&last, &retired, &count)
 	if errors.Is(err, sql.ErrNoRows) {
 		var orphaned int
 		if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches`).Scan(&orphaned); err != nil {
@@ -160,6 +160,9 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 			return 0, false, ErrConflict
 		}
 	}
+	if err := CheckDispatchCancellationTx(ctx, tx, p); err != nil {
+		return 0, false, err
+	}
 	var ownership string
 	var last, floor int64
 	if err := tx.QueryRowContext(ctx, `SELECT ownership,last_sequence,retired FROM worker_dispatch_meta WHERE singleton=1`).Scan(&ownership, &last, &floor); err != nil {
@@ -195,7 +198,7 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 		return 0, false, ErrConflict
 	}
 	var count int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches`).Scan(&count); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM worker_dispatches)+(SELECT COUNT(*) FROM worker_dispatch_cancellations)`).Scan(&count); err != nil {
 		return 0, false, err
 	}
 	if count >= maxCommands {
@@ -205,6 +208,9 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 		return 0, false, ErrConflict
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET last_sequence=? WHERE singleton=1`, p.DispatchSequence); err != nil {
+		return 0, false, err
+	}
+	if err = advanceFinalizedDispatchesTx(ctx, tx); err != nil {
 		return 0, false, err
 	}
 	return next, true, nil
@@ -245,6 +251,17 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
 		return err
 	}
+	var ownershipRaw string
+	if err = tx.QueryRowContext(ctx, `SELECT ownership FROM worker_dispatch_meta WHERE singleton=1`).Scan(&ownershipRaw); err != nil {
+		return err
+	}
+	var ownership transport.NativeWorkerOwnership
+	if json.Unmarshal([]byte(ownershipRaw), &ownership) != nil {
+		return ErrConflict
+	}
+	if err = RetireDispatchCancellationsTx(ctx, tx, ownership.ID, floor); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -267,7 +284,7 @@ func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDis
 	if _, _, err = checkLease(ctx, tx, lease); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM worker_dispatches ORDER BY dispatch_sequence LIMIT ?`, maxCommands)
+	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM (SELECT proof,operation_sequence,state FROM worker_dispatches UNION ALL SELECT json_extract(payload,'$.proposal.proof'),0,'cancelled' FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence<=(SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1)  ) ORDER BY json_extract(proof,'$.dispatchSequence') LIMIT ?`, maxCommands)
 	if err != nil {
 		return nil, err
 	}
@@ -294,4 +311,26 @@ func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDis
 		return nil, err
 	}
 	return records, nil
+}
+
+// Finalized cancellation is an ordinal tombstone, never a native operation.
+// This runs in the finalization/admission transaction so reopening cannot
+// observe a skipped ordinal without its matching committed marker.
+func advanceFinalizedDispatchesTx(ctx context.Context, tx *sql.Tx) error {
+	var last int64
+	if err := tx.QueryRowContext(ctx, `SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1`).Scan(&last); err != nil {
+		return err
+	}
+	for {
+		var finalized bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_dispatch_cancellations WHERE dispatch_sequence=? AND state='finalized')`, last+1).Scan(&finalized); err != nil {
+			return err
+		}
+		if !finalized {
+			break
+		}
+		last++
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET last_sequence=? WHERE singleton=1`, last)
+	return err
 }

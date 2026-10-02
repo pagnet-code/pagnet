@@ -972,6 +972,7 @@ func (d *Daemon) wsURL() string {
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
+		q.Set("native_dispatch_cancellation", transport.NativeDispatchCancellationProtocol)
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

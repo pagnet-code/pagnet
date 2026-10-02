@@ -25,6 +25,7 @@ type NativeWorkerProxy struct {
 	confirmedGeneration, confirmedStart string
 	sourceMu                            sync.Mutex
 	sourceCursor                        int64
+	cancellationCursor                  int64
 }
 
 func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnection, dir string, expected sessionworker.Scope, controllerID string) (*NativeWorkerProxy, error) {

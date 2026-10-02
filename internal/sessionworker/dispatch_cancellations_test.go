@@ -18,16 +18,7 @@ func cancellationFixture(t *testing.T) (*Journal, string, int64, transport.Nativ
 	t.Helper()
 	j, dir := testJournal(t)
 	a := lease(t, j)
-	o := transport.NativeWorkerOwnership{ID: domain.NewID().String(), InstanceID: j.scope.InstanceID, OwnershipGeneration: j.scope.Generation, State: "active"}
-	raw, _ := json.Marshal(o)
-	for _, query := range []string{`CREATE TABLE worker_dispatch_meta(singleton INTEGER PRIMARY KEY,ownership TEXT,last_sequence INTEGER,retired INTEGER)`, `CREATE TABLE worker_dispatches(dispatch_sequence INTEGER PRIMARY KEY,operation_sequence INTEGER,command_id TEXT,proof BLOB,state TEXT)`} {
-		if _, err := j.db.Exec(query); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := j.db.Exec(`INSERT INTO worker_dispatch_meta VALUES(1,?,0,0)`, string(raw)); err != nil {
-		t.Fatal(err)
-	}
+	o := dispatchOwnership(t, j, a)
 	p := transport.NativeDispatchCancellationProposal{InstanceID: j.scope.InstanceID, CommandType: "host.agent_input", Reason: "expired", Proof: transport.NativeDispatchProof{OwnershipID: o.ID, OwnershipGeneration: j.scope.Generation, DispatchSequence: 1, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String(), SourceRunnerID: domain.NewID().String(), SourceRunnerEpoch: time.Now().UTC(), SourceBootID: domain.NewID().String()}}
 	return j, dir, a, p
 }
@@ -146,7 +137,7 @@ func TestDispatchCancellationRefusesAcceptedAndUncertainMapping(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			j, _, a, p := cancellationFixture(t)
 			defer j.Close()
-			_, _, err := j.Admit(t.Context(), a, 1, p.Proof.SourceCommandID, "prompt", json.RawMessage(`{}`))
+			_, _, err := admitCancellationFixture(t, j, a, p.Proof)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -159,7 +150,11 @@ func TestDispatchCancellationRefusesAcceptedAndUncertainMapping(t *testing.T) {
 	t.Run("ordinal", func(t *testing.T) {
 		j, _, a, p := cancellationFixture(t)
 		defer j.Close()
-		j.db.Exec(`INSERT INTO worker_dispatches VALUES(1,1,'other',NULL,'uncertain')`)
+		other := p.Proof
+		other.SourceCommandID = domain.NewID().String()
+		if _, _, err := admitCancellationFixture(t, j, a, other); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := j.PrepareDispatchCancellation(t.Context(), a, p); !errors.Is(err, ErrConflict) {
 			t.Fatal("occupied ordinal cancelled", err)
 		}
@@ -178,7 +173,7 @@ func TestDispatchCancellationRacesAdmissionAndFailedPrepareCommit(t *testing.T) 
 		}()
 		go func() {
 			defer wg.Done()
-			_, execute, err := j.Admit(t.Context(), a, 1, p.Proof.SourceCommandID, "prompt", json.RawMessage(`{}`))
+			_, execute, err := admitCancellationFixture(t, j, a, p.Proof)
 			effect = err == nil && execute
 		}()
 		wg.Wait()
@@ -194,7 +189,67 @@ func TestDispatchCancellationRacesAdmissionAndFailedPrepareCommit(t *testing.T) 
 		t.Fatal("failed commit created prep")
 	}
 	j.db.Exec(`DROP TRIGGER fail_prepare`)
-	if _, effect, err := j.Admit(t.Context(), a, 1, p.Proof.SourceCommandID, "prompt", json.RawMessage(`{}`)); err != nil || !effect {
+	if _, effect, err := admitCancellationFixture(t, j, a, p.Proof); err != nil || !effect {
 		t.Fatal("failed marker fenced unaccepted input", err)
+	}
+}
+
+func admitCancellationFixture(t *testing.T, j *Journal, lease int64, p transport.NativeDispatchProof) (Outcome, bool, error) {
+	current := &Admission{Scope: j.scope, NativeAdmissionID: domain.NewID().String(), RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), BootID: "current-B", Kind: "worker", NetworkID: "network"}
+	return j.admitDispatch(t.Context(), lease, 0, p.SourceCommandID, "prompt", json.RawMessage(`{"input":"actual original turn"}`), func() (*Admission, error) { return current, nil }, &p)
+}
+
+func TestCancelledOrdinalsRemainContiguousAcrossAdmissionAndReopen(t *testing.T) {
+	j, dir, a, first := cancellationFixture(t)
+	third := first
+	third.Proof.DispatchSequence = 3
+	third.Proof.SourceCommandID = domain.NewID().String()
+	third.Proof.SourceAdmissionID = domain.NewID().String()
+	final := func(proposal transport.NativeDispatchCancellationProposal) {
+		t.Helper()
+		prepared, err := j.PrepareDispatchCancellation(t.Context(), a, proposal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = j.FinalizeDispatchCancellation(t.Context(), a, cancellationReceipt(prepared)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	final(third)
+	var last int64
+	if err := j.db.QueryRow(`SELECT last_sequence FROM worker_dispatch_meta`).Scan(&last); err != nil || last != 0 {
+		t.Fatal("jumped an unaccepted gap", last, err)
+	}
+	final(first)
+	records, err := j.DispatchRecords(t.Context(), a)
+	if err != nil || len(records) != 1 || records[0].State != "cancelled" || records[0].OperationSequence != 0 {
+		t.Fatal("manufactured native effect", records, err)
+	}
+	second := first.Proof
+	second.DispatchSequence = 2
+	second.SourceCommandID = domain.NewID().String()
+	second.SourceAdmissionID = domain.NewID().String()
+	out, effect, err := admitCancellationFixture(t, j, a, second)
+	if err != nil || !effect || out.Sequence != 1 {
+		t.Fatal("cancelled ordinals consumed native operations", out, effect, err)
+	}
+	if err = j.db.QueryRow(`SELECT last_sequence FROM worker_dispatch_meta`).Scan(&last); err != nil || last != 3 {
+		t.Fatal("finalized successor did not advance atomically", last, err)
+	}
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(dir, testScope())
+	if err != nil {
+		t.Fatal("original mixed ledger cannot reopen", err)
+	}
+	defer j.Close()
+	a = lease(t, j)
+	records, err = j.DispatchRecords(t.Context(), a)
+	if err != nil || len(records) != 3 || records[0].State != "cancelled" || records[1].State != "uncertain" || records[2].State != "cancelled" {
+		t.Fatal("reopen lost original ordering/uncertainty", records, err)
+	}
+	if err = j.RetireDispatches(t.Context(), a, 3); !errors.Is(err, ErrConflict) {
+		t.Fatal("uncertain accepted effect crossed cancellation retirement", err)
 	}
 }
