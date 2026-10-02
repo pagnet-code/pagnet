@@ -80,4 +80,16 @@ func TestOwnerTerminalUnwrapAuthenticatesInstanceContextAndCiphertext(t *testing
 			}
 		})
 	}
+	// Revocation also fences an already established browser session: retained
+	// historical key material must never authorize a new CEK disclosure.
+	if err = ring.Revoke(epoch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = crypto.SaveContextKeyring(d.StateDir, ring); err != nil {
+		t.Fatal(err)
+	}
+	if item := unwrap(aad, envelope); item.WrappedCek != nil || item.Error == "" {
+		t.Fatal("revoked owner epoch released terminal CEK")
+	}
+
 }
