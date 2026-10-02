@@ -1192,10 +1192,11 @@ type CryptoUnwrapCekResult struct {
 // the committed epoch admitted for the browser session. ObjectType/ObjectID
 // must match the browser's AAD; the HPKE wrap also binds the exact object ID.
 type CryptoWrapCekPayload struct {
-	CommandID string `json:"commandId"`
-	TenantID  string `json:"tenantId"`
-	NetworkID string `json:"networkId"`
-	SessionID string `json:"sessionId"`
+	ProtectedContext *e2ee.ProtectedContext `json:"protectedContext,omitempty"`
+	CommandID        string                 `json:"commandId"`
+	TenantID         string                 `json:"tenantId"`
+	NetworkID        string                 `json:"networkId"`
+	SessionID        string                 `json:"sessionId"`
 	// AAD binds the exact admitted network, committed epoch and object.
 	AAD        e2ee.AAD `json:"aad"`
 	ObjectType string   `json:"objectType"`
