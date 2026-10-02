@@ -130,6 +130,9 @@ func unwrapCekToBrowser(kr *crypto.Keyring, browserPub []byte, networkID, sessio
 // it through the normal protected-field write path (authorization enforced
 // there).
 func (d *Daemon) doCryptoWrapCek(p transport.CryptoWrapCekPayload) (any, error) {
+	if p.ProtectedContext != nil {
+		return d.ownerWrap(p)
+	}
 	sess, err := d.sessionValid(p.NetworkID, p.SessionID)
 	if err != nil {
 		return nil, err

@@ -346,9 +346,9 @@ func (d *Daemon) ownerSessionStart(p transport.CryptoSessionStartPayload) (any, 
 	if err != nil {
 		return nil, errors.New("protected context local key unavailable")
 	}
-	epoch, err := ring.ActiveEpoch()
-	if err != nil {
-		return nil, errors.New("protected context key epoch unavailable")
+	epoch, found := ring.EpochByID(p.EpochID)
+	if p.EpochID == "" || !found || epoch.State == crypto.EpochRevoked {
+		return nil, errors.New("protected context committed key epoch unavailable")
 	}
 	identity, err := d.cryptoManager().hostIdentity()
 	if err != nil {
@@ -362,13 +362,13 @@ func (d *Daemon) ownerSessionStart(p transport.CryptoSessionStartPayload) (any, 
 			delete(o.sessions, id)
 		}
 	}
-	if existing, exists := o.sessions[p.SessionID]; exists && (existing.Context != *c || existing.UserID != p.UserID || existing.BrowserPub != p.BrowserPub) {
+	if existing, exists := o.sessions[p.SessionID]; exists && (existing.Context != *c || existing.UserID != p.UserID || existing.BrowserPub != p.BrowserPub || existing.EpochID != p.EpochID) {
 		return nil, errors.New("protected context session binding changed")
 	}
 	if _, exists := o.sessions[p.SessionID]; !exists && len(o.sessions) >= ownerContextLimit {
 		return nil, errors.New("protected context session limit reached")
 	}
-	o.sessions[p.SessionID] = transport.ProtectedContextSessionBinding{Context: *c, SessionID: p.SessionID, UserID: p.UserID, BrowserPub: p.BrowserPub, ExpiresAt: time.Now().Add(ownerContextTTL)}
+	o.sessions[p.SessionID] = transport.ProtectedContextSessionBinding{EpochID: p.EpochID, Context: *c, SessionID: p.SessionID, UserID: p.UserID, BrowserPub: p.BrowserPub, ExpiresAt: time.Now().Add(ownerContextTTL)}
 	return &transport.CryptoSessionStartResult{HostX25519: base64.StdEncoding.EncodeToString(identity.X25519Pub), EpochID: epoch.ID}, nil
 }
 func (d *Daemon) ownerUnwrap(p transport.CryptoUnwrapCekPayload) (any, error) {
@@ -409,7 +409,9 @@ func (d *Daemon) ownerUnwrap(p transport.CryptoUnwrapCekPayload) (any, error) {
 			aad = *obj.AAD
 		}
 		bound, boundOK := d.contextForInstance(aad.Sender)
-		valid := boundOK && bound == *c && aad.ProtectedContext != nil && *aad.ProtectedContext == *c && aad.ValidateScope() == nil && aad.ObjectID == obj.ObjectID && aad.KeyEpochID == obj.Envelope.KeyEpochID && aad.Recipient == c.OwnerUserID && aad.ObjectType == e2ee.ObjectTypeRuntimeInteraction
+		instanceBound := boundOK && bound == *c && aad.ObjectType == e2ee.ObjectTypeRuntimeInteraction
+		templateBound := aad.ObjectType == e2ee.ObjectTypeAgentTemplate && validOwnerProtocolID(obj.ObjectID) && aad.Sender == c.OwnerUserID
+		valid := (instanceBound || templateBound) && aad.ProtectedContext != nil && *aad.ProtectedContext == *c && aad.ValidateScope() == nil && aad.ObjectID == obj.ObjectID && aad.KeyEpochID == obj.Envelope.KeyEpochID && aad.Recipient == c.OwnerUserID
 		if !found || !valid {
 			item.Error = "protected_context_binding_invalid"
 			result.Results = append(result.Results, item)

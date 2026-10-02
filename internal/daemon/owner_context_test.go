@@ -126,7 +126,7 @@ func TestOwnerContextInspectionProofAndAuthenticatedObjectUnwrap(t *testing.T) {
 		t.Fatal(err)
 	}
 	session := domain.NewID().String()
-	start := transport.CryptoSessionStartPayload{ProtectedContext: &p.Context, TenantID: p.Context.TenantID, UserID: p.Context.OwnerUserID, SessionID: session, BrowserPub: base64.StdEncoding.EncodeToString(browser.X25519Pub)}
+	start := transport.CryptoSessionStartPayload{EpochID: ready.EpochID, ProtectedContext: &p.Context, TenantID: p.Context.TenantID, UserID: p.Context.OwnerUserID, SessionID: session, BrowserPub: base64.StdEncoding.EncodeToString(browser.X25519Pub)}
 	if _, err = d.ownerSessionStart(start); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestOwnerContextInspectionProofAndAuthenticatedObjectUnwrap(t *testing.T) {
 }
 
 func TestOwnerContextPrivateStorageAndScopeRefusal(t *testing.T) {
-	d, p, _ := preparedOwnerDaemon(t)
+	d, p, ready := preparedOwnerDaemon(t)
 	path := filepath.Join(d.StateDir, "e2ee", "contexts", p.Context.ID, "keyring.json")
 	if err := os.Chmod(path, 0644); err != nil {
 		t.Fatal(err)
@@ -228,7 +228,7 @@ func TestOwnerContextPrivateStorageAndScopeRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := transport.CryptoSessionStartPayload{ProtectedContext: &p.Context, TenantID: p.Context.TenantID, UserID: domain.NewID().String(), SessionID: domain.NewID().String(), BrowserPub: base64.StdEncoding.EncodeToString(browser.X25519Pub)}
+	start := transport.CryptoSessionStartPayload{EpochID: ready.EpochID, ProtectedContext: &p.Context, TenantID: p.Context.TenantID, UserID: domain.NewID().String(), SessionID: domain.NewID().String(), BrowserPub: base64.StdEncoding.EncodeToString(browser.X25519Pub)}
 	if _, err = d.ownerSessionStart(start); err == nil {
 		t.Fatal("foreign owner started unwrap session")
 	}

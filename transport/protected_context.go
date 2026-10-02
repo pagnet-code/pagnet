@@ -41,6 +41,7 @@ type OwnerInspection struct {
 	NativeInteractionID string `json:"nativeInteractionId"`
 }
 type ProtectedContextSessionBinding struct {
+	EpochID    string                `json:"epochId"`
 	Context    e2ee.ProtectedContext `json:"context"`
 	SessionID  string                `json:"sessionId"`
 	UserID     string                `json:"userId"`
