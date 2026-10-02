@@ -87,6 +87,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -615,7 +617,8 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 	// Scripted native interaction: the turn blocks until an interaction
 	// command answers it (the busy/idle + interaction round-trip).
 	if kind := os.Getenv("PAGNET_FAKE_INTERACTION"); kind != "" {
-		nativeID := "fake-int-" + short(cmd.TurnID)
+		turnDigest := sha256.Sum256([]byte(cmd.TurnID))
+		nativeID := "fake-int-" + hex.EncodeToString(turnDigest[:16])
 		var payload json.RawMessage
 		if raw := os.Getenv("PAGNET_FAKE_INTERACTION_PAYLOAD"); raw != "" {
 			if !json.Valid([]byte(raw)) {
