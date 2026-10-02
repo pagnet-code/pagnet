@@ -25,7 +25,7 @@ func TestFailedNativeListenerCannotAdvertiseWholeOwnership(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 	key := bytes.Repeat([]byte{1}, 32)
-	bootstrap := Bootstrap{Protocol: Protocol, Scope: testScope(), Native: NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: "/bin/true", MCPExecutable: "/bin/true", Workspace: dir, NetworkID: "network", Kind: "worker", TenantID: "tenant"}}
+	bootstrap := Bootstrap{Protocol: Protocol, Scope: testScope(), Native: NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: "/bin/true", MCPExecutable: "/bin/true", Workspace: dir, NetworkID: "network", Kind: "worker", TenantID: "tenant", NetworkTenantID: "tenant"}}
 	if err := PrepareBootstrap(dir, bootstrap, key); err != nil {
 		t.Fatal(err)
 	}

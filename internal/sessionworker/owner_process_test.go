@@ -189,7 +189,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := bytes.Repeat([]byte{9}, 32)
-	bootstrap := Bootstrap{Protocol: Protocol, Scope: scope, Native: NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: nativeBinary, MCPExecutable: workerBinary, Workspace: workspace, NetworkID: uuid.NewString(), Kind: "worker", TenantID: tenant, ProtectedContext: &protected, ContextStateDir: contextState}}
+	bootstrap := Bootstrap{Protocol: Protocol, Scope: scope, Native: NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: nativeBinary, MCPExecutable: workerBinary, Workspace: workspace, NetworkID: uuid.NewString(), Kind: "worker", TenantID: tenant, NetworkTenantID: tenant, ProtectedContext: &protected, ContextStateDir: contextState}}
 	if err = PrepareBootstrap(state, bootstrap, key); err != nil {
 		t.Fatal(err)
 	}

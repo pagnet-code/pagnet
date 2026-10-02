@@ -13,7 +13,7 @@ import (
 
 func TestActivationAuthorityBeforeNativeGenerationAndReconnection(t *testing.T) {
 	j, _ := testJournal(t)
-	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, TenantID: "tenant", NetworkID: "network", Kind: "worker"}
+	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, TenantID: "tenant", NetworkTenantID: "shared-network-tenant", NetworkID: "network", Kind: "worker"}
 	o := &SessionOwner{journal: j, spec: spec, relay: newRelayBroker(j.scope, spec)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -49,12 +49,20 @@ func TestActivationAuthorityBeforeNativeGenerationAndReconnection(t *testing.T) 
 		if request == nil || request.NativeGeneration != generation || request.SourceCommandID != "same-source-command" {
 			t.Fatalf("wrong actual activation request: %+v", request)
 		}
-		raw, _ := json.Marshal(map[string]any{"id": "origin-" + generation, "commandId": request.SourceCommandID, "tenantId": spec.TenantID, "hostId": j.scope.HostID, "instanceId": j.scope.InstanceID, "runtime": spec.Runtime, "nativeGeneration": generation, "nativeAdmissionId": admission.NativeAdmissionID, "runnerId": admission.RunnerID, "runnerEpoch": admission.RunnerEpoch, "bootId": admission.BootID, "createdAt": time.Now().UTC()})
+		raw, _ := json.Marshal(map[string]any{"id": "origin-" + generation, "commandId": request.SourceCommandID, "tenantId": spec.NetworkTenantID, "hostId": j.scope.HostID, "instanceId": j.scope.InstanceID, "runtime": spec.Runtime, "nativeGeneration": generation, "nativeAdmissionId": admission.NativeAdmissionID, "runnerId": admission.RunnerID, "runnerEpoch": admission.RunnerEpoch, "bootId": admission.BootID, "createdAt": time.Now().UTC()})
 		result := ActivationOrigin{ID: request.ID, NativeGeneration: generation, Origin: raw}
 		wrong := result
 		wrong.NativeGeneration = "another-generation"
 		if err := o.relay.completeActivation(lease, wrong); err == nil {
 			t.Fatal("wrong native generation authorized")
+		}
+		var wrongTenant map[string]any
+		_ = json.Unmarshal(raw, &wrongTenant)
+		wrongTenant["tenantId"] = spec.TenantID
+		wrongSource := result
+		wrongSource.Origin, _ = json.Marshal(wrongTenant)
+		if err := o.relay.completeActivation(lease, wrongSource); err == nil {
+			t.Fatal("account tenant replaced shared network source tenant")
 		}
 		select {
 		case <-done:
@@ -120,7 +128,7 @@ func resultRunner(raw json.RawMessage) string {
 
 func TestSameControllerFreshTransportReissuesUnlaunchedGate(t *testing.T) {
 	scope := testScope()
-	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, TenantID: scope.TenantID, NetworkID: "network", Kind: "worker"}
+	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, TenantID: scope.TenantID, NetworkTenantID: "shared-network-tenant", NetworkID: "network", Kind: "worker"}
 	broker := newRelayBroker(scope, spec)
 	broker.bindLease(1)
 	original := Admission{NativeAdmissionID: "original-server-admission", Scope: scope, TenantID: scope.TenantID, NetworkID: "network", Kind: "worker", RunnerID: "runner", RunnerEpoch: time.Now().UTC(), BootID: "boot"}

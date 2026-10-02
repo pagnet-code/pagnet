@@ -31,6 +31,7 @@ type NativeSpec struct {
 	Env                                      []string `json:"-"`
 	Workspace, Model, StandingInstructions   string
 	MCPExecutable, NetworkID, Kind, TenantID string
+	NetworkTenantID                          string
 	ProtectedContext                         *e2ee.ProtectedContext
 	ContextStateDir                          string
 }
@@ -92,7 +93,7 @@ type SessionOwner struct {
 }
 
 func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*SessionOwner, error) {
-	if !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) || (spec.Kind != "worker" && spec.Kind != "representative") || (spec.Kind == "worker" && spec.NetworkID == "") {
+	if !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) || (spec.Kind != "worker" && spec.Kind != "representative") || (spec.Kind == "worker" && (spec.NetworkID == "" || spec.NetworkTenantID == "")) {
 		return nil, errors.New("incomplete worker native scope or execution profile")
 	}
 	if spec.TenantID != j.scope.TenantID {

@@ -13,6 +13,8 @@ import (
 // ActivationRequest is created by the worker before a native process exists.
 // Registering an origin for a previous attempt never authorizes this generation.
 type ActivationRequest struct {
+	NetworkID        string             `json:"networkId,omitempty"`
+	NetworkTenantID  string             `json:"networkTenantId,omitempty"`
 	ID               string             `json:"id"`
 	Scope            Scope              `json:"scope"`
 	SourceCommandID  string             `json:"sourceCommandId"`
@@ -50,7 +52,7 @@ func (o *SessionOwner) awaitActivationOrigin(ctx context.Context, commandID, gen
 		o.relay.mu.Unlock()
 		return nil, errors.New("native activation admission unavailable")
 	}
-	ticket := &activationTicket{request: ActivationRequest{ID: uuid.NewString(), Scope: o.journal.scope, SourceCommandID: commandID, NativeGeneration: generation, ActualRuntime: o.spec.Runtime}, done: make(chan activationReply, 1)}
+	ticket := &activationTicket{request: ActivationRequest{ID: uuid.NewString(), Scope: o.journal.scope, SourceCommandID: commandID, NativeGeneration: generation, ActualRuntime: o.spec.Runtime, NetworkID: o.spec.NetworkID, NetworkTenantID: o.spec.NetworkTenantID}, done: make(chan activationReply, 1)}
 	o.relay.activation = ticket
 	o.relay.mu.Unlock()
 	defer func() {
@@ -125,7 +127,7 @@ func (b *relayBroker) completeActivation(lease int64, result ActivationOrigin) e
 		BootID            string             `json:"bootId"`
 		CreatedAt         time.Time          `json:"createdAt"`
 	}
-	if json.Unmarshal(result.Origin, &origin) != nil || origin.NativeAdmissionID != ticket.request.Admission.NativeAdmissionID || origin.ID == "" || origin.CreatedAt.IsZero() || origin.CommandID != ticket.request.SourceCommandID || origin.TenantID != b.spec.TenantID || origin.HostID != b.scope.HostID || origin.InstanceID != b.scope.InstanceID || origin.Runtime != b.spec.Runtime || origin.NativeGeneration != ticket.request.NativeGeneration || origin.RunnerID != ticket.request.Admission.RunnerID || !origin.RunnerEpoch.Equal(ticket.request.Admission.RunnerEpoch) || origin.BootID != ticket.request.Admission.BootID {
+	if json.Unmarshal(result.Origin, &origin) != nil || origin.NativeAdmissionID != ticket.request.Admission.NativeAdmissionID || origin.ID == "" || origin.CreatedAt.IsZero() || origin.CommandID != ticket.request.SourceCommandID || origin.TenantID != b.spec.sourceTenantID() || origin.HostID != b.scope.HostID || origin.InstanceID != b.scope.InstanceID || origin.Runtime != b.spec.Runtime || origin.NativeGeneration != ticket.request.NativeGeneration || origin.RunnerID != ticket.request.Admission.RunnerID || !origin.RunnerEpoch.Equal(ticket.request.Admission.RunnerEpoch) || origin.BootID != ticket.request.Admission.BootID {
 		return errors.New("authority origin does not match native activation scope")
 	}
 	// Current admission must still be the one that authorized this exact request.
@@ -135,4 +137,14 @@ func (b *relayBroker) completeActivation(lease int64, result ActivationOrigin) e
 	ticket.done <- activationReply{origin: append(json.RawMessage(nil), result.Origin...)}
 	b.activation = nil
 	return nil
+}
+
+// Account admission and owner inspection authority belong to the host tenant.
+// A worker's source observation belongs to its selected network tenant, which
+// can be different when the owner participates in a shared network.
+func (s NativeSpec) sourceTenantID() string {
+	if s.Kind == "worker" {
+		return s.NetworkTenantID
+	}
+	return s.TenantID
 }
