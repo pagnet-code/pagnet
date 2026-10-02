@@ -469,3 +469,59 @@ func TestNativeWorkerExplicitDeleteMetadataOnlyRetainsCiphertext(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeResourceInterruptionCapabilityRequiredBeforeBackendWrite(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "absent", true: "authenticated"}[enabled], func(t *testing.T) {
+			sends, acks := 0, 0
+			var c *NativeObservationConnection
+			c, o := deliveryFixture(t, func(ctx context.Context, typ string, value any) error {
+				sends++
+				if typ != transport.MsgNativeObservation {
+					t.Fatal("unexpected resource source write", typ)
+				}
+				p := value.(transport.NativeObservationPayload)
+				c.NativeWorkerObservationDisposition(transport.MsgNativeObservationReceipt, transport.NativeObservationReceiptPayload{ObservationID: p.ObservationID, OriginID: p.OriginID, Digest: p.Digest, Disposition: "committed"})
+				return nil
+			})
+			if enabled {
+				a, err := c.AuthenticatedNativeHostSession()
+				if err != nil {
+					t.Fatal(err)
+				}
+				a.ProtocolFeatures = append(a.ProtocolFeatures, transport.NativeResourceInterruptionProtocol)
+				previous := c
+				c = NewNativeObservationConnection(previous.serverURL, previous.hostID, previous.bootID, previous.send)
+				previous.Close()
+				if err = c.Admit(a); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var origin transport.NativeObservationOrigin
+			if err := json.Unmarshal(o.Origin, &origin); err != nil {
+				t.Fatal(err)
+			}
+			o.Event.Type = session.EventSessionStopped
+			o.ResourceInterruption = &transport.NativeResourceInterruption{Cause: transport.NativeResourceOutputLimit, Source: transport.NativeAgentSource{OriginID: origin.ID, NativeGeneration: o.NativeGeneration, SessionID: o.NativeSessionID, LogicalTurnID: "pagnet-worker-turn-1", NativeTurnSequence: 1, InputKind: "task", SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String()}}
+			call := func(_ context.Context, r sessionworker.Request) (sessionworker.Response, error) {
+				if r.Type == "observations" {
+					return sessionworker.Response{Observations: []sessionworker.NativeObservation{o}}, nil
+				}
+				if r.Type == "observation_ack" {
+					acks++
+					return sessionworker.Response{}, nil
+				}
+				t.Fatal("unsupported resource worker call", r.Type)
+				return sessionworker.Response{}, nil
+			}
+			err := c.DrainNativeWorkerSources(t.Context(), call)
+			if enabled {
+				if err != nil || sends != 1 || acks != 1 {
+					t.Fatal("authenticated resource capability did not deliver", err, sends, acks)
+				}
+			} else if !errors.Is(err, ErrNativeOriginAdmissionDeferred) || sends != 0 || acks != 0 {
+				t.Fatal("resource source wrote without authenticated capability", err, sends, acks)
+			}
+		})
+	}
+}

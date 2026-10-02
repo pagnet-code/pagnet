@@ -65,6 +65,9 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 		chunkBytes = "65536"
 	}
 	extraEnv := []string{"PAGNET_FAKE_OUTPUT_CHUNK_BYTES=" + chunkBytes, "PAGNET_FAKE_FULL_OUTPUT=1"}
+	if !resourceLimit {
+		extraEnv = append(extraEnv, "PAGNET_FAKE_FINAL_OUTPUT=1")
+	}
 	if outputOverflow {
 		extraEnv = append(extraEnv, "PAGNET_FAKE_OUTPUT_REPEAT=256")
 	}
@@ -207,7 +210,7 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 	}
 	rows.Close()
 	key, _ := epoch.KeyArray()
-	var text bytes.Buffer
+	var text, finalText bytes.Buffer
 	chunks, completed, stopped := 0, 0, 0
 	var interruption *transport.NativeResourceInterruption
 	for _, o := range observations {
@@ -222,6 +225,25 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 			completed++
 		}
 		if o.OutputContent == nil {
+			continue
+		}
+		if o.Event.Type == session.EventTurnCompleted {
+			if o.OutputStream != nil {
+				t.Fatal("final native body masqueraded as stream batch")
+			}
+			var finalFragments []transport.NativeContentFragment
+			for ordinal := 0; ordinal < o.OutputContent.FragmentCount; ordinal++ {
+				f, readErr := j.ReadContentFragment(ctx, leaseB, o.ID, o.SourceDigest, o.OutputContent.ContentID, ordinal)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				finalFragments = append(finalFragments, *f)
+			}
+			plain, _, openErr := nativecontent.Open(*o.OutputContent, finalFragments, key)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			finalText.Write(plain)
 			continue
 		}
 		chunks++
@@ -253,8 +275,8 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 		if sourceCount(t, j, "worker_resource_interruptions") != 1 || sourceCount(t, j, "worker_output_spools") != 1 {
 			t.Fatal("resource stop discarded retained original evidence")
 		}
-	} else if completed != 1 || interruption != nil {
-		t.Fatal("genuine completion changed", completed, interruption)
+	} else if completed != 1 || interruption != nil || finalText.String() != expected {
+		t.Fatal("genuine completion/final output changed", completed, interruption, finalText.Len(), len(expected))
 	}
 	if text.String() != expected || (!outputOverflow && chunks > 3) || (outputOverflow && chunks != 320) || stopped != 1 {
 		t.Fatal("genuine bounded source completion lost", text.Len(), len(expected), chunks, completed, stopped)

@@ -622,7 +622,7 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 		prev.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		_ = saveSession(sessionPath, prev)
 		emit(persistEvent{
-			Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1",
+			Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1", Output: persistentFinalOutput(out),
 		})
 		emit(persistEvent{Event: "runtime.idle", TurnID: cmd.TurnID, SessionID: prev.SessionID})
 		return
@@ -698,7 +698,7 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 	_ = saveSession(sessionPath, prev)
 
 	emit(persistEvent{
-		Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1",
+		Event: "runtime.turn.completed", TurnID: cmd.TurnID, SessionID: prev.SessionID, Model: "fake-persist-1", Output: persistentFinalOutput(out),
 	})
 	emit(persistEvent{Event: "runtime.idle", TurnID: cmd.TurnID, SessionID: prev.SessionID})
 }
@@ -730,4 +730,13 @@ func emitPersistentOutput(emit func(persistEvent), turn, sid, output string) {
 		emit(persistEvent{Event: "runtime.turn.output", TurnID: turn, SessionID: sid, Output: output[:end]})
 		output = output[end:]
 	}
+}
+
+// Explicit synthetic-fixture mode reports the authoritative final native body
+// separately from streamed text, as providers with terminal result bodies do.
+func persistentFinalOutput(output string) string {
+	if os.Getenv("PAGNET_FAKE_FINAL_OUTPUT") == "1" {
+		return output
+	}
+	return ""
 }
