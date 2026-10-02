@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--server-helper", required=True, type=Path)
     parser.add_argument("--delete", action="store_true", help="also prove actual owned deletion after controller replacement")
     parser.add_argument("--revoked-delete", action="store_true", help="prove real offered task, original grant revocation and owned deletion")
+    parser.add_argument("--resource-delete", action="store_true", help="prove genuine output-limit EOF, interrupted task and owned deletion")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     binary = args.server_helper.resolve()
@@ -62,8 +63,8 @@ def main():
         )
         result = subprocess.run(
             ["go", "test", "-race", "./internal/daemon", "-run",
-             "^TestActualPagnetServeRevokedGrantOwnedDeletion$" if args.revoked_delete else "^TestActualPagnetServeOwnedDeletion$" if args.delete else "^TestActualPagnetServeControllerReplacementPrivateTerminal$",
-             "-count=1", "-timeout=120s", "-v"],
+             "^TestActualPagnetServeOwnedResourceInterruption$" if args.resource_delete else "^TestActualPagnetServeRevokedGrantOwnedDeletion$" if args.revoked_delete else "^TestActualPagnetServeOwnedDeletion$" if args.delete else "^TestActualPagnetServeControllerReplacementPrivateTerminal$",
+             "-count=1", "-timeout=180s", "-v"],
             cwd=root, env=testenv,
         )
         return result.returncode

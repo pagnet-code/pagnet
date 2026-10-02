@@ -55,8 +55,13 @@ func TestActualPagnetServeRevokedGrantOwnedDeletion(t *testing.T) {
 	runActualPagnetServeContinuity(t, true, true)
 }
 
+func TestActualPagnetServeOwnedResourceInterruption(t *testing.T) {
+	runActualPagnetServeContinuity(t, true, false, true)
+}
+
 func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMode ...bool) {
 	revokedDelete := len(revokedMode) > 0 && revokedMode[0]
+	resourceDelete := len(revokedMode) > 1 && revokedMode[1]
 	if os.Getenv("PAGNET_NATIVE_SERVE_PROOF") != "1" {
 		t.Skip("requires explicit isolated PostgreSQL production serve proof")
 	}
@@ -148,6 +153,9 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		runtimeEnv := "PAGNET_FAKE_TUI_TICK_MS=50,PAGNET_FAKE_TUI_BOOT_BYTES=65536"
 		if revokedDelete {
 			runtimeEnv += ",PAGNET_FAKE_INTERACTION=approval"
+		}
+		if resourceDelete {
+			runtimeEnv += ",PAGNET_FAKE_FULL_OUTPUT=1,PAGNET_FAKE_OUTPUT_CHUNK_BYTES=65536,PAGNET_FAKE_OUTPUT_REPEAT=256"
 		}
 		command.Env = append(os.Environ(), "PATH="+bin+":/usr/local/bin:/usr/bin:/bin", "HOME="+root, "PAGNET_RUNTIME_ENV="+runtimeEnv)
 		// Credentials, encrypted keys and PTY bytes never enter test logs.
@@ -394,7 +402,7 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 	if metaA.SessionID == metaB.SessionID || metaA.SessionKeyID == metaB.SessionKeyID {
 		t.Fatal("replacement view reused private input authority")
 	}
-	if !revokedDelete {
+	if !revokedDelete && !resourceDelete {
 		var outputKey [32]byte
 		copy(outputKey[:], keyB)
 		defer clear(outputKey[:])
@@ -490,7 +498,7 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 	if birth, err := proc.StartIdentity(originalNativePID); err != nil || birth != secretB.NativeStartIdentity {
 		t.Fatal("controller replacement changed original native PID/birth")
 	}
-	if revokedDelete {
+	if revokedDelete || resourceDelete {
 		t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal bootstraps; no user input synthesized")
 	} else {
 		t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal source; fresh private view keys and locally encrypted input/output")
@@ -500,11 +508,16 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 	}
 	var revokedTaskID string
 	var priorContentProjections int
-	if revokedDelete {
+	if revokedDelete || resourceDelete {
 		t.Log("phase: production encrypted offered task and actual scheduler admission")
 		revokedTaskID = domain.NewID().String()
 		taskAAD := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: fixture.TenantID, NetworkID: fixture.NetworkID, ObjectType: e2ee.ObjectTypeTask, ObjectID: revokedTaskID, Sender: "human", Recipient: "", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), KeyEpochID: fixture.EpochID}
-		taskEnvelope, err := e2ee.Encrypt([]byte("synthetic approval-blocked original task"), epochKey, taskAAD)
+		prompt := []byte("synthetic approval-blocked original task")
+		if resourceDelete {
+			prompt = []byte(strings.Repeat("synthetic original resource bound ", 1500))
+		}
+		taskEnvelope, err := e2ee.Encrypt(prompt, epochKey, taskAAD)
+		clear(prompt)
 		if err != nil {
 			t.Fatal("synthetic task encryption failed", err)
 		}
@@ -540,15 +553,65 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		if !started {
 			t.Fatal("actual scheduler did not bind the original accepted native task source")
 		}
-		var revoked struct {
-			OK         bool `json:"ok"`
-			StatusCode int  `json:"statusCode"`
+		if resourceDelete {
+			t.Log("phase: genuine original resource stream awaiting committed supervised EOF")
+			deadline := time.Now().Add(60 * time.Second)
+			settled := false
+			for time.Now().Before(deadline) {
+				var resource struct {
+					OK               bool   `json:"ok"`
+					TaskState        string `json:"taskState"`
+					TaskInterruption struct {
+						OriginID string `json:"originId"`
+						Cause    string `json:"cause"`
+						TurnID   string `json:"turnId"`
+					} `json:"taskInterruption"`
+					Items []struct {
+						OriginID               string                      `json:"originId"`
+						TurnID                 string                      `json:"turnId"`
+						Cause                  string                      `json:"cause"`
+						Generation             string                      `json:"nativeGeneration"`
+						Session                string                      `json:"nativeSessionId"`
+						TurnState              string                      `json:"turnState"`
+						StoppedCommitted       bool                        `json:"stoppedCommitted"`
+						VendorTerminalReceipts int                         `json:"vendorTerminalReceipts"`
+						Source                 transport.NativeAgentSource `json:"source"`
+					} `json:"items"`
+				}
+				helper.call(t, map[string]any{"action": "resource_status", "taskId": revokedTaskID}, &resource)
+				if resource.TaskState == "completed" || len(resource.Items) > 1 {
+					t.Fatal("original resource overflow falsely completed or duplicated source")
+				}
+				if resource.OK && len(resource.Items) == 1 {
+					item := resource.Items[0]
+					if item.Cause != "output_limit" || item.OriginID != secretB.SourceOriginID || item.Generation != secretB.NativeGeneration || item.Session != secretB.NativeSessionID || item.VendorTerminalReceipts != 0 || item.Source.OriginID != item.OriginID || item.Source.NativeGeneration != item.Generation || item.Source.SessionID != item.Session || item.Source.SourceCommandID == "" || item.Source.SourceAdmissionID == "" || item.Source.NativeTurnSequence <= 0 || item.Source.InputKind != "task" {
+						t.Fatal("resource interruption did not retain exact original native task source")
+					}
+					if item.StoppedCommitted && item.TurnState == "failed" && resource.TaskState == "blocked" && resource.TaskInterruption.Cause == item.Cause && resource.TaskInterruption.OriginID == item.OriginID && resource.TaskInterruption.TurnID == item.TurnID {
+						birth, err := proc.StartIdentity(originalNativePID)
+						if os.IsNotExist(err) || err == nil && birth != secretB.NativeStartIdentity || proc.ProcessIsZombie(originalNativePID) {
+							settled = true
+							break
+						}
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if !settled {
+				t.Fatal("original resource overflow did not commit genuine EOF and blocked task projection")
+			}
+			t.Log("original output-limit marker and supervised EOF committed; task blocked without native vendor completion/failure")
+		} else {
+			var revoked struct {
+				OK         bool `json:"ok"`
+				StatusCode int  `json:"statusCode"`
+			}
+			helper.call(t, map[string]any{"action": "revoke_agent_grant"}, &revoked)
+			if !revoked.OK || (revoked.StatusCode != 200 && revoked.StatusCode != 204) {
+				t.Fatal("actual original agent grant revocation was not committed")
+			}
+			t.Log("phase: genuine original task started; grant revoked before actual DELETE")
 		}
-		helper.call(t, map[string]any{"action": "revoke_agent_grant"}, &revoked)
-		if !revoked.OK || (revoked.StatusCode != 200 && revoked.StatusCode != 204) {
-			t.Fatal("actual original agent grant revocation was not committed")
-		}
-		t.Log("phase: genuine original task started; grant revoked before actual DELETE")
 	}
 	var deleted struct {
 		OK         bool `json:"ok"`
