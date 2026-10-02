@@ -134,7 +134,16 @@ func testEpochAttestationAuthenticatesStoredHistory(t *testing.T, retained bool)
 	// Same public identity and epoch label, but a different local key: a
 	// server-selected real historical sample rejects trusting this wrong ring.
 	kr.Epochs[0].Key = bytes.Repeat([]byte{9}, 32)
-	if err := crypto.SaveKeyring(d.StateDir, kr); err != nil {
+	if err := crypto.SaveKeyring(d.StateDir, kr); err == nil {
+		t.Fatal("normal writer replaced existing epoch key")
+	}
+	// Model externally corrupted isolated fixture storage, bypassing the now
+	// fenced production writer; attestation must still reject the wrong key.
+	corrupt, err := json.Marshal(kr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, corrupt, 0600); err != nil {
 		t.Fatal(err)
 	}
 	p.Sample = &originalSample

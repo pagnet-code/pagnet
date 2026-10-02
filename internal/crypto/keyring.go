@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -248,6 +249,9 @@ func SaveKeyring(stateDir string, kr *Keyring) error {
 		return err
 	}
 	defer release()
+	if err = validateNetworkAuthorityReplacement(stateDir, kr); err != nil {
+		return err
+	}
 	b, err := json.Marshal(kr)
 	if err != nil {
 		return fmt.Errorf("crypto: marshal keyring: %w", err)
@@ -310,4 +314,42 @@ func WithNetworkKeyring(ctx context.Context, stateDir, networkID string, fn func
 		return err
 	}
 	return fn(ring)
+}
+
+// Run under the exclusive authority lock. A stale writer must reload instead
+// of reviving an already rotated/revoked epoch or replacing its key material.
+func validateNetworkAuthorityReplacement(stateDir string, incoming *Keyring) error {
+	seen := map[string]bool{}
+	for _, epoch := range incoming.Epochs {
+		if epoch.ID == "" || seen[epoch.ID] || len(epoch.Key) != epochKeySize || (epoch.State != EpochActive && epoch.State != EpochRotated && epoch.State != EpochRevoked) {
+			return errors.New("network authority replacement has invalid epoch history")
+		}
+		seen[epoch.ID] = true
+	}
+	previous, err := LoadKeyring(stateDir, incoming.NetworkID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	rank := func(state EpochState) int {
+		switch state {
+		case EpochActive:
+			return 1
+		case EpochRotated:
+			return 2
+		case EpochRevoked:
+			return 3
+		default:
+			return 0
+		}
+	}
+	for _, persisted := range previous.Epochs {
+		candidate, found := incoming.EpochByID(persisted.ID)
+		if !found || !bytes.Equal(candidate.Key, persisted.Key) || rank(candidate.State) < rank(persisted.State) || rank(candidate.State) == 0 {
+			return errors.New("network authority replacement conflicts with persisted epoch history")
+		}
+	}
+	return nil
 }

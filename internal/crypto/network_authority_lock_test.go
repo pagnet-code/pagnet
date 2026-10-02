@@ -59,3 +59,68 @@ func TestNetworkAuthorityPinsActionAgainstConcurrentRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNetworkStaleSaveCannotReviveOrForgetPersistedEpochAuthority(t *testing.T) {
+	state := t.TempDir()
+	ring := NewKeyring("01900000-0000-7000-8000-0000000000aa")
+	original, err := ring.Activate(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = SaveKeyring(state, ring); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := LoadKeyring(state, ring.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ring.Rotate(time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err = SaveKeyring(state, ring); err != nil {
+		t.Fatal("explicit rotation rejected", err)
+	}
+	if err = SaveKeyring(state, stale); err == nil {
+		t.Fatal("stale active epoch revived after rotation")
+	}
+	if err = ring.Revoke(original.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = SaveKeyring(state, ring); err != nil {
+		t.Fatal(err)
+	}
+	stale.Epochs[0].State = EpochRotated
+	if err = SaveKeyring(state, stale); err == nil {
+		t.Fatal("stale rotated epoch revived after revocation")
+	}
+	changed, err := LoadKeyring(state, ring.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Epochs[0].Key = append([]byte(nil), changed.Epochs[0].Key...)
+	changed.Epochs[0].Key[0] ^= 1
+	if err = SaveKeyring(state, changed); err == nil {
+		t.Fatal("same epoch key material replaced")
+	}
+	changed, err = LoadKeyring(state, ring.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Epochs = changed.Epochs[1:]
+	if err = SaveKeyring(state, changed); err == nil {
+		t.Fatal("persisted authority history forgotten")
+	}
+	latest, err := LoadKeyring(state, ring.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch, ok := latest.EpochByID(original.ID); !ok || epoch.State != EpochRevoked {
+		t.Fatal("failed stale writes changed durable revocation")
+	}
+	if _, err = latest.Rotate(time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err = SaveKeyring(state, latest); err != nil {
+		t.Fatal("fresh explicit rotation rejected", err)
+	}
+}
