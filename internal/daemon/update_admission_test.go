@@ -22,7 +22,7 @@ func TestUpdateFinalizationExcludesRealLaunch(t *testing.T) {
 	d := newTestDaemon(t)
 	originalSupervisor := d.sup
 	t.Cleanup(func() { originalSupervisor.StopAll(time.Second) })
-	d.sup = proc.NewSupervisor(proc.Config{StateDir: t.TempDir()}, d.Log)
+	d.sup = proc.NewSupervisor(proc.Config{StateDir: privateDaemonStateDir(t)}, d.Log)
 	marker := filepath.Join(t.TempDir(), "started")
 	finalizing, finish, finalized := make(chan struct{}), make(chan struct{}), make(chan bool, 1)
 	var finishOnce sync.Once

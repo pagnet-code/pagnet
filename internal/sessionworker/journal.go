@@ -27,10 +27,11 @@ const maxCommands = 128
 const maxOutcomeBytes = 64 << 10
 
 var (
-	ErrFenced   = errors.New("controller lease is no longer current")
-	ErrConflict = errors.New("intent sequence or digest conflicts with durable history")
-	ErrRetired  = errors.New("intent is older than retained durable history")
-	ErrFull     = errors.New("unacknowledged worker outcomes reached the bounded limit")
+	ErrFenced     = errors.New("controller lease is no longer current")
+	ErrConflict   = errors.New("intent sequence or digest conflicts with durable history")
+	ErrRetired    = errors.New("intent is older than retained durable history")
+	ErrNativeBusy = errors.New("original native turn is still in flight")
+	ErrFull       = errors.New("unacknowledged worker outcomes reached the bounded limit")
 )
 
 // Scope is immutable for the lifetime of a worker. Generation identifies this
@@ -307,6 +308,15 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	}
 	if sequence != next || sequence == 9223372036854775807 {
 		return out, false, ErrConflict
+	}
+	if dispatch != nil && (kind == "prompt" || kind == "activate") {
+		var active int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_intent WHERE state='admitted' AND kind IN ('prompt','activate')`).Scan(&active); err != nil {
+			return out, false, err
+		}
+		if active > 0 {
+			return out, false, ErrNativeBusy
+		}
 	}
 	if authorizeNew != nil {
 		if out.SourceAdmission, err = authorizeNew(); err != nil {

@@ -45,7 +45,7 @@ func (d *Daemon) nativeWorkerFor(conn *websocket.Conn, instanceID string) (*Nati
 	return link.proxy, nil
 }
 func (d *Daemon) nativeAcceptActivate(conn *websocket.Conn, instanceID string, proof *transport.NativeDispatchProof) error {
-	return d.nativeAcceptOperation(conn, instanceID, proof, "activate", sessionworker.Operation{InputKind: "wake"})
+	return d.nativeAcceptOperation(conn, instanceID, proof, "attach", sessionworker.Operation{InputKind: "user_input"})
 }
 func (d *Daemon) nativeAcceptOperation(conn *websocket.Conn, instanceID string, proof *transport.NativeDispatchProof, kind string, operation sessionworker.Operation) error {
 	if proof == nil {
@@ -153,7 +153,7 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 		return err
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		if p.Launch == nil || p.Launch.InstanceID != p.InstanceID || p.Launch.NativeDispatch != nil {
+		if p.Launch == nil || p.Launch.InstanceID != p.InstanceID || p.Launch.CommandID != p.SourceCommandID || p.Launch.NativeDispatch != nil {
 			return ErrNativeOriginAdmissionDeferred
 		}
 		row, _, _, err := d.prepareLaunch(*p.Launch)
@@ -299,6 +299,34 @@ func (d *Daemon) pumpNativeBridge(ctx context.Context, link *nativeWorkerLink) {
 				result.OK = result.Error == ""
 			}
 			_, _ = link.proxy.call(ctx, sessionworker.Request{Type: "bridge_result", Relay: &result})
+		}
+	}
+}
+
+func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeObservationConnection) {
+	if d.nativeRegistry == nil {
+		return
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		records, err := d.nativeRegistry.List()
+		if err != nil {
+			return
+		}
+		for _, record := range records {
+			if _, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err == nil {
+				continue
+			}
+			original := record
+			d.enqueueInstance(original.Scope.InstanceID, func() { _ = d.connectNativeWorker(conn, connection, original) })
+		}
+		select {
+		case <-d.turnCtx.Done():
+			return
+		case <-connection.closed:
+			return
+		case <-ticker.C:
 		}
 	}
 }

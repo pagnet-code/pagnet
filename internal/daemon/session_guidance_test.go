@@ -51,7 +51,7 @@ func TestSessionGuidanceIsPrivateScopedAndRemovedWithoutWorkLoss(t *testing.T) {
 }
 
 func TestSessionGuidanceRejectsDirectoryEscapeAndReplacesFileSymlink(t *testing.T) {
-	d := &Daemon{StateDir: t.TempDir(), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	d := &Daemon{StateDir: privateDaemonStateDir(t), Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	row := &InstanceRow{InstanceID: domain.NewID().String()}
 	path, err := d.writeSessionGuidance(row)
 	if err != nil {

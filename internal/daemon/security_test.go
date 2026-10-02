@@ -16,7 +16,7 @@ import (
 // buggy or compromised control plane — must be refused, not resolved
 // into a path.
 func TestDoLaunch_RejectsNonUUIDInstanceID(t *testing.T) {
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{t.TempDir()}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{t.TempDir()}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

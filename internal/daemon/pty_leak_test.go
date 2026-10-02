@@ -159,7 +159,7 @@ func killMarkerGroups(marker string) {
 func newP0Daemon(t *testing.T, bin string, env []string) *Daemon {
 	t.Helper()
 	cfg := Config{
-		StateDir:   t.TempDir(),
+		StateDir:   privateDaemonStateDir(t),
 		Debug:      true,
 		NoScan:     true,
 		RuntimeEnv: env,

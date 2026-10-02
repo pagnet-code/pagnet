@@ -31,7 +31,7 @@ func gitInitRepo(t *testing.T, dir string) {
 func newTestDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	// Debug: daemon unit tests may drive the deterministic fake runtime.
-	d, err := New(Config{StateDir: t.TempDir(), Debug: true}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), Debug: true}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

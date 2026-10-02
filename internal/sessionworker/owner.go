@@ -270,6 +270,82 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			if out.Kind == "activate" {
 				result = o.Snapshot()
 			}
+		case "restart":
+			err = o.manager.Stop(o.journal.scope.InstanceID)
+			if err != nil {
+				break
+			}
+			for !o.prompt.TryLock() {
+				select {
+				case <-o.ctx.Done():
+					err = o.ctx.Err()
+				case <-time.After(20 * time.Millisecond):
+				}
+				if err != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+			o.mu.Lock()
+			o.candidateAdmission = out.SourceAdmission
+			o.candidateCommandID = op.SourceCommandID
+			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind}
+			o.mu.Unlock()
+			events := make(chan session.SessionEvent, 64)
+			drained := make(chan struct{})
+			go func() {
+				defer close(drained)
+				for event := range events {
+					if !o.nativeSink {
+						o.observe(event)
+					}
+				}
+			}()
+			_, err = o.manager.EnsureActive(o.ctx, o.sess, events)
+			close(events)
+			<-drained
+			o.prompt.Unlock()
+			if err == nil {
+				result = o.Snapshot()
+			}
+		case "attach":
+			for !o.driver.Live(o.journal.scope.InstanceID) {
+				if o.prompt.TryLock() {
+					o.mu.Lock()
+					o.candidateAdmission = out.SourceAdmission
+					o.candidateCommandID = op.SourceCommandID
+					o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind}
+					o.mu.Unlock()
+					events := make(chan session.SessionEvent, 64)
+					drained := make(chan struct{})
+					go func() {
+						defer close(drained)
+						for event := range events {
+							if !o.nativeSink {
+								o.observe(event)
+							}
+						}
+					}()
+					_, err = o.manager.EnsureActive(o.ctx, o.sess, events)
+					close(events)
+					<-drained
+					o.prompt.Unlock()
+					break
+				}
+				select {
+				case <-o.ctx.Done():
+					err = o.ctx.Err()
+				case <-time.After(20 * time.Millisecond):
+				}
+				if err != nil {
+					break
+				}
+			}
+			if err == nil {
+				result = o.Snapshot()
+			}
 		case "input":
 			err = o.writeInput(op)
 		case "resize":

@@ -181,6 +181,9 @@ func TestDispatchAdmissionRollbackAndConcurrentReplay(t *testing.T) {
 	if runs.Load() != 1 {
 		t.Fatal("effect admitted more than once", runs.Load())
 	}
+	if err := j.Settle(t.Context(), 1, "completed", nil); err != nil {
+		t.Fatal(err)
+	}
 	if _, run, err := j.admitDispatch(t.Context(), l, 0, gap.SourceCommandID, "activate", json.RawMessage(`{}`), authorize, &gap); err != nil || !run {
 		t.Fatal("deferred original ordinal lost", run, err)
 	}
@@ -259,5 +262,43 @@ func TestDispatchRecordsRetainSettledMappingUntilBackendRetirement(t *testing.T)
 	}
 	if records, err = j.DispatchRecords(t.Context(), b); err != nil || len(records) != 0 {
 		t.Fatal("retired mapping remains", err)
+	}
+}
+
+func TestOriginalNativeDispatchDefersNextTurnButReacknowledgesAcceptedWork(t *testing.T) {
+	j, err := OpenJournal(filepath.Join(t.TempDir(), "worker"), testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	l := lease(t, j)
+	o := dispatchOwnership(t, j, l)
+	a := dispatchProof(o, 1)
+	b := dispatchProof(o, 2)
+	authorize := func() (*Admission, error) {
+		return &Admission{Scope: j.scope, NativeAdmissionID: a.SourceAdmissionID, RunnerID: a.SourceRunnerID, RunnerEpoch: a.SourceRunnerEpoch, BootID: a.SourceBootID}, nil
+	}
+	payload := json.RawMessage(`{"input":"original private turn"}`)
+	first, run, err := j.admitDispatch(t.Context(), l, 0, a.SourceCommandID, "prompt", payload, authorize, &a)
+	if err != nil || !run {
+		t.Fatal(run, err)
+	}
+	duplicate, run, err := j.admitDispatch(t.Context(), l, 0, a.SourceCommandID, "prompt", payload, authorize, &a)
+	if err != nil || run || duplicate.Sequence != first.Sequence {
+		t.Fatal("accepted work not reacknowledged", run, err)
+	}
+	if _, run, err = j.admitDispatch(t.Context(), l, 0, b.SourceCommandID, "prompt", payload, authorize, &b); !errors.Is(err, ErrNativeBusy) || run {
+		t.Fatal("overlapping native turn admitted", run, err)
+	}
+	records, err := j.DispatchRecords(t.Context(), l)
+	if err != nil || len(records) != 1 {
+		t.Fatal("deferred work allocated ordinal", records, err)
+	}
+	if err = j.Settle(t.Context(), first.Sequence, "completed", nil); err != nil {
+		t.Fatal(err)
+	}
+	next, run, err := j.admitDispatch(t.Context(), l, 0, b.SourceCommandID, "prompt", payload, authorize, &b)
+	if err != nil || !run || next.Sequence != first.Sequence+1 {
+		t.Fatal("deferred next work lost", next.Sequence, run, err)
 	}
 }

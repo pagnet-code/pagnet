@@ -53,7 +53,7 @@ func (a *turnCapturingAdapter) SandboxSpec(agentruntime.TurnSpec) *sandbox.Spec 
 // the daemon, the network id, and the active epoch id.
 func newLaunchCryptoDaemon(t *testing.T, repo string) (*Daemon, string, string) {
 	t.Helper()
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{repo}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{repo}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

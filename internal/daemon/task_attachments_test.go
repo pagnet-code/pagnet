@@ -11,7 +11,7 @@ import (
 )
 
 func TestPrivateTaskAttachmentMaterialization(t *testing.T) {
-	d := &Daemon{Config: Config{StateDir: t.TempDir()}}
+	d := &Daemon{Config: Config{StateDir: privateDaemonStateDir(t)}}
 	row := &InstanceRow{InstanceID: domain.NewID().String()}
 	raw, err := domain.EncodeTaskContent(domain.TaskContent{Objective: "inspect attachment", Attachments: []domain.TaskAttachment{{Name: "report.txt", MIME: "text/plain", Data: base64.StdEncoding.EncodeToString([]byte("private data"))}}})
 	if err != nil {

@@ -390,13 +390,21 @@ func (s *State) DeleteInstance(instanceID string) error {
 // the native session ID and on-disk session state so explicit wake resumes it;
 // an instance with no session can activate for the first time. Terminal and
 // intervention states remain unchanged.
-func (s *State) ReconcileRestart() (int64, error) {
-	res, err := s.db.Exec(`
+func (s *State) ReconcileRestart() (int64, error) { return s.ReconcileRestartExcept(nil) }
+func (s *State) ReconcileRestartExcept(owned []string) (int64, error) {
+	query := `
 		UPDATE instances
 		SET status = 'hibernated',
 		    updated_at = ?
-		WHERE status IN ('idle', 'working', 'waking')`,
-		time.Now().UTC().Format(time.RFC3339))
+		WHERE status IN ('idle', 'working', 'waking')`
+	args := []any{time.Now().UTC().Format(time.RFC3339)}
+	if len(owned) > 0 {
+		query += " AND instance_id NOT IN (" + strings.TrimSuffix(strings.Repeat("?,", len(owned)), ",") + ")"
+		for _, id := range owned {
+			args = append(args, id)
+		}
+	}
+	res, err := s.db.Exec(query, args...)
 	if err != nil {
 		return 0, err
 	}

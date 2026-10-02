@@ -69,7 +69,7 @@ func TestDecryptMessageToolResult(t *testing.T) {
 			}
 		})
 	}
-	missing, err := New(Config{StateDir: t.TempDir()}, nil)
+	missing, err := New(Config{StateDir: privateDaemonStateDir(t)}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,7 +22,7 @@ func TestListDirs_OnlyDirsSorted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{root}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestListDirs_NestedPath(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(nested, "child"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{root}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestListDirs_NestedPath(t *testing.T) {
 func TestListDirs_OutsideRootRefused(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir() // a different temp dir, NOT under root
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root},
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{root},
 		RootsMode: domain.RootsModeAllowList}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -95,7 +95,7 @@ func TestListDirs_NotADirectory(t *testing.T) {
 	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{root}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestLaunch_CWDSubdir(t *testing.T) {
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{repo}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{repo}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestLaunch_CWDSubdir(t *testing.T) {
 
 func TestLaunch_CWDEqualsWorkspaceRoot(t *testing.T) {
 	repo := t.TempDir()
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{repo}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{repo}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestLaunch_CWDSiblingOfWorkspaceRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{root}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{root}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

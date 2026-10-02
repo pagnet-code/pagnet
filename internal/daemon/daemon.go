@@ -28,6 +28,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -688,6 +689,16 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		d.Close()
 		return nil, fmt.Errorf("load host runtime profiles: %w", err)
 	}
+	// Independently owned sessions survive controller shutdown. Discover their
+	// durable namespace before legacy reconciliation can overwrite live state.
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		registry, err := OpenNativeWorkerRegistry(cfg.StateDir)
+		if err != nil {
+			d.Close()
+			return nil, fmt.Errorf("open native worker registry: %w", err)
+		}
+		d.nativeRegistry = registry
+	}
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
@@ -701,7 +712,18 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 	// idle/working/waking rows to hibernated, retaining their native session.
 	// The next heartbeat publishes the corrected state; explicit wake and
 	// redelivery can resume the endpoint through the existing CAS gate.
-	if n, err := st.ReconcileRestart(); err == nil && n > 0 {
+	var ownedInstances []string
+	if d.nativeRegistry != nil {
+		records, err := d.nativeRegistry.List()
+		if err != nil {
+			d.Close()
+			return nil, err
+		}
+		for _, record := range records {
+			ownedInstances = append(ownedInstances, record.Scope.InstanceID)
+		}
+	}
+	if n, err := st.ReconcileRestartExcept(ownedInstances); err == nil && n > 0 {
 		log.Warn("reconciled stale live instances from a previous run", "n", n)
 	}
 	// P6 auto-update: clear a leftover staging dir from a previous
@@ -812,6 +834,14 @@ func (d *Daemon) Close() error {
 		// with a bounded grace, reap, and flush state. The supervisor owns
 		// the group termination and the bounded wait — never wait forever
 		// for one runtime.
+		d.nativeWorkersMu.Lock()
+		for _, link := range d.nativeWorkers {
+			_ = link.proxy.Close()
+		}
+		d.nativeWorkersMu.Unlock()
+		if d.nativeRegistry != nil {
+			_ = d.nativeRegistry.Close()
+		}
 		d.turnCancel()       // ctx watchers terminate active turn groups
 		d.terminal.stopAll() // stop PTY sessions (delegates to the supervisor)
 		if n := d.sup.StopAll(10 * time.Second); n > 0 {
@@ -937,6 +967,9 @@ func (d *Daemon) wsURL() string {
 	q := u.Query()
 	q.Set("boot_id", d.bootID)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	if d.nativeRegistry != nil {
+		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -1116,6 +1149,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		if handled, err := nativeConn.HandleEnvelope(env); handled {
 			if err != nil {
 				return fmt.Errorf("native host protocol: %w", err)
+			}
+			if env.Type == transport.MsgHostSession {
+				go d.recoverNativeWorkers(conn, nativeConn)
 			}
 			continue
 		}
@@ -1389,6 +1425,17 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case transport.MsgNativeOwnershipPrepare:
+		var p transport.NativeOwnershipPreparePayload
+		if env.DecodePayload(&p) != nil {
+			return
+		}
+		d.enqueueInstance(p.InstanceID, func() {
+			if err := d.prepareNativeOwnership(conn, p); err != nil && !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+				d.Log.Warn("native ownership preparation deferred", "instance", p.InstanceID, "err", err)
+			}
+		})
+
 	case transport.MsgPrepareProtectedContext:
 		var p transport.PrepareProtectedContextPayload
 		if env.DecodePayload(&p) != nil || p.CommandID == "" {
@@ -1425,7 +1472,23 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doLaunch(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeDispatch != nil {
+					mission, _, err := d.resolveLaunchContent(p)
+					if err != nil {
+						return err
+					}
+					kind := "activate"
+					if mission != "" {
+						kind = "prompt"
+					}
+					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, kind, sessionworker.Operation{Input: mission, InputKind: "wake"})
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doLaunch(conn, p)
+			})
 		})
 
 	case transport.MsgStopAgent:
@@ -1438,7 +1501,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doStop(conn, p.InstanceID) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeDispatch != nil {
+					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "stop", sessionworker.Operation{})
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doStop(conn, p.InstanceID)
+			})
 		})
 
 	case transport.MsgRestartAgent:
@@ -1451,7 +1522,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doRestart(conn, p.InstanceID) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeDispatch != nil {
+					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "restart", sessionworker.Operation{InputKind: "wake"})
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doRestart(conn, p.InstanceID)
+			})
 		})
 
 	case transport.MsgWakeAgent:
@@ -1462,7 +1541,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.WakeRequestID, func() {
-			d.guarded(conn, p.WakeRequestID, func() error { return d.doWake(conn, p.InstanceID, p.Reason) })
+			d.guarded(conn, p.WakeRequestID, func() error {
+				if p.NativeDispatch != nil {
+					return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "activate", sessionworker.Operation{InputKind: "wake"})
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doWake(conn, p.InstanceID, p.Reason)
+			})
 		})
 
 	case transport.MsgDeliverNetworkEvent:
@@ -1475,7 +1562,15 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doDeliver(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if p.NativeDispatch != nil {
+					return d.doNativeDeliver(conn, p)
+				}
+				if d.nativeOwned(p.InstanceID) {
+					return ErrDeferred
+				}
+				return d.doDeliver(conn, p)
+			})
 		})
 
 	case transport.MsgAttachTerminal:

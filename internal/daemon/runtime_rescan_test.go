@@ -15,7 +15,7 @@ import (
 func TestRuntimeRescanDiscoversInstallAfterStartupWithoutReplacingDrivers(t *testing.T) {
 	binDir := t.TempDir()
 	t.Setenv("PATH", binDir)
-	d, err := newDaemon(Config{StateDir: t.TempDir(), NoScan: true}, nil, func() (string, error) {
+	d, err := newDaemon(Config{StateDir: privateDaemonStateDir(t), NoScan: true}, nil, func() (string, error) {
 		// Version probes fail immediately; this regression concerns discovery,
 		// not launching a real vendor CLI or a sandbox from the test binary.
 		return filepath.Join(binDir, "missing-pagnet"), nil

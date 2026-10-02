@@ -78,3 +78,14 @@ func p0FakeBinary(t *testing.T) string {
 	}
 	return bin
 }
+
+// A daemon state directory is private even when the test runner's temporary
+// parent is group-writable. Production never relaxes its namespace policy.
+func privateDaemonStateDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}

@@ -26,7 +26,7 @@ import (
 // adapter (the canonical runtime name is NOT the binary name — qwen-code →
 // `qwen`), or the inventory never reports runtimes the daemon can drive.
 func TestDetectRuntimes_UsesAdapterBinaryResolution(t *testing.T) {
-	d, err := New(Config{StateDir: t.TempDir()}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -155,7 +155,7 @@ func (stubAdapter) SandboxSpec(agentruntime.TurnSpec) *sandbox.Spec { return nil
 func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 	repo := t.TempDir()
 	gitInitRepo(t, repo)
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{repo}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{repo}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestConcurrentRWLaunches_ExactlyOneKeepsCheckout(t *testing.T) {
 func TestDoForget_RemovesWorktreeKeepsBranch(t *testing.T) {
 	repo := t.TempDir()
 	gitInitRepo(t, repo)
-	d, err := New(Config{StateDir: t.TempDir(), AllowedRoots: []string{repo}}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t), AllowedRoots: []string{repo}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

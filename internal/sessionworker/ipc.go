@@ -308,7 +308,7 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 			}
 			if err != nil {
 				response.Error = err.Error()
-				response.Retryable = errors.Is(err, ErrDispatchGap) || errors.Is(err, ErrFull)
+				response.Retryable = errors.Is(err, ErrDispatchGap) || errors.Is(err, ErrFull) || errors.Is(err, ErrNativeBusy)
 			} else {
 				response.Outcome = &out
 				if run {
