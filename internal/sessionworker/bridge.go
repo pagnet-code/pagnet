@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
+	"github.com/pagnet-code/pagnet/internal/session"
 )
 
 // Admission is the current controller's public control-plane session binding.
@@ -31,13 +32,14 @@ type Admission struct {
 	BootID            string    `json:"bootId"`
 }
 type BridgeCall struct {
-	ID               string          `json:"id"`
-	Scope            Scope           `json:"scope"`
-	NativeGeneration string          `json:"nativeGeneration"`
-	Origin           json.RawMessage `json:"origin,omitempty"`
-	Admission        Admission       `json:"admission"`
-	Tool             string          `json:"tool"`
-	Args             json.RawMessage `json:"args"`
+	TurnSource       *NativeTurnSource `json:"turnSource,omitempty"`
+	ID               string            `json:"id"`
+	Scope            Scope             `json:"scope"`
+	NativeGeneration string            `json:"nativeGeneration"`
+	Origin           json.RawMessage   `json:"origin,omitempty"`
+	Admission        Admission         `json:"admission"`
+	Tool             string            `json:"tool"`
+	Args             json.RawMessage   `json:"args"`
 }
 type BridgeResult struct {
 	ID     string          `json:"id"`
@@ -336,7 +338,7 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 			continue
 		}
 		callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...)})
+		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: o.activeBridgeTurnSource(callCtx, generation)})
 		cancel()
 		result.ID = req.ID
 		if bridgeWrite(c, result) != nil {
@@ -371,4 +373,31 @@ func (b *relayBroker) authorizeNativeEffect(lease int64) (*Admission, error) {
 	}
 	copy := *b.admission
 	return &copy, nil
+}
+
+// Native requests cannot nominate a source. Read the actual accepted turn and
+// require its still-held original producer capability before forwarding it.
+func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation string) *NativeTurnSource {
+	o.mu.Lock()
+	candidate := o.candidateTurnSource
+	valid := o.generation == generation && !o.closing
+	o.mu.Unlock()
+	if !valid || candidate.Sequence <= 0 {
+		return nil
+	}
+	sid, ok := o.manager.TryNativeID(o.journal.scope.InstanceID)
+	if !ok || sid == "" {
+		return nil
+	}
+	source, unavailable, err := o.journal.NativeEventSource(ctx, generation, session.SessionEvent{SessionID: sid, TurnID: logicalWorkerTurn(candidate.Sequence)})
+	if err != nil || unavailable || source == nil || source.SourceTask == nil {
+		return nil
+	}
+	key, available := o.originalTaskContentPin(source)
+	clear(key[:])
+	if !available {
+		return nil
+	}
+	source.SourceTask = cloneNativeTaskSource(source.SourceTask)
+	return source
 }
