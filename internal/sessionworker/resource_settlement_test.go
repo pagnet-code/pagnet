@@ -85,6 +85,9 @@ func acceptedInterruptionFixture(t *testing.T, resource bool, private ...string)
 		}
 		event := session.SessionEvent{Type: session.EventInteractionStarted, SessionID: source.NativeSessionID, TurnID: source.LogicalTurnID, Interaction: &session.InteractionEvent{NativeInteractionID: "original-private-choice"}}
 		o := NativeObservation{ID: domain.NewID().String(), InteractionID: domain.NewID().String(), NativeGeneration: source.NativeGeneration, NativeSessionID: source.NativeSessionID, Origin: raw, ObservedAt: time.Now().UTC(), Event: event, TurnSource: &source}
+		if private[0] == "permission-no-id" {
+			o.InteractionID = ""
+		}
 		switch private[0] {
 		case "output":
 			o.Event.Type = session.EventTurnOutput

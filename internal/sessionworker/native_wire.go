@@ -87,6 +87,12 @@ func NativeBackendObservation(o NativeObservation) (transport.NativeObservationP
 		if o.Event.Type != session.EventInteractionStarted && o.Event.Type != session.EventInteractionResolved {
 			return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
 		}
+		// Private permission capture has no publishable backend inspection yet.
+		// Preparing that inspection also allocates its server interaction ID;
+		// absent crypto authority must stay unsupported, not malformed source.
+		if o.Event.Type == session.EventInteractionStarted && o.Event.Interaction != nil && o.Inspection == nil {
+			return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
+		}
 		if o.Event.Interaction == nil || o.InteractionID == "" {
 			return transport.NativeObservationPayload{}, ErrConflict
 		}

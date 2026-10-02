@@ -156,11 +156,11 @@ func TestOwnerStoppedDeleteProofLostReplyReopenAndQuarantine(t *testing.T) {
 }
 
 func TestOwnerStoppedPurgesOnlyOriginalUnpublishedPrivatePermission(t *testing.T) {
-	for _, kind := range []string{"permission", "output", "plan", "fragment", "wrong-turn"} {
+	for _, kind := range []string{"permission", "permission-no-id", "output", "plan", "fragment", "wrong-turn"} {
 		t.Run(kind, func(t *testing.T) {
 			f, p := originalDeleteFixture(t, false, kind)
 			err := f.journal.collectDeletionQuarantines(t.Context(), f.lease, p, f.key)
-			if kind == "permission" {
+			if kind == "permission" || kind == "permission-no-id" {
 				if err != nil {
 					t.Fatal(err)
 				}

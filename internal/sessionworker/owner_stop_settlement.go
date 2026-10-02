@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -149,7 +150,13 @@ func stoppedReceiptReplayTx(ctx context.Context, tx *sql.Tx, id, digest string, 
 
 // Runs before generic quarantine cleanup. Only an actual captured accepted turn
 // in this original process can be abandoned by its later completed owned Stop.
-func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *transport.NativeOwnershipDeletionProof) error {
+func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *transport.NativeOwnershipDeletionProof) (err error) {
+	stage := "original_candidates"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("owner_stop/%s: %w", stage, err)
+		}
+	}()
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM worker_intent w JOIN worker_turn_sources t ON t.sequence=w.sequence WHERE w.state='uncertain' AND w.kind='prompt' AND t.native_generation=? AND t.native_session=?`, d.NativeGeneration, d.NativeSessionID).Scan(&count); err != nil {
 		return err
@@ -157,6 +164,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	if count == 0 {
 		return nil
 	}
+	stage = "original_stop_dispatch"
 	var stopRaw []byte
 	var stopKind, stopState string
 	if err := tx.QueryRowContext(ctx, `SELECT d.proof,w.kind,w.state FROM worker_dispatches d JOIN worker_intent w ON w.sequence=d.operation_sequence WHERE d.dispatch_sequence=?`, d.StopProof.DispatchSequence).Scan(&stopRaw, &stopKind, &stopState); err != nil {
@@ -166,8 +174,9 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	if json.Unmarshal(stopRaw, &stop) != nil || !reflect.DeepEqual(stop, d.StopProof) || stopKind != "stop" || stopState != "completed" {
 		return ErrConflict
 	}
+	stage = "original_stopped_receipt"
 	var captured []byte
-	err := tx.QueryRowContext(ctx, `SELECT payload FROM worker_stopped_receipts WHERE observation_id=?`, d.StoppedObservationID).Scan(&captured)
+	err = tx.QueryRowContext(ctx, `SELECT payload FROM worker_stopped_receipts WHERE observation_id=?`, d.StoppedObservationID).Scan(&captured)
 	var stopped stoppedReceipt
 	if errors.Is(err, sql.ErrNoRows) {
 		var raw, receipt []byte
@@ -185,6 +194,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	} else if json.Unmarshal(captured, &stopped) != nil {
 		return ErrConflict
 	}
+	stage = "original_reader_quiescence"
 	var quiesced bool
 	if err = tx.QueryRowContext(ctx, `SELECT quiesced FROM worker_source_registration WHERE origin_id=? AND native_generation=?`, d.OriginID, d.NativeGeneration).Scan(&quiesced); err != nil {
 		return err
@@ -192,6 +202,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	if !quiesced {
 		return ErrConflict
 	}
+	stage = "accepted_turn_binding"
 	rows, err := tx.QueryContext(ctx, `SELECT t.sequence,t.logical_turn,t.native_generation,t.native_session,t.source_command,t.source_admission,t.input_kind,d.proof,a.admission,t.started,t.source_task FROM worker_turn_sources t JOIN worker_intent w ON w.sequence=t.sequence JOIN worker_dispatches d ON d.operation_sequence=t.sequence JOIN worker_intent_admission a ON a.sequence=t.sequence WHERE w.state='uncertain' AND w.kind='prompt' AND t.native_generation=? AND t.native_session=?`, d.NativeGeneration, d.NativeSessionID)
 	if err != nil {
 		return err
@@ -228,6 +239,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	if len(candidates) != count {
 		return ErrConflict
 	}
+	stage = "settlement_write"
 	for _, e := range candidates {
 		raw, marshalErr := json.Marshal(e)
 		if marshalErr != nil {

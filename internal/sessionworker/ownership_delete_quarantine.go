@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
@@ -18,7 +19,13 @@ func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, p
 	return j.collectDeletionQuarantines(ctx, lease, proof, nil)
 }
 
-func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, proof *transport.NativeOwnershipDeletionProof, captureKey []byte) error {
+func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, proof *transport.NativeOwnershipDeletionProof, captureKey []byte) (err error) {
+	stage := "proof_header"
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("native_delete_cleanup/%s: %w", stage, err)
+		}
+	}()
 	if proof == nil || proof.DeleteRequestID == "" || proof.OriginID == "" || proof.NativeGeneration == "" || proof.NativeSessionID == "" || proof.StoppedObservationID == "" || proof.StoppedSourceSequence <= 0 || proof.StoppedObservedAt.IsZero() || !proof.StoppedExpiresAt.After(proof.StoppedObservedAt) {
 		return ErrConflict
 	}
@@ -33,6 +40,7 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	stage = "reader_retry"
 	if len(j.sourceRetries) != 0 {
 		return ErrConflict
 	}
@@ -53,9 +61,11 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	if json.Unmarshal([]byte(raw), &owned) != nil || proof.StopProof.OwnershipID != owned.ID || proof.StopProof.OwnershipGeneration != j.scope.Generation || proof.StopProof.DispatchSequence <= 0 || proof.StopProof.DispatchSequence > last || proof.StopProof.SourceCommandID == "" || proof.StopProof.SourceAdmissionID == "" || proof.StopProof.SourceRunnerID == "" || proof.StopProof.SourceBootID == "" || proof.StopProof.SourceRunnerEpoch.IsZero() {
 		return ErrConflict
 	}
+	stage = "owner_stop_settlement"
 	if err = j.settleOwnerStoppedTx(ctx, tx, proof); err != nil {
 		return err
 	}
+	stage = "remaining_effects"
 	var unsafe bool
 	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_source_registration WHERE quiesced=0) OR EXISTS(SELECT 1 FROM worker_intent WHERE state NOT IN ('completed','failed','resource_interrupted','owner_stopped')) OR EXISTS(SELECT 1 FROM worker_dispatches WHERE state NOT IN ('completed','failed','resource_interrupted','owner_stopped')) OR EXISTS(SELECT 1 FROM worker_dispatch_cancellations WHERE state!='finalized')`).Scan(&unsafe); err != nil {
 		return err
@@ -63,6 +73,7 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	if unsafe {
 		return ErrConflict
 	}
+	stage = "terminal_quarantines"
 	rows, err := tx.QueryContext(ctx, `SELECT o.id,o.digest,o.payload,d.receipt,COALESCE(s.source_sequence,0) FROM worker_source_dispositions d JOIN worker_observations o ON o.id=d.observation_id JOIN worker_source_registration r ON r.origin_id=json_extract(o.payload,'$.origin.id') AND r.native_generation=json_extract(o.payload,'$.nativeGeneration') LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE r.quiesced=1 LIMIT ?`, maxPendingObservations)
 	if err != nil {
 		return err
@@ -110,9 +121,11 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 			}
 		}
 	}
+	stage = "private_inspections"
 	if err = j.collectOwnerStoppedPrivateInspectionsTx(ctx, tx, proof); err != nil {
 		return err
 	}
+	stage = "source_reservations"
 	if err = j.collectStoppedNativeReservationsTx(ctx, tx, captureKey, proof.NativeGeneration, proof.NativeSessionID, proof.OriginID); err != nil {
 		return err
 	}
@@ -124,6 +137,7 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	if err = j.collectClosedPrivateObservationsTx(ctx, tx); err != nil {
 		return err
 	}
+	stage = "commit"
 	if err = tx.Commit(); err != nil {
 		return err
 	}

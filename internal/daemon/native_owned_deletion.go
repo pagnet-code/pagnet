@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -13,7 +14,16 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstancePayload) error {
+func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstancePayload) (err error) {
+	stage := "registry"
+	defer func() {
+		if err != nil {
+			if d.Log != nil {
+				d.Log.Warn("owned deletion remains pending", "stage", stage, "reason", err)
+			}
+			err = fmt.Errorf("native_forget/%s: %w", stage, err)
+		}
+	}()
 	record, err := d.nativeRegistry.Lookup(p.InstanceID)
 	if err != nil {
 		return err
@@ -39,6 +49,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
+		stage = "source_drain"
 		if err = proxy.DrainDeletionSources(ctx, p.DeleteRequestID); err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
@@ -51,6 +62,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		link.mu.Lock()
 		owned := link.ownership
 		link.mu.Unlock()
+		stage = "deletion_proof"
 		if p.DeletionProof != nil {
 			if p.DeletionProof.DeleteRequestID != p.DeleteRequestID || p.DeletionProof.StopProof.OwnershipID != owned.ID || p.DeletionProof.StopProof.OwnershipGeneration != record.Scope.Generation {
 				return ErrNativeObservationConflict
@@ -59,6 +71,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 				return errors.Join(ErrDeferred, err)
 			}
 		}
+		stage = "dispatch_settlement"
 		settled, err := proxy.SettleDispatches(ctx, owned)
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
@@ -66,6 +79,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		if settled.LastDispatchSequence != settled.RetiredFloor {
 			return ErrDeferred
 		}
+		stage = "native_snapshot"
 		snapshot, err := proxy.Snapshot(ctx)
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
@@ -73,6 +87,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
 			return ErrDeferred
 		}
+		stage = "backend_retirement"
 		retired, err := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, *settled, settled.RetiredFloor, nil, true)
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
