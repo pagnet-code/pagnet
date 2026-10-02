@@ -545,7 +545,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 			}
 			if interaction.Resolved && observation.InteractionID == originalInspection.InteractionID {
 				permissionResolved = true
-				if observation.TurnSource == nil || observation.TurnSource.SourceCommandID != "long-delivery-A" || observation.TurnSource.SourceAdmissionID != originalSourceAdmissionID {
+				if observation.TurnSource == nil || observation.TurnSource.SourceCommandID != "long-delivery-A" || observation.TurnSource.SourceAdmissionID != originalSourceAdmissionID || observation.TurnSource.InputKind != "task" {
 					t.Fatalf("native resolution lost original delivery admission across controller replacement: source=%+v eventTurn=%s expectedAdmission=%s", observation.TurnSource, observation.Event.TurnID, originalSourceAdmissionID)
 				}
 			}

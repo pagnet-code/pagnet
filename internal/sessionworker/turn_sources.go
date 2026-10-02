@@ -11,6 +11,7 @@ import (
 )
 
 type NativeTurnSource struct {
+	InputKind         string `json:"inputKind,omitempty"`
 	Sequence          int64  `json:"sequence"`
 	LogicalTurnID     string `json:"logicalTurnId"`
 	NativeGeneration  string `json:"nativeGeneration"`
@@ -22,10 +23,37 @@ type NativeTurnSource struct {
 func logicalWorkerTurn(sequence int64) string { return fmt.Sprintf("pagnet-worker-turn-%d", sequence) }
 func (j *Journal) initializeTurnSources() error {
 	for _, query := range []string{
-		`CREATE TABLE IF NOT EXISTS worker_turn_sources(sequence INTEGER NOT NULL,logical_turn TEXT NOT NULL,native_generation TEXT NOT NULL,native_session TEXT NOT NULL,source_command TEXT NOT NULL,source_admission TEXT NOT NULL,completed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(native_generation,logical_turn))`,
+		`CREATE TABLE IF NOT EXISTS worker_turn_sources(sequence INTEGER NOT NULL,logical_turn TEXT NOT NULL,native_generation TEXT NOT NULL,native_session TEXT NOT NULL,source_command TEXT NOT NULL,source_admission TEXT NOT NULL,input_kind TEXT NOT NULL DEFAULT '',completed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(native_generation,logical_turn))`,
 		`CREATE TABLE IF NOT EXISTS worker_interaction_sources(native_generation TEXT NOT NULL,native_id TEXT NOT NULL,native_session TEXT NOT NULL,logical_turn TEXT NOT NULL,PRIMARY KEY(native_generation,native_session,native_id))`,
 	} {
 		if _, err := j.db.Exec(query); err != nil {
+			return err
+		}
+	}
+	columns, err := j.db.Query(`PRAGMA table_info(worker_turn_sources)`)
+	if err != nil {
+		return err
+	}
+	hasKind := false
+	for columns.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			columns.Close()
+			return err
+		}
+		if name == "input_kind" {
+			hasKind = true
+		}
+	}
+	err = columns.Err()
+	columns.Close()
+	if err != nil {
+		return err
+	}
+	if !hasKind {
+		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN input_kind TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -49,7 +77,7 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
-	if source.Sequence <= 0 || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.NativeGeneration == "" || source.NativeSessionID == "" || len(source.NativeSessionID) > 1024 || len(source.NativeGeneration) > 256 || (source.SourceCommandID == "") != (source.SourceAdmissionID == "") || len(source.SourceCommandID) > 256 || len(source.SourceAdmissionID) > 256 {
+	if (source.InputKind != "" && !ValidNativeInputKind(source.InputKind)) || source.Sequence <= 0 || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.NativeGeneration == "" || source.NativeSessionID == "" || len(source.NativeSessionID) > 1024 || len(source.NativeGeneration) > 256 || (source.SourceCommandID == "") != (source.SourceAdmissionID == "") || len(source.SourceCommandID) > 256 || len(source.SourceAdmissionID) > 256 {
 		return errors.New("invalid accepted native turn source")
 	}
 	j.mu.Lock()
@@ -90,7 +118,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	if count >= maxCommands {
 		return ErrFull
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission) VALUES(?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID)
+	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind) VALUES(?,?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID, source.InputKind)
 	if err != nil {
 		return err
 	}
@@ -98,7 +126,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 }
 func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	err := tx.QueryRowContext(ctx, `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`, generation, turn).Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID)
+	err := tx.QueryRowContext(ctx, `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`, generation, turn).Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind)
 	return source, err
 }
 

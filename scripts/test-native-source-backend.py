@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-helper", required=True, type=Path)
     parser.add_argument("--overlay", type=Path)
+    parser.add_argument("--turns", action="store_true", help="prove actual native turn delivery")
     args = parser.parse_args()
     binary = args.server_helper.resolve()
     if not binary.is_file():
@@ -64,7 +65,7 @@ def main():
         command.extend(
             [
                 "./internal/daemon",
-                "-run", "^TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof$",
+                "-run", "^TestNativeTurnDrainerActualOwnerBackendOriginalSourceAndRollback$" if args.turns else "^TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof$",
                 "-count=1", "-timeout=120s", "-v",
             ]
         )

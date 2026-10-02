@@ -24,8 +24,30 @@ func NativeWorkerWireObservation(o sessionworker.NativeObservation) (transport.N
 		return transport.NativeObservationPayload{}, ErrNativeObservationConflict
 	}
 	var body any
-	typ := sessionworker.LifecycleSourceType(o.Event.Type)
-	if typ != "" {
+	typ := sessionworker.NativeSourceType(o)
+	if typ == transport.MsgRuntimeTurnStarted || typ == transport.MsgRuntimeTurnCompleted || typ == transport.MsgRuntimeTurnFailed {
+		source := o.TurnSource
+		if o.SourceSequence <= 0 || source == nil {
+			return transport.NativeObservationPayload{}, ErrNativeObservationConflict
+		}
+		p := transport.NativeTurnSourcePayload{InstanceID: origin.InstanceID, Runtime: origin.Runtime, NativeGeneration: o.NativeGeneration, SessionID: o.NativeSessionID, SourceSequence: o.SourceSequence, LogicalTurnID: source.LogicalTurnID, NativeTurnSequence: source.Sequence, SourceCommandID: source.SourceCommandID, SourceAdmissionID: source.SourceAdmissionID, InputKind: source.InputKind}
+		if typ == transport.MsgRuntimeTurnFailed {
+			p.Kind = nativeFailureMetadata(o.Event.FailureKind)
+			if o.Event.RetryAt != nil {
+				if parsed, err := time.Parse(time.RFC3339Nano, *o.Event.RetryAt); err == nil && parsed.Location() == time.UTC {
+					p.RetryAt = *o.Event.RetryAt
+				}
+			}
+		}
+		// Token counts are numeric source metadata. No arbitrary vendor model/error
+		// text crosses this adapter without a separate bounded public contract.
+		if typ != transport.MsgRuntimeTurnStarted {
+			p.InputTokens = nativeTokenCount(o.Event.InputTokens)
+			p.OutputTokens = nativeTokenCount(o.Event.OutputTokens)
+			p.CachedTokens = nativeTokenCount(o.Event.CachedTokens)
+		}
+		body = p
+	} else if typ != "" {
 		if o.SourceSequence <= 0 {
 			return transport.NativeObservationPayload{}, ErrNativeObservationConflict
 		}
@@ -174,4 +196,20 @@ func (c *NativeObservationConnection) DrainNativeWorkerSources(ctx context.Conte
 // connection retries the worker's original payload and exact fragment bytes.
 func nativeDeliveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, 30*time.Second)
+}
+
+func nativeFailureMetadata(kind string) string {
+	switch kind {
+	case "rate_limited", "quota_exhausted", "auth_required", "context_limit", "network_error", "process_error", "permission_error", "unknown", "interrupted", "runtime_error":
+		return kind
+	default:
+		return ""
+	}
+}
+func nativeTokenCount(value *int) *int {
+	if value == nil || *value < 0 {
+		return nil
+	}
+	copy := *value
+	return &copy
 }

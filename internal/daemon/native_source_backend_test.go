@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,12 +110,13 @@ func (h *nativeBackendHelper) call(t *testing.T, p any, result any) {
 }
 
 type nativeBackendPeer struct {
-	socket      *websocket.Conn
-	connection  *NativeObservationConnection
-	session     transport.HostSessionPayload
-	done        chan struct{}
-	writes      sync.Mutex
-	dropReceipt bool
+	socket            *websocket.Conn
+	connection        *NativeObservationConnection
+	session           transport.HostSessionPayload
+	done              chan struct{}
+	writes            sync.Mutex
+	dropReceipt       bool
+	dropObservationID atomic.Pointer[string]
 }
 
 func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceipt bool) *nativeBackendPeer {
@@ -185,7 +187,8 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 				if env.DecodePayload(&p) != nil {
 					return
 				}
-				if peer.dropReceipt && env.Type == transport.MsgNativeObservationReceipt && p.Disposition == "committed" {
+				dropID := peer.dropObservationID.Load()
+				if (peer.dropReceipt || (dropID != nil && *dropID == p.ObservationID)) && env.Type == transport.MsgNativeObservationReceipt && p.Disposition == "committed" {
 					peer.connection.Close()
 					_ = socket.Close()
 					return

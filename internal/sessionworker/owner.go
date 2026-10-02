@@ -210,7 +210,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			o.mu.Lock()
 			o.candidateAdmission = out.SourceAdmission
 			o.candidateCommandID = op.SourceCommandID
-			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID}
+			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind}
 			fatal := o.fatal
 			if fatal == nil {
 				fatal = o.observationBlocked
@@ -269,6 +269,19 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 	o.mu.Unlock()
 }
 func (o *SessionOwner) finish(sequence int64, result any, err error) {
+	// Native failure bodies belong only to the original encrypted source
+	// capture. Intent outcome recovery is bounded public status metadata.
+	switch native := result.(type) {
+	case session.TurnResult:
+		native.Error = ""
+		result = native
+	case *session.TurnResult:
+		if native != nil {
+			copy := *native
+			copy.Error = ""
+			result = copy
+		}
+	}
 	state := "completed"
 	if err != nil {
 		state = "failed"
@@ -277,7 +290,7 @@ func (o *SessionOwner) finish(sequence int64, result any, err error) {
 		}
 		result = struct {
 			Error string `json:"error"`
-		}{err.Error()}
+		}{"native operation failed"}
 	}
 	raw, marshalErr := json.Marshal(result)
 	if marshalErr != nil {

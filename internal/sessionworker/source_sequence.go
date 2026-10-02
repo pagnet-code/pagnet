@@ -11,8 +11,8 @@ import (
 )
 
 // LifecycleSourceType is the bounded lifecycle subset that has an independent
-// contiguous original-origin stream. Turns, plans and approvals never consume
-// a lifecycle sequence.
+// contiguous original-origin stream. Accepted turn events share that stream;
+// unsupported/unbound turns, plans and approvals never consume a sequence.
 func LifecycleSourceType(eventType string) string {
 	switch eventType {
 	case session.EventSessionStarted, session.EventSessionResumed:
@@ -69,7 +69,7 @@ func (j *Journal) initializeSourceSequences() error {
 		return err
 	}
 	for _, o := range pending {
-		if initialized > 0 && LifecycleSourceType(o.Event.Type) != "" {
+		if initialized > 0 && NativeSourceType(o) != "" {
 			return errors.New("original lifecycle sequence mapping is missing")
 		}
 		if err = allocateSourceSequence(context.Background(), tx, o); err != nil {
@@ -94,7 +94,7 @@ func (j *Journal) initializeSourceSequences() error {
 		var origin struct {
 			ID string `json:"id"`
 		}
-		if json.Unmarshal(raw, &o) != nil || json.Unmarshal(o.Origin, &origin) != nil || origin.ID != id || sequence <= 0 || last < sequence || LifecycleSourceType(o.Event.Type) == "" {
+		if json.Unmarshal(raw, &o) != nil || json.Unmarshal(o.Origin, &origin) != nil || origin.ID != id || sequence <= 0 || last < sequence || NativeSourceType(o) == "" {
 			check.Close()
 			return errors.New("original lifecycle sequence binding is corrupt")
 		}
@@ -111,7 +111,7 @@ func (j *Journal) initializeSourceSequences() error {
 }
 
 func allocateSourceSequence(ctx context.Context, tx *sql.Tx, o NativeObservation) error {
-	if LifecycleSourceType(o.Event.Type) == "" {
+	if NativeSourceType(o) == "" {
 		return nil
 	}
 	var origin struct {
