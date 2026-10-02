@@ -629,12 +629,10 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 				"prompt":  "fake native question (opaque vendor payload)",
 			})
 		}
-		var options []domain.RuntimeInteractionOption
-		if raw := os.Getenv("PAGNET_FAKE_INTERACTION_OPTIONS"); raw != "" {
-			if json.Unmarshal([]byte(raw), &options) != nil || !domain.ValidRuntimeInteractionOptions(options) {
-				fmt.Fprintln(os.Stderr, "invalid fake native permission options")
-				os.Exit(2)
-			}
+		options, err := persistentInteractionOptions()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
 		}
 		summary := os.Getenv("PAGNET_FAKE_INTERACTION_SUMMARY")
 		if summary == "" {
