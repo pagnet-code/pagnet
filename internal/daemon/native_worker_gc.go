@@ -29,7 +29,38 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 	a, b := *p.NativeOwnership, *record.Ownership
 	a.LastDispatchSequence, a.RetiredFloor = 0, 0
 	b.LastDispatchSequence, b.RetiredFloor = 0, 0
+	a.State, b.State = "active", "active"
+	a.DeletionProof, b.DeletionProof = nil, nil
 	if !reflect.DeepEqual(a, b) {
+		return nativeWorkerGC{}, ErrNativeObservationConflict
+	}
+	existing, lookupErr := r.lookupGC(p.InstanceID)
+	if lookupErr == nil {
+		if existing.CommandID != p.CommandID || existing.DeleteRequestID != p.DeleteRequestID || existing.Ownership.ID != p.NativeOwnership.ID || existing.Ownership.OwnershipGeneration != record.Scope.Generation {
+			return existing, ErrNativeObservationConflict
+		}
+		switch p.NativeOwnership.State {
+		case "active":
+			if p.NativeOwnership.DeletionProof != nil {
+				return existing, ErrNativeObservationConflict
+			}
+		case "retired":
+			// A refreshed backend delivery can carry the retirement committed
+			// by this same job. It cannot create a new collection authority.
+			proposedRaw, _ := json.Marshal(p.NativeOwnership)
+			committedRaw, _ := json.Marshal(existing.Ownership)
+			if existing.Phase == "waiting" || string(proposedRaw) != string(committedRaw) {
+				return existing, ErrNativeObservationConflict
+			}
+		default:
+			return existing, ErrNativeObservationConflict
+		}
+		return existing, nil
+	}
+	if !errors.Is(lookupErr, sql.ErrNoRows) {
+		return nativeWorkerGC{}, lookupErr
+	}
+	if p.NativeOwnership.State != "active" || p.NativeOwnership.DeletionProof != nil {
 		return nativeWorkerGC{}, ErrNativeObservationConflict
 	}
 	proposed := nativeWorkerGC{CommandID: p.CommandID, DeleteRequestID: p.DeleteRequestID, Ownership: *p.NativeOwnership, Phase: "waiting"}
@@ -40,7 +71,7 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 	if _, err = r.db.Exec(`INSERT INTO native_worker_gc VALUES(?,?) ON CONFLICT(instance_id) DO NOTHING`, p.InstanceID, raw); err != nil {
 		return proposed, err
 	}
-	existing, err := r.lookupGC(p.InstanceID)
+	existing, err = r.lookupGC(p.InstanceID)
 	if err != nil {
 		return proposed, err
 	}

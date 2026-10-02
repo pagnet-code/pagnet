@@ -45,6 +45,23 @@ func TestNativeGCOriginalTupleAndRemoteCommitBeforeRegistryReclaim(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	retry := p
+	retry.NativeOwnership = &retired
+	resumed, retryErr := registry.beginGC(record, retry)
+	if retryErr != nil || resumed.Phase != "backend_retired" {
+		t.Fatal("exact retired delivery cannot resume original deletion", retryErr)
+	}
+	badRetired := retired
+	badRetired.RetiredFloor++
+	retry.NativeOwnership = &badRetired
+	if _, err := registry.beginGC(record, retry); err == nil {
+		t.Fatal("refreshed delivery replaced committed retirement proof")
+	}
+	retry.NativeOwnership = &retired
+	retry.DeleteRequestID = domain.NewID().String()
+	if _, err := registry.beginGC(record, retry); err == nil {
+		t.Fatal("foreign job reused retired collection authority")
+	}
 	gc, err = registry.advanceGC(p.InstanceID, gc, "collecting", nil)
 	if err != nil {
 		t.Fatal(err)
