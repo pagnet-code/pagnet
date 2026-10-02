@@ -155,6 +155,15 @@ func (o *SessionOwner) prepareInspection(event session.SessionEvent, generation 
 }
 
 func (o *SessionOwner) resolveApproval(op Operation) error {
+	return o.resolveApprovalWithSource(op, nil)
+}
+func (o *SessionOwner) resolveAuthenticatedApproval(op Operation, source *Admission) error {
+	if source != nil && ValidateNativeResolveOperation(op) != nil {
+		return errors.New("invalid authenticated native resolution")
+	}
+	return o.resolveApprovalWithSource(op, source)
+}
+func (o *SessionOwner) resolveApprovalWithSource(op Operation, source *Admission) error {
 	o.mu.Lock()
 	record := o.pending[op.InteractionID]
 	if record == nil || record.inspection == nil || record.consumed || !time.Now().Before(record.expires) || op.NativeGeneration == "" || op.NativeGeneration != o.generation || op.NativeGeneration != record.inspection.NativeGeneration || op.NativeSessionID != record.inspection.NativeSessionID {
@@ -171,18 +180,21 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 		o.mu.Unlock()
 		return errors.New("native choice was not observed")
 	}
-	// Check exact proof for every choice, including rejection. Private IPC does
-	// not grant permission to invent a browser's inspected native consent.
-	proof, err := base64.StdEncoding.DecodeString(op.InspectionProof)
-	expected, proofErr := e2ee.ApprovalProof(record.secret, record.inspection.DetailAAD, o.journal.scope.InstanceID, op.NativeSessionID, op.InteractionID, op.OptionID)
-	if err != nil || proofErr != nil || len(proof) != 32 || !hmac.Equal(proof, expected) {
-		o.mu.Unlock()
-		return errors.New("native inspected choice proof is invalid")
+	// Permission grants require inspected content. An authenticated exact
+	// observed rejection can safely decline even if content authority is lost.
+	safeReject := (optionKind == "reject_once" || optionKind == "reject_always") && o.authenticatedResolutionSource(op, source)
+	if !safeReject {
+		proof, err := base64.StdEncoding.DecodeString(op.InspectionProof)
+		expected, proofErr := e2ee.ApprovalProof(record.secret, record.inspection.DetailAAD, o.journal.scope.InstanceID, op.NativeSessionID, op.InteractionID, op.OptionID)
+		if err != nil || proofErr != nil || len(proof) != 32 || !hmac.Equal(proof, expected) {
+			o.mu.Unlock()
+			return errors.New("native inspected choice proof is invalid")
+		}
 	}
 	o.mu.Unlock()
 	ctx, cancel := context.WithTimeout(o.ctx, 15*time.Second)
 	defer cancel()
-	return o.withInspectionEpoch(ctx, record.inspection.DetailAAD, func(epoch crypto.KeyEpoch) error {
+	deliver := func() error {
 		o.mu.Lock()
 		if o.pending[op.InteractionID] != record || record.consumed || o.generation != op.NativeGeneration {
 			o.mu.Unlock()
@@ -197,7 +209,11 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 			return errors.Join(session.ErrTurnInterrupted, err)
 		}
 		return nil
-	})
+	}
+	if safeReject {
+		return deliver()
+	}
+	return o.withInspectionEpoch(ctx, record.inspection.DetailAAD, func(crypto.KeyEpoch) error { return deliver() })
 }
 
 // Resolution answers are distinct from the inspected permission payload. Read

@@ -20,7 +20,11 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-func TestActualNativeTaskParserOutputOriginalEncryption(t *testing.T) {
+func TestActualNativeTaskParserOutputOriginalEncryption(t *testing.T) { testActualNativeTask(t, false) }
+func TestActualNativeAuthenticatedRejectAfterInspectionEpochRevoked(t *testing.T) {
+	testActualNativeTask(t, true)
+}
+func testActualNativeTask(t *testing.T, reject bool) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +51,11 @@ func TestActualNativeTaskParserOutputOriginalEncryption(t *testing.T) {
 	if err = hostcrypto.SaveKeyring(keydir, ring); err != nil {
 		t.Fatal(err)
 	}
-	owner, err := NewSessionOwner(context.Background(), j, NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: binary, MCPExecutable: binary, Workspace: t.TempDir(), NetworkID: network, NetworkTenantID: scope.TenantID, NetworkStateDir: keydir, TenantID: scope.TenantID, Kind: "worker"}, bytes.Repeat([]byte{7}, 32))
+	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: binary, MCPExecutable: binary, Workspace: t.TempDir(), NetworkID: network, NetworkTenantID: scope.TenantID, NetworkStateDir: keydir, TenantID: scope.TenantID, Kind: "worker"}
+	if reject {
+		spec.Env = []string{"PAGNET_FAKE_INTERACTION=permission", `PAGNET_FAKE_INTERACTION_OPTIONS=[{"id":"allow","kind":"allow_once"},{"id":"deny","kind":"reject_once"}]`}
+	}
+	owner, err := NewSessionOwner(context.Background(), j, spec, bytes.Repeat([]byte{7}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +83,74 @@ func TestActualNativeTaskParserOutputOriginalEncryption(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner.Execute(out, raw)
+	if reject {
+		var inspection *Inspection
+		for inspection == nil {
+			rows, err := j.PendingObservations(ctx, 32)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, observation := range rows {
+				if observation.Event.Type == session.EventInteractionStarted {
+					inspection = observation.Inspection
+				}
+			}
+			if inspection != nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("genuine permission not observed", ctx.Err())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		grant := &Admission{NativeAdmissionID: uuid.NewString(), Scope: scope, TenantID: scope.TenantID, NetworkID: network, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
+		choice := Operation{SourceCommandID: uuid.NewString(), SourceAdmissionID: grant.NativeAdmissionID, NativeGeneration: owner.generation, NativeSessionID: sid, InteractionID: inspection.NativeInteractionID, OptionID: "allow"}
+		if err = owner.resolveAuthenticatedApproval(choice, grant); err == nil {
+			t.Fatal("authenticated transport granted permission without inspection")
+		}
+		choice.OptionID = "deny"
+		if err = owner.resolveApproval(choice); err == nil {
+			t.Fatal("legacy unbound transport declined without proof")
+		}
+		foreign := *grant
+		foreign.Scope.Generation = "foreign-owner"
+		if err = owner.resolveAuthenticatedApproval(choice, &foreign); err == nil {
+			t.Fatal("foreign accepted owner declined original choice")
+		}
+		if err = ring.Revoke(epoch.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err = hostcrypto.SaveKeyring(keydir, ring); err != nil {
+			t.Fatal(err)
+		}
+		resolveRaw, _ := json.Marshal(choice)
+		resolution, execute, err := j.admit(ctx, current, 2, choice.SourceCommandID, "resolve", resolveRaw, func() (*Admission, error) { return grant, nil })
+		if err != nil || !execute || resolution.SourceAdmission == nil {
+			t.Fatal("isolated authenticated resolution not durable", err)
+		}
+		owner.Execute(resolution, resolveRaw)
+		for {
+			result, err := j.Outcome(ctx, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State != "admitted" {
+				if result.State != "completed" {
+					t.Fatal("genuine native rejection failed", result.State)
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("genuine native rejection hung", ctx.Err())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		if err = owner.resolveAuthenticatedApproval(choice, grant); err == nil {
+			t.Fatal("genuine native rejection applied twice")
+		}
+	}
 	for {
 		out, err = j.Outcome(ctx, 1)
 		if err != nil {
