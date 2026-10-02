@@ -24,16 +24,32 @@ type NativeOwnershipRegisterPayload struct {
 	ProfileFingerprint  string `json:"profileFingerprint"`
 }
 type NativeWorkerOwnership struct {
-	ID                   string `json:"id"`
-	InstanceID           string `json:"instanceId"`
-	OwnershipGeneration  string `json:"ownershipGeneration"`
-	Runtime              string `json:"runtime"`
-	Profile              string `json:"profile"`
-	OriginalAdmissionID  string `json:"originalAdmissionId"`
-	State                string `json:"state"`
-	LastDispatchSequence int64  `json:"lastDispatchSequence"`
-	RetiredFloor         int64  `json:"retiredFloor"`
-	ProfileFingerprint   string `json:"profileFingerprint"`
+	DeletionProof        *NativeOwnershipDeletionProof `json:"deletionProof,omitempty"`
+	ID                   string                        `json:"id"`
+	InstanceID           string                        `json:"instanceId"`
+	OwnershipGeneration  string                        `json:"ownershipGeneration"`
+	Runtime              string                        `json:"runtime"`
+	Profile              string                        `json:"profile"`
+	OriginalAdmissionID  string                        `json:"originalAdmissionId"`
+	State                string                        `json:"state"`
+	LastDispatchSequence int64                         `json:"lastDispatchSequence"`
+	RetiredFloor         int64                         `json:"retiredFloor"`
+	ProfileFingerprint   string                        `json:"profileFingerprint"`
+}
+
+// Present only on authenticated retired ownership after explicit owner deletion
+// and genuine original stopped receipt. It authorizes no new native execution.
+type NativeOwnershipDeletionProof struct {
+	DeleteRequestID       string              `json:"deleteRequestId"`
+	StopProof             NativeDispatchProof `json:"stopProof"`
+	OriginID              string              `json:"originId"`
+	NativeGeneration      string              `json:"nativeGeneration"`
+	NativeSessionID       string              `json:"nativeSessionId"`
+	StoppedObservationID  string              `json:"stoppedObservationId"`
+	StoppedDigest         string              `json:"stoppedDigest"`
+	StoppedSourceSequence int64               `json:"stoppedSourceSequence"`
+	StoppedObservedAt     time.Time           `json:"stoppedObservedAt"`
+	StoppedExpiresAt      time.Time           `json:"stoppedExpiresAt"`
 }
 
 // Retirement advances only contiguous settled dispatch outcomes. Uncertain ordinals
