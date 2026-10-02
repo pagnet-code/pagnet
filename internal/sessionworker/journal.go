@@ -55,11 +55,12 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
-	mu    sync.Mutex
-	db    *sql.DB
-	scope Scope
-	owner io.Closer
-	dir   string
+	observationCapacity chan struct{}
+	mu                  sync.Mutex
+	db                  *sql.DB
+	scope               Scope
+	owner               io.Closer
+	dir                 string
 }
 
 func OpenJournal(dir string, scope Scope) (*Journal, error) {
@@ -104,7 +105,7 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	j := &Journal{db: db, scope: scope, owner: owner, dir: dir}
+	j := &Journal{db: db, scope: scope, owner: owner, dir: dir, observationCapacity: make(chan struct{})}
 	fail := func(e error) (*Journal, error) { _ = db.Close(); return nil, e }
 	for _, q := range []string{
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
@@ -125,9 +126,6 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	}
 	if protocol != Protocol || stored != string(encoded) {
 		return fail(errors.New("worker journal scope or protocol mismatch"))
-	}
-	if err = j.initializeOutput(); err != nil {
-		return fail(err)
 	}
 	if err = j.initializeObservations(); err != nil {
 		return fail(err)

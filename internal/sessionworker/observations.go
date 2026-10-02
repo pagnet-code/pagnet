@@ -180,5 +180,18 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	close(j.observationCapacity)
+	j.observationCapacity = make(chan struct{})
+	return nil
+}
+
+// Capture before attempting a journal write so a concurrent capacity release
+// cannot be missed between the failed write and the native reader's wait.
+func (j *Journal) ObservationCapacity() <-chan struct{} {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.observationCapacity
 }

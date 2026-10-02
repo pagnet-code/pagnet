@@ -35,6 +35,7 @@ type handshake struct {
 }
 
 type Request struct {
+	ReplayGeneration string            `json:"replayGeneration,omitempty"`
 	ActivationOrigin *ActivationOrigin `json:"activationOrigin,omitempty"`
 	ObservationID    string            `json:"observationId,omitempty"`
 	SourceDigest     string            `json:"sourceDigest,omitempty"`
@@ -385,7 +386,7 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		response.Snapshot = &snap
 	case "output":
 		var page OutputPage
-		page, err = o.journal.ReplayOutput(ctx, req.Cursor, req.Limit)
+		page, err = o.outputReplay().Replay(req.ReplayGeneration, req.Cursor, req.Limit)
 		if err == nil {
 			response.Output = &page
 		}

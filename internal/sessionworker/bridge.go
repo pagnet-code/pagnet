@@ -116,6 +116,9 @@ func (b *relayBroker) admit(lease int64, a Admission) error {
 	if a.NativeAdmissionID == "" || len(a.NativeAdmissionID) > 256 || a.Scope != b.scope || a.TenantID != b.spec.TenantID || a.NetworkID != b.spec.NetworkID || a.Kind != b.spec.Kind || a.RunnerID == "" || len(a.RunnerID) > 256 || a.RunnerEpoch.IsZero() || a.BootID == "" || len(a.BootID) > 256 {
 		return errors.New("control-plane admission does not match worker scope")
 	}
+	if b.admission != nil && *b.admission != a {
+		b.invalidateIssued()
+	}
 	copy := a
 	b.admission = &copy
 	return nil

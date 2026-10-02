@@ -117,3 +117,29 @@ func resultRunner(raw json.RawMessage) string {
 	_ = json.Unmarshal(raw, &origin)
 	return origin.RunnerID
 }
+
+func TestSameControllerFreshTransportReissuesUnlaunchedGate(t *testing.T) {
+	scope := testScope()
+	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, TenantID: scope.TenantID, NetworkID: "network", Kind: "worker"}
+	broker := newRelayBroker(scope, spec)
+	broker.bindLease(1)
+	original := Admission{NativeAdmissionID: "original-server-admission", Scope: scope, TenantID: scope.TenantID, NetworkID: "network", Kind: "worker", RunnerID: "runner", RunnerEpoch: time.Now().UTC(), BootID: "boot"}
+	if err := broker.admit(1, original); err != nil {
+		t.Fatal(err)
+	}
+	broker.activation = &activationTicket{request: ActivationRequest{ID: "exact-request", Scope: scope, SourceCommandID: "original-command", NativeGeneration: "original-generation", ActualRuntime: spec.Runtime}, done: make(chan activationReply, 1)}
+	first, err := broker.pollActivation(1)
+	if err != nil || first == nil {
+		t.Fatal("first authority gate unavailable")
+	}
+	replacement := original
+	replacement.NativeAdmissionID = "replacement-server-admission"
+	replacement.RunnerEpoch = original.RunnerEpoch.Add(time.Second)
+	if err := broker.admit(1, replacement); err != nil {
+		t.Fatal(err)
+	}
+	again, err := broker.pollActivation(1)
+	if err != nil || again == nil || again.ID != first.ID || again.NativeGeneration != first.NativeGeneration || again.Admission != original || again.CurrentAdmission != replacement {
+		t.Fatalf("fresh transport lost or rewrote original attempt: %+v %v", again, err)
+	}
+}

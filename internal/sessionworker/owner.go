@@ -70,6 +70,7 @@ type SessionOwner struct {
 	closing            bool
 	ctx                context.Context
 	journal            *Journal
+	output             *OutputReplay
 	spec               NativeSpec
 	manager            *session.Manager
 	driver             session.Driver
@@ -289,7 +290,7 @@ func (o *SessionOwner) failPersistence(err error) {
 func (o *SessionOwner) record(kind string, data any, generation string, origin json.RawMessage) {
 	raw, err := json.Marshal(data)
 	if err == nil {
-		_, err = o.journal.AppendOutput(context.Background(), generation, origin, kind, raw)
+		_, err = o.outputReplay().Append(generation, origin, kind, raw)
 	}
 	if err != nil {
 		o.failPersistence(err)

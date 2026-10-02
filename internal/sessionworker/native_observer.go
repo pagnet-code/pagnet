@@ -3,6 +3,7 @@ package sessionworker
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -69,7 +70,9 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			return err
 		}
 		observation.SourceDigest = digest
+		backoff := 250 * time.Millisecond
 		for {
+			available := o.journal.ObservationCapacity()
 			err = o.journal.JournalObservation(o.ctx, observation)
 			if err == nil {
 				break
@@ -81,10 +84,23 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			}
 			o.observationWaiters[observation.ID] = true
 			o.mu.Unlock()
-			timer := time.NewTimer(25 * time.Millisecond)
+			var retry <-chan time.Time
+			var timer *time.Timer
+			if !errors.Is(err, ErrFull) {
+				timer = time.NewTimer(backoff)
+				retry = timer.C
+				if backoff < 5*time.Second {
+					backoff *= 2
+					if backoff > 5*time.Second {
+						backoff = 5 * time.Second
+					}
+				}
+			}
 			select {
 			case <-o.ctx.Done():
-				timer.Stop()
+				if timer != nil {
+					timer.Stop()
+				}
 				o.mu.Lock()
 				delete(o.observationWaiters, observation.ID)
 				if len(o.observationWaiters) == 0 {
@@ -92,7 +108,12 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 				}
 				o.mu.Unlock()
 				return o.ctx.Err()
-			case <-timer.C:
+			case <-available:
+				if timer != nil {
+					timer.Stop()
+				}
+				backoff = 250 * time.Millisecond
+			case <-retry:
 			}
 		}
 		o.mu.Lock()
