@@ -349,12 +349,14 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 			continue
 		}
 		callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		sid, known := o.manager.TryNativeID(o.journal.scope.InstanceID)
-		if !known || sid == "" {
+		readyCtx, readyCancel := context.WithTimeout(callCtx, 2*time.Second)
+		sid, readyErr := o.awaitBridgeNativeSession(readyCtx, generation, nonce)
+		readyCancel()
+		if readyErr != nil || localpeer.VerifyOwned(c, *root, identity) != nil {
 			cancel()
 			return
 		}
-		source, sourceErr := o.activeBridgeTurnSource(callCtx, generation)
+		source, sourceErr := o.bridgeTurnSourceForSession(callCtx, generation, sid)
 		if sourceErr != nil {
 			cancel()
 			_ = bridgeWrite(c, map[string]any{"id": req.ID, "ok": false, "error": "native source unavailable"})
@@ -365,6 +367,43 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 		result.ID = req.ID
 		if bridgeWrite(c, result) != nil {
 			return
+		}
+	}
+}
+
+// A native process may call its MCP bridge while Activate still holds the
+// manager's activation lock. Its FULL-captured session event supplies the SID
+// without waiting for Activate, which itself may require MCP. Never infer a SID.
+func (o *SessionOwner) awaitBridgeNativeSession(ctx context.Context, generation, nonce string) (string, error) {
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		o.mu.Lock()
+		valid := !o.closing && o.generation == generation && o.nonce == nonce
+		capturedSID := ""
+		if o.bridgeSessionGeneration == generation {
+			capturedSID = o.bridgeSessionID
+		}
+		o.mu.Unlock()
+		if !valid || !o.driver.Live(o.journal.scope.InstanceID) {
+			return "", ErrFenced
+		}
+		if capturedSID != "" {
+			return capturedSID, nil
+		}
+		if sid, known := o.manager.TryNativeID(o.journal.scope.InstanceID); known {
+			if sid == "" {
+				return "", ErrConflict
+			}
+			return sid, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-tick.C:
 		}
 	}
 }
@@ -400,6 +439,14 @@ func (b *relayBroker) authorizeNativeEffect(lease int64) (*Admission, error) {
 // Native requests cannot nominate a source. Read the actual accepted turn and
 // require its still-held original producer capability before forwarding it.
 func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation string) (*NativeTurnSource, error) {
+	sid, ok := o.manager.TryNativeID(o.journal.scope.InstanceID)
+	if !ok || sid == "" {
+		return nil, ErrConflict
+	}
+	return o.bridgeTurnSourceForSession(ctx, generation, sid)
+}
+
+func (o *SessionOwner) bridgeTurnSourceForSession(ctx context.Context, generation, sid string) (*NativeTurnSource, error) {
 	o.mu.Lock()
 	candidate := o.candidateTurnSource
 	valid := o.generation == generation && !o.closing
@@ -409,10 +456,6 @@ func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation st
 	}
 	if candidate.Sequence <= 0 {
 		return nil, nil
-	}
-	sid, ok := o.manager.TryNativeID(o.journal.scope.InstanceID)
-	if !ok || sid == "" {
-		return nil, ErrConflict
 	}
 	source, err := o.journal.activeNativeBridgeSource(ctx, generation, sid, logicalWorkerTurn(candidate.Sequence))
 	if err != nil || source == nil {

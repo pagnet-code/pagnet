@@ -88,6 +88,8 @@ type SessionOwner struct {
 	terminalWrite            sync.Mutex
 	mu                       sync.Mutex
 	generation, nonce        string
+	bridgeSessionGeneration  string
+	bridgeSessionID          string
 	nativeObserverRegistered bool
 	origin                   json.RawMessage
 	candidateAdmission       *Admission

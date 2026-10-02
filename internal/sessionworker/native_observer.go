@@ -233,6 +233,12 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 			}
 		}
 		o.mu.Lock()
+		if o.generation == generation && event.SessionID != "" && (event.Type == session.EventSessionStarted || event.Type == session.EventSessionResumed) {
+			// Publish only the genuine, FULL-captured identity. Native startup
+			// can require MCP before the manager's Activate call returns.
+			o.bridgeSessionGeneration = generation
+			o.bridgeSessionID = event.SessionID
+		}
 		if event.Interaction != nil && !event.Interaction.Resolved {
 			if pending := o.pending[event.Interaction.NativeInteractionID]; pending != nil && pending.inspection != nil && pending.inspection.NativeGeneration == generation {
 				// Complete ciphertext is now durable. Keep only local private commitments

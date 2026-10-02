@@ -375,11 +375,21 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	// Queueing is not an application receipt. Observe actual native evidence.
 	streamDeadline := time.Now().Add(5 * time.Second)
 	streamApplied := false
+	var rendered strings.Builder
+	var streamCursor int64
+	var streamGeneration string
 	for time.Now().Before(streamDeadline) {
-		response := a.call(t, Request{Type: "output", Limit: 64})
-		var rendered strings.Builder
+		response := a.call(t, Request{Type: "output", Limit: 64, Cursor: streamCursor, ReplayGeneration: streamGeneration})
 		if response.Output != nil {
+			if response.Output.Gap {
+				t.Fatal("original native output replay lost evidence")
+			}
+			streamGeneration = response.Output.ReplayGeneration
 			for _, record := range response.Output.Records {
+				if record.Sequence <= streamCursor || record.NativeGeneration != initial.NativeGeneration {
+					t.Fatal("native output replay changed original source or order")
+				}
+				streamCursor = record.Sequence
 				if record.Kind == "terminal" {
 					var data []byte
 					_ = json.Unmarshal(record.Data, &data)
