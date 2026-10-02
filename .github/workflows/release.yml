@@ -27,13 +27,13 @@ jobs:
     # runner billing is broken, so CI runs on the org's own infrastructure.
     runs-on: [self-hosted, self-hosted-linux, owl-deploy]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history so `git describe --tags` (the release VERSION) can
           # resolve the tag instead of falling back to a bare commit hash.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # Keep the persistent runner's native Go caches; do not restore
