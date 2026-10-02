@@ -13,3 +13,7 @@ type NativeInstanceForgottenPayload struct {
 	OwnershipGeneration string `json:"ownershipGeneration"`
 	Disposition         string `json:"disposition"`
 }
+
+const MsgNativeInstanceForgottenAck = "host.native_instance_forgotten_ack"
+
+type NativeInstanceForgottenAckPayload = NativeInstanceForgottenPayload
