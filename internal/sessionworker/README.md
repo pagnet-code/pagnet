@@ -8,7 +8,7 @@ The implemented foundation owns an exclusive private state journal and a
 versioned owner-local Unix controller socket. Linux and Darwin authenticate the
 socket's actual kernel owner and mutually authenticate fresh server/client
 nonces with a separate 32-byte local control key. The canonical proof binds the
-full account/host/instance/ownership generation, protocol, controller identity
+full server/tenant/account/host/instance/ownership generation, protocol, controller identity
 and durable monotonic lease. Unsupported transports reject; incompatible
 versions do not fall back. Failed authentication cannot acquire a lease.
 
@@ -17,7 +17,7 @@ Each controller must durably assign a stable command ID and intent ordinal
 Admission records only a digest/kind/identity and commits before a native effect.
 Duplicate ordinals require the same digest and identity and return the existing
 outcome. A new authenticated controller fences subsequent operations from the
-old connection; already admitted work remains the worker's responsibility.
+old connection and closes its socket; already admitted work remains the worker's responsibility.
 A crashed worker's unfinished outcomes become uncertain and are never rerun.
 
 There are at most 128 retained intents, each outcome is at most 64 KiB, and frame
@@ -37,14 +37,24 @@ state paths are rejected, and a lifetime kernel file lock prevents two workers
 from misclassifying each other's live effects as crash uncertainty. Invalid
 scope, protocol, SQLite integrity, sequence holes or intent rows refuse opening.
 
-The next implementation stage must instantiate the actual session.Manager,
-production drivers and Supervisor within the worker, own the sole PTY reader
-and bounded sequenced replay, native MCP socket/nonce/kernel ancestry and exact
-pending native approval state. Tool forwarding must reach only the current
-fenced controller and pass fresh control-plane admission; worker possession of
-a local control key never supplies network authority. The native activation
-origin descriptor from observation receipts remains immutable across controller
-transport changes and is separate from bridge nonce and lease generation.
+The current internal owner runs the actual session.Manager, native Fake/Qwen/
+Codex/Grok drivers and Supervisor in the worker, owns the sole PTY reader and
+bounded sequenced replay, and retains exact native approval state. Native MCP
+uses a separate worker-owned socket, activation nonce and captured kernel
+process ancestry. Forwarding reaches only the current fenced controller with
+fresh control-plane admission. Before every actual process generation starts,
+the worker waits for its exact server-admitted source origin; reconnect does not
+rewrite that source or the actual runtime/profile. Native source observations
+have stable identities and original timestamps, wait for durable journal COMMIT,
+and remain until a transactionally fenced controller ciphertext-journal receipt.
+The actual native/two-controller subprocess fixture verifies uninterrupted PID,
+PTY, session, timer and approvals across replacement and a controller-free gap.
+
+The production daemon proxy and server admission/receipt integration are still
+under construction. Darwin owner-local permissions do not isolate an untrusted
+native process with the same UID; platform enablement requires an actual secure
+boundary, not the presence of a 0600 control key. Production update admission
+remains conservative until the complete pagnet serve replacement path is proven.
 
 Only actual worker/native and two-controller subprocess acceptance, followed by
 daemon routing migration and bridge/inspection/receipt integration, can justify

@@ -330,7 +330,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if b.build == a.build || b.lease <= a.lease {
 		t.Fatal("controller replacement was not independently built/fenced")
 	}
-	if r := a.intent(t, 5, "stale-controller", "input", input); r.Error != ErrFenced.Error() {
+	if r := a.intent(t, 5, "stale-controller", "input", input); r.Error == "" {
 		t.Fatalf("old controller retained native authority: %+v", r)
 	}
 	if r := b.intent(t, 4, "terminal-one", "input", input); r.Error != "" || r.Outcome == nil || r.Outcome.State != "completed" {

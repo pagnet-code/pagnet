@@ -151,14 +151,22 @@ func (j *Journal) PendingObservations(ctx context.Context, limit int) ([]NativeO
 
 // A controller acknowledges only after its ciphertext outbox COMMIT. Removing
 // this row never asserts a control-plane or browser receipt.
-func (j *Journal) AcknowledgeObservation(ctx context.Context, id, digest string) error {
+func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, digest string) error {
 	if id == "" || len(id) > 256 || len(digest) != 64 {
 		return errors.New("invalid native observation acknowledgement")
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, _, err = checkLease(ctx, tx, lease); err != nil {
+		return err
+	}
 	var previous string
-	err := j.db.QueryRowContext(ctx, `SELECT digest FROM worker_observations WHERE id=?`, id).Scan(&previous)
+	err = tx.QueryRowContext(ctx, `SELECT digest FROM worker_observations WHERE id=?`, id).Scan(&previous)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -168,6 +176,9 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, id, digest string)
 	if previous != digest {
 		return ErrConflict
 	}
-	_, err = j.db.ExecContext(ctx, `DELETE FROM worker_observations WHERE id=? AND digest=?`, id, digest)
-	return err
+	_, err = tx.ExecContext(ctx, `DELETE FROM worker_observations WHERE id=? AND digest=?`, id, digest)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }

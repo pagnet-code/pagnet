@@ -172,6 +172,7 @@ func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, 
 		}
 	}()
 	slots := make(chan struct{}, 4)
+	controllers := &currentController{}
 	var wg sync.WaitGroup
 	defer func() { cancel(); wg.Wait() }()
 	for {
@@ -191,12 +192,12 @@ func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, 
 		wg.Go(func() {
 			defer func() { <-slots }()
 			defer c.Close()
-			serveController(ctx, c, j, key, execute, owner, build)
+			serveController(ctx, c, j, key, execute, owner, build, controllers)
 		})
 	}
 }
 
-func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byte, execute IntentExecutor, owner *SessionOwner, build string) {
+func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byte, execute IntentExecutor, owner *SessionOwner, build string, controllers *currentController) {
 	if _, _, err := localpeer.Owner(c); err != nil {
 		return
 	}
@@ -221,6 +222,10 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 	if err != nil {
 		return
 	}
+	if !controllers.install(auth.Lease, c) {
+		return
+	}
+	defer controllers.release(auth.Lease, c)
 	if owner != nil {
 		owner.relay.bindLease(auth.Lease)
 		defer owner.relay.disconnect(auth.Lease)
@@ -387,7 +392,7 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 	case "observations":
 		response.Observations, err = o.journal.PendingObservations(ctx, req.Limit)
 	case "observation_ack":
-		err = o.journal.AcknowledgeObservation(ctx, req.ObservationID, req.SourceDigest)
+		err = o.journal.AcknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest)
 	case "admission":
 		if req.Admission == nil {
 			err = errors.New("fresh control-plane admission required")
@@ -409,4 +414,35 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		response.Error = err.Error()
 	}
 	return response
+}
+
+// Installation follows mutual authentication and durable lease acquisition.
+// Unauthenticated peers can never evict the current controller. Superseded
+// sockets close promptly so stale readers cannot exhaust bounded IPC slots.
+type currentController struct {
+	mu    sync.Mutex
+	lease int64
+	conn  *net.UnixConn
+}
+
+func (c *currentController) install(lease int64, conn *net.UnixConn) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if lease <= c.lease {
+		return false
+	}
+	old := c.conn
+	c.lease = lease
+	c.conn = conn
+	if old != nil {
+		_ = old.Close()
+	}
+	return true
+}
+func (c *currentController) release(lease int64, conn *net.UnixConn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lease == lease && c.conn == conn {
+		c.conn = nil
+	}
 }

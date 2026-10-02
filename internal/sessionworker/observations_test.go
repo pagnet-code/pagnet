@@ -44,10 +44,10 @@ func TestNativeSourceObservationDurableRetryAndControllerAcknowledgement(t *test
 	if err := reopened.JournalObservation(ctx, changed); !errors.Is(err, ErrConflict) {
 		t.Fatalf("retry renewed observation: %v", err)
 	}
-	if err := reopened.AcknowledgeObservation(ctx, source.ID, changed.SourceDigest); !errors.Is(err, ErrConflict) {
+	if err := reopened.AcknowledgeObservation(ctx, lease(t, reopened), source.ID, changed.SourceDigest); !errors.Is(err, ErrConflict) {
 		t.Fatalf("wrong-source ACK accepted: %v", err)
 	}
-	if err := reopened.AcknowledgeObservation(ctx, source.ID, source.SourceDigest); err != nil {
+	if err := reopened.AcknowledgeObservation(ctx, lease(t, reopened), source.ID, source.SourceDigest); err != nil {
 		t.Fatal(err)
 	}
 	page, err = reopened.PendingObservations(ctx, 32)
@@ -114,7 +114,7 @@ func TestNativeObserverBackpressureRetainsOriginalEvent(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	released := time.Now().UTC()
-	if err = j.AcknowledgeObservation(ctx, first.ID, first.SourceDigest); err != nil {
+	if err = j.AcknowledgeObservation(ctx, lease(t, j), first.ID, first.SourceDigest); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -135,5 +135,32 @@ func TestNativeObserverBackpressureRetainsOriginalEvent(t *testing.T) {
 	}
 	if actual.Event.TurnID != "actual-turn" || actual.ObservedAt.Before(started) || !actual.ObservedAt.Before(released) {
 		t.Fatal("backpressure replaced or renewed original native event")
+	}
+}
+
+func TestObservationAcknowledgementFencesInsideJournalMutation(t *testing.T) {
+	j, _ := testJournal(t)
+	ctx := context.Background()
+	observation := NativeObservation{ID: "retained-source", NativeGeneration: "generation", Origin: json.RawMessage(`{"id":"original-authority"}`), ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventIdle}}
+	observation.SourceDigest, _ = observationDigest(observation)
+	if err := j.JournalObservation(ctx, observation); err != nil {
+		t.Fatal(err)
+	}
+	old := lease(t, j)
+	// This reproduces the exact unsafe interleaving: preflight passed, then a
+	// replacement controller acquired ownership before the destructive receipt.
+	if err := j.CurrentLease(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	current := lease(t, j)
+	if err := j.AcknowledgeObservation(ctx, old, observation.ID, observation.SourceDigest); !errors.Is(err, ErrFenced) {
+		t.Fatalf("stale controller dropped source evidence: %v", err)
+	}
+	page, err := j.PendingObservations(ctx, 32)
+	if err != nil || len(page) != 1 {
+		t.Fatalf("stale ACK retired evidence: %+v %v", page, err)
+	}
+	if err := j.AcknowledgeObservation(ctx, current, observation.ID, observation.SourceDigest); err != nil {
+		t.Fatal(err)
 	}
 }

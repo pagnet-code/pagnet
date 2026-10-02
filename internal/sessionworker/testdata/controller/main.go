@@ -55,7 +55,7 @@ func main() {
 		response, err := controller.Call(ctx, req)
 		cancel()
 		if err != nil {
-			fatal(err)
+			response = sessionworker.Response{Error: err.Error()}
 		}
 		if err = encoder.Encode(response); err != nil {
 			fatal(err)

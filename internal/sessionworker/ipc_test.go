@@ -103,7 +103,7 @@ func TestPrivateIPCHandoffAndAuthentication(t *testing.T) {
 		t.Fatal("replacement controller has no new durable fence")
 	}
 	response, err = a.Call(ctx, Request{Type: "intent", Sequence: 2, CommandID: "old", Kind: "input", Payload: json.RawMessage(`{}`)})
-	if err != nil || response.Error != ErrFenced.Error() {
+	if err == nil && response.Error == "" {
 		t.Fatalf("old connection retained authority: %+v %v", response, err)
 	}
 	response, err = b.Call(ctx, request)
@@ -175,5 +175,29 @@ func TestPrivateIPCFreshNonceAndVersionFailClosed(t *testing.T) {
 	_, _ = oversized.Write(header[:])
 	if err := readFrame(oversized, &reply); err == nil {
 		t.Fatal("oversized unauthenticated frame accepted")
+	}
+}
+
+func TestAuthenticatedControllerReplacementReleasesConnectionSlots(t *testing.T) {
+	j, dir, key, _ := ipcFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var controllers []*Controller
+	for i := 0; i < 6; i++ {
+		c, err := DialController(ctx, dir, testScope(), key, "replacement")
+		if err != nil {
+			t.Fatalf("replacement %d blocked by stale connections: %v", i+1, err)
+		}
+		controllers = append(controllers, c)
+		defer c.Close()
+	}
+	for _, c := range controllers[:len(controllers)-1] {
+		response, err := c.Call(ctx, Request{Type: "outcome", Sequence: 1})
+		if err == nil && response.Error == "" {
+			t.Fatal("superseded connection retained authority")
+		}
+	}
+	if err := j.CurrentLease(ctx, controllers[len(controllers)-1].Lease); err != nil {
+		t.Fatal(err)
 	}
 }
