@@ -38,7 +38,8 @@ type NativeWorkerRegistry struct {
 	mu   sync.Mutex
 }
 
-func privateNativeRegistryDir(path string) error {
+func privateNativeRegistryDir(path string) error { return privateNativeRegistryPath(path, true) }
+func privateNativeRegistryPath(path string, exact bool) error {
 	if !filepath.IsAbs(path) {
 		return errors.New("native registry path must be absolute")
 	}
@@ -49,7 +50,7 @@ func privateNativeRegistryDir(path string) error {
 		}
 		if p == filepath.Clean(path) {
 			stat, ok := info.Sys().(*syscall.Stat_t)
-			if !ok || stat.Uid != uint32(os.Getuid()) || info.Mode().Perm() != 0700 {
+			if !ok || stat.Uid != uint32(os.Getuid()) || (exact && info.Mode().Perm() != 0700) || (!exact && info.Mode().Perm()&0022 != 0) {
 				return errors.New("native registry directory is not private")
 			}
 		}
@@ -65,7 +66,7 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 		return nil, errors.New("native state path must be absolute")
 	}
 	// Reject symlinked ancestors before creating descendants.
-	if err := privateNativeRegistryDir(stateDir); err != nil {
+	if err := privateNativeRegistryPath(stateDir, false); err != nil {
 		return nil, err
 	}
 	if err := os.Mkdir(root, 0700); err != nil && !os.IsExist(err) {

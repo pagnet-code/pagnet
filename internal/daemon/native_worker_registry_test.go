@@ -256,3 +256,32 @@ func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) 
 	// The synthetic child exits naturally; the helper never kills uncertain PIDs.
 	time.Sleep(320 * time.Millisecond)
 }
+
+func TestNativeWorkerRegistryAcceptsSafeParentWithoutChangingPermissions(t *testing.T) {
+	for _, mode := range []os.FileMode{0755, 0777} {
+		parent := t.TempDir()
+		if err := os.Chmod(parent, mode); err != nil {
+			t.Fatal(err)
+		}
+		registry, err := OpenNativeWorkerRegistry(parent)
+		if mode == 0777 {
+			if err == nil {
+				registry.Close()
+				t.Fatal("writable daemon state parent accepted")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal("safe existing daemon parent refused", err)
+		}
+		defer registry.Close()
+		info, err := os.Stat(parent)
+		if err != nil || info.Mode().Perm() != mode {
+			t.Fatal("daemon parent permissions silently changed", err)
+		}
+		child, err := os.Stat(registry.root)
+		if err != nil || child.Mode().Perm() != 0700 {
+			t.Fatal("private registry child not protected", err)
+		}
+	}
+}
