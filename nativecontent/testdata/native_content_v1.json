@@ -142,6 +142,8 @@
   },
   {
     "name": "owner_inspection",
+    "approvalProofOptionId": "once",
+    "approvalProof": "HePqv57PR7VL94Te9483tXcgaTaQ4P35DYf0dSJKz2c=",
     "epochKeyHex": "0100000000000000000000000000000000000000000000000000000000000000",
     "plaintext": "{\"format\":\"pagnet.owner_interaction.v1\",\"summary\":\"Inspect \\u003c\\u003e\\u0026 € before allowing\",\"nativePayload\":{\"arguments\":\"example\"},\"inspection\":{\"secret\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\",\"instanceId\":\"00000000-0000-0000-0000-000000000004\",\"sessionId\":\"session \\u003c\\u003e\\u0026 € \\u2028\\u2029 \\\\ \\\"\\n\",\"nativeInteractionId\":\"native-request\"}}",
     "plaintextDigest": "820bc3bb6a953a49b94462bae67cc5b33c3472d8c1493b4b18f46de595037c61",

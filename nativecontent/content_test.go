@@ -2,6 +2,7 @@ package nativecontent
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -186,15 +187,17 @@ func TestNativeContentMaximumSourceFitsEveryEncodedFrame(t *testing.T) {
 
 func TestNativeContentCommittedCrossLanguageVectors(t *testing.T) {
 	type vector struct {
-		Name                 string
-		EpochKeyHex          string
-		Plaintext            string
-		PlaintextDigest      string
-		Reference            transport.NativeContentReference
-		Fragments            []transport.NativeContentFragment
-		ManifestAADCanonical string
-		FragmentAADCanonical []string
-		FragmentIDs          []string
+		Name                  string
+		ApprovalProof         string `json:"approvalProof"`
+		ApprovalProofOptionID string `json:"approvalProofOptionId"`
+		EpochKeyHex           string
+		Plaintext             string
+		PlaintextDigest       string
+		Reference             transport.NativeContentReference
+		Fragments             []transport.NativeContentFragment
+		ManifestAADCanonical  string
+		FragmentAADCanonical  []string
+		FragmentIDs           []string
 	}
 	raw, err := os.ReadFile("testdata/native_content_v1.json")
 	if err != nil {
@@ -227,6 +230,20 @@ func TestNativeContentCommittedCrossLanguageVectors(t *testing.T) {
 			opened, _, err := Open(v.Reference, v.Fragments, key)
 			if err != nil || string(opened) != v.Plaintext || digest(opened) != v.PlaintextDigest {
 				t.Fatal("committed vector cannot authenticate whole original content", err)
+			}
+			if v.ApprovalProof != "" {
+				var detail transport.OwnerInteractionDetail
+				if err := json.Unmarshal(opened, &detail); err != nil {
+					t.Fatal(err)
+				}
+				secret, err := base64.StdEncoding.DecodeString(detail.Inspection.Secret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				proof, err := e2ee.ApprovalProof(secret, v.Reference.ManifestAAD, detail.Inspection.InstanceID, detail.Inspection.SessionID, detail.Inspection.NativeInteractionID, v.ApprovalProofOptionID)
+				if err != nil || base64.StdEncoding.EncodeToString(proof) != v.ApprovalProof {
+					t.Fatal("committed whole-manifest inspection proof changed", err)
+				}
 			}
 		})
 	}
