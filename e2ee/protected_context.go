@@ -48,6 +48,9 @@ func (c ProtectedContext) Validate() error {
 	return nil
 }
 func (a AAD) ValidateScope() error {
+	if err := a.validateNativeContentBinding(); err != nil {
+		return err
+	}
 	if a.ProtectedContext == nil {
 		if a.NetworkID == "" {
 			return errors.New("missing protected content scope")

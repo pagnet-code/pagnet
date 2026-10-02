@@ -34,7 +34,7 @@ func CEKSize() int { return cekSize }
 // aad.KeyEpochID must be set: it becomes the envelope's key_epoch_id and
 // binds the object to the epoch.
 func Encrypt(plaintext []byte, epochKey [32]byte, aad AAD) (EncryptedPayloadV1, error) {
-	if aad.ProtectedContext != nil {
+	if aad.ProtectedContext != nil || aad.NativeContent != nil {
 		if err := aad.ValidateScope(); err != nil {
 			return EncryptedPayloadV1{}, err
 		}
@@ -89,7 +89,7 @@ func encryptCore(plaintext []byte, epochKey, cek [32]byte, aad AAD, nonce, nonce
 // one used at encryption and GCM authentication fails. The envelope's
 // key_epoch_id must also match aad.KeyEpochID.
 func Decrypt(env EncryptedPayloadV1, epochKey [32]byte, aad AAD) ([]byte, error) {
-	if aad.ProtectedContext != nil {
+	if aad.ProtectedContext != nil || aad.NativeContent != nil {
 		if err := aad.ValidateScope(); err != nil {
 			return nil, err
 		}

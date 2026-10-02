@@ -13,16 +13,17 @@ package e2ee
 // CreatedAt is a deterministic RFC3339 UTC string (not a time.Time) so the
 // canonical bytes are stable across implementations.
 type AAD struct {
-	ProtocolVersion  int               `json:"protocol_version"`
-	TenantID         string            `json:"tenant_id"`
-	NetworkID        string            `json:"network_id"`
-	ObjectType       string            `json:"object_type"`
-	ObjectID         string            `json:"object_id"`
-	Sender           string            `json:"sender"`
-	Recipient        string            `json:"recipient"`
-	CreatedAt        string            `json:"created_at"`
-	KeyEpochID       string            `json:"key_epoch_id"`
-	ProtectedContext *ProtectedContext `json:"protected_context,omitempty"`
+	ProtocolVersion  int                   `json:"protocol_version"`
+	TenantID         string                `json:"tenant_id"`
+	NetworkID        string                `json:"network_id"`
+	ObjectType       string                `json:"object_type"`
+	ObjectID         string                `json:"object_id"`
+	Sender           string                `json:"sender"`
+	Recipient        string                `json:"recipient"`
+	CreatedAt        string                `json:"created_at"`
+	KeyEpochID       string                `json:"key_epoch_id"`
+	ProtectedContext *ProtectedContext     `json:"protected_context,omitempty"`
+	NativeContent    *NativeContentBinding `json:"native_content,omitempty"`
 }
 
 // CanonicalBytes returns the canonical serialization of the AAD: compact
