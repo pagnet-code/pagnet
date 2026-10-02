@@ -404,7 +404,12 @@ func (j *Journal) Settle(ctx context.Context, sequence int64, state string, resu
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	res, err := j.db.ExecContext(ctx, `UPDATE worker_intent SET state=?,result=? WHERE sequence=? AND state='admitted'`, state, []byte(result), sequence)
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE worker_intent SET state=?,result=? WHERE sequence=? AND state='admitted'`, state, []byte(result), sequence)
 	if err != nil {
 		return err
 	}
@@ -415,7 +420,14 @@ func (j *Journal) Settle(ctx context.Context, sequence int64, state string, resu
 	if n != 1 {
 		return ErrConflict
 	}
-	return nil
+	if state != "uncertain" {
+		// A trusted worker outcome before ANY native binding/evidence used no
+		// producer reservation. No accepted source or uncertain effect is erased.
+		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_reservations WHERE sequence=? AND NOT EXISTS(SELECT 1 FROM worker_turn_sources WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_output_spools WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions WHERE sequence=?) AND NOT EXISTS(SELECT 1 FROM worker_observations WHERE json_extract(payload,'$.turnSource.sequence')=?)`, sequence, sequence, sequence, sequence, sequence); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (j *Journal) Outcome(ctx context.Context, sequence int64) (out Outcome, err error) {

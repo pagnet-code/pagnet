@@ -85,6 +85,17 @@ func testActualNativeTask(t *testing.T, reject bool) {
 	if err != nil || !execute {
 		t.Fatal(err)
 	}
+	reserve, reserveErr := j.db.BeginTx(ctx, nil)
+	if reserveErr != nil {
+		t.Fatal(reserveErr)
+	}
+	if reserveErr = j.reserveTerminalTx(ctx, reserve, 1, "prompt"); reserveErr != nil {
+		reserve.Rollback()
+		t.Fatal(reserveErr)
+	}
+	if reserveErr = reserve.Commit(); reserveErr != nil {
+		t.Fatal(reserveErr)
+	}
 	owner.Execute(out, raw)
 	if reject {
 		var inspection *Inspection

@@ -162,6 +162,11 @@ func TestNativeSourceReservationPrecedesAcceptanceAndSurvivesReopen(t *testing.T
 	if err != nil || !run || out.SourceAdmission == nil || sourceCount(t, j, "worker_terminal_reservations") != 1 {
 		t.Fatal("native effect lacks durable original reservation", err)
 	}
+	// Accepted native binding still has no genuine final capture: outcome
+	// settlement alone must not free this original producer's future budget.
+	if err = j.BindNativeTurn(ctx, NativeTurnSource{Sequence: 1, LogicalTurnID: logicalWorkerTurn(1), NativeGeneration: "original-A", NativeSessionID: "session-A", SourceCommandID: "original-command-A", SourceAdmissionID: "original-admission-A", InputKind: "task"}); err != nil {
+		t.Fatal(err)
+	}
 	if err = j.Settle(ctx, 1, "completed", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}

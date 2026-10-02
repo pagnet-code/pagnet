@@ -75,6 +75,9 @@ func consumeTerminalReservationTx(ctx context.Context, tx *sql.Tx, observation N
 	if terminal != "" && (isFinal || observation.Event.Type == session.EventTurnOutput || observation.Event.Type == session.EventPlanUpdated || observation.Event.Type == session.EventTurnStarted) {
 		return false, ErrConflict
 	}
+	if terminal != "" && rows == 0 {
+		return false, nil
+	}
 	minimumRows, minimumCapture, minimumContent := 0, 0, 0
 	if !isFinal && terminal == "" {
 		minimumRows, minimumCapture, minimumContent = 2, terminalCaptureReserveBytes/2, terminalContentReserveBytes/2
@@ -99,6 +102,16 @@ func consumeTerminalReservationTx(ctx context.Context, tx *sql.Tx, observation N
 	if observation.Event.Type == session.EventTurnCompleted || observation.Event.Type == session.EventTurnFailed {
 		terminal = observation.ID
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET observation_id=?,rows_left=rows_left-1,capture_left=capture_left-?,content_left=content_left-? WHERE sequence=?`, terminal, captureBytes, contentBytes, observation.TurnSource.Sequence)
+	if isFinal {
+		// All prior output was flushed before this complete genuine terminal
+		// capture. Release UNUSED future capacity in this same FULL commit;
+		// retain the terminal identity and all evidence until a real receipt.
+		_, err = tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET observation_id=?,rows_left=1,capture_left=MIN(capture_left-?,?),content_left=0 WHERE sequence=?`, terminal, captureBytes, sourceStopReserveBytes, observation.TurnSource.Sequence)
+	} else if terminal != "" {
+		// One trailing native status/idle callback has reserved metadata space.
+		_, err = tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET rows_left=0,capture_left=0,content_left=0 WHERE sequence=?`, observation.TurnSource.Sequence)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET observation_id=?,rows_left=rows_left-1,capture_left=capture_left-?,content_left=content_left-? WHERE sequence=?`, terminal, captureBytes, contentBytes, observation.TurnSource.Sequence)
+	}
 	return true, err
 }

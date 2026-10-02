@@ -83,6 +83,18 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	plan := &session.PlanSnapshot{Source: "codex", NativeTurnID: "actual-vendor-turn", Entries: []session.PlanEntry{{Text: "private original plan", Status: "in_progress"}}}
 	emit(session.SessionEvent{Type: session.EventPlanUpdated, Plan: plan})
 	emit(session.SessionEvent{Type: session.EventTurnCompleted})
+	if err = j.Settle(ctx, 1, "completed", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	retained := sourceCount(t, j, "worker_observations")
+	// A full genuine final capture releases unused future capacity, while
+	// every original source cipher remains unacknowledged and recoverable.
+	if _, run, err := j.admit(ctx, current, 2, "next-original-operation", "prompt", json.RawMessage(`{}`), func() (*Admission, error) { return &Admission{Scope: scope}, nil }); err != nil || !run {
+		t.Fatal("captured final kept unused capacity hostage", err)
+	}
+	if sourceCount(t, j, "worker_observations") != retained {
+		t.Fatal("capacity release deleted original evidence")
+	}
 	registration.Retire()
 	owner.nativeObserverWG.Wait()
 	if len(owner.taskContentPins) != 0 {
