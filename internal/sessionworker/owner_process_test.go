@@ -293,13 +293,13 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 			t.Fatal("native process read its worker's private control key")
 		}
 	}
-	if r := a.intent(t, 2, "memory-one", "prompt", Operation{Input: "let keep preserved", InputKind: "task", SourceCommandID: "another-delivery"}); r.Error != "" {
+	if r := a.intent(t, 2, "memory-one", "prompt", Operation{Input: "let keep preserved", InputKind: "user_input", SourceCommandID: "another-delivery"}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
 	if out := a.outcome(t, 2); out.State != "completed" {
 		t.Fatal(out)
 	}
-	if r := a.intent(t, 3, "long-turn-one", "prompt", Operation{Input: "continue native work across controller replacement", InputKind: "task", SourceCommandID: "long-delivery-A"}); r.Error != "" {
+	if r := a.intent(t, 3, "long-turn-one", "prompt", Operation{Input: "continue native work across controller replacement", InputKind: "user_input", SourceCommandID: "long-delivery-A"}); r.Error != "" {
 		t.Fatal(r.Error)
 	}
 	var waiting NativeSnapshot
@@ -573,7 +573,7 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 			}
 			if interaction.Resolved && observation.InteractionID == originalInspection.InteractionID {
 				permissionResolved = true
-				if observation.TurnSource == nil || observation.TurnSource.SourceCommandID != "long-delivery-A" || observation.TurnSource.SourceAdmissionID != originalSourceAdmissionID || observation.TurnSource.InputKind != "task" {
+				if observation.TurnSource == nil || observation.TurnSource.SourceCommandID != "long-delivery-A" || observation.TurnSource.SourceAdmissionID != originalSourceAdmissionID || observation.TurnSource.InputKind != "user_input" {
 					t.Fatalf("native resolution lost original delivery admission across controller replacement: source=%+v eventTurn=%s expectedAdmission=%s", observation.TurnSource, observation.Event.TurnID, originalSourceAdmissionID)
 				}
 			}

@@ -283,3 +283,42 @@ func taskSourceJSON(source *transport.NativeTaskSource) string {
 	encoded, _ := json.Marshal(source)
 	return string(encoded)
 }
+
+// Completed native sources remain immutable journal evidence, but no longer
+// impersonate a managed turn for genuine human/background endpoint calls.
+// Unknown/uncertain history and failed reads never become endpoint authority.
+func (j *Journal) activeNativeBridgeSource(ctx context.Context, generation, sessionID, turn string) (*NativeTurnSource, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	source, err := readNativeTurn(ctx, tx, generation, turn)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if source.NativeSessionID != sessionID {
+		return nil, ErrConflict
+	}
+	var completed int
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT t.completed,COALESCE(w.state,'retired') FROM worker_turn_sources t LEFT JOIN worker_intent w ON w.sequence=t.sequence WHERE t.native_generation=? AND t.logical_turn=?`, generation, turn).Scan(&completed, &state)
+	if err != nil {
+		return nil, err
+	}
+	if state == "uncertain" {
+		return nil, ErrConflict
+	}
+	if completed == 1 {
+		return nil, nil
+	}
+	if completed != 0 || state == "retired" {
+		return nil, ErrConflict
+	}
+	return &source, nil
+}

@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
-	"github.com/pagnet-code/pagnet/internal/session"
 )
 
 // Admission is the current controller's public control-plane session binding.
@@ -343,7 +342,13 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 			cancel()
 			return
 		}
-		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, NativeSessionID: sid, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: o.activeBridgeTurnSource(callCtx, generation)})
+		source, sourceErr := o.activeBridgeTurnSource(callCtx, generation)
+		if sourceErr != nil {
+			cancel()
+			_ = bridgeWrite(c, map[string]any{"id": req.ID, "ok": false, "error": "native source unavailable"})
+			continue
+		}
+		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, NativeSessionID: sid, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: source})
 		cancel()
 		result.ID = req.ID
 		if bridgeWrite(c, result) != nil {
@@ -382,33 +387,36 @@ func (b *relayBroker) authorizeNativeEffect(lease int64) (*Admission, error) {
 
 // Native requests cannot nominate a source. Read the actual accepted turn and
 // require its still-held original producer capability before forwarding it.
-func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation string) *NativeTurnSource {
+func (o *SessionOwner) activeBridgeTurnSource(ctx context.Context, generation string) (*NativeTurnSource, error) {
 	o.mu.Lock()
 	candidate := o.candidateTurnSource
 	valid := o.generation == generation && !o.closing
 	o.mu.Unlock()
-	if !valid || candidate.Sequence <= 0 {
-		return nil
+	if !valid {
+		return nil, ErrFenced
+	}
+	if candidate.Sequence <= 0 {
+		return nil, nil
 	}
 	sid, ok := o.manager.TryNativeID(o.journal.scope.InstanceID)
 	if !ok || sid == "" {
-		return nil
+		return nil, ErrConflict
 	}
-	source, unavailable, err := o.journal.NativeEventSource(ctx, generation, session.SessionEvent{SessionID: sid, TurnID: logicalWorkerTurn(candidate.Sequence)})
-	if err != nil || unavailable || source == nil {
-		return nil
+	source, err := o.journal.activeNativeBridgeSource(ctx, generation, sid, logicalWorkerTurn(candidate.Sequence))
+	if err != nil || source == nil {
+		return nil, err
 	}
 	if source.InputKind != "task" {
-		return source
+		return source, nil
 	}
 	if source.SourceTask == nil {
-		return nil
+		return nil, ErrConflict
 	}
 	key, available := o.originalTaskContentPin(source)
 	clear(key[:])
 	if !available {
-		return nil
+		return nil, ErrConflict
 	}
 	source.SourceTask = cloneNativeTaskSource(source.SourceTask)
-	return source
+	return source, nil
 }
