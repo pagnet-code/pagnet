@@ -251,7 +251,7 @@ func (d *ClaudePersistent) Activate(ctx context.Context, s *session.RuntimeSessi
 	e := &claudeEndpoint{h: h, in: in, out: out, done: make(chan struct{}), writes: make(chan acpWrite, 16), events: make(chan session.SessionEvent, 128), controls: map[string]chan error{}, permissions: map[string]claudePermission{}, background: map[string]bool{}, nativeID: id, started: time.Now()}
 	if d.NativeEventObserverRegistrationFactory != nil {
 		r := d.NativeEventObserverRegistrationFactory(s.InstanceID)
-		e.observer = r.Observe
+		e.observer = resourceBoundObserver(r.Observe, h.Terminate)
 		e.retire = r.Retire
 	}
 	go e.writeLoop()

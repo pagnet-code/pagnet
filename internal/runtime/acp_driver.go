@@ -237,7 +237,7 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 	if planSource == "" {
 		planSource = "acp"
 	}
-	e := &acpEndpoint{planSource: planSource, observer: registration.Observe, handle: h, id: string(domain.NewID()), started: time.Now(), permissions: map[string]acpPermission{}, tools: map[string]bool{}, resolutions: make(chan *session.InteractionEvent, 32)}
+	e := &acpEndpoint{planSource: planSource, observer: resourceBoundObserver(registration.Observe, h.Terminate), handle: h, id: string(domain.NewID()), started: time.Now(), permissions: map[string]acpPermission{}, tools: map[string]bool{}, resolutions: make(chan *session.InteractionEvent, 32)}
 	e.conn = newOwnedACPConnection(in, out, func() {
 		e.resolutionGate.Lock()
 		defer e.resolutionGate.Unlock()
