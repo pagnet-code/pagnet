@@ -17,6 +17,8 @@ func LifecycleSourceType(eventType string) string {
 	switch eventType {
 	case session.EventSessionStarted, session.EventSessionResumed:
 		return "host.runtime_session"
+	case session.EventSessionStopped:
+		return "host.agent_stopped"
 	case session.EventBusy, session.EventIdle:
 		return "host.agent_status"
 	default:

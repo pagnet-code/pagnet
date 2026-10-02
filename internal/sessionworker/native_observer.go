@@ -231,7 +231,7 @@ func nativeInteractionIdentity(scope Scope, origin json.RawMessage, generation, 
 // explicit lifecycle/turn/plan/interaction evidence enters the source outbox.
 func durableNativeEvent(event session.SessionEvent) bool {
 	switch event.Type {
-	case session.EventSessionStarted, session.EventSessionResumed, session.EventSessionLost, session.EventSessionIdentityChanged, session.EventBusy, session.EventIdle, session.EventTurnStarted, session.EventPlanUpdated, session.EventTurnCompleted, session.EventTurnFailed, session.EventInteractionStarted, session.EventInteractionResolved:
+	case session.EventSessionStopped, session.EventSessionStarted, session.EventSessionResumed, session.EventSessionLost, session.EventSessionIdentityChanged, session.EventBusy, session.EventIdle, session.EventTurnStarted, session.EventPlanUpdated, session.EventTurnCompleted, session.EventTurnFailed, session.EventInteractionStarted, session.EventInteractionResolved:
 		return true
 	default:
 		return false

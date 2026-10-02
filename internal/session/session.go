@@ -460,6 +460,7 @@ type SessionEvent struct {
 // match the existing host-protocol vocabulary so the daemon can forward
 // them without reshaping.
 const (
+	EventSessionStopped         = "runtime.session.stopped"
 	EventSessionStarted         = "runtime.session.started"
 	EventSessionResumed         = "runtime.session.resumed"
 	EventSessionLost            = "runtime.session.lost"
