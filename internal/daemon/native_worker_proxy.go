@@ -140,7 +140,7 @@ func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeS
 // lane cannot submit native intents, resolve an approval, or relay a tool.
 func (p *NativeWorkerProxy) SourceCall(ctx context.Context, request sessionworker.Request) (sessionworker.Response, error) {
 	switch request.Type {
-	case "observations", "content_fragment", "source_capture", "observation_ack":
+	case "observations", "content_fragment", "source_capture", "observation_ack", "source_disposition", "source_dispositions":
 		return p.call(ctx, request)
 	default:
 		return sessionworker.Response{}, errors.New("unsupported native source journal request")
