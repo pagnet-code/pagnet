@@ -4126,13 +4126,22 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	if d.sessionDriverFor(row) != nil {
 		return d.attachSessionDriven(conn, p, row)
 	}
-	d.addAttach(p.InstanceID, p.SessionID)
-
 	s, err := d.terminal.start(p.InstanceID, row.SessionID != "")
 	if err != nil {
-		d.removeAttach(p.InstanceID, p.SessionID)
 		return err
 	}
+	// Bind the viewer to the current generation atomically with exit
+	// claiming. A retiring PTY cannot capture a replacement's viewer.
+	d.terminal.mu.Lock()
+	current := d.terminal.sessions[p.InstanceID] == s && !s.killed && s.exitSettled == nil
+	if current {
+		d.addAttach(p.InstanceID, p.SessionID)
+	}
+	d.terminal.mu.Unlock()
+	if !current {
+		return ErrDeferred
+	}
+
 	// Wake semantics: a hibernated instance becomes awake (idle) once its
 	// interactive process is running. A busy instance simply keeps its
 	// turn (process-per-turn) while the PTY runs alongside it.

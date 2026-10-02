@@ -87,6 +87,9 @@ type ptySession struct {
 	// killed marks an explicit Stop: the exit watcher must NOT emit the
 	// natural-exit (hibernated) event — the stopper owns instance state.
 	killed bool
+	// exitSettled reserves this generation while its natural exit is published.
+	// Replacement waits without holding the global terminal map lock.
+	exitSettled chan struct{}
 
 	// endpointView marks a Phase 3 (terminal session unification) session
 	// on a session-driven endpoint's OWN TUI PTY — the always-on CAPTURE
@@ -425,6 +428,10 @@ func (tm *terminalManager) activeCount() int {
 func (tm *terminalManager) start(instanceID string, resume bool) (*ptySession, error) {
 	tm.mu.Lock()
 	if s := tm.sessions[instanceID]; s != nil {
+		if s.exitSettled != nil {
+			tm.mu.Unlock()
+			return nil, ErrDeferred
+		}
 		tm.mu.Unlock()
 		return tm.awaitLive(s)
 	}
@@ -795,17 +802,44 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 	// is what releases the PTY and unblocks the read loop.
 	waitErr := s.h.Wait()
 	_ = s.f.Close() // backstop: the master already errored when the group died
+	tm.finishExitedPTY(s, waitErr)
+}
+
+// finishExitedPTY publishes lifecycle effects only for the retiring owner.
+func (tm *terminalManager) finishExitedPTY(s *ptySession, waitErr error) {
 	tm.mu.Lock()
-	killed := false
-	if tm.sessions[s.instanceID] == s {
+	// Only this generation may publish lifecycle effects. Explicit stop
+	// removes its slot before the reaper returns; a replacement can already
+	// own the instance when this watcher runs.
+	owned := tm.sessions[s.instanceID] == s
+	killed := s.killed
+	var ended []string
+	if owned && !killed {
+		s.exitSettled = make(chan struct{})
 		tm.stopInputLocked(s)
-		delete(tm.sessions, s.instanceID)
-		delete(tm.lastSize, s.instanceID)
-		killed = s.killed
+		tm.d.attachMu.Lock()
+		for sessionID := range tm.d.attaches[s.instanceID] {
+			ended = append(ended, sessionID)
+		}
+		tm.d.attachMu.Unlock()
 	}
 	tm.mu.Unlock()
-	if killed {
+	if !owned || killed {
 		return
+	}
+	defer func() {
+		tm.mu.Lock()
+		if tm.sessions[s.instanceID] == s {
+			delete(tm.sessions, s.instanceID)
+			delete(tm.lastSize, s.instanceID)
+		}
+		close(s.exitSettled)
+		tm.mu.Unlock()
+	}()
+	for _, sessionID := range ended {
+		_ = tm.d.send(nil, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+			InstanceID: s.instanceID, SessionID: sessionID, ClosedReason: "process_exited",
+		})
 	}
 	row, ok, _ := tm.d.state.GetInstance(s.instanceID)
 	if !ok {
@@ -821,10 +855,9 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 	_ = tm.d.state.SetInstanceStatus(s.instanceID, "hibernated", row.SessionID)
 	tm.d.send(nil, transport.MsgAgentHibernated, map[string]any{
 		"instanceId": s.instanceID, "sessionId": row.SessionID,
-		// The PTY process itself exited: terminal clients must be told
-		// (other hibernate reasons must not tear down a fresh session's
-		// clients — see the server's MsgAgentHibernated handler).
-		"reason": "process_exited",
+		// Viewers of this generation were closed individually above. An
+		// instance-wide close would also terminate a newly requested view.
+		"reason": "terminal_exited",
 	})
 	tm.d.reportEndpointStatus(nil, s.instanceID) // offline (hibernated)
 	tm.d.Log.Info("pty exited; instance hibernated (session preserved)",
@@ -854,6 +887,11 @@ func (tm *terminalManager) stop(instanceID string) {
 	}
 	tm.mu.Lock()
 	if tm.sessions[instanceID] == s {
+		if done := s.exitSettled; done != nil {
+			tm.mu.Unlock()
+			<-done
+			return
+		}
 		s.killed = true
 		tm.stopInputLocked(s)
 		delete(tm.sessions, instanceID)
