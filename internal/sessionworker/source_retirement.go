@@ -285,3 +285,25 @@ func (j *Journal) sourceStopReservationsLocked() int {
 	}
 	return count
 }
+
+// requireNativeReadersQuiesced fences explicit fresh restart until every old
+// reader has committed its final capture and surrendered its append capability.
+// Pending ciphertext remains untouched; backend origin admission still orders
+// receipt delivery before accepting a replacement native generation.
+func (j *Journal) requireNativeReadersQuiesced(ctx context.Context) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for producer := range j.sourceProducers {
+		if !producer.closed {
+			return session.ErrBusy
+		}
+	}
+	var active int
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_source_registration WHERE quiesced=0`).Scan(&active); err != nil {
+		return err
+	}
+	if active != 0 {
+		return session.ErrBusy
+	}
+	return nil
+}

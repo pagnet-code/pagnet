@@ -349,13 +349,62 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	return m.ensureActive(ctx, sess, events, false)
 }
 
+// StartFresh deliberately starts a new logical native conversation after an
+// explicit stop. It is never an automatic fallback for a missing resume. The
+// caller must stop and join the original native reader before requesting this.
+// Original persisted conversation files are preserved for historical recovery.
+func (m *Manager) StartFresh(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent) (*RuntimeEndpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	prompt := m.promptLock(sess.InstanceID)
+	if !prompt.TryLock() {
+		return nil, ErrBusy
+	}
+	defer prompt.Unlock()
+	activation := m.activationLock(sess.InstanceID)
+	activation.Lock()
+	defer activation.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	d := m.driverLocked(sess.Runtime)
+	if d == nil {
+		return nil, fmt.Errorf("session: no driver registered for runtime %q", sess.Runtime)
+	}
+	if d.Live(sess.InstanceID) {
+		return nil, ErrBusy
+	}
+	m.mu.Lock()
+	if sess.Ownership == OwnershipExternal || sess.Endpoint != nil && sess.Endpoint.Ownership == OwnershipExternal {
+		m.mu.Unlock()
+		return nil, errors.New("session: explicit fresh activation requires pagnet ownership")
+	}
+	sess.NativeID = ""
+	sess.Materialised = false
+	sess.State = StateInactive
+	sess.Endpoint = nil
+	sess.NativeBusy = false
+	sess.PendingInteractions = map[string]bool{}
+	m.mu.Unlock()
+	return m.ensureActiveLocked(ctx, sess, events, true, true)
+}
+
 // ownsPrompt is true only for submitPrompt, which already holds promptLock.
 func (m *Manager) ensureActive(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent, ownsPrompt bool) (*RuntimeEndpoint, error) {
 	lock := m.activationLock(sess.InstanceID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	m.refreshNativeMaterialisation(sess.InstanceID)
+	return m.ensureActiveLocked(ctx, sess, events, ownsPrompt, false)
+}
+
+// ensureActiveLocked requires the activation lock. Explicit fresh activation
+// holds it across the reset and launch so ordinary resume cannot race the reset.
+func (m *Manager) ensureActiveLocked(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent, ownsPrompt, fresh bool) (*RuntimeEndpoint, error) {
+	if !fresh {
+		m.refreshNativeMaterialisation(sess.InstanceID)
+	}
 	// Read the state AND the endpoint under the lock (the endpoint is
 	// mutated by activation/hibernation; a torn read would let a stale
 	// endpoint escape the liveness check below). This read happens AFTER

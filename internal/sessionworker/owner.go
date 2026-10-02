@@ -303,6 +303,20 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 				break
 			}
 			o.mu.Lock()
+			blocked := o.fatal
+			if blocked == nil {
+				blocked = o.observationBlocked
+			}
+			o.mu.Unlock()
+			if blocked == nil {
+				blocked = o.journal.requireNativeReadersQuiesced(o.ctx)
+			}
+			if blocked != nil {
+				o.prompt.Unlock()
+				err = blocked
+				break
+			}
+			o.mu.Lock()
 			o.candidateAdmission = out.SourceAdmission
 			o.candidateCommandID = op.SourceCommandID
 			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind}
@@ -317,7 +331,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 					}
 				}
 			}()
-			_, err = o.manager.EnsureActive(o.ctx, o.sess, events)
+			_, err = o.manager.StartFresh(o.ctx, o.sess, events)
 			close(events)
 			<-drained
 			o.prompt.Unlock()
