@@ -358,6 +358,7 @@ const (
 
 // LaunchAgentPayload is a structured launch command (never shell).
 type LaunchAgentPayload struct {
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
 	// CommandID provides idempotency across reconnects/resends.
 	CommandID string `json:"commandId"`
 	// InstanceID is pre-allocated by the control plane.
@@ -451,9 +452,10 @@ type LaunchAgentPayload struct {
 // stored runtime session and starts a turn for the queued work.
 // wakeRequestId provides idempotency across reconnects/resends.
 type WakeAgentPayload struct {
-	WakeRequestID string `json:"wakeRequestId"`
-	InstanceID    string `json:"instanceId"`
-	Reason        string `json:"reason"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	WakeRequestID  string               `json:"wakeRequestId"`
+	InstanceID     string               `json:"instanceId"`
+	Reason         string               `json:"reason"`
 }
 
 // RequestInventoryPayload asks the host to rescan runtimes/workspaces and
@@ -536,8 +538,9 @@ type StopAgentPayload struct {
 
 // RestartAgentPayload restarts an agent instance.
 type RestartAgentPayload struct {
-	CommandID  string `json:"commandId"`
-	InstanceID string `json:"instanceId"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	CommandID      string               `json:"commandId"`
+	InstanceID     string               `json:"instanceId"`
 }
 
 // ForgetInstancePayload tells the daemon an instance was deleted on the
@@ -551,8 +554,9 @@ type ForgetInstancePayload struct {
 // NetworkEventPayload is an inbound work/notification for a managed agent
 // (ASK, TASK, NOTICE, STATUS, or user terminal input).
 type NetworkEventPayload struct {
-	CommandID  string `json:"commandId"`
-	InstanceID string `json:"instanceId"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	CommandID      string               `json:"commandId"`
+	InstanceID     string               `json:"instanceId"`
 	// MessageID is set when the work is a durable message: a clean command
 	// ack marks that message delivered (message.delivered). A failed turn
 	// acks with an error, so the message stays pending for re-delivery.
@@ -726,10 +730,11 @@ type WorkspaceReport struct {
 // Terminal is always true — kept on the wire because an in-flight older
 // daemon still branches on it.
 type TerminalAttachPayload struct {
-	CommandID  string `json:"commandId"`
-	InstanceID string `json:"instanceId"`
-	SessionID  string `json:"sessionId"`
-	Terminal   bool   `json:"terminal,omitempty"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	CommandID      string               `json:"commandId"`
+	InstanceID     string               `json:"instanceId"`
+	SessionID      string               `json:"sessionId"`
+	Terminal       bool                 `json:"terminal,omitempty"`
 }
 
 // DetachTerminalPayload closes an attach session. Detach is observational —
