@@ -424,7 +424,7 @@ func (d *Daemon) ownerUnwrap(p transport.CryptoUnwrapCekPayload) (any, error) {
 			aad = *obj.AAD
 		}
 		bound, boundOK := d.contextForInstance(aad.Sender)
-		instanceBound := boundOK && bound == *c && aad.ObjectType == e2ee.ObjectTypeRuntimeInteraction
+		instanceBound := boundOK && bound == *c && (aad.ObjectType == e2ee.ObjectTypeRuntimeInteraction || aad.ObjectType == e2ee.ObjectTypeRuntimeTerminalSession)
 		templateBound := aad.ObjectType == e2ee.ObjectTypeAgentTemplate && validOwnerProtocolID(obj.ObjectID) && aad.Sender == c.OwnerUserID
 		valid := (instanceBound || templateBound) && aad.ProtectedContext != nil && *aad.ProtectedContext == *c && aad.ValidateScope() == nil && aad.ObjectID == obj.ObjectID && aad.KeyEpochID == obj.Envelope.KeyEpochID && aad.Recipient == c.OwnerUserID
 		if !found || !valid {
