@@ -8,6 +8,16 @@ type NativeEventObserver func(SessionEvent) error
 
 type NativeEventObserverFactory func(instanceID string) NativeEventObserver
 
+// NativeEventObserverRegistration owns the append capability for one endpoint.
+// Retire closes Observe and waits for all callbacks, including concurrent
+// interaction resolution callbacks. The endpoint must call it when its reader
+// exits; no old reader or resolution callback can append after it returns.
+type NativeEventObserverRegistration struct {
+	Observe NativeEventObserver
+	Retire  func()
+}
+type NativeEventObserverRegistrationFactory func(instanceID string) NativeEventObserverRegistration
+
 // ObserveNativeActivity folds positively observed native work into the owned
 // session. Activation identity remains the driver's activation-lock authority;
 // native activity must not race those identity writes.
