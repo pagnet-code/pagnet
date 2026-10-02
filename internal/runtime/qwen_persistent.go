@@ -1210,6 +1210,11 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 func (e *qwenEndpoint) cleanupOnExit() {
 	if e.h != nil {
 		e.h.Wait()
+		if e.nativeObserver != nil && e.state != nil {
+			if sid := e.state.nativeSessionID(); sid != "" {
+				_ = e.nativeObserver(session.SessionEvent{Type: session.EventSessionStopped, SessionID: sid})
+			}
+		}
 	}
 	// Drop THIS endpoint's record (so Live() reports it gone and Submit
 	// cannot find a dead endpoint). It runs AFTER the reap (so the

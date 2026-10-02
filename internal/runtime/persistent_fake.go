@@ -648,12 +648,16 @@ func (e *persistEndpoint) readLoop() {
 	scanner := bufio.NewScanner(e.stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	activated := false
+	nativeSessionID := ""
 	for scanner.Scan() {
 		var ev persistWireEvent
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
 			continue
 		}
 		norm := normalizePersist(ev)
+		if norm.Type == session.EventSessionStarted || norm.Type == session.EventSessionResumed {
+			nativeSessionID = norm.SessionID
+		}
 		if e.nativeObserver != nil {
 			if err := e.nativeObserver(norm); err != nil {
 				break
@@ -673,6 +677,9 @@ func (e *persistEndpoint) readLoop() {
 	// hit ErrInstanceBusy on the (already dead) old endpoint.
 	if e.h != nil {
 		e.h.Wait()
+		if e.nativeObserver != nil && nativeSessionID != "" {
+			_ = e.nativeObserver(session.SessionEvent{Type: session.EventSessionStopped, SessionID: nativeSessionID})
+		}
 	}
 	// Drop THIS endpoint's record (D1) so Live() reports it gone and
 	// Submit cannot find a dead endpoint. This is what makes an unexpected

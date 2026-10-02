@@ -1109,6 +1109,11 @@ func (e *codexEndpoint) settleTurn(ch chan<- session.SessionEvent) {
 func (e *codexEndpoint) cleanupOnExit() {
 	if e.h != nil {
 		e.h.Wait()
+		if e.nativeObserver != nil && e.state != nil {
+			if sid := e.state.nativeThreadID(); sid != "" {
+				_ = e.nativeObserver(session.SessionEvent{Type: session.EventSessionStopped, SessionID: sid})
+			}
+		}
 	}
 	// Drop THIS endpoint's record (so Live() reports it gone and Submit
 	// cannot find a dead endpoint). It runs AFTER the reap (so the
