@@ -61,8 +61,43 @@ func (j *Journal) initializeDispatches() error {
 			return err
 		}
 	}
+	// Older retained mappings may recover their kind only from the original
+	// still-retained intent. Pruned historical kinds remain unknown.
+	columns, err := j.db.Query(`PRAGMA table_info(worker_dispatches)`)
+	if err != nil {
+		return err
+	}
+	hasKind := false
+	for columns.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			columns.Close()
+			return err
+		}
+		if name == "operation_kind" {
+			hasKind = true
+		}
+	}
+	err = columns.Err()
+	columns.Close()
+	if err != nil {
+		return err
+	}
+	if !hasKind {
+		if _, err = j.db.Exec(`ALTER TABLE worker_dispatches ADD COLUMN operation_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if _, err = j.db.Exec(`CREATE TRIGGER IF NOT EXISTS worker_dispatch_kind_immutable BEFORE UPDATE OF operation_kind ON worker_dispatches WHEN NEW.operation_kind<>OLD.operation_kind AND (OLD.operation_kind<>'' OR NOT EXISTS(SELECT 1 FROM worker_intent i WHERE i.sequence=OLD.operation_sequence AND i.command_id=OLD.command_id AND i.kind=NEW.operation_kind)) BEGIN SELECT RAISE(ABORT,'original dispatch operation kind is immutable'); END`); err != nil {
+		return err
+	}
+	if _, err = j.db.Exec(`UPDATE worker_dispatches SET operation_kind=(SELECT i.kind FROM worker_intent i WHERE i.sequence=operation_sequence AND i.command_id=worker_dispatches.command_id) WHERE operation_kind='' AND EXISTS(SELECT 1 FROM worker_intent i WHERE i.sequence=operation_sequence AND i.command_id=worker_dispatches.command_id)`); err != nil {
+		return err
+	}
 	var last, retired, count int64
-	err := j.db.QueryRow(`SELECT last_sequence,retired,((SELECT COUNT(*) FROM worker_dispatches)+(SELECT COUNT(*) FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence>worker_dispatch_meta.retired AND dispatch_sequence<=worker_dispatch_meta.last_sequence)) FROM worker_dispatch_meta WHERE singleton=1`).Scan(&last, &retired, &count)
+	err = j.db.QueryRow(`SELECT last_sequence,retired,((SELECT COUNT(*) FROM worker_dispatches)+(SELECT COUNT(*) FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence>worker_dispatch_meta.retired AND dispatch_sequence<=worker_dispatch_meta.last_sequence)) FROM worker_dispatch_meta WHERE singleton=1`).Scan(&last, &retired, &count)
 	if errors.Is(err, sql.ErrNoRows) {
 		var orphaned int
 		if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches`).Scan(&orphaned); err != nil {
@@ -88,7 +123,7 @@ func (j *Journal) initializeDispatches() error {
 	if json.Unmarshal([]byte(ownership), &o) != nil || o.InstanceID != j.scope.InstanceID || o.OwnershipGeneration != j.scope.Generation {
 		return ErrConflict
 	}
-	if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches WHERE dispatch_sequence<=? OR dispatch_sequence>? OR operation_sequence<=0 OR operation_sequence>=(SELECT next_sequence FROM worker_meta WHERE singleton=1) OR state NOT IN ('admitted','completed','failed','uncertain','resource_interrupted','owner_stopped') OR (state='resource_interrupted' AND NOT EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR (state='owner_stopped' AND NOT EXISTS(SELECT 1 FROM worker_owner_stop_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR json_extract(proof,'$.ownershipId') IS NOT ? OR json_extract(proof,'$.ownershipGeneration') IS NOT ? OR json_extract(proof,'$.dispatchSequence') IS NOT dispatch_sequence OR json_extract(proof,'$.sourceCommandId') IS NOT command_id`, retired, last, o.ID, j.scope.Generation).Scan(&invalid); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches WHERE dispatch_sequence<=? OR dispatch_sequence>? OR operation_sequence<=0 OR operation_sequence>=(SELECT next_sequence FROM worker_meta WHERE singleton=1) OR state NOT IN ('admitted','completed','failed','uncertain','resource_interrupted','owner_stopped') OR (state='resource_interrupted' AND NOT EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR (state='owner_stopped' AND NOT EXISTS(SELECT 1 FROM worker_owner_stop_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR operation_kind NOT IN ('','activate','prompt','stop','hibernate','attach','restart','resolve') OR EXISTS(SELECT 1 FROM worker_intent i WHERE i.sequence=operation_sequence AND (i.command_id<>worker_dispatches.command_id OR (operation_kind<>'' AND i.kind<>operation_kind))) OR json_extract(proof,'$.ownershipId') IS NOT ? OR json_extract(proof,'$.ownershipGeneration') IS NOT ? OR json_extract(proof,'$.dispatchSequence') IS NOT dispatch_sequence OR json_extract(proof,'$.sourceCommandId') IS NOT command_id`, retired, last, o.ID, j.scope.Generation).Scan(&invalid); err != nil {
 		return err
 	}
 	if invalid != 0 {
@@ -278,6 +313,7 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 // NativeDispatchRecord retains only immutable routing metadata and settlement.
 // It survives local outcome acknowledgement until backend retirement commits.
 type NativeDispatchRecord struct {
+	Kind              string                        `json:"kind,omitempty"`
 	Proof             transport.NativeDispatchProof `json:"proof"`
 	OperationSequence int64                         `json:"operationSequence"`
 	State             string                        `json:"state"`
@@ -294,7 +330,7 @@ func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDis
 	if _, _, err = checkLease(ctx, tx, lease); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM (SELECT proof,operation_sequence,CASE WHEN EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=worker_dispatches.operation_sequence AND v.committed=0) THEN 'view_pending' ELSE state END AS state FROM worker_dispatches UNION ALL SELECT json_extract(payload,'$.proposal.proof'),0,'cancelled' FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence<=(SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1)  ) ORDER BY json_extract(proof,'$.dispatchSequence') LIMIT ?`, maxCommands)
+	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state,operation_kind FROM (SELECT proof,operation_sequence,operation_kind,CASE WHEN EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=worker_dispatches.operation_sequence AND v.committed=0) THEN 'view_pending' ELSE state END AS state FROM worker_dispatches UNION ALL SELECT json_extract(payload,'$.proposal.proof'),0,'','cancelled' FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence<=(SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1)  ) ORDER BY json_extract(proof,'$.dispatchSequence') LIMIT ?`, maxCommands)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +339,7 @@ func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDis
 	for rows.Next() {
 		var r NativeDispatchRecord
 		var raw []byte
-		if err = rows.Scan(&raw, &r.OperationSequence, &r.State); err != nil {
+		if err = rows.Scan(&raw, &r.OperationSequence, &r.State, &r.Kind); err != nil {
 			return nil, err
 		}
 		if decodeClosed(raw, &r.Proof) != nil {

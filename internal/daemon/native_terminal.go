@@ -443,8 +443,8 @@ func (d *Daemon) nativeTerminalDetach(conn *websocket.Conn, p transport.DetachTe
 	return nil
 }
 func (d *Daemon) nativeTerminalStop(conn *websocket.Conn, p transport.TerminalStopPayload) error {
-	if err := d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "hibernate", sessionworker.Operation{}); err != nil {
-		return err
+	if p.NativeDispatch == nil || p.CommandID != p.NativeDispatch.SourceCommandID {
+		return ErrNativeObservationConflict
 	}
 	proxy, err := d.nativeWorkerFor(conn, p.InstanceID)
 	if err != nil {
@@ -452,22 +452,82 @@ func (d *Daemon) nativeTerminalStop(conn *websocket.Conn, p transport.TerminalSt
 	}
 	ctx, cancel := context.WithTimeout(d.turnCtx, time.Second)
 	defer cancel()
-	response, err := proxy.call(ctx, sessionworker.Request{Type: "outcome", Sequence: p.NativeDispatch.DispatchSequence})
-	if err != nil || response.Outcome == nil || response.Outcome.State == "admitted" {
+	retained, err := proxy.call(ctx, sessionworker.Request{Type: "dispatches"})
+	if err != nil {
 		return ErrDeferred
 	}
-	if response.Outcome.State != "completed" {
-		return errors.New("Runtime is busy or could not safely hibernate")
+	completed, proofErr := nativeCompletedTerminalStop(*p.NativeDispatch, retained.Dispatches)
+	if ctx.Err() != nil {
+		return ErrDeferred
 	}
-	manager := d.terminal.nativeManager()
-	manager.mu.Lock()
-	capture := manager.captures[p.InstanceID]
-	manager.mu.Unlock()
-	if capture != nil && capture.proxy == proxy {
-		capture.close(d, "stopped")
+	if proofErr == nil && completed {
+		return nil
+	}
+	if proofErr != nil && !errors.Is(proofErr, ErrNativeOriginAdmissionDeferred) {
+		return proofErr
+	}
+	if err = d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "stop", sessionworker.Operation{}); err != nil {
+		return err
+	}
+	return awaitNativeTerminalStop(ctx, *p.NativeDispatch, proxy.call)
+}
+
+// A retained original stop completion can acknowledge a lost reply without
+// repeating its effect or touching a later generation's terminal capture.
+func nativeCompletedTerminalStop(proof transport.NativeDispatchProof, records []sessionworker.NativeDispatchRecord) (bool, error) {
+	operation, err := nativeDispatchOperationSequence(proof, records)
+	if err != nil {
+		return false, err
+	}
+	for _, record := range records {
+		if record.OperationSequence == operation && transport.SameNativeDispatchProof(record.Proof, proof) {
+			if record.Kind != "stop" {
+				return false, ErrNativeObservationConflict
+			}
+			return record.State == "completed", nil
+		}
+	}
+	return false, ErrNativeOriginAdmissionDeferred
+}
+
+// A backend dispatch ordinal is never a local operation ordinal. Resolve its
+// retained original proof before reading the outcome or closing a native view.
+func awaitNativeTerminalStop(ctx context.Context, proof transport.NativeDispatchProof, call func(context.Context, sessionworker.Request) (sessionworker.Response, error)) error {
+	dispatches, err := call(ctx, sessionworker.Request{Type: "dispatches"})
+	if err != nil {
+		return ErrDeferred
+	}
+	completed, err := nativeCompletedTerminalStop(proof, dispatches.Dispatches)
+	if err != nil {
+		return errors.Join(ErrDeferred, err)
+	}
+	if ctx.Err() != nil {
+		return ErrDeferred
+	}
+	if completed {
+		return nil
+	}
+	operation, err := nativeDispatchOperationSequence(proof, dispatches.Dispatches)
+	if err != nil {
+		return errors.Join(ErrDeferred, err)
+	}
+	response, err := call(ctx, sessionworker.Request{Type: "outcome", Sequence: operation})
+	if err != nil || response.Outcome == nil {
+		return ErrDeferred
+	}
+	if response.Outcome.State == "admitted" {
+		return ErrDeferred
+	}
+	out := response.Outcome
+	if out.Sequence != operation || out.Kind != "stop" || out.CommandID != proof.SourceCommandID || out.SourceAdmission == nil || out.SourceAdmission.NativeAdmissionID != proof.SourceAdmissionID || out.SourceAdmission.RunnerID != proof.SourceRunnerID || !out.SourceAdmission.RunnerEpoch.Equal(proof.SourceRunnerEpoch) || out.SourceAdmission.BootID != proof.SourceBootID {
+		return ErrNativeObservationConflict
+	}
+	if out.State != "completed" {
+		return errors.New("Runtime could not safely stop")
 	}
 	return nil
 }
+
 func (tm *terminalManager) closeNative() {
 	tm.mu.Lock()
 	manager := tm.native

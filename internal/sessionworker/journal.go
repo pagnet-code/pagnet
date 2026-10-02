@@ -376,6 +376,11 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_intent(sequence,command_id,digest,kind,state) VALUES(?,?,?,?,'admitted')`, sequence, commandID, digest, kind); err != nil {
 		return out, false, fmt.Errorf("intent identity conflict: %w", err)
 	}
+	if dispatch != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatches SET operation_kind=? WHERE operation_sequence=? AND operation_kind=''`, kind, sequence); err != nil {
+			return out, false, err
+		}
+	}
 	if dispatch != nil && kind == "attach" {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO worker_terminal_view_commits(operation_sequence) VALUES(?)`, sequence); err != nil {
 			return out, false, err
