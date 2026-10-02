@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -62,5 +63,41 @@ func TestDaemonLastAttachKeepsUnprovenNativeSchedulesAlive(t *testing.T) {
 	}
 	if d.sup.EndpointPID(id) != nil {
 		t.Fatal("explicit stop could not terminate endpoint")
+	}
+}
+
+// A configuration refresh is not an explicit stop. Native schedulers may be
+// waiting without a visible turn, so an attach must preserve unknown work.
+func TestDaemonConfigurationRefreshPreservesUnknownNativeSchedules(t *testing.T) {
+	d := newPersistentTestDaemon(t)
+	client, server := newMemWS(t)
+	id := domain.NewID().String()
+	d.connMu.Lock()
+	d.curConn = client
+	d.connMu.Unlock()
+	driveLaunch(t, d, server, transport.LaunchAgentPayload{CommandID: "config-schedule-launch", InstanceID: id, Runtime: string(domain.RuntimeFakePersistent), Kind: "representative"})
+	waitForEndpointLive(t, d, id)
+	original := d.sup.EndpointPID(id)
+	sess := d.sessions.GetSession(id)
+	if sess == nil {
+		t.Fatal("session missing")
+	}
+	d.sessions.RegisterDriver(unprovenSuspendDriver{d.sessions.DriverFor(domain.RuntimeFakePersistent)})
+	d.sessions.SetModel(sess, "different-model")
+	if _, err := d.sessions.EnsureActive(context.Background(), sess, nil); err != nil {
+		t.Fatal(err)
+	}
+	after := d.sup.EndpointPID(id)
+	if original == nil || after == nil || *original != *after {
+		t.Fatalf("automatic configuration refresh destroyed unknown native work: before=%v after=%v", original, after)
+	}
+	if sess.Endpoint.LaunchModel == "different-model" {
+		t.Fatal("unknown native work was silently replaced to refresh configuration")
+	}
+	if err := d.doStop(client, id); err != nil {
+		t.Fatal(err)
+	}
+	if d.sup.EndpointPID(id) != nil {
+		t.Fatal("explicit stop failed")
 	}
 }

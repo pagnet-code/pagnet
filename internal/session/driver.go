@@ -203,7 +203,8 @@ type ActivityReporter interface {
 // Manager.Submit. A minted session ID or TODO text is never such proof.
 type MaterialisationReporter interface{ Materialised(instanceID string) bool }
 
-// SuspendSafetyReporter may attest that an automatic terminal detach can stop
-// this endpoint without losing runtime-owned schedules or background work.
+// SuspendSafetyReporter may attest that an automatic terminal detach or
+// configuration refresh can stop this endpoint without losing runtime-owned
+// schedules or background work.
 // Absence of this complete native proof must keep a persistent endpoint alive.
 type SuspendSafetyReporter interface{ AutoSuspendSafe(instanceID string) bool }

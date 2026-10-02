@@ -129,8 +129,8 @@ func (m *Manager) Session(instanceID string, runtime domain.RuntimeName, workspa
 // SetLaunchEnv sets the session's launch environment (the turn spec's env,
 // Phase 2 / R8). It is called by the daemon before each Submit so the
 // endpoint (re)activation uses the current spec env. See RuntimeSession.Env
-// for the launch-env semantics (fixed at spawn; a change restarts the
-// endpoint on the next EnsureActive).
+// for the launch-env semantics: fixed at spawn, with changes applied only
+// when replacement is safe or after an explicit lifecycle transition.
 func (m *Manager) SetLaunchEnv(sess *RuntimeSession, env []string) {
 	if sess == nil {
 		return
@@ -143,8 +143,8 @@ func (m *Manager) SetLaunchEnv(sess *RuntimeSession, env []string) {
 // SetModel sets the session's launch model (the turn spec's resolved model,
 // Phase 4 / B9). It is called by the daemon before each Submit so the
 // endpoint (re)activation uses the current model. See RuntimeSession.Model
-// for the launch-model semantics (fixed at spawn; a change restarts the
-// endpoint on the next EnsureActive, preserving the session).
+// for the launch-model semantics: fixed at spawn, with changes applied only
+// when replacement is safe or after an explicit lifecycle transition.
 func (m *Manager) SetModel(sess *RuntimeSession, model string) {
 	if sess == nil {
 		return
@@ -158,8 +158,8 @@ func (m *Manager) SetModel(sess *RuntimeSession, model string) {
 // spec's StandingInstructions, instruction-model Wave 3). It is called by
 // the daemon before each Submit so the endpoint (re)activation uses the
 // current standing context. See RuntimeSession.StandingInstructions for the
-// launch semantics (fixed at spawn; a change restarts the endpoint on the
-// next EnsureActive, preserving the session).
+// launch semantics: fixed at spawn, with changes applied only when replacement
+// is safe or after an explicit lifecycle transition.
 func (m *Manager) SetStandingInstructions(sess *RuntimeSession, text string) {
 	if sess == nil {
 		return
@@ -361,8 +361,9 @@ func (m *Manager) ensureActive(ctx context.Context, sess *RuntimeSession, events
 		// from what the live endpoint was launched with, the endpoint must
 		// be RESTARTED (stopped + re-activated) so the new value takes
 		// effect — the session is preserved (a materialised session resumes
-		// the same native session on re-activation). Active work and unresolved
-		// interactions defer replacement: return the live endpoint now and
+		// the same native session on re-activation). Active work, unresolved
+		// interactions and unknown suspension safety defer replacement: return
+		// the live endpoint now and
 		// apply the configuration at the next safe activation opportunity.
 		staleLaunch := live && ep != nil &&
 			(!sameEnv(wantEnv, ep.LaunchEnv) || wantModel != ep.LaunchModel ||
@@ -386,6 +387,15 @@ func (m *Manager) ensureActive(ctx context.Context, sess *RuntimeSession, events
 				defer prompt.Unlock()
 			}
 			if activity, ok := d.(ActivityReporter); ok && activity.ActiveWork(sess.InstanceID) {
+				return ep, nil
+			}
+			// Refreshing desired configuration is automatic, just like closing a
+			// terminal view. An idle turn ledger cannot prove runtime-owned
+			// timers or background jobs are safe to destroy. Keep the actual
+			// launch profile until complete native suspension proof or an
+			// explicit stop/restart provides a lifecycle boundary.
+			safety, ok := d.(SuspendSafetyReporter)
+			if !ok || !safety.AutoSuspendSafe(sess.InstanceID) {
 				return ep, nil
 			}
 			// Stop the (still-live) endpoint, preserving the session —

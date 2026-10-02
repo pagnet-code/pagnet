@@ -62,6 +62,9 @@ func newMemDriver() *memDriver {
 
 func (d *memDriver) Name() domain.RuntimeName { return domain.RuntimeFake }
 
+// The deterministic fixture has no runtime-owned schedules or background jobs.
+func (d *memDriver) AutoSuspendSafe(string) bool { return true }
+
 func (d *memDriver) Capabilities() Capabilities {
 	return Capabilities{
 		PersistentEndpoint:              true,
