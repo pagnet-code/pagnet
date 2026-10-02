@@ -70,8 +70,10 @@ func TestDispatchOriginalSourceAndOrdinalSurviveReplacementAndReopen(t *testing.
 	if _, _, err = j.admitDispatch(t.Context(), a, 0, p.SourceCommandID, "prompt", payload, nil, &p); !errors.Is(err, ErrFenced) {
 		t.Fatal("A not fenced", err)
 	}
-	if _, _, err = j.Admit(t.Context(), b, 3, "unbound-prompt", "prompt", payload); err == nil {
-		t.Fatal("bound ownership permitted ordinal-free prompt")
+	for _, kind := range []string{"prompt", "activate", "attach", "stop", "hibernate", "restart"} {
+		if _, _, err = j.Admit(t.Context(), b, 3, "unbound-"+kind, kind, payload); err == nil {
+			t.Fatal("bound ownership permitted ordinal-free lifecycle", kind)
+		}
 	}
 	if err = j.Acknowledge(t.Context(), b, 1); err == nil {
 		t.Fatal("unsettled local intent acked")

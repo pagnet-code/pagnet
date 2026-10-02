@@ -1608,7 +1608,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		// racing a second endpoint, and doAttach defers (ErrDeferred) when a
 		// turn is genuinely in flight with the endpoint briefly down.
 		job := func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doAttach(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if d.nativeOwned(p.InstanceID) {
+					return d.doNativeAttachTerminal(conn, p)
+				}
+				return d.doAttach(conn, p)
+			})
 		}
 		d.enqueueCommandConcurrent(conn, p.InstanceID, p.CommandID, job)
 
@@ -1622,7 +1627,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doDetach(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if d.nativeOwned(p.InstanceID) {
+					return d.nativeTerminalDetach(conn, p)
+				}
+				return d.doDetach(conn, p)
+			})
 		})
 
 	// LIVE terminal messages (PROTOCOL §3 "Live messages"): written
@@ -1633,6 +1643,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		var p transport.TerminalInputPayload
 		if err := env.DecodePayload(&p); err != nil {
 			d.Log.Warn("terminal input payload decode failed", "type", env.Type, "err", err)
+			return
+		}
+		if d.nativeOwned(p.InstanceID) {
+			if err := d.nativeTerminalInput(conn, p); err != nil {
+				d.Log.Debug("native terminal input rejected", "instance", p.InstanceID)
+			}
 			return
 		}
 		data, err := base64.StdEncoding.DecodeString(p.Data)
@@ -1650,6 +1666,10 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			d.Log.Warn("terminal resize payload decode failed", "type", env.Type, "err", err)
 			return
 		}
+		if d.nativeOwned(p.InstanceID) {
+			_ = d.nativeTerminalResize(conn, p)
+			return
+		}
 		d.terminal.submit(terminalLiveMsg{
 			isResize: true, instance: p.InstanceID, session: p.SessionID,
 			cols: p.Cols, rows: p.Rows,
@@ -1662,7 +1682,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doTerminalStop(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if d.nativeOwned(p.InstanceID) {
+					return d.nativeTerminalStop(conn, p)
+				}
+				return d.doTerminalStop(conn, p)
+			})
 		})
 
 	case transport.MsgTerminalSnapshot:
@@ -1672,7 +1697,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueCommand(conn, p.InstanceID, p.CommandID, func() {
-			d.guarded(conn, p.CommandID, func() error { return d.doTerminalSnapshot(conn, p) })
+			d.guarded(conn, p.CommandID, func() error {
+				if d.nativeOwned(p.InstanceID) {
+					return d.nativeTerminalSnapshot(conn, p)
+				}
+				return d.doTerminalSnapshot(conn, p)
+			})
 		})
 
 	case transport.MsgForgetInstance:
