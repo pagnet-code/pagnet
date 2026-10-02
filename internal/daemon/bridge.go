@@ -409,7 +409,7 @@ func (d *Daemon) executeBridgeToolWithRead(row *InstanceRow, tool string, args j
 	if args == nil {
 		args = json.RawMessage("{}")
 	}
-	if tool == "network_register_capabilities" {
+	if tool == "network_register_capabilities" && !d.nativeOwned(row.InstanceID) {
 		return d.registerInstanceCapabilities(row, args)
 	}
 	resolved, errMsg := d.resolveToolReferences(row, tool, args)
