@@ -88,6 +88,10 @@ func TestLongBridgePathRejectsUnsafeDirectories(t *testing.T) {
 				if err = os.Mkdir(private, 0755); err != nil {
 					t.Fatal(err)
 				}
+				// Pin the unsafe fixture independent of the process umask.
+				if err = os.Chmod(private, 0755); err != nil {
+					t.Fatal(err)
+				}
 			case "file":
 				if err = os.WriteFile(private, nil, 0600); err != nil {
 					t.Fatal(err)

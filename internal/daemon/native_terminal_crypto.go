@@ -60,6 +60,9 @@ func (d *Daemon) nativeTerminalEpoch(p *NativeWorkerProxy) (e2ee.AAD, [32]byte, 
 		gate.RLock()
 		defer gate.RUnlock()
 		ring, err := hostcrypto.LoadContextKeyring(d.StateDir, context)
+		if ring != nil {
+			defer clearNativeTerminalEpochKeys(ring.Epochs)
+		}
 		if err != nil {
 			return e2ee.AAD{}, empty, err
 		}
@@ -84,6 +87,9 @@ func (d *Daemon) nativeTerminalEpoch(p *NativeWorkerProxy) (e2ee.AAD, [32]byte, 
 		return e2ee.AAD{}, empty, ErrNativeObservationConflict
 	}
 	ring, err := hostcrypto.LoadKeyring(d.StateDir, spec.NetworkID)
+	if ring != nil {
+		defer clearNativeTerminalEpochKeys(ring.Epochs)
+	}
 	if err != nil {
 		return e2ee.AAD{}, empty, err
 	}
@@ -250,4 +256,12 @@ func (d *Daemon) nativeSendTerminal(conn *websocket.Conn, p *NativeWorkerProxy, 
 		return err
 	}
 	return d.write(conn, raw)
+}
+
+// Keyring loads are private temporary copies; retain only the selected fixed
+// key array for the operation and clear all decoded epoch material on return.
+func clearNativeTerminalEpochKeys(epochs []hostcrypto.KeyEpoch) {
+	for i := range epochs {
+		clear(epochs[i].Key)
+	}
 }

@@ -52,6 +52,13 @@ func (c *cliCtx) newCLITerminalChannel(scope *cliTerminalScope, network, instanc
 	channel.load = func() (string, [32]byte, error) {
 		var empty [32]byte
 		state, ring, err := c.clientCrypto(network)
+		if ring != nil {
+			defer func() {
+				for i := range ring.Epochs {
+					clear(ring.Epochs[i].Key)
+				}
+			}()
+		}
 		if err != nil {
 			return "", empty, err
 		}
