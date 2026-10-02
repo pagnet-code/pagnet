@@ -1,6 +1,15 @@
 package transport
 
 const NativeAgentSourceProtocol = "native-agent-source-v1"
+const NativeEndpointAgentSourceProtocol = "native-endpoint-agent-source-v1"
+
+// NativeEndpointAgentSource proves the original live endpoint without claiming
+// an accepted managed turn. It authorizes only that instance's fixed network.
+type NativeEndpointAgentSource struct {
+	OriginID         string `json:"originId"`
+	NativeGeneration string `json:"nativeGeneration"`
+	SessionID        string `json:"sessionId"`
+}
 
 // NativeAgentSource is the actual turn capability derived by the independent
 // worker bridge. Source command/admission and private operation ordinal remain
