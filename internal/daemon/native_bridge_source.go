@@ -41,7 +41,25 @@ func (d *Daemon) relayNativeBridge(ctx context.Context, link *nativeWorkerLink, 
 		return nil, err.Error()
 	}
 	request := transport.AgentRequestPayload{InstanceID: row.InstanceID, PrincipalID: row.AgentPrincipalID, Tool: tool, Args: args, NativeSource: source}
+	if source == nil && row.NetworkID != "" && slices.Contains(admission.ProtocolFeatures, transport.NativeEndpointAgentSourceProtocol) {
+		endpoint, err := nativeBridgeEndpointSource(call)
+		if err != nil {
+			return nil, err.Error()
+		}
+		request.NativeEndpointSource = endpoint
+	}
 	return d.relayNativeSourceRequest(ctx, link, request)
+}
+
+func nativeBridgeEndpointSource(call *sessionworker.BridgeCall) (*transport.NativeEndpointAgentSource, error) {
+	if call == nil || call.TurnSource != nil || call.NativeSessionID == "" || call.NativeGeneration == "" || call.Scope.InstanceID == "" || call.Scope.HostID == "" || call.Scope.TenantID == "" {
+		return nil, errors.New("native endpoint source unavailable")
+	}
+	var origin transport.NativeObservationOrigin
+	if json.Unmarshal(call.Origin, &origin) != nil || origin.ID == "" || origin.InstanceID != call.Scope.InstanceID || origin.HostID != call.Scope.HostID || origin.TenantID != call.Scope.TenantID || origin.NativeGeneration != call.NativeGeneration || (origin.NativeSessionID != "" && origin.NativeSessionID != call.NativeSessionID) {
+		return nil, errors.New("native endpoint source binding invalid")
+	}
+	return &transport.NativeEndpointAgentSource{OriginID: origin.ID, NativeGeneration: call.NativeGeneration, SessionID: call.NativeSessionID}, nil
 }
 
 func (d *Daemon) relayNativeSourceRequest(ctx context.Context, link *nativeWorkerLink, request transport.AgentRequestPayload) (json.RawMessage, string) {

@@ -31,6 +31,7 @@ type Admission struct {
 	BootID            string    `json:"bootId"`
 }
 type BridgeCall struct {
+	NativeSessionID  string            `json:"nativeSessionId,omitempty"`
 	TurnSource       *NativeTurnSource `json:"turnSource,omitempty"`
 	ID               string            `json:"id"`
 	Scope            Scope             `json:"scope"`
@@ -337,7 +338,12 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 			continue
 		}
 		callCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: o.activeBridgeTurnSource(callCtx, generation)})
+		sid, known := o.manager.TryNativeID(o.journal.scope.InstanceID)
+		if !known || sid == "" {
+			cancel()
+			return
+		}
+		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, NativeSessionID: sid, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: o.activeBridgeTurnSource(callCtx, generation)})
 		cancel()
 		result.ID = req.ID
 		if bridgeWrite(c, result) != nil {

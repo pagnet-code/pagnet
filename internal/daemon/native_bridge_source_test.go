@@ -161,3 +161,43 @@ func TestNativeTerminalOutcomeUsesOriginalLocalOperationMapping(t *testing.T) {
 		t.Fatal("terminal outcome adopted foreign original source")
 	}
 }
+
+func TestNativeBridgeEndpointSourceRequiresOriginalLiveSession(t *testing.T) {
+	scope := sessionworker.Scope{TenantID: domain.NewID().String(), HostID: domain.NewID().String(), InstanceID: domain.NewID().String()}
+	original := transport.NativeObservationOrigin{ID: domain.NewID().String(), TenantID: scope.TenantID, HostID: scope.HostID, InstanceID: scope.InstanceID, NativeGeneration: "native-A", NativeSessionID: "session-A"}
+	for _, variant := range []string{"original", "generation", "session", "instance", "host", "tenant", "origin", "managed_turn", "missing_session", "missing_generation"} {
+		t.Run(variant, func(t *testing.T) {
+			origin := original
+			call := &sessionworker.BridgeCall{Scope: scope, NativeGeneration: original.NativeGeneration, NativeSessionID: original.NativeSessionID}
+			switch variant {
+			case "generation":
+				call.NativeGeneration = "native-B"
+			case "session":
+				call.NativeSessionID = "session-B"
+			case "instance":
+				call.Scope.InstanceID = domain.NewID().String()
+			case "host":
+				call.Scope.HostID = domain.NewID().String()
+			case "tenant":
+				call.Scope.TenantID = domain.NewID().String()
+			case "origin":
+				origin.ID = ""
+			case "managed_turn":
+				call.TurnSource = &sessionworker.NativeTurnSource{}
+			case "missing_session":
+				call.NativeSessionID = ""
+			case "missing_generation":
+				call.NativeGeneration = ""
+			}
+			call.Origin, _ = json.Marshal(origin)
+			got, err := nativeBridgeEndpointSource(call)
+			if variant == "original" {
+				if err != nil || got.OriginID != original.ID || got.SessionID != original.NativeSessionID || got.NativeGeneration != original.NativeGeneration {
+					t.Fatal(got, err)
+				}
+			} else if err == nil {
+				t.Fatal("foreign or ambiguous endpoint source accepted", got)
+			}
+		})
+	}
+}
