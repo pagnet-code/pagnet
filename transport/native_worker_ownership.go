@@ -1,6 +1,9 @@
 package transport
 
-import "time"
+import (
+	"github.com/pagnet-code/pagnet/e2ee"
+	"time"
+)
 
 const NativeWorkerOwnershipProtocol = "native-worker-ownership-v1"
 const (
@@ -68,11 +71,15 @@ const MsgNativeOwnershipPrepare = "host.native_ownership_prepare"
 // authorization to execute native input. Launch retains the original command ID
 // and encrypted configuration/AAD; it must never enter the command submit path.
 type NativeOwnershipPreparePayload struct {
-	SourceCommandID   string                 `json:"sourceCommandId"`
-	SourceCommandType string                 `json:"sourceCommandType"`
-	InstanceID        string                 `json:"instanceId"`
-	Runtime           string                 `json:"runtime"`
-	Profile           string                 `json:"profile"`
-	Launch            *LaunchAgentPayload    `json:"launch,omitempty"`
-	Ownership         *NativeWorkerOwnership `json:"ownership,omitempty"`
+	ProtectedContextRequired bool                   `json:"protectedContextRequired,omitempty"`
+	ProtectedContextReady    bool                   `json:"protectedContextReady,omitempty"`
+	ProtectedContext         *e2ee.ProtectedContext `json:"protectedContext,omitempty"`
+	ProtectedContextEpochID  string                 `json:"protectedContextEpochId,omitempty"`
+	SourceCommandID          string                 `json:"sourceCommandId"`
+	SourceCommandType        string                 `json:"sourceCommandType"`
+	InstanceID               string                 `json:"instanceId"`
+	Runtime                  string                 `json:"runtime"`
+	Profile                  string                 `json:"profile"`
+	Launch                   *LaunchAgentPayload    `json:"launch,omitempty"`
+	Ownership                *NativeWorkerOwnership `json:"ownership,omitempty"`
 }
