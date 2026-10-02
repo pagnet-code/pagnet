@@ -23,7 +23,7 @@ func (c *NativeObservationConnection) NativeWorkerAdmission(scope sessionworker.
 	if c.session == nil {
 		return sessionworker.Admission{}, ErrNativeOriginAdmissionDeferred
 	}
-	if scope.HostID != c.hostID || scope.ServerURL == "" || scope.TenantID == "" || scope.AccountID == "" || scope.InstanceID == "" || scope.Generation == "" {
+	if scope.TenantID != c.session.TenantID || scope.AccountID != c.session.AccountID || scope.HostID != c.hostID || scope.ServerURL == "" || scope.TenantID == "" || scope.AccountID == "" || scope.InstanceID == "" || scope.Generation == "" {
 		return sessionworker.Admission{}, ErrNativeObservationConflict
 	}
 	if (kind == "worker" && networkID == "") || (kind != "worker" && kind != "representative") {
@@ -56,7 +56,7 @@ func (c *NativeObservationConnection) AuthorizeNativeWorkerActivation(ctx contex
 	} else if request.NetworkID != "" || request.NetworkTenantID != "" {
 		return sessionworker.ActivationOrigin{}, ErrNativeObservationConflict
 	}
-	source := transport.HostSessionPayload{NativeAdmissionID: request.Admission.NativeAdmissionID, HostID: expectedScope.HostID, RunnerID: request.Admission.RunnerID, RunnerEpoch: request.Admission.RunnerEpoch, BootID: request.Admission.BootID}
+	source := transport.HostSessionPayload{TenantID: expectedScope.TenantID, AccountID: expectedScope.AccountID, NativeAdmissionID: request.Admission.NativeAdmissionID, HostID: expectedScope.HostID, RunnerID: request.Admission.RunnerID, RunnerEpoch: request.Admission.RunnerEpoch, BootID: request.Admission.BootID}
 	origin, err := c.RegisterOriginForSource(ctx, source, request.SourceCommandID, expectedScope.InstanceID, string(request.ActualRuntime), request.NativeGeneration)
 	if err != nil {
 		return sessionworker.ActivationOrigin{}, err

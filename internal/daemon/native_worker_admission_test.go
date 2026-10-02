@@ -16,7 +16,7 @@ func TestNativeWorkerActivationAdapterKeepsOriginalAuthorityWithFreshController(
 		t.Run(scenario, func(t *testing.T) {
 			scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: domain.NewID().String(), AccountID: domain.NewID().String(), HostID: domain.NewID().String(), InstanceID: domain.NewID().String(), Generation: domain.NewID().String()}
 			network, networkTenant := domain.NewID().String(), domain.NewID().String()
-			session := transport.HostSessionPayload{NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), BootID: domain.NewID().String(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
+			session := transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID, OwnershipScope: "personal", NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), BootID: domain.NewID().String(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
 			source := sessionworker.Admission{NativeAdmissionID: domain.NewID().String(), Scope: scope, TenantID: scope.TenantID, NetworkID: network, Kind: "worker", RunnerID: domain.NewID().String(), RunnerEpoch: session.RunnerEpoch.Add(-time.Minute), BootID: domain.NewID().String()}
 			sent := 0
 			var connection *NativeObservationConnection
@@ -91,7 +91,7 @@ func TestNativeWorkerSessionRenewalPinsActualLiveBirthAndGeneration(t *testing.T
 				connection.SessionConfirmed(transport.NativeOriginSessionConfirmedPayload{RequestID: request.RequestID, OriginID: request.OriginID, NativeGeneration: request.NativeGeneration, SessionID: request.SessionID, RunnerID: runner, RunnerEpoch: epoch})
 				return nil
 			})
-			if err := connection.Admit(transport.HostSessionPayload{NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: runner, RunnerEpoch: epoch, BootID: boot, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
+			if err := connection.Admit(transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID, OwnershipScope: "personal", NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: runner, RunnerEpoch: epoch, BootID: boot, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
 				t.Fatal(err)
 			}
 			snapshot := func(context.Context) (sessionworker.NativeSnapshot, error) {
@@ -134,5 +134,40 @@ func TestNativeWorkerSessionRenewalPinsActualLiveBirthAndGeneration(t *testing.T
 				t.Fatal("invalid live proof reached server", scenario)
 			}
 		})
+	}
+}
+
+func TestNativeWorkerAdmissionPinsServerAuthenticatedAccountNotCallerLabels(t *testing.T) {
+	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: domain.NewID().String(), AccountID: domain.NewID().String(), HostID: domain.NewID().String(), InstanceID: domain.NewID().String(), Generation: domain.NewID().String()}
+	session := transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID, OwnershipScope: "personal", NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), BootID: domain.NewID().String(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
+	connection := NewNativeObservationConnection(scope.HostID, session.BootID, func(context.Context, string, any) error { t.Fatal("scope check wrote to server"); return nil })
+	defer connection.Close()
+	if err := connection.Admit(session); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"tenant", "account"} {
+		changed := scope
+		if kind == "tenant" {
+			changed.TenantID = domain.NewID().String()
+		} else {
+			changed.AccountID = domain.NewID().String()
+		}
+		if _, err := connection.NativeWorkerAdmission(changed, domain.NewID().String(), "worker"); err == nil {
+			t.Fatal("caller scope overrode authenticated host authority", kind)
+		}
+	}
+	changed := session
+	changed.AccountID = domain.NewID().String()
+	if err := connection.Admit(changed); err == nil {
+		t.Fatal("same server admission changed its authenticated account")
+	}
+	authenticated, err := connection.AuthenticatedNativeHostSession()
+	if err != nil || authenticated.AccountID != scope.AccountID || authenticated.TenantID != scope.TenantID {
+		t.Fatal("authenticated authority unavailable", authenticated, err)
+	}
+	authenticated.ProtocolFeatures[0] = "changed-local-copy"
+	fresh, err := connection.AuthenticatedNativeHostSession()
+	if err != nil || fresh.ProtocolFeatures[0] != transport.NativeObservationReceiptProtocol {
+		t.Fatal("caller mutated authenticated feature set", fresh, err)
 	}
 }

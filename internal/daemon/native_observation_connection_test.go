@@ -20,7 +20,7 @@ func TestNativeObservationConnectionKeepsAdmissionExactAndDisconnectUnblocks(t *
 		requests <- p.(transport.NativeOriginRegisterPayload)
 		return nil
 	})
-	admission := transport.HostSessionPayload{NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: time.Now().UTC(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
+	admission := transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: time.Now().UTC(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
 	wrong := admission
 	wrong.BootID = domain.NewID().String()
 	if err := conn.Admit(wrong); !errors.Is(err, ErrNativeObservationConflict) {
@@ -69,13 +69,13 @@ func TestNativeObservationConnectionRetainsOriginalOriginAcrossReconnect(t *test
 		return nil
 	})
 	epoch := time.Now().UTC()
-	if err := conn.Admit(transport.HostSessionPayload{NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: epoch, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
+	if err := conn.Admit(transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: epoch, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
 		t.Fatal(err)
 	}
 	command, instance := domain.NewID().String(), domain.NewID().String()
 	done := make(chan error, 1)
 	go func() {
-		source := transport.HostSessionPayload{NativeAdmissionID: runner, HostID: host, RunnerID: runner, BootID: boot, RunnerEpoch: epoch.Add(-time.Minute)}
+		source := transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: runner, HostID: host, RunnerID: runner, BootID: boot, RunnerEpoch: epoch.Add(-time.Minute)}
 		origin, err := conn.RegisterOriginForSource(t.Context(), source, command, instance, "qwen-code", "test-native-generation")
 		if err == nil && !origin.RunnerEpoch.Equal(epoch.Add(-time.Minute)) {
 			err = errors.New("original native epoch replaced")
@@ -97,7 +97,7 @@ func TestNativeObservationConnectionAdmissionFailuresHaveDistinctDisposition(t *
 			requests <- p.(transport.NativeOriginRegisterPayload)
 			return nil
 		})
-		if err := conn.Admit(transport.HostSessionPayload{NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: time.Now(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
+		if err := conn.Admit(transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: runner, HostID: host, BootID: boot, RunnerID: runner, RunnerEpoch: time.Now(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
@@ -141,7 +141,7 @@ func TestNativeObservationSessionConfirmationRequiresLiveProofAndExactReceipt(t 
 				conn.SessionConfirmed(reply)
 				return nil
 			})
-			if err := conn.Admit(transport.HostSessionPayload{NativeAdmissionID: domain.NewID().String(), HostID: host, RunnerID: runner, RunnerEpoch: epoch, BootID: boot, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
+			if err := conn.Admit(transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: domain.NewID().String(), HostID: host, RunnerID: runner, RunnerEpoch: epoch, BootID: boot, ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}); err != nil {
 				t.Fatal(err)
 			}
 			origin := transport.NativeObservationOrigin{ID: domain.NewID().String(), HostID: host, InstanceID: domain.NewID().String(), Runtime: "qwen-code", NativeGeneration: "actual-generation"}

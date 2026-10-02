@@ -53,6 +53,18 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 	if p.HostID != c.hostID || p.BootID != c.bootID || p.RunnerEpoch.IsZero() {
 		return ErrNativeObservationConflict
 	}
+	if p.OwnershipScope != "personal" && p.OwnershipScope != "organization" {
+		return ErrNativeObservationConflict
+	}
+	if _, err := domain.ParseID(p.TenantID); err != nil {
+		return ErrNativeObservationConflict
+	}
+	if _, err := domain.ParseID(p.AccountID); err != nil {
+		return ErrNativeObservationConflict
+	}
+	if p.OwnershipScope == "organization" && p.AccountID != p.TenantID {
+		return ErrNativeObservationConflict
+	}
 	if _, err := domain.ParseID(p.NativeAdmissionID); err != nil {
 		return ErrNativeObservationConflict
 	}
@@ -69,7 +81,7 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		return errors.New("native observation receipts unavailable")
 	}
 	if c.session != nil {
-		if c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
+		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
 			return ErrNativeObservationConflict
 		}
 		return nil
@@ -118,6 +130,10 @@ func (c *NativeObservationConnection) RegisterOriginForSource(ctx context.Contex
 	if c.session == nil {
 		c.mu.Unlock()
 		return nil, ErrNativeOriginAdmissionDeferred
+	}
+	if source.TenantID != c.session.TenantID || source.AccountID != c.session.AccountID {
+		c.mu.Unlock()
+		return nil, ErrNativeObservationConflict
 	}
 	if len(c.pending)+len(c.pendingSessions) >= 64 {
 		c.mu.Unlock()
@@ -271,4 +287,23 @@ func (c *NativeObservationConnection) SessionConfirmed(p transport.NativeOriginS
 	case reply <- p:
 	default:
 	}
+}
+
+// AuthenticatedNativeHostSession returns an immutable copy of the authority
+// supplied by this exact authenticated server connection. Local CLI account
+// labels and cached worker journals cannot supply host account identities.
+func (c *NativeObservationConnection) AuthenticatedNativeHostSession() (transport.HostSessionPayload, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return transport.HostSessionPayload{}, ErrNativeOriginAdmissionDeferred
+	default:
+	}
+	if c.session == nil {
+		return transport.HostSessionPayload{}, ErrNativeOriginAdmissionDeferred
+	}
+	result := *c.session
+	result.ProtocolFeatures = append([]string(nil), c.session.ProtocolFeatures...)
+	return result, nil
 }

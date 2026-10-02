@@ -21,6 +21,9 @@ const (
 // HostSessionPayload is the authenticated connection's negotiated feature set.
 // Transport epoch changes do not manufacture a replacement native origin.
 type HostSessionPayload struct {
+	TenantID          string    `json:"tenantId"`
+	AccountID         string    `json:"accountId"`
+	OwnershipScope    string    `json:"ownershipScope"`
 	NativeAdmissionID string    `json:"nativeAdmissionId"`
 	HostID            string    `json:"hostId"`
 	RunnerID          string    `json:"runnerId"`
