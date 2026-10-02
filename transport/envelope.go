@@ -839,7 +839,8 @@ type AgentResponsePayload struct {
 // around it. The vendor payload stays opaque — never parsed server-side
 // for correctness.
 type InteractionEventPayload struct {
-	Options []domain.RuntimeInteractionOption `json:"options,omitempty"`
+	NativeGeneration string                            `json:"nativeGeneration,omitempty"`
+	Options          []domain.RuntimeInteractionOption `json:"options,omitempty"`
 	// InteractionID is the pagnet-side id (daemon-minted; idempotency key).
 	InteractionID string `json:"interactionId"`
 	InstanceID    string `json:"instanceId"`
