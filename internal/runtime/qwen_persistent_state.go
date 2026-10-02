@@ -60,6 +60,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -764,7 +765,16 @@ func (s *qwenTurnState) processControlRequest(ev qwenDOEvent) []session.SessionE
 	if req.ToolName == "ask_user_question" {
 		kind = "question"
 	}
-	summary := fmt.Sprintf("qwen %s: %s", kind, req.ToolName)
+	label := req.ToolName
+	if len(label) > 512 {
+		label = label[:512]
+		for !utf8.ValidString(label) {
+			label = label[:len(label)-1]
+		}
+		label += "…"
+	}
+	// The complete tool name/request remains in NativePayload; this is a label.
+	summary := fmt.Sprintf("qwen %s: %s", kind, label)
 	onMachineStream := s.turnActive && s.turnIsMachine
 	s.interactions[ev.RequestID] = &qwenInteraction{
 		requestID:       ev.RequestID,
@@ -786,6 +796,7 @@ func (s *qwenTurnState) processControlRequest(ev qwenDOEvent) []session.SessionE
 		TurnID:    s.machineTurnID,
 		Interaction: &session.InteractionEvent{
 			NativeInteractionID: ev.RequestID,
+			Options:             qwenPermissionOptions(kind),
 			Kind:                kind,
 			Summary:             summary,
 			NativePayload:       ev.Request,
@@ -929,4 +940,28 @@ func (s *qwenTurnState) activeWork() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.turnActive || len(s.interactions) > 0
+}
+
+func qwenPermissionOptions(kind string) []domain.RuntimeInteractionOption {
+	if kind != "permission" {
+		return nil
+	}
+	return []domain.RuntimeInteractionOption{{ID: "allow_once", Kind: "allow_once"}, {ID: "reject_once", Kind: "reject_once"}}
+}
+
+func (s *qwenTurnState) permissionOption(requestID, optionID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := s.interactions[requestID]
+	if pending == nil || pending.kind != "permission" {
+		return false, errors.New("qwen choice is not a pending supported permission")
+	}
+	switch optionID {
+	case "allow_once":
+		return true, nil
+	case "reject_once":
+		return false, nil
+	default:
+		return false, errors.New("qwen choice is not a pending supported permission")
+	}
 }

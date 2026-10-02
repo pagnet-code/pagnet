@@ -838,6 +838,7 @@ func TestQwenPersistent_Integration_ToolApproval(t *testing.T) {
 					Kind:          session.SubmitInteraction,
 					InteractionID: id,
 					Decision:      "resolved",
+					Answer:        "allow_once",
 				}, turnEvents); err != nil && !errors.Is(err, session.ErrEndpointGone) {
 					t.Errorf("Submit interaction resolution for %s: %v", id, err)
 				}
