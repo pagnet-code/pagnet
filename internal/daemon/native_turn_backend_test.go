@@ -13,13 +13,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
+	hostcrypto "github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
+	"github.com/pagnet-code/pagnet/nativecontent"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -81,9 +86,17 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	}
 	defer journal.Close()
 	privateKey := bytes.Repeat([]byte{23}, 32)
-	spec := sessionworker.NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: binary, MCPExecutable: binary, Workspace: t.TempDir(), Kind: "worker", TenantID: scope.TenantID, NetworkID: fixture.NetworkID, NetworkTenantID: fixture.TenantID}
+	keydir := t.TempDir()
+	taskKey := bytes.Repeat([]byte{29}, 32)
+	ring := &hostcrypto.Keyring{NetworkID: fixture.NetworkID, Epochs: []hostcrypto.KeyEpoch{{ID: fixture.EpochID, State: hostcrypto.EpochActive, Key: taskKey, CreatedAt: time.Now().UTC()}}}
+	if err = hostcrypto.SaveKeyring(keydir, ring); err != nil {
+		t.Fatal(err)
+	}
+	spec := sessionworker.NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: binary, MCPExecutable: binary, Workspace: t.TempDir(), Kind: "worker", TenantID: scope.TenantID, NetworkID: fixture.NetworkID, NetworkTenantID: fixture.TenantID, NetworkStateDir: keydir}
 	if terminal == "failed" {
 		spec.Env = []string{"PAGNET_FAKE_RATELIMIT=1s"}
+	} else {
+		spec.Env = []string{"PAGNET_FAKE_FULL_OUTPUT_REPEAT=8"}
 	}
 	owner, err := sessionworker.NewSessionOwner(t.Context(), journal, spec, privateKey)
 	if err != nil {
@@ -208,15 +221,29 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 		t.Fatal("actual initial session observation did not commit", err)
 	}
 	seed := func(peer *nativeBackendPeer) struct {
-		CommandID string `json:"commandId"`
-		TaskID    string `json:"taskId"`
+		CommandID  string                      `json:"commandId"`
+		TaskID     string                      `json:"taskId"`
+		TaskSource *transport.NativeTaskSource `json:"taskSource"`
 	} {
 		t.Helper()
 		var seeded struct {
-			CommandID string `json:"commandId"`
-			TaskID    string `json:"taskId"`
+			CommandID  string                      `json:"commandId"`
+			TaskID     string                      `json:"taskId"`
+			TaskSource *transport.NativeTaskSource `json:"taskSource"`
 		}
-		helper.call(t, map[string]any{"action": "seed_turn_source", "runnerId": peer.session.RunnerID, "runnerEpoch": peer.session.RunnerEpoch, "bootId": peer.session.BootID, "nativeAdmissionId": peer.session.NativeAdmissionID}, &seeded)
+		taskID := domain.NewID().String()
+		aad := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: fixture.TenantID, NetworkID: fixture.NetworkID, ObjectType: e2ee.ObjectTypeTask, ObjectID: taskID, Sender: fixture.InstanceID, Recipient: fixture.InstanceID, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), KeyEpochID: fixture.EpochID}
+		var key [32]byte
+		copy(key[:], taskKey)
+		envelope, err := e2ee.Encrypt([]byte("actual encrypted original task body"), key, aad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		helper.call(t, map[string]any{"action": "seed_encrypted_task_source", "runnerId": peer.session.RunnerID, "runnerEpoch": peer.session.RunnerEpoch, "bootId": peer.session.BootID, "nativeAdmissionId": peer.session.NativeAdmissionID, "taskAAD": aad, "taskEnvelope": envelope}, &seeded)
+		if seeded.TaskSource == nil || seeded.TaskSource.TaskID != taskID || !bytes.Equal(seeded.TaskSource.InputAAD.CanonicalBytes(), aad.CanonicalBytes()) {
+			t.Fatal("backend did notretain actualoriginalencryptedtaskdescriptor")
+		}
+
 		if seeded.CommandID == "" || seeded.TaskID == "" {
 			t.Fatal("backend original task command missing")
 		}
@@ -224,22 +251,25 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	}
 	originalTask := seed(a)
 	secret := "actual-native-turn-private-" + terminal
-	invoke(controllerA, 2, "prompt", sessionworker.Operation{Input: "let protected " + secret, InputKind: "task", SourceCommandID: originalTask.CommandID, SourceAdmissionID: a.session.NativeAdmissionID})
+	invoke(controllerA, 2, "prompt", sessionworker.Operation{Input: secret + strings.Repeat(" original full native task text €", 3000), InputKind: "task", SourceCommandID: originalTask.CommandID, SourceAdmissionID: a.session.NativeAdmissionID, SourceTask: originalTask.TaskSource})
 	outcome(controllerA, 2)
 	page, err := controllerA.Call(t.Context(), sessionworker.Request{Type: "observations", Limit: 32})
 	if err != nil || page.Error != "" {
 		t.Fatal(err)
 	}
-	var started, ended sessionworker.NativeObservation
+	var started, ended, output sessionworker.NativeObservation
 	for _, o := range page.Observations {
 		if o.Event.Type == session.EventTurnStarted {
 			started = o
+		}
+		if o.Event.Type == session.EventTurnOutput && o.Event.NativeOutput {
+			output = o
 		}
 		if o.Event.Type == session.EventTurnCompleted || o.Event.Type == session.EventTurnFailed {
 			ended = o
 		}
 	}
-	if started.ID == "" || ended.ID == "" || started.Capture == nil || ended.Capture == nil || started.TurnSource == nil || ended.TurnSource == nil || started.TurnSource.SourceCommandID != originalTask.CommandID || started.TurnSource.SourceAdmissionID != a.session.NativeAdmissionID || started.TurnSource.InputKind != "task" || *started.TurnSource != *ended.TurnSource {
+	if started.ID == "" || ended.ID == "" || started.Capture == nil || ended.Capture == nil || started.TurnSource == nil || ended.TurnSource == nil || started.TurnSource.SourceCommandID != originalTask.CommandID || started.TurnSource.SourceAdmissionID != a.session.NativeAdmissionID || started.TurnSource.InputKind != "task" || !reflect.DeepEqual(started.TurnSource, ended.TurnSource) {
 		t.Fatal("actual native events lost original accepted turn source")
 	}
 	if started.Event.Type != session.EventTurnStarted || (terminal == "completed" && ended.Event.Type != session.EventTurnCompleted) || (terminal == "failed" && ended.Event.Type != session.EventTurnFailed) {
@@ -276,6 +306,32 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	}
 	if err = a.connection.DrainNativeWorkerSources(t.Context(), onePage(controllerA)); err != nil {
 		t.Fatal(err)
+	}
+	var outputFragments []transport.NativeContentFragment
+	if terminal == "completed" {
+		if output.OutputContent == nil || output.OutputContent.FragmentCount <= transport.NativeContentMaxFragmentPage || output.SourceSequence != started.SourceSequence+1 {
+			t.Fatal("actual producer did notcapture genuineorderedtext")
+		}
+		for ordinal := 0; ordinal < output.OutputContent.FragmentCount; ordinal++ {
+			r, err := controllerA.Call(t.Context(), sessionworker.Request{Type: "content_fragment", ObservationID: output.ID, SourceDigest: output.SourceDigest, ContentID: output.OutputContent.ContentID, ContentOrdinal: ordinal})
+			if err != nil || r.Error != "" || r.ContentFragment == nil {
+				t.Fatal("actual original output ciphertext unavailable")
+			}
+			outputFragments = append(outputFragments, *r.ContentFragment)
+		}
+		var key [32]byte
+		copy(key[:], taskKey)
+		plain, _, err := nativecontent.Open(*output.OutputContent, outputFragments, key)
+		input := strings.Repeat(secret+strings.Repeat(" original full native task text €", 3000), 8)
+		if err != nil || string(plain) != "[fake-persist task] handled "+input+": "+input {
+			t.Fatal("actual native output changed", err)
+		}
+		if _, err = ring.Rotate(time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if err = hostcrypto.SaveKeyring(keydir, ring); err != nil {
+			t.Fatal(err)
+		}
 	}
 	actualStarted, err := NativeWorkerWireObservation(started)
 	if err != nil {
@@ -340,6 +396,72 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	if err = b.connection.DrainNativeWorkerSources(t.Context(), onePage(controllerB)); err != nil {
 		t.Fatal("B original started receipt recovery failed", err)
 	}
+	if terminal == "completed" {
+		var operation map[string]any
+		helper.call(t, map[string]any{"action": "fail_receipt", "observationId": output.ID}, &operation)
+		// Stage the bounded pages before putting a receipt timeout on the
+		// actual transactional publication; writing the large ciphertext is
+		// independently measured and must not poison the websocket deadline.
+		for ready := false; !ready; {
+			budget := transport.NativeContentMaxFragmentPage
+			ready, err = b.connection.stageWorkerContent(t.Context(), output, *output.OutputContent, controllerB.Call, &budget)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		failureCtx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
+		rollback := b.connection.DrainNativeWorkerSources(failureCtx, controllerB.Call)
+		cancel()
+		if !errors.Is(rollback, context.DeadlineExceeded) {
+			t.Fatal("actual task output rollback inventedreceipt", rollback)
+		}
+		var rolledBack nativeBackendStats
+		helper.call(t, map[string]any{"action": "stats", "originId": origin.ID, "observationId": output.ID, "contentId": output.OutputContent.ContentID, "forbiddenPlaintext": secret}, &rolledBack)
+		if rolledBack.ReceiptCount != 0 || rolledBack.Attachments != 0 || !rolledBack.PrivacyClean {
+			t.Fatal("actual failed task output transaction partiallyattached content")
+		}
+		retained, err := controllerB.Call(t.Context(), sessionworker.Request{Type: "content_fragment", ObservationID: output.ID, SourceDigest: output.SourceDigest, ContentID: output.OutputContent.ContentID, ContentOrdinal: 0})
+		if err != nil || retained.Error != "" || retained.ContentFragment == nil || !reflect.DeepEqual(*retained.ContentFragment, outputFragments[0]) {
+			t.Fatal("actual failed task output COMMIT deleted/re-encrypted original ciphertext")
+		}
+		helper.call(t, map[string]any{"action": "clear_failure"}, &operation)
+		b.dropObservationID.Store(&output.ID)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		var lost error
+		for lost == nil {
+			lost = b.connection.DrainNativeWorkerSources(ctx, controllerB.Call)
+		}
+		cancel()
+		if !errors.Is(lost, ErrNativeOriginAdmissionDeferred) {
+			t.Fatal("lost real tasktext receipt didnotretain cipher", lost)
+		}
+		var committed nativeBackendStats
+		helper.call(t, map[string]any{"action": "stats", "originId": origin.ID, "observationId": output.ID, "contentId": output.OutputContent.ContentID, "forbiddenPlaintext": secret}, &committed)
+		if committed.ReceiptCount != 1 || committed.Attachments != 1 || !committed.PrivacyClean || !reflect.DeepEqual(committed.Fragments, outputFragments) {
+			t.Fatal("real dropped text receipt altered original committed ciphertext")
+		}
+		c := connectNativeBackend(t, fixture, false)
+		controllerC, err := sessionworker.DialOwnerController(t.Context(), dir, scope, privateKey, "turn-controller-C")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer controllerC.Close()
+		admit(c, controllerC)
+		if err = c.connection.ConfirmNativeWorkerSession(t.Context(), scope, origin, hex.EncodeToString(profile[:]), snapshot(controllerC)); err != nil {
+			t.Fatal(err)
+		}
+		for ordinal, fragment := range outputFragments {
+			retained, err := controllerC.Call(t.Context(), sessionworker.Request{Type: "content_fragment", ObservationID: output.ID, SourceDigest: output.SourceDigest, ContentID: output.OutputContent.ContentID, ContentOrdinal: ordinal})
+			if err != nil || retained.Error != "" || retained.ContentFragment == nil || !reflect.DeepEqual(*retained.ContentFragment, fragment) {
+				t.Fatal("freshC rewrote/lost original output ciphertext")
+			}
+		}
+		b = c
+		controllerB = controllerC
+		if err = b.connection.DrainNativeWorkerSources(t.Context(), onePage(controllerB)); err != nil {
+			t.Fatal("freshC matching original text receipt replay failed", err)
+		}
+	}
 	var operation map[string]any
 	helper.call(t, map[string]any{"action": "fail_receipt", "observationId": ended.ID}, &operation)
 	failureCtx, cancelFailure := context.WithTimeout(t.Context(), 500*time.Millisecond)
@@ -365,6 +487,13 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	helper.call(t, check, &stats)
 	if stats.ReceiptCount != 1 || stats.Disposition != "committed" || stats.TurnCount != 1 || stats.TurnStatus != terminal || stats.TurnID != expectedTurn || stats.TaskID != originalTask.TaskID || stats.SourceCommandID != originalTask.CommandID || stats.SourceAdmissionID != a.session.NativeAdmissionID || stats.SourceRunnerID != a.session.RunnerID || !stats.PrivacyClean {
 		t.Fatal("actual terminal source through B changed original A task binding")
+	}
+	if terminal == "completed" {
+		var contentStats nativeBackendStats
+		helper.call(t, map[string]any{"action": "stats", "originId": origin.ID, "observationId": output.ID, "contentId": output.OutputContent.ContentID, "logicalTurnId": output.Event.TurnID, "forbiddenPlaintext": secret}, &contentStats)
+		if contentStats.ReceiptCount != 1 || contentStats.Disposition != "committed" || contentStats.Attachments != 1 || !contentStats.PrivacyClean || !reflect.DeepEqual(contentStats.Reference, output.OutputContent) || !reflect.DeepEqual(contentStats.Fragments, outputFragments) {
+			t.Fatal("actual backendtasktextcommit changedoriginalcipher")
+		}
 	}
 	missing, err := controllerB.Call(t.Context(), sessionworker.Request{Type: "source_capture", ObservationID: ended.ID, SourceDigest: ended.SourceDigest})
 	if err != nil || missing.Error == "" || missing.Capture != nil {

@@ -126,6 +126,7 @@ func connectNativeBackend(t *testing.T, fixture nativeBackendFixture, dropReceip
 	boot := domain.NewID().String()
 	q.Set("boot_id", boot)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Set("native_task_content", transport.NativeTaskContentProtocol)
 	u.RawQuery = q.Encode()
 	header := http.Header{"Authorization": []string{"Bearer " + fixture.Credential}}
 	socket, _, err := websocket.DefaultDialer.DialContext(t.Context(), u.String(), header)

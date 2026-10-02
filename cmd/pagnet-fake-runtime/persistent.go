@@ -676,6 +676,12 @@ func runPersistTurn(cmd persistCmd, prev *session, sessionPath string, emit func
 	// Deterministic "work": echo the input (one transcript chunk).
 	out := fmt.Sprintf("[fake-persist %s] handled %s: %s",
 		kindOr(cmd.InputKind, "turn"), firstLine(cmd.Input), firstLine(cmd.Input))
+	// Explicit isolated fixture: exercise full native chunks larger than a
+	// single bounded delivery page, instead of the default short TUI echo.
+	if repeat, err := strconv.Atoi(os.Getenv("PAGNET_FAKE_FULL_OUTPUT_REPEAT")); err == nil && repeat >= 1 && repeat <= 8 && len(cmd.Input) <= 128<<10 {
+		full := strings.Repeat(cmd.Input, repeat)
+		out = fmt.Sprintf("[fake-persist %s] handled %s: %s", kindOr(cmd.InputKind, "turn"), full, full)
+	}
 	emit(persistEvent{Event: "runtime.turn.output", TurnID: cmd.TurnID, SessionID: prev.SessionID, Output: out})
 
 	// Persist the session (materialises it on the first exchange).
