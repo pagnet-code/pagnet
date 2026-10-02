@@ -281,9 +281,9 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		response := Response{}
 		switch req.Type {
 		case "intent":
-			var authorize func() error
+			var authorize func() (*Admission, error)
 			if owner != nil {
-				authorize = func() error { return owner.relay.authorizeNativeEffect(auth.Lease) }
+				authorize = func() (*Admission, error) { return owner.relay.authorizeNativeEffect(auth.Lease) }
 			}
 			out, run, err := j.admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize)
 			if err != nil {

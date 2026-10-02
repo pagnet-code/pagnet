@@ -360,14 +360,15 @@ func (b *relayBroker) bindNative(generation string) {
 	b.order = nil
 }
 
-func (b *relayBroker) authorizeNativeEffect(lease int64) error {
+func (b *relayBroker) authorizeNativeEffect(lease int64) (*Admission, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed || lease != b.lease {
-		return ErrFenced
+		return nil, ErrFenced
 	}
 	if b.admission == nil {
-		return errors.New("fresh control-plane admission is required before new native effects")
+		return nil, errors.New("fresh control-plane admission is required before new native effects")
 	}
-	return nil
+	copy := *b.admission
+	return &copy, nil
 }

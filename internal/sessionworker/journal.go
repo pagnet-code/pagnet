@@ -44,11 +44,12 @@ type Scope struct {
 }
 
 type Outcome struct {
-	Sequence  int64           `json:"sequence"`
-	CommandID string          `json:"commandId"`
-	Kind      string          `json:"kind"`
-	State     string          `json:"state"` // admitted | completed | failed | uncertain
-	Result    json.RawMessage `json:"result,omitempty"`
+	SourceAdmission *Admission      `json:"sourceAdmission,omitempty"`
+	Sequence        int64           `json:"sequence"`
+	CommandID       string          `json:"commandId"`
+	Kind            string          `json:"kind"`
+	State           string          `json:"state"` // admitted | completed | failed | uncertain
+	Result          json.RawMessage `json:"result,omitempty"`
 }
 
 // Journal stores only intent digests and outcomes. Prompt bodies, arbitrary
@@ -110,6 +111,7 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	for _, q := range []string{
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
 		`CREATE TABLE IF NOT EXISTS worker_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), protocol TEXT NOT NULL, scope TEXT NOT NULL, lease INTEGER NOT NULL, next_sequence INTEGER NOT NULL, retired INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS worker_intent_admission(sequence INTEGER PRIMARY KEY, admission BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS worker_intent(sequence INTEGER PRIMARY KEY, command_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, result BLOB, acknowledged INTEGER NOT NULL DEFAULT 0)`,
 	} {
 		if _, err = db.Exec(q); err != nil {
@@ -228,7 +230,7 @@ func (j *Journal) Admit(ctx context.Context, lease, sequence int64, commandID, k
 }
 
 // Only new effects need admission. Exact prior ordinal replay is read-only.
-func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() error) (out Outcome, execute bool, err error) {
+func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() (*Admission, error)) (out Outcome, execute bool, err error) {
 	if sequence <= 0 || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
 		return out, false, errors.New("invalid or oversized intent")
 	}
@@ -255,6 +257,15 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 		if out.CommandID != commandID || out.Kind != kind || oldDigest != digest {
 			return out, false, ErrConflict
 		}
+		var source []byte
+		if readErr := tx.QueryRowContext(ctx, `SELECT admission FROM worker_intent_admission WHERE sequence=?`, sequence).Scan(&source); readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+			return out, false, readErr
+		}
+		if len(source) > 0 {
+			if err = json.Unmarshal(source, &out.SourceAdmission); err != nil {
+				return out, false, err
+			}
+		}
 		return out, false, tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -264,7 +275,7 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 		return out, false, ErrConflict
 	}
 	if authorizeNew != nil {
-		if err = authorizeNew(); err != nil {
+		if out.SourceAdmission, err = authorizeNew(); err != nil {
 			return out, false, err
 		}
 	}
@@ -278,13 +289,22 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_intent(sequence,command_id,digest,kind,state) VALUES(?,?,?,?,'admitted')`, sequence, commandID, digest, kind); err != nil {
 		return out, false, fmt.Errorf("intent identity conflict: %w", err)
 	}
+	if out.SourceAdmission != nil {
+		source, marshalErr := json.Marshal(out.SourceAdmission)
+		if marshalErr != nil {
+			return out, false, marshalErr
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO worker_intent_admission(sequence,admission) VALUES(?,?)`, sequence, source); err != nil {
+			return out, false, err
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_meta SET next_sequence=? WHERE singleton=1`, sequence+1); err != nil {
 		return out, false, err
 	}
 	if err = tx.Commit(); err != nil {
 		return out, false, err
 	}
-	return Outcome{Sequence: sequence, CommandID: commandID, Kind: kind, State: "admitted"}, true, nil
+	return Outcome{Sequence: sequence, CommandID: commandID, Kind: kind, State: "admitted", SourceAdmission: out.SourceAdmission}, true, nil
 }
 
 // Settle does not require the original controller lease: an already admitted
@@ -318,6 +338,18 @@ func (j *Journal) Outcome(ctx context.Context, sequence int64) (out Outcome, err
 	var rawResult []byte
 	err = j.db.QueryRowContext(ctx, `SELECT sequence,command_id,kind,state,result FROM worker_intent WHERE sequence=?`, sequence).Scan(&out.Sequence, &out.CommandID, &out.Kind, &out.State, &rawResult)
 	out.Result = json.RawMessage(rawResult)
+	if err != nil {
+		return
+	}
+	var source []byte
+	err = j.db.QueryRowContext(ctx, `SELECT admission FROM worker_intent_admission WHERE sequence=?`, sequence).Scan(&source)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+		return
+	}
+	if err == nil {
+		err = json.Unmarshal(source, &out.SourceAdmission)
+	}
 	return
 }
 
@@ -360,6 +392,9 @@ func (j *Journal) Acknowledge(ctx context.Context, lease, sequence int64) error 
 			return err
 		}
 		floor++
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_intent_admission WHERE sequence<=?`, floor); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_intent WHERE sequence<=?`, floor); err != nil {
 		return err

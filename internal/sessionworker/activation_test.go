@@ -23,10 +23,6 @@ func TestActivationAuthorityBeforeNativeGenerationAndReconnection(t *testing.T) 
 	}
 	for _, generation := range []string{"first-attempt", "proven-unaccepted-retry"} {
 		done := make(chan answer, 1)
-		go func() {
-			origin, err := o.awaitActivationOrigin(ctx, "same-source-command", generation)
-			done <- answer{origin, err}
-		}()
 		o.relay.bindLease(1)
 		admission := Admission{NativeAdmissionID: "native-admission-original", Scope: j.scope, TenantID: spec.TenantID, NetworkID: spec.NetworkID, Kind: spec.Kind, RunnerID: "runner-one", RunnerEpoch: time.Now().UTC(), BootID: "boot-one"}
 		if generation == "proven-unaccepted-retry" {
@@ -37,6 +33,10 @@ func TestActivationAuthorityBeforeNativeGenerationAndReconnection(t *testing.T) 
 		if err := o.relay.admit(lease, admission); err != nil {
 			t.Fatal(err)
 		}
+		go func() {
+			origin, err := o.awaitActivationOrigin(ctx, "same-source-command", generation, &admission)
+			done <- answer{origin, err}
+		}()
 		var request *ActivationRequest
 		deadline := time.Now().Add(time.Second)
 		for time.Now().Before(deadline) {
@@ -135,7 +135,7 @@ func TestSameControllerFreshTransportReissuesUnlaunchedGate(t *testing.T) {
 	if err := broker.admit(1, original); err != nil {
 		t.Fatal(err)
 	}
-	broker.activation = &activationTicket{request: ActivationRequest{ID: "exact-request", Scope: scope, SourceCommandID: "original-command", NativeGeneration: "original-generation", ActualRuntime: spec.Runtime}, done: make(chan activationReply, 1)}
+	broker.activation = &activationTicket{request: ActivationRequest{Admission: original, ID: "exact-request", Scope: scope, SourceCommandID: "original-command", NativeGeneration: "original-generation", ActualRuntime: spec.Runtime}, done: make(chan activationReply, 1)}
 	first, err := broker.pollActivation(1)
 	if err != nil || first == nil {
 		t.Fatal("first authority gate unavailable")
@@ -149,5 +149,49 @@ func TestSameControllerFreshTransportReissuesUnlaunchedGate(t *testing.T) {
 	again, err := broker.pollActivation(1)
 	if err != nil || again == nil || again.ID != first.ID || again.NativeGeneration != first.NativeGeneration || again.Admission != original || again.CurrentAdmission != replacement {
 		t.Fatalf("fresh transport lost or rewrote original attempt: %+v %v", again, err)
+	}
+}
+
+// Accepted provenance is committed with the intent and survives reopening;
+// changing the current lease can authorize continuation but cannot rewrite it.
+func TestAcceptedActivationAdmissionSurvivesJournalReopen(t *testing.T) {
+	j, _ := testJournal(t)
+	ctx := context.Background()
+	lease, err := j.AdvanceLease(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := Admission{NativeAdmissionID: "accepted-A", Scope: j.scope, RunnerID: "runner-A", RunnerEpoch: time.Now().UTC(), BootID: "boot-A"}
+	payload := json.RawMessage(`{"sourceCommandId":"original-command"}`)
+	accepted, run, err := j.admit(ctx, lease, 1, "intent-A", "activate", payload, func() (*Admission, error) { copy := source; return &copy, nil })
+	if err != nil || !run || accepted.SourceAdmission == nil || *accepted.SourceAdmission != source {
+		t.Fatalf("accepted source missing: %+v %v", accepted, err)
+	}
+	dir, scope := j.dir, j.scope
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(dir, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	nextLease, err := reopened.AdvanceLease(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, run, err := reopened.admit(ctx, nextLease, 1, "intent-A", "activate", payload, func() (*Admission, error) {
+		t.Fatal("read-only replay consulted replacement admission")
+		return nil, nil
+	})
+	if err != nil || run || replay.State != "uncertain" || replay.SourceAdmission == nil || *replay.SourceAdmission != source {
+		t.Fatalf("original accepted source changed on reopen/replay: %+v %v", replay, err)
+	}
+	if err = reopened.Acknowledge(ctx, nextLease, 1); err != nil {
+		t.Fatal(err)
+	}
+	var retained int
+	if err = reopened.db.QueryRow(`SELECT COUNT(*) FROM worker_intent_admission`).Scan(&retained); err != nil || retained != 0 {
+		t.Fatalf("source retention was not reclaimed: %d %v", retained, err)
 	}
 }

@@ -84,6 +84,7 @@ type SessionOwner struct {
 	mu                  sync.Mutex
 	generation, nonce   string
 	origin              json.RawMessage
+	candidateAdmission  *Admission
 	candidateCommandID  string
 	candidateTurnSource NativeTurnSource
 	terminal            *os.File
@@ -209,6 +210,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			}
 			defer o.prompt.Unlock()
 			o.mu.Lock()
+			o.candidateAdmission = out.SourceAdmission
 			o.candidateCommandID = op.SourceCommandID
 			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID}
 			fatal := o.fatal
@@ -462,8 +464,9 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		o := d.owner
 		o.mu.Lock()
 		commandID := o.candidateCommandID
+		admission := o.candidateAdmission
 		o.mu.Unlock()
-		origin, err := o.awaitActivationOrigin(ctx, commandID, generation)
+		origin, err := o.awaitActivationOrigin(ctx, commandID, generation, admission)
 		if err != nil {
 			return nil, err
 		}

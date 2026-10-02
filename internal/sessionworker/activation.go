@@ -43,7 +43,10 @@ type activationTicket struct {
 	done    chan activationReply
 }
 
-func (o *SessionOwner) awaitActivationOrigin(ctx context.Context, commandID, generation string) (json.RawMessage, error) {
+func (o *SessionOwner) awaitActivationOrigin(ctx context.Context, commandID, generation string, source *Admission) (json.RawMessage, error) {
+	if source == nil {
+		return nil, errors.New("native activation accepted source is missing")
+	}
 	if commandID == "" || len(commandID) > 256 {
 		return nil, errors.New("native activation source command is missing")
 	}
@@ -52,7 +55,7 @@ func (o *SessionOwner) awaitActivationOrigin(ctx context.Context, commandID, gen
 		o.relay.mu.Unlock()
 		return nil, errors.New("native activation admission unavailable")
 	}
-	ticket := &activationTicket{request: ActivationRequest{ID: uuid.NewString(), Scope: o.journal.scope, SourceCommandID: commandID, NativeGeneration: generation, ActualRuntime: o.spec.Runtime, NetworkID: o.spec.NetworkID, NetworkTenantID: o.spec.NetworkTenantID}, done: make(chan activationReply, 1)}
+	ticket := &activationTicket{request: ActivationRequest{Admission: *source, ID: uuid.NewString(), Scope: o.journal.scope, SourceCommandID: commandID, NativeGeneration: generation, ActualRuntime: o.spec.Runtime, NetworkID: o.spec.NetworkID, NetworkTenantID: o.spec.NetworkTenantID}, done: make(chan activationReply, 1)}
 	o.relay.activation = ticket
 	o.relay.mu.Unlock()
 	defer func() {
@@ -85,7 +88,7 @@ func (b *relayBroker) pollActivation(lease int64) (*ActivationRequest, error) {
 	b.activation.issued = true
 	b.activation.lease = lease
 	if b.activation.request.Admission.RunnerID == "" {
-		b.activation.request.Admission = *b.admission
+		return nil, errors.New("native activation accepted source is missing")
 	}
 	b.activation.request.CurrentAdmission = *b.admission
 	copy := b.activation.request
