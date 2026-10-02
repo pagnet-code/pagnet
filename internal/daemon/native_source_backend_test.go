@@ -226,17 +226,18 @@ func nativeBackendSourceDigest(o sessionworker.NativeObservation) string {
 }
 
 type nativeBackendStats struct {
-	ReceiptCount     int                               `json:"receiptCount"`
-	Disposition      string                            `json:"disposition"`
-	Attachments      int                               `json:"attachments"`
-	SourceRunnerID   string                            `json:"sourceRunnerId"`
-	NativeGeneration string                            `json:"nativeGeneration"`
-	ProjectedCount   int                               `json:"projectedCount"`
-	PrivacyClean     bool                              `json:"privacyClean"`
-	Digest           string                            `json:"digest"`
-	Reference        *transport.NativeContentReference `json:"reference"`
-	Fragments        []transport.NativeContentFragment `json:"fragments"`
-	InstanceStatus   string                            `json:"instanceStatus"`
+	LifecycleSequence int64                             `json:"lifecycleSequence"`
+	ReceiptCount      int                               `json:"receiptCount"`
+	Disposition       string                            `json:"disposition"`
+	Attachments       int                               `json:"attachments"`
+	SourceRunnerID    string                            `json:"sourceRunnerId"`
+	NativeGeneration  string                            `json:"nativeGeneration"`
+	ProjectedCount    int                               `json:"projectedCount"`
+	PrivacyClean      bool                              `json:"privacyClean"`
+	Digest            string                            `json:"digest"`
+	Reference         *transport.NativeContentReference `json:"reference"`
+	Fragments         []transport.NativeContentFragment `json:"fragments"`
+	InstanceStatus    string                            `json:"instanceStatus"`
 }
 
 func TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof(t *testing.T) {
@@ -456,6 +457,46 @@ func TestNativeSourceDrainerActualBackendReconnectAndCiphertextProof(t *testing.
 	helper.call(t, check, &stats)
 	if stats.ReceiptCount != 1 || stats.Disposition != "committed" || stats.InstanceStatus != "working" || stats.SourceRunnerID != a.session.RunnerID {
 		t.Fatal("lifecycle did not preserve original A while projecting through B")
+	}
+	// Retain unsupported private records beyond one entire bounded scan. They
+	// must never receive ACK, acquire a lifecycle sequence, or starve real sources.
+	for i := 0; i < 160; i++ {
+		unsupported := sessionworker.NativeObservation{ID: domain.NewID().String(), NativeGeneration: generation, NativeSessionID: nativeSession, Origin: originRaw, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventPlanUpdated, SessionID: nativeSession}}
+		unsupported.SourceDigest = nativeBackendSourceDigest(unsupported)
+		if err = journal.JournalObservation(t.Context(), unsupported); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idle := sessionworker.NativeObservation{ID: domain.NewID().String(), NativeGeneration: generation, NativeSessionID: nativeSession, Origin: originRaw, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventIdle, SessionID: nativeSession}}
+	idle.SourceDigest = nativeBackendSourceDigest(idle)
+	if err = journal.JournalObservation(t.Context(), idle); err != nil {
+		t.Fatal(err)
+	}
+	after, err := b.connection.DrainNativeWorkerSourcesPage(t.Context(), controllerB.Call, 0)
+	if err != nil || after <= 0 {
+		t.Fatal("unsupported source scan did not retain bounded cursor", err)
+	}
+	check["observationId"] = idle.ID
+	helper.call(t, check, &stats)
+	if stats.ReceiptCount != 0 {
+		t.Fatal("bounded scan exceeded128 rows")
+	}
+	after, err = b.connection.DrainNativeWorkerSourcesPage(t.Context(), controllerB.Call, after)
+	if err != nil || after != 0 {
+		t.Fatal("retained unsupported records starved actual lifecycle", err)
+	}
+	helper.call(t, check, &stats)
+	if stats.ReceiptCount != 1 || stats.Disposition != "committed" || stats.InstanceStatus != "idle" || stats.LifecycleSequence != 2 || stats.SourceRunnerID != a.session.RunnerID {
+		t.Fatal("paged lifecycle changed original source/sequence")
+	}
+	pending, err := journal.PendingObservations(t.Context(), 32)
+	if err != nil || len(pending) != 32 {
+		t.Fatal("paging discarded unsupported evidence", err)
+	}
+	for _, o := range pending {
+		if o.Event.Type != session.EventPlanUpdated || o.SourceSequence != 0 || nativeBackendSourceDigest(o) != o.SourceDigest {
+			t.Fatal("cursor mutated unsupported private source")
+		}
 	}
 	foreignFixture := fixture
 	foreignFixture.Credential = fixture.ForeignCredential

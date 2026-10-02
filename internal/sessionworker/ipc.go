@@ -58,6 +58,7 @@ type Request struct {
 }
 
 type Response struct {
+	ObservationPage *NativeObservationPage           `json:"observationPage,omitempty"`
 	ContentFragment *transport.NativeContentFragment `json:"contentFragment,omitempty"`
 	Capture         *NativeCaptureChunk              `json:"capture,omitempty"`
 	Activation      *ActivationRequest               `json:"activation,omitempty"`
@@ -428,7 +429,13 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 			response.Output = &page
 		}
 	case "observations":
-		response.Observations, err = o.journal.PendingObservationsForLease(ctx, lease, req.Limit)
+		var page NativeObservationPage
+		page, err = o.journal.ObservationPageForLease(ctx, lease, req.Cursor, req.Limit)
+		if err == nil {
+			response.Observations = page.Observations
+			page.Observations = nil
+			response.ObservationPage = &page
+		}
 	case "content_fragment":
 		response.ContentFragment, err = o.journal.ReadContentFragment(ctx, lease, req.ObservationID, req.SourceDigest, req.ContentID, req.ContentOrdinal)
 	case "source_capture":

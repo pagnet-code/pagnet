@@ -124,72 +124,97 @@ func NativeWorkerWireObservation(o sessionworker.NativeObservation) (transport.N
 	return transport.NativeObservationPayload{ObservationID: o.ID, OriginID: origin.ID, MessageType: typ, Digest: hex.EncodeToString(digest[:]), ObservedAt: o.ObservedAt, ExpiresAt: o.ObservedAt.Add(NativeObservationRetryHorizon), Payload: raw}, nil
 }
 
-// DrainNativeWorkerSources makes at most one bounded journal page and 16
-// ciphertext fragment writes per invocation. A backend durable commit is the
-// sole event that permits the worker's atomic source/capture/fragment ACK.
-// Call belongs to the exact authenticated, lease-fenced private controller.
+// DrainNativeWorkerSources retains the legacy one-page adapter. Controller
+// integrations use DrainNativeWorkerSourcesPage and retain its per-worker cursor.
 func (c *NativeObservationConnection) DrainNativeWorkerSources(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error)) error {
+	_, err := c.drainNativeWorkerSourcesPage(ctx, call, 0, 1)
+	return err
+}
+
+// DrainNativeWorkerSourcesPage scans at most 128 rows and writes at most 16
+// ciphertext fragments per call. After is side metadata from this exact worker's
+// prior result. Keep it with the pinned worker proxy, reset it on replacement.
+// A zero result starts the next bounded pass from the oldest retained evidence.
+// Failed or unfinished supported sources never advance beyond their page.
+func (c *NativeObservationConnection) DrainNativeWorkerSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64) (int64, error) {
+	return c.drainNativeWorkerSourcesPage(ctx, call, after, 4)
+}
+func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64, maxPages int) (int64, error) {
+	if after < 0 {
+		return after, ErrNativeObservationConflict
+	}
 	c.mu.Lock()
 	err := c.deliveryReadyLocked(false)
 	c.mu.Unlock()
 	if err != nil {
-		return err
-	}
-	page, err := call(ctx, sessionworker.Request{Type: "observations", Limit: 32})
-	if err != nil {
-		return err
-	}
-	if page.Error != "" {
-		return errors.New(page.Error)
-	}
-	if len(page.Observations) > 32 {
-		return ErrNativeObservationCapacity
+		return after, err
 	}
 	budget := transport.NativeContentMaxFragmentPage
-	for _, o := range page.Observations {
-		var original transport.NativeObservationOrigin
-		if json.Unmarshal(o.Origin, &original) != nil || original.HostID != c.hostID {
-			return ErrNativeObservationConflict
-		}
-		p, err := NativeWorkerWireObservation(o)
-		if errors.Is(err, ErrNativeSourceUnsupported) {
-			continue
-		}
+	for pages := 0; pages < maxPages; pages++ {
+		page, err := call(ctx, sessionworker.Request{Type: "observations", Limit: 32, Cursor: after})
 		if err != nil {
-			return err
+			return after, err
 		}
-		var ref *transport.NativeContentReference
-		if o.Event.Type == session.EventInteractionStarted && o.Inspection != nil {
-			ref = o.Inspection.DetailContent
+		if page.Error != "" {
+			return after, errors.New(page.Error)
 		}
-		if o.Event.Type == session.EventInteractionResolved && o.Resolution != nil {
-			ref = o.Resolution.DetailContent
+		if len(page.Observations) > 32 {
+			return after, ErrNativeObservationCapacity
 		}
-		if ref != nil {
-			ready, err := c.stageWorkerContent(ctx, o, *ref, call, &budget)
+		cursor := page.ObservationPage
+		// Old worker protocols return no page metadata and remain one-page only.
+		if cursor != nil && (cursor.After != after || cursor.NextCursor < after || (len(page.Observations) > 0 && cursor.NextCursor <= after) || (cursor.More && len(page.Observations) == 0)) {
+			return after, ErrNativeObservationConflict
+		}
+		for _, o := range page.Observations {
+			var original transport.NativeObservationOrigin
+			if json.Unmarshal(o.Origin, &original) != nil || original.HostID != c.hostID {
+				return after, ErrNativeObservationConflict
+			}
+			p, err := NativeWorkerWireObservation(o)
+			if errors.Is(err, ErrNativeSourceUnsupported) {
+				continue
+			}
 			if err != nil {
-				return err
+				return after, err
 			}
-			if !ready {
-				return nil
+			var ref *transport.NativeContentReference
+			if o.Event.Type == session.EventInteractionStarted && o.Inspection != nil {
+				ref = o.Inspection.DetailContent
+			}
+			if o.Event.Type == session.EventInteractionResolved && o.Resolution != nil {
+				ref = o.Resolution.DetailContent
+			}
+			if ref != nil {
+				ready, err := c.stageWorkerContent(ctx, o, *ref, call, &budget)
+				if err != nil {
+					return after, err
+				}
+				if !ready {
+					return after, nil
+				}
+			}
+			receipt, err := c.deliverWorkerObservation(ctx, p)
+			if err != nil {
+				return after, err
+			}
+			if receipt.Disposition != "committed" {
+				return after, ErrNativeOriginAdmissionRejected
+			}
+			ack, err := call(ctx, sessionworker.Request{Type: "observation_ack", ObservationID: o.ID, SourceDigest: o.SourceDigest})
+			if err != nil {
+				return after, err
+			}
+			if ack.Error != "" {
+				return after, errors.New(ack.Error)
 			}
 		}
-		receipt, err := c.deliverWorkerObservation(ctx, p)
-		if err != nil {
-			return err
+		if cursor == nil || !cursor.More {
+			return 0, nil
 		}
-		if receipt.Disposition != "committed" {
-			return ErrNativeOriginAdmissionRejected
-		}
-		ack, err := call(ctx, sessionworker.Request{Type: "observation_ack", ObservationID: o.ID, SourceDigest: o.SourceDigest})
-		if err != nil {
-			return err
-		}
-		if ack.Error != "" {
-			return errors.New(ack.Error)
-		}
+		after = cursor.NextCursor
 	}
-	return nil
+	return after, nil
 }
 
 // Timeouts free all pending entries, and disconnect wakes every waiter. A fresh

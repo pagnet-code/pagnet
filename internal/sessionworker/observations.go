@@ -168,42 +168,60 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 }
 
 func (j *Journal) PendingObservations(ctx context.Context, limit int) ([]NativeObservation, error) {
-	return j.pendingObservations(ctx, 0, limit)
+	page, err := j.pendingObservationPage(ctx, 0, 0, limit)
+	return page.Observations, err
 }
 func (j *Journal) PendingObservationsForLease(ctx context.Context, lease int64, limit int) ([]NativeObservation, error) {
 	if lease <= 0 {
 		return nil, ErrFenced
 	}
-	return j.pendingObservations(ctx, lease, limit)
+	page, err := j.pendingObservationPage(ctx, lease, 0, limit)
+	return page.Observations, err
 }
-func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit int) ([]NativeObservation, error) {
-	if limit < 1 || limit > 32 {
-		return nil, errors.New("invalid native observation page bound")
+
+// NativeObservationPage cursors identify SQLite rows, not native source identity.
+// A cursor is transport metadata authenticated by the exact controller IPC lease.
+type NativeObservationPage struct {
+	After        int64               `json:"after"`
+	NextCursor   int64               `json:"nextCursor"`
+	More         bool                `json:"more"`
+	Observations []NativeObservation `json:"-"`
+}
+
+func (j *Journal) ObservationPageForLease(ctx context.Context, lease, after int64, limit int) (NativeObservationPage, error) {
+	if lease <= 0 {
+		return NativeObservationPage{}, ErrFenced
+	}
+	return j.pendingObservationPage(ctx, lease, after, limit)
+}
+func (j *Journal) pendingObservationPage(ctx context.Context, lease, after int64, limit int) (NativeObservationPage, error) {
+	page := NativeObservationPage{After: after, NextCursor: after}
+	if after < 0 || limit < 1 || limit > 32 {
+		return page, errors.New("invalid native observation page bound")
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return page, err
 	}
 	defer tx.Rollback()
 	if lease > 0 {
 		if _, _, err = checkLease(ctx, tx, lease); err != nil {
-			return nil, err
+			return page, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id ORDER BY o.sequence LIMIT ?`, limit)
+	rows, err := tx.QueryContext(ctx, `SELECT o.sequence,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.sequence>? ORDER BY o.sequence LIMIT ?`, after, limit)
 	if err != nil {
-		return nil, err
+		return page, err
 	}
 	defer rows.Close()
-	var result []NativeObservation
 	total := 0
 	for rows.Next() {
 		var raw []byte
-		var sourceSequence int64
-		if err = rows.Scan(&raw, &sourceSequence); err != nil {
-			return nil, err
+		var rowSequence, sourceSequence int64
+		if err = rows.Scan(&rowSequence, &raw, &sourceSequence); err != nil {
+			return page, err
 		}
 		if total+len(raw) > maxFrame*3/4 {
 			break
@@ -211,21 +229,25 @@ func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit in
 		total += len(raw)
 		var observation NativeObservation
 		if err = json.Unmarshal(raw, &observation); err != nil {
-			return nil, err
+			return page, err
 		}
 		observation.SourceSequence = sourceSequence
-		result = append(result, observation)
+		page.Observations = append(page.Observations, observation)
+		page.NextCursor = rowSequence
 	}
 	if err = rows.Err(); err != nil {
-		return nil, err
+		return page, err
 	}
 	if err = rows.Close(); err != nil {
-		return nil, err
+		return page, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_observations WHERE sequence>?)`, page.NextCursor).Scan(&page.More); err != nil {
+		return page, err
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, err
+		return page, err
 	}
-	return result, nil
+	return page, nil
 }
 
 // A controller acknowledges only after a matching durable backend commit receipt.
