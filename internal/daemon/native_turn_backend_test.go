@@ -24,19 +24,22 @@ import (
 )
 
 type nativeTurnBackendStats struct {
-	ReceiptCount      int    `json:"receiptCount"`
-	Disposition       string `json:"disposition"`
-	Digest            string `json:"digest"`
-	TurnID            string `json:"turnId"`
-	TurnCount         int    `json:"turnCount"`
-	TurnStatus        string `json:"turnStatus"`
-	TaskID            string `json:"taskId"`
-	SourceCommandID   string `json:"sourceCommandId"`
-	SourceAdmissionID string `json:"sourceAdmissionId"`
-	SourceRunnerID    string `json:"sourceRunnerId"`
-	NativeGeneration  string `json:"nativeGeneration"`
-	LifecycleSequence int64  `json:"lifecycleSequence"`
-	PrivacyClean      bool   `json:"privacyClean"`
+	ReceiptCount      int     `json:"receiptCount"`
+	Disposition       string  `json:"disposition"`
+	Digest            string  `json:"digest"`
+	TurnID            string  `json:"turnId"`
+	TurnCount         int     `json:"turnCount"`
+	TurnStatus        string  `json:"turnStatus"`
+	TaskID            string  `json:"taskId"`
+	SourceCommandID   string  `json:"sourceCommandId"`
+	SourceAdmissionID string  `json:"sourceAdmissionId"`
+	SourceRunnerID    string  `json:"sourceRunnerId"`
+	NativeGeneration  string  `json:"nativeGeneration"`
+	LifecycleSequence int64   `json:"lifecycleSequence"`
+	PrivacyClean      bool    `json:"privacyClean"`
+	OriginRetired     bool    `json:"originRetired"`
+	ActiveOriginID    *string `json:"activeOriginId"`
+	SessionState      string  `json:"sessionState"`
 }
 
 func TestNativeTurnDrainerActualOwnerBackendOriginalSourceAndRollback(t *testing.T) {
@@ -417,7 +420,7 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	}
 	var stoppedStats nativeTurnBackendStats
 	helper.call(t, map[string]any{"action": "stats", "originId": origin.ID, "observationId": stopped.ID, "logicalTurnId": ended.Event.TurnID, "forbiddenPlaintext": secret}, &stoppedStats)
-	if stoppedStats.ReceiptCount != 1 || stoppedStats.Disposition != "committed" || stoppedStats.Digest != stoppedWire.Digest || stoppedStats.NativeGeneration != stopped.NativeGeneration || stoppedStats.LifecycleSequence != stopped.SourceSequence || stoppedStats.SourceRunnerID != a.session.RunnerID || !stoppedStats.PrivacyClean {
+	if stoppedStats.ReceiptCount != 1 || stoppedStats.Disposition != "committed" || stoppedStats.Digest != stoppedWire.Digest || stoppedStats.NativeGeneration != stopped.NativeGeneration || stoppedStats.LifecycleSequence != stopped.SourceSequence || stoppedStats.SourceRunnerID != a.session.RunnerID || !stoppedStats.PrivacyClean || !stoppedStats.OriginRetired || stoppedStats.ActiveOriginID != nil || stoppedStats.SessionState != "invalid" {
 		t.Fatal("actual EOF receipt lost original source authority")
 	}
 	if count("worker_source_stream") != 1 || count("worker_turn_sources") != 1 {
