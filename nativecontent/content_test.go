@@ -86,10 +86,48 @@ func TestNativeContentEnforcesRecordBoundsAndCompleteUTF8(t *testing.T) {
 	if _, err := Build(make([]byte, transport.NativeContentMaxPlaintextBytes+1), [32]byte{1}, good.Reference.ManifestAAD, *good.Reference.ManifestAAD.NativeContent, "application/octet-stream"); err == nil {
 		t.Fatal("oversize source admitted")
 	}
-	invalid := contentFixture(t, []byte{0xff, 0xfe})
-	if _, _, err := Open(invalid.Reference, invalid.Fragments, [32]byte{1}); err == nil {
-		t.Fatal("invalid complete UTF8 accepted")
+	invalidBytes := []byte{0xff, 0xfe}
+	for _, mime := range []string{"text/plain", "text/plain; charset=utf-8", "application/json"} {
+		if _, err := Build(invalidBytes, [32]byte{1}, good.Reference.ManifestAAD, *good.Reference.ManifestAAD.NativeContent, mime); err == nil {
+			t.Fatal("invalid UTF8 producer admitted", mime)
+		}
 	}
+	binary, err := Build(invalidBytes, [32]byte{1}, good.Reference.ManifestAAD, *good.Reference.ManifestAAD.NativeContent, "application/octet-stream")
+	if err != nil {
+		t.Fatal("binary producer rejected", err)
+	}
+	opened, _, err := Open(binary.Reference, binary.Fragments, [32]byte{1})
+	if err != nil || !bytes.Equal(opened, invalidBytes) {
+		t.Fatal("binary content did not round-trip", err)
+	}
+	// Construct a cryptographically coherent malicious text declaration. The
+	// consumer still rejects complete invalid UTF8 even if a producer bypassed Build.
+	manifestRaw, err := e2ee.Decrypt(binary.Reference.ManifestEnvelope, [32]byte{1}, binary.Reference.ManifestAAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest transport.NativeContentManifest
+	if err := json.Unmarshal(manifestRaw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.MimeType = "text/plain"
+	replacementRaw, _ := json.Marshal(manifest)
+	before, _ := ciphertextLength(binary.Reference.ManifestEnvelope, transport.NativeContentMaxManifestPlaintextBytes+16)
+	binary.Reference.ManifestEnvelope, err = e2ee.Encrypt(replacementRaw, [32]byte{1}, binary.Reference.ManifestAAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := ciphertextLength(binary.Reference.ManifestEnvelope, transport.NativeContentMaxManifestPlaintextBytes+16)
+	binary.Reference.CiphertextBytes += after - before
+	binary.Reference.CiphertextDigest, err = CiphertextCommitment(binary.Reference, binary.Fragments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Open(binary.Reference, binary.Fragments, [32]byte{1}); err == nil {
+		t.Fatal("invalid complete UTF8 consumer accepted")
+	}
+	clear(manifestRaw)
+	clear(replacementRaw)
 	good.Fragments[0].Envelope.Ciphertext = strings.Repeat("A", (transport.NativeContentFragmentPlaintextBytes+100)*2)
 	if err := ValidateFragment(good.Reference, good.Fragments[0]); err == nil {
 		t.Fatal("oversize fragment admitted")

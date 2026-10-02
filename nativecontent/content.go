@@ -35,6 +35,9 @@ func Build(plain []byte, key [32]byte, aad e2ee.AAD, binding e2ee.NativeContentB
 	if len(plain) == 0 || len(plain) > transport.NativeContentMaxPlaintextBytes || len(mimeType) == 0 || len(mimeType) > 128 {
 		return Transfer{}, ErrInvalid
 	}
+	if requiresUTF8(mimeType) && !utf8.Valid(plain) {
+		return Transfer{}, ErrInvalid
+	}
 	count := (len(plain) + transport.NativeContentFragmentPlaintextBytes - 1) / transport.NativeContentFragmentPlaintextBytes
 	binding.Format = e2ee.NativeContentBindingFormat
 	binding.FragmentCount = count
@@ -242,9 +245,13 @@ func Open(ref transport.NativeContentReference, fragments []transport.NativeCont
 	if int64(len(result)) != manifest.PlaintextBytes || digest(result) != manifest.PlaintextDigest {
 		return nil, "", ErrInvalid
 	}
-	if (strings.HasPrefix(manifest.MimeType, "text/") || manifest.MimeType == "application/json") && !utf8.Valid(result) {
+	if requiresUTF8(manifest.MimeType) && !utf8.Valid(result) {
 		return nil, "", ErrInvalid
 	}
 	success = true
 	return result, manifest.MimeType, nil
+}
+
+func requiresUTF8(mimeType string) bool {
+	return strings.HasPrefix(mimeType, "text/") || mimeType == "application/json"
 }
