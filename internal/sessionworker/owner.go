@@ -359,6 +359,12 @@ func (o *SessionOwner) writeInput(op Operation) error {
 	if !valid || master == nil || !o.driver.Live(o.journal.scope.InstanceID) {
 		return errors.New("terminal generation is no longer live")
 	}
+	// The supervisor publishes a pollable nonblocking PTY. A stalled native
+	// reader cannot hold the controller fence indefinitely during a paste.
+	if err := master.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return err
+	}
+	defer master.SetWriteDeadline(time.Time{})
 	n, err := master.Write(op.Data)
 	if err != nil || n != len(op.Data) {
 		return fmt.Errorf("%w: terminal input may be partially applied", session.ErrTurnInterrupted)

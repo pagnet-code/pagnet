@@ -326,9 +326,64 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if out := a.outcome(t, 4); out.State != "completed" {
 		t.Fatal(out)
 	}
+	// A separate ephemeral input lane never creates a durable intent or
+	// advances ownership. Rapid keys and resize bursts use the same native PTY.
+	rawStream, _ := json.Marshal(Operation{NativeGeneration: initial.NativeGeneration})
+	if response := a.call(t, Request{Type: "terminal_open", Payload: rawStream}); response.Error != "" {
+		t.Fatal(response.Error)
+	}
+	for i := 0; i < 30; i++ {
+		raw, _ := json.Marshal(Operation{Rows: uint16(24 + i), Cols: uint16(80 + i)})
+		if response := a.call(t, Request{Type: "terminal_resize", Payload: raw}); response.Error != "" {
+			t.Fatal(response.Error)
+		}
+	}
+	for _, part := range []string{"let ", "via-stream ", "exactly-once\n"} {
+		raw, _ := json.Marshal(Operation{Data: []byte(part)})
+		if response := a.call(t, Request{Type: "terminal_input", Payload: raw}); response.Error != "" {
+			t.Fatal(response.Error)
+		}
+	}
+	// Queueing is not an application receipt. Observe actual native evidence.
+	streamDeadline := time.Now().Add(5 * time.Second)
+	streamApplied := false
+	for time.Now().Before(streamDeadline) {
+		response := a.call(t, Request{Type: "output", Limit: 64})
+		var rendered strings.Builder
+		if response.Output != nil {
+			for _, record := range response.Output.Records {
+				if record.Kind == "terminal" {
+					var data []byte
+					_ = json.Unmarshal(record.Data, &data)
+					rendered.Write(data)
+				}
+			}
+		}
+		if strings.Contains(rendered.String(), "you> let via-stream exactly-once") {
+			streamApplied = true
+			break
+		}
+		if status := a.call(t, Request{Type: "terminal_status"}); status.Error != "" {
+			t.Fatal(status.Error)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !streamApplied {
+		t.Fatal("ephemeral stream did not reach actual native process")
+	}
 	b := startController(t, controllerB, state)
 	if b.build == a.build || b.lease <= a.lease {
 		t.Fatal("controller replacement was not independently built/fenced")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.call(t, Request{Type: "terminal_status"}).Error != "" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if a.call(t, Request{Type: "terminal_status"}).Error == "" {
+		t.Fatal("superseded terminal lane remained usable")
 	}
 	if r := a.intent(t, 5, "stale-controller", "input", input); r.Error == "" {
 		t.Fatalf("old controller retained native authority: %+v", r)
@@ -436,12 +491,12 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	for time.Now().Before(deadline) {
 		raw, _ := os.ReadFile(sessionPath)
 		_ = json.Unmarshal(raw, &nativeState)
-		if nativeState.Turns >= 3 {
+		if nativeState.Turns >= 4 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if nativeState.Turns != 3 || nativeState.Vars["keep"] != "preserved" || nativeState.Vars["via-terminal"] != "exactly-once" {
+	if nativeState.Turns != 4 || nativeState.Vars["keep"] != "preserved" || nativeState.Vars["via-terminal"] != "exactly-once" || nativeState.Vars["via-stream"] != "exactly-once" {
 		t.Fatalf("native effects duplicated or lost: %+v", nativeState)
 	}
 	// Human TUI events were never part of Submit's machine-turn channel. The
@@ -498,8 +553,16 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 	if !permissionResolved {
 		t.Fatal("resolved approval lost original worker interaction identity")
 	}
-	if page := b.call(t, Request{Type: "observations", Limit: 32}); page.Error != "" || len(page.Observations) != 0 {
-		t.Fatal("controller durable ACK left observation pending")
+	page := b.call(t, Request{Type: "observations", Limit: 32})
+	if page.Error != "" {
+		t.Fatal(page.Error)
+	}
+	for _, observation := range page.Observations {
+		// Further native lifecycle events may arrive while the original page is
+		// acknowledged; exact receipt must never erase those new observations.
+		if seen[observation.ID] {
+			t.Fatal("controller durable ACK left acknowledged observation pending")
+		}
 	}
 	var terminal strings.Builder
 	cursor := int64(0)

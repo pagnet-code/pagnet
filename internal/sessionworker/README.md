@@ -34,13 +34,27 @@ captured before redaction, separately from the original approval secret. Capture
 keys derive from the local control key with full scope and state-directory
 binding; authenticated source bindings retain the exact origin, generation,
 native session and original timestamp. Bounded slices require the current lease
-inside the read transaction. Only ciphertext commitments appear in metadata;
+inside the read transaction. The aggregate pending source budget is 4,096 rows and 32 MiB, including all
+capture ciphertext and metadata; a single private source is at most 20 MiB.
+Capacity exhaustion blocks new durable sources until exact acknowledged rows
+are reclaimed, while existing inspection state remains owned by the worker.
+Only ciphertext commitments appear in metadata;
 plaintext hashes are never exported. Capture and projection commit atomically,
 and controller journal acknowledgment removes both. This local pending capture
 is not a server receipt or an automatic network publication. Raw PTY
 echo is retained only in a bounded 2 MiB worker-owned memory ring, never as a
 SQLite output transcript. Replacing a worker reports a distinct replay generation
 and an explicit gap; replacing its controller preserves the ring.
+
+The terminal input lane mutually authenticates with the exact current controller
+identity and lease without acquiring another lease. It uses a separate socket
+from slower controller RPCs, a bounded 256 KiB ephemeral queue, small input
+batches and coalesced resize. It sends no per-key acknowledgement, persists no
+keystrokes and synthesizes no local echo. Lease replacement and terminal effects
+share a fence; replacement closes the old lane. Native writes have a short
+deadline. EOF discards queued input and never replays an uncertain paste.
+A native session without a real interactive PTY rejects terminal setup clearly
+without disturbing its machine-side session.
 
 A controller must durably store/project an outcome before acknowledging it.
 Socket read/write errors close that connection; an unknown admission outcome

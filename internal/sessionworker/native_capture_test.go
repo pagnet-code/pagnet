@@ -178,3 +178,41 @@ func TestResolutionUsesOriginalExistingInspectionEpoch(t *testing.T) {
 		t.Fatal("resolution changed stored content keys")
 	}
 }
+
+func TestAggregatePrivateCaptureBoundAndAcknowledgedReclamation(t *testing.T) {
+	j, _ := testJournal(t)
+	ctx := context.Background()
+	key := bytes.Repeat([]byte{2}, 32)
+	build := func(id string) (NativeObservation, []byte) {
+		observation := NativeObservation{ID: id, NativeGeneration: "native", Origin: json.RawMessage(`{"id":"source"}`), ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventInteractionResolved}}
+		ref, encrypted, err := sealNativeCapture(key, j.scope, j.dir, observation, string(bytes.Repeat([]byte{'s'}, 16<<20)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		observation.Capture = ref
+		observation.SourceDigest, _ = observationDigest(observation)
+		return observation, encrypted
+	}
+	first, firstCipher := build("first")
+	second, secondCipher := build("second")
+	if err := j.JournalCapturedObservation(ctx, first, firstCipher); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.JournalCapturedObservation(ctx, second, secondCipher); !errors.Is(err, ErrFull) {
+		t.Fatalf("aggregate source storage was unbounded: %v", err)
+	}
+	pending, err := j.PendingObservations(ctx, 32)
+	if err != nil || len(pending) != 1 || pending[0].ID != first.ID {
+		t.Fatal("full source queue deleted still-needed evidence")
+	}
+	if err = j.AcknowledgeObservation(ctx, lease(t, j), first.ID, first.SourceDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err = j.JournalCapturedObservation(ctx, second, secondCipher); err != nil {
+		t.Fatal("ack did not reclaim pending capture capacity", err)
+	}
+	var total int
+	if err = j.db.QueryRow(`SELECT COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&total); err != nil || total > maxPendingObservationBytes {
+		t.Fatal("aggregate bound exceeded")
+	}
+}

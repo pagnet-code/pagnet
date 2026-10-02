@@ -23,15 +23,18 @@ const maxFrame = 1 << 20
 const handshakeTimeout = 5 * time.Second
 
 type handshake struct {
-	Ownership    string `json:"ownership,omitempty"`
-	WorkerBuild  string `json:"workerBuild,omitempty"`
-	Protocol     string `json:"protocol"`
-	Scope        Scope  `json:"scope"`
-	ControllerID string `json:"controllerId,omitempty"`
-	ServerNonce  string `json:"serverNonce"`
-	ClientNonce  string `json:"clientNonce,omitempty"`
-	Lease        int64  `json:"lease,omitempty"`
-	Proof        string `json:"proof,omitempty"`
+	NativeGeneration string `json:"nativeGeneration,omitempty"`
+	Error            string `json:"error,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	Ownership        string `json:"ownership,omitempty"`
+	WorkerBuild      string `json:"workerBuild,omitempty"`
+	Protocol         string `json:"protocol"`
+	Scope            Scope  `json:"scope"`
+	ControllerID     string `json:"controllerId,omitempty"`
+	ServerNonce      string `json:"serverNonce"`
+	ClientNonce      string `json:"clientNonce,omitempty"`
+	Lease            int64  `json:"lease,omitempty"`
+	Proof            string `json:"proof,omitempty"`
 }
 
 type Request struct {
@@ -83,13 +86,14 @@ func writeFrame(w io.Writer, v any) error {
 	_, err = io.Copy(w, bytes.NewReader(b))
 	return err
 }
-func readFrame(r io.Reader, v any) error {
+func readFrame(r io.Reader, v any) error { return readBoundedFrame(r, v, maxFrame) }
+func readBoundedFrame(r io.Reader, v any, limit uint32) error {
 	var header [4]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return err
 	}
 	n := binary.BigEndian.Uint32(header[:])
-	if n == 0 || n > maxFrame {
+	if n == 0 || n > limit {
 		return errors.New("worker frame exceeds bound")
 	}
 	b := make([]byte, int(n))
@@ -218,14 +222,36 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		return
 	}
 	var auth handshake
-	if readFrame(c, &auth) != nil || auth.Protocol != Protocol || auth.Ownership != hello.Ownership || auth.WorkerBuild != hello.WorkerBuild || auth.Scope != j.scope || auth.ServerNonce != serverNonce || !validNonce(auth.ClientNonce) || auth.ControllerID == "" || len(auth.ControllerID) > 256 || auth.Lease != 0 || !equalProof(auth.Proof, authenticationProof(key, "controller", auth)) {
+	if readFrame(c, &auth) != nil || auth.Protocol != Protocol || auth.Ownership != hello.Ownership || auth.WorkerBuild != hello.WorkerBuild || auth.Scope != j.scope || auth.ServerNonce != serverNonce || !validNonce(auth.ClientNonce) || auth.ControllerID == "" || len(auth.ControllerID) > 256 || !equalProof(auth.Proof, authenticationProof(key, "controller", auth)) {
 		return
 	}
-	auth.Lease, err = j.AdvanceLease(ctx)
+	if auth.Mode == "terminal" {
+		if owner == nil || auth.Lease <= 0 {
+			return
+		}
+		if !owner.hasLiveTerminal(auth.NativeGeneration) {
+			auth.Error = "This native session does not expose a live interactive terminal."
+			auth.Proof = authenticationProof(key, "worker", auth)
+			_ = writeFrame(c, auth)
+			return
+		}
+		if !controllers.installStream(auth.Lease, auth.ControllerID, c) {
+			return
+		}
+		defer controllers.releaseStream(c)
+		auth.Proof = authenticationProof(key, "worker", auth)
+		if writeFrame(c, auth) != nil {
+			return
+		}
+		_ = c.SetDeadline(time.Time{})
+		serveTerminalStream(ctx, c, owner, controllers, auth.Lease)
+		return
+	}
+	if auth.Mode != "" || auth.Lease != 0 || auth.NativeGeneration != "" || auth.Error != "" {
+		return
+	}
+	auth.Lease, err = controllers.advanceAndInstall(ctx, j, auth.ControllerID, c)
 	if err != nil {
-		return
-	}
-	if !controllers.install(auth.Lease, c) {
 		return
 	}
 	defer controllers.release(auth.Lease, c)
@@ -298,6 +324,7 @@ type Controller struct {
 	conn                   net.Conn
 	Lease                  int64
 	Ownership, WorkerBuild string
+	identity               string
 }
 
 func DialController(ctx context.Context, dir string, scope Scope, key []byte, id string) (*Controller, error) {
@@ -317,7 +344,7 @@ func DialController(ctx context.Context, dir string, scope Scope, key []byte, id
 	if err = readFrame(c, &h); err != nil {
 		return fail(err)
 	}
-	if h.Protocol != Protocol || h.Scope != scope || !validNonce(h.ServerNonce) || h.ClientNonce != "" || h.ControllerID != "" || h.Lease != 0 || h.Proof != "" {
+	if h.NativeGeneration != "" || h.Error != "" || h.Mode != "" || h.Protocol != Protocol || h.Scope != scope || !validNonce(h.ServerNonce) || h.ClientNonce != "" || h.ControllerID != "" || h.Lease != 0 || h.Proof != "" {
 		return fail(errors.New("worker handshake scope or protocol mismatch"))
 	}
 	h.ControllerID = id
@@ -333,11 +360,11 @@ func DialController(ctx context.Context, dir string, scope Scope, key []byte, id
 	if err = readFrame(c, &reply); err != nil {
 		return fail(err)
 	}
-	if reply.Protocol != h.Protocol || reply.Ownership != h.Ownership || reply.WorkerBuild != h.WorkerBuild || reply.Scope != h.Scope || reply.ControllerID != h.ControllerID || reply.ServerNonce != h.ServerNonce || reply.ClientNonce != h.ClientNonce || reply.Lease <= 0 || !equalProof(reply.Proof, authenticationProof(key, "worker", reply)) {
+	if reply.NativeGeneration != "" || reply.Error != "" || reply.Mode != h.Mode || reply.Protocol != h.Protocol || reply.Ownership != h.Ownership || reply.WorkerBuild != h.WorkerBuild || reply.Scope != h.Scope || reply.ControllerID != h.ControllerID || reply.ServerNonce != h.ServerNonce || reply.ClientNonce != h.ClientNonce || reply.Lease <= 0 || !equalProof(reply.Proof, authenticationProof(key, "worker", reply)) {
 		return fail(errors.New("worker mutual authentication failed"))
 	}
 	_ = c.SetDeadline(time.Time{})
-	return &Controller{conn: c, Lease: reply.Lease, Ownership: reply.Ownership, WorkerBuild: reply.WorkerBuild}, nil
+	return &Controller{conn: c, Lease: reply.Lease, Ownership: reply.Ownership, WorkerBuild: reply.WorkerBuild, identity: id}, nil
 }
 func (c *Controller) Close() error { return c.conn.Close() }
 func (c *Controller) Call(ctx context.Context, req Request) (Response, error) {
@@ -425,29 +452,69 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 // Unauthenticated peers can never evict the current controller. Superseded
 // sockets close promptly so stale readers cannot exhaust bounded IPC slots.
 type currentController struct {
-	mu    sync.Mutex
-	lease int64
-	conn  *net.UnixConn
+	mu       sync.Mutex
+	lease    int64
+	identity string
+	stream   *net.UnixConn
+	conn     *net.UnixConn
 }
 
-func (c *currentController) install(lease int64, conn *net.UnixConn) bool {
+// The same mutex fences ephemeral native effects and lease installation.
+// There is no SQLite transaction or durable intent for a terminal keystroke.
+func (c *currentController) advanceAndInstall(ctx context.Context, j *Journal, id string, conn *net.UnixConn) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if lease <= c.lease {
+	lease, err := j.AdvanceLease(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	if c.stream != nil {
+		_ = c.stream.Close()
+		c.stream = nil
+	}
+	c.lease = lease
+	c.identity = id
+	c.conn = conn
+	return lease, nil
+}
+func (c *currentController) installStream(lease int64, id string, conn *net.UnixConn) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lease != lease || c.identity != id || c.conn == nil {
 		return false
 	}
-	old := c.conn
-	c.lease = lease
-	c.conn = conn
-	if old != nil {
-		_ = old.Close()
+	if c.stream != nil {
+		_ = c.stream.Close()
 	}
+	c.stream = conn
 	return true
+}
+func (c *currentController) releaseStream(conn *net.UnixConn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stream == conn {
+		c.stream = nil
+	}
+}
+func (c *currentController) terminalEffect(lease int64, conn *net.UnixConn, do func() error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lease != lease || c.conn == nil || c.stream != conn {
+		return ErrFenced
+	}
+	return do()
 }
 func (c *currentController) release(lease int64, conn *net.UnixConn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.lease == lease && c.conn == conn {
 		c.conn = nil
+		if c.stream != nil {
+			_ = c.stream.Close()
+			c.stream = nil
+		}
 	}
 }
