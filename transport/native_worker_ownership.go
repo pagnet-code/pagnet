@@ -60,3 +60,18 @@ type NativeOwnershipRegisteredPayload struct {
 	PublicError string                 `json:"publicError,omitempty"`
 	Retryable   bool                   `json:"retryable,omitempty"`
 }
+
+const MsgNativeOwnershipPrepare = "host.native_ownership_prepare"
+
+// Preparation is configuration only. It has no dispatch ordinal, admission or
+// authorization to execute native input. Launch retains the original command ID
+// and encrypted configuration/AAD; it must never enter the command submit path.
+type NativeOwnershipPreparePayload struct {
+	SourceCommandID   string                 `json:"sourceCommandId"`
+	SourceCommandType string                 `json:"sourceCommandType"`
+	InstanceID        string                 `json:"instanceId"`
+	Runtime           string                 `json:"runtime"`
+	Profile           string                 `json:"profile"`
+	Launch            *LaunchAgentPayload    `json:"launch,omitempty"`
+	Ownership         *NativeWorkerOwnership `json:"ownership,omitempty"`
+}
