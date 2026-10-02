@@ -226,6 +226,9 @@ func outputPumpToReady(ws *websocket.Conn, output io.Writer, private ...*cliTerm
 				}
 				reasonMu.Lock()
 				reason = f.Reason
+				if f.Error != "" {
+					reason += ": " + f.Error
+				}
 				reasonMu.Unlock()
 				return
 			case "error":
