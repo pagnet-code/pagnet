@@ -26,6 +26,9 @@ type NativeResolution struct {
 	DetailAAD      e2ee.AAD                          `json:"detailAAD"`
 }
 type NativeObservation struct {
+	OutputContent            *transport.NativeContentReference `json:"outputContent,omitempty"`
+	PlanContent              *transport.NativeContentReference `json:"planContent,omitempty"`
+	SourceContentUnavailable bool                              `json:"sourceContentUnavailable,omitempty"`
 	// SourceSequence is durable delivery metadata, independent of private capture identity.
 	SourceSequence               int64                             `json:"sourceSequence,omitempty"`
 	OriginalNativePayloadContent *transport.NativeContentReference `json:"originalNativePayloadContent,omitempty"`

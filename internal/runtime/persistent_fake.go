@@ -931,6 +931,9 @@ func normalizePersist(ev persistWireEvent) session.SessionEvent {
 			Answer:              ev.Answer,
 		}
 	}
+	if ev.Event == session.EventTurnOutput {
+		out.NativeOutput = true
+	}
 	return out
 }
 

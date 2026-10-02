@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -23,14 +24,17 @@ func NativeWorkerWireObservation(o sessionworker.NativeObservation) (transport.N
 	if json.Unmarshal(o.Origin, &origin) != nil || origin.ID == "" || origin.InstanceID == "" || origin.Runtime == "" || origin.NativeGeneration != o.NativeGeneration || o.NativeSessionID == "" || o.ObservedAt.IsZero() {
 		return transport.NativeObservationPayload{}, ErrNativeObservationConflict
 	}
+	if o.SourceContentUnavailable {
+		return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
+	}
 	var body any
 	typ := sessionworker.NativeSourceType(o)
-	if typ == transport.MsgRuntimeTurnStarted || typ == transport.MsgRuntimeTurnCompleted || typ == transport.MsgRuntimeTurnFailed {
+	if typ == transport.MsgRuntimeTurnStarted || typ == transport.MsgRuntimeTurnCompleted || typ == transport.MsgRuntimeTurnFailed || typ == transport.MsgRuntimeTurnOutput || typ == transport.MsgRuntimeTurnPlan {
 		source := o.TurnSource
 		if o.SourceSequence <= 0 || source == nil {
 			return transport.NativeObservationPayload{}, ErrNativeObservationConflict
 		}
-		p := transport.NativeTurnSourcePayload{InstanceID: origin.InstanceID, Runtime: origin.Runtime, NativeGeneration: o.NativeGeneration, SessionID: o.NativeSessionID, SourceSequence: o.SourceSequence, LogicalTurnID: source.LogicalTurnID, NativeTurnSequence: source.Sequence, SourceCommandID: source.SourceCommandID, SourceAdmissionID: source.SourceAdmissionID, InputKind: source.InputKind}
+		p := transport.NativeTurnSourcePayload{InstanceID: origin.InstanceID, Runtime: origin.Runtime, NativeGeneration: o.NativeGeneration, SessionID: o.NativeSessionID, SourceSequence: o.SourceSequence, LogicalTurnID: source.LogicalTurnID, NativeTurnSequence: source.Sequence, SourceCommandID: source.SourceCommandID, SourceAdmissionID: source.SourceAdmissionID, InputKind: source.InputKind, OutputContent: o.OutputContent, PlanContent: o.PlanContent}
 		if typ == transport.MsgRuntimeTurnFailed {
 			p.Kind = nativeFailureMetadata(o.Event.FailureKind)
 			if o.Event.RetryAt != nil {
@@ -178,6 +182,16 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			if err != nil {
 				return after, err
 			}
+			if p.MessageType == transport.MsgRuntimeTurnOutput || p.MessageType == transport.MsgRuntimeTurnPlan || o.OutputContent != nil || o.PlanContent != nil {
+				session, err := c.AuthenticatedNativeHostSession()
+				if err != nil {
+					return after, err
+				}
+				if !slices.Contains(session.ProtocolFeatures, transport.NativeTaskContentProtocol) {
+					return after, ErrNativeOriginAdmissionDeferred
+				}
+			}
+			var refs []*transport.NativeContentReference
 			var ref *transport.NativeContentReference
 			if o.Event.Type == session.EventInteractionStarted && o.Inspection != nil {
 				ref = o.Inspection.DetailContent
@@ -186,6 +200,15 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 				ref = o.Resolution.DetailContent
 			}
 			if ref != nil {
+				refs = append(refs, ref)
+			}
+			if o.OutputContent != nil {
+				refs = append(refs, o.OutputContent)
+			}
+			if o.PlanContent != nil {
+				refs = append(refs, o.PlanContent)
+			}
+			for _, ref := range refs {
 				ready, err := c.stageWorkerContent(ctx, o, *ref, call, &budget)
 				if err != nil {
 					return after, err

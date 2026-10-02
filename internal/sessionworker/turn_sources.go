@@ -252,10 +252,17 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	o.mu.Unlock()
 	source.NativeSessionID = sess.NativeID
 	source.LogicalTurnID = req.TurnID
+	o.pinOriginalTaskContent(source)
+	if source.SourceTask != nil {
+		if _, available := o.originalTaskContentPin(&source); !available {
+			o.releaseNativeTaskTurnPin(&source)
+			return errors.New("original task crypto authority unavailable")
+		}
+	}
 	if err := o.journal.BindNativeTurn(ctx, source); err != nil {
+		o.releaseNativeTaskTurnPin(&source)
 		return err
 	}
-	o.pinOriginalTaskContent(source)
 	return d.Driver.Submit(ctx, sess, req, events)
 }
 

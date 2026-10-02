@@ -363,10 +363,11 @@ func (s *codexTurnState) processAgentMessageDelta(turnID, delta string) []sessio
 		return nil // a different turn's delta: not ours
 	}
 	return []session.SessionEvent{{
-		Type:      session.EventTurnOutput,
-		SessionID: s.threadID,
-		TurnID:    s.machineTurnID,
-		Output:    delta,
+		Type:         session.EventTurnOutput,
+		SessionID:    s.threadID,
+		TurnID:       s.machineTurnID,
+		Output:       delta,
+		NativeOutput: true,
 	}}
 }
 

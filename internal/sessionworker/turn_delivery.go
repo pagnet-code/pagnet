@@ -26,6 +26,16 @@ func NativeSourceType(o NativeObservation) string {
 	}
 	var typ string
 	switch o.Event.Type {
+	case session.EventTurnOutput:
+		if !o.Event.NativeOutput || o.OutputContent == nil {
+			return ""
+		}
+		typ = transport.MsgRuntimeTurnOutput
+	case session.EventPlanUpdated:
+		if o.PlanContent == nil {
+			return ""
+		}
+		typ = transport.MsgRuntimeTurnPlan
 	case session.EventTurnStarted:
 		typ = transport.MsgRuntimeTurnStarted
 	case session.EventTurnCompleted:
@@ -36,7 +46,10 @@ func NativeSourceType(o NativeObservation) string {
 		return ""
 	}
 	source := o.TurnSource
-	if source == nil || o.SourceUnavailable || source.Sequence <= 0 || source.LogicalTurnID != fmt.Sprintf("pagnet-worker-turn-%d", source.Sequence) || source.LogicalTurnID != o.Event.TurnID || source.NativeGeneration != o.NativeGeneration || source.NativeSessionID != o.NativeSessionID || source.NativeSessionID != o.Event.SessionID || source.SourceCommandID == "" || source.SourceAdmissionID == "" || !ValidNativeInputKind(source.InputKind) {
+	if source == nil || o.SourceUnavailable || o.SourceContentUnavailable || source.Sequence <= 0 || source.LogicalTurnID != fmt.Sprintf("pagnet-worker-turn-%d", source.Sequence) || source.LogicalTurnID != o.Event.TurnID || source.NativeGeneration != o.NativeGeneration || source.NativeSessionID != o.NativeSessionID || source.NativeSessionID != o.Event.SessionID || source.SourceCommandID == "" || source.SourceAdmissionID == "" || !ValidNativeInputKind(source.InputKind) {
+		return ""
+	}
+	if (typ == transport.MsgRuntimeTurnOutput || typ == transport.MsgRuntimeTurnPlan || o.OutputContent != nil) && (source.InputKind != "task" || source.SourceTask == nil) {
 		return ""
 	}
 	return typ

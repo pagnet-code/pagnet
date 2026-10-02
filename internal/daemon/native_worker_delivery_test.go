@@ -267,3 +267,47 @@ func TestNativeWorkerContentRejectsUnboundedOrInvalidProgress(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeTaskContentCapabilityRequiredBeforeAnyBackendWrite(t *testing.T) {
+	writes, acknowledgements := 0, 0
+	c, o := deliveryFixture(t, func(context.Context, string, any) error { writes++; return nil })
+	o.Event = session.SessionEvent{Type: session.EventTurnOutput, SessionID: o.NativeSessionID, TurnID: "pagnet-worker-turn-1", NativeOutput: true, Output: "private native text must never reach wire"}
+	o.TurnSource = &sessionworker.NativeTurnSource{Sequence: 1, LogicalTurnID: o.Event.TurnID, NativeGeneration: o.NativeGeneration, NativeSessionID: o.NativeSessionID, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String(), InputKind: "task", SourceTask: &transport.NativeTaskSource{TaskID: domain.NewID().String()}}
+	o.OutputContent = &transport.NativeContentReference{}
+	a, err := NativeWorkerWireObservation(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NativeWorkerWireObservation(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := json.Marshal(a)
+	second, _ := json.Marshal(b)
+	if !bytes.Equal(first, second) || bytes.Contains(first, []byte("private native text")) || a.MessageType != transport.MsgRuntimeTurnOutput {
+		t.Fatal("task wire retry changed or leaked plaintext")
+	}
+	call := func(_ context.Context, r sessionworker.Request) (sessionworker.Response, error) {
+		switch r.Type {
+		case "observations":
+			return sessionworker.Response{Observations: []sessionworker.NativeObservation{o}}, nil
+		case "observation_ack":
+			acknowledgements++
+		default:
+			t.Fatalf("unsupported capability retrieved content via %s", r.Type)
+		}
+		return sessionworker.Response{}, nil
+	}
+	if err = c.DrainNativeWorkerSources(context.Background(), call); !errors.Is(err, ErrNativeOriginAdmissionDeferred) || writes != 0 || acknowledgements != 0 {
+		t.Fatal("unsupported backend received task content or ACK", err, writes, acknowledgements)
+	}
+	o.Event.NativeOutput = false
+	if _, err = NativeWorkerWireObservation(o); !errors.Is(err, ErrNativeSourceUnsupported) {
+		t.Fatal("diagnostic became genuine task text", err)
+	}
+	o.Event.NativeOutput = true
+	o.SourceContentUnavailable = true
+	if _, err = NativeWorkerWireObservation(o); !errors.Is(err, ErrNativeSourceUnsupported) {
+		t.Fatal("missing original encryption authority became supported", err)
+	}
+}

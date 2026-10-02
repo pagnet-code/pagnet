@@ -581,10 +581,11 @@ func (s *qwenTurnState) processStreamEvent(ev qwenDOEvent) []session.SessionEven
 		if se.Delta.Type == "text_delta" && se.Delta.Text != "" &&
 			s.turnActive && s.turnIsMachine {
 			return []session.SessionEvent{{
-				Type:      session.EventTurnOutput,
-				SessionID: s.sessionID,
-				TurnID:    s.machineTurnID,
-				Output:    se.Delta.Text,
+				Type:         session.EventTurnOutput,
+				SessionID:    s.sessionID,
+				TurnID:       s.machineTurnID,
+				Output:       se.Delta.Text,
+				NativeOutput: true,
 			}}
 		}
 		return nil

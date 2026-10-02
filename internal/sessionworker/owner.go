@@ -201,6 +201,9 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 	if spec.ContextStateDir != "" {
 		denied = append(denied, spec.ContextStateDir)
 	}
+	if spec.NetworkStateDir != "" {
+		denied = append(denied, spec.NetworkStateDir)
+	}
 	owner.manager.SetSandboxDenied(owner.sess, denied)
 	return owner, nil
 }

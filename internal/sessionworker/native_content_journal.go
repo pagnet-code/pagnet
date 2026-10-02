@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"reflect"
 
 	"github.com/pagnet-code/pagnet/nativecontent"
 	"github.com/pagnet-code/pagnet/transport"
@@ -40,6 +41,12 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 	if observation.Resolution != nil && ref.Purpose == "interaction_answer" {
 		attached = observation.Resolution.DetailContent
 	}
+	if ref.Purpose == "native_turn_output" {
+		attached = observation.OutputContent
+	}
+	if ref.Purpose == "native_turn_plan" {
+		attached = observation.PlanContent
+	}
 	expected, _ := json.Marshal(attached)
 	actual, _ := json.Marshal(ref)
 	if attached == nil || string(expected) != string(actual) {
@@ -49,8 +56,17 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 	var origin struct {
 		ID string `json:"id"`
 	}
-	if json.Unmarshal(observation.Origin, &origin) != nil || ref.ObservationID != observation.ID || ref.OriginID != origin.ID || ref.NativeGeneration != observation.NativeGeneration || ref.NativeSessionID != observation.NativeSessionID || ref.SubjectID != observation.InteractionID || ref.SubjectType != "runtime_interaction" {
+	if json.Unmarshal(observation.Origin, &origin) != nil || ref.ObservationID != observation.ID || ref.OriginID != origin.ID || ref.NativeGeneration != observation.NativeGeneration || ref.NativeSessionID != observation.NativeSessionID {
 		return errors.New("encrypted native content differs from original source")
+	}
+	if ref.Purpose == "native_turn_output" || ref.Purpose == "native_turn_plan" {
+		source := observation.TurnSource
+		binding := ref.ManifestAAD.NativeContent
+		if source == nil || source.SourceTask == nil || binding == nil || binding.SourceCommandID != source.SourceCommandID || binding.SourceAdmissionID != source.SourceAdmissionID || binding.LogicalTurnID != source.LogicalTurnID || ref.ManifestAAD.KeyEpochID != source.SourceTask.InputAAD.KeyEpochID || ref.ManifestAAD.NetworkID != source.SourceTask.InputAAD.NetworkID || ref.ManifestAAD.TenantID != source.SourceTask.InputAAD.TenantID || ref.ManifestAAD.Recipient != source.SourceTask.InputAAD.Recipient || !reflect.DeepEqual(ref.ManifestAAD.ProtectedContext, source.SourceTask.InputAAD.ProtectedContext) {
+			return errors.New("encrypted task content differs from accepted original source")
+		}
+	} else if ref.SubjectID != observation.InteractionID || ref.SubjectType != "runtime_interaction" {
+		return errors.New("encrypted interaction content differs from original source")
 	}
 	commitment, err := nativecontent.CiphertextCommitment(ref, transfer.Fragments)
 	if err != nil || commitment != ref.CiphertextDigest {
@@ -171,6 +187,12 @@ func (j *Journal) verifyStoredContent() error {
 		}
 		if observation.Resolution != nil && observation.Resolution.DetailContent != nil && observation.Resolution.DetailContent.ContentID == b.content {
 			ref = observation.Resolution.DetailContent
+		}
+		if observation.OutputContent != nil && observation.OutputContent.ContentID == b.content {
+			ref = observation.OutputContent
+		}
+		if observation.PlanContent != nil && observation.PlanContent.ContentID == b.content {
+			ref = observation.PlanContent
 		}
 		if ref == nil || ref.ObservationID != b.observation {
 			return errors.New("stored content is not attached to its original source")

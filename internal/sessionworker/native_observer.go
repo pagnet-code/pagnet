@@ -46,7 +46,7 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		if duplicate {
 			return observeCtx.Err()
 		}
-		if !durableNativeEvent(event) {
+		if !durableNativeEvent(event) && !(event.Type == session.EventTurnOutput && event.NativeOutput) {
 			o.recordLiveEvent(event, generation, origin)
 			return observeCtx.Err()
 		}
@@ -59,6 +59,10 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		}
 		observation.TurnSource = source
 		observation.SourceUnavailable = unavailable
+		taskTransfer := o.captureOriginalTaskContent(originalEvent, &observation)
+		if taskTransfer != nil {
+			transfers = append(transfers, *taskTransfer)
+		}
 		// Original private details are captured above; the journal projection is metadata only.
 		event.Plan = nil
 		event.Output = ""
@@ -96,7 +100,13 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			copy.Answer = ""
 			event.Interaction = &copy
 		}
-		captureSource := NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent}
+		captureSource := NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent, OriginalTurnOutputContent: observation.OutputContent, OriginalTurnPlanContent: observation.PlanContent}
+		if observation.OutputContent != nil {
+			captureSource.Event.Output = ""
+		}
+		if observation.PlanContent != nil {
+			captureSource.Event.Plan = nil
+		}
 		if observation.OriginalNativePayloadContent != nil {
 			copy := *originalEvent.Interaction
 			copy.NativePayload = nil

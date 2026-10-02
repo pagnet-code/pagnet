@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/nativecontent"
 )
 
@@ -50,4 +51,59 @@ func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose
 	aad.CreatedAt = observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")
 	binding := e2ee.NativeContentBinding{ContentID: uuid.NewString(), ObservationID: observation.ID, OriginID: origin.ID, InstanceID: instanceID, NativeGeneration: observation.NativeGeneration, NativeSessionID: observation.NativeSessionID, SubjectType: "runtime_turn", SubjectID: subject, Purpose: purpose, SourceCommandID: source.SourceCommandID, SourceAdmissionID: source.SourceAdmissionID, LogicalTurnID: source.LogicalTurnID}
 	return nativecontent.Build(plain, key, aad, binding, mimeType)
+}
+
+func (o *SessionOwner) captureOriginalTaskContent(event session.SessionEvent, observation *NativeObservation) *nativecontent.Transfer {
+	source := observation.TurnSource
+	if source == nil || source.InputKind != "task" {
+		return nil
+	}
+	var plain []byte
+	purpose, mime := "", ""
+	switch event.Type {
+	case session.EventTurnOutput:
+		if !event.NativeOutput || event.Output == "" {
+			return nil
+		}
+		purpose, mime = "native_turn_output", "text/plain; charset=utf-8"
+		plain = []byte(event.Output)
+	case session.EventTurnCompleted, session.EventTurnFailed:
+		if event.Output == "" {
+			return nil
+		}
+		purpose, mime = "native_turn_output", "text/plain; charset=utf-8"
+		plain = []byte(event.Output)
+	case session.EventPlanUpdated:
+		if session.ValidatePlan(event.Plan) != nil {
+			observation.SourceContentUnavailable = true
+			return nil
+		}
+		purpose, mime = "native_turn_plan", "application/json"
+		var err error
+		plain, err = canonicalNativeJSON(event.Plan)
+		if err != nil {
+			observation.SourceContentUnavailable = true
+			return nil
+		}
+	default:
+		return nil
+	}
+	defer clear(plain)
+	key, available := o.originalTaskContentPin(source)
+	if !available {
+		observation.SourceContentUnavailable = true
+		return nil
+	}
+	defer clear(key[:])
+	transfer, err := buildOriginalTurnContent(*observation, o.journal.scope.InstanceID, purpose, mime, plain, key)
+	if err != nil {
+		observation.SourceContentUnavailable = true
+		return nil
+	}
+	if purpose == "native_turn_output" {
+		observation.OutputContent = &transfer.Reference
+	} else {
+		observation.PlanContent = &transfer.Reference
+	}
+	return &transfer
 }

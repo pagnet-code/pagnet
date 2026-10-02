@@ -24,6 +24,8 @@ const maxPrivateSourceBytes = 20 << 20
 const NativeSourceCaptureFormat = "pagnet.worker-native-source.v2"
 
 type NativeSourceCapture struct {
+	OriginalTurnOutputContent    *transport.NativeContentReference `json:"originalTurnOutputContent,omitempty"`
+	OriginalTurnPlanContent      *transport.NativeContentReference `json:"originalTurnPlanContent,omitempty"`
 	Format                       string                            `json:"format"`
 	Event                        session.SessionEvent              `json:"event"`
 	OriginalNativePayloadContent *transport.NativeContentReference `json:"originalNativePayloadContent,omitempty"`
@@ -87,7 +89,10 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 		Origin                            []byte
 		NativeGeneration, NativeSessionID string
 		ObservedAt                        string
-	}{observation.OriginalNativePayloadContent, observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v2", 2, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")})
+		OutputContent                     *transport.NativeContentReference `json:",omitempty"`
+		PlanContent                       *transport.NativeContentReference `json:",omitempty"`
+		SourceContentUnavailable          bool                              `json:",omitempty"`
+	}{observation.OriginalNativePayloadContent, observation.TurnSource, observation.SourceUnavailable, "pagnet-worker-private-source-aad-v2", 2, scope, filepath.Clean(directory), observation.ID, []byte(observation.Origin), observation.NativeGeneration, observation.NativeSessionID, observation.ObservedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"), observation.OutputContent, observation.PlanContent, observation.SourceContentUnavailable})
 }
 
 func sealNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
@@ -275,6 +280,21 @@ func OpenNativeSourceCapture(key []byte, scope Scope, directory string, observat
 		if source.Event.Interaction == nil || !source.Event.Interaction.Resolved || len(source.Event.Interaction.NativePayload) > 0 || ref.Purpose != "interaction_detail" || ref.InstanceID != scope.InstanceID || ref.NativeGeneration != observation.NativeGeneration || ref.NativeSessionID != observation.NativeSessionID || ref.SubjectID != observation.InteractionID || ref.OriginID != origin.ID || ref.ManifestAAD.ValidateScope() != nil {
 			return NativeSourceCapture{}, errors.New("original request reference is not the same inspected source")
 		}
+	}
+	for _, pair := range []struct {
+		expected, actual *transport.NativeContentReference
+	}{{observation.OutputContent, source.OriginalTurnOutputContent}, {observation.PlanContent, source.OriginalTurnPlanContent}} {
+		expected, _ := canonicalNativeJSON(pair.expected)
+		actual, _ := canonicalNativeJSON(pair.actual)
+		if !bytes.Equal(expected, actual) {
+			return NativeSourceCapture{}, errors.New("original task content reference differs from captured source")
+		}
+	}
+	if source.OriginalTurnOutputContent != nil && source.Event.Output != "" {
+		return NativeSourceCapture{}, errors.New("original task output duplicated instead of exact encrypted reference")
+	}
+	if source.OriginalTurnPlanContent != nil && source.Event.Plan != nil {
+		return NativeSourceCapture{}, errors.New("original task plan duplicated instead of exact encrypted reference")
 	}
 	return source, nil
 }
