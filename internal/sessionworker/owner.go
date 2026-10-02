@@ -93,6 +93,7 @@ type SessionOwner struct {
 	candidateAdmission       *Admission
 	candidateCommandID       string
 	candidateTurnSource      NativeTurnSource
+	bridgeSourceMu           sync.Mutex
 	taskContentPins          map[string]nativeTaskContentPin
 	outputMu                 sync.Mutex
 	terminal                 *os.File

@@ -41,10 +41,12 @@ type BridgeCall struct {
 	Args             json.RawMessage   `json:"args"`
 }
 type BridgeResult struct {
-	ID     string          `json:"id"`
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  string          `json:"error,omitempty"`
+	ID        string          `json:"id"`
+	OK        bool            `json:"ok"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	ErrorCode string          `json:"errorCode,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
 }
 type relayTicket struct {
 	call   BridgeCall
@@ -165,23 +167,33 @@ func (b *relayBroker) complete(lease int64, result BridgeResult) error {
 	return nil
 }
 func (b *relayBroker) call(ctx context.Context, call BridgeCall) BridgeResult {
+	ticket, denied := b.enqueue(call)
+	if ticket == nil {
+		return denied
+	}
+	return b.await(ctx, ticket)
+}
+func (b *relayBroker) enqueue(call BridgeCall) (*relayTicket, BridgeResult) {
 	b.mu.Lock()
 	if b.closed || b.admission == nil || call.NativeGeneration != b.nativeGeneration || len(b.pending) >= 16 {
 		b.mu.Unlock()
-		return BridgeResult{Error: "Pagnet control-plane connection is unavailable; this operation was not forwarded."}
+		return nil, BridgeResult{Error: "Pagnet control-plane connection is unavailable; this operation was not forwarded."}
 	}
 	call.ID = uuid.NewString()
 	ticket := &relayTicket{call: call, done: make(chan BridgeResult, 1)}
 	b.pending[call.ID] = ticket
 	b.order = append(b.order, call.ID)
 	b.mu.Unlock()
+	return ticket, BridgeResult{}
+}
+func (b *relayBroker) await(ctx context.Context, ticket *relayTicket) BridgeResult {
 	select {
 	case result := <-ticket.done:
 		return result
 	case <-ctx.Done():
 		b.mu.Lock()
 		issued := ticket.issued
-		delete(b.pending, call.ID)
+		delete(b.pending, ticket.call.ID)
 		b.compact()
 		b.mu.Unlock()
 		if issued {
@@ -348,7 +360,7 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 			_ = bridgeWrite(c, map[string]any{"id": req.ID, "ok": false, "error": "native source unavailable"})
 			continue
 		}
-		result := o.relay.call(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, NativeSessionID: sid, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: source})
+		result := o.forwardBridgeCall(callCtx, BridgeCall{Scope: o.journal.scope, NativeGeneration: generation, NativeSessionID: sid, Origin: origin, Tool: req.Tool, Args: append(json.RawMessage(nil), req.Args...), TurnSource: source})
 		cancel()
 		result.ID = req.ID
 		if bridgeWrite(c, result) != nil {

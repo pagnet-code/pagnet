@@ -32,23 +32,28 @@ func nativeBridgeSource(call *sessionworker.BridgeCall) (*transport.NativeAgentS
 }
 
 func (d *Daemon) relayNativeBridge(ctx context.Context, link *nativeWorkerLink, row *InstanceRow, call *sessionworker.BridgeCall, tool string, args json.RawMessage) (json.RawMessage, string) {
+	raw, message, _ := d.relayNativeBridgeWithRefusal(ctx, link, row, call, tool, args)
+	return raw, message
+}
+
+func (d *Daemon) relayNativeBridgeWithRefusal(ctx context.Context, link *nativeWorkerLink, row *InstanceRow, call *sessionworker.BridgeCall, tool string, args json.RawMessage) (json.RawMessage, string, bool) {
 	admission, err := link.proxy.connection.AuthenticatedNativeHostSession()
 	if err != nil || !slices.Contains(admission.ProtocolFeatures, transport.NativeAgentSourceProtocol) {
-		return nil, "native source-aware tools are not supported by this connection"
+		return nil, "native source-aware tools are not supported by this connection", false
 	}
 	source, err := nativeBridgeSource(call)
 	if err != nil {
-		return nil, err.Error()
+		return nil, err.Error(), false
 	}
 	request := transport.AgentRequestPayload{InstanceID: row.InstanceID, PrincipalID: row.AgentPrincipalID, Tool: tool, Args: args, NativeSource: source}
 	if source == nil && row.NetworkID != "" && slices.Contains(admission.ProtocolFeatures, transport.NativeEndpointAgentSourceProtocol) {
 		endpoint, err := nativeBridgeEndpointSource(call)
 		if err != nil {
-			return nil, err.Error()
+			return nil, err.Error(), false
 		}
 		request.NativeEndpointSource = endpoint
 	}
-	return d.relayNativeSourceRequest(ctx, link, request)
+	return d.relayNativeSourceRequestWithRefusal(ctx, link, request)
 }
 
 func nativeBridgeEndpointSource(call *sessionworker.BridgeCall) (*transport.NativeEndpointAgentSource, error) {
@@ -63,31 +68,39 @@ func nativeBridgeEndpointSource(call *sessionworker.BridgeCall) (*transport.Nati
 }
 
 func (d *Daemon) relayNativeSourceRequest(ctx context.Context, link *nativeWorkerLink, request transport.AgentRequestPayload) (json.RawMessage, string) {
+	raw, message, _ := d.relayNativeSourceRequestWithRefusal(ctx, link, request)
+	return raw, message
+}
+
+func (d *Daemon) relayNativeSourceRequestWithRefusal(ctx context.Context, link *nativeWorkerLink, request transport.AgentRequestPayload) (json.RawMessage, string, bool) {
 	// Only a typed, pre-effect refusal may be repeated. A timeout, disconnect,
 	// generic error or ambiguous delivery must never duplicate an operation.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		response, err := d.relayConnectionResponse(ctx, link.conn, request)
 		if err != nil {
-			return nil, err.Error()
+			return nil, err.Error(), false
 		}
 		if response.OK {
-			return response.Result, ""
+			return response.Result, "", false
+		}
+		if response.ErrorCode == "source_settled" && response.Retryable && len(response.Result) == 0 && request.NativeSource != nil && request.NativeSource.InputKind != "task" && request.NativeEndpointSource == nil {
+			return nil, "Original turn ended before this operation was forwarded.", true
 		}
 		if response.ErrorCode != "source_not_ready" || !response.Retryable || time.Now().After(deadline) {
 			if response.Error == "" {
-				return nil, "control plane error (no detail)"
+				return nil, "control plane error (no detail)", false
 			}
-			return nil, response.Error
+			return nil, response.Error, false
 		}
 		timer := time.NewTimer(25 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, errConnInterrupted
+			return nil, errConnInterrupted, false
 		case <-link.proxy.connection.closed:
 			timer.Stop()
-			return nil, errConnInterrupted
+			return nil, errConnInterrupted, false
 		case <-timer.C:
 		}
 	}

@@ -305,15 +305,22 @@ func (d *Daemon) pumpNativeBridge(ctx context.Context, link *nativeWorkerLink) {
 			call := response.Bridge
 			row, ok, rowErr := d.state.GetInstance(link.proxy.scope.InstanceID)
 			result := sessionworker.BridgeResult{ID: call.ID}
+			sourceSettled := false
 			if rowErr != nil || !ok || call.Scope != link.proxy.scope {
 				result.Error = "native bridge scope unavailable"
 			} else {
 				result.Result, result.Error = d.executeBridgeToolWithRead(row, call.Tool, call.Args, func(tool string, args json.RawMessage) (json.RawMessage, string) {
-					return d.relayNativeBridge(ctx, link, row, call, tool, args)
+					raw, message, settled := d.relayNativeBridgeWithRefusal(ctx, link, row, call, tool, args)
+					sourceSettled = settled
+					return raw, message
 				}, func(args, raw json.RawMessage) (json.RawMessage, string) {
 					return d.nativeTaskReadForBridge(ctx, link.proxy, row, call, args, raw)
 				})
 				result.OK = result.Error == ""
+				if sourceSettled && !result.OK {
+					result.ErrorCode = "source_settled"
+					result.Retryable = true
+				}
 			}
 			_, _ = link.proxy.call(ctx, sessionworker.Request{Type: "bridge_result", Relay: &result})
 		}

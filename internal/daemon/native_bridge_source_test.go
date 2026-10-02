@@ -52,10 +52,13 @@ func TestNativeBridgeSourcePinsOriginalWorkerTurn(t *testing.T) {
 }
 
 func TestNativeBridgeRepeatsOnlyExplicitPreEffectRefusal(t *testing.T) {
-	for _, mode := range []string{"ready", "generic_retryable", "not_retryable"} {
+	for _, mode := range []string{"ready", "generic_retryable", "not_retryable", "settled", "settled_task", "settled_with_result"} {
 		t.Run(mode, func(t *testing.T) {
 			d := newTestDaemon(t)
 			source := &transport.NativeAgentSource{OriginID: domain.NewID().String(), NativeGeneration: "original-A", SessionID: "vendor-A", LogicalTurnID: "turn-A", NativeTurnSequence: 7, InputKind: "user_input", SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String()}
+			if mode == "settled_task" {
+				source.InputKind = "task"
+			}
 			request := transport.AgentRequestPayload{InstanceID: domain.NewID().String(), PrincipalID: domain.NewID().String(), Tool: "control_channel_send", Args: json.RawMessage(`{"body":"original conversation"}`), NativeSource: source}
 			var calls atomic.Int32
 			failures := make(chan string, 4)
@@ -81,6 +84,12 @@ func TestNativeBridgeRepeatsOnlyExplicitPreEffectRefusal(t *testing.T) {
 					}
 					n := calls.Add(1)
 					response := transport.AgentResponsePayload{RequestID: env.ID, Error: "original source not ready", ErrorCode: "source_not_ready", Retryable: true}
+					if strings.HasPrefix(mode, "settled") {
+						response.ErrorCode = "source_settled"
+					}
+					if mode == "settled_with_result" {
+						response.Result = json.RawMessage(`{}`)
+					}
 					if mode == "generic_retryable" {
 						response.ErrorCode = "other"
 					}
@@ -120,7 +129,10 @@ func TestNativeBridgeRepeatsOnlyExplicitPreEffectRefusal(t *testing.T) {
 			connection := NewNativeObservationConnection(server.URL, "host", "boot", nil)
 			defer connection.Close()
 			link := &nativeWorkerLink{conn: conn, proxy: &NativeWorkerProxy{connection: connection}}
-			got, message := d.relayNativeSourceRequest(t.Context(), link, request)
+			got, message, settled := d.relayNativeSourceRequestWithRefusal(t.Context(), link, request)
+			if settled != (mode == "settled") {
+				t.Fatal("incorrect typed non-task pre-effect refusal propagation", mode, settled)
+			}
 			want := int32(1)
 			if mode == "ready" {
 				want = 2

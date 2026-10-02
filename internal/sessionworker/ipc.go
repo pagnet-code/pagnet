@@ -302,6 +302,9 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		response := Response{}
 		switch req.Type {
 		case "intent", "dispatch":
+			if owner != nil {
+				owner.bridgeSourceMu.Lock()
+			}
 			var authorize func() (*Admission, error)
 			if owner != nil {
 				authorize = func() (*Admission, error) { return owner.relay.authorizeNativeEffect(auth.Lease) }
@@ -317,6 +320,9 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 				out, run, err = j.admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize)
 			} else {
 				err = ErrConflict
+			}
+			if owner != nil {
+				owner.bridgeSourceMu.Unlock()
 			}
 			if err != nil {
 				response.Error = err.Error()
