@@ -7,6 +7,8 @@ type NativeResourceInterruption struct {
 	Source NativeAgentSource `json:"source"`
 }
 
+const NativeResourceInterruptionProtocol = "native-resource-interruption-v1"
+
 const (
 	NativeResourceOutputLimit  = "output_limit"
 	NativeResourceCaptureLimit = "capture_limit"
