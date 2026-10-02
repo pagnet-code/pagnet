@@ -69,13 +69,14 @@ type NativeOriginRegisteredPayload struct {
 // Digest binds the original journal bytes. Retries keep those bytes and their
 // IDs; they do not re-encrypt an answer or execute a native choice again.
 type NativeObservationPayload struct {
-	ObservationID string          `json:"observationId"`
-	OriginID      string          `json:"originId"`
-	MessageType   string          `json:"messageType"`
-	Digest        string          `json:"digest"`
-	ObservedAt    time.Time       `json:"observedAt"`
-	ExpiresAt     time.Time       `json:"expiresAt"`
-	Payload       json.RawMessage `json:"payload"`
+	DeleteRequestID string          `json:"deleteRequestId,omitempty"`
+	ObservationID   string          `json:"observationId"`
+	OriginID        string          `json:"originId"`
+	MessageType     string          `json:"messageType"`
+	Digest          string          `json:"digest"`
+	ObservedAt      time.Time       `json:"observedAt"`
+	ExpiresAt       time.Time       `json:"expiresAt"`
+	Payload         json.RawMessage `json:"payload"`
 }
 
 type NativeObservationReceiptPayload struct {
@@ -111,3 +112,5 @@ type NativeOriginSessionConfirmedPayload struct {
 	PublicError      string    `json:"publicError,omitempty"`
 	Retryable        bool      `json:"retryable,omitempty"`
 }
+
+const NativeObservationDeleteQuarantined = "delete_quarantined"
