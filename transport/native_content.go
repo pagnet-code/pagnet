@@ -86,3 +86,10 @@ type NativeContentStatusPayload struct {
 	ContentID        string `json:"contentId"`
 	CiphertextDigest string `json:"ciphertextDigest"`
 }
+
+// Authenticated GET responses expose content only after the source observation
+// and its complete attachment commit. Staging is a separate host protocol.
+type NativeContentDescriptor struct {
+	State     string                 `json:"state"`
+	Reference NativeContentReference `json:"reference"`
+}
