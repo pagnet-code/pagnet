@@ -1394,6 +1394,10 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 	insts, err := d.state.ListInstances()
 	if err == nil {
 		for _, i := range insts {
+			// Owned lifecycle is projected only from committed original worker receipts.
+			if d.nativeOwned(i.InstanceID) {
+				continue
+			}
 			ist := transport.InstanceStatus{
 				InstanceID: i.InstanceID,
 				Status:     d.observedInstanceStatus(i),
@@ -2689,6 +2693,11 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 // stays reachable), and drops the local row. The instance is gone for
 // good: no restart is possible, so there is nothing to preserve.
 func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
+	// A generic forget cannot discard an independently owned journal/process.
+	// Its explicit retirement must commit before local data can be reclaimed.
+	if d.nativeOwned(instanceID) {
+		return ErrNativeOriginAdmissionDeferred
+	}
 	row, ok, err := d.state.GetInstance(instanceID)
 	if err != nil {
 		return err

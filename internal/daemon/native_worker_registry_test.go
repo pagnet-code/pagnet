@@ -285,3 +285,24 @@ func TestNativeWorkerRegistryAcceptsSafeParentWithoutChangingPermissions(t *test
 		}
 	}
 }
+
+func TestLegacyForgetCannotDiscardOriginalOwnedInstance(t *testing.T) {
+	registry, scope, spec := nativeRegistryFixture(t)
+	if _, err := registry.Reserve(scope, spec, "original", ""); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDaemon(t)
+	d.nativeRegistry = registry
+	if err := d.state.UpsertInstance(InstanceRow{InstanceID: scope.InstanceID, AgentName: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.doForget(nil, scope.InstanceID); !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+		t.Fatal("legacy forget crossed owned retirement", err)
+	}
+	if _, ok, err := d.state.GetInstance(scope.InstanceID); err != nil || !ok {
+		t.Fatal("owned source state lost", err)
+	}
+	if !registry.Owns(scope.InstanceID) {
+		t.Fatal("original registry lost")
+	}
+}
