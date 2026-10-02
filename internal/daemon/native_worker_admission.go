@@ -23,7 +23,7 @@ func (c *NativeObservationConnection) NativeWorkerAdmission(scope sessionworker.
 	if c.session == nil {
 		return sessionworker.Admission{}, ErrNativeOriginAdmissionDeferred
 	}
-	if scope.TenantID != c.session.TenantID || scope.AccountID != c.session.AccountID || scope.HostID != c.hostID || scope.ServerURL == "" || scope.TenantID == "" || scope.AccountID == "" || scope.InstanceID == "" || scope.Generation == "" {
+	if scope.TenantID != c.session.TenantID || scope.AccountID != c.session.AccountID || scope.HostID != c.hostID || scope.ServerURL != c.serverURL || scope.TenantID == "" || scope.AccountID == "" || scope.InstanceID == "" || scope.Generation == "" {
 		return sessionworker.Admission{}, ErrNativeObservationConflict
 	}
 	if (kind == "worker" && networkID == "") || (kind != "worker" && kind != "representative") {

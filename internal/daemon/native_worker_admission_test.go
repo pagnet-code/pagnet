@@ -20,7 +20,7 @@ func TestNativeWorkerActivationAdapterKeepsOriginalAuthorityWithFreshController(
 			source := sessionworker.Admission{NativeAdmissionID: domain.NewID().String(), Scope: scope, TenantID: scope.TenantID, NetworkID: network, Kind: "worker", RunnerID: domain.NewID().String(), RunnerEpoch: session.RunnerEpoch.Add(-time.Minute), BootID: domain.NewID().String()}
 			sent := 0
 			var connection *NativeObservationConnection
-			connection = NewNativeObservationConnection(scope.HostID, session.BootID, func(_ context.Context, typ string, p any) error {
+			connection = NewNativeObservationConnection(scope.ServerURL, scope.HostID, session.BootID, func(_ context.Context, typ string, p any) error {
 				sent++
 				request := p.(transport.NativeOriginRegisterPayload)
 				if typ != transport.MsgNativeOriginRegister || request.NativeAdmissionID != source.NativeAdmissionID {
@@ -85,7 +85,7 @@ func TestNativeWorkerSessionRenewalPinsActualLiveBirthAndGeneration(t *testing.T
 			sent, calls := 0, 0
 			runner, boot := domain.NewID().String(), domain.NewID().String()
 			var connection *NativeObservationConnection
-			connection = NewNativeObservationConnection(scope.HostID, boot, func(_ context.Context, typ string, p any) error {
+			connection = NewNativeObservationConnection(scope.ServerURL, scope.HostID, boot, func(_ context.Context, typ string, p any) error {
 				sent++
 				request := p.(transport.NativeOriginSessionPayload)
 				connection.SessionConfirmed(transport.NativeOriginSessionConfirmedPayload{RequestID: request.RequestID, OriginID: request.OriginID, NativeGeneration: request.NativeGeneration, SessionID: request.SessionID, RunnerID: runner, RunnerEpoch: epoch})
@@ -140,17 +140,19 @@ func TestNativeWorkerSessionRenewalPinsActualLiveBirthAndGeneration(t *testing.T
 func TestNativeWorkerAdmissionPinsServerAuthenticatedAccountNotCallerLabels(t *testing.T) {
 	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: domain.NewID().String(), AccountID: domain.NewID().String(), HostID: domain.NewID().String(), InstanceID: domain.NewID().String(), Generation: domain.NewID().String()}
 	session := transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID, OwnershipScope: "personal", NativeAdmissionID: domain.NewID().String(), HostID: scope.HostID, RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), BootID: domain.NewID().String(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
-	connection := NewNativeObservationConnection(scope.HostID, session.BootID, func(context.Context, string, any) error { t.Fatal("scope check wrote to server"); return nil })
+	connection := NewNativeObservationConnection(scope.ServerURL, scope.HostID, session.BootID, func(context.Context, string, any) error { t.Fatal("scope check wrote to server"); return nil })
 	defer connection.Close()
 	if err := connection.Admit(session); err != nil {
 		t.Fatal(err)
 	}
-	for _, kind := range []string{"tenant", "account"} {
+	for _, kind := range []string{"tenant", "account", "server"} {
 		changed := scope
 		if kind == "tenant" {
 			changed.TenantID = domain.NewID().String()
-		} else {
+		} else if kind == "account" {
 			changed.AccountID = domain.NewID().String()
+		} else {
+			changed.ServerURL = "https://different-server.test"
 		}
 		if _, err := connection.NativeWorkerAdmission(changed, domain.NewID().String(), "worker"); err == nil {
 			t.Fatal("caller scope overrode authenticated host authority", kind)

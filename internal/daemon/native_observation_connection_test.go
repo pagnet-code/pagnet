@@ -13,7 +13,7 @@ import (
 func TestNativeObservationConnectionKeepsAdmissionExactAndDisconnectUnblocks(t *testing.T) {
 	host, boot, runner := domain.NewID().String(), domain.NewID().String(), domain.NewID().String()
 	requests := make(chan transport.NativeOriginRegisterPayload, 1)
-	conn := NewNativeObservationConnection(host, boot, func(_ context.Context, typ string, p any) error {
+	conn := NewNativeObservationConnection("https://example.test", host, boot, func(_ context.Context, typ string, p any) error {
 		if typ != transport.MsgNativeOriginRegister {
 			t.Fatal(typ)
 		}
@@ -64,7 +64,7 @@ func TestNativeObservationConnectionKeepsAdmissionExactAndDisconnectUnblocks(t *
 func TestNativeObservationConnectionRetainsOriginalOriginAcrossReconnect(t *testing.T) {
 	host, boot, runner := domain.NewID().String(), domain.NewID().String(), domain.NewID().String()
 	requests := make(chan transport.NativeOriginRegisterPayload, 1)
-	conn := NewNativeObservationConnection(host, boot, func(_ context.Context, _ string, p any) error {
+	conn := NewNativeObservationConnection("https://example.test", host, boot, func(_ context.Context, _ string, p any) error {
 		requests <- p.(transport.NativeOriginRegisterPayload)
 		return nil
 	})
@@ -93,7 +93,7 @@ func TestNativeObservationConnectionAdmissionFailuresHaveDistinctDisposition(t *
 	for _, retryable := range []bool{false, true} {
 		host, boot, runner := domain.NewID().String(), domain.NewID().String(), domain.NewID().String()
 		requests := make(chan transport.NativeOriginRegisterPayload, 1)
-		conn := NewNativeObservationConnection(host, boot, func(_ context.Context, _ string, p any) error {
+		conn := NewNativeObservationConnection("https://example.test", host, boot, func(_ context.Context, _ string, p any) error {
 			requests <- p.(transport.NativeOriginRegisterPayload)
 			return nil
 		})
@@ -124,7 +124,7 @@ func TestNativeObservationSessionConfirmationRequiresLiveProofAndExactReceipt(t 
 			epoch := time.Now().UTC()
 			sent, verified := 0, 0
 			var conn *NativeObservationConnection
-			conn = NewNativeObservationConnection(host, boot, func(_ context.Context, typ string, p any) error {
+			conn = NewNativeObservationConnection("https://example.test", host, boot, func(_ context.Context, typ string, p any) error {
 				sent++
 				request := p.(transport.NativeOriginSessionPayload)
 				if typ != transport.MsgNativeOriginSession || request.RunnerID != runner || !request.RunnerEpoch.Equal(epoch) {

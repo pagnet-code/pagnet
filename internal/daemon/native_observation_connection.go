@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net/url"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 type NativeObservationConnection struct {
 	mu              sync.Mutex
 	hostID, bootID  string
+	serverURL       string
 	session         *transport.HostSessionPayload
 	pending         map[string]chan transport.NativeOriginRegisteredPayload
 	pendingSessions map[string]chan transport.NativeOriginSessionConfirmedPayload
@@ -26,8 +28,8 @@ type NativeObservationConnection struct {
 	send            func(context.Context, string, any) error
 }
 
-func NewNativeObservationConnection(hostID, bootID string, send func(context.Context, string, any) error) *NativeObservationConnection {
-	return &NativeObservationConnection{hostID: hostID, bootID: bootID, send: send, pending: make(map[string]chan transport.NativeOriginRegisteredPayload), pendingSessions: make(map[string]chan transport.NativeOriginSessionConfirmedPayload), closed: make(chan struct{})}
+func NewNativeObservationConnection(serverURL, hostID, bootID string, send func(context.Context, string, any) error) *NativeObservationConnection {
+	return &NativeObservationConnection{serverURL: serverURL, hostID: hostID, bootID: bootID, send: send, pending: make(map[string]chan transport.NativeOriginRegisteredPayload), pendingSessions: make(map[string]chan transport.NativeOriginSessionConfirmedPayload), closed: make(chan struct{})}
 }
 
 func (c *NativeObservationConnection) Close() {
@@ -49,6 +51,10 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 	case <-c.closed:
 		return ErrNativeOriginAdmissionDeferred
 	default:
+	}
+	endpoint, err := url.Parse(c.serverURL)
+	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return ErrNativeObservationConflict
 	}
 	if p.HostID != c.hostID || p.BootID != c.bootID || p.RunnerEpoch.IsZero() {
 		return ErrNativeObservationConflict
