@@ -59,7 +59,7 @@ func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sq
 		if s.NativeSessionID != sessionID {
 			return ErrConflict
 		}
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent WHERE sequence=? AND state IN ('completed','failed','resource_interrupted')) OR ?<=(SELECT retired FROM worker_meta WHERE singleton=1)`, s.Sequence, s.Sequence).Scan(&settled); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent WHERE sequence=? AND state IN ('completed','failed','resource_interrupted','owner_stopped')) OR ?<=(SELECT retired FROM worker_meta WHERE singleton=1)`, s.Sequence, s.Sequence).Scan(&settled); err != nil {
 			return err
 		}
 		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_observations WHERE json_extract(payload,'$.turnSource.sequence')=?) OR EXISTS(SELECT 1 FROM worker_interaction_sources WHERE native_generation=? AND logical_turn=?)`, s.Sequence, generation, s.LogicalTurnID).Scan(&pending); err != nil {

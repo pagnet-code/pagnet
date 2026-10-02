@@ -119,3 +119,14 @@ or completed event and never permits replay of earlier native effects. Late loca
 finish cannot overwrite the proof, and its completion is required before outcome
 ACK. The bounded settlement evidence survives transport loss and worker reopen,
 then is reclaimed only with the matching committed contiguous dispatch floor.
+
+Explicit deletion can record `owner_stopped` for an original uncertain prompt
+only with its captured native start, exact bound command/admission, a later
+completed owned Stop, genuine original EOF, and the backend's exact deletion
+proof. This is an abandonment record: prior effects remain unknown and are never
+replayed. A separate uncertain resolution or input still blocks collection.
+Original committed EOF receipts are retained until their generation is settled;
+expired or quarantined EOF evidence keeps its original disposition. The closure
+transaction may purge only an unpublished private permission inspection with the
+same proven turn and no protected references/fragments. Unpublished task output
+and plans remain blockers. Evidence is reclaimed with the original dispatch floor.

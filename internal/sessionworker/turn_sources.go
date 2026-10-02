@@ -28,7 +28,7 @@ type NativeTurnSource struct {
 func logicalWorkerTurn(sequence int64) string { return fmt.Sprintf("pagnet-worker-turn-%d", sequence) }
 func (j *Journal) initializeTurnSources() error {
 	for _, query := range []string{
-		`CREATE TABLE IF NOT EXISTS worker_turn_sources(sequence INTEGER NOT NULL,logical_turn TEXT NOT NULL,native_generation TEXT NOT NULL,native_session TEXT NOT NULL,source_command TEXT NOT NULL,source_admission TEXT NOT NULL,input_kind TEXT NOT NULL DEFAULT '',completed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(native_generation,logical_turn))`,
+		`CREATE TABLE IF NOT EXISTS worker_turn_sources(sequence INTEGER NOT NULL,logical_turn TEXT NOT NULL,native_generation TEXT NOT NULL,native_session TEXT NOT NULL,source_command TEXT NOT NULL,source_admission TEXT NOT NULL,input_kind TEXT NOT NULL DEFAULT '',completed INTEGER NOT NULL DEFAULT 0,started INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(native_generation,logical_turn))`,
 		`CREATE TABLE IF NOT EXISTS worker_interaction_sources(native_generation TEXT NOT NULL,native_id TEXT NOT NULL,native_session TEXT NOT NULL,logical_turn TEXT NOT NULL,PRIMARY KEY(native_generation,native_session,native_id))`,
 	} {
 		if _, err := j.db.Exec(query); err != nil {
@@ -39,7 +39,7 @@ func (j *Journal) initializeTurnSources() error {
 	if err != nil {
 		return err
 	}
-	hasKind, hasTask := false, false
+	hasKind, hasTask, hasStarted := false, false, false
 	for columns.Next() {
 		var cid, notNull, pk int
 		var name, typ string
@@ -47,6 +47,9 @@ func (j *Journal) initializeTurnSources() error {
 		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 			columns.Close()
 			return err
+		}
+		if name == "started" {
+			hasStarted = true
 		}
 		if name == "source_task" {
 			hasTask = true
@@ -62,6 +65,11 @@ func (j *Journal) initializeTurnSources() error {
 	}
 	if !hasKind {
 		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN input_kind TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !hasStarted {
+		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN started INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -232,6 +240,11 @@ func retainNativeEventSource(ctx context.Context, tx *sql.Tx, observation Native
 			} else {
 				return err
 			}
+		}
+	}
+	if observation.TurnSource != nil && event.Type == session.EventTurnStarted {
+		if _, err := tx.ExecContext(ctx, `UPDATE worker_turn_sources SET started=1 WHERE native_generation=? AND logical_turn=?`, observation.NativeGeneration, observation.TurnSource.LogicalTurnID); err != nil {
+			return err
 		}
 	}
 	if observation.TurnSource != nil && (event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed || event.Type == session.EventSessionLost) {

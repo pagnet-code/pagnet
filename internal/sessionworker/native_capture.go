@@ -264,7 +264,7 @@ func (j *Journal) initializeCaptures() error {
 		return errors.New("orphaned private source capture")
 	}
 	var count, size int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_source_captures`).Scan(&count, &size); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_owner_stop_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_stopped_receipts) FROM worker_source_captures`).Scan(&count, &size); err != nil {
 		return err
 	}
 	if count > maxPendingObservations || size > maxPendingObservationBytes {

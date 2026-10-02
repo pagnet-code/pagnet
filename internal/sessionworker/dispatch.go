@@ -88,7 +88,7 @@ func (j *Journal) initializeDispatches() error {
 	if json.Unmarshal([]byte(ownership), &o) != nil || o.InstanceID != j.scope.InstanceID || o.OwnershipGeneration != j.scope.Generation {
 		return ErrConflict
 	}
-	if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches WHERE dispatch_sequence<=? OR dispatch_sequence>? OR operation_sequence<=0 OR operation_sequence>=(SELECT next_sequence FROM worker_meta WHERE singleton=1) OR state NOT IN ('admitted','completed','failed','uncertain','resource_interrupted') OR (state='resource_interrupted' AND NOT EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR json_extract(proof,'$.ownershipId') IS NOT ? OR json_extract(proof,'$.ownershipGeneration') IS NOT ? OR json_extract(proof,'$.dispatchSequence') IS NOT dispatch_sequence OR json_extract(proof,'$.sourceCommandId') IS NOT command_id`, retired, last, o.ID, j.scope.Generation).Scan(&invalid); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_dispatches WHERE dispatch_sequence<=? OR dispatch_sequence>? OR operation_sequence<=0 OR operation_sequence>=(SELECT next_sequence FROM worker_meta WHERE singleton=1) OR state NOT IN ('admitted','completed','failed','uncertain','resource_interrupted','owner_stopped') OR (state='resource_interrupted' AND NOT EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR (state='owner_stopped' AND NOT EXISTS(SELECT 1 FROM worker_owner_stop_settlements s WHERE s.sequence=operation_sequence AND json(json_extract(s.payload,'$.proof'))=json(proof))) OR json_extract(proof,'$.ownershipId') IS NOT ? OR json_extract(proof,'$.ownershipGeneration') IS NOT ? OR json_extract(proof,'$.dispatchSequence') IS NOT dispatch_sequence OR json_extract(proof,'$.sourceCommandId') IS NOT command_id`, retired, last, o.ID, j.scope.Generation).Scan(&invalid); err != nil {
 		return err
 	}
 	if invalid != 0 {
@@ -240,13 +240,16 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 		return ErrConflict
 	}
 	var unsafe int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed','resource_interrupted') OR EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=d.operation_sequence AND finished=0) OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=d.operation_sequence AND v.committed=0) OR EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_resource_interruptions r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed','resource_interrupted','owner_stopped') OR EXISTS(SELECT 1 FROM worker_resource_settlements s WHERE s.sequence=d.operation_sequence AND finished=0) OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=d.operation_sequence AND v.committed=0) OR EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_resource_interruptions r WHERE r.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
 		return err
 	}
 	if unsafe != 0 {
 		return ErrConflict
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_view_commits WHERE operation_sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_owner_stop_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_resource_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {

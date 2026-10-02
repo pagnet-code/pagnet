@@ -29,6 +29,10 @@ type resourceFixture struct {
 }
 
 func acceptedResourceFixture(t *testing.T) resourceFixture {
+	return acceptedInterruptionFixture(t, true)
+}
+
+func acceptedInterruptionFixture(t *testing.T, resource bool, private ...string) resourceFixture {
 	t.Helper()
 	j, dir := testJournal(t)
 	l := lease(t, j)
@@ -50,12 +54,69 @@ func acceptedResourceFixture(t *testing.T) resourceFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = j.recordNativeResourceInterruption(t.Context(), p, source, transport.NativeResourceOutputLimit); err != nil {
-		t.Fatal(err)
+	if resource {
+		if err = j.recordNativeResourceInterruption(t.Context(), p, source, transport.NativeResourceOutputLimit); err != nil {
+			t.Fatal(err)
+		}
 	}
 	marker, err := j.nativeResourceInterruption(t.Context(), source.NativeGeneration)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !resource {
+		started := NativeObservation{ID: domain.NewID().String(), NativeGeneration: source.NativeGeneration, NativeSessionID: source.NativeSessionID, Origin: raw, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventTurnStarted, SessionID: source.NativeSessionID, TurnID: source.LogicalTurnID}, TurnSource: &source}
+		started.SourceDigest, _ = observationDigest(started)
+		if err = j.journalCapturedObservation(t.Context(), p, started, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err = j.AcknowledgeObservation(t.Context(), l, started.ID, started.SourceDigest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(private) == 1 {
+		tx, readErr := j.db.BeginTx(t.Context(), nil)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		source, readErr := readNativeTurn(t.Context(), tx, source.NativeGeneration, logicalWorkerTurn(1))
+		tx.Rollback()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		event := session.SessionEvent{Type: session.EventInteractionStarted, SessionID: source.NativeSessionID, TurnID: source.LogicalTurnID, Interaction: &session.InteractionEvent{NativeInteractionID: "original-private-choice"}}
+		o := NativeObservation{ID: domain.NewID().String(), InteractionID: domain.NewID().String(), NativeGeneration: source.NativeGeneration, NativeSessionID: source.NativeSessionID, Origin: raw, ObservedAt: time.Now().UTC(), Event: event, TurnSource: &source}
+		switch private[0] {
+		case "output":
+			o.Event.Type = session.EventTurnOutput
+			o.SourceContentUnavailable = true
+		case "plan":
+			o.Event.Type = session.EventPlanUpdated
+			o.SourceContentUnavailable = true
+		case "wrong-turn":
+			source.SourceCommandID = domain.NewID().String()
+		}
+		ref, cipher, sealErr := sealNativeCapture(bytes.Repeat([]byte{7}, 32), j.scope, j.dir, o, NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: event})
+		if sealErr != nil {
+			t.Fatal(sealErr)
+		}
+		o.Capture = ref
+		o.SourceDigest, _ = observationDigest(o)
+		if private[0] == "wrong-turn" {
+			raw, _ := json.Marshal(o)
+			if _, err = j.db.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, o.ID, o.SourceDigest, raw, len(raw)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = j.db.Exec(`INSERT INTO worker_source_captures(id,ciphertext,size) VALUES(?,?,?)`, o.ID, cipher, len(cipher)); err != nil {
+				t.Fatal(err)
+			}
+		} else if err = j.journalCapturedObservation(t.Context(), p, o, cipher); err != nil {
+			t.Fatal(err)
+		}
+		if private[0] == "fragment" {
+			if _, err = j.db.Exec(`INSERT INTO worker_content_fragments(observation_id,content_id,ordinal,payload,size) VALUES(?,'private-protected-content',0,X'01',1)`, o.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	o := NativeObservation{ID: domain.NewID().String(), NativeGeneration: source.NativeGeneration, NativeSessionID: source.NativeSessionID, Origin: raw, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventSessionStopped, SessionID: source.NativeSessionID}, ResourceInterruption: marker}
 	o.SourceDigest, _ = observationDigest(o)
@@ -63,10 +124,20 @@ func acceptedResourceFixture(t *testing.T) resourceFixture {
 		t.Fatal(err)
 	}
 	pending, err := j.PendingObservations(t.Context(), 32)
-	if err != nil || len(pending) != 1 {
-		t.Fatal(pending, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	o = pending[0]
+	found := false
+	for _, captured := range pending {
+		if captured.ID == o.ID {
+			o = captured
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("original EOF capture missing")
+	}
 	wire, err := NativeBackendObservation(o)
 	if err != nil {
 		t.Fatal(err)

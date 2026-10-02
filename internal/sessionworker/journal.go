@@ -139,6 +139,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if err = j.initializeOutputSpools(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeOwnerStopSettlements(); err != nil {
+		return fail(err)
+	}
 	if err = j.initializeResourceSettlements(); err != nil {
 		return fail(err)
 	}
@@ -422,7 +425,7 @@ func (j *Journal) Settle(ctx context.Context, sequence int64, state string, resu
 	}
 	if n != 1 {
 		var proven bool
-		if readErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent w JOIN worker_resource_settlements r ON r.sequence=w.sequence WHERE w.sequence=? AND w.state=?)`, sequence, ResourceInterrupted).Scan(&proven); readErr != nil {
+		if readErr := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent w JOIN worker_resource_settlements r ON r.sequence=w.sequence WHERE w.sequence=? AND w.state IN (?,?) UNION ALL SELECT 1 FROM worker_intent w JOIN worker_owner_stop_settlements r ON r.sequence=w.sequence WHERE w.sequence=? AND w.state=?)`, sequence, ResourceInterrupted, OwnerStopped, sequence, OwnerStopped).Scan(&proven); readErr != nil {
 			return readErr
 		}
 		if !proven {
@@ -549,7 +552,7 @@ func (j *Journal) validateHistory() error {
 	if lease < 0 || next < 1 || retired < 0 || retired >= next || count < 0 || count > maxCommands || next-retired-1 != count {
 		return errors.New("worker journal sequence history is incomplete")
 	}
-	rows, err := j.db.Query(`SELECT sequence,command_id,digest,kind,state,result,acknowledged,EXISTS(SELECT 1 FROM worker_resource_settlements r WHERE r.sequence=worker_intent.sequence) FROM worker_intent ORDER BY sequence`)
+	rows, err := j.db.Query(`SELECT sequence,command_id,digest,kind,state,result,acknowledged,(EXISTS(SELECT 1 FROM worker_resource_settlements r WHERE r.sequence=worker_intent.sequence) OR EXISTS(SELECT 1 FROM worker_owner_stop_settlements r WHERE r.sequence=worker_intent.sequence)) FROM worker_intent ORDER BY sequence`)
 	if err != nil {
 		return err
 	}
@@ -564,8 +567,8 @@ func (j *Journal) validateHistory() error {
 			return err
 		}
 		_, digestErr := hex.DecodeString(digest)
-		validState := state == "admitted" || state == "completed" || state == "failed" || state == "uncertain" || state == ResourceInterrupted
-		if sequence != expected || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || (state == ResourceInterrupted && !interruptedProof) || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
+		validState := state == "admitted" || state == "completed" || state == "failed" || state == "uncertain" || (state == ResourceInterrupted || state == OwnerStopped)
+		if sequence != expected || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || ((state == ResourceInterrupted || state == OwnerStopped) && !interruptedProof) || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
 			return errors.New("worker journal contains an invalid intent")
 		}
 		expected++

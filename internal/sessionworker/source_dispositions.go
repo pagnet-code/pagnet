@@ -110,7 +110,7 @@ func (j *Journal) RecordNativeSourceDisposition(ctx context.Context, lease int64
 		return err
 	}
 	var total int
-	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)`).Scan(&total); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_owner_stop_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_stopped_receipts)`).Scan(&total); err != nil {
 		return err
 	}
 	var unmarked int

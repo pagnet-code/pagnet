@@ -449,10 +449,19 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 	switch req.Type {
 	case "deletion_quarantines":
 		snapshot := o.Snapshot()
-		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
+		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal {
 			err = ErrNativeBusy
 		} else {
-			err = o.journal.CollectDeletionQuarantines(ctx, lease, req.DeletionProof)
+			err = o.journal.collectDeletionQuarantines(ctx, lease, req.DeletionProof, o.captureKey)
+			if err == nil {
+				o.mu.Lock()
+				for id, pending := range o.pending {
+					if pending.inspection != nil && pending.inspection.NativeGeneration == req.DeletionProof.NativeGeneration && pending.inspection.NativeSessionID == req.DeletionProof.NativeSessionID {
+						delete(o.pending, id)
+					}
+				}
+				o.mu.Unlock()
+			}
 		}
 	case "worker_retire":
 		err = o.prepareOwnershipRetirement(ctx, lease, req.Ownership)

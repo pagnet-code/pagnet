@@ -26,7 +26,7 @@ func (j *Journal) initializeTerminalReservations() error {
 		return err
 	}
 	var usedRows, usedCapture, usedContent int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements),(SELECT COALESCE(SUM(size),0) FROM worker_content_fragments) FROM worker_observations`).Scan(&usedRows, &usedCapture, &usedContent); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_owner_stop_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_stopped_receipts),(SELECT COALESCE(SUM(size),0) FROM worker_content_fragments) FROM worker_observations`).Scan(&usedRows, &usedCapture, &usedContent); err != nil {
 		return err
 	}
 	if invalid != 0 || count > maxCommands || usedRows+reservedRows > maxPendingObservations || usedCapture+captures > maxPendingObservationBytes || usedContent+content > maxWorkerContentBytes {
@@ -47,7 +47,7 @@ func (j *Journal) reserveTerminalTx(ctx context.Context, tx *sql.Tx, sequence in
 		return err
 	}
 	var count, total, unmarked, fragments int
-	err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements),(SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)),(SELECT COALESCE(SUM(size),0) FROM worker_content_fragments) FROM worker_observations`).Scan(&count, &total, &unmarked, &fragments)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_owner_stop_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_stopped_receipts),(SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)),(SELECT COALESCE(SUM(size),0) FROM worker_content_fragments) FROM worker_observations`).Scan(&count, &total, &unmarked, &fragments)
 	if err != nil {
 		return err
 	}

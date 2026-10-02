@@ -15,6 +15,10 @@ import (
 // terminal rejection. It never fabricates a source ACK or settles an uncertain
 // native effect. The original worker scope and actual reader EOF stay mandatory.
 func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, proof *transport.NativeOwnershipDeletionProof) error {
+	return j.collectDeletionQuarantines(ctx, lease, proof, nil)
+}
+
+func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, proof *transport.NativeOwnershipDeletionProof, captureKey []byte) error {
 	if proof == nil || proof.DeleteRequestID == "" || proof.OriginID == "" || proof.NativeGeneration == "" || proof.NativeSessionID == "" || proof.StoppedObservationID == "" || proof.StoppedSourceSequence <= 0 || proof.StoppedObservedAt.IsZero() || !proof.StoppedExpiresAt.After(proof.StoppedObservedAt) {
 		return ErrConflict
 	}
@@ -49,8 +53,11 @@ func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, p
 	if json.Unmarshal([]byte(raw), &owned) != nil || proof.StopProof.OwnershipID != owned.ID || proof.StopProof.OwnershipGeneration != j.scope.Generation || proof.StopProof.DispatchSequence <= 0 || proof.StopProof.DispatchSequence > last || proof.StopProof.SourceCommandID == "" || proof.StopProof.SourceAdmissionID == "" || proof.StopProof.SourceRunnerID == "" || proof.StopProof.SourceBootID == "" || proof.StopProof.SourceRunnerEpoch.IsZero() {
 		return ErrConflict
 	}
+	if err = j.settleOwnerStoppedTx(ctx, tx, proof); err != nil {
+		return err
+	}
 	var unsafe bool
-	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_source_registration WHERE quiesced=0) OR EXISTS(SELECT 1 FROM worker_intent WHERE state NOT IN ('completed','failed')) OR EXISTS(SELECT 1 FROM worker_dispatches WHERE state NOT IN ('completed','failed')) OR EXISTS(SELECT 1 FROM worker_dispatch_cancellations WHERE state!='finalized')`).Scan(&unsafe); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_source_registration WHERE quiesced=0) OR EXISTS(SELECT 1 FROM worker_intent WHERE state NOT IN ('completed','failed','resource_interrupted','owner_stopped')) OR EXISTS(SELECT 1 FROM worker_dispatches WHERE state NOT IN ('completed','failed','resource_interrupted','owner_stopped')) OR EXISTS(SELECT 1 FROM worker_dispatch_cancellations WHERE state!='finalized')`).Scan(&unsafe); err != nil {
 		return err
 	}
 	if unsafe {
@@ -103,9 +110,15 @@ func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, p
 			}
 		}
 	}
+	if err = j.collectOwnerStoppedPrivateInspectionsTx(ctx, tx, proof); err != nil {
+		return err
+	}
+	if err = j.collectStoppedNativeReservationsTx(ctx, tx, captureKey, proof.NativeGeneration, proof.NativeSessionID, proof.OriginID); err != nil {
+		return err
+	}
 	// These are source references, not native outcomes. Only already settled
 	// original local operations can lose their references after explicit deletion.
-	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.quiesced=1 AND r.native_generation=t.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND (t.sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) OR EXISTS(SELECT 1 FROM worker_intent w WHERE w.sequence=t.sequence AND w.state IN ('completed','failed')))`); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.quiesced=1 AND r.native_generation=t.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND (t.sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) OR EXISTS(SELECT 1 FROM worker_intent w WHERE w.sequence=t.sequence AND w.state IN ('completed','failed','resource_interrupted','owner_stopped')))`); err != nil {
 		return err
 	}
 	if err = j.collectClosedPrivateObservationsTx(ctx, tx); err != nil {

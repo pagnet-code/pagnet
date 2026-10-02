@@ -104,7 +104,7 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 	}
 	defer tx.Rollback()
 	var pending, total int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements) FROM worker_observations`).Scan(&pending, &total); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)+(SELECT COALESCE(SUM(size),0) FROM worker_output_spools)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_interruptions)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_resource_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_owner_stop_settlements)+(SELECT COALESCE(SUM(length(payload)),0) FROM worker_stopped_receipts) FROM worker_observations`).Scan(&pending, &total); err != nil {
 		return nil, err
 	}
 	var unmarked int
@@ -208,6 +208,9 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 		}
 		if active {
 			continue
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_stopped_receipts WHERE json_extract(payload,'$.observation.origin.id')=?`, id); err != nil {
+			return err
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_source_stream WHERE origin_id=?`, id); err != nil {
 			return err
