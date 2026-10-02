@@ -667,6 +667,17 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		Commands            []struct{ Type, Status string } `json:"commands"`
 	}
 	helper.call(t, map[string]any{"action": "delete_status"}, &final)
+	var closure struct {
+		Items []struct {
+			OriginID, Generation, SessionID, OwnershipID, OwnershipGeneration, StopOrdinal, StopCommandID, StopAdmissionID, Disposition, ObservedAt, ExpiresAt string
+			SourceSequence                                                                                                                                     int64
+			ProofPresent, ReceiptExact, OriginInactive                                                                                                         bool
+		} `json:"items"`
+	}
+	helper.call(t, map[string]any{"action": "deletion_diagnostics"}, &closure)
+	for _, item := range closure.Items {
+		t.Log("bounded backend original closure", item)
+	}
 	t.Log("bounded deletion state", final.DeletionState, final.OwnershipState, final.StoppedReceiptCount)
 	for _, command := range final.Commands {
 		t.Log("bounded deletion command", command.Type, command.Status)
@@ -690,6 +701,39 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 				var n int
 				if rows.Scan(&typ, &n) == nil {
 					t.Log("bounded pending native event types", typ, n)
+				}
+			}
+			rows.Close()
+		}
+		// Bounded metadata only: never select capture/plaintext/envelope/key bytes.
+		for _, query := range []struct{ label, sql string }{
+			{"intent", `SELECT sequence,kind,state,acknowledged FROM worker_intent ORDER BY sequence LIMIT 16`},
+			{"turn", `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,started,completed FROM worker_turn_sources ORDER BY sequence LIMIT 16`},
+			{"task source match", `SELECT t.sequence,json_extract(d.proof,'$.taskSource')=t.source_task FROM worker_turn_sources t JOIN worker_dispatches d ON d.operation_sequence=t.sequence LIMIT 16`},
+			{"dispatch", `SELECT dispatch_sequence,operation_sequence,state,json_extract(proof,'$.sourceCommandId'),json_extract(proof,'$.sourceAdmissionId'),json_extract(proof,'$.ownershipId'),json_extract(proof,'$.ownershipGeneration') FROM worker_dispatches ORDER BY dispatch_sequence LIMIT 16`},
+			{"stopped receipt", `SELECT observation_id,native_generation,json_extract(payload,'$.observation.nativeSessionId'),json_extract(payload,'$.observation.sourceSequence'),json_extract(payload,'$.receipt.disposition'),json_extract(payload,'$.receipt.originId'),json_extract(payload,'$.observation.observedAt') FROM worker_stopped_receipts LIMIT 16`},
+			{"registration", `SELECT origin_id,native_generation,quiesced FROM worker_source_registration LIMIT 16`},
+			{"observation flags", `SELECT id,COALESCE(json_extract(payload,'$.sourceSequence'),0),COALESCE(json_extract(payload,'$.event.Type'),json_extract(payload,'$.event.type'),'unknown'),json_type(payload,'$.inspection') IS NOT NULL,json_type(payload,'$.outputContent') IS NOT NULL,json_type(payload,'$.planContent') IS NOT NULL,json_type(payload,'$.originalNativePayloadContent') IS NOT NULL,EXISTS(SELECT 1 FROM worker_source_captures c WHERE c.id=o.id) FROM worker_observations o LIMIT 16`},
+			{"settlement counts", `SELECT (SELECT count(*) FROM worker_stopped_receipts),(SELECT count(*) FROM worker_owner_stop_settlements),(SELECT count(*) FROM worker_resource_settlements)`},
+		} {
+			rows, err := db.Query(query.sql)
+			if err != nil {
+				t.Log("bounded diagnostic unavailable", query.label)
+				continue
+			}
+			columns, err := rows.Columns()
+			if err != nil {
+				rows.Close()
+				continue
+			}
+			for rows.Next() {
+				values := make([]any, len(columns))
+				dest := make([]any, len(columns))
+				for i := range values {
+					dest[i] = &values[i]
+				}
+				if rows.Scan(dest...) == nil {
+					t.Log("bounded original metadata", query.label, values)
 				}
 			}
 			rows.Close()
