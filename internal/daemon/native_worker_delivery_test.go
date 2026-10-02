@@ -357,3 +357,35 @@ func TestNativeWorkerTerminalReceiptDurableMarkBeforeNextSource(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeWorkerExpiredContentRequestsReceiptWithoutStaging(t *testing.T) {
+	var c *NativeObservationConnection
+	c, o := deliveryFixture(t, func(_ context.Context, typ string, value any) error {
+		if typ != transport.MsgNativeObservation {
+			t.Fatal("expired source staged unnecessary ciphertext", typ)
+		}
+		p := value.(transport.NativeObservationPayload)
+		c.NativeWorkerObservationDisposition(transport.MsgNativeObservationReceipt, transport.NativeObservationReceiptPayload{ObservationID: p.ObservationID, OriginID: p.OriginID, Digest: p.Digest, Disposition: "expired"})
+		return nil
+	})
+	o.ObservedAt = time.Now().UTC().Add(-8 * 24 * time.Hour)
+	o.Event = session.SessionEvent{Type: session.EventInteractionStarted, Interaction: &session.InteractionEvent{Kind: "question", NativeInteractionID: "question"}}
+	o.InteractionID = domain.NewID().String()
+	o.Inspection = &sessionworker.Inspection{DetailContent: &transport.NativeContentReference{ContentID: domain.NewID().String()}}
+	marked := false
+	call := func(_ context.Context, r sessionworker.Request) (sessionworker.Response, error) {
+		switch r.Type {
+		case "observations":
+			return sessionworker.Response{Observations: []sessionworker.NativeObservation{o}}, nil
+		case "source_disposition":
+			marked = true
+			return sessionworker.Response{}, nil
+		default:
+			t.Fatal("expired source changed ciphertext/evidence", r.Type)
+		}
+		return sessionworker.Response{}, nil
+	}
+	if err := c.DrainNativeWorkerSources(t.Context(), call); err != nil || !marked {
+		t.Fatal("expired evidence blocked on content staging", err)
+	}
+}

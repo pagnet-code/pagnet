@@ -107,8 +107,12 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&pending, &total); err != nil {
 		return nil, err
 	}
+	var unmarked int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
+		return nil, err
+	}
 	reserved := j.sourceStopReservationsLocked() + 1
-	if pending+reserved > maxPendingObservations || total+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
+	if pending+reserved > maxPendingObservations || total+unmarked*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
 		return nil, ErrFull
 	}
 	var count int

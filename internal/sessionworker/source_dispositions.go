@@ -8,6 +8,8 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+const sourceDispositionReserveBytes = 2048
+
 // Terminal backend receipts consume a source sequence, but do not authorize
 // deletion of evidence that the backend did not attach. Side metadata retains
 // its immutable original source for authenticated recovery.
@@ -65,7 +67,7 @@ func (j *Journal) RecordNativeSourceDisposition(ctx context.Context, lease int64
 		return ErrConflict
 	}
 	raw, err := json.Marshal(r)
-	if err != nil || len(raw) > 2048 {
+	if err != nil || len(raw) > sourceDispositionReserveBytes {
 		return ErrConflict
 	}
 	j.mu.Lock()
@@ -111,7 +113,11 @@ func (j *Journal) RecordNativeSourceDisposition(ctx context.Context, lease int64
 	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)`).Scan(&total); err != nil {
 		return err
 	}
-	if total+len(raw)+j.sourceStopReservationsLocked()*sourceStopReserveBytes > maxPendingObservationBytes {
+	var unmarked int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
+		return err
+	}
+	if total+len(raw)+(unmarked-1)*sourceDispositionReserveBytes+j.sourceStopReservationsLocked()*sourceStopReserveBytes > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_dispositions VALUES(?,?,?,?)`, id, digest, raw, len(raw)); err != nil {

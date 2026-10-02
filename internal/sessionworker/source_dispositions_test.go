@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 	"testing"
@@ -117,5 +118,71 @@ func TestTerminalSourceDispositionRetainsOriginalAndAdvancesSendCursor(t *testin
 				t.Fatal("uncommitted original was deleted")
 			}
 		})
+	}
+}
+
+func TestTerminalDispositionHasReservedCapacityAtFullCiphertextQuota(t *testing.T) {
+	j, dir := testJournal(t)
+	defer j.Close()
+	ctx := context.Background()
+	a := lease(t, j)
+	key := bytes.Repeat([]byte{17}, 32)
+	build := func(n int) (NativeObservation, []byte) {
+		o := NativeObservation{ID: domain.NewID().String(), NativeGeneration: "original", NativeSessionID: "actual", Origin: json.RawMessage(`{"id":"origin","instanceId":"instance","runtime":"fake","nativeGeneration":"original"}`), ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventBusy}}
+		var err error
+		var cipher []byte
+		o.Capture, cipher, err = sealNativeCapture(key, j.scope, dir, o, NativeSourceCapture{Format: NativeSourceCaptureFormat, Event: session.SessionEvent{Type: session.EventBusy, Output: string(bytes.Repeat([]byte("x"), n))}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.SourceDigest, _ = observationDigest(o)
+		return o, cipher
+	}
+	for {
+		var total, count int
+		if err := j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
+			t.Fatal(err)
+		}
+		remaining := maxPendingObservationBytes - total - (count+1)*sourceDispositionReserveBytes
+		if remaining < 4096 {
+			break
+		}
+		small, encrypted := build(1)
+		raw, _ := json.Marshal(small)
+		n := min(maxPrivateSourceBytes-2048, remaining-len(raw)-len(encrypted)-64)
+		o, cipher := build(n)
+		raw, _ = json.Marshal(o)
+		if excess := len(raw) + len(cipher) - remaining; excess > 0 {
+			o, cipher = build(n - excess)
+		}
+		if err := j.JournalCapturedObservation(ctx, o, cipher); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extra, cipher := build(4096)
+	if err := j.JournalCapturedObservation(ctx, extra, cipher); !errors.Is(err, ErrFull) {
+		t.Fatal("ordinary capture consumed disposition reserve", err)
+	}
+	page, err := j.PendingObservationsForLease(ctx, a, 32)
+	if err != nil || len(page) < 2 {
+		t.Fatal(err)
+	}
+	for _, o := range page {
+		p, err := NativeBackendObservation(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := transport.NativeObservationReceiptPayload{ObservationID: o.ID, OriginID: p.OriginID, Digest: p.Digest, Disposition: "expired"}
+		if err = j.RecordNativeSourceDisposition(ctx, a, o.ID, o.SourceDigest, r); err != nil {
+			t.Fatal("full cipher quota prevented terminal durable disposition", err)
+		}
+	}
+	var size int
+	j.db.QueryRow(`SELECT (SELECT COALESCE(SUM(size),0) FROM worker_observations)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions)`).Scan(&size)
+	if size > maxPendingObservationBytes {
+		t.Fatal("unbounded terminal metadata")
+	}
+	if pending, err := j.PendingObservationsForLease(ctx, a, 32); err != nil || len(pending) != 0 {
+		t.Fatal("full retained evidence still blocked send cursor", err)
 	}
 }

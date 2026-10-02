@@ -158,15 +158,19 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures)+(SELECT COALESCE(SUM(size),0) FROM worker_source_dispositions) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
+	var unmarked int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
+		return err
+	}
 	reserved := j.sourceStopReservationsLocked()
 	terminal := producer != nil && !producer.stoppedCommitted && observation.Event.Type == session.EventSessionStopped
 	if terminal {
 		reserved--
-		if len(raw)+len(encrypted) > sourceStopReserveBytes {
+		if len(raw)+len(encrypted)+sourceDispositionReserveBytes > sourceStopReserveBytes {
 			return ErrFull
 		}
 	}
-	if count+reserved >= maxPendingObservations || total+len(raw)+len(encrypted)+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
+	if count+reserved >= maxPendingObservations || total+len(raw)+len(encrypted)+(unmarked+1)*sourceDispositionReserveBytes+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {

@@ -106,6 +106,12 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			if o.PlanContent != nil {
 				refs = append(refs, o.PlanContent)
 			}
+			// An authenticated expired receipt does not attach content. Ask
+			// for it directly so backend staging quotas cannot prevent retaining
+			// the terminal disposition. The server alone decides expiration.
+			if time.Now().After(p.ExpiresAt) {
+				refs = nil
+			}
 			for _, ref := range refs {
 				ready, err := c.stageWorkerContent(ctx, o, *ref, call, &budget)
 				if err != nil {

@@ -166,13 +166,17 @@ func TestCancelledProducerEOFUsesReservedBytesWithinExistingQuota(t *testing.T) 
 		if err = j.db.QueryRow(`SELECT COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&total); err != nil {
 			t.Fatal(err)
 		}
-		remaining := maxPendingObservationBytes - sourceStopReserveBytes - total
+		var unmarked int
+		if err = j.db.QueryRow(`SELECT COUNT(*) FROM worker_observations o WHERE NOT EXISTS(SELECT 1 FROM worker_source_dispositions d WHERE d.observation_id=o.id)`).Scan(&unmarked); err != nil {
+			t.Fatal(err)
+		}
+		remaining := maxPendingObservationBytes - sourceStopReserveBytes - total - (unmarked+1)*sourceDispositionReserveBytes
 		if remaining < 4096 {
 			break
 		}
 		small, encoded := build(1)
 		raw, _ := json.Marshal(small)
-		size := min(maxPrivateSourceBytes-2048, remaining-len(raw)-len(encoded)+1)
+		size := min(maxPrivateSourceBytes-2048, remaining-len(raw)-len(encoded)-64)
 		o, cipher := build(size)
 		raw, _ = json.Marshal(o)
 		if excess := len(raw) + len(cipher) - remaining; excess > 0 {
