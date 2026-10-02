@@ -36,6 +36,11 @@ func (c *NativeObservationConnection) HandleEnvelope(env transport.Envelope) (ha
 		if err = env.DecodePayload(&p); err == nil {
 			err = c.Admit(p)
 		}
+	case transport.MsgNativeTaskInputRead:
+		var p transport.NativeTaskInputReadPayload
+		if err = env.DecodePayload(&p); err == nil {
+			c.NativeTaskInputDisposition(p)
+		}
 	case transport.MsgNativeOriginRegistered:
 		var p transport.NativeOriginRegisteredPayload
 		if err = env.DecodePayload(&p); err == nil {

@@ -395,6 +395,10 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 // executeBridgeTool applies the same identity surface, reference mapping and
 // encryption policy to both daemon-local and independently owned bridges.
 func (d *Daemon) executeBridgeTool(row *InstanceRow, tool string, args json.RawMessage, relay func(string, json.RawMessage) (json.RawMessage, string)) (json.RawMessage, string) {
+	return d.executeBridgeToolWithRead(row, tool, args, relay, nil)
+}
+
+func (d *Daemon) executeBridgeToolWithRead(row *InstanceRow, tool string, args json.RawMessage, relay func(string, json.RawMessage) (json.RawMessage, string), read func(json.RawMessage, json.RawMessage) (json.RawMessage, string)) (json.RawMessage, string) {
 	prefix := "network_"
 	if row.Kind == "representative" {
 		prefix = "control_"
@@ -417,6 +421,9 @@ func (d *Daemon) executeBridgeTool(row *InstanceRow, tool string, args json.RawM
 		return nil, errMsg
 	}
 	result, errMsg := relay(tool, encrypted)
+	if errMsg == "" && read != nil {
+		result, errMsg = read(resolved, result)
+	}
 	if errMsg == "" {
 		result, errMsg = d.decryptMessageToolResult(row, tool, result)
 	}

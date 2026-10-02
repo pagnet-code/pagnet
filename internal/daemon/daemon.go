@@ -970,6 +970,7 @@ func (d *Daemon) wsURL() string {
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	if d.nativeRegistry != nil {
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
+		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

@@ -27,6 +27,7 @@ type NativeObservationConnection struct {
 	pendingContent      map[string]chan transport.NativeContentStagedPayload
 	pendingObservations map[string]chan transport.NativeObservationReceiptPayload
 	pendingOwnership    map[string]chan transport.NativeOwnershipRegisteredPayload
+	pendingTaskInputs   map[string]chan transport.NativeTaskInputReadPayload
 	closed              chan struct{}
 	send                func(context.Context, string, any) error
 }
