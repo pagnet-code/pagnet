@@ -90,20 +90,45 @@ func runMain(args []string, build string) error {
 		return err
 	}
 	defer owner.Close()
-	ctx, cancelServers := context.WithCancel(ctx)
+	workerCtx := ctx
+	ctx, cancelServers := context.WithCancel(workerCtx)
 	defer cancelServers()
+	bridgeReady := make(chan struct{})
 	bridgeDone := make(chan error, 1)
-	go func() { bridgeDone <- owner.ServeBridge(ctx) }()
-	controlErr := ServeOwner(ctx, owner, key, build)
-	cancelServers()
-	bridgeErr := <-bridgeDone
-	if controlErr != nil && !errors.Is(controlErr, context.Canceled) {
-		return controlErr
+	go func() { bridgeDone <- owner.serveBridge(ctx, bridgeReady) }()
+	// Whole ownership is not advertised while its required native bridge is
+	// absent. A permanent listener failure cannot leave a usable control socket.
+	select {
+	case err := <-bridgeDone:
+		if workerCtx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("native bridge startup failed: %w", err)
+	case <-workerCtx.Done():
+		cancelServers()
+		<-bridgeDone
+		return nil
+	case <-bridgeReady:
 	}
-	if bridgeErr != nil && !errors.Is(bridgeErr, context.Canceled) {
-		return bridgeErr
+	controlDone := make(chan error, 1)
+	go func() { controlDone <- ServeOwner(ctx, owner, key, build) }()
+	var cause error
+	select {
+	case cause = <-bridgeDone:
+		cancelServers()
+		<-controlDone
+	case cause = <-controlDone:
+		cancelServers()
+		<-bridgeDone
 	}
-	return nil
+	if workerCtx.Err() != nil {
+		return nil
+	}
+	if cause == nil {
+		return errors.New("required worker listener terminated unexpectedly")
+	}
+	return fmt.Errorf("required worker listener failed: %w", cause)
+
 }
 func decodeClosed(raw []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))

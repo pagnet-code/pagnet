@@ -55,9 +55,11 @@ The actual native/two-controller subprocess fixture verifies uninterrupted PID,
 PTY, session, timer and approvals across replacement and a controller-free gap.
 
 The production daemon proxy and server admission/receipt integration are still
-under construction. Darwin owner-local permissions do not isolate an untrusted
-native process with the same UID; platform enablement requires an actual secure
-boundary, not the presence of a 0600 control key. Production update admission
+under construction. Darwin native runtimes intentionally share the owner's OS trust boundary. A
+0600 control key restricts other users, but does not isolate an untrusted native
+process with the same UID. Trusted local runtimes remain useful on Darwin; a
+developer who needs mutual isolation can select an external execution boundary.
+Fresh authenticated network/context grants and controller fences remain required. Production update admission
 remains conservative until the complete pagnet serve replacement path is proven.
 
 Only actual worker/native and two-controller subprocess acceptance, followed by

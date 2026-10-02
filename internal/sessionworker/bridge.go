@@ -204,7 +204,7 @@ func (b *relayBroker) close() {
 // ServeBridge owns a stable native MCP socket and actual per-activation nonce.
 // Native clients stay connected across controller changes and daemon socket
 // replacement, while each subsequent call requires a current fenced admission.
-func (o *SessionOwner) ServeBridge(ctx context.Context) error {
+func (o *SessionOwner) serveBridge(ctx context.Context, ready chan<- struct{}) error {
 	path := filepath.Join(o.journal.dir, "native.sock")
 	if len(path) > 100 {
 		return errors.New("native bridge path exceeds supported platform limit")
@@ -223,6 +223,7 @@ func (o *SessionOwner) ServeBridge(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-ctx.Done(); _ = listener.Close() }()
+	close(ready) // Required listener is bound, private and ready before control advertisement.
 	slots := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	defer func() { cancel(); wg.Wait() }()
