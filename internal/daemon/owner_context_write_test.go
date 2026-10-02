@@ -5,6 +5,8 @@ package daemon
 import (
 	"bytes"
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +15,50 @@ import (
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
 )
+
+func TestOwnerTemplateContextPreparationWithoutAgent(t *testing.T) {
+	d := newCryptoDaemon(t)
+	hostID := domain.NewID().String()
+	if err := d.state.KVSet("host_id", hostID); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := d.cryptoManager().hostIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := e2ee.ProtectedContext{Kind: e2ee.OwnerContextKind, ID: domain.NewID().String(), TenantID: domain.NewID().String(), OwnerUserID: domain.NewID().String(), HostID: hostID}
+	request := transport.PrepareProtectedContextPayload{CommandID: domain.NewID().String(), Context: c, HostX25519: base64.StdEncoding.EncodeToString(identity.X25519Pub), HostEd25519: base64.StdEncoding.EncodeToString(identity.Ed25519Pub)}
+	result, err := d.doPrepareProtectedContext(request)
+	if err != nil {
+		t.Fatal("template required a representative", err)
+	}
+	ready := result.(transport.ProtectedContextReadyPayload)
+	if ready.InstanceID != "" || ready.Context != c || ready.EpochID == "" {
+		t.Fatal("invented instance or changed scope")
+	}
+	again, err := d.doPrepareProtectedContext(request)
+	if err != nil || again.(transport.ProtectedContextReadyPayload) != ready {
+		t.Fatal("preparation replay changed original context", err)
+	}
+	wrong := request
+	wrong.CommandID = domain.NewID().String()
+	wrong.Context.OwnerUserID = domain.NewID().String()
+	if _, err := d.doPrepareProtectedContext(wrong); err == nil {
+		t.Fatal("template context rebound to another owner")
+	}
+	wrong = request
+	wrong.Context.HostID = domain.NewID().String()
+	if _, err := d.doPrepareProtectedContext(wrong); err == nil {
+		t.Fatal("foreign host prepared template keys")
+	}
+	if err = os.Remove(filepath.Join(d.StateDir, "e2ee", "contexts", c.ID, "keyring.json")); err != nil {
+		t.Fatal(err)
+	}
+	request.CommandID = domain.NewID().String()
+	if _, err := d.doPrepareProtectedContext(request); err == nil {
+		t.Fatal("lost template key silently replaced")
+	}
+}
 
 func TestOwnerTemplateBrowserWriteReadAndCommittedEpoch(t *testing.T) {
 	d, prepared, ready := preparedOwnerDaemon(t)

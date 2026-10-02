@@ -80,18 +80,22 @@ func (d *Daemon) contextForInstance(instance string) (e2ee.ProtectedContext, boo
 	return c, true
 }
 func (d *Daemon) doPrepareProtectedContext(p transport.PrepareProtectedContextPayload) (any, error) {
-	if p.Context.Validate() != nil || !validOwnerProtocolID(p.CommandID) || !validOwnerProtocolID(p.InstanceID) || p.Context.HostID != d.stateID() {
+	if p.Context.Validate() != nil || !validOwnerProtocolID(p.CommandID) || (p.InstanceID != "" && !validOwnerProtocolID(p.InstanceID)) || p.Context.HostID != d.stateID() {
 		return nil, errors.New("protected context binding invalid")
 	}
-	row, ok, err := d.state.GetInstance(p.InstanceID)
-	if err == nil && !ok && d.nativeRegistry != nil {
-		return nil, ErrDeferred
-	}
-	if err != nil || !ok || row.NetworkID != "" {
-		return nil, errors.New("protected context instance unavailable")
-	}
-	if existing, ok := d.contextForInstance(p.InstanceID); ok && existing != p.Context {
-		return nil, errors.New("protected context instance binding changed")
+	if p.InstanceID != "" {
+		row, ok, err := d.state.GetInstance(p.InstanceID)
+		if err == nil && !ok && d.nativeRegistry != nil {
+			return nil, ErrDeferred
+		}
+		if err != nil || !ok || row.NetworkID != "" {
+			return nil, errors.New("protected context instance unavailable")
+		}
+		if existing, ok := d.contextForInstance(p.InstanceID); ok && existing != p.Context {
+			return nil, errors.New("protected context instance binding changed")
+		}
+	} else if p.Rotate {
+		return nil, errors.New("template context rotation requires explicit authority")
 	}
 	identity, err := d.cryptoManager().hostIdentity()
 	if err != nil {
@@ -111,12 +115,23 @@ func (d *Daemon) doPrepareProtectedContext(p transport.PrepareProtectedContextPa
 	o := d.ownerCrypto()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	bindingKey := ownerContextBindingKey(p.InstanceID)
+	if p.InstanceID == "" {
+		bindingKey = "protected-context-authority:" + p.Context.ID
+	}
+	bindingRaw, authorityBound := d.state.KVGet(bindingKey)
+	if authorityBound {
+		var bound e2ee.ProtectedContext
+		if json.Unmarshal([]byte(bindingRaw), &bound) != nil || bound != p.Context {
+			return nil, errors.New("protected context authority binding changed")
+		}
+	}
 	ring, err := crypto.LoadContextKeyring(d.StateDir, p.Context)
 	if os.IsNotExist(err) {
 		if p.ExpectedEpochID != "" {
 			return nil, errors.New("protected context local key lost")
 		}
-		if _, bound := d.contextForInstance(p.InstanceID); bound {
+		if authorityBound {
 			return nil, errors.New("protected context local key lost")
 		}
 		ring = &crypto.ContextKeyring{Context: p.Context}
@@ -147,7 +162,7 @@ func (d *Daemon) doPrepareProtectedContext(p transport.PrepareProtectedContextPa
 		return nil, errors.New("protected context local key persistence failed")
 	}
 	raw, _ := json.Marshal(p.Context)
-	if err = d.state.KVSet(ownerContextBindingKey(p.InstanceID), string(raw)); err != nil {
+	if err = d.state.KVSet(bindingKey, string(raw)); err != nil {
 		return nil, errors.New("protected context binding persistence failed")
 	}
 	// Rotation invalidates browser sessions and approvals bound to the old epoch.
