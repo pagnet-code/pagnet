@@ -54,6 +54,7 @@ func (j *Journal) initializeDispatches() error {
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS worker_dispatch_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),ownership TEXT NOT NULL,last_sequence INTEGER NOT NULL,retired INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS worker_dispatches(dispatch_sequence INTEGER PRIMARY KEY,operation_sequence INTEGER NOT NULL UNIQUE,command_id TEXT NOT NULL UNIQUE,proof BLOB NOT NULL,state TEXT NOT NULL DEFAULT 'admitted')`,
+		`CREATE TABLE IF NOT EXISTS worker_terminal_view_commits(operation_sequence INTEGER PRIMARY KEY,committed INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TRIGGER IF NOT EXISTS worker_dispatch_settle AFTER UPDATE OF state ON worker_intent BEGIN UPDATE worker_dispatches SET state=NEW.state WHERE operation_sequence=NEW.sequence; END`,
 	} {
 		if _, err := j.db.Exec(q); err != nil {
@@ -239,11 +240,14 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 		return ErrConflict
 	}
 	var unsafe int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed') OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatches d WHERE dispatch_sequence<=? AND (state NOT IN ('completed','failed') OR operation_sequence>? OR EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=d.operation_sequence AND v.committed=0) OR EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=d.operation_sequence) OR EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=d.operation_sequence))`, floor, operationFloor).Scan(&unsafe); err != nil {
 		return err
 	}
 	if unsafe != 0 {
 		return ErrConflict
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_terminal_view_commits WHERE operation_sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
 		return err
@@ -284,7 +288,7 @@ func (j *Journal) DispatchRecords(ctx context.Context, lease int64) ([]NativeDis
 	if _, _, err = checkLease(ctx, tx, lease); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM (SELECT proof,operation_sequence,state FROM worker_dispatches UNION ALL SELECT json_extract(payload,'$.proposal.proof'),0,'cancelled' FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence<=(SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1)  ) ORDER BY json_extract(proof,'$.dispatchSequence') LIMIT ?`, maxCommands)
+	rows, err := tx.QueryContext(ctx, `SELECT proof,operation_sequence,state FROM (SELECT proof,operation_sequence,CASE WHEN EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=worker_dispatches.operation_sequence AND v.committed=0) THEN 'view_pending' ELSE state END AS state FROM worker_dispatches UNION ALL SELECT json_extract(payload,'$.proposal.proof'),0,'cancelled' FROM worker_dispatch_cancellations WHERE state='finalized' AND dispatch_sequence<=(SELECT last_sequence FROM worker_dispatch_meta WHERE singleton=1)  ) ORDER BY json_extract(proof,'$.dispatchSequence') LIMIT ?`, maxCommands)
 	if err != nil {
 		return nil, err
 	}

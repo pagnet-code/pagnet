@@ -454,6 +454,8 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		} else if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
 			err = o.journal.BindDispatchOwnership(ctx, lease, *req.Ownership, string(o.spec.Runtime), NativeProfileFingerprint(o.spec))
 		}
+	case "terminal_view_commit":
+		err = o.journal.CommitTerminalView(ctx, lease, req.NativeDispatch)
 	case "dispatches":
 		response.Dispatches, err = o.journal.DispatchRecords(ctx, lease)
 	case "dispatch_retire":

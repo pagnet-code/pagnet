@@ -358,6 +358,11 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_intent(sequence,command_id,digest,kind,state) VALUES(?,?,?,?,'admitted')`, sequence, commandID, digest, kind); err != nil {
 		return out, false, fmt.Errorf("intent identity conflict: %w", err)
 	}
+	if dispatch != nil && kind == "attach" {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO worker_terminal_view_commits(operation_sequence) VALUES(?)`, sequence); err != nil {
+			return out, false, err
+		}
+	}
 	if out.SourceAdmission != nil {
 		source, marshalErr := json.Marshal(out.SourceAdmission)
 		if marshalErr != nil {
@@ -439,6 +444,13 @@ func (j *Journal) Acknowledge(ctx context.Context, lease, sequence int64) error 
 	}
 	if sequence <= floor {
 		return tx.Commit()
+	}
+	var pendingView bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_terminal_view_commits WHERE operation_sequence=? AND committed=0)`, sequence).Scan(&pendingView); err != nil {
+		return err
+	}
+	if pendingView {
+		return ErrConflict
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE worker_intent SET acknowledged=1 WHERE sequence=? AND state!='admitted'`, sequence)
 	if err != nil {

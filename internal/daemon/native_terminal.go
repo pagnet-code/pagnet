@@ -252,7 +252,23 @@ func (d *Daemon) nativeTerminalWindowFor(conn *websocket.Conn, instance, session
 	}
 	return capture, window, nil
 }
-func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.TerminalAttachPayload) error {
+func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.TerminalAttachPayload) (resultErr error) {
+	defer func() {
+		if p.NativeDispatch == nil || errors.Is(resultErr, ErrDeferred) || errors.Is(resultErr, context.Canceled) {
+			return
+		}
+		proxy, err := d.nativeWorkerFor(conn, p.InstanceID)
+		if err != nil {
+			resultErr = errors.Join(ErrDeferred, resultErr, err)
+			return
+		}
+		ctx, cancel := context.WithTimeout(d.turnCtx, 2*time.Second)
+		defer cancel()
+		if _, err = proxy.call(ctx, sessionworker.Request{Type: "terminal_view_commit", NativeDispatch: p.NativeDispatch}); err != nil {
+			resultErr = errors.Join(ErrDeferred, resultErr, err)
+		}
+	}()
+
 	detached, err := d.state.TerminalDetached(p.InstanceID, p.SessionID)
 	if err != nil {
 		return err
