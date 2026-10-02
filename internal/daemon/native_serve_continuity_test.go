@@ -14,7 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -147,6 +150,7 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		return m
 	}
 	manifest() // original valid local identity exists before real inventory publication
+	warnings := &nativeDeletionWarningMetadata{records: make(map[string]bool)}
 	start := func(binary string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, "serve", "--state-dir", root, "--debug", "--no-auto-update")
 		command.Dir = workspace
@@ -158,7 +162,8 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 			runtimeEnv += ",PAGNET_FAKE_FULL_OUTPUT=1,PAGNET_FAKE_OUTPUT_CHUNK_BYTES=65536,PAGNET_FAKE_OUTPUT_REPEAT=256"
 		}
 		command.Env = append(os.Environ(), "PATH="+bin+":/usr/local/bin:/usr/bin:/bin", "HOME="+root, "PAGNET_RUNTIME_ENV="+runtimeEnv)
-		// Credentials, encrypted keys and PTY bytes never enter test logs.
+		// Only fixed cleanup stages/classes are retained; all other stderr is discarded.
+		command.Stderr = warnings
 		if err := command.Start(); err != nil {
 			t.Fatal("actual serve failed to start", err)
 		}
@@ -660,6 +665,9 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	for _, warning := range warnings.snapshot() {
+		t.Log("bounded owned deletion warning", warning)
+	}
 	var final struct {
 		DeletionState       string                          `json:"deletionState"`
 		OwnershipState      string                          `json:"ownershipState"`
@@ -669,9 +677,9 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 	helper.call(t, map[string]any{"action": "delete_status"}, &final)
 	var closure struct {
 		Items []struct {
-			OriginID, Generation, SessionID, OwnershipID, OwnershipGeneration, StopOrdinal, StopCommandID, StopAdmissionID, Disposition, ObservedAt, ExpiresAt string
-			SourceSequence                                                                                                                                     int64
-			ProofPresent, ReceiptExact, OriginInactive                                                                                                         bool
+			OriginID, Generation, SessionID, OwnershipID, OwnershipGeneration, StopOrdinal, StopCommandID, StopAdmissionID, Disposition, ObservedAt, ExpiresAt, SourceBootID, SourceRunnerID, SourceRunnerEpoch string
+			SourceSequence                                                                                                                                                                                      int64
+			ProofPresent, ReceiptExact, OriginInactive                                                                                                                                                          bool
 		} `json:"items"`
 	}
 	helper.call(t, map[string]any{"action": "deletion_diagnostics"}, &closure)
@@ -710,7 +718,7 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 			{"intent", `SELECT sequence,kind,state,acknowledged FROM worker_intent ORDER BY sequence LIMIT 16`},
 			{"turn", `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,started,completed FROM worker_turn_sources ORDER BY sequence LIMIT 16`},
 			{"task source match", `SELECT t.sequence,json_extract(d.proof,'$.taskSource')=t.source_task FROM worker_turn_sources t JOIN worker_dispatches d ON d.operation_sequence=t.sequence LIMIT 16`},
-			{"dispatch", `SELECT dispatch_sequence,operation_sequence,state,json_extract(proof,'$.sourceCommandId'),json_extract(proof,'$.sourceAdmissionId'),json_extract(proof,'$.ownershipId'),json_extract(proof,'$.ownershipGeneration') FROM worker_dispatches ORDER BY dispatch_sequence LIMIT 16`},
+			{"dispatch", `SELECT dispatch_sequence,operation_sequence,state,json_extract(proof,'$.sourceCommandId'),json_extract(proof,'$.sourceAdmissionId'),json_extract(proof,'$.ownershipId'),json_extract(proof,'$.ownershipGeneration'),json_extract(proof,'$.sourceBootId'),json_extract(proof,'$.sourceRunnerId'),json_extract(proof,'$.sourceRunnerEpoch') FROM worker_dispatches ORDER BY dispatch_sequence LIMIT 16`},
 			{"stopped receipt", `SELECT observation_id,native_generation,json_extract(payload,'$.observation.nativeSessionId'),json_extract(payload,'$.observation.sourceSequence'),json_extract(payload,'$.receipt.disposition'),json_extract(payload,'$.receipt.originId'),json_extract(payload,'$.observation.observedAt') FROM worker_stopped_receipts LIMIT 16`},
 			{"registration", `SELECT origin_id,native_generation,quiesced FROM worker_source_registration LIMIT 16`},
 			{"observation flags", `SELECT id,COALESCE(json_extract(payload,'$.sourceSequence'),0),COALESCE(json_extract(payload,'$.event.Type'),json_extract(payload,'$.event.type'),'unknown'),json_type(payload,'$.inspection') IS NOT NULL,json_type(payload,'$.outputContent') IS NOT NULL,json_type(payload,'$.planContent') IS NOT NULL,json_type(payload,'$.originalNativePayloadContent') IS NOT NULL,EXISTS(SELECT 1 FROM worker_source_captures c WHERE c.id=o.id) FROM worker_observations o LIMIT 16`},
@@ -744,4 +752,83 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMo
 		}
 	}
 	t.Fatal("owned deletion did not finish physical retirement and confirmed private collection")
+}
+
+// Retain only known symbolic cleanup stages and public error classes. The raw
+// daemon stream is never written to disk or copied into a test failure.
+type nativeDeletionWarningMetadata struct {
+	mu      sync.Mutex
+	line    []byte
+	discard bool
+	records map[string]bool
+}
+
+var nativeDeletionStagePattern = regexp.MustCompile(`(?:stage=["']?|native_delete_cleanup/|owner_stop/)([a-z_]+)`)
+
+func (w *nativeDeletionWarningMetadata) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	known := map[string]bool{}
+	for _, stage := range []string{"registry", "source_drain", "deletion_proof", "dispatch_settlement", "native_snapshot", "backend_retirement", "original_candidates", "original_stop_dispatch", "original_stopped_receipt", "original_reader_quiescence", "accepted_turn_binding", "settlement_write", "proof_header", "reader_retry", "owner_stop_settlement", "remaining_effects", "terminal_quarantines", "private_inspections", "source_reservations", "commit"} {
+		known[stage] = true
+	}
+	for _, b := range data {
+		if b != '\n' {
+			if !w.discard {
+				if len(w.line) < 4096 {
+					w.line = append(w.line, b)
+				} else {
+					clear(w.line)
+					w.line = w.line[:0]
+					w.discard = true
+				}
+			}
+			continue
+		}
+		if !w.discard && bytes.Contains(w.line, []byte(`msg="owned deletion remains pending"`)) {
+			stages := []string{}
+			for _, match := range nativeDeletionStagePattern.FindAllSubmatch(w.line, -1) {
+				if known[string(match[1])] {
+					stages = append(stages, string(match[1]))
+				}
+			}
+			class := "unclassified"
+			for _, candidate := range []string{"conflict", "deadline exceeded", "deferred", "lease", "locked"} {
+				if bytes.Contains(w.line, []byte(candidate)) {
+					class = candidate
+					break
+				}
+			}
+			if len(stages) > 0 && len(w.records) < 64 {
+				w.records[strings.Join(stages, "/")+" ["+class+"]"] = true
+			}
+		}
+		clear(w.line)
+		w.line = w.line[:0]
+		w.discard = false
+	}
+	return len(data), nil
+}
+func (w *nativeDeletionWarningMetadata) snapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := []string{}
+	for record := range w.records {
+		out = append(out, record)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestNativeDeletionWarningMetadataDiscardsProcessSecrets(t *testing.T) {
+	w := &nativeDeletionWarningMetadata{records: make(map[string]bool)}
+	for _, part := range []string{"unrelated synthetic private body/key/ciphertext\n", strings.Repeat("x", 8192) + "\n", `level=WARN msg="owned deletion remains pending" stage=deletion_`, "proof reason=\"native_delete_cleanup/private_inspections: conflict\"\n"} {
+		if n, err := w.Write([]byte(part)); err != nil || n != len(part) {
+			t.Fatal("bounded log consumer lost data")
+		}
+	}
+	got := w.snapshot()
+	if len(got) != 1 || got[0] != "deletion_proof/private_inspections [conflict]" {
+		t.Fatal("unsafe or missing deletion warning classification", got)
+	}
 }
