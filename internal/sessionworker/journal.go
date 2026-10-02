@@ -27,11 +27,12 @@ const maxCommands = 128
 const maxOutcomeBytes = 64 << 10
 
 var (
-	ErrFenced     = errors.New("controller lease is no longer current")
-	ErrConflict   = errors.New("intent sequence or digest conflicts with durable history")
-	ErrRetired    = errors.New("intent is older than retained durable history")
-	ErrNativeBusy = errors.New("original native turn is still in flight")
-	ErrFull       = errors.New("unacknowledged worker outcomes reached the bounded limit")
+	ErrWorkerOwned = errors.New("worker state already has a live owner")
+	ErrFenced      = errors.New("controller lease is no longer current")
+	ErrConflict    = errors.New("intent sequence or digest conflicts with durable history")
+	ErrRetired     = errors.New("intent is older than retained durable history")
+	ErrNativeBusy  = errors.New("original native turn is still in flight")
+	ErrFull        = errors.New("unacknowledged worker outcomes reached the bounded limit")
 )
 
 // Scope is immutable for the lifetime of a worker. Generation identifies this

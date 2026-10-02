@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -22,7 +23,19 @@ func CollectRetiredWorker(ctx context.Context, dir string, scope Scope, proof tr
 	if _, err := os.Lstat(filepath.Join(dir, "intents.sqlite")); err != nil {
 		return err
 	}
+	// Retirement acknowledges its durable receipt before graceful worker exit.
+	// Wait only for that exact lifetime lock; no PID inference or force kill.
 	j, err := OpenJournal(dir, scope)
+	for errors.Is(err, ErrWorkerOwned) {
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		j, err = OpenJournal(dir, scope)
+	}
 	if err != nil {
 		return err
 	}

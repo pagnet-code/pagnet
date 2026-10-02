@@ -46,7 +46,10 @@ func acquireOwnership(dir string) (io.Closer, error) {
 	}
 	if err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, errors.New("worker state already has a live owner")
+		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+			return nil, ErrWorkerOwned
+		}
+		return nil, err
 	}
 	return f, nil
 }

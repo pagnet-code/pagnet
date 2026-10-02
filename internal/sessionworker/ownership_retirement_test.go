@@ -140,8 +140,10 @@ func TestCollectionRequiresExclusiveCommittedOriginalReceipt(t *testing.T) {
 	retired.State = "retired"
 	authorized := false
 	approve := func() error { authorized = true; return nil }
-	if err := CollectRetiredWorker(t.Context(), dir, j.scope, retired, approve); err == nil || authorized {
-		t.Fatal("live owner collected")
+	liveContext, cancelLive := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelLive()
+	if err := CollectRetiredWorker(liveContext, dir, j.scope, retired, approve); !errors.Is(err, context.DeadlineExceeded) || authorized {
+		t.Fatal("live owner collected or collection did not respect cancellation", err)
 	}
 	scope := j.scope
 	if err := j.Close(); err != nil {
@@ -169,5 +171,40 @@ func TestCollectionRequiresExclusiveCommittedOriginalReceipt(t *testing.T) {
 	}
 	if err = CompleteRetiredWorkerCollection(dir); err != nil {
 		t.Fatal("post-unlink replay failed", err)
+	}
+}
+
+func TestCollectionWaitsForOriginalRetiredOwnerLock(t *testing.T) {
+	j, dir := testJournal(t)
+	scope := j.scope
+	retired := dispatchOwnership(t, j, lease(t, j))
+	retired.State = "retired"
+	if err := j.CommitOwnershipRetirement(t.Context(), lease(t, j), retired); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	authorized := make(chan struct{}, 1)
+	go func() {
+		done <- CollectRetiredWorker(ctx, dir, scope, retired, func() error { authorized <- struct{}{}; return nil })
+	}()
+	select {
+	case err := <-done:
+		t.Fatal("collection did not wait for original live owner", err)
+	case <-authorized:
+		t.Fatal("collection authorized while original lifetime lock was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal("retired lock release did not resume collection", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("collection did not resume on original owner exit")
 	}
 }
