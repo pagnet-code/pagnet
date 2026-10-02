@@ -70,6 +70,7 @@ type NativeSnapshot struct {
 type SessionOwner struct {
 	cancel                   context.CancelFunc
 	wg                       sync.WaitGroup
+	nativeObserverWG         sync.WaitGroup
 	closing                  bool
 	ctx                      context.Context
 	journal                  *Journal
@@ -473,7 +474,14 @@ func (o *SessionOwner) Close() {
 	o.relay.close()
 	o.supervisor.StopAll(5 * time.Second)
 	o.wg.Wait()
-	clear(o.captureKey)
+	quiesced := make(chan struct{})
+	go func() { o.nativeObserverWG.Wait(); close(quiesced) }()
+	select {
+	case <-quiesced:
+		clear(o.captureKey)
+	case <-time.After(5 * time.Second):
+		o.failPersistence(errors.New("native source observer shutdown did not quiesce"))
+	}
 }
 
 // ownedDriver intercepts every actual activation, including the Manager's

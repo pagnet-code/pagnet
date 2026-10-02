@@ -129,6 +129,9 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		if previous != digest {
 			return ErrConflict
 		}
+		if producer != nil && observation.Event.Type == session.EventSessionStopped {
+			producer.stoppedCommitted = true
+		}
 		return nil
 	}
 	// QueryRow's missing-row case is the sole authority to create a new entry.
@@ -149,7 +152,15 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
-	if count >= maxPendingObservations || total+len(raw)+len(encrypted) > maxPendingObservationBytes {
+	reserved := j.sourceStopReservationsLocked()
+	terminal := producer != nil && !producer.stoppedCommitted && observation.Event.Type == session.EventSessionStopped
+	if terminal {
+		reserved--
+		if len(raw)+len(encrypted) > sourceStopReserveBytes {
+			return ErrFull
+		}
+	}
+	if count+reserved >= maxPendingObservations || total+len(raw)+len(encrypted)+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {
@@ -171,7 +182,11 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 			return err
 		}
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	if err == nil && terminal {
+		producer.stoppedCommitted = true
+	}
+	return err
 }
 
 func (j *Journal) PendingObservations(ctx context.Context, limit int) ([]NativeObservation, error) {

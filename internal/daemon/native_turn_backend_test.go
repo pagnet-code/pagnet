@@ -400,6 +400,26 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	page, err = controllerB.Call(t.Context(), sessionworker.Request{Type: "observations", Limit: 32})
+	if err != nil || page.Error != "" || len(page.Observations) != 1 || page.Observations[0].Event.Type != session.EventSessionStopped {
+		t.Fatal("actual supervised EOF did not retain an original source", err)
+	}
+	stopped := page.Observations[0]
+	if stopped.NativeSessionID != ended.NativeSessionID || stopped.NativeGeneration != ended.NativeGeneration || stopped.SourceSequence <= ended.SourceSequence {
+		t.Fatal("actual EOF changed original generation/session/sequence")
+	}
+	if err = b.connection.DrainNativeWorkerSources(t.Context(), controllerB.Call); err != nil {
+		t.Fatal("actual backend did not commit supervised EOF source", err)
+	}
+	stoppedWire, err := NativeWorkerWireObservation(stopped)
+	if err != nil || stoppedWire.MessageType != transport.MsgAgentStopped {
+		t.Fatal("original EOF wire adapter changed message type", err)
+	}
+	var stoppedStats nativeTurnBackendStats
+	helper.call(t, map[string]any{"action": "stats", "originId": origin.ID, "observationId": stopped.ID, "logicalTurnId": ended.Event.TurnID, "forbiddenPlaintext": secret}, &stoppedStats)
+	if stoppedStats.ReceiptCount != 1 || stoppedStats.Disposition != "committed" || stoppedStats.Digest != stoppedWire.Digest || stoppedStats.NativeGeneration != stopped.NativeGeneration || stoppedStats.LifecycleSequence != stopped.SourceSequence || stoppedStats.SourceRunnerID != a.session.RunnerID || !stoppedStats.PrivacyClean {
+		t.Fatal("actual EOF receipt lost original source authority")
+	}
 	if count("worker_source_stream") != 1 || count("worker_turn_sources") != 1 {
 		t.Fatal("reader exit ignored original unACKed source outcomes")
 	}

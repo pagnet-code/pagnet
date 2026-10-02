@@ -44,3 +44,37 @@ Fake, Qwen and Codex endpoints now receive a paired `NativeEventObserverRegistra
 The journal persistently enables registration-bound production appends after the first original producer. Direct fixture imports cannot bypass it, including after reopen. Exclusive worker lifetime ownership on reopen proves prior worker-memory producer capabilities no longer exist; pending original source records and references retain their immutable bytes and ordinal. Reclamation selects at most 32 eligible quiesced generations, and requires no original observations, captures, content, interaction or turn references, no producer retry pins, completed turns with original intent ACK floor, and no unACKed activation outcome. Reclamation removes the stream and registration atomically, retaining a single protocol marker.
 
 Automated race tests exercise the actual local fake native subprocess, authenticated private controllers, isolated backend WebSockets/PostgreSQL, reader EOF, original outcome ACK and zero settled reference cardinality. A 4,112-generation SQLite capacity test checks lifetime cardinality with NORMAL fsync for runtime; reopen and ambiguous-COMMIT tests separately use production FULL fsync. Deterministic concurrent reader/resolver and SQLite blocking tests prove retirement waits; pending evidence, unresolved interactions and incomplete turns prevent reclamation. Deliberate old-callback-capability and ambiguous-COMMIT mutations fail the expected assertions. These are isolated automated proofs. No original-host process or live API verification is performed.
+
+### Genuine process EOF and bounded graceful shutdown
+
+`runtime.session.stopped` is emitted by the Fake/Qwen/Codex endpoint reader
+only after its single-owner supervised process Wait returns. It uses the
+actual activated native session ID and enters the original source journal
+before paired observer retirement. It carries no invented terminal turn or
+private error. Its wire adapter is `host.agent_stopped` in the same contiguous
+original-origin sequence stream.
+
+Each active registered original producer reserves one row and 64 KiB for its
+final stopped observation **within** the existing 4096-row/48-MiB aggregate
+observation and private-capture budget. Ordinary append and new registration
+account for outstanding reservations. A committed stopped source consumes its
+own reservation; paired retirement releases any unused one. There is no extra
+queue or lifetime tombstone. Reopen does not revive old producer capabilities.
+
+Shutdown cancels ordinary execution/backpressure, requests supervised process
+termination, and waits for registered observer retirement before clearing the
+private capture key. Genuine EOF admission has a separate three-second bounded
+context so execution cancellation cannot erase it. Observer quiescence has a
+five-second bound; failure is recorded and the capture key is retained rather
+than cleared while a callback might still use it. Permanent SQLite failure or
+an unkillable native process remains an honest shutdown failure; this protocol
+cannot fabricate an EOF or receipt for those cases.
+
+Automated proofs use an actual isolated fake native process with a full ordinary
+outbox, FULL SQLite durability for the final EOF, shutdown and exact-row reopen.
+A separate encrypted-capture byte-pressure proof stays within the aggregate
+budget and rejects callbacks after retirement. Removing EOF context separation
+fails that proof. The paired PostgreSQL/WebSocket turn fixture now commits and
+ACKs actual stopped evidence before expecting settled source watermark cleanup;
+both completed and failed native turns pass. These remain inactive fixture
+proofs, not live user-provider verification.

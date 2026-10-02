@@ -1,6 +1,7 @@
 package sessionworker
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,12 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		origin = append(json.RawMessage(nil), producer.origin...)
 	}
 	return func(event session.SessionEvent) error {
+		observeCtx := o.ctx
+		if event.Type == session.EventSessionStopped {
+			var cancel context.CancelFunc
+			observeCtx, cancel = context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
+			defer cancel()
+		}
 		observedAt := time.Now().UTC()
 		o.mu.Lock()
 		if o.generation == generation {
@@ -37,16 +44,16 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		}
 		o.mu.Unlock()
 		if duplicate {
-			return o.ctx.Err()
+			return observeCtx.Err()
 		}
 		if !durableNativeEvent(event) {
 			o.recordLiveEvent(event, generation, origin)
-			return o.ctx.Err()
+			return observeCtx.Err()
 		}
 		originalEvent := event
 		var transfers []nativecontent.Transfer
 		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
-		source, unavailable, err := o.journal.NativeEventSource(o.ctx, generation, event)
+		source, unavailable, err := o.journal.NativeEventSource(observeCtx, generation, event)
 		if err != nil {
 			return err
 		}
@@ -136,7 +143,7 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		backoff := 250 * time.Millisecond
 		for {
 			available := o.journal.ObservationCapacity()
-			err = o.journal.journalCapturedObservation(o.ctx, producer, observation, encrypted, transfers...)
+			err = o.journal.journalCapturedObservation(observeCtx, producer, observation, encrypted, transfers...)
 			if err == nil {
 				break
 			}
@@ -160,7 +167,7 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 				}
 			}
 			select {
-			case <-o.ctx.Done():
+			case <-observeCtx.Done():
 				if timer != nil {
 					timer.Stop()
 				}
@@ -170,7 +177,7 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 					o.observationBlocked = nil
 				}
 				o.mu.Unlock()
-				return o.ctx.Err()
+				return observeCtx.Err()
 			case <-available:
 				if timer != nil {
 					timer.Stop()
@@ -199,8 +206,8 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 			o.releaseNativeTaskTurnPin(source)
 		}
 		o.record("session", event, generation, origin)
-		if o.ctx.Err() != nil {
-			return o.ctx.Err()
+		if observeCtx.Err() != nil {
+			return observeCtx.Err()
 		}
 		return nil
 	}

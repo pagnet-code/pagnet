@@ -14,11 +14,12 @@ import (
 // get only its paired Observe/Retire registration; IPC has no append operation.
 // Source descriptors, generations and ciphertext are never rewritten to retire.
 type nativeSourceProducer struct {
-	journal    *Journal
-	originID   string
-	generation string
-	origin     json.RawMessage
-	closed     bool // journal mutex
+	journal          *Journal
+	originID         string
+	generation       string
+	origin           json.RawMessage
+	closed           bool // journal mutex
+	stoppedCommitted bool // own reserved terminal capacity consumed
 }
 
 func (p *nativeSourceProducer) owns(origin json.RawMessage) bool {
@@ -102,6 +103,14 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 		return nil, err
 	}
 	defer tx.Rollback()
+	var pending, total int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&pending, &total); err != nil {
+		return nil, err
+	}
+	reserved := j.sourceStopReservationsLocked() + 1
+	if pending+reserved > maxPendingObservations || total+reserved*sourceStopReserveBytes > maxPendingObservationBytes {
+		return nil, ErrFull
+	}
 	var count int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_source_registration`).Scan(&count); err != nil {
 		return nil, err
@@ -204,21 +213,24 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 
 func (o *SessionOwner) nativeEventRegistration(instanceID string) session.NativeEventObserverRegistration {
 	o.mu.Lock()
-	if o.nativeObserverRegistered {
+	if o.nativeObserverRegistered || o.closing {
 		o.mu.Unlock()
 		return session.NativeEventObserverRegistration{Observe: func(session.SessionEvent) error { return ErrFenced }, Retire: func() {}}
 	}
 	o.nativeObserverRegistered = true
+	o.nativeObserverWG.Add(1)
 	generation := o.generation
 	origin := append(json.RawMessage(nil), o.origin...)
 	o.mu.Unlock()
 	producer, err := o.journal.registerNativeSource(o.ctx, generation, origin)
 	if err != nil {
+		o.nativeObserverWG.Done()
 		o.failPersistence(err)
 		return session.NativeEventObserverRegistration{Observe: func(session.SessionEvent) error { return err }, Retire: func() {}}
 	}
 	observer := o.nativeSourceObserver(instanceID, producer)
 	return nativeObserverRegistration(observer, func() {
+		defer o.nativeObserverWG.Done()
 		o.releaseNativeTaskPins(generation)
 		if err := o.journal.retireNativeSource(context.Background(), producer); err != nil {
 			o.failPersistence(err)
@@ -247,4 +259,18 @@ func nativeObserverRegistration(observer session.NativeEventObserver, retire fun
 			retire()
 		},
 	}
+}
+
+// Active original producers reserve their eventual genuine process EOF within
+// the existing aggregate quota. No extra queue or lifetime tombstone is added.
+const sourceStopReserveBytes = 64 << 10
+
+func (j *Journal) sourceStopReservationsLocked() int {
+	count := 0
+	for p := range j.sourceProducers {
+		if !p.closed && !p.stoppedCommitted {
+			count++
+		}
+	}
+	return count
 }
