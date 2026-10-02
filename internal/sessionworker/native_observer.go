@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -25,15 +26,24 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		if current {
 			o.manager.ObserveNativeActivity(instanceID, event)
 		}
+		if !durableNativeEvent(event) {
+			o.recordLiveEvent(event, generation, origin)
+			return o.ctx.Err()
+		}
+		originalEvent := event
+		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
+		ref, encrypted, err := sealNativeCapture(o.captureKey, o.journal.scope, o.journal.dir, observation, originalEvent)
+		if err != nil {
+			return err
+		}
+		observation.Capture = ref
+		// Original private details are captured above; the journal projection is metadata only.
+		event.Plan = nil
+		event.Output = ""
+		event.Error = ""
 		var inspection *Inspection
 		if event.Interaction != nil {
-			if event.Interaction.Resolved {
-				o.mu.Lock()
-				if current {
-					delete(o.pending, event.Interaction.NativeInteractionID)
-				}
-				o.mu.Unlock()
-			} else {
+			if !event.Interaction.Resolved {
 				o.prepareInspection(event, generation)
 			}
 			o.mu.Lock()
@@ -41,6 +51,9 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 				copy := *pending.inspection
 				copy.Options = append(copy.Options[:0:0], pending.inspection.Options...)
 				inspection = &copy
+			}
+			if event.Interaction.Resolved && current {
+				delete(o.pending, event.Interaction.NativeInteractionID)
 			}
 			o.mu.Unlock()
 			copy := *event.Interaction
@@ -60,7 +73,11 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			return err
 		}
 		event = stableEvent
-		observation := NativeObservation{ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt, Event: event, Inspection: inspection}
+		observation.Event = event
+		observation.Inspection = inspection
+		if originalEvent.Interaction != nil && originalEvent.Interaction.Resolved {
+			observation.Resolution = o.encryptResolution(originalEvent, inspection, observedAt)
+		}
 		if event.Interaction != nil {
 			observation.InteractionID = nativeInteractionIdentity(o.journal.scope, origin, generation, event.SessionID, event.Interaction.NativeInteractionID)
 		}
@@ -73,7 +90,7 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		backoff := 250 * time.Millisecond
 		for {
 			available := o.journal.ObservationCapacity()
-			err = o.journal.JournalObservation(o.ctx, observation)
+			err = o.journal.JournalCapturedObservation(o.ctx, observation, encrypted)
 			if err == nil {
 				break
 			}
@@ -149,4 +166,40 @@ func nativeInteractionIdentity(scope Scope, origin json.RawMessage, generation, 
 	}{"pagnet-native-interaction-identity-v1", scope, descriptor.ID, generation, nativeSession, nativeID}
 	raw, _ := json.Marshal(binding)
 	return uuid.NewHash(sha256.New(), uuid.NameSpaceOID, raw, 8).String()
+}
+
+// Transient output is not a published result or a durable transcript. Only
+// explicit lifecycle/turn/plan/interaction evidence enters the source outbox.
+func durableNativeEvent(event session.SessionEvent) bool {
+	switch event.Type {
+	case session.EventSessionStarted, session.EventSessionResumed, session.EventSessionLost, session.EventSessionIdentityChanged, session.EventBusy, session.EventIdle, session.EventTurnStarted, session.EventPlanUpdated, session.EventTurnCompleted, session.EventTurnFailed, session.EventInteractionStarted, session.EventInteractionResolved:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o *SessionOwner) recordLiveEvent(event session.SessionEvent, generation string, origin json.RawMessage) {
+	const chunkBytes = 64 << 10
+	if len(event.Output) <= chunkBytes {
+		o.record("session", event, generation, origin)
+		return
+	}
+	remaining := event.Output
+	for len(remaining) > 0 {
+		end := len(remaining)
+		if end > chunkBytes {
+			end = chunkBytes
+			for end > 0 && !utf8.RuneStart(remaining[end]) {
+				end--
+			}
+			if end == 0 {
+				end = chunkBytes
+			} // Invalid native UTF-8 must not create an infinite loop.
+		}
+		fragment := event
+		fragment.Output = remaining[:end]
+		o.record("session", fragment, generation, origin)
+		remaining = remaining[end:]
+	}
 }

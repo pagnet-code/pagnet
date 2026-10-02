@@ -85,7 +85,7 @@ func runMain(args []string, build string) error {
 		return err
 	}
 	defer journal.Close()
-	owner, err := NewSessionOwner(ctx, journal, bootstrap.Native)
+	owner, err := NewSessionOwner(ctx, journal, bootstrap.Native, key)
 	if err != nil {
 		return err
 	}

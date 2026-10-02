@@ -71,6 +71,7 @@ type SessionOwner struct {
 	closing            bool
 	ctx                context.Context
 	journal            *Journal
+	captureKey         []byte
 	output             *OutputReplay
 	spec               NativeSpec
 	manager            *session.Manager
@@ -92,7 +93,10 @@ type SessionOwner struct {
 	relay              *relayBroker
 }
 
-func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*SessionOwner, error) {
+func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKey []byte) (*SessionOwner, error) {
+	if len(controlKey) != 32 {
+		return nil, errors.New("worker private capture key missing")
+	}
 	if !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) || (spec.Kind != "worker" && spec.Kind != "representative") || (spec.Kind == "worker" && (spec.NetworkID == "" || spec.NetworkTenantID == "")) {
 		return nil, errors.New("incomplete worker native scope or execution profile")
 	}
@@ -116,7 +120,7 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec) (*Session
 	cfg := proc.DefaultConfig()
 	cfg.StateDir = j.dir
 	sup := proc.NewSupervisor(cfg, slog.New(slog.DiscardHandler))
-	owner := &SessionOwner{ctx: ctx, cancel: cancel, journal: j, spec: spec, manager: session.NewManager(), supervisor: sup, pending: map[string]*nativeApproval{}, relay: newRelayBroker(j.scope, spec)}
+	owner := &SessionOwner{ctx: ctx, cancel: cancel, journal: j, captureKey: append([]byte(nil), controlKey...), spec: spec, manager: session.NewManager(), supervisor: sup, pending: map[string]*nativeApproval{}, relay: newRelayBroker(j.scope, spec)}
 	var driver session.Driver
 	switch spec.Runtime {
 	case domain.RuntimeFakePersistent:
@@ -426,6 +430,7 @@ func (o *SessionOwner) Close() {
 	o.relay.close()
 	o.supervisor.StopAll(5 * time.Second)
 	o.wg.Wait()
+	clear(o.captureKey)
 }
 
 // ownedDriver intercepts every actual activation, including the Manager's

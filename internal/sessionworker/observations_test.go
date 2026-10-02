@@ -101,7 +101,7 @@ func TestNativeObserverBackpressureRetainsOriginalEvent(t *testing.T) {
 	}
 	manager := session.NewManager()
 	manager.Session(j.scope.InstanceID, domain.RuntimeFakePersistent, "workspace")
-	owner := &SessionOwner{ctx: ctx, journal: j, manager: manager, generation: "generation", origin: json.RawMessage(`{"id":"origin"}`), pending: map[string]*nativeApproval{}}
+	owner := &SessionOwner{ctx: ctx, journal: j, captureKey: make([]byte, 32), manager: manager, generation: "generation", origin: json.RawMessage(`{"id":"origin"}`), pending: map[string]*nativeApproval{}}
 	observer := owner.nativeEventObserver(j.scope.InstanceID)
 	started := time.Now().UTC()
 	completed := make(chan error, 1)

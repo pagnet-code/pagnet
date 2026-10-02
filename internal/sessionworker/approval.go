@@ -154,3 +154,34 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 		return nil
 	})
 }
+
+// Resolution answers are distinct from the inspected permission payload. Read
+// the actual accepted inspection epoch; do not create/rotate content authority.
+// Large or currently unavailable answers remain complete in the private source
+// capture for the purpose-specific content manifest path.
+func (o *SessionOwner) encryptResolution(event session.SessionEvent, inspection *Inspection, observedAt time.Time) *NativeResolution {
+	if inspection == nil || o.spec.ProtectedContext == nil || event.Interaction == nil || !event.Interaction.Resolved || len(event.Interaction.Answer) > 64<<10 {
+		return nil
+	}
+	var resolution *NativeResolution
+	_ = crypto.WithContextKeyring(o.ctx, o.spec.ContextStateDir, *o.spec.ProtectedContext, func(ring *crypto.ContextKeyring) error {
+		epoch, ok := ring.EpochByID(inspection.DetailAAD.KeyEpochID)
+		if !ok {
+			return errors.New("original resolution content authority unavailable")
+		}
+		key, err := epoch.KeyArray()
+		if err != nil {
+			return err
+		}
+		defer clear(key[:])
+		aad := inspection.DetailAAD
+		aad.CreatedAt = observedAt.UTC().Format(time.RFC3339)
+		envelope, err := e2ee.Encrypt([]byte(event.Interaction.Answer), key, aad)
+		if err != nil {
+			return err
+		}
+		resolution = &NativeResolution{DetailEnvelope: envelope, DetailAAD: aad}
+		return nil
+	})
+	return resolution
+}

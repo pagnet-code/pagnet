@@ -35,6 +35,7 @@ type handshake struct {
 }
 
 type Request struct {
+	CaptureOffset    int               `json:"captureOffset,omitempty"`
 	ReplayGeneration string            `json:"replayGeneration,omitempty"`
 	ActivationOrigin *ActivationOrigin `json:"activationOrigin,omitempty"`
 	ObservationID    string            `json:"observationId,omitempty"`
@@ -51,6 +52,7 @@ type Request struct {
 }
 
 type Response struct {
+	Capture      *NativeCaptureChunk `json:"capture,omitempty"`
 	Activation   *ActivationRequest  `json:"activation,omitempty"`
 	Observations []NativeObservation `json:"observations,omitempty"`
 	Snapshot     *NativeSnapshot     `json:"snapshot,omitempty"`
@@ -391,7 +393,9 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 			response.Output = &page
 		}
 	case "observations":
-		response.Observations, err = o.journal.PendingObservations(ctx, req.Limit)
+		response.Observations, err = o.journal.PendingObservationsForLease(ctx, lease, req.Limit)
+	case "source_capture":
+		response.Capture, err = o.journal.ReadCaptureChunk(ctx, lease, req.ObservationID, req.SourceDigest, req.CaptureOffset)
 	case "observation_ack":
 		err = o.journal.AcknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest)
 	case "admission":

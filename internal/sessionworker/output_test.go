@@ -76,7 +76,7 @@ func TestTerminalReplayCannotWaitForSQLiteIntentLock(t *testing.T) {
 	}
 }
 
-func TestLargeDurableNativeAnswerFitsBoundedEphemeralReplay(t *testing.T) {
+func TestLargeIncrementalOutputFitsReplayWithoutDurableTranscript(t *testing.T) {
 	j, _ := testJournal(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -92,16 +92,23 @@ func TestLargeDurableNativeAnswerFitsBoundedEphemeralReplay(t *testing.T) {
 		t.Fatalf("valid large native answer poisoned worker: %v", owner.fatal)
 	}
 	observations, err := j.PendingObservations(ctx, 32)
-	if err != nil || len(observations) != 1 || observations[0].Event.Output != answer {
-		t.Fatal("exact durable answer lost")
+	if err != nil || len(observations) != 0 {
+		t.Fatal("incremental output incorrectly retained as durable evidence")
 	}
 	page, err := owner.outputReplay().Replay("", 0, 64)
-	if err != nil || len(page.Records) != 1 {
-		t.Fatal("large answer lost in replay")
+	if err != nil || len(page.Records) == 0 {
+		t.Fatal("large incremental output lost")
 	}
-	var replayed session.SessionEvent
-	if err := json.Unmarshal(page.Records[0].Data, &replayed); err != nil || replayed.Output != answer {
-		t.Fatal("large replay truncated")
+	var rebuilt bytes.Buffer
+	for _, record := range page.Records {
+		var replayed session.SessionEvent
+		if err := json.Unmarshal(record.Data, &replayed); err != nil {
+			t.Fatal(err)
+		}
+		rebuilt.WriteString(replayed.Output)
+	}
+	if rebuilt.String() != answer {
+		t.Fatal("incremental live output truncated")
 	}
 	encoded, _ := json.Marshal(Response{Output: &page})
 	if len(encoded) > maxFrame {

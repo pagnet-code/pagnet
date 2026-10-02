@@ -27,8 +27,17 @@ apply backpressure. Receipts retire only a contiguous prefix, retaining its
 ordinal floor forever, so pruned intent replay cannot become new work. Command
 IDs are not an unbounded tombstone collection; replay safety requires the
 controller to preserve its original ordinal. The intent journal retains digests rather than prompt bodies, and never stores
-launch environments, host credentials or native approval secrets. Private native
-observations can retain agent output in the owner-local durable outbox. Raw PTY
+launch environments, host credentials or native approval secrets. Purposeful native lifecycle, plan and interaction sources retain their complete
+original details encrypted in a bounded owner-local pending outbox. Incremental
+runtime output is not durable evidence. Original private resolution answers are
+captured before redaction, separately from the original approval secret. Capture
+keys derive from the local control key with full scope and state-directory
+binding; authenticated source bindings retain the exact origin, generation,
+native session and original timestamp. Bounded slices require the current lease
+inside the read transaction. Only ciphertext commitments appear in metadata;
+plaintext hashes are never exported. Capture and projection commit atomically,
+and controller journal acknowledgment removes both. This local pending capture
+is not a server receipt or an automatic network publication. Raw PTY
 echo is retained only in a bounded 2 MiB worker-owned memory ring, never as a
 SQLite output transcript. Replacing a worker reports a distinct replay generation
 and an explicit gap; replacing its controller preserves the ring.

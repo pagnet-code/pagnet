@@ -9,6 +9,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/session"
 )
 
@@ -17,6 +18,10 @@ const maxPendingObservationBytes = 32 << 20
 
 // ObservedAt and SourceDigest belong to the original native source. Neither
 // reconnect nor replacement of the controller creates a new observation.
+type NativeResolution struct {
+	DetailEnvelope e2ee.EncryptedPayloadV1 `json:"detailEnvelope"`
+	DetailAAD      e2ee.AAD                `json:"detailAAD"`
+}
 type NativeObservation struct {
 	InteractionID    string               `json:"interactionId,omitempty"`
 	ID               string               `json:"id"`
@@ -26,6 +31,8 @@ type NativeObservation struct {
 	ObservedAt       time.Time            `json:"observedAt"`
 	SourceDigest     string               `json:"sourceDigest"`
 	Event            session.SessionEvent `json:"event"`
+	Resolution       *NativeResolution    `json:"resolution,omitempty"`
+	Capture          *NativeCaptureRef    `json:"capture,omitempty"`
 	Inspection       *Inspection          `json:"inspection,omitempty"`
 }
 
@@ -78,6 +85,13 @@ func (j *Journal) initializeObservations() error {
 // JournalObservation is idempotent across ambiguous COMMIT outcomes. The native
 // reader retains this exact record on failure and applies backpressure.
 func (j *Journal) JournalObservation(ctx context.Context, observation NativeObservation) error {
+	return j.JournalCapturedObservation(ctx, observation, nil)
+}
+
+func (j *Journal) JournalCapturedObservation(ctx context.Context, observation NativeObservation, encrypted []byte) error {
+	if err := verifyCapture(observation.Capture, encrypted); err != nil {
+		return err
+	}
 	digest, err := observationDigest(observation)
 	if err != nil || observation.ID == "" || len(observation.ID) > 256 || observation.NativeGeneration == "" || len(observation.NativeGeneration) > 256 || observation.ObservedAt.IsZero() || len(observation.Origin) > 8192 || !json.Valid(observation.Origin) || digest != observation.SourceDigest {
 		return errors.New("invalid native source observation")
@@ -106,25 +120,49 @@ func (j *Journal) JournalObservation(ctx context.Context, observation NativeObse
 		return err
 	}
 	var count, total int
-	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0) FROM worker_observations`).Scan(&count, &total); err != nil {
+	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
 	}
-	if count >= maxPendingObservations || total+len(raw) > maxPendingObservationBytes {
+	if count >= maxPendingObservations || total+len(raw)+len(encrypted) > maxPendingObservationBytes {
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {
 		return err
 	}
+	if len(encrypted) > 0 {
+		if _, err = tx.Exec(`INSERT INTO worker_source_captures(id,ciphertext,size) VALUES(?,?,?)`, observation.ID, encrypted, len(encrypted)); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
 func (j *Journal) PendingObservations(ctx context.Context, limit int) ([]NativeObservation, error) {
+	return j.pendingObservations(ctx, 0, limit)
+}
+func (j *Journal) PendingObservationsForLease(ctx context.Context, lease int64, limit int) ([]NativeObservation, error) {
+	if lease <= 0 {
+		return nil, ErrFenced
+	}
+	return j.pendingObservations(ctx, lease, limit)
+}
+func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit int) ([]NativeObservation, error) {
 	if limit < 1 || limit > 32 {
 		return nil, errors.New("invalid native observation page bound")
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	rows, err := j.db.QueryContext(ctx, `SELECT payload FROM worker_observations ORDER BY sequence LIMIT ?`, limit)
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if lease > 0 {
+		if _, _, err = checkLease(ctx, tx, lease); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT payload FROM worker_observations ORDER BY sequence LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +184,16 @@ func (j *Journal) PendingObservations(ctx context.Context, limit int) ([]NativeO
 		}
 		result = append(result, observation)
 	}
-	return result, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // A controller acknowledges only after its ciphertext outbox COMMIT. Removing
@@ -175,6 +222,9 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	}
 	if previous != digest {
 		return ErrConflict
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_source_captures WHERE id=?`, id); err != nil {
+		return err
 	}
 	_, err = tx.ExecContext(ctx, `DELETE FROM worker_observations WHERE id=? AND digest=?`, id, digest)
 	if err != nil {
