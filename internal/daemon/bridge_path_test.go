@@ -53,7 +53,7 @@ func TestResolveSelfExecutable(t *testing.T) {
 // binary cannot spawn its bridges — it must refuse to start with a
 // clear error, never run and silently come up tool-less.
 func TestNewFailsWhenSelfUnresolvable(t *testing.T) {
-	_, err := newDaemon(Config{StateDir: t.TempDir()}, nil,
+	_, err := newDaemon(Config{StateDir: privateDaemonStateDir(t)}, nil,
 		func() (string, error) {
 			return "", errors.New("simulated: /proc/self/exe unreadable")
 		})
@@ -79,7 +79,7 @@ func TestMCPConfigSelfSpawnNoPATH(t *testing.T) {
 	writeFakeBridge(t, decoyDir, "pagnet-control")
 	t.Setenv("PATH", decoyDir)
 
-	d, err := New(Config{StateDir: t.TempDir()}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestMCPConfigSelfSpawnNoPATH(t *testing.T) {
 // that renames a key or drops a field would silently break every
 // adapter, so the exact structure is asserted here.
 func TestMCPConfigShape(t *testing.T) {
-	d, err := New(Config{StateDir: t.TempDir()}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

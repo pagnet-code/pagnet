@@ -28,3 +28,24 @@ func TestRestartReconcilesAllDeadLiveStatuses(t *testing.T) {
 		t.Fatalf("reconciliation is not idempotent: %d %v", n, err)
 	}
 }
+
+func TestRestartReconciliationPreservesIndependentWorkerNamespaces(t *testing.T) {
+	d := newTestDaemon(t)
+	for _, row := range []InstanceRow{{InstanceID: "independent-working", DefinitionID: "definition", Runtime: "qwen-code", Status: "working", SessionID: "original-session"}, {InstanceID: "legacy-working", DefinitionID: "definition", Runtime: "qwen-code", Status: "working", SessionID: "legacy-session"}} {
+		if err := d.state.UpsertInstance(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count, err := d.state.ReconcileRestartExcept([]string{"independent-working"})
+	if err != nil || count != 1 {
+		t.Fatal(count, err)
+	}
+	owned, ok, err := d.state.GetInstance("independent-working")
+	if err != nil || !ok || owned.Status != "working" || owned.SessionID != "original-session" {
+		t.Fatal("controller restart rewrote surviving owner", owned, err)
+	}
+	old, ok, err := d.state.GetInstance("legacy-working")
+	if err != nil || !ok || old.Status != "hibernated" || old.SessionID != "legacy-session" {
+		t.Fatal("legacy reconciliation changed", old, err)
+	}
+}

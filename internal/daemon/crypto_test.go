@@ -13,7 +13,7 @@ import (
 // handlers only need StateDir + stateID, so no adapters or roots are required.
 func newCryptoDaemon(t *testing.T) *Daemon {
 	t.Helper()
-	d, err := New(Config{StateDir: t.TempDir()}, nil)
+	d, err := New(Config{StateDir: privateDaemonStateDir(t)}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
