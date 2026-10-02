@@ -139,9 +139,9 @@ func TestLaunch_RequireSandbox_NilSpecRefused(t *testing.T) {
 }
 
 // TestLaunch_LandlockUnavailable_Refused pins H3's kernel branch: a spec is
-// carried, but the kernel has no Landlock — the launch is refused (the
-// availability probe is faked via the seam; on a real kernel lacking
-// Landlock the same branch runs un-faked).
+// carried, but the kernel cannot provide the required Landlock protection —
+// the launch is refused. The availability probe is faked via the seam; a
+// kernel without Landlock or with an insufficient ABI follows the same branch.
 func TestLaunch_LandlockUnavailable_Refused(t *testing.T) {
 	skipNoSandboxPlatform(t)
 	prev := sandboxAvailable
@@ -165,8 +165,8 @@ func TestLaunch_LandlockUnavailable_Refused(t *testing.T) {
 	if !errors.Is(err, ErrSandboxUnavailable) {
 		t.Fatalf("refusal = %v, want %v", err, ErrSandboxUnavailable)
 	}
-	if !strings.Contains(err.Error(), "supports no Landlock") {
-		t.Fatalf("refusal = %q, want the explicit no-Landlock reason", err)
+	if !strings.Contains(err.Error(), "Landlock ABI3 or newer") || !strings.Contains(err.Error(), "truncation protection") {
+		t.Fatalf("refusal = %q, want the actionable minimum Landlock requirement", err)
 	}
 }
 
