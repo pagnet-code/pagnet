@@ -771,9 +771,14 @@ type TerminalSnapshotPayload struct {
 // stdin bytes (keystrokes, control sequences, pasted text). LIVE message —
 // no CommandID, never acked, delivered at most once.
 type TerminalInputPayload struct {
-	InstanceID string `json:"instanceId"`
-	SessionID  string `json:"sessionId"`
-	Data       string `json:"data"` // base64
+	InstanceID       string                   `json:"instanceId"`
+	SessionID        string                   `json:"sessionId"`
+	Data             string                   `json:"data"` // base64
+	NativeGeneration string                   `json:"nativeGeneration,omitempty"`
+	SessionKeyID     string                   `json:"sessionKeyId,omitempty"`
+	Seq              uint64                   `json:"seq,omitempty"`
+	Envelope         *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	AAD              *e2ee.AAD                `json:"aad,omitempty"`
 }
 
 // TerminalResizePayload updates the PTY window size (SIGWINCH). LIVE
@@ -810,7 +815,11 @@ type TerminalOutputPayload struct {
 	// identity env) than the daemon renders now — the main trigger is an
 	// auto-update re-exec. The UI shows a "restart the terminal to apply"
 	// hint next to the existing Restart action (no auto-restart).
-	ConfigStale bool `json:"configStale,omitempty"`
+	ConfigStale      bool                     `json:"configStale,omitempty"`
+	NativeGeneration string                   `json:"nativeGeneration,omitempty"`
+	SessionKeyID     string                   `json:"sessionKeyId,omitempty"`
+	Envelope         *e2ee.EncryptedPayloadV1 `json:"envelope,omitempty"`
+	AAD              *e2ee.AAD                `json:"aad,omitempty"`
 }
 
 // AgentRequestPayload is one agent tool call relayed by the daemon to the
@@ -1420,4 +1429,20 @@ type EndpointInvocationResultAckPayload struct {
 type EndpointInvocationDeferPayload struct {
 	InvocationID string `json:"invocationId"`
 	DispatchID   string `json:"dispatchId"`
+}
+
+// Protected bootstrap authenticates ephemeral directional frame keys. It is
+// never an input acknowledgment, native turn or durable terminal transcript.
+const MsgTerminalSessionKey = "host.terminal_session_key"
+
+type TerminalSessionKeyPayload struct {
+	InstanceID          string                   `json:"instanceId"`
+	SessionID           string                   `json:"sessionId"`
+	NativeGeneration    string                   `json:"nativeGeneration"`
+	SessionKeyID        string                   `json:"sessionKeyId"`
+	SourceOriginID      string                   `json:"sourceOriginId"`
+	NativeSessionID     string                   `json:"nativeSessionId"`
+	NativeStartIdentity string                   `json:"nativeStartIdentity"`
+	Envelope            *e2ee.EncryptedPayloadV1 `json:"envelope"`
+	AAD                 *e2ee.AAD                `json:"aad"`
 }
