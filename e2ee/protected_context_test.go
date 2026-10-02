@@ -92,3 +92,25 @@ func TestNetworkApprovalProofBindsOriginalScopeAndExactChoice(t *testing.T) {
 		t.Fatal("foreign instance became permission proof")
 	}
 }
+
+func TestNetworkApprovalPublicCanonicalVector(t *testing.T) {
+	raw, err := os.ReadFile("testdata/network_approval_public_vector.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vector struct {
+		CanonicalAAD string `json:"canonicalAAD"`
+		Proof        string `json:"proof"`
+	}
+	if json.Unmarshal(raw, &vector) != nil {
+		t.Fatal("invalid public vector")
+	}
+	var aad AAD
+	if json.Unmarshal([]byte(vector.CanonicalAAD), &aad) != nil || aad.ProtectedContext != nil || string(aad.CanonicalBytes()) != vector.CanonicalAAD {
+		t.Fatal("network canonical vector changed")
+	}
+	proof, err := ApprovalProof(bytes.Repeat([]byte{7}, 32), aad, aad.Sender, "native-session", "native-approval", "allow-once")
+	if err != nil || base64.StdEncoding.EncodeToString(proof) != vector.Proof {
+		t.Fatal("network HMAC differs from public browser vector", err)
+	}
+}
