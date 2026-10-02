@@ -354,7 +354,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 		case "resize":
 			err = o.resize(op)
 		case "resolve":
-			if out.SourceAdmission != nil && op.SourceCommandID != out.CommandID {
+			if out.SourceAdmission != nil && (op.SourceCommandID != "" || op.SourceAdmissionID != "") && op.SourceCommandID != out.CommandID {
 				err = errors.New("native resolution command differs from original accepted source")
 			} else {
 				err = o.resolveAuthenticatedApproval(op, out.SourceAdmission)

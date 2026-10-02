@@ -158,6 +158,9 @@ func (o *SessionOwner) resolveApproval(op Operation) error {
 	return o.resolveApprovalWithSource(op, nil)
 }
 func (o *SessionOwner) resolveAuthenticatedApproval(op Operation, source *Admission) error {
+	if op.SourceCommandID == "" && op.SourceAdmissionID == "" {
+		return o.resolveApprovalWithSource(op, nil)
+	}
 	if source != nil && ValidateNativeResolveOperation(op) != nil {
 		return errors.New("invalid authenticated native resolution")
 	}
