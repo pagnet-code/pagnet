@@ -25,6 +25,9 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if len(j.sourceRetries) != 0 {
+		return ErrConflict
+	}
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
