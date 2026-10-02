@@ -473,8 +473,9 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		o.origin = append(json.RawMessage(nil), origin...)
 		o.pending = map[string]*nativeApproval{}
 		o.terminal = nil
-		o.mu.Unlock()
+		// Generation replacement and its activity reset share the observer fence.
 		o.manager.ResetNativeActivity(sess.InstanceID)
+		o.mu.Unlock()
 		o.relay.bindNative(generation)
 		// Manager holds its activation lock across this write and Activate. No
 		// controller can mutate launch environment/model on a live worker endpoint.

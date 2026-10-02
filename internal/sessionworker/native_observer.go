@@ -21,11 +21,10 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 	return func(event session.SessionEvent) error {
 		observedAt := time.Now().UTC()
 		o.mu.Lock()
-		current := o.generation == generation
-		o.mu.Unlock()
-		if current {
+		if o.generation == generation {
 			o.manager.ObserveNativeActivity(instanceID, event)
 		}
+		o.mu.Unlock()
 		if !durableNativeEvent(event) {
 			o.recordLiveEvent(event, generation, origin)
 			return o.ctx.Err()
@@ -58,8 +57,11 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 				copy.Options = append(copy.Options[:0:0], pending.inspection.Options...)
 				inspection = &copy
 			}
-			if event.Interaction.Resolved && current {
-				delete(o.pending, event.Interaction.NativeInteractionID)
+			if event.Interaction.Resolved && o.generation == generation {
+				pending := o.pending[event.Interaction.NativeInteractionID]
+				if pending != nil && pending.inspection != nil && pending.inspection.NativeGeneration == generation && pending.inspection.NativeSessionID == event.SessionID {
+					delete(o.pending, event.Interaction.NativeInteractionID)
+				}
 			}
 			o.mu.Unlock()
 			copy := *event.Interaction

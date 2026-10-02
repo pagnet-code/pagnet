@@ -281,7 +281,11 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		response := Response{}
 		switch req.Type {
 		case "intent":
-			out, run, err := j.Admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload)
+			var authorize func() error
+			if owner != nil {
+				authorize = func() error { return owner.relay.authorizeNativeEffect(auth.Lease) }
+			}
+			out, run, err := j.admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize)
 			if err != nil {
 				response.Error = err.Error()
 			} else {
@@ -425,6 +429,8 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		response.Capture, err = o.journal.ReadCaptureChunk(ctx, lease, req.ObservationID, req.SourceDigest, req.CaptureOffset)
 	case "observation_ack":
 		err = o.journal.AcknowledgeObservation(ctx, lease, req.ObservationID, req.SourceDigest)
+	case "admission_revoke":
+		o.relay.disconnect(lease)
 	case "admission":
 		if req.Admission == nil {
 			err = errors.New("fresh control-plane admission required")

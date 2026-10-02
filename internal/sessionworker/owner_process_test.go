@@ -619,3 +619,160 @@ func TestActualNativeOwnerAcrossIndependentControllerProcesses(t *testing.T) {
 		t.Fatal("durable controller fence was lost")
 	}
 }
+
+func TestAdoptedControllerRejectsNewNativeEffectsWithoutAdmission(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "pgn-own-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	state := filepath.Join(dir, "s")
+	workspace := filepath.Join(dir, "w")
+	contextState := filepath.Join(dir, "c")
+	binaries := filepath.Join(dir, "b", "bin")
+	for _, path := range []string{workspace, contextState, binaries} {
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workerBinary := filepath.Join(binaries, "pagnet")
+	nativeBinary := filepath.Join(binaries, "native")
+	controllerA := filepath.Join(binaries, "controller-a")
+	controllerB := filepath.Join(binaries, "controller-b")
+	testBinary(t, root, workerBinary, "./cmd/pagnet", "-X main.version=worker-original")
+	testBinary(t, root, nativeBinary, "./cmd/pagnet-fake-runtime", "")
+	testBinary(t, root, controllerA, "./internal/sessionworker/testdata/controller", "-X main.build=controller-a")
+	testBinary(t, root, controllerB, "./internal/sessionworker/testdata/controller", "-X main.build=controller-b")
+	tenant := uuid.NewString()
+	scope := Scope{ServerURL: "https://control.invalid", TenantID: tenant, AccountID: uuid.NewString(), HostID: uuid.NewString(), InstanceID: uuid.NewString(), Generation: uuid.NewString()}
+	protected := e2ee.ProtectedContext{Kind: e2ee.OwnerContextKind, ID: uuid.NewString(), TenantID: tenant, OwnerUserID: uuid.NewString(), HostID: scope.HostID}
+	epoch := crypto.KeyEpoch{ID: uuid.NewString(), State: crypto.EpochActive, Key: bytes.Repeat([]byte{7}, 32), CreatedAt: time.Now().UTC()}
+	if err = crypto.SaveContextKeyring(contextState, &crypto.ContextKeyring{Context: protected, Epochs: []crypto.KeyEpoch{epoch}}); err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{9}, 32)
+	bootstrap := Bootstrap{Protocol: Protocol, Scope: scope, Native: NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: nativeBinary, MCPExecutable: workerBinary, Workspace: workspace, NetworkID: uuid.NewString(), Kind: "worker", TenantID: tenant, NetworkTenantID: tenant, ProtectedContext: &protected, ContextStateDir: contextState}}
+	if err = PrepareBootstrap(state, bootstrap, key); err != nil {
+		t.Fatal(err)
+	}
+	fixtureResult := filepath.Join(workspace, "bridge-result.json")
+	env := []string{"PAGNET_FAKE_INTERACTION=permission", `PAGNET_FAKE_INTERACTION_OPTIONS=[{"id":"proceed","kind":"allow_once"},{"id":"cancel","kind":"reject_once"}]`, "PAGNET_FAKE_TUI_BOOT_BYTES=65536", "PAGNET_FAKE_TUI_TICK_MS=50", "PAGNET_FAKE_BRIDGE_CONTROL=1", "PAGNET_FAKE_SPAWN_BRIDGE=1", "PAGNET_FAKE_BRIDGE_RESULT_FILE=" + fixtureResult, "PAGNET_FAKE_FS_PROBE=" + filepath.Join(state, "control.key"), "PAGNET_FAKE_FS_PROBE_FILE=" + filepath.Join(workspace, "fs-probe.json")}
+	readEnv, writeEnv, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(workerBinary, Subcommand, "--state", state, "--env-fd", "3")
+	command.ExtraFiles = []*os.File{readEnv}
+	var workerStderr bytes.Buffer
+	command.Stderr = &workerStderr
+	if err = command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = readEnv.Close()
+	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
+	if err = json.NewEncoder(writeEnv).Encode(env); err != nil {
+		t.Fatal(err)
+	}
+	_ = writeEnv.Close()
+	waitPath(t, filepath.Join(state, "controller.sock"))
+	waitPath(t, filepath.Join(state, "native.sock"))
+	a := startController(t, controllerA, state)
+	admission := Admission{NativeAdmissionID: uuid.NewString(), Scope: scope, TenantID: tenant, NetworkID: bootstrap.Native.NetworkID, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
+	if r := a.call(t, Request{Type: "admission", Admission: &admission}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	if r := a.intent(t, 1, "activate-one", "activate", Operation{SourceCommandID: "activate-one"}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	var activation *ActivationRequest
+	activationDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(activationDeadline) {
+		r := a.call(t, Request{Type: "activation_poll"})
+		if r.Error != "" {
+			t.Fatal(r.Error)
+		}
+		if r.Activation != nil {
+			activation = r.Activation
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if activation == nil || activation.SourceCommandID != "activate-one" || activation.NativeGeneration == "" {
+		t.Fatalf("missing exact native activation request: %+v", activation)
+	}
+	if premature := a.snapshot(t); premature.PID != 0 || premature.NativeSessionID != "" {
+		t.Fatalf("native launched before authority origin: %+v", premature)
+	}
+	origin := json.RawMessage(fmt.Sprintf(`{"id":%q,"commandId":"activate-one","tenantId":%q,"hostId":%q,"instanceId":%q,"runtime":"fake-persistent","nativeGeneration":%q,"nativeAdmissionId":%q,"runnerId":%q,"runnerEpoch":%q,"bootId":%q,"createdAt":%q}`, uuid.NewString(), tenant, scope.HostID, scope.InstanceID, activation.NativeGeneration, admission.NativeAdmissionID, admission.RunnerID, admission.RunnerEpoch.Format(time.RFC3339Nano), admission.BootID, time.Now().UTC().Format(time.RFC3339Nano)))
+	if r := a.call(t, Request{Type: "activation_origin", ActivationOrigin: &ActivationOrigin{ID: activation.ID, NativeGeneration: activation.NativeGeneration, Origin: origin}}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	if out := a.outcome(t, 1); out.State != "completed" {
+		t.Fatalf("native activation failed: %+v stderr=%s", out, workerStderr.String())
+	}
+	initial := a.snapshot(t)
+	if initial.PID <= 0 || initial.NativeStartIdentity == "" || initial.NativeGeneration == "" || initial.NativeSessionID == "" || !initial.HasTerminal {
+		t.Fatalf("actual native ownership missing: %+v", initial)
+	}
+	// The real native MCP subprocess forwards through the worker-owned socket.
+	deadline := time.Now().Add(10 * time.Second)
+	var spawned *BridgeCall
+	for time.Now().Before(deadline) {
+		r := a.call(t, Request{Type: "bridge_poll"})
+		if r.Error != "" {
+			t.Fatal(r.Error)
+		}
+		if r.Bridge != nil {
+			spawned = r.Bridge
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if spawned == nil || spawned.Scope != scope || spawned.NativeGeneration != initial.NativeGeneration || !bytes.Equal(spawned.Origin, origin) {
+		t.Fatalf("native MCP did not inherit exact worker source: %+v", spawned)
+	}
+	if r := a.call(t, Request{Type: "bridge_result", Relay: &BridgeResult{ID: spawned.ID, OK: true, Result: json.RawMessage(`{"fixture":"actual-native-mcp"}`)}}); r.Error != "" {
+		t.Fatal(r.Error)
+	}
+	if runtime.GOOS == "linux" {
+		waitPath(t, filepath.Join(workspace, "fs-probe.json"))
+		raw, _ := os.ReadFile(filepath.Join(workspace, "fs-probe.json"))
+		var probes []struct {
+			OK bool `json:"ok"`
+		}
+		if json.Unmarshal(raw, &probes) != nil || len(probes) != 1 || probes[0].OK {
+			t.Fatal("native process read its worker's private control key")
+		}
+	}
+	t.Cleanup(func() {
+		_ = command.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func() { _ = command.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			_ = command.Process.Kill()
+			<-done
+		}
+	})
+	a.close()
+	a = startController(t, controllerB, state)
+	if response := a.call(t, Request{Type: "bridge_poll"}); response.Error != "fresh control-plane admission is required" {
+		t.Fatalf("fixture accidentally retained admission: %+v", response)
+	}
+	response := a.intent(t, 2, "unadmitted-prompt", "prompt", Operation{Input: "let without-fresh-admission native-effect", InputKind: "task", SourceCommandID: "unadmitted-delivery", SourceAdmissionID: admission.NativeAdmissionID})
+
+	if response.Error == "" {
+		t.Fatal("new native intent was admitted without fresh control-plane authority")
+	}
+	if actual := a.snapshot(t); actual.PID != initial.PID || actual.NativeStartIdentity != initial.NativeStartIdentity {
+		t.Fatal("denial changed actual native generation")
+	}
+	if replay := a.intent(t, 1, "activate-one", "activate", Operation{SourceCommandID: "activate-one"}); replay.Error != "" || replay.Outcome == nil || replay.Outcome.State != "completed" {
+		t.Fatalf("existing exact outcome replay lost during admission gap: %+v", replay)
+	}
+}

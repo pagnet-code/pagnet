@@ -224,6 +224,11 @@ func intentDigest(kind string, payload json.RawMessage) string {
 // Admit returns execute=false for a known intent, including unfinished or
 // uncertain outcomes. A retry must retain its original ordinal and command ID.
 func (j *Journal) Admit(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage) (out Outcome, execute bool, err error) {
+	return j.admit(ctx, lease, sequence, commandID, kind, payload, nil)
+}
+
+// Only new effects need admission. Exact prior ordinal replay is read-only.
+func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() error) (out Outcome, execute bool, err error) {
 	if sequence <= 0 || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
 		return out, false, errors.New("invalid or oversized intent")
 	}
@@ -257,6 +262,11 @@ func (j *Journal) Admit(ctx context.Context, lease, sequence int64, commandID, k
 	}
 	if sequence != next || sequence == 9223372036854775807 {
 		return out, false, ErrConflict
+	}
+	if authorizeNew != nil {
+		if err = authorizeNew(); err != nil {
+			return out, false, err
+		}
 	}
 	var count int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_intent`).Scan(&count); err != nil {
