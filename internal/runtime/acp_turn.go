@@ -29,8 +29,16 @@ func (d *ACPDriver) Submit(ctx context.Context, s *session.RuntimeSession, req s
 		return session.ErrBusy
 	}
 	e.busy = true
+	e.turn = req.TurnID
+	e.observedStart = false
 	e.mu.Unlock()
-	defer func() { e.mu.Lock(); e.busy = false; e.permissions = map[string]acpPermission{}; e.mu.Unlock() }()
+	defer func() {
+		e.mu.Lock()
+		e.busy = false
+		e.turn = ""
+		e.permissions = map[string]acpPermission{}
+		e.mu.Unlock()
+	}()
 	// session/load can finish while older history notifications remain queued.
 	// ACP v1 has session-scoped updates, so discard replay before admitting a
 	// new prompt; only notifications inside this owned exchange are progress.
@@ -62,7 +70,7 @@ replayDrained:
 	}
 	defer e.conn.finish(call)
 	emit := func(kind, output string, interaction *session.InteractionEvent) bool {
-		return acpEmit(ctx, ch, session.SessionEvent{Type: kind, SessionID: e.nativeID, TurnID: req.TurnID, Output: output, Interaction: interaction})
+		return e.emit(ctx, ch, session.SessionEvent{Type: kind, SessionID: e.nativeID, TurnID: req.TurnID, Output: output, Interaction: interaction})
 	}
 	if !emit(session.EventTurnStarted, "", nil) {
 		e.cancel()
@@ -99,14 +107,14 @@ replayDrained:
 				if json.Unmarshal(message.Params, &data) != nil || data.Update.Entries == nil {
 					return nil
 				}
-				plan := &session.PlanSnapshot{Source: "acp", Entries: make([]session.PlanEntry, 0, len(data.Update.Entries))}
+				plan := &session.PlanSnapshot{Source: e.planSource, Entries: make([]session.PlanEntry, 0, len(data.Update.Entries))}
 				for _, entry := range data.Update.Entries {
 					plan.Entries = append(plan.Entries, session.PlanEntry{Text: entry.Content, Status: entry.Status, Priority: entry.Priority})
 				}
 				if session.ValidatePlan(plan) != nil {
 					return nil
 				}
-				if !acpEmit(ctx, ch, session.SessionEvent{Type: session.EventPlanUpdated, SessionID: e.nativeID, TurnID: req.TurnID, Plan: plan}) {
+				if !e.emit(ctx, ch, session.SessionEvent{Type: session.EventPlanUpdated, SessionID: e.nativeID, TurnID: req.TurnID, Plan: plan}) {
 					e.cancel()
 					return session.ErrTurnInterrupted
 				}
@@ -118,7 +126,11 @@ replayDrained:
 				}
 			}
 		} else if message.Method == "session/request_permission" && len(message.ID) > 0 {
-			interaction, err := e.permission(ctx, message)
+			interaction := message.nativePermission
+			var err error
+			if interaction == nil {
+				interaction, err = e.permission(ctx, message)
+			}
 			if err != nil {
 				e.handle.Abort("ACP invalid permission request")
 				return session.ErrTurnInterrupted
@@ -158,7 +170,7 @@ replayDrained:
 				return err
 			}
 			if response.Error != nil {
-				acpEmit(ctx, ch, session.SessionEvent{Type: session.EventTurnFailed, SessionID: e.nativeID, TurnID: req.TurnID, FailureKind: "runtime_error", Error: response.Error.Error()})
+				e.emit(ctx, ch, session.SessionEvent{Type: session.EventTurnFailed, SessionID: e.nativeID, TurnID: req.TurnID, FailureKind: "runtime_error", Error: response.Error.Error()})
 				return nil
 			}
 			var result struct {
@@ -179,7 +191,7 @@ replayDrained:
 				e.handle.Abort("ACP invalid terminal result")
 				return session.ErrTurnInterrupted
 			}
-			acpEmit(ctx, ch, session.SessionEvent{Type: session.EventTurnFailed, SessionID: e.nativeID, TurnID: req.TurnID, FailureKind: "runtime_error", Error: "Native ACP turn stopped: " + result.StopReason})
+			e.emit(ctx, ch, session.SessionEvent{Type: session.EventTurnFailed, SessionID: e.nativeID, TurnID: req.TurnID, FailureKind: "runtime_error", Error: "Native ACP turn stopped: " + result.StopReason})
 			return nil
 		case message := <-e.conn.messages:
 			if err := handleMessage(message); err != nil {
@@ -269,10 +281,15 @@ func (e *acpEndpoint) permission(ctx context.Context, message acpMessage) (*sess
 	if _, exists := e.permissions[id]; exists {
 		return nil, errors.New("duplicate ACP permission")
 	}
-	e.permissions[id] = acpPermission{id: append(json.RawMessage{}, message.ID...), options: options}
+	e.permissions[id] = acpPermission{id: append(json.RawMessage{}, message.ID...), options: options, raw: append(json.RawMessage{}, message.Params...), turn: e.turn}
 	return &session.InteractionEvent{NativeInteractionID: id, Kind: "permission", Summary: "Native tool approval", Options: publicOptions, NativePayload: append(json.RawMessage{}, message.Params...)}, nil
 }
 func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) error {
+	e.resolutionGate.RLock()
+	defer e.resolutionGate.RUnlock()
+	if e.retired {
+		return session.ErrEndpointGone
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	e.mu.Lock()
@@ -305,6 +322,23 @@ func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) er
 	} else if p.options[req.Answer] == "reject_once" || p.options[req.Answer] == "reject_always" {
 		decision = "declined"
 	}
-	e.resolutions <- &session.InteractionEvent{NativeInteractionID: req.InteractionID, Kind: "permission", Resolved: true, Decision: decision, Answer: req.Answer}
-	return nil
+	resolution := &session.InteractionEvent{NativeInteractionID: req.InteractionID, Kind: "permission", Resolved: true, Decision: decision, Answer: req.Answer, NativePayload: p.raw}
+	e.mu.Unlock()
+	if e.observer != nil {
+		if err := e.observer(session.SessionEvent{Type: session.EventInteractionResolved, SessionID: e.nativeID, TurnID: p.turn, Interaction: resolution}); err != nil {
+			e.mu.Lock()
+			return err
+		}
+	}
+	e.mu.Lock()
+	select {
+	case e.resolutions <- resolution:
+		return nil
+	default:
+		return errors.New("native ACP committed resolution queue full")
+	}
+}
+
+func (e *acpEndpoint) emit(ctx context.Context, ch chan<- session.SessionEvent, event session.SessionEvent) bool {
+	return acpEmit(ctx, ch, event)
 }

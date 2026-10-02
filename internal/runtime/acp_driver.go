@@ -24,29 +24,42 @@ import (
 // is immutable after registration, allowing independent executable/auth profiles.
 // Client filesystem and terminal RPCs are deliberately not advertised.
 type ACPDriver struct {
-	Binary, BinaryName          string
-	Runtime                     domain.RuntimeName
-	Env, PrefixArgs, NativeDirs []string
-	StateDir, NativeHomeEnv     string
-	StartupTimeout              time.Duration
-	Arguments                   func(*session.RuntimeSession) []string
-	Authenticate                func([]string, []string) (string, error)
-	life                        lifecycleState
-	mu                          sync.Mutex
-	endpoints                   map[string]*acpEndpoint
+	PlanSource                             string
+	NativeEventObserverRegistrationFactory session.NativeEventObserverRegistrationFactory
+	Binary, BinaryName                     string
+	Runtime                                domain.RuntimeName
+	Env, PrefixArgs, NativeDirs            []string
+	StateDir, NativeHomeEnv                string
+	StartupTimeout                         time.Duration
+	Arguments                              func(*session.RuntimeSession) []string
+	PrepareLaunch                          func(*session.RuntimeSession, []string, string) ([]string, error)
+	Authenticate                           func([]string, []string) (string, error)
+	life                                   lifecycleState
+	mu                                     sync.Mutex
+	endpoints                              map[string]*acpEndpoint
 }
 type acpEndpoint struct {
-	conn         *acpConnection
-	handle       *proc.Handle
-	id, nativeID string
-	started      time.Time
-	load         bool
-	mu           sync.Mutex
-	busy         bool
-	permissions  map[string]acpPermission
-	resolutions  chan *session.InteractionEvent
+	tools          map[string]bool
+	planSource     string
+	resolutionGate sync.RWMutex
+	retired        bool
+	announced      bool
+	observer       session.NativeEventObserver
+	observedStart  bool
+	conn           *acpConnection
+	handle         *proc.Handle
+	id, nativeID   string
+	started        time.Time
+	load           bool
+	mu             sync.Mutex
+	busy           bool
+	turn           string
+	permissions    map[string]acpPermission
+	resolutions    chan *session.InteractionEvent
 }
 type acpPermission struct {
+	raw     json.RawMessage
+	turn    string
 	id      json.RawMessage
 	options map[string]string
 }
@@ -102,12 +115,11 @@ func (d *ACPDriver) ActiveWork(id string) bool {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.busy || len(e.permissions) > 0
+	return e.busy || len(e.permissions) > 0 || len(e.tools) > 0
 }
 func (d *ACPDriver) Stop(id string) error {
 	d.mu.Lock()
 	e := d.endpoints[id]
-	delete(d.endpoints, id)
 	d.mu.Unlock()
 	if e == nil {
 		return nil
@@ -116,7 +128,19 @@ func (d *ACPDriver) Stop(id string) error {
 	if err := d.life.get().(proc.EndpointLifecycle).StopEndpoint(id); err != nil {
 		return err
 	}
+	select {
+	case <-e.conn.readerDone:
+	case <-time.After(3 * time.Second):
+		return errors.New("ACP native observer retirement is still pending")
+	}
 	_, err := e.handle.WaitDeadline(2 * time.Second)
+	if err == nil {
+		d.mu.Lock()
+		if d.endpoints[id] == e {
+			delete(d.endpoints, id)
+		}
+		d.mu.Unlock()
+	}
 	return err
 }
 func (d *ACPDriver) Hibernate(ctx context.Context, s *session.RuntimeSession) error {
@@ -166,6 +190,12 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 	if err != nil {
 		return nil, err
 	}
+	if d.PrepareLaunch != nil {
+		env, err = d.PrepareLaunch(s, env, state)
+		if err != nil {
+			return nil, err
+		}
+	}
 	mcp, err := acpMCPServers(env)
 	if err != nil {
 		return nil, err
@@ -199,7 +229,32 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 		out.Close()
 		return nil, err
 	}
-	e := &acpEndpoint{conn: newACPConnection(in, out), handle: h, id: string(domain.NewID()), started: time.Now(), permissions: map[string]acpPermission{}, resolutions: make(chan *session.InteractionEvent, 32)}
+	registration := session.NativeEventObserverRegistration{}
+	if d.NativeEventObserverRegistrationFactory != nil {
+		registration = d.NativeEventObserverRegistrationFactory(s.InstanceID)
+	}
+	planSource := d.PlanSource
+	if planSource == "" {
+		planSource = "acp"
+	}
+	e := &acpEndpoint{planSource: planSource, observer: registration.Observe, handle: h, id: string(domain.NewID()), started: time.Now(), permissions: map[string]acpPermission{}, tools: map[string]bool{}, resolutions: make(chan *session.InteractionEvent, 32)}
+	e.conn = newOwnedACPConnection(in, out, func() {
+		e.resolutionGate.Lock()
+		defer e.resolutionGate.Unlock()
+		h.Abort("ACP native reader closed")
+		if _, waitErr := h.WaitDeadline(2 * time.Second); waitErr == nil {
+			e.mu.Lock()
+			announced, native := e.announced, e.nativeID
+			e.mu.Unlock()
+			if announced && e.observer != nil {
+				_ = e.observer(session.SessionEvent{Type: session.EventSessionStopped, SessionID: native})
+			}
+		}
+		e.retired = true
+		if registration.Retire != nil {
+			registration.Retire()
+		}
+	}, e.captureNativeMessage)
 	success := false
 	defer func() {
 		if !success {
@@ -255,7 +310,9 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 		if err = e.conn.request(startup, "session/load", params, nil); err != nil {
 			return nil, fmt.Errorf("%w: %v", session.ErrSessionLost, err)
 		}
+		e.mu.Lock()
 		e.nativeID = s.NativeID
+		e.mu.Unlock()
 		event = session.EventSessionResumed
 	} else {
 		var result struct {
@@ -267,7 +324,9 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 		if result.SessionID == "" || len(result.SessionID) > 4096 {
 			return nil, errors.New("native ACP session ID invalid")
 		}
+		e.mu.Lock()
 		e.nativeID = result.SessionID
+		e.mu.Unlock()
 	}
 	s.NativeID = e.nativeID
 	d.mu.Lock()
@@ -286,7 +345,21 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 			e.handle.Abort("ACP transport closed")
 		}
 	}()
-	acpEmit(ctx, ch, session.SessionEvent{Type: event, SessionID: e.nativeID})
+	activationEvent := session.SessionEvent{Type: event, SessionID: e.nativeID}
+	e.resolutionGate.RLock()
+	if e.observer != nil {
+		err = e.observer(activationEvent)
+	}
+	if err == nil {
+		e.mu.Lock()
+		e.announced = true
+		e.mu.Unlock()
+	}
+	e.resolutionGate.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	acpEmit(ctx, ch, activationEvent)
 	return e.info(s), nil
 }
 

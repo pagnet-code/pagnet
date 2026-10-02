@@ -1,0 +1,24 @@
+# Future owned Claude and OpenCode sessions
+
+The independently owned SessionOwner now accepts Claude Code and OpenCode in addition to Fake, Qwen, Codex and Grok. This remains on the future branch; the released daemon driver catalog is unchanged.
+
+Claude owns one supervised `claude -p --input-format stream-json --output-format stream-json --verbose --permission-prompt-tool stdio --permission-mode default` subprocess. Initialize, interrupt, user messages, native tool permission requests and correlated control responses use the official SDK wire protocol. Cold sessions use an original UUID `--session-id`; materialised resumes use the exact saved `--resume` identity. No native write with uncertain delivery is retried as a fresh prompt. The control process remains alive across completed turns and authenticated controller replacement.
+
+OpenCode owns its documented `opencode acp` subprocess and private server lifetime. ACP initialize/session-new/session-load/session-prompt and session-scoped updates preserve the original session identity. MCP startup parameters come from the worker's existing original execution profile; model and standing instructions are written into a private configuration. Existing global account data is not copied into the private native home. Unsupported session-load capabilities fail explicitly without substituting a new conversation.
+
+Shared ACP, including Grok, and Claude now capture native source events in the protocol reader before managed queue filtering. Paired registrations retain exact original generation/origin and quiesce accepted permission resolution writes before retirement. On reader exit they abort only that supervised handle and require observed process reaping before capturing `runtime.session.stopped` with the original native SID. Stop capture precedes registration retirement; a timeout does not prove death. The stopped event has a contiguous source sequence and maps to `host.agent_stopped`. Earlier accepted terminal and approval captures remain ordered before that stopped receipt. EOF does not invent a successful/failed native terminal result or infer hibernation.
+
+Machine endpoints do not advertise a same-process native TUI, second-client terminal attachment or PTY: the documented protocols expose structured stdio rather than a parallel terminal for this owned process. Automatic suspension is disabled because complete scheduler/background-work enumeration is unavailable. Positive Claude background task notifications, CronCreate/ScheduleWakeup and ACP tool activity prevent explicit hibernation; only genuine terminal task/tool status clears known work. A scheduler remains conservatively active until explicit stop.
+
+## Automated evidence
+
+Actual synthetic Go native subprocesses validate two turns on the same PID/session, exact resume identity, native approval payload/allow-once round trip, unsupported resume, malformed/foreign-session/EOF failure without blind retry, background task completion and scheduler hibernation refusal. Actual independently built worker and two controller subprocesses exercise both adapters: original PID, kernel birth, SID, generation and origin survive controller replacement, stale controller leases fail, original encrypted source captures authenticate, and explicit supervised stop is captured before source retirement. These tests make no provider requests. MCP startup configuration is checked by the native fixtures; a vendor-hosted MCP/tool execution is not verified.
+
+No live vendor integration or provider authentication is claimed. If an abrupt native death lacks an actual terminal result, the source does not manufacture one to satisfy backend turn settlement; stopped source delivery remains subject to the backend's earlier-turn settlement contract. SIGKILL of the worker itself cannot publish a final source event. Original native background/TUI turn ordinal publication requires the separately owned source protocol and is not synthesized by these adapters.
+
+## Primary protocol references
+
+- Anthropic [SDK query/control implementation](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py), [persistent subprocess transport](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/transport/subprocess_cli.py) and [message parser](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/message_parser.py).
+- Anthropic [CLI reference](https://code.claude.com/docs/en/cli-reference) and [scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks).
+- OpenCode [ACP CLI](https://opencode.ai/v2/docs/cli/acp/), [ACP integration](https://dev.opencode.ai/docs/acp/) and [server](https://dev.opencode.ai/docs/server/).
+- ACP [tool calls and partial status updates](https://agentclientprotocol.com/protocol/v1/tool-calls).

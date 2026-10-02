@@ -35,6 +35,12 @@ func TestMain(m *testing.M) {
 	if len(os.Args) >= 2 && os.Args[1] == sandbox.Subcommand {
 		os.Exit(sandbox.RunWrapperMain(os.Args[2:]))
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "claude-stream-fixture" {
+		os.Exit(runClaudeStreamFixture())
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "opencode-acp-fixture" {
+		os.Exit(runOpenCodeACPFixture())
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "grok-acp-fixture" {
 		os.Exit(runGrokACPFixture())
 	}

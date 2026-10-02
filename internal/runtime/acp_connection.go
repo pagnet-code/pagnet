@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"io"
 	"sync"
 )
@@ -17,12 +18,14 @@ const acpMaxFrame = 16 << 20
 var errACPDeliveryUncertain = errors.New("ACP delivery outcome uncertain")
 
 type acpMessage struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *acpRPCError    `json:"error,omitempty"`
+	replyMethod      string
+	nativePermission *session.InteractionEvent
+	JSONRPC          string          `json:"jsonrpc"`
+	ID               json.RawMessage `json:"id,omitempty"`
+	Method           string          `json:"method,omitempty"`
+	Params           json.RawMessage `json:"params,omitempty"`
+	Result           json.RawMessage `json:"result,omitempty"`
+	Error            *acpRPCError    `json:"error,omitempty"`
 }
 type acpRPCError struct {
 	Code    int    `json:"code"`
@@ -40,20 +43,31 @@ type acpCall struct {
 	response chan acpMessage
 }
 type acpConnection struct {
-	input    io.WriteCloser
-	output   io.ReadCloser
-	writes   chan acpWrite
-	messages chan acpMessage
-	done     chan struct{}
-	once     sync.Once
-	mu       sync.Mutex
-	next     uint64
-	pending  map[string]chan acpMessage
-	err      error
+	observe        func(*acpMessage) error
+	pendingMethods map[string]string
+	input          io.WriteCloser
+	output         io.ReadCloser
+	writes         chan acpWrite
+	messages       chan acpMessage
+	done           chan struct{}
+	readerDone     chan struct{}
+	retire         func()
+	once           sync.Once
+	mu             sync.Mutex
+	next           uint64
+	pending        map[string]chan acpMessage
+	err            error
 }
 
 func newACPConnection(input io.WriteCloser, output io.ReadCloser) *acpConnection {
-	c := &acpConnection{input: input, output: output, writes: make(chan acpWrite, 16), messages: make(chan acpMessage, 128), done: make(chan struct{}), pending: map[string]chan acpMessage{}}
+	return newOwnedACPConnection(input, output, nil)
+}
+func newOwnedACPConnection(input io.WriteCloser, output io.ReadCloser, retire func(), observers ...func(*acpMessage) error) *acpConnection {
+	c := &acpConnection{input: input, output: output, writes: make(chan acpWrite, 16), messages: make(chan acpMessage, 128), done: make(chan struct{}), pending: map[string]chan acpMessage{}, readerDone: make(chan struct{}), retire: retire}
+	c.pendingMethods = map[string]string{}
+	if len(observers) > 0 {
+		c.observe = observers[0]
+	}
 	go c.writeLoop()
 	go c.readLoop()
 	return c
@@ -98,6 +112,10 @@ func (c *acpConnection) writeLoop() {
 	}
 }
 func (c *acpConnection) readLoop() {
+	defer close(c.readerDone)
+	if c.retire != nil {
+		defer c.retire()
+	}
 	scanner := bufio.NewScanner(c.output)
 	scanner.Buffer(make([]byte, 4096), acpMaxFrame)
 	for scanner.Scan() {
@@ -113,7 +131,14 @@ func (c *acpConnection) readLoop() {
 			}
 			c.mu.Lock()
 			pending := c.pending[string(m.ID)]
+			m.replyMethod = c.pendingMethods[string(m.ID)]
 			c.mu.Unlock()
+			if c.observe != nil {
+				if err := c.observe(&m); err != nil {
+					c.close(err)
+					return
+				}
+			}
 			if pending != nil {
 				select {
 				case pending <- m:
@@ -123,6 +148,12 @@ func (c *acpConnection) readLoop() {
 				}
 			}
 			continue
+		}
+		if c.observe != nil {
+			if err := c.observe(&m); err != nil {
+				c.close(err)
+				return
+			}
 		}
 		select {
 		case c.messages <- m:
@@ -178,6 +209,7 @@ func (c *acpConnection) begin(ctx context.Context, method string, params any) (*
 	id := fmt.Sprint(c.next)
 	reply := make(chan acpMessage, 1)
 	c.pending[id] = reply
+	c.pendingMethods[id] = method
 	c.mu.Unlock()
 	call := &acpCall{id: id, response: reply}
 	if err := c.send(ctx, map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(id), "method": method, "params": params}); err != nil {
@@ -186,7 +218,12 @@ func (c *acpConnection) begin(ctx context.Context, method string, params any) (*
 	}
 	return call, nil
 }
-func (c *acpConnection) finish(call *acpCall) { c.mu.Lock(); delete(c.pending, call.id); c.mu.Unlock() }
+func (c *acpConnection) finish(call *acpCall) {
+	c.mu.Lock()
+	delete(c.pending, call.id)
+	delete(c.pendingMethods, call.id)
+	c.mu.Unlock()
+}
 func (c *acpConnection) notify(ctx context.Context, method string, params any) error {
 	return c.send(ctx, map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
 }

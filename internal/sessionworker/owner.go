@@ -155,11 +155,29 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
 		owner.nativeSink = true
 		driver = d
+	case domain.RuntimeClaudeCode:
+		d := agentruntime.NewClaudePersistent(spec.Binary)
+		d.StateDir = filepath.Join(j.dir, "native-state")
+		d.PrefixArgs = spec.PrefixArgs
+		d.NativeDirs = spec.NativeDirs
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
+		owner.nativeSink = true
+		driver = d
+	case domain.RuntimeOpenCode:
+		d := agentruntime.NewOpenCodePersistent(spec.Binary)
+		d.StateDir = filepath.Join(j.dir, "native-state")
+		d.PrefixArgs = spec.PrefixArgs
+		d.NativeDirs = spec.NativeDirs
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
+		owner.nativeSink = true
+		driver = d
 	case domain.RuntimeGrok:
 		d := agentruntime.NewGrok(spec.Binary)
 		d.StateDir = filepath.Join(j.dir, "native-state")
 		d.PrefixArgs = spec.PrefixArgs
 		d.NativeDirs = spec.NativeDirs
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
+		owner.nativeSink = true
 		driver = d
 	default:
 		cancel()
