@@ -93,3 +93,12 @@ type NativeContentDescriptor struct {
 	State     string                 `json:"state"`
 	Reference NativeContentReference `json:"reference"`
 }
+
+// NativeContentDependency names exact already-attached ciphertext without
+// duplicating its manifest in another128KiB observation frame. The receiver
+// must also verify the original attachment's interaction, origin, native scope
+// and purpose; a content ID alone never grants authority.
+type NativeContentDependency struct {
+	ContentID        string `json:"contentId"`
+	CiphertextDigest string `json:"ciphertextDigest"`
+}

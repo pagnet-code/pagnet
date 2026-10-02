@@ -879,6 +879,10 @@ type InteractionEventPayload struct {
 	// encrypted manifest. It is part of the immutable observation payload;
 	// staged fragments alone never establish an observation receipt.
 	DetailContent *NativeContentReference `json:"detailContent,omitempty"`
+	// OriginalDetailContent binds an answer to its previously preserved exact
+	// request when the native source omitted a byte-identical repeated payload.
+	// Both references belong to the original immutable observation digest.
+	OriginalDetailContent *NativeContentDependency `json:"originalDetailContent,omitempty"`
 }
 
 // --- E2EE / Private Network crypto commands (plan §11.6/§11.7/§11.8) --------

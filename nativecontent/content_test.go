@@ -153,7 +153,7 @@ func TestNativeContentMaximumSourceFitsEveryEncodedFrame(t *testing.T) {
 	if len(transfer.Fragments) != e2ee.NativeContentMaxFragments {
 		t.Fatal("maximum source fragment count incorrect")
 	}
-	interaction := transport.InteractionEventPayload{InteractionID: binding.SubjectID, InstanceID: binding.InstanceID, SessionID: binding.NativeSessionID, NativeGeneration: binding.NativeGeneration, Runtime: "codex", Kind: "permission", Resolved: true, Decision: "resolved", DetailContent: &transfer.Reference}
+	interaction := transport.InteractionEventPayload{InteractionID: binding.SubjectID, InstanceID: binding.InstanceID, SessionID: binding.NativeSessionID, NativeGeneration: binding.NativeGeneration, Runtime: "codex", Kind: "permission", Resolved: true, Decision: "resolved", DetailContent: &transfer.Reference, OriginalDetailContent: &transport.NativeContentDependency{ContentID: transfer.Reference.ContentID, CiphertextDigest: transfer.Reference.CiphertextDigest}}
 	interactionRaw, err := json.Marshal(interaction)
 	if err != nil {
 		t.Fatal(err)
