@@ -26,8 +26,8 @@ func MustSandbox() bool { return true }
 // false is a FAILURE that must stop the launch.
 func Available() bool { return requireKernelABI(getABI()) == nil }
 
-// requireKernelABI enforces complete filesystem integrity, not just read
-// denial: older ABIs cannot prevent truncating protected files.
+// requireKernelABI enforces the filesystem-content protection minimum:
+// older ABIs cannot prevent truncating protected files.
 func requireKernelABI(a landlockABI) error {
 	if a.version < 3 {
 		return fmt.Errorf("unsupported Linux sandbox: Landlock ABI3 or newer is required for truncation protection (detected ABI%d, kernel %s; Linux 6.2+ with Landlock enabled)", a.version, kernelRelease())
@@ -140,15 +140,14 @@ var (
 	// needs (bash opens O_WRONLY|O_CREAT|O_TRUNC); read covers /dev/urandom,
 	// /dev/zero, /dev/tty, /dev/null. No remove bits — creating or removing
 	// device nodes is DAC-gated anyway (/dev is root-owned; a normal user
-	// cannot write the directory). Safe: Landlock sits ON TOP of DAC, so a
-	// device is writable only if the user's DAC already allows it (a normal
-	// user: /dev/null + own ttys; /dev/mem, /dev/sda, ... stay denied).
+	// cannot write the directory). Device access also depends on the user's
+	// existing OS permissions, including supplementary groups. This policy
+	// does not restrict device IOCTLs or grant only selected device nodes.
 	// See the Spec.Dev doc.
 	devAccess = uint64(bReadFile | bReadDir | bWriteFile | bExecute | bTruncate)
-	// traverseAccess grants directory entry names, never file contents.
-	// The policy grants it on socket parents and conservatively on grant
-	// ancestors for ABI1–3. Modern ABI4 native tests need no ancestor grants.
-	traverseAccess = uint64(bReadDir)
+	// directoryNamesAccess grants directory entry names, never file contents.
+	// The policy grants it only on explicitly listed socket parents.
+	directoryNamesAccess = uint64(bReadDir)
 )
 
 // Apply installs the sandbox on the CURRENT process (the wrapper, immediately
@@ -271,17 +270,13 @@ func applyLandlock(spec *Spec) error {
 // as opposed to the best-effort coarse RO support paths (a missing one is
 // a deterministic no-op skip — see applyLandlock). For each granted
 // subtree (RW/RO/Dev) it records the grant on the subtree root; for each
-// socket it records READ_DIR (traversal) on the socket's parent subtree.
+// socket it records READ_DIR (directory listing) on its parent subtree.
 //
-// The current policy adds conservative ancestor READ_DIR grants on ABI1–3
-// and omits them on ABI4+ (verified on this host's ABI4). This is a policy
-// compatibility choice, not a guarantee that older kernels require it.
-// READ_DIR on / exposes entry names beneath it; it never grants READ_FILE.
+// Only explicit subtree roots receive grants; path traversal needs no
+// ancestor READ_DIR grant. READ_DIR permits opening/listing directories.
 // stat/lstat metadata is not restricted by Landlock on any ABI.
-//
-// Grants are intersected with the rights supported by the detected ABI.
-// ABI1/2 cannot restrict truncation; unsupported operations remain residual
-// limitations, rather than becoming more restrictive through bit omission.
+// Grants are intersected with the rights supported by the detected ABI;
+// Apply rejects ABI1/2 because they cannot restrict truncation.
 //
 // Pathname Unix socket connections are not currently handled by this policy.
 // Linux added LANDLOCK_ACCESS_FS_RESOLVE_UNIX in ABI v9, not ABI v5 (which
@@ -299,8 +294,6 @@ func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[s
 	// paths are best-effort (a missing one is a no-op grant, skipped).
 	mandatory := map[string]bool{}
 	abiMask := abi.fsMask
-	// Preserve the existing conservative ancestor grants on ABI1–3.
-	legacyTraversal := abi.version >= 1 && abi.version < 4
 	add := func(p string, selfAccess uint64, isMandatory bool) error {
 		p = filepath.Clean(p)
 		if p == "" {
@@ -315,15 +308,6 @@ func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[s
 			mandatory[p] = true
 		}
 		accessFs |= grant
-		if legacyTraversal {
-			for d := filepath.Dir(p); ; d = filepath.Dir(d) {
-				rules[d] |= traverseAccess
-				accessFs |= traverseAccess
-				if d == "/" {
-					break
-				}
-			}
-		}
 		return nil
 	}
 	for _, p := range spec.RW {
@@ -348,9 +332,9 @@ func computeRules(spec *Spec, abi landlockABI) (map[string]uint64, uint64, map[s
 		if parent == s {
 			return nil, 0, nil, fmt.Errorf("socket path %q has no parent directory", s)
 		}
-		// READ_DIR on the parent (to resolve the socket file) + traversal on
-		// the ancestors. See the function doc for why CONNECT is not gated.
-		if err := add(parent, traverseAccess, false); err != nil {
+		// Permit listing the explicit socket parent, never reading its files.
+		// This is not a connection gate; see the function doc for IPC limits.
+		if err := add(parent, directoryNamesAccess, false); err != nil {
 			return nil, 0, nil, err
 		}
 	}

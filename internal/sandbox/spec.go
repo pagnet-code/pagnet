@@ -27,10 +27,10 @@
 //
 // Actual exposure (kernel-inherent, all ABIs): Landlock never gates
 // stat/lstat — a sandboxed process can learn the existence/size/mtime of
-// any path, but never file contents. On ABI v1–v3 kernels the ancestor
-// traversal chain (a conservative policy compatibility choice) additionally
-// exposes directory entry NAMES system-wide; on ABI v4+ no ancestor grants
-// are added, so only the granted subtrees' entry names are visible.
+// any path. Landlock also does not restrict chmod/chown or timestamp changes;
+// ordinary OS permissions still apply. Directory entry names are visible only
+// within explicitly granted subtrees and socket parents; there are no
+// implicit ancestor directory-listing grants.
 package sandbox
 
 import (
@@ -75,12 +75,9 @@ type Spec struct {
 	// (RuntimeSupportRO) and any extras.
 	RO []string
 	// Sockets: unix socket paths the runtime must be able to reach (the
-	// daemon bridge socket). The sandbox grants READ_DIR (traversal) on the
-	// socket's parent — and, on ABI v1–v3 kernels only, on its ancestors up
-	// to / (a conservative compatibility policy; on ABI v4+ the
-	// parent rule alone suffices — verified empirically) — so any file
-	// access toward that path walks a granted chain. No read/write on the
-	// surrounding dir contents.
+	// daemon bridge socket). The sandbox grants directory listing on the
+	// socket's parent, never read/write access to its surrounding files.
+	// Parent listing is a policy grant, not a path-traversal requirement.
 	//
 	// Pathname Unix socket connections are gateable since Landlock ABI v9
 	// through LANDLOCK_ACCESS_FS_RESOLVE_UNIX. This policy does not yet handle
@@ -450,8 +447,7 @@ type Options struct {
 	// BridgeDir: the directory containing the daemon bridge worker binary
 	// (the pagnet MCP server the runtime spawns as its child). RO grant
 	// (read+execute) — the sandboxed runtime must be able to EXEC its MCP
-	// server; the ancestors get READ_DIR traversal from the rule
-	// expansion, so the one directory grant is sufficient.
+	// server. The directory grant needs no ancestor listing grants.
 	BridgeDir string
 	// ExtraRO / ExtraRW: driver-specific additions.
 	ExtraRO []string
@@ -472,7 +468,7 @@ type Options struct {
 // + the bridge socket + the Denied containment set. The daemon's state dir
 // is NEVER placed in RW or RO — it is reached only through READ_DIR on the
 // socket's parent (entry NAMES visible, never file CONTENTS: Landlock
-// grants READ_DIR on the state dir for traversal but never READ_FILE), and
+// grants READ_DIR on the state dir but never READ_FILE), and
 // Options.Denied carries it as a containment set: a spec whose RW or RO grants
 // cover a denied path (workspace = $HOME swallowing ~/.pagnet) is refused
 // by Normalize — the launch fails closed before any process starts.

@@ -125,46 +125,31 @@ func TestComputeRules_MaskIntersection(t *testing.T) {
 	}
 }
 
-// TestComputeRules_AncestorTraversalPerABI pins the F-S2-3 behavior: the
-// ancestor READ_DIR chain is added ONLY on ABI v1–v3 (the kernel's path
-// resolution requires it there); on ABI v4+ the subtree rules stand alone
-// (verified empirically: absolute-path open + socket connect into a leaf
-// subtree succeed with no ancestor grants on this host, 6.8 / ABI v4).
-func TestComputeRules_AncestorTraversalPerABI(t *testing.T) {
+// TestComputeRules_NoAmbientAncestorListing prevents broad directory-name
+// exposure on every supported ABI. Exact leaf grants need no ancestor rules.
+func TestComputeRules_NoAmbientAncestorListing(t *testing.T) {
 	spec := &Spec{RW: []string{"/home/u/ws"}, Sockets: []string{"/state/pagnetd.sock"}}
-	// ABI v1: every ancestor up to / gets READ_DIR (the legacy exposure).
-	// Use the original ABI1 filesystem mask.
-	rules, _, _, err := computeRules(spec, landlockABI{
-		version: 1, fsMask: landlockFSMask(1),
-	})
-	if err != nil {
-		t.Fatalf("computeRules (v1): %v", err)
-	}
-	for _, ancestor := range []string{"/home/u", "/home", "/"} {
-		if rules[ancestor]&traverseAccess != traverseAccess {
-			t.Errorf("v1: ancestor %s lacks READ_DIR traversal (got 0x%x)", ancestor, rules[ancestor])
-		}
-	}
-	// ABI v4: NO ancestor rules — only the granted subtrees (the RW root
-	// and the socket's parent). The stat-metadata exposure remains on all
-	// ABIs (kernel-inherent); the entry-name exposure does not.
-	rules, _, _, err = computeRules(spec, landlockABI{version: 4, fsMask: 0x7FFF})
-	if err != nil {
-		t.Fatalf("computeRules (v4): %v", err)
-	}
-	if len(rules) != 2 {
-		t.Fatalf("v4: %d rules, want exactly the 2 subtree rules (got %v)", len(rules), rules)
-	}
-	for _, p := range []string{"/home/u", "/home", "/"} {
-		if _, ok := rules[p]; ok {
-			t.Errorf("v4: unexpected ancestor rule %q (got %v)", p, rules)
-		}
-	}
-	if rules["/home/u/ws"] != rwAccess {
-		t.Errorf("v4: rw grant = 0x%x, want the full rw set 0x%x", rules["/home/u/ws"], rwAccess)
-	}
-	if rules["/state"]&traverseAccess != traverseAccess {
-		t.Errorf("v4: socket parent %q lacks READ_DIR (got 0x%x)", "/state", rules["/state"])
+	for _, version := range []int{3, 4, 5, 6, 9} {
+		t.Run(fmt.Sprintf("ABI%d", version), func(t *testing.T) {
+			rules, _, _, err := computeRules(spec, landlockABI{version: version, fsMask: landlockFSMask(version)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rules) != 2 {
+				t.Fatalf("%d rules, want exactly the two explicit subtree roots: %v", len(rules), rules)
+			}
+			for _, ancestor := range []string{"/home/u", "/home", "/"} {
+				if _, ok := rules[ancestor]; ok {
+					t.Errorf("unexpected ancestor listing grant %q", ancestor)
+				}
+			}
+			if rules["/home/u/ws"] != rwAccess {
+				t.Errorf("RW grant = %#x, want %#x", rules["/home/u/ws"], rwAccess)
+			}
+			if rules["/state"] != directoryNamesAccess {
+				t.Errorf("socket parent grant = %#x, want directory names only", rules["/state"])
+			}
+		})
 	}
 }
 
