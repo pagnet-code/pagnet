@@ -40,6 +40,9 @@ func TestNativeOutputTailOriginalKeyReopenBoundAndQuiescence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if data.FirstObservedAt.Nanosecond()%1000 != 0 || data.LastObservedAt.Nanosecond()%1000 != 0 {
+		t.Fatal("encrypted original tail clock is not canonical")
+	}
 	originalCount := data.DeltaCount
 	clear(data.Key)
 	// Exact callback retries recover uncertain COMMIT, without duplicating text.

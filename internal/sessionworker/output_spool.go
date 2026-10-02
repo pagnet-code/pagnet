@@ -140,7 +140,7 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	var previous []byte
 	err = tx.QueryRowContext(ctx, `SELECT ciphertext FROM worker_output_spools WHERE sequence=? AND native_generation=?`, source.Sequence, source.NativeGeneration).Scan(&previous)
 	if err == sql.ErrNoRows {
-		result = nativeOutputSpool{Source: source, Origin: append(json.RawMessage(nil), p.origin...), StreamID: uuid.NewString(), BatchID: uuid.NewString(), FirstObservedAt: time.Now().UTC(), KeyAvailable: available}
+		result = nativeOutputSpool{Source: source, Origin: append(json.RawMessage(nil), p.origin...), StreamID: uuid.NewString(), BatchID: uuid.NewString(), FirstObservedAt: nativeSourceTime(time.Now()), KeyAvailable: available}
 		if available {
 			result.Key = append([]byte(nil), originalKey[:]...)
 		}
@@ -180,9 +180,9 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	result.DeltaCount++
 	result.NativeBytes += len(event.Output)
 	if result.Text == "" {
-		result.FirstObservedAt = time.Now().UTC()
+		result.FirstObservedAt = nativeSourceTime(time.Now())
 	}
-	result.LastObservedAt = time.Now().UTC()
+	result.LastObservedAt = nativeSourceTime(time.Now())
 	result.Text += event.Output
 	result.LastDeltaID, result.LastDeltaDigest = deltaID, deltaDigest
 	sealed, err := sealOutputSpool(key, j.scope, j.dir, result)

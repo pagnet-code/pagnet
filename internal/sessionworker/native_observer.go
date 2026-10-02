@@ -15,6 +15,10 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+// nativeSourceTime fixes transport precision before capture, encryption and digest.
+// PostgreSQL retains microseconds; private provider event timestamps remain untouched.
+func nativeSourceTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsecond) }
+
 // The factory runs before the endpoint reader starts. Each closure retains the
 // original activation source even when subsequent delivery commands arrive.
 func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeSourceProducer) session.NativeEventObserver {
@@ -43,7 +47,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		if projection != nil && projection.Ready != nil {
 			return o.commitReadyNativeOutput(observeCtx, producer, projection)
 		}
-		observedAt := time.Now().UTC()
+		observedAt := nativeSourceTime(time.Now())
 		o.mu.Lock()
 		if o.generation == generation {
 			o.manager.ObserveNativeActivity(instanceID, event)
