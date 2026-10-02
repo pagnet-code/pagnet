@@ -7,6 +7,9 @@ export PATH := $(dir $(GO)):$(PATH)
 
 BIN := bin
 RELEASE_DIR := dist
+# FULL-fsync native worker subprocess race fixtures take about eight minutes
+# locally; keep a bounded per-package budget with room for slower CI disks.
+TEST_TIMEOUT ?= 20m
 VERSION ?= $(shell sh scripts/version.sh)
 RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
 
@@ -33,10 +36,10 @@ install: validate-version
 	$(GO) install -ldflags "-X main.version=$(VERSION) -X main.defaultServerURL=$(DEFAULT_SERVER_URL)" ./cmd/pagnet
 
 test:
-	$(GO) test ./...
+	$(GO) test -timeout=$(TEST_TIMEOUT) ./...
 
 test-race:
-	$(GO) test -race ./...
+	$(GO) test -timeout=$(TEST_TIMEOUT) -race ./...
 
 fmt:
 	$(GO) fmt ./...

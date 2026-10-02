@@ -36,12 +36,15 @@ jobs:
       - run: GOOS=windows GOARCH=amd64 go build -o /tmp/pagnet-windows-amd64.exe ./cmd/pagnet
       - run: GOOS=windows GOARCH=arm64 go build -o /tmp/pagnet-windows-arm64.exe ./cmd/pagnet
       - run: GOOS=windows GOARCH=amd64 go vet ./sdk ./e2ee ./internal/externalbridge
-      - run: go test -count=1 ./...
+      # Match Makefile TEST_TIMEOUT: FULL-fsync worker subprocess fixtures
+      # need headroom above Go's default 10m on slower CI disks. Each package
+      # remains bounded; failures and races still fail the job.
+      - run: go test -timeout=20m -count=1 ./...
       # -race: pagnet pushes BEFORE the monorepo pointer bump, so a
       # regression only the race detector catches must fail here, not
       # first in the monorepo (the 2026-09-29 stderr-drain race). The P0
       # process stress fixtures are bounded by default (the heavy variant
       # is opt-in via PAGNET_PROC_STRESS, unset in CI), so the detector's
       # overhead is safe on the runner.
-      - run: go test -count=1 -race ./...
+      - run: go test -timeout=20m -count=1 -race ./...
       - run: test -z "$(gofmt -l .)"
