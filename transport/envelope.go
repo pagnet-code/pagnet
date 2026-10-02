@@ -532,8 +532,9 @@ type ListDirsResultPayload struct {
 
 // StopAgentPayload stops an agent instance.
 type StopAgentPayload struct {
-	CommandID  string `json:"commandId"`
-	InstanceID string `json:"instanceId"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	CommandID      string               `json:"commandId"`
+	InstanceID     string               `json:"instanceId"`
 }
 
 // RestartAgentPayload restarts an agent instance.
@@ -750,9 +751,10 @@ type DetachTerminalPayload struct {
 // TerminalStopPayload kills the instance's PTY session. Durable and
 // idempotent (a second stop is an acknowledged no-op).
 type TerminalStopPayload struct {
-	CommandID  string `json:"commandId"`
-	InstanceID string `json:"instanceId"`
-	SessionID  string `json:"sessionId"`
+	NativeDispatch *NativeDispatchProof `json:"nativeDispatch,omitempty"`
+	CommandID      string               `json:"commandId"`
+	InstanceID     string               `json:"instanceId"`
+	SessionID      string               `json:"sessionId"`
 }
 
 // TerminalSnapshotPayload requests one PTY snapshot frame for an attach
