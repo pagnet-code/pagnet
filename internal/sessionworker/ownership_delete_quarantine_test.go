@@ -15,7 +15,7 @@ import (
 )
 
 func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
-	for _, variant := range []string{"expired", "stale_origin", "missing-proof", "missing-disposition", "invalid-disposition", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
+	for _, variant := range []string{"expired", "stale_origin", "missing-proof", "missing-disposition", "invalid-disposition", "proof-points-to-nonstopped", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
 		t.Run(variant, func(t *testing.T) {
 			j, _ := testJournal(t)
 			defer j.Close()
@@ -77,6 +77,15 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 				proof.StoppedDisposition = ""
 			case "invalid-disposition":
 				proof.StoppedDisposition = "unsupported"
+			case "proof-points-to-nonstopped":
+				proof.StoppedObservationID = observation.ID
+				proof.OriginID = origin.ID
+				proof.NativeGeneration = observation.NativeGeneration
+				proof.NativeSessionID = observation.NativeSessionID
+				proof.StoppedDigest = observation.SourceDigest
+				proof.StoppedSourceSequence = pending[0].SourceSequence
+				proof.StoppedObservedAt = observation.ObservedAt
+				proof.StoppedDisposition = receipt.Disposition
 			case "foreign-ownership":
 				proof.StopProof.OwnershipID = domain.NewID().String()
 			case "foreign-generation":
