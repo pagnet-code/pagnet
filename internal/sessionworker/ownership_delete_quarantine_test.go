@@ -15,7 +15,7 @@ import (
 )
 
 func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
-	for _, variant := range []string{"expired", "stale_origin", "missing-proof", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
+	for _, variant := range []string{"expired", "stale_origin", "missing-proof", "missing-disposition", "invalid-disposition", "foreign-ownership", "foreign-generation", "unaccepted-stop", "live-reader", "uncertain-effect", "uncommitted-source", "corrupt-receipt"} {
 		t.Run(variant, func(t *testing.T) {
 			j, _ := testJournal(t)
 			defer j.Close()
@@ -69,10 +69,14 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 				}
 			}
 			now := time.Now().UTC()
-			proof := &transport.NativeOwnershipDeletionProof{DeleteRequestID: domain.NewID().String(), StopProof: stop, OriginID: "latest-original-stop-origin", NativeGeneration: "latest-activation", NativeSessionID: "latest-session", StoppedObservationID: domain.NewID().String(), StoppedDigest: strings.Repeat("a", 64), StoppedSourceSequence: 3, StoppedObservedAt: now, StoppedExpiresAt: now.Add(time.Hour)}
+			proof := &transport.NativeOwnershipDeletionProof{DeleteRequestID: domain.NewID().String(), StopProof: stop, OriginID: "latest-original-stop-origin", NativeGeneration: "latest-activation", NativeSessionID: "latest-session", StoppedObservationID: domain.NewID().String(), StoppedDigest: strings.Repeat("a", 64), StoppedSourceSequence: 3, StoppedDisposition: "committed", StoppedObservedAt: now, StoppedExpiresAt: now.Add(time.Hour)}
 			switch variant {
 			case "missing-proof":
 				proof = nil
+			case "missing-disposition":
+				proof.StoppedDisposition = ""
+			case "invalid-disposition":
+				proof.StoppedDisposition = "unsupported"
 			case "foreign-ownership":
 				proof.StopProof.OwnershipID = domain.NewID().String()
 			case "foreign-generation":

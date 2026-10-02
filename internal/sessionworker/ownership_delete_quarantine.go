@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -15,6 +16,11 @@ import (
 // native effect. The original worker scope and actual reader EOF stay mandatory.
 func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, proof *transport.NativeOwnershipDeletionProof) error {
 	if proof == nil || proof.DeleteRequestID == "" || proof.OriginID == "" || proof.NativeGeneration == "" || proof.NativeSessionID == "" || proof.StoppedObservationID == "" || proof.StoppedSourceSequence <= 0 || proof.StoppedObservedAt.IsZero() || !proof.StoppedExpiresAt.After(proof.StoppedObservedAt) {
+		return ErrConflict
+	}
+	switch proof.StoppedDisposition {
+	case "committed", "expired", "stale_origin", transport.NativeObservationDeleteQuarantined:
+	default:
 		return ErrConflict
 	}
 	digest, err := hex.DecodeString(proof.StoppedDigest)
@@ -73,6 +79,10 @@ func (j *Journal) CollectDeletionQuarantines(ctx context.Context, lease int64, p
 		observation.SourceSequence = sequence
 		actual, digestErr := observationDigest(observation)
 		if digestErr != nil || actual != privateDigest || !matchingTerminalReceipt(observation, terminal) {
+			rows.Close()
+			return ErrConflict
+		}
+		if id == proof.StoppedObservationID && (observation.Event.Type != session.EventSessionStopped || origin.ID != proof.OriginID || observation.NativeGeneration != proof.NativeGeneration || observation.NativeSessionID != proof.NativeSessionID || privateDigest != proof.StoppedDigest || sequence != proof.StoppedSourceSequence || !observation.ObservedAt.Equal(proof.StoppedObservedAt) || terminal.Disposition != proof.StoppedDisposition) {
 			rows.Close()
 			return ErrConflict
 		}
