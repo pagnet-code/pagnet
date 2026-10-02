@@ -304,6 +304,16 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 		}
 		return errors.New("This runtime does not expose an original interactive terminal")
 	}
+	// A local live PTY is not yet proof that this fresh remote connection owns
+	// its original session. Commit the exact live source before publishing a key;
+	// asynchronous pump ordering must not make the server silently drop bootstrap.
+	if err = proxy.Reconcile(ctx); err != nil {
+		return errors.Join(ErrDeferred, err)
+	}
+	snapshot, err = proxy.Snapshot(ctx)
+	if err != nil || !snapshot.HasTerminal {
+		return errors.Join(ErrDeferred, err)
+	}
 	capture, err := d.nativeTerminalCaptureFor(proxy, snapshot)
 	if err != nil {
 		return err
