@@ -26,6 +26,8 @@ type NativeResolution struct {
 	DetailAAD      e2ee.AAD                          `json:"detailAAD"`
 }
 type NativeObservation struct {
+	// SourceSequence is durable delivery metadata, independent of private capture identity.
+	SourceSequence               int64                             `json:"sourceSequence,omitempty"`
 	OriginalNativePayloadContent *transport.NativeContentReference `json:"originalNativePayloadContent,omitempty"`
 	TurnSource                   *NativeTurnSource                 `json:"turnSource,omitempty"`
 	SourceUnavailable            bool                              `json:"sourceUnavailable,omitempty"`
@@ -44,6 +46,7 @@ type NativeObservation struct {
 
 func observationDigest(observation NativeObservation) (string, error) {
 	observation.SourceDigest = ""
+	observation.SourceSequence = 0
 	raw, err := json.Marshal(observation)
 	if err != nil || len(raw) > maxFrame*3/4 {
 		return "", errors.New("native observation exceeds private frame bound")
@@ -125,6 +128,16 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	// Only an actually pinned original native producer can retry an ambiguous
+	// COMMIT after ACK. Pins have worker lifetime, and no IPC append API exists.
+	if retry := j.sourceRetries[observation.ID]; retry != nil {
+		if retry.digest != digest {
+			return ErrConflict
+		}
+		if retry.retired {
+			return nil
+		}
+	}
 	var count, total int
 	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
 		return err
@@ -133,6 +146,9 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 		return ErrFull
 	}
 	if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observation.ID, digest, raw, len(raw)); err != nil {
+		return err
+	}
+	if err = allocateSourceSequence(ctx, tx, observation); err != nil {
 		return err
 	}
 	if err = retainNativeEventSource(ctx, tx, observation); err != nil {
@@ -176,7 +192,7 @@ func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit in
 			return nil, err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT payload FROM worker_observations ORDER BY sequence LIMIT ?`, limit)
+	rows, err := tx.QueryContext(ctx, `SELECT o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id ORDER BY o.sequence LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +201,8 @@ func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit in
 	total := 0
 	for rows.Next() {
 		var raw []byte
-		if err = rows.Scan(&raw); err != nil {
+		var sourceSequence int64
+		if err = rows.Scan(&raw, &sourceSequence); err != nil {
 			return nil, err
 		}
 		if total+len(raw) > maxFrame*3/4 {
@@ -196,6 +213,7 @@ func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit in
 		if err = json.Unmarshal(raw, &observation); err != nil {
 			return nil, err
 		}
+		observation.SourceSequence = sourceSequence
 		result = append(result, observation)
 	}
 	if err = rows.Err(); err != nil {
@@ -210,8 +228,8 @@ func (j *Journal) pendingObservations(ctx context.Context, lease int64, limit in
 	return result, nil
 }
 
-// A controller acknowledges only after its ciphertext outbox COMMIT. Removing
-// this row never asserts a control-plane or browser receipt.
+// A controller acknowledges only after a matching durable backend commit receipt.
+// Staging receipts, writes and local projections never retire original evidence.
 func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, digest string) error {
 	if id == "" || len(id) > 256 || len(digest) != 64 {
 		return errors.New("invalid native observation acknowledgement")
@@ -237,6 +255,9 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	if previous != digest {
 		return ErrConflict
 	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_observation_sequence WHERE observation_id=?`, id); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_content_fragments WHERE observation_id=?`, id); err != nil {
 		return err
 	}
@@ -249,6 +270,9 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	}
 	if err = tx.Commit(); err != nil {
 		return err
+	}
+	if retry := j.sourceRetries[id]; retry != nil {
+		retry.retired = true
 	}
 	close(j.observationCapacity)
 	j.observationCapacity = make(chan struct{})

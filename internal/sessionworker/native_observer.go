@@ -125,6 +125,10 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 			return err
 		}
 		observation.SourceDigest = digest
+		if err = o.journal.pinSourceRetry(observation.ID, digest); err != nil {
+			return err
+		}
+		defer o.journal.releaseSourceRetry(observation.ID, digest)
 		backoff := 250 * time.Millisecond
 		for {
 			available := o.journal.ObservationCapacity()

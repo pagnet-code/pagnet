@@ -56,6 +56,7 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
+	sourceRetries       map[string]*nativeSourceRetry
 	observationCapacity chan struct{}
 	mu                  sync.Mutex
 	db                  *sql.DB
@@ -130,6 +131,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 		return fail(errors.New("worker journal scope or protocol mismatch"))
 	}
 	if err = j.initializeObservations(); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeSourceSequences(); err != nil {
 		return fail(err)
 	}
 	if err = j.initializeCaptures(); err != nil {

@@ -18,14 +18,16 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
-	mu              sync.Mutex
-	hostID, bootID  string
-	serverURL       string
-	session         *transport.HostSessionPayload
-	pending         map[string]chan transport.NativeOriginRegisteredPayload
-	pendingSessions map[string]chan transport.NativeOriginSessionConfirmedPayload
-	closed          chan struct{}
-	send            func(context.Context, string, any) error
+	mu                  sync.Mutex
+	hostID, bootID      string
+	serverURL           string
+	session             *transport.HostSessionPayload
+	pending             map[string]chan transport.NativeOriginRegisteredPayload
+	pendingSessions     map[string]chan transport.NativeOriginSessionConfirmedPayload
+	pendingContent      map[string]chan transport.NativeContentStagedPayload
+	pendingObservations map[string]chan transport.NativeObservationReceiptPayload
+	closed              chan struct{}
+	send                func(context.Context, string, any) error
 }
 
 func NewNativeObservationConnection(serverURL, hostID, bootID string, send func(context.Context, string, any) error) *NativeObservationConnection {
@@ -141,7 +143,7 @@ func (c *NativeObservationConnection) RegisterOriginForSource(ctx context.Contex
 		c.mu.Unlock()
 		return nil, ErrNativeObservationConflict
 	}
-	if len(c.pending)+len(c.pendingSessions) >= 64 {
+	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
 		c.mu.Unlock()
 		return nil, ErrNativeObservationCapacity
 	}
@@ -234,7 +236,7 @@ func (c *NativeObservationConnection) ConfirmSession(ctx context.Context, origin
 		c.mu.Unlock()
 		return ErrNativeObservationConflict
 	}
-	if len(c.pending)+len(c.pendingSessions) >= 64 {
+	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
 		c.mu.Unlock()
 		return ErrNativeObservationCapacity
 	}
