@@ -7,7 +7,6 @@ import (
 	"errors"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
-	"reflect"
 )
 
 // DispatchCancellationPreparation is not an intent or native outcome. The
@@ -173,7 +172,7 @@ func (j *Journal) PrepareDispatchCancellation(ctx context.Context, lease int64, 
 	err = tx.QueryRowContext(ctx, `SELECT payload FROM worker_dispatch_cancellations WHERE dispatch_sequence=? OR command_id=?`, p.DispatchSequence, p.SourceCommandID).Scan(&raw)
 	if err == nil {
 		var old DispatchCancellationPreparation
-		if json.Unmarshal(raw, &old) != nil || !reflect.DeepEqual(old.Proposal, proposal) {
+		if json.Unmarshal(raw, &old) != nil || !transport.SameNativeDispatchCancellationProposal(old.Proposal, proposal) {
 			return record, ErrConflict
 		}
 		return old, nil
@@ -219,7 +218,7 @@ func (j *Journal) FinalizeDispatchCancellation(ctx context.Context, lease int64,
 		return err
 	}
 	var record DispatchCancellationPreparation
-	if json.Unmarshal(raw, &record) != nil || !validCancellationPreparation(j.scope, record) || record.Request.RequestID != response.RequestID || record.Request.InstanceID != response.InstanceID || !reflect.DeepEqual(record.Proposal.Proof, *response.Proof) {
+	if json.Unmarshal(raw, &record) != nil || !validCancellationPreparation(j.scope, record) || record.Request.RequestID != response.RequestID || record.Request.InstanceID != response.InstanceID || !transport.SameNativeDispatchProof(record.Proposal.Proof, *response.Proof) {
 		return ErrConflict
 	}
 	if err = checkCancellationOwnershipTx(ctx, tx, j.scope, *response.Proof, false); err != nil {

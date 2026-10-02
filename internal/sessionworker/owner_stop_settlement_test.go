@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
@@ -174,6 +175,35 @@ func TestOwnerStoppedPurgesOnlyOriginalUnpublishedPrivatePermission(t *testing.T
 				if sourceCount(t, f.journal, "worker_observations") != 1 || sourceCount(t, f.journal, "worker_source_captures") != 1 || sourceCount(t, f.journal, "worker_owner_stop_settlements") != 0 {
 					t.Fatal("failed deletion lost original evidence", kind)
 				}
+			}
+		})
+	}
+}
+
+func TestOwnerStoppedAcceptsOnlyExactSQLTimestampInstants(t *testing.T) {
+	for _, change := range []string{"representation", "changed-epoch", "changed-stopped-time"} {
+		t.Run(change, func(t *testing.T) {
+			f, p := originalDeleteFixture(t, false, "permission-no-id")
+			defer f.journal.Close()
+			p.StopProof.SourceRunnerEpoch = p.StopProof.SourceRunnerEpoch.In(time.FixedZone("Europe/Lisbon", 3600))
+			p.StoppedObservedAt = p.StoppedObservedAt.In(time.FixedZone("Europe/Lisbon", 3600))
+			p.StoppedExpiresAt = p.StoppedExpiresAt.In(time.FixedZone("Europe/Lisbon", 3600))
+			if change == "changed-epoch" {
+				p.StopProof.SourceRunnerEpoch = p.StopProof.SourceRunnerEpoch.Add(time.Nanosecond)
+			}
+			if change == "changed-stopped-time" {
+				p.StoppedObservedAt = p.StoppedObservedAt.Add(time.Nanosecond)
+			}
+			err := f.journal.collectDeletionQuarantines(t.Context(), f.lease, p, f.key)
+			if change == "representation" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sourceCount(t, f.journal, "worker_owner_stop_settlements") != 1 || sourceCount(t, f.journal, "worker_observations") != 0 {
+					t.Fatal("exact original interruption not reclaimed")
+				}
+			} else if err == nil || sourceCount(t, f.journal, "worker_owner_stop_settlements") != 0 || sourceCount(t, f.journal, "worker_observations") != 1 {
+				t.Fatal("changed original timestamp accepted or evidence lost", err)
 			}
 		})
 	}

@@ -171,7 +171,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 		return err
 	}
 	var stop transport.NativeDispatchProof
-	if json.Unmarshal(stopRaw, &stop) != nil || !reflect.DeepEqual(stop, d.StopProof) || stopKind != "stop" || stopState != "completed" {
+	if json.Unmarshal(stopRaw, &stop) != nil || !transport.SameNativeDispatchProof(stop, d.StopProof) || stopKind != "stop" || stopState != "completed" {
 		return ErrConflict
 	}
 	stage = "original_stopped_receipt"
@@ -308,7 +308,7 @@ func (j *Journal) collectOwnerStoppedPrivateInspectionsTx(ctx context.Context, t
 		} else if err != nil {
 			return err
 		}
-		if json.Unmarshal(raw, &e) != nil || validateOwnerStopSettlement(j.scope, e) != nil || !reflect.DeepEqual(e.Deletion, *d) || !reflect.DeepEqual(e.Turn, *c.o.TurnSource) || !reflect.DeepEqual(e.Stopped.Observation.Origin, c.o.Origin) {
+		if json.Unmarshal(raw, &e) != nil || validateOwnerStopSettlement(j.scope, e) != nil || !transport.SameNativeOwnershipDeletionProof(e.Deletion, *d) || !reflect.DeepEqual(e.Turn, *c.o.TurnSource) || !reflect.DeepEqual(e.Stopped.Observation.Origin, c.o.Origin) {
 			continue
 		}
 		for _, q := range []string{`DELETE FROM worker_observation_sequence WHERE observation_id=?`, `DELETE FROM worker_source_captures WHERE id=?`, `DELETE FROM worker_observations WHERE id=?`} {

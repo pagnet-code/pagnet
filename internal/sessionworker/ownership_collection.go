@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
@@ -45,7 +44,7 @@ func CollectRetiredWorker(ctx context.Context, dir string, scope Scope, proof tr
 		return err
 	}
 	var committed transport.NativeWorkerOwnership
-	if json.Unmarshal(raw, &committed) != nil || !reflect.DeepEqual(committed, proof) {
+	if json.Unmarshal(raw, &committed) != nil || !transport.SameNativeWorkerOwnership(committed, proof) {
 		return ErrConflict
 	}
 	if authorizeCollection == nil {

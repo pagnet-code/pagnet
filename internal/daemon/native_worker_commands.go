@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"reflect"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -94,7 +93,7 @@ func nativeDispatchOperationSequence(proof transport.NativeDispatchProof, record
 		if record.Proof.DispatchSequence != proof.DispatchSequence {
 			continue
 		}
-		if !reflect.DeepEqual(record.Proof, proof) || record.OperationSequence <= 0 {
+		if !transport.SameNativeDispatchProof(record.Proof, proof) || record.OperationSequence <= 0 {
 			return 0, ErrNativeObservationConflict
 		}
 		return record.OperationSequence, nil

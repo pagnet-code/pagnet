@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"reflect"
 
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -39,7 +38,8 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	var previous []byte
 	err = tx.QueryRowContext(ctx, `SELECT payload FROM worker_ownership_retirement WHERE singleton=1`).Scan(&previous)
 	if err == nil {
-		if !reflect.DeepEqual(previous, raw) {
+		var committed transport.NativeWorkerOwnership
+		if json.Unmarshal(previous, &committed) != nil || !transport.SameNativeWorkerOwnership(committed, proof) {
 			return ErrConflict
 		}
 		return tx.Commit()
@@ -61,7 +61,7 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	normalized.DeletionProof = nil
 	normalized.LastDispatchSequence = 0
 	normalized.RetiredFloor = 0
-	if !reflect.DeepEqual(bound, normalized) || last != proof.LastDispatchSequence || floor != proof.RetiredFloor {
+	if !transport.SameNativeWorkerOwnership(bound, normalized) || last != proof.LastDispatchSequence || floor != proof.RetiredFloor {
 		return ErrConflict
 	}
 	if err = j.collectClosedPrivateObservationsTx(ctx, tx); err != nil {

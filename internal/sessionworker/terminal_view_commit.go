@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/pagnet-code/pagnet/transport"
-	"reflect"
 )
 
 // A completed native attach only means the PTY exists. Its original operation
@@ -30,7 +29,7 @@ func (j *Journal) CommitTerminalView(ctx context.Context, lease int64, proof *tr
 		return err
 	}
 	var original transport.NativeDispatchProof
-	if json.Unmarshal(raw, &original) != nil || !reflect.DeepEqual(original, *proof) {
+	if json.Unmarshal(raw, &original) != nil || !transport.SameNativeDispatchProof(original, *proof) {
 		return ErrConflict
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE worker_terminal_view_commits SET committed=1 WHERE operation_sequence=?`, sequence)
