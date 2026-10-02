@@ -51,7 +51,12 @@ func TestActualPagnetServeOwnedDeletion(t *testing.T) {
 	runActualPagnetServeContinuity(t, true)
 }
 
-func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
+func TestActualPagnetServeRevokedGrantOwnedDeletion(t *testing.T) {
+	runActualPagnetServeContinuity(t, true, true)
+}
+
+func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool, revokedMode ...bool) {
+	revokedDelete := len(revokedMode) > 0 && revokedMode[0]
 	if os.Getenv("PAGNET_NATIVE_SERVE_PROOF") != "1" {
 		t.Skip("requires explicit isolated PostgreSQL production serve proof")
 	}
@@ -140,7 +145,11 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 	start := func(binary string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, "serve", "--state-dir", root, "--debug", "--no-auto-update")
 		command.Dir = workspace
-		command.Env = append(os.Environ(), "PATH="+bin+":/usr/local/bin:/usr/bin:/bin", "HOME="+root, "PAGNET_RUNTIME_ENV=PAGNET_FAKE_TUI_TICK_MS=50,PAGNET_FAKE_TUI_BOOT_BYTES=65536")
+		runtimeEnv := "PAGNET_FAKE_TUI_TICK_MS=50,PAGNET_FAKE_TUI_BOOT_BYTES=65536"
+		if revokedDelete {
+			runtimeEnv += ",PAGNET_FAKE_INTERACTION=approval"
+		}
+		command.Env = append(os.Environ(), "PATH="+bin+":/usr/local/bin:/usr/bin:/bin", "HOME="+root, "PAGNET_RUNTIME_ENV="+runtimeEnv)
 		// Credentials, encrypted keys and PTY bytes never enter test logs.
 		if err := command.Start(); err != nil {
 			t.Fatal("actual serve failed to start", err)
@@ -385,92 +394,94 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 	if metaA.SessionID == metaB.SessionID || metaA.SessionKeyID == metaB.SessionKeyID {
 		t.Fatal("replacement view reused private input authority")
 	}
-	var outputKey [32]byte
-	copy(outputKey[:], keyB)
-	defer clear(outputKey[:])
-	// Each keystroke batch is encrypted locally under the attach-bound input
-	// key. This production websocket path does not use a key RPC or input ACK.
-	inputBytes, err := base64.StdEncoding.Strict().DecodeString(secretB.InputKey)
-	if err != nil || len(inputBytes) != 32 {
-		t.Fatal("input direction key invalid")
-	}
-	var inputKey [32]byte
-	copy(inputKey[:], inputBytes)
-	clear(inputBytes)
-	defer clear(inputKey[:])
-	marker := []byte("isolated-original-pty-continuity")
-	defer clear(marker)
-	input := append(append([]byte(nil), marker...), '\n')
-	defer clear(input)
-	inputAAD := *metaB.AAD
-	inputAAD.ObjectType = e2ee.ObjectTypeRuntimeTerminalInput
-	inputAAD.KeyEpochID = metaB.SessionKeyID
-	inputAAD.ObjectID, err = e2ee.TerminalFrameObjectID(metaB.InstanceID, metaB.SessionID, metaB.NativeGeneration, metaB.SessionKeyID, "input", false, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inputEnvelope, err := e2ee.Encrypt(input, inputKey, inputAAD)
-	if err != nil {
-		t.Fatal("local input encryption failed", err)
-	}
-	if err := connB.WriteJSON(struct {
-		Type string `json:"type"`
-		transport.TerminalInputPayload
-	}{"input", transport.TerminalInputPayload{InstanceID: metaB.InstanceID, SessionID: metaB.SessionID, NativeGeneration: metaB.NativeGeneration, SessionKeyID: metaB.SessionKeyID, Seq: 1, Envelope: &inputEnvelope, AAD: &inputAAD}}); err != nil {
-		t.Fatal("encrypted production terminal input failed", err)
-	}
-	// Keep only a bounded trailing window when a marker crosses PTY frames.
-	trailing := make([]byte, 0, 4096)
-	defer clear(trailing)
-
-	for {
-		var raw json.RawMessage
-		if err := connB.ReadJSON(&raw); err != nil {
-			t.Fatal("replacement view lacks original terminal bytes", err)
+	if !revokedDelete {
+		var outputKey [32]byte
+		copy(outputKey[:], keyB)
+		defer clear(outputKey[:])
+		// Each keystroke batch is encrypted locally under the attach-bound input
+		// key. This production websocket path does not use a key RPC or input ACK.
+		inputBytes, err := base64.StdEncoding.Strict().DecodeString(secretB.InputKey)
+		if err != nil || len(inputBytes) != 32 {
+			t.Fatal("input direction key invalid")
 		}
-		var frame struct {
-			Type string `json:"type"`
-			transport.TerminalOutputPayload
-		}
-		if json.Unmarshal(raw, &frame) != nil {
-			t.Fatal("output frame invalid")
-		}
-		if frame.Type != "terminal" || frame.Envelope == nil {
-			continue
-		}
-		if frame.AAD == nil || frame.Data != "" || frame.NativeGeneration != metaB.NativeGeneration || frame.SessionKeyID != metaB.SessionKeyID {
-			t.Fatal("replacement terminal leaked or relabeled source")
-		}
-		sequence := frame.Seq
-		if frame.Snapshot {
-			sequence = frame.LastSeq
-		}
-		expectedAAD := *metaB.AAD
-		expectedAAD.ObjectType = e2ee.ObjectTypeRuntimeTerminal
-		expectedAAD.KeyEpochID = metaB.SessionKeyID
-		expectedAAD.ObjectID, err = e2ee.TerminalFrameObjectID(metaB.InstanceID, metaB.SessionID, metaB.NativeGeneration, metaB.SessionKeyID, "output", frame.Snapshot, sequence)
-		if err != nil || !bytes.Equal(expectedAAD.CanonicalBytes(), frame.AAD.CanonicalBytes()) {
-			t.Fatal("original output changed authorized window scope")
-		}
-		plain, err := e2ee.Decrypt(*frame.Envelope, outputKey, *frame.AAD)
+		var inputKey [32]byte
+		copy(inputKey[:], inputBytes)
+		clear(inputBytes)
+		defer clear(inputKey[:])
+		marker := []byte("isolated-original-pty-continuity")
+		defer clear(marker)
+		input := append(append([]byte(nil), marker...), '\n')
+		defer clear(input)
+		inputAAD := *metaB.AAD
+		inputAAD.ObjectType = e2ee.ObjectTypeRuntimeTerminalInput
+		inputAAD.KeyEpochID = metaB.SessionKeyID
+		inputAAD.ObjectID, err = e2ee.TerminalFrameObjectID(metaB.InstanceID, metaB.SessionID, metaB.NativeGeneration, metaB.SessionKeyID, "input", false, 1)
 		if err != nil {
-			t.Fatal("original terminal output integrity failed", err)
+			t.Fatal(err)
 		}
-		if len(plain) > 4096 {
-			clear(trailing)
-			trailing = append(trailing[:0], plain[len(plain)-4096:]...)
-		} else {
-			if len(trailing)+len(plain) > 4096 {
-				n := len(trailing) + len(plain) - 4096
-				copy(trailing, trailing[n:])
-				clear(trailing[len(trailing)-n:])
-				trailing = trailing[:len(trailing)-n]
+		inputEnvelope, err := e2ee.Encrypt(input, inputKey, inputAAD)
+		if err != nil {
+			t.Fatal("local input encryption failed", err)
+		}
+		if err := connB.WriteJSON(struct {
+			Type string `json:"type"`
+			transport.TerminalInputPayload
+		}{"input", transport.TerminalInputPayload{InstanceID: metaB.InstanceID, SessionID: metaB.SessionID, NativeGeneration: metaB.NativeGeneration, SessionKeyID: metaB.SessionKeyID, Seq: 1, Envelope: &inputEnvelope, AAD: &inputAAD}}); err != nil {
+			t.Fatal("encrypted production terminal input failed", err)
+		}
+		// Keep only a bounded trailing window when a marker crosses PTY frames.
+		trailing := make([]byte, 0, 4096)
+		defer clear(trailing)
+
+		for {
+			var raw json.RawMessage
+			if err := connB.ReadJSON(&raw); err != nil {
+				t.Fatal("replacement view lacks original terminal bytes", err)
 			}
-			trailing = append(trailing, plain...)
-		}
-		clear(plain)
-		if bytes.Contains(trailing, marker) {
-			break
+			var frame struct {
+				Type string `json:"type"`
+				transport.TerminalOutputPayload
+			}
+			if json.Unmarshal(raw, &frame) != nil {
+				t.Fatal("output frame invalid")
+			}
+			if frame.Type != "terminal" || frame.Envelope == nil {
+				continue
+			}
+			if frame.AAD == nil || frame.Data != "" || frame.NativeGeneration != metaB.NativeGeneration || frame.SessionKeyID != metaB.SessionKeyID {
+				t.Fatal("replacement terminal leaked or relabeled source")
+			}
+			sequence := frame.Seq
+			if frame.Snapshot {
+				sequence = frame.LastSeq
+			}
+			expectedAAD := *metaB.AAD
+			expectedAAD.ObjectType = e2ee.ObjectTypeRuntimeTerminal
+			expectedAAD.KeyEpochID = metaB.SessionKeyID
+			expectedAAD.ObjectID, err = e2ee.TerminalFrameObjectID(metaB.InstanceID, metaB.SessionID, metaB.NativeGeneration, metaB.SessionKeyID, "output", frame.Snapshot, sequence)
+			if err != nil || !bytes.Equal(expectedAAD.CanonicalBytes(), frame.AAD.CanonicalBytes()) {
+				t.Fatal("original output changed authorized window scope")
+			}
+			plain, err := e2ee.Decrypt(*frame.Envelope, outputKey, *frame.AAD)
+			if err != nil {
+				t.Fatal("original terminal output integrity failed", err)
+			}
+			if len(plain) > 4096 {
+				clear(trailing)
+				trailing = append(trailing[:0], plain[len(plain)-4096:]...)
+			} else {
+				if len(trailing)+len(plain) > 4096 {
+					n := len(trailing) + len(plain) - 4096
+					copy(trailing, trailing[n:])
+					clear(trailing[len(trailing)-n:])
+					trailing = trailing[:len(trailing)-n]
+				}
+				trailing = append(trailing, plain...)
+			}
+			clear(plain)
+			if bytes.Contains(trailing, marker) {
+				break
+			}
 		}
 	}
 	if birth, err := proc.StartIdentity(workerPID); err != nil || birth != workerBirth {
@@ -479,9 +490,65 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 	if birth, err := proc.StartIdentity(originalNativePID); err != nil || birth != secretB.NativeStartIdentity {
 		t.Fatal("controller replacement changed original native PID/birth")
 	}
-	t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal source; fresh private view keys and locally encrypted input/output")
+	if revokedDelete {
+		t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal bootstraps; no user input synthesized")
+	} else {
+		t.Log("actual serve A→B retains original worker/runtime session, generation, birth and encrypted terminal source; fresh private view keys and locally encrypted input/output")
+	}
 	if !deleteOriginal {
 		return
+	}
+	var revokedTaskID string
+	var priorContentProjections int
+	if revokedDelete {
+		t.Log("phase: production encrypted offered task and actual scheduler admission")
+		revokedTaskID = domain.NewID().String()
+		taskAAD := e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: fixture.TenantID, NetworkID: fixture.NetworkID, ObjectType: e2ee.ObjectTypeTask, ObjectID: revokedTaskID, Sender: "human", Recipient: "", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), KeyEpochID: fixture.EpochID}
+		taskEnvelope, err := e2ee.Encrypt([]byte("synthetic approval-blocked original task"), epochKey, taskAAD)
+		if err != nil {
+			t.Fatal("synthetic task encryption failed", err)
+		}
+		var offered struct {
+			OK         bool   `json:"ok"`
+			StatusCode int    `json:"statusCode"`
+			TaskID     string `json:"taskId"`
+		}
+		helper.call(t, map[string]any{"action": "real_task", "taskAAD": taskAAD, "taskEnvelope": taskEnvelope}, &offered)
+		if !offered.OK || offered.StatusCode != 201 || offered.TaskID != revokedTaskID {
+			t.Fatal("actual encrypted offered task was not created")
+		}
+		deadline := time.Now().Add(25 * time.Second)
+		started := false
+		for time.Now().Before(deadline) {
+			var task struct {
+				OK                 bool   `json:"ok"`
+				TaskState          string `json:"taskState"`
+				StartedSources     int    `json:"startedSources"`
+				ContentProjections int    `json:"contentProjections"`
+			}
+			helper.call(t, map[string]any{"action": "real_task_status", "taskId": revokedTaskID}, &task)
+			if task.TaskState == "completed" {
+				t.Fatal("approval-blocked genuine task completed without a native decision")
+			}
+			if task.OK && task.StartedSources > 0 {
+				started = true
+				priorContentProjections = task.ContentProjections
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !started {
+			t.Fatal("actual scheduler did not bind the original accepted native task source")
+		}
+		var revoked struct {
+			OK         bool `json:"ok"`
+			StatusCode int  `json:"statusCode"`
+		}
+		helper.call(t, map[string]any{"action": "revoke_agent_grant"}, &revoked)
+		if !revoked.OK || (revoked.StatusCode != 200 && revoked.StatusCode != 204) {
+			t.Fatal("actual original agent grant revocation was not committed")
+		}
+		t.Log("phase: genuine original task started; grant revoked before actual DELETE")
 	}
 	var deleted struct {
 		OK         bool `json:"ok"`
@@ -489,7 +556,7 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 	}
 	helper.call(t, map[string]any{"action": "delete_agent"}, &deleted)
 	if !deleted.OK || deleted.StatusCode != 202 {
-		t.Fatal("actual owned deletion did not return durable pending job")
+		t.Fatal("actual owned deletion did not return durable pending job", deleted.OK, deleted.StatusCode)
 	}
 	t.Log("phase: actual DELETE accepted; awaiting original ownership retirement and collection")
 	deadline := time.Now().Add(30 * time.Second)
@@ -513,6 +580,18 @@ func runActualPagnetServeContinuity(t *testing.T, deleteOriginal bool) {
 		workerExited := os.IsNotExist(workerErr) || workerErr == nil && workerCurrent != workerBirth || proc.ProcessIsZombie(workerPID)
 		nativeExited := os.IsNotExist(nativeErr) || nativeErr == nil && nativeCurrent != secretB.NativeStartIdentity || proc.ProcessIsZombie(originalNativePID)
 		if remote.OK && remote.DeletionState == "completed" && !remote.InstancePresent && !remote.DefinitionPresent && !remote.PrincipalPresent && errors.Is(recordErr, sql.ErrNoRows) && errors.Is(gcErr, sql.ErrNoRows) && os.IsNotExist(dirErr) && os.IsNotExist(socketErr) && workerExited && nativeExited {
+			if revokedDelete {
+				var task struct {
+					OK                 bool   `json:"ok"`
+					TaskState          string `json:"taskState"`
+					ContentProjections int    `json:"contentProjections"`
+				}
+				helper.call(t, map[string]any{"action": "real_task_status", "taskId": revokedTaskID}, &task)
+				if !task.OK || task.TaskState == "completed" || task.ContentProjections > priorContentProjections {
+					t.Fatal("revoked original task exposed new content or claimed fake completion")
+				}
+				t.Log("actual revoked-grant ordered metadata closure retains no false task completion or post-revocation content projection")
+			}
 			t.Log("actual DELETE 202 stops original runtime, retires worker, collects private files, commits server deletion and reclaims local registry marker")
 			return
 		}
