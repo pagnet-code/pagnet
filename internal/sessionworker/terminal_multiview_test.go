@@ -80,3 +80,40 @@ func TestTerminalMultipleViewsShareLeaseButNotDetach(t *testing.T) {
 		t.Fatal("unbounded viewers accepted")
 	}
 }
+
+func TestQuietTerminalStreamExitsWhenOwnerRetires(t *testing.T) {
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(t.TempDir(), "quiet.sock"), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	peer, err := net.DialUnix("unix", nil, listener.Addr().(*net.UnixAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	owned, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owned.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { serveTerminalStream(ctx, owned, nil, nil, 1); close(done) }()
+	// Keep the real viewer open and send no input: EOF must come from owner
+	// cancellation, rather than client detach or a subsequent keystroke.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quiet terminal stream prevents owner retirement")
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if n, err := peer.Read(b[:]); n != 0 || err == nil {
+		t.Fatal("retired stream remains connected", n, err)
+	}
+}

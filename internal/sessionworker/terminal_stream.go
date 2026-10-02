@@ -211,6 +211,17 @@ func (s *TerminalStream) writeLoop() {
 }
 
 func serveTerminalStream(ctx context.Context, conn *net.UnixConn, owner *SessionOwner, current *currentController, lease int64) {
+	// A quiet viewer can remain blocked in read even after the native process
+	// stops. Retirement must release every stream before the owner exits.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
 	for {
 		var frame terminalFrame
 		if err := readBoundedFrame(conn, &frame, 16<<10); err != nil {
