@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -84,4 +85,19 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 		return nil, err
 	}
 	return updated, nil
+}
+
+// Server dispatch order and local operation order are independent: local
+// resize/view operations may occupy an operation without a server ordinal.
+func nativeDispatchOperationSequence(proof transport.NativeDispatchProof, records []sessionworker.NativeDispatchRecord) (int64, error) {
+	for _, record := range records {
+		if record.Proof.DispatchSequence != proof.DispatchSequence {
+			continue
+		}
+		if !reflect.DeepEqual(record.Proof, proof) || record.OperationSequence <= 0 {
+			return 0, ErrNativeObservationConflict
+		}
+		return record.OperationSequence, nil
+	}
+	return 0, ErrNativeOriginAdmissionDeferred
 }

@@ -274,8 +274,16 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 		return errors.Join(ErrDeferred, err)
 	}
 	if !snapshot.HasTerminal {
-		response, callErr := proxy.call(ctx, sessionworker.Request{Type: "outcome", Sequence: p.NativeDispatch.DispatchSequence})
-		if callErr != nil || response.Outcome == nil || response.Outcome.State == "accepted" {
+		dispatches, dispatchErr := proxy.call(ctx, sessionworker.Request{Type: "dispatches"})
+		if dispatchErr != nil {
+			return ErrDeferred
+		}
+		operation, mappingErr := nativeDispatchOperationSequence(*p.NativeDispatch, dispatches.Dispatches)
+		if mappingErr != nil {
+			return ErrDeferred
+		}
+		response, callErr := proxy.call(ctx, sessionworker.Request{Type: "outcome", Sequence: operation})
+		if callErr != nil || response.Outcome == nil || response.Outcome.State == "admitted" {
 			return ErrDeferred
 		}
 		return errors.New("This runtime does not expose an original interactive terminal")
@@ -416,7 +424,7 @@ func (d *Daemon) nativeTerminalStop(conn *websocket.Conn, p transport.TerminalSt
 	ctx, cancel := context.WithTimeout(d.turnCtx, time.Second)
 	defer cancel()
 	response, err := proxy.call(ctx, sessionworker.Request{Type: "outcome", Sequence: p.NativeDispatch.DispatchSequence})
-	if err != nil || response.Outcome == nil || response.Outcome.State == "accepted" {
+	if err != nil || response.Outcome == nil || response.Outcome.State == "admitted" {
 		return ErrDeferred
 	}
 	if response.Outcome.State != "completed" {

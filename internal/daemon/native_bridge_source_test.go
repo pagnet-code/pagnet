@@ -147,3 +147,17 @@ func TestNativeBridgeRepeatsOnlyExplicitPreEffectRefusal(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeTerminalOutcomeUsesOriginalLocalOperationMapping(t *testing.T) {
+	proof := transport.NativeDispatchProof{OwnershipID: domain.NewID().String(), OwnershipGeneration: "original-A", DispatchSequence: 9, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String()}
+	records := []sessionworker.NativeDispatchRecord{{Proof: proof, OperationSequence: 42, State: "admitted"}}
+	got, err := nativeDispatchOperationSequence(proof, records)
+	if err != nil || got != 42 {
+		t.Fatal("terminal outcome adopted server ordinal", got, err)
+	}
+	foreign := proof
+	foreign.SourceAdmissionID = domain.NewID().String()
+	if _, err = nativeDispatchOperationSequence(foreign, records); err == nil {
+		t.Fatal("terminal outcome adopted foreign original source")
+	}
+}
