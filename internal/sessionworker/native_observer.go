@@ -15,11 +15,15 @@ import (
 
 // The factory runs before the endpoint reader starts. Each closure retains the
 // original activation source even when subsequent delivery commands arrive.
-func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEventObserver {
+func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeSourceProducer) session.NativeEventObserver {
 	o.mu.Lock()
 	generation := o.generation
 	origin := append(json.RawMessage(nil), o.origin...)
 	o.mu.Unlock()
+	if producer != nil {
+		generation = producer.generation
+		origin = append(json.RawMessage(nil), producer.origin...)
+	}
 	return func(event session.SessionEvent) error {
 		observedAt := time.Now().UTC()
 		o.mu.Lock()
@@ -132,7 +136,7 @@ func (o *SessionOwner) nativeEventObserver(instanceID string) session.NativeEven
 		backoff := 250 * time.Millisecond
 		for {
 			available := o.journal.ObservationCapacity()
-			err = o.journal.JournalCapturedObservation(o.ctx, observation, encrypted, transfers...)
+			err = o.journal.journalCapturedObservation(o.ctx, producer, observation, encrypted, transfers...)
 			if err == nil {
 				break
 			}

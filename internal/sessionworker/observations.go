@@ -91,13 +91,17 @@ func (j *Journal) initializeObservations() error {
 	return rows.Err()
 }
 
-// JournalObservation is idempotent across ambiguous COMMIT outcomes. The native
-// reader retains this exact record on failure and applies backpressure.
+// Direct imports support unpublished fixtures before the producer protocol.
+// Registered production sources require their exact original append capability,
+// including retries after an uncertain COMMIT.
 func (j *Journal) JournalObservation(ctx context.Context, observation NativeObservation) error {
 	return j.JournalCapturedObservation(ctx, observation, nil)
 }
 
 func (j *Journal) JournalCapturedObservation(ctx context.Context, observation NativeObservation, encrypted []byte, transfers ...nativecontent.Transfer) error {
+	return j.journalCapturedObservation(ctx, nil, observation, encrypted, transfers...)
+}
+func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nativeSourceProducer, observation NativeObservation, encrypted []byte, transfers ...nativecontent.Transfer) error {
 	if err := verifyCapture(observation.Capture, encrypted); err != nil {
 		return err
 	}
@@ -111,6 +115,9 @@ func (j *Journal) JournalCapturedObservation(ctx context.Context, observation Na
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.strictSourceProducer && (producer == nil || producer.closed || !j.sourceProducers[producer] || producer.generation != observation.NativeGeneration || !producer.owns(observation.Origin)) {
+		return ErrFenced
+	}
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -298,7 +305,7 @@ func (j *Journal) AcknowledgeObservation(ctx context.Context, lease int64, id, d
 	}
 	close(j.observationCapacity)
 	j.observationCapacity = make(chan struct{})
-	return nil
+	return j.reclaimSourceStreamsLocked(ctx)
 }
 
 // Capture before attempting a journal write so a concurrent capacity release

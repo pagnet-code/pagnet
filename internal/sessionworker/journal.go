@@ -57,13 +57,15 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
-	sourceRetries       map[string]*nativeSourceRetry
-	observationCapacity chan struct{}
-	mu                  sync.Mutex
-	db                  *sql.DB
-	scope               Scope
-	owner               io.Closer
-	dir                 string
+	sourceRetries        map[string]*nativeSourceRetry
+	sourceProducers      map[*nativeSourceProducer]bool
+	strictSourceProducer bool
+	observationCapacity  chan struct{}
+	mu                   sync.Mutex
+	db                   *sql.DB
+	scope                Scope
+	owner                io.Closer
+	dir                  string
 }
 
 func OpenJournal(dir string, scope Scope) (*Journal, error) {
@@ -155,6 +157,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	// No native mutation is repeated after a worker crash. Its completed outcome
 	// may have been lost after the effect but before fsync; report that uncertainty.
 	if _, err = db.Exec(`UPDATE worker_intent SET state='uncertain' WHERE state='admitted'`); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeSourceRetirement(); err != nil {
 		return fail(err)
 	}
 	owner = nil // journal owns the lifetime lock after successful initialization
@@ -442,7 +447,10 @@ func (j *Journal) Acknowledge(ctx context.Context, lease, sequence int64) error 
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_meta SET retired=? WHERE singleton=1`, floor); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return j.reclaimSourceStreamsLocked(ctx)
 }
 
 // validateHistory refuses partial/mixed journal generations. A valid SQLite

@@ -114,7 +114,8 @@ const startupDiagLineRunes = 200
 
 // QwenPersistent is the Qwen Dual Output persistent driver.
 type QwenPersistent struct {
-	NativeEventObserverFactory session.NativeEventObserverFactory
+	NativeEventObserverFactory             session.NativeEventObserverFactory
+	NativeEventObserverRegistrationFactory session.NativeEventObserverRegistrationFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -491,14 +492,15 @@ func (q *QwenPersistent) PTYMaster(instanceID string) *os.File {
 
 // qwenEndpoint is one live qwen dual-output endpoint process.
 type qwenEndpoint struct {
-	nativeObserver session.NativeEventObserver
-	f              *QwenPersistent // back-reference (the reader's exit path drops this record)
-	instanceID     string
-	stateDir       string
-	h              *proc.Handle // set once at launch, never nilled (immutable)
-	eventsPath     string
-	inputPath      string
-	state          *qwenTurnState
+	nativeObserver       session.NativeEventObserver
+	retireNativeObserver func()
+	f                    *QwenPersistent // back-reference (the reader's exit path drops this record)
+	instanceID           string
+	stateDir             string
+	h                    *proc.Handle // set once at launch, never nilled (immutable)
+	eventsPath           string
+	inputPath            string
+	state                *qwenTurnState
 
 	// activationCh carries the process's first (activation) event; closed
 	// by the reader after it is delivered.
@@ -984,7 +986,11 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		startupDeadline: startupDeadline,
 		readerDone:      make(chan struct{}),
 	}
-	if q.NativeEventObserverFactory != nil {
+	if q.NativeEventObserverRegistrationFactory != nil {
+		registration := q.NativeEventObserverRegistrationFactory(sess.InstanceID)
+		e.nativeObserver = registration.Observe
+		e.retireNativeObserver = registration.Retire
+	} else if q.NativeEventObserverFactory != nil {
 		e.nativeObserver = q.NativeEventObserverFactory(sess.InstanceID)
 	}
 	go e.readLoop()
@@ -1013,6 +1019,9 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 // turn.
 func (e *qwenEndpoint) readLoop() {
 	defer close(e.readerDone)
+	if e.retireNativeObserver != nil {
+		defer e.retireNativeObserver()
+	}
 	// Wait for the events file to appear (the bridge opens it at startup).
 	f, err := e.waitForEventsFile()
 	if err != nil {

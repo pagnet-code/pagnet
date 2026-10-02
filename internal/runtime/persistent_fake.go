@@ -49,7 +49,8 @@ const fakeActivationTimeout = 15 * time.Second
 // It is registered ONLY in debug mode (like the process-per-turn Fake) and
 // is NOT a real agent runtime.
 type PersistentFake struct {
-	NativeEventObserverFactory session.NativeEventObserverFactory
+	NativeEventObserverFactory             session.NativeEventObserverFactory
+	NativeEventObserverRegistrationFactory session.NativeEventObserverRegistrationFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -343,11 +344,12 @@ func (f *PersistentFake) BinaryPath() (string, bool) {
 
 // persistEndpoint is one live fake persistent endpoint process.
 type persistEndpoint struct {
-	nativeObserver session.NativeEventObserver
-	f              *PersistentFake // back-reference (the reader's EOF path drops this record)
-	instanceID     string
-	sessionDir     string
-	h              *proc.Handle // set once at launch, never nilled (immutable)
+	nativeObserver       session.NativeEventObserver
+	retireNativeObserver func()
+	f                    *PersistentFake // back-reference (the reader's EOF path drops this record)
+	instanceID           string
+	sessionDir           string
+	h                    *proc.Handle // set once at launch, never nilled (immutable)
 	// standingInstructions is the standing document the endpoint was
 	// launched with (a copy of the session's StandingInstructions at
 	// activation time — the reference implementation of the persistent
@@ -609,7 +611,11 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 		activationCh:         make(chan session.SessionEvent, 1),
 		readerDone:           make(chan struct{}),
 	}
-	if f.NativeEventObserverFactory != nil {
+	if f.NativeEventObserverRegistrationFactory != nil {
+		registration := f.NativeEventObserverRegistrationFactory(sess.InstanceID)
+		e.nativeObserver = registration.Observe
+		e.retireNativeObserver = registration.Retire
+	} else if f.NativeEventObserverFactory != nil {
 		e.nativeObserver = f.NativeEventObserverFactory(sess.InstanceID)
 	}
 	go e.readLoop()
@@ -636,6 +642,9 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 // owner — it read all of stdout) and signals any waiting turn.
 func (e *persistEndpoint) readLoop() {
 	defer close(e.readerDone)
+	if e.retireNativeObserver != nil {
+		defer e.retireNativeObserver()
+	}
 	scanner := bufio.NewScanner(e.stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	activated := false

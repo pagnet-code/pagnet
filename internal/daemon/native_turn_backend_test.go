@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -369,6 +370,52 @@ func proveNativeTurnOwnerBackend(t *testing.T, binary, terminal string) {
 	page, err = controllerB.Call(t.Context(), sessionworker.Request{Type: "observations", Limit: 32})
 	if err != nil || page.Error != "" || len(page.Observations) != 0 {
 		t.Fatal("real actual native source backlog did not drain")
+	}
+	// Only this isolated test native process is stopped. No user/original host
+	// process or API is touched. Real reader retirement precedes watermark GC.
+	invoke(controllerB, 3, "stop", sessionworker.Operation{NativeGeneration: initial.NativeGeneration})
+	outcome(controllerB, 3)
+	local, err := sql.Open("sqlite", filepath.Join(dir, "intents.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	count := func(table string) int {
+		t.Helper()
+		var n int
+		if err := local.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		var closed int
+		err = local.QueryRow(`SELECT quiesced FROM worker_source_registration WHERE origin_id=?`, origin.ID).Scan(&closed)
+		if err == nil && closed == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("actual native reader did not retire original registration", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if count("worker_source_stream") != 1 || count("worker_turn_sources") != 1 {
+		t.Fatal("reader exit ignored original unACKed source outcomes")
+	}
+	for _, sequence := range []int64{3, 1, 2} {
+		reply, err := controllerB.Call(t.Context(), sessionworker.Request{Type: "ack", Sequence: sequence})
+		if err != nil || reply.Error != "" {
+			t.Fatal("original native outcome acknowledgement failed")
+		}
+	}
+	if count("worker_source_stream") != 0 || count("worker_source_registration") != 0 || count("worker_turn_sources") != 0 {
+		t.Fatal("actual settled retired generation retained lifetime watermark")
+	}
+	// Private controller transport cannot recreate retired native observation.
+	reply, err := controllerB.Call(t.Context(), sessionworker.Request{Type: "append_observation", Payload: json.RawMessage(`{}`)})
+	if err != nil || reply.Error == "" {
+		t.Fatal("controller gained original source append capability")
 	}
 	for _, name := range []string{"intents.sqlite", "intents.sqlite-wal"} {
 		raw, err := os.ReadFile(filepath.Join(dir, name))

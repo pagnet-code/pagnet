@@ -65,33 +65,34 @@ type NativeSnapshot struct {
 }
 
 type SessionOwner struct {
-	cancel              context.CancelFunc
-	wg                  sync.WaitGroup
-	closing             bool
-	ctx                 context.Context
-	journal             *Journal
-	captureKey          []byte
-	output              *OutputReplay
-	spec                NativeSpec
-	manager             *session.Manager
-	driver              session.Driver
-	supervisor          *proc.Supervisor
-	sess                *session.RuntimeSession
-	prompt              sync.Mutex
-	terminalWrite       sync.Mutex
-	mu                  sync.Mutex
-	generation, nonce   string
-	origin              json.RawMessage
-	candidateAdmission  *Admission
-	candidateCommandID  string
-	candidateTurnSource NativeTurnSource
-	terminal            *os.File
-	pending             map[string]*nativeApproval
-	fatal               error
-	nativeSink          bool
-	observationBlocked  error
-	observationWaiters  map[string]bool
-	relay               *relayBroker
+	cancel                   context.CancelFunc
+	wg                       sync.WaitGroup
+	closing                  bool
+	ctx                      context.Context
+	journal                  *Journal
+	captureKey               []byte
+	output                   *OutputReplay
+	spec                     NativeSpec
+	manager                  *session.Manager
+	driver                   session.Driver
+	supervisor               *proc.Supervisor
+	sess                     *session.RuntimeSession
+	prompt                   sync.Mutex
+	terminalWrite            sync.Mutex
+	mu                       sync.Mutex
+	generation, nonce        string
+	nativeObserverRegistered bool
+	origin                   json.RawMessage
+	candidateAdmission       *Admission
+	candidateCommandID       string
+	candidateTurnSource      NativeTurnSource
+	terminal                 *os.File
+	pending                  map[string]*nativeApproval
+	fatal                    error
+	nativeSink               bool
+	observationBlocked       error
+	observationWaiters       map[string]bool
+	relay                    *relayBroker
 }
 
 func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKey []byte) (*SessionOwner, error) {
@@ -129,7 +130,7 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 		d.StateDir = filepath.Join(j.dir, "native-state")
 		d.PTYSize = &pty.Winsize{Rows: 24, Cols: 80}
 		d.PTYAvailable = owner.captureTerminal
-		d.NativeEventObserverFactory = owner.nativeEventObserver
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
 		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeQwenCode:
@@ -138,7 +139,7 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 		d.PrefixArgs = spec.PrefixArgs
 		d.NativeDirs = spec.NativeDirs
 		d.PTYAvailable = owner.captureTerminal
-		d.NativeEventObserverFactory = owner.nativeEventObserver
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
 		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeCodex:
@@ -147,7 +148,7 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 		d.PrefixArgs = spec.PrefixArgs
 		d.NativeDirs = spec.NativeDirs
 		d.PTYAvailable = owner.captureTerminal
-		d.NativeEventObserverFactory = owner.nativeEventObserver
+		d.NativeEventObserverRegistrationFactory = owner.nativeEventRegistration
 		owner.nativeSink = true
 		driver = d
 	case domain.RuntimeGrok:
@@ -481,6 +482,7 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		}
 		o.mu.Lock()
 		o.generation = generation
+		o.nativeObserverRegistered = false
 		o.nonce = nonce
 		o.origin = append(json.RawMessage(nil), origin...)
 		o.pending = map[string]*nativeApproval{}

@@ -1,6 +1,9 @@
 package sessionworker
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // The only production append writer is the original native event observer.
 // A pin spans its entire retry loop and is released only after known success
@@ -34,5 +37,7 @@ func (j *Journal) releaseSourceRetry(id, digest string) {
 	defer j.mu.Unlock()
 	if retry := j.sourceRetries[id]; retry != nil && retry.digest == digest {
 		delete(j.sourceRetries, id)
+		// Evidence remains safe if reclamation fails; a later ACK/retirement retries.
+		_ = j.reclaimSourceStreamsLocked(context.Background())
 	}
 }

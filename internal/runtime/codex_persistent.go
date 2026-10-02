@@ -97,7 +97,8 @@ const (
 
 // CodexPersistent is the Codex app-server persistent driver.
 type CodexPersistent struct {
-	NativeEventObserverFactory session.NativeEventObserverFactory
+	NativeEventObserverFactory             session.NativeEventObserverFactory
+	NativeEventObserverRegistrationFactory session.NativeEventObserverRegistrationFactory
 	// StateDir is immutable host-local storage owned by this driver instance.
 	// Explicit ownership avoids process-global environment routing across workers.
 	StateDir string
@@ -479,14 +480,15 @@ func (c *CodexPersistent) Live(instanceID string) bool {
 
 // codexEndpoint is one live codex app-server endpoint process.
 type codexEndpoint struct {
-	nativeObserver session.NativeEventObserver
-	generation     string
-	f              *CodexPersistent // back-reference (the reader's exit path drops this record)
-	instanceID     string
-	h              *proc.Handle // set once at launch, never nilled (immutable)
-	state          *codexTurnState
-	stdin          io.WriteCloser
-	stdout         io.ReadCloser
+	nativeObserver       session.NativeEventObserver
+	retireNativeObserver func()
+	generation           string
+	f                    *CodexPersistent // back-reference (the reader's exit path drops this record)
+	instanceID           string
+	h                    *proc.Handle // set once at launch, never nilled (immutable)
+	state                *codexTurnState
+	stdin                io.WriteCloser
+	stdout               io.ReadCloser
 
 	// activationCh carries the (synthesized) activation event; closed by
 	// the driver after it is delivered.
@@ -766,7 +768,11 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		pending:      map[int64]*codexRPCWaiter{},
 	}
 	e.turnCond = sync.NewCond(&e.mu)
-	if c.NativeEventObserverFactory != nil {
+	if c.NativeEventObserverRegistrationFactory != nil {
+		registration := c.NativeEventObserverRegistrationFactory(sess.InstanceID)
+		e.nativeObserver = registration.Observe
+		e.retireNativeObserver = registration.Retire
+	} else if c.NativeEventObserverFactory != nil {
 		e.nativeObserver = c.NativeEventObserverFactory(sess.InstanceID)
 	}
 	go e.readLoop()
@@ -918,6 +924,9 @@ func (e *codexEndpoint) handshake(ctx context.Context, sess *session.RuntimeSess
 // never blocks on a process that was never stopped (B7 PATH B).
 func (e *codexEndpoint) readLoop() {
 	defer close(e.readerDone)
+	if e.retireNativeObserver != nil {
+		defer e.retireNativeObserver()
+	}
 	scanner := bufio.NewScanner(e.stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
