@@ -51,6 +51,14 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		link.mu.Lock()
 		owned := link.ownership
 		link.mu.Unlock()
+		if p.DeletionProof != nil {
+			if p.DeletionProof.DeleteRequestID != p.DeleteRequestID || p.DeletionProof.StopProof.OwnershipID != owned.ID || p.DeletionProof.StopProof.OwnershipGeneration != record.Scope.Generation {
+				return ErrNativeObservationConflict
+			}
+			if _, err = proxy.call(ctx, sessionworker.Request{Type: "deletion_quarantines", DeletionProof: p.DeletionProof}); err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+		}
 		settled, err := proxy.SettleDispatches(ctx, owned)
 		if err != nil {
 			return errors.Join(ErrDeferred, err)

@@ -38,6 +38,7 @@ type handshake struct {
 }
 
 type Request struct {
+	DeletionProof    *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
 	CancelProposal   *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
 	CancelReceipt    *transport.NativeDispatchCancelledPayload     `json:"cancelReceipt,omitempty"`
 	SourceReceipt    *transport.NativeObservationReceiptPayload    `json:"sourceReceipt,omitempty"`
@@ -446,6 +447,13 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "deletion_quarantines":
+		snapshot := o.Snapshot()
+		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
+			err = ErrNativeBusy
+		} else {
+			err = o.journal.CollectDeletionQuarantines(ctx, lease, req.DeletionProof)
+		}
 	case "worker_retire":
 		err = o.prepareOwnershipRetirement(ctx, lease, req.Ownership)
 	case "ownership_bind":

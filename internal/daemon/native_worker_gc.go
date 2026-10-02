@@ -101,7 +101,11 @@ func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase str
 		if proof == nil || proof.State != "retired" || proof.LastDispatchSequence != proof.RetiredFloor {
 			return gc, ErrNativeObservationConflict
 		}
+		if proof.DeletionProof != nil && (proof.DeletionProof.DeleteRequestID != gc.DeleteRequestID || proof.DeletionProof.StopProof.OwnershipID != gc.Ownership.ID || proof.DeletionProof.StopProof.OwnershipGeneration != gc.Ownership.OwnershipGeneration) {
+			return gc, ErrNativeObservationConflict
+		}
 		expected, actual := gc.Ownership, *proof
+		expected.DeletionProof, actual.DeletionProof = nil, nil
 		expected.State = "retired"
 		expected.LastDispatchSequence = 0
 		expected.RetiredFloor = 0

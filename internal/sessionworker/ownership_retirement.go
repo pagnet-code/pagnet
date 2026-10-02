@@ -16,6 +16,9 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	if proof.State != "retired" || proof.LastDispatchSequence != proof.RetiredFloor || proof.InstanceID != j.scope.InstanceID || proof.OwnershipGeneration != j.scope.Generation {
 		return ErrConflict
 	}
+	if proof.DeletionProof != nil && (proof.DeletionProof.StopProof.OwnershipID != proof.ID || proof.DeletionProof.StopProof.OwnershipGeneration != proof.OwnershipGeneration || proof.DeletionProof.StopProof.DispatchSequence <= 0 || proof.DeletionProof.StopProof.DispatchSequence > proof.LastDispatchSequence || proof.DeletionProof.DeleteRequestID == "") {
+		return ErrConflict
+	}
 	raw, err := json.Marshal(proof)
 	if err != nil {
 		return err
@@ -52,6 +55,7 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	}
 	normalized := proof
 	normalized.State = "active"
+	normalized.DeletionProof = nil
 	normalized.LastDispatchSequence = 0
 	normalized.RetiredFloor = 0
 	if !reflect.DeepEqual(bound, normalized) || last != proof.LastDispatchSequence || floor != proof.RetiredFloor {
