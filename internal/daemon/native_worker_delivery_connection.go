@@ -82,7 +82,7 @@ func (c *NativeObservationConnection) contentExchange(ctx context.Context, typ s
 		c.mu.Unlock()
 		return transport.NativeContentStagedPayload{}, err
 	}
-	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
+	if c.pendingCountLocked() >= 64 {
 		c.mu.Unlock()
 		return transport.NativeContentStagedPayload{}, ErrNativeObservationCapacity
 	}
@@ -184,7 +184,7 @@ func (c *NativeObservationConnection) deliverWorkerObservation(ctx context.Conte
 		c.mu.Unlock()
 		return transport.NativeObservationReceiptPayload{}, err
 	}
-	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
+	if c.pendingCountLocked() >= 64 {
 		c.mu.Unlock()
 		return transport.NativeObservationReceiptPayload{}, ErrNativeObservationCapacity
 	}

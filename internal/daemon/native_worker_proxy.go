@@ -14,13 +14,15 @@ import (
 // never launches/adopts a PID or changes an execution profile. Production
 // command routing still requires durable intent mapping and source delivery.
 type NativeWorkerProxy struct {
-	connection *NativeObservationConnection
-	controller *sessionworker.Controller
-	scope      sessionworker.Scope
-	profile    string
-	bootstrap  sessionworker.Bootstrap
-	done       chan struct{}
-	closeOnce  sync.Once
+	connection   *NativeObservationConnection
+	controller   *sessionworker.Controller
+	scope        sessionworker.Scope
+	profile      string
+	bootstrap    sessionworker.Bootstrap
+	done         chan struct{}
+	closeOnce    sync.Once
+	sourceMu     sync.Mutex
+	sourceCursor int64
 }
 
 func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnection, dir string, expected sessionworker.Scope, controllerID string) (*NativeWorkerProxy, error) {
@@ -86,6 +88,9 @@ func (p *NativeWorkerProxy) call(ctx context.Context, request sessionworker.Requ
 		return sessionworker.Response{}, err
 	}
 	if response.Error != "" {
+		if response.Retryable {
+			return sessionworker.Response{}, errors.Join(ErrNativeOriginAdmissionDeferred, errors.New(response.Error))
+		}
 		return sessionworker.Response{}, errors.New(response.Error)
 	}
 	// Do not expose observations/inspection after the authenticated remote
@@ -94,6 +99,17 @@ func (p *NativeWorkerProxy) call(ctx context.Context, request sessionworker.Requ
 		return sessionworker.Response{}, err
 	}
 	return response, nil
+}
+
+// DrainSources keeps the authenticated journal scan cursor for this proxy's
+// lifetime. An error retains the returned cursor, so a later page never makes
+// an unsupported prefix starve valid evidence behind it.
+func (p *NativeWorkerProxy) DrainSources(ctx context.Context) error {
+	p.sourceMu.Lock()
+	defer p.sourceMu.Unlock()
+	next, err := p.connection.DrainNativeWorkerSourcesPage(ctx, p.SourceCall, p.sourceCursor)
+	p.sourceCursor = next
+	return err
 }
 
 func (p *NativeWorkerProxy) RefreshAdmission(ctx context.Context) error {

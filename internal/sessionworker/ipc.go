@@ -39,25 +39,28 @@ type handshake struct {
 }
 
 type Request struct {
-	ContentID        string            `json:"contentId,omitempty"`
-	ContentOrdinal   int               `json:"contentOrdinal,omitempty"`
-	CaptureOffset    int               `json:"captureOffset,omitempty"`
-	ReplayGeneration string            `json:"replayGeneration,omitempty"`
-	ActivationOrigin *ActivationOrigin `json:"activationOrigin,omitempty"`
-	ObservationID    string            `json:"observationId,omitempty"`
-	SourceDigest     string            `json:"sourceDigest,omitempty"`
-	Admission        *Admission        `json:"admission,omitempty"`
-	Relay            *BridgeResult     `json:"relay,omitempty"`
-	Cursor           int64             `json:"cursor,omitempty"`
-	Limit            int               `json:"limit,omitempty"`
-	Type             string            `json:"type"`
-	Sequence         int64             `json:"sequence,omitempty"`
-	CommandID        string            `json:"commandId,omitempty"`
-	Kind             string            `json:"kind,omitempty"`
-	Payload          json.RawMessage   `json:"payload,omitempty"`
+	Ownership        *transport.NativeWorkerOwnership `json:"ownership,omitempty"`
+	NativeDispatch   *transport.NativeDispatchProof   `json:"nativeDispatch,omitempty"`
+	ContentID        string                           `json:"contentId,omitempty"`
+	ContentOrdinal   int                              `json:"contentOrdinal,omitempty"`
+	CaptureOffset    int                              `json:"captureOffset,omitempty"`
+	ReplayGeneration string                           `json:"replayGeneration,omitempty"`
+	ActivationOrigin *ActivationOrigin                `json:"activationOrigin,omitempty"`
+	ObservationID    string                           `json:"observationId,omitempty"`
+	SourceDigest     string                           `json:"sourceDigest,omitempty"`
+	Admission        *Admission                       `json:"admission,omitempty"`
+	Relay            *BridgeResult                    `json:"relay,omitempty"`
+	Cursor           int64                            `json:"cursor,omitempty"`
+	Limit            int                              `json:"limit,omitempty"`
+	Type             string                           `json:"type"`
+	Sequence         int64                            `json:"sequence,omitempty"`
+	CommandID        string                           `json:"commandId,omitempty"`
+	Kind             string                           `json:"kind,omitempty"`
+	Payload          json.RawMessage                  `json:"payload,omitempty"`
 }
 
 type Response struct {
+	Retryable       bool                             `json:"retryable,omitempty"`
 	ObservationPage *NativeObservationPage           `json:"observationPage,omitempty"`
 	ContentFragment *transport.NativeContentFragment `json:"contentFragment,omitempty"`
 	Capture         *NativeCaptureChunk              `json:"capture,omitempty"`
@@ -285,14 +288,24 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		}
 		response := Response{}
 		switch req.Type {
-		case "intent":
+		case "intent", "dispatch":
 			var authorize func() (*Admission, error)
 			if owner != nil {
 				authorize = func() (*Admission, error) { return owner.relay.authorizeNativeEffect(auth.Lease) }
 			}
-			out, run, err := j.admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize)
+			var out Outcome
+			var run bool
+			var err error
+			if req.Type == "dispatch" && owner != nil && req.NativeDispatch != nil {
+				out, run, err = j.admitDispatch(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize, req.NativeDispatch)
+			} else if req.Type == "intent" && req.NativeDispatch == nil {
+				out, run, err = j.admit(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize)
+			} else {
+				err = ErrConflict
+			}
 			if err != nil {
 				response.Error = err.Error()
+				response.Retryable = errors.Is(err, ErrDispatchGap) || errors.Is(err, ErrFull)
 			} else {
 				response.Outcome = &out
 				if run {
@@ -411,6 +424,16 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "ownership_bind":
+		if req.Ownership == nil {
+			err = ErrConflict
+		} else if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
+			err = o.journal.BindDispatchOwnership(ctx, lease, *req.Ownership, string(o.spec.Runtime), NativeProfileFingerprint(o.spec))
+		}
+	case "dispatch_retire":
+		if _, err = o.relay.authorizeNativeEffect(lease); err == nil {
+			err = o.journal.RetireDispatches(ctx, lease, req.Sequence)
+		}
 	case "activation_poll":
 		response.Activation, err = o.relay.pollActivation(lease)
 	case "activation_origin":

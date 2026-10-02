@@ -263,8 +263,9 @@ type Daemon struct {
 	sessions *session.Manager
 
 	// Live host connection (for the bridge relay; nil while disconnected).
-	connMu  sync.Mutex
-	curConn *websocket.Conn
+	connMu     sync.Mutex
+	curConn    *websocket.Conn
+	nativeConn *NativeObservationConnection // guarded by connMu; exact socket lifetime
 	// websocket.Conn allows ONE concurrent writer; the heartbeat, command
 	// acks, and bridge relay all share the connection, so writes serialize.
 	writeMu sync.Mutex
@@ -932,6 +933,7 @@ func (d *Daemon) wsURL() string {
 	// daemon process as a runner under the host, keyed by (host_id, boot_id).
 	q := u.Query()
 	q.Set("boot_id", d.bootID)
+	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -954,12 +956,16 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	nativeConn := d.nativeConnection(conn)
+	defer nativeConn.Close()
 	d.connMu.Lock()
 	d.curConn = conn
+	d.nativeConn = nativeConn
 	d.connMu.Unlock()
 	defer func() {
 		d.connMu.Lock()
 		d.curConn = nil
+		d.nativeConn = nil
 		d.connMu.Unlock()
 	}()
 	d.Log.Info("connected to control plane")
@@ -1103,6 +1109,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			fmt.Fprintln(os.Stderr,
 				"pagnet: this host was unenrolled from the control plane — the daemon is stopping")
 			return ErrUnenrolled
+		}
+		if handled, err := nativeConn.HandleEnvelope(env); handled {
+			if err != nil {
+				return fmt.Errorf("native host protocol: %w", err)
+			}
+			continue
 		}
 		if env.Type == transport.MsgAgentResponse {
 			d.deliverAgentResponse(env)

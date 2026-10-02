@@ -26,6 +26,7 @@ type NativeObservationConnection struct {
 	pendingSessions     map[string]chan transport.NativeOriginSessionConfirmedPayload
 	pendingContent      map[string]chan transport.NativeContentStagedPayload
 	pendingObservations map[string]chan transport.NativeObservationReceiptPayload
+	pendingOwnership    map[string]chan transport.NativeOwnershipRegisteredPayload
 	closed              chan struct{}
 	send                func(context.Context, string, any) error
 }
@@ -143,7 +144,7 @@ func (c *NativeObservationConnection) RegisterOriginForSource(ctx context.Contex
 		c.mu.Unlock()
 		return nil, ErrNativeObservationConflict
 	}
-	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
+	if c.pendingCountLocked() >= 64 {
 		c.mu.Unlock()
 		return nil, ErrNativeObservationCapacity
 	}
@@ -236,7 +237,7 @@ func (c *NativeObservationConnection) ConfirmSession(ctx context.Context, origin
 		c.mu.Unlock()
 		return ErrNativeObservationConflict
 	}
-	if len(c.pending)+len(c.pendingSessions)+len(c.pendingContent)+len(c.pendingObservations) >= 64 {
+	if c.pendingCountLocked() >= 64 {
 		c.mu.Unlock()
 		return ErrNativeObservationCapacity
 	}

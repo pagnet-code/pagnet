@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/transport"
 	"io"
 	"net/url"
 	"os"
@@ -145,6 +146,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 	if err = j.initializeTurnSources(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeDispatches(); err != nil {
+		return fail(err)
+	}
 	if err = j.validateHistory(); err != nil {
 		return fail(err)
 	}
@@ -238,7 +242,11 @@ func (j *Journal) Admit(ctx context.Context, lease, sequence int64, commandID, k
 
 // Only new effects need admission. Exact prior ordinal replay is read-only.
 func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() (*Admission, error)) (out Outcome, execute bool, err error) {
-	if sequence <= 0 || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
+	return j.admitDispatch(ctx, lease, sequence, commandID, kind, payload, authorizeNew, nil)
+}
+
+func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() (*Admission, error), dispatch *transport.NativeDispatchProof) (out Outcome, execute bool, err error) {
+	if (sequence <= 0 && dispatch == nil) || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
 		return out, false, errors.New("invalid or oversized intent")
 	}
 	digest := intentDigest(kind, payload)
@@ -252,6 +260,20 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 	next, retired, err := checkLease(ctx, tx, lease)
 	if err != nil {
 		return out, false, err
+	}
+	var newDispatch bool
+	if dispatch != nil {
+		if sequence, newDispatch, err = j.prepareDispatchTx(ctx, tx, next, sequence, commandID, *dispatch); err != nil {
+			return out, false, err
+		}
+	} else if kind == "activate" || kind == "prompt" {
+		var bound int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_dispatch_meta`).Scan(&bound); err != nil {
+			return out, false, err
+		}
+		if bound != 0 {
+			return out, false, ErrConflict
+		}
 	}
 	if sequence <= retired {
 		return out, false, ErrRetired
@@ -285,6 +307,17 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 		if out.SourceAdmission, err = authorizeNew(); err != nil {
 			return out, false, err
 		}
+	}
+	if dispatch != nil {
+		if !newDispatch || out.SourceAdmission == nil || out.SourceAdmission.Scope != j.scope {
+			return out, false, ErrConflict
+		}
+		original := *out.SourceAdmission
+		original.NativeAdmissionID = dispatch.SourceAdmissionID
+		original.RunnerID = dispatch.SourceRunnerID
+		original.RunnerEpoch = dispatch.SourceRunnerEpoch
+		original.BootID = dispatch.SourceBootID
+		out.SourceAdmission = &original
 	}
 	var count int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_intent`).Scan(&count); err != nil {
