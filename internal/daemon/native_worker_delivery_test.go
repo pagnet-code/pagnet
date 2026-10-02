@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -387,5 +388,84 @@ func TestNativeWorkerExpiredContentRequestsReceiptWithoutStaging(t *testing.T) {
 	}
 	if err := c.DrainNativeWorkerSources(t.Context(), call); err != nil || !marked {
 		t.Fatal("expired evidence blocked on content staging", err)
+	}
+}
+
+func TestNativeWorkerExplicitDeleteMetadataOnlyRetainsCiphertext(t *testing.T) {
+	for _, mode := range []string{"supported", "unsupported", "invalid_job", "wrong_digest", "disconnect"} {
+		t.Run(mode, func(t *testing.T) {
+			var c *NativeObservationConnection
+			job := domain.NewID().String()
+			var original transport.NativeObservationPayload
+			writes, marks := 0, 0
+			c, o := deliveryFixture(t, func(_ context.Context, typ string, value any) error {
+				if typ != transport.MsgNativeObservation {
+					t.Fatal("deletion staged private content", typ)
+				}
+				p := value.(transport.NativeObservationPayload)
+				if p.DeleteRequestID != job {
+					t.Fatal("unbound delete job")
+				}
+				p.DeleteRequestID = ""
+				if !reflect.DeepEqual(p, original) {
+					t.Fatal("original metadata changed")
+				}
+				writes++
+				if mode == "disconnect" {
+					c.Close()
+					return nil
+				}
+				digest := p.Digest
+				if mode == "wrong_digest" {
+					digest = "wrong"
+				}
+				c.NativeWorkerObservationDisposition(transport.MsgNativeObservationReceipt, transport.NativeObservationReceiptPayload{ObservationID: p.ObservationID, OriginID: p.OriginID, Digest: digest, Disposition: transport.NativeObservationDeleteQuarantined})
+				return nil
+			})
+			// The absent task-content capability must not impede this explicitly
+			// authorized metadata path, and the cipher reference remains unchanged.
+			o.Event = session.SessionEvent{Type: session.EventInteractionStarted, Interaction: &session.InteractionEvent{Kind: "question", NativeInteractionID: "question"}}
+			o.InteractionID = domain.NewID().String()
+			o.Inspection = &sessionworker.Inspection{DetailContent: &transport.NativeContentReference{ContentID: domain.NewID().String()}}
+			var err error
+			original, err = NativeWorkerWireObservation(o)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode != "unsupported" {
+				c.mu.Lock()
+				c.session.ProtocolFeatures = append(c.session.ProtocolFeatures, transport.NativeOwnedDeletionProtocol)
+				c.mu.Unlock()
+			}
+			if mode == "invalid_job" {
+				job = "not-a-job"
+			}
+			call := func(_ context.Context, req sessionworker.Request) (sessionworker.Response, error) {
+				switch req.Type {
+				case "observations":
+					return sessionworker.Response{Observations: []sessionworker.NativeObservation{o}}, nil
+				case "source_disposition":
+					if req.ObservationID != o.ID || req.SourceDigest != o.SourceDigest || req.SourceReceipt == nil || req.SourceReceipt.Disposition != transport.NativeObservationDeleteQuarantined {
+						t.Fatal("wrong source quarantine")
+					}
+					marks++
+					return sessionworker.Response{}, nil
+				default:
+					t.Fatal("deletion read/deleted ciphertext", req.Type)
+					return sessionworker.Response{}, nil
+				}
+			}
+			_, err = c.DrainDeletionSourcesPage(t.Context(), call, 0, job)
+			if mode == "supported" {
+				if err != nil || writes != 1 || marks != 1 {
+					t.Fatal(err, writes, marks)
+				}
+			} else if err == nil || marks != 0 {
+				t.Fatal("unsafe deletion accepted", err, marks)
+			}
+			if (mode == "unsupported" || mode == "invalid_job") && writes != 0 {
+				t.Fatal("unauthorized deletion publication")
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -29,7 +30,7 @@ func NativeWorkerWireObservation(o sessionworker.NativeObservation) (transport.N
 // DrainNativeWorkerSources retains the legacy one-page adapter. Controller
 // integrations use DrainNativeWorkerSourcesPage and retain its per-worker cursor.
 func (c *NativeObservationConnection) DrainNativeWorkerSources(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error)) error {
-	_, err := c.drainNativeWorkerSourcesPage(ctx, call, 0, 1)
+	_, err := c.drainNativeWorkerSourcesPage(ctx, call, 0, 1, "")
 	return err
 }
 
@@ -39,9 +40,26 @@ func (c *NativeObservationConnection) DrainNativeWorkerSources(ctx context.Conte
 // A zero result starts the next bounded pass from the oldest retained evidence.
 // Failed or unfinished supported sources never advance beyond their page.
 func (c *NativeObservationConnection) DrainNativeWorkerSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64) (int64, error) {
-	return c.drainNativeWorkerSourcesPage(ctx, call, after, 4)
+	return c.drainNativeWorkerSourcesPage(ctx, call, after, 4, "")
 }
-func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64, maxPages int) (int64, error) {
+
+// DrainDeletionSourcesPage publishes immutable metadata only for an explicit
+// authenticated typed Forget job. The caller must validate that job's ownership
+// against its pinned worker. This grants no permission to erase private evidence.
+func (c *NativeObservationConnection) DrainDeletionSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64, jobID string) (int64, error) {
+	if _, err := domain.ParseID(jobID); err != nil {
+		return after, ErrNativeObservationConflict
+	}
+	admission, err := c.AuthenticatedNativeHostSession()
+	if err != nil {
+		return after, err
+	}
+	if !slices.Contains(admission.ProtocolFeatures, transport.NativeOwnedDeletionProtocol) {
+		return after, ErrNativeOriginAdmissionDeferred
+	}
+	return c.drainNativeWorkerSourcesPage(ctx, call, after, 4, jobID)
+}
+func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.Context, call func(context.Context, sessionworker.Request) (sessionworker.Response, error), after int64, maxPages int, deleteJobID string) (int64, error) {
 	if after < 0 {
 		return after, ErrNativeObservationConflict
 	}
@@ -80,7 +98,7 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			if err != nil {
 				return after, err
 			}
-			if p.MessageType == transport.MsgRuntimeTurnOutput || p.MessageType == transport.MsgRuntimeTurnPlan || o.OutputContent != nil || o.PlanContent != nil {
+			if deleteJobID == "" && (p.MessageType == transport.MsgRuntimeTurnOutput || p.MessageType == transport.MsgRuntimeTurnPlan || o.OutputContent != nil || o.PlanContent != nil) {
 				session, err := c.AuthenticatedNativeHostSession()
 				if err != nil {
 					return after, err
@@ -109,7 +127,7 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			// An authenticated expired receipt does not attach content. Ask
 			// for it directly so backend staging quotas cannot prevent retaining
 			// the terminal disposition. The server alone decides expiration.
-			if time.Now().After(p.ExpiresAt) {
+			if time.Now().After(p.ExpiresAt) || deleteJobID != "" {
 				refs = nil
 			}
 			for _, ref := range refs {
@@ -121,12 +139,13 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 					return after, nil
 				}
 			}
+			p.DeleteRequestID = deleteJobID
 			receipt, err := c.deliverWorkerObservation(ctx, p)
 			if err != nil {
 				return after, err
 			}
 			if receipt.Disposition != "committed" {
-				if receipt.Disposition != "expired" && receipt.Disposition != "stale_origin" {
+				if receipt.Disposition != "expired" && receipt.Disposition != "stale_origin" && receipt.Disposition != transport.NativeObservationDeleteQuarantined {
 					return after, ErrNativeOriginAdmissionRejected
 				}
 				marked, err := call(ctx, sessionworker.Request{Type: "source_disposition", ObservationID: o.ID, SourceDigest: o.SourceDigest, SourceReceipt: &receipt})

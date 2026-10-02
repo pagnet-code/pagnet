@@ -31,7 +31,7 @@ func (j *Journal) createSourceDispositions() error {
 }
 func matchingTerminalReceipt(o NativeObservation, r transport.NativeObservationReceiptPayload) bool {
 	p, err := NativeBackendObservation(o)
-	return err == nil && (r.Disposition == "expired" || r.Disposition == "stale_origin") && r.ObservationID == p.ObservationID && r.OriginID == p.OriginID && r.Digest == p.Digest
+	return err == nil && (r.Disposition == "expired" || r.Disposition == "stale_origin" || r.Disposition == transport.NativeObservationDeleteQuarantined) && r.ObservationID == p.ObservationID && r.OriginID == p.OriginID && r.Digest == p.Digest
 }
 func (j *Journal) validateSourceDispositions() error {
 	rows, err := j.db.Query(`SELECT d.observation_id,d.source_digest,d.receipt,d.size,o.payload,COALESCE(s.source_sequence,0) FROM worker_source_dispositions d LEFT JOIN worker_observations o ON o.id=d.observation_id LEFT JOIN worker_observation_sequence s ON s.observation_id=d.observation_id`)

@@ -15,7 +15,7 @@ import (
 )
 
 func TestTerminalSourceDispositionRetainsOriginalAndAdvancesSendCursor(t *testing.T) {
-	for _, disposition := range []string{"expired", "stale_origin"} {
+	for _, disposition := range []string{"expired", "stale_origin", transport.NativeObservationDeleteQuarantined} {
 		t.Run(disposition, func(t *testing.T) {
 			j, dir := testJournal(t)
 			ctx := context.Background()
