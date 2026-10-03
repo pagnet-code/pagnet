@@ -637,7 +637,7 @@ func TestEnrollWithoutToken(t *testing.T) {
 	t.Cleanup(func() { userToken = prevToken })
 
 	dir := t.TempDir()
-	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, "", ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	// The minted enrollment token was consumed exactly once.

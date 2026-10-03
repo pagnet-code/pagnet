@@ -29,7 +29,7 @@ func TestEnrollServerFlagGiven(t *testing.T) {
 	t.Cleanup(func() { userToken = prevToken })
 
 	dir := t.TempDir()
-	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, "", ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	if n := ts.enrollCallCount(); n != 1 {
@@ -58,7 +58,7 @@ func TestEnrollServerFromState(t *testing.T) {
 	if err := mergeConfigFile(dir, map[string]any{"serverUrl": ts.URL}); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
-	if err := enrollHostForeground(dir, "", "test-host", nil, ""); err != nil {
+	if err := enrollHostForeground(dir, "", "test-host", nil, "", ""); err != nil {
 		t.Fatalf("enrollHostForeground: %v", err)
 	}
 	if n := ts.enrollCallCount(); n != 1 {

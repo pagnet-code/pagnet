@@ -144,7 +144,7 @@ func ensureServerSwitch(root, account string, cfg *config.Daemon) error {
 	if !ok {
 		return errors.New("switch cancelled — the host was not re-enrolled")
 	}
-	if err := enrollHostForeground(root, account, "", nil, ""); err != nil {
+	if err := enrollHostForeground(root, account, "", nil, "", ""); err != nil {
 		return err
 	}
 	if cfg2, _, err := loadAccountConfig(root); err == nil {

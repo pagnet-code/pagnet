@@ -122,7 +122,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	// exactly once, so it is the trigger for the console handoff (below).
 	firstRun := needsEnroll(cfg)
 	if firstRun {
-		if err := enrollHostForeground(root, account, "", nil, ""); err != nil {
+		if err := enrollHostForeground(root, account, "", nil, "", ""); err != nil {
 			return err
 		}
 		cfg, _, err = loadAccountConfig(root)
@@ -304,7 +304,7 @@ func runDetach(cmd *cobra.Command) error {
 	// never runs inside the detached child. (A config load failure is not
 	// fatal here: the child reports it.)
 	if cfg, account, err := loadAccountConfig(stateDir); err == nil && needsEnroll(cfg) {
-		if err := enrollHostForeground(stateDir, account, "", nil, ""); err != nil {
+		if err := enrollHostForeground(stateDir, account, "", nil, "", ""); err != nil {
 			return err
 		}
 	}

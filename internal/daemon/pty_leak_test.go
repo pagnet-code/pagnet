@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -179,6 +180,43 @@ func newP0Daemon(t *testing.T, bin string, env []string) *Daemon {
 	return d
 }
 
+// waitPTYLeakChildReady waits for evidence emitted by the slave-holding
+// descendant itself, after installing its SIGHUP disposition. A process count
+// cannot establish readiness: it may briefly count the sandbox launcher before
+// exec, rather than the descendant whose cleanup this regression exercises.
+func waitPTYLeakChildReady(t *testing.T, s *ptySession, marker string, deadline time.Time) int {
+	t.Helper()
+	ready := regexp.MustCompile(`pagnet-pty-child-ready ([0-9]+)\r*\n`)
+	for time.Now().Before(deadline) {
+		s.bufMu.Lock()
+		match := ready.FindSubmatch(s.ring)
+		s.bufMu.Unlock()
+		if len(match) == 2 {
+			pid, err := strconv.Atoi(string(match[1]))
+			if err != nil || pid <= 0 || pid == s.h.PID() {
+				t.Fatal("invalid slave-holding child readiness identity")
+			}
+			env, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+			if err != nil || !bytes.Contains(env, []byte("PAGNET_P0_LEAK="+marker+"\x00")) {
+				t.Fatal("ready child is not the marked fixture descendant", err)
+			}
+			pgrp, err := syscall.Getpgid(pid)
+			if err != nil || pgrp != s.h.PID() {
+				t.Fatal("ready child does not belong to the PTY process group", err)
+			}
+			childSlave, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", "0"))
+			leaderSlave, leaderErr := os.Readlink(filepath.Join("/proc", strconv.Itoa(s.h.PID()), "fd", "0"))
+			if err != nil || leaderErr != nil || !strings.HasPrefix(childSlave, "/dev/pts/") || childSlave != leaderSlave {
+				t.Fatal("ready child does not hold the session's PTY slave", err, leaderErr)
+			}
+			return pid
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("slave-holding descendant never reported readiness")
+	return 0
+}
+
 // TestPTYSessionLeak is the §46/§47 PTY regression: a PTY session whose
 // runtime spawns a slave-holding helper must, after stop(), leave zero
 // marker processes and no leaked goroutines.
@@ -220,13 +258,9 @@ func TestPTYSessionLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("terminal start: %v", err)
 	}
-	_ = s
+	childPID := waitPTYLeakChildReady(t, s, marker, deadline)
+	t.Logf("slave-holding descendant ready: pid=%d", childPID)
 
-	// Wait for the PTY child fixture to appear: the fake runtime itself
-	// carries the marker, the slave-holding child inherits it → >= 2.
-	for countMarkerProcesses(marker) < 2 && time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-	}
 	if got := countMarkerProcesses(marker); got < 2 {
 		t.Fatalf("pty child fixture did not start (marker procs=%d)", got)
 	}
@@ -350,8 +384,8 @@ func TestPTYConcurrentStartSingleProcess(t *testing.T) {
 	// The single session's fake runtime + its slave-holding child = 2
 	// marker processes. If the reservation regressed to N launches, this
 	// would be ~2N and trip the ceiling below.
-	for countMarkerProcesses(marker) < 2 && time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
+	for s := range sessions {
+		waitPTYLeakChildReady(t, s, marker, deadline)
 	}
 	if got := countMarkerProcesses(marker); got > ptyLeakMaxMarkerChildren {
 		killMarkerGroups(marker)

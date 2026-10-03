@@ -547,7 +547,7 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 	// production shape: the direct child is killed, the slave-holding
 	// descendant is not.
 	if os.Getenv("PAGNET_FAKE_PTY_CHILD") == "1" {
-		c := exec.Command("sh", "-c", "trap \"\" HUP; exec sleep 3600")
+		c := exec.Command("sh", "-c", "trap \"\" HUP; printf '\\r\\npagnet-pty-child-ready %s\\r\\n' \"$$\"; exec sleep 3600")
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := c.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "pty child fixture spawn: %v\r\n", err)

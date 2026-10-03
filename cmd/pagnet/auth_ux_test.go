@@ -277,7 +277,7 @@ func TestServeWrongClassRepromptsThenSucceeds(t *testing.T) {
 
 	// The translated text goes to stderr; capture it to prove what was shown.
 	shownText, runErr := captureStderr(func() error {
-		return enrollHostForeground(dir, account, "test-host", nil, "")
+		return enrollHostForeground(dir, account, "test-host", nil, "", "")
 	})
 
 	if runErr != nil {
@@ -330,7 +330,7 @@ func TestServeWrongClassExitsNonInteractive(t *testing.T) {
 	nonInteractive = true
 	t.Cleanup(func() { nonInteractive = prevNI })
 
-	err := enrollHostForeground(dir, account, "test-host", nil, "")
+	err := enrollHostForeground(dir, account, "test-host", nil, "", "")
 	if err == nil {
 		t.Fatal("want the friendly failure")
 	}
@@ -373,7 +373,7 @@ func TestRepromptLoopIsBounded(t *testing.T) {
 	}
 	t.Cleanup(func() { askPagnetTokenFn = prevAsk })
 
-	err := enrollHostForeground(dir, account, "test-host", nil, "")
+	err := enrollHostForeground(dir, account, "test-host", nil, "", "")
 	if err == nil {
 		t.Fatal("want the bounded failure")
 	}

@@ -251,13 +251,21 @@ func printVersion(w io.Writer) {
 // credential + identity in the active account's config (mode 0600).
 // User sign-in lives in `pagnet login`.
 func enrollCmd() *cobra.Command {
-	var token, name, stateDir, rootsMode string
+	var token, name, stateDir, rootsMode, ownership string
 	var roots []string
 	cmd := &cobra.Command{
 		Use:   "enroll",
 		Short: "Connect this host: signs you in (first run) and consumes an enrollment token",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if cmd.Flags().Changed("ownership") {
+				if ownership != "personal" && ownership != "organization" {
+					return errors.New("--ownership must be personal or organization")
+				}
+				if token != "" {
+					return errors.New("--ownership cannot be combined with --token or $PAGNET_ENROLL_TOKEN: the enrollment token already specifies ownership")
+				}
+			}
 			root := machineStateDir(stateDir)
 			account, err := accounts.ActiveAccount(root, accountFlag)
 			if err != nil {
@@ -268,7 +276,7 @@ func enrollCmd() *cobra.Command {
 				// paste), mint a one-time token for this host, and enroll
 				// with it. With --token the scripted/CI path is unchanged
 				// (no sign-in at all).
-				if err := enrollHostForeground(root, account, name, roots, rootsMode); err != nil {
+				if err := enrollHostForeground(root, account, name, roots, rootsMode, ownership); err != nil {
 					return err
 				}
 			} else {
@@ -300,6 +308,7 @@ func enrollCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&token, "token", os.Getenv("PAGNET_ENROLL_TOKEN"), "one-time enrollment token ($PAGNET_ENROLL_TOKEN; without it, enroll signs you in and mints one for this host)")
 	cmd.Flags().StringVar(&name, "name", "", "host name (default: machine hostname)")
+	cmd.Flags().StringVar(&ownership, "ownership", "", "host ownership: personal or organization (default: personal; organization requires an administrator)")
 	cmd.Flags().StringArrayVar(&roots, "roots", nil, "allowed workspace root (repeatable; server-side token roots win)")
 	cmd.Flags().StringVar(&rootsMode, "roots-mode", "", "roots enforcement: allow_all (default, any path) or allow_list (confine to --roots)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")
@@ -395,11 +404,15 @@ func doEnroll(server, token, name string, roots []string, rootsMode string, accD
 // server's error CODE, so the caller can translate a known auth failure into
 // product text. The body travels with it for the non-auth path only and is
 // never rendered to a human by that caller (plan §7).
-func mintEnrollmentToken(base, userTok, hostName string, roots []string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
+func mintEnrollmentToken(base, userTok, hostName string, roots []string, ownership string) (string, error) {
+	payload := map[string]any{
 		"name":         hostName,
 		"allowedRoots": roots,
-	})
+	}
+	if ownership != "" {
+		payload["ownershipScope"] = ownership
+	}
+	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, base+"api/v1/hosts/enrollment-tokens", bytes.NewReader(body))
 	if err != nil {
 		return "", err
@@ -472,7 +485,19 @@ func resolveEnrollServer(root, account string) (string, error) {
 // --token / $PAGNET_TOKEN (a prompt cannot fix a flag the operator set), or
 // when the human stops trying. Printing the server's JSON body and dying —
 // what this did before — is the 2026-09-20 incident (plan §7).
-func enrollHostForeground(root, account, name string, roots []string, rootsMode string) error {
+func enrollHostForeground(root, account, name string, roots []string, rootsMode, ownership string) error {
+	if ownership != "" {
+		if ownership != "personal" && ownership != "organization" {
+			return errors.New("--ownership must be personal or organization")
+		}
+		cfg, err := config.LoadDaemon(accountConfigDir(root, account))
+		if err != nil {
+			return err
+		}
+		if cfg.HostID != "" || cfg.Credential != "" {
+			return errors.New("this host is already enrolled; change ownership in the app: Hosts → select this host → Transfer ownership")
+		}
+	}
 	server, err := resolveEnrollServer(root, account)
 	if err != nil {
 		return err
@@ -491,7 +516,7 @@ func enrollHostForeground(root, account, name string, roots []string, rootsMode 
 		if err != nil {
 			return err
 		}
-		minted, err := mintEnrollmentToken(base, userTok, hostName, roots)
+		minted, err := mintEnrollmentToken(base, userTok, hostName, roots, ownership)
 		if err == nil {
 			return doEnroll(server, minted, hostName, roots, rootsMode, accDir)
 		}
