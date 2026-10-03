@@ -64,6 +64,7 @@ type Journal struct {
 	outputSpoolLookup    *sql.Stmt
 	outputSpoolReserve   *sql.Stmt
 	outputSpoolAppend    *sql.Stmt
+	outputDeltaAppend    *sql.Stmt
 	sourceRetries        map[string]*nativeSourceRetry
 	sourceProducers      map[*nativeSourceProducer]bool
 	strictSourceProducer bool

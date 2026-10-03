@@ -33,30 +33,41 @@ type nativeOutputReady struct {
 }
 
 type nativeOutputSpool struct {
-	Ready           *nativeOutputReady `json:"ready,omitempty"`
-	Source          NativeTurnSource
-	Origin          json.RawMessage
-	StreamID        string
-	BatchID         string
-	Text            string
-	NativeBytes     int
-	DeltaCount      int64
-	RollingDigest   string
-	ByteOffset      int64
-	FirstObservedAt time.Time
-	LastObservedAt  time.Time
-	Key             []byte
-	KeyAvailable    bool
-	LastDeltaID     string
-	LastDeltaDigest string
+	Ready             *nativeOutputReady `json:"ready,omitempty"`
+	Source            NativeTurnSource
+	Origin            json.RawMessage
+	StreamID          string
+	BatchID           string
+	Text              string
+	NativeBytes       int
+	DeltaCount        int64
+	RollingDigest     string
+	ByteOffset        int64
+	FirstObservedAt   time.Time
+	LastObservedAt    time.Time
+	Key               []byte
+	KeyAvailable      bool
+	LastDeltaID       string
+	LastDeltaDigest   string
+	PendingDeltas     int64
+	PendingBytes      int
+	PendingBaseDigest string
 }
 
 func (j *Journal) initializeOutputSpools() error {
 	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS worker_resource_interruptions(sequence INTEGER PRIMARY KEY,native_generation TEXT NOT NULL,payload BLOB NOT NULL)`); err != nil {
 		return err
 	}
-	_, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS worker_output_spools(sequence INTEGER PRIMARY KEY,native_generation TEXT NOT NULL,ciphertext BLOB NOT NULL,size INTEGER NOT NULL)`)
-	return err
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS worker_output_spools(sequence INTEGER PRIMARY KEY,native_generation TEXT NOT NULL,ciphertext BLOB NOT NULL,size INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS worker_output_deltas(sequence INTEGER NOT NULL,ordinal INTEGER NOT NULL,ciphertext BLOB NOT NULL,PRIMARY KEY(sequence,ordinal)) WITHOUT ROWID`,
+		`CREATE TRIGGER IF NOT EXISTS worker_output_delta_cleanup AFTER DELETE ON worker_output_spools BEGIN DELETE FROM worker_output_deltas WHERE sequence=OLD.sequence; END`,
+	} {
+		if _, err := j.db.Exec(q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func outputSpoolAAD(scope Scope, directory, generation string, sequence int64) []byte {
 	raw, _ := canonicalNativeJSON(struct {
@@ -160,6 +171,10 @@ func openOutputSpool(key []byte, scope Scope, directory, generation string, sequ
 		clear(result.Key)
 		return nativeOutputSpool{}, ErrConflict
 	}
+	if result.ByteOffset < 0 || result.PendingDeltas < 0 || result.PendingDeltas > result.DeltaCount || result.PendingBytes < 0 || result.ByteOffset+int64(len(result.Text))+int64(result.PendingBytes) != int64(result.NativeBytes) || (result.PendingDeltas == 0 && (result.PendingBytes != 0 || result.PendingBaseDigest != "")) {
+		clear(result.Key)
+		return nativeOutputSpool{}, ErrConflict
+	}
 	return result, nil
 }
 
@@ -185,9 +200,10 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	}
 	defer tx.Rollback()
 	var previous []byte
+	var previousSize int
 	lookup := tx.StmtContext(ctx, j.outputSpoolLookup)
 	defer lookup.Close()
-	err = lookup.QueryRowContext(ctx, source.Sequence, source.NativeGeneration).Scan(&previous)
+	err = lookup.QueryRowContext(ctx, source.Sequence, source.NativeGeneration).Scan(&previous, &previousSize)
 	if err == sql.ErrNoRows {
 		result = nativeOutputSpool{Source: source, Origin: append(json.RawMessage(nil), p.origin...), StreamID: uuid.NewString(), BatchID: uuid.NewString(), FirstObservedAt: nativeSourceTime(time.Now()), KeyAvailable: available}
 		if available {
@@ -214,6 +230,10 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 				clear(result.Key)
 				return nativeOutputSpool{}, ErrConflict
 			}
+			if err = j.assembleOutputDeltas(ctx, tx, key, &result, previousSize, len(previous)); err != nil {
+				clear(result.Key)
+				return nativeOutputSpool{}, err
+			}
 			return result, nil
 		}
 	}
@@ -222,17 +242,21 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 		return nativeOutputSpool{}, ErrNativeOutputLimit
 	}
 	oldDigest, _ := hex.DecodeString(result.RollingDigest)
+	if result.PendingDeltas == 0 {
+		result.PendingBaseDigest = result.RollingDigest
+	}
 	chain := sha256.New()
 	_, _ = chain.Write(oldDigest)
 	_, _ = chain.Write(raw)
 	result.RollingDigest = hex.EncodeToString(chain.Sum(nil))
 	result.DeltaCount++
 	result.NativeBytes += len(event.Output)
-	if result.Text == "" {
+	if result.Text == "" && result.PendingBytes == 0 {
 		result.FirstObservedAt = nativeSourceTime(time.Now())
 	}
 	result.LastObservedAt = nativeSourceTime(time.Now())
-	result.Text += event.Output
+	result.PendingDeltas++
+	result.PendingBytes += len(event.Output)
 	result.LastDeltaID, result.LastDeltaDigest = deltaID, deltaDigest
 	sealed, err := j.outputEncoder.seal(key, j.scope, j.dir, result)
 	if err != nil {
@@ -240,7 +264,12 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 		return nativeOutputSpool{}, err
 	}
 	// Private tail storage consumes only original reserved prefix capacity.
-	growth := len(sealed) - len(previous)
+	delta, err := sealOutputDelta(key, j.scope, j.dir, source, result.DeltaCount, raw)
+	if err != nil {
+		clear(result.Key)
+		return nativeOutputSpool{}, err
+	}
+	growth := len(sealed) - len(previous) + len(delta)
 	reserve := tx.StmtContext(ctx, j.outputSpoolReserve)
 	defer reserve.Close()
 	changed, err := reserve.ExecContext(ctx, growth, source.Sequence, growth, terminalCaptureReserveBytes/2)
@@ -254,7 +283,13 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	}
 	appendStatement := tx.StmtContext(ctx, j.outputSpoolAppend)
 	defer appendStatement.Close()
-	if _, err = appendStatement.ExecContext(ctx, source.Sequence, source.NativeGeneration, sealed, len(sealed)); err != nil {
+	if _, err = appendStatement.ExecContext(ctx, source.Sequence, source.NativeGeneration, sealed, previousSize+growth); err != nil {
+		clear(result.Key)
+		return nativeOutputSpool{}, err
+	}
+	appendDelta := tx.StmtContext(ctx, j.outputDeltaAppend)
+	defer appendDelta.Close()
+	if _, err = appendDelta.ExecContext(ctx, source.Sequence, result.DeltaCount, delta); err != nil {
 		clear(result.Key)
 		return nativeOutputSpool{}, err
 	}
@@ -279,7 +314,8 @@ type outputSpoolProjection struct {
 
 func (j *Journal) projectOutputSpoolTx(ctx context.Context, tx *sql.Tx, p *outputSpoolProjection) error {
 	var previous []byte
-	if err := tx.QueryRowContext(ctx, `SELECT ciphertext FROM worker_output_spools WHERE sequence=? AND native_generation=?`, p.Sequence, p.Generation).Scan(&previous); err != nil {
+	var previousSize int
+	if err := tx.QueryRowContext(ctx, `SELECT ciphertext,size FROM worker_output_spools WHERE sequence=? AND native_generation=?`, p.Sequence, p.Generation).Scan(&previous, &previousSize); err != nil {
 		return err
 	}
 	sum := sha256.Sum256(previous)
@@ -293,19 +329,29 @@ func (j *Journal) projectOutputSpoolTx(ctx context.Context, tx *sql.Tx, p *outpu
 	} else if _, err := tx.ExecContext(ctx, `UPDATE worker_output_spools SET ciphertext=?,size=? WHERE sequence=?`, p.Remaining, len(p.Remaining), p.Sequence); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM worker_output_deltas WHERE sequence=?`, p.Sequence); err != nil {
+		return err
+	}
 	// Replace the private tail with its complete immutable observation/capture
 	// and exact native ciphertext, in this transaction. No backend ACK invented.
-	_, err := tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET capture_left=capture_left+? WHERE sequence=?`, len(previous)-len(p.Remaining), p.Sequence)
+	_, err := tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET capture_left=capture_left+? WHERE sequence=?`, previousSize-len(p.Remaining), p.Sequence)
 	return err
 }
 func (j *Journal) readOutputSpool(ctx context.Context, key []byte, generation string, sequence int64) (nativeOutputSpool, []byte, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	var encrypted []byte
-	if err := j.db.QueryRowContext(ctx, `SELECT ciphertext FROM worker_output_spools WHERE sequence=? AND native_generation=?`, sequence, generation).Scan(&encrypted); err != nil {
+	var size int
+	if err := j.db.QueryRowContext(ctx, `SELECT ciphertext,size FROM worker_output_spools WHERE sequence=? AND native_generation=?`, sequence, generation).Scan(&encrypted, &size); err != nil {
 		return nativeOutputSpool{}, nil, err
 	}
 	data, err := openOutputSpool(key, j.scope, j.dir, generation, sequence, encrypted)
+	if err == nil {
+		err = j.assembleOutputDeltas(ctx, j.db, key, &data, size, len(encrypted))
+	}
+	if err != nil {
+		clear(data.Key)
+	}
 	return data, encrypted, err
 }
 func (j *Journal) outputSpoolSequences(ctx context.Context, generation string) ([]int64, error) {
@@ -330,6 +376,11 @@ func (j *Journal) outputSpoolSequences(ctx context.Context, generation string) (
 type nativeOutputProjectionObserver func(session.SessionEvent, *NativeOutputStreamProof, *outputSpoolProjection) error
 
 func (o *SessionOwner) observeOutputDelta(p *nativeSourceProducer, source NativeTurnSource, event session.SessionEvent, observe nativeOutputProjectionObserver) error {
+	// An empty output notification has no original text to capture or project.
+	// It must not leave a pending zero-byte stream blocking genuine EOF cleanup.
+	if event.Output == "" {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
 	defer cancel()
 	originalKey, available := o.originalTaskContentPin(&source)
@@ -340,7 +391,7 @@ func (o *SessionOwner) observeOutputDelta(p *nativeSourceProducer, source Native
 	for {
 		var data nativeOutputSpool
 		data, err = o.journal.appendOutputDelta(ctx, p, o.captureKey, source, event, deltaID, originalKey, available)
-		needsProjection = data.Ready != nil || len(data.Text) >= nativeOutputBatchBytes
+		needsProjection = data.Ready != nil || int64(data.NativeBytes)-data.ByteOffset >= nativeOutputBatchBytes
 		clear(data.Key)
 		if err == nil {
 			break
@@ -408,6 +459,7 @@ func (o *SessionOwner) flushNativeOutput(generation string, sequence int64, forc
 		proof := &NativeOutputStreamProof{Format: NativeOutputStreamCaptureFormat, StreamID: data.StreamID, BatchID: data.BatchID, DeltaCount: data.DeltaCount, RollingDigest: data.RollingDigest, ByteOffset: data.ByteOffset, ByteLength: count, FirstObservedAt: data.FirstObservedAt, LastObservedAt: data.LastObservedAt}
 		event := session.SessionEvent{Type: session.EventTurnOutput, NativeOutput: true, TurnID: data.Source.LogicalTurnID, SessionID: data.Source.NativeSessionID, Output: data.Text[:count]}
 		data.Text = data.Text[count:]
+		data.PendingDeltas, data.PendingBytes, data.PendingBaseDigest = 0, 0, ""
 		data.ByteOffset += int64(count)
 		data.BatchID = uuid.NewString()
 		remaining, err := o.journal.outputEncoder.seal(o.captureKey, o.journal.scope, o.journal.dir, data)
@@ -502,7 +554,8 @@ func (j *Journal) prepareOutputReady(ctx context.Context, key []byte, p *outputS
 	}
 	defer tx.Rollback()
 	var previous []byte
-	if err = tx.QueryRowContext(ctx, `SELECT ciphertext FROM worker_output_spools WHERE sequence=? AND native_generation=?`, p.Sequence, p.Generation).Scan(&previous); err != nil {
+	var previousSize int
+	if err = tx.QueryRowContext(ctx, `SELECT ciphertext,size FROM worker_output_spools WHERE sequence=? AND native_generation=?`, p.Sequence, p.Generation).Scan(&previous, &previousSize); err != nil {
 		return err
 	}
 	sum := sha256.Sum256(previous)
@@ -531,7 +584,7 @@ func (j *Journal) prepareOutputReady(ctx context.Context, key []byte, p *outputS
 	if count != 1 {
 		return ErrNativeCaptureLimit
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE worker_output_spools SET ciphertext=?,size=? WHERE sequence=?`, encrypted, len(encrypted), p.Sequence); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE worker_output_spools SET ciphertext=?,size=? WHERE sequence=?`, encrypted, previousSize+growth, p.Sequence); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {

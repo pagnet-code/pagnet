@@ -74,7 +74,7 @@ func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sq
 			var origin struct {
 				ID string `json:"id"`
 			}
-			if openErr != nil || tail.Text != "" || tail.Ready != nil || json.Unmarshal(tail.Origin, &origin) != nil || origin.ID != originID || tail.Source.NativeSessionID != sessionID || tail.Source.SourceCommandID != s.SourceCommandID || tail.Source.SourceAdmissionID != s.SourceAdmissionID || tail.Source.LogicalTurnID != s.LogicalTurnID || tail.Source.InputKind != s.InputKind {
+			if openErr != nil || tail.Text != "" || tail.PendingDeltas != 0 || tail.Ready != nil || json.Unmarshal(tail.Origin, &origin) != nil || origin.ID != originID || tail.Source.NativeSessionID != sessionID || tail.Source.SourceCommandID != s.SourceCommandID || tail.Source.SourceAdmissionID != s.SourceAdmissionID || tail.Source.LogicalTurnID != s.LogicalTurnID || tail.Source.InputKind != s.InputKind {
 				return ErrConflict
 			}
 		}
