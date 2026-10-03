@@ -185,7 +185,9 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	}
 	defer tx.Rollback()
 	var previous []byte
-	err = tx.QueryRowContext(ctx, `SELECT ciphertext FROM worker_output_spools WHERE sequence=? AND native_generation=?`, source.Sequence, source.NativeGeneration).Scan(&previous)
+	lookup := tx.StmtContext(ctx, j.outputSpoolLookup)
+	defer lookup.Close()
+	err = lookup.QueryRowContext(ctx, source.Sequence, source.NativeGeneration).Scan(&previous)
 	if err == sql.ErrNoRows {
 		result = nativeOutputSpool{Source: source, Origin: append(json.RawMessage(nil), p.origin...), StreamID: uuid.NewString(), BatchID: uuid.NewString(), FirstObservedAt: nativeSourceTime(time.Now()), KeyAvailable: available}
 		if available {
@@ -239,7 +241,9 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 	}
 	// Private tail storage consumes only original reserved prefix capacity.
 	growth := len(sealed) - len(previous)
-	changed, err := tx.ExecContext(ctx, `UPDATE worker_terminal_reservations SET capture_left=capture_left-? WHERE sequence=? AND observation_id='' AND capture_left-?>=?`, growth, source.Sequence, growth, terminalCaptureReserveBytes/2)
+	reserve := tx.StmtContext(ctx, j.outputSpoolReserve)
+	defer reserve.Close()
+	changed, err := reserve.ExecContext(ctx, growth, source.Sequence, growth, terminalCaptureReserveBytes/2)
 	if err != nil {
 		return nativeOutputSpool{}, err
 	}
@@ -248,7 +252,9 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 		clear(result.Key)
 		return nativeOutputSpool{}, ErrNativeOutputLimit
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_output_spools(sequence,native_generation,ciphertext,size) VALUES(?,?,?,?) ON CONFLICT(sequence) DO UPDATE SET ciphertext=excluded.ciphertext,size=excluded.size`, source.Sequence, source.NativeGeneration, sealed, len(sealed)); err != nil {
+	appendStatement := tx.StmtContext(ctx, j.outputSpoolAppend)
+	defer appendStatement.Close()
+	if _, err = appendStatement.ExecContext(ctx, source.Sequence, source.NativeGeneration, sealed, len(sealed)); err != nil {
 		clear(result.Key)
 		return nativeOutputSpool{}, err
 	}

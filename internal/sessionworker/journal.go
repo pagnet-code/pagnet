@@ -60,6 +60,10 @@ type Outcome struct {
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
 	outputEncoder        nativeOutputEncoder
+	nativeTurnLookup     *sql.Stmt
+	outputSpoolLookup    *sql.Stmt
+	outputSpoolReserve   *sql.Stmt
+	outputSpoolAppend    *sql.Stmt
 	sourceRetries        map[string]*nativeSourceRetry
 	sourceProducers      map[*nativeSourceProducer]bool
 	strictSourceProducer bool
@@ -182,6 +186,9 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 		return fail(err)
 	}
 	if err = j.initializeSourceRetirement(); err != nil {
+		return fail(err)
+	}
+	if err = j.prepareNativeOutputStatements(); err != nil {
 		return fail(err)
 	}
 	owner = nil // journal owns the lifetime lock after successful initialization

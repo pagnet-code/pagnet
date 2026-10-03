@@ -130,3 +130,44 @@ func TestNativeSubmitCannotPrecedeSourceCommit(t *testing.T) {
 		t.Fatal("immutable source tuple overwritten")
 	}
 }
+
+func TestPreparedNativeSourceLookupCancellationNeverCachesAuthority(t *testing.T) {
+	j, dir := testJournal(t)
+	original := admitTurnSource(t, j, lease(t, j), 1, "source-command-A", "source-admission-A")
+	event := session.SessionEvent{Type: session.EventTurnOutput, SessionID: original.NativeSessionID, TurnID: original.LogicalTurnID, NativeOutput: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := j.NativeEventSource(ctx, original.NativeGeneration, event); !errors.Is(err, context.Canceled) {
+		t.Fatal("canceled prepared lookup returned authority", err)
+	}
+	actual, _, err := j.NativeEventSource(context.Background(), original.NativeGeneration, event)
+	if err != nil || actual == nil || *actual != original {
+		t.Fatal("cancellation poisoned subsequent exact source lookup", err)
+	}
+	event.SessionID = "foreign-session"
+	if _, _, err := j.NativeEventSource(context.Background(), original.NativeGeneration, event); !errors.Is(err, ErrConflict) {
+		t.Fatal("prepared lookup cached authority across native sessions", err)
+	}
+	event.SessionID = original.NativeSessionID
+	// Physical row removal is test pressure: a prepared query caches its plan,
+	// never an earlier authorization result or source tuple.
+	if _, err := j.db.Exec(`DELETE FROM worker_turn_sources WHERE sequence=1`); err != nil {
+		t.Fatal(err)
+	}
+	actual, unavailable, err := j.NativeEventSource(context.Background(), original.NativeGeneration, event)
+	if err != nil || actual != nil || !unavailable {
+		t.Fatal("prepared lookup returned deleted source authority", err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(dir, j.scope)
+	if err != nil {
+		t.Fatal("prepared statements prevented durable reopen", err)
+	}
+	defer reopened.Close()
+	actual, unavailable, err = reopened.NativeEventSource(context.Background(), original.NativeGeneration, event)
+	if err != nil || actual != nil || !unavailable {
+		t.Fatal("reopened prepared lookup fabricated deleted source", err)
+	}
+}

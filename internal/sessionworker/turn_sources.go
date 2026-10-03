@@ -150,9 +150,13 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	return tx.Commit()
 }
 func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (NativeTurnSource, error) {
+	return scanNativeTurn(tx.QueryRowContext(ctx, nativeTurnLookupSQL, generation, turn))
+}
+
+func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	var source NativeTurnSource
 	var task string
-	err := tx.QueryRowContext(ctx, `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`, generation, turn).Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task)
+	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task)
 	if err == nil && task != "" {
 		err = json.Unmarshal([]byte(task), &source.SourceTask)
 	}
@@ -164,29 +168,38 @@ func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (N
 func (j *Journal) NativeEventSource(ctx context.Context, generation string, event session.SessionEvent) (*NativeTurnSource, bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	// A non-interaction event needs one immutable source row. Its SELECT is
+	// already a single SQLite snapshot; a separate BEGIN/ROLLBACK adds no
+	// consistency while forcing extra parser work for every tiny output delta.
+	if event.Interaction == nil {
+		source, err := scanNativeTurn(j.nativeTurnLookup.QueryRowContext(ctx, generation, event.TurnID))
+		return nativeEventSourceResult(source, err, event.TurnID, event.SessionID)
+	}
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	defer tx.Rollback()
 	turn := event.TurnID
-	if event.Interaction != nil {
-		var original string
-		err = tx.QueryRowContext(ctx, `SELECT logical_turn FROM worker_interaction_sources WHERE native_generation=? AND native_session=? AND native_id=?`, generation, event.SessionID, event.Interaction.NativeInteractionID).Scan(&original)
-		if err == nil {
-			turn = original
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return nil, false, err
-		}
+	var original string
+	err = tx.QueryRowContext(ctx, `SELECT logical_turn FROM worker_interaction_sources WHERE native_generation=? AND native_session=? AND native_id=?`, generation, event.SessionID, event.Interaction.NativeInteractionID).Scan(&original)
+	if err == nil {
+		turn = original
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, err
 	}
 	source, err := readNativeTurn(ctx, tx, generation, turn)
+	return nativeEventSourceResult(source, err, turn, event.SessionID)
+}
+
+func nativeEventSourceResult(source NativeTurnSource, err error, turn, sessionID string) (*NativeTurnSource, bool, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, strings.HasPrefix(turn, "pagnet-worker-turn-"), nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	if source.NativeSessionID != event.SessionID {
+	if source.NativeSessionID != sessionID {
 		return nil, false, ErrConflict
 	}
 	return &source, false, nil
