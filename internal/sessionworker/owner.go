@@ -31,9 +31,13 @@ type NativeSpec struct {
 	Workspace, Model, StandingInstructions   string
 	MCPExecutable, NetworkID, Kind, TenantID string
 	NetworkTenantID                          string
-	ProtectedContext                         *e2ee.ProtectedContext
-	ContextStateDir                          string
-	NetworkStateDir                          string `json:",omitempty"`
+	// InitialNativeSessionID is an existing, host-persisted conversation to
+	// resume on the first activation. Drivers must verify its actual identity;
+	// configuration metadata never constitutes a native session observation.
+	InitialNativeSessionID string `json:",omitempty"`
+	ProtectedContext       *e2ee.ProtectedContext
+	ContextStateDir        string
+	NetworkStateDir        string `json:",omitempty"`
 }
 
 type Operation struct {
@@ -202,6 +206,20 @@ func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 	owner.driver = driver
 	owner.manager.RegisterDriver(&ownedDriver{Driver: driver, owner: owner})
 	owner.sess = owner.manager.Session(j.scope.InstanceID, spec.Runtime, spec.Workspace)
+	if spec.InitialNativeSessionID != "" {
+		// Import a host's stored conversation only before this worker's first
+		// admitted operation. The immutable bootstrap must never resurrect an
+		// old conversation after a subsequent explicit fresh restart.
+		var pristine bool
+		if err := j.db.QueryRowContext(ctx, `SELECT next_sequence=1 AND retired=0 FROM worker_meta WHERE singleton=1`).Scan(&pristine); err != nil {
+			cancel()
+			clear(owner.captureKey)
+			return nil, err
+		}
+		if pristine {
+			owner.manager.RestoreNativeState(j.scope.InstanceID, spec.InitialNativeSessionID)
+		}
+	}
 	owner.manager.SetModel(owner.sess, spec.Model)
 	owner.manager.SetStandingInstructions(owner.sess, spec.StandingInstructions)
 	denied := []string{j.dir}

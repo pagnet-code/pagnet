@@ -1442,8 +1442,12 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 			return
 		}
 		d.enqueueInstance(p.InstanceID, func() {
-			if err := d.prepareNativeOwnership(conn, p); err != nil && !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
-				d.Log.Warn("native ownership preparation deferred", "instance", p.InstanceID, "err", err)
+			if err := d.prepareNativeOwnership(conn, p); err != nil {
+				if errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+					d.Log.Debug("native ownership preparation waiting", "instance", p.InstanceID, "operation", p.SourceCommandType, "err", err)
+				} else {
+					d.Log.Warn("native ownership preparation deferred", "instance", p.InstanceID, "operation", p.SourceCommandType, "err", err)
+				}
 			}
 		})
 

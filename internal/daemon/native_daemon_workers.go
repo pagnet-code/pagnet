@@ -114,6 +114,7 @@ func (d *Daemon) nativeConfiguration(row *InstanceRow, scope sessionworker.Scope
 		return sessionworker.NativeSpec{}, err
 	}
 	spec := sessionworker.NativeSpec{Runtime: rn, Binary: binary, PrefixArgs: prefix, NativeDirs: dirs, Env: append(append([]string(nil), d.RuntimeEnv...), env...), Workspace: row.Workspace, Model: row.Model, StandingInstructions: standing, MCPExecutable: d.selfExe, NetworkID: row.NetworkID, Kind: row.Kind, TenantID: scope.TenantID, ContextStateDir: d.StateDir, NetworkStateDir: d.StateDir}
+	spec.InitialNativeSessionID = row.SessionID
 	if row.NetworkID != "" {
 		m := d.cryptoManager()
 		m.mu.Lock()
@@ -154,12 +155,36 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 		return err
 	}
 	if errors.Is(err, sql.ErrNoRows) {
-		if p.Launch == nil || p.Launch.InstanceID != p.InstanceID || p.Launch.CommandID != p.SourceCommandID || p.Launch.NativeDispatch != nil {
-			return ErrNativeOriginAdmissionDeferred
+		// The launch is configuration, not the source of this pending operation.
+		// An attach/wake may bootstrap ownership long after the original launch
+		// was acknowledged. Preserve both command identities and all sealed AAD.
+		if p.Launch == nil {
+			return fmt.Errorf("original launch configuration unavailable: %w", ErrNativeOriginAdmissionDeferred)
 		}
-		row, _, _, err := d.prepareLaunch(*p.Launch)
+		if p.Launch.InstanceID != p.InstanceID || p.Launch.NativeDispatch != nil || p.Launch.Runtime != p.Runtime || p.Launch.Profile != p.Profile {
+			return ErrNativeObservationConflict
+		}
+		if _, err := domain.ParseID(p.Launch.CommandID); err != nil {
+			return ErrNativeObservationConflict
+		}
+		if p.SourceCommandType == transport.MsgLaunchAgent && p.Launch.CommandID != p.SourceCommandID {
+			return ErrNativeObservationConflict
+		}
+		row, exists, err := d.state.GetInstance(p.InstanceID)
 		if err != nil {
 			return err
+		}
+		if exists {
+			// Replaying launch preparation would replace the existing workspace,
+			// standing configuration and native session with a fresh idle row.
+			if row.Runtime != p.Runtime || row.Profile != p.Profile || row.NetworkID != p.Launch.NetworkID || row.DefinitionID != p.Launch.DefinitionID || row.AgentPrincipalID != p.Launch.AgentPrincipalID {
+				return ErrNativeObservationConflict
+			}
+		} else {
+			row, _, _, err = d.prepareLaunch(*p.Launch)
+			if err != nil {
+				return err
+			}
 		}
 		if p.ProtectedContextRequired {
 			local, ready := d.contextForInstance(p.InstanceID)
@@ -245,6 +270,7 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 	if old != nil {
 		_ = old.proxy.Close()
 	}
+	d.Log.Info("native session worker connected", "instance", record.Scope.InstanceID, "runtime", record.Spec.Runtime)
 	go d.pumpNativeWorker(link)
 	return nil
 }
