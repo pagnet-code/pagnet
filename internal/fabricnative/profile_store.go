@@ -1,10 +1,12 @@
 package fabricnative
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -97,8 +99,10 @@ func (s *ProfileStore) nativeBinding(ctx context.Context, scope registry.Descrip
 	return fabric.NewError(fabric.CodeUnsupported, "Selected binding is not a native execution profile")
 }
 
-// Put uses the existing signed binding projection and its CAS generation. There
-// is no second database, filesystem registry or unbounded enumeration. Secrets
+// Put installs an immutable private execution profile in the signed binding
+// projection. Exact installation retries recover the actual existing profile;
+// changed runtime/profile requires an explicitly new binding and ownership slot.
+// There is no second database or filesystem registry. Secrets
 // are resolved separately into the launcher's memory-only credential pipe.
 func (s *ProfileStore) Put(ctx context.Context, scope registry.DescriptorBatchScope, p Profile) (uint64, error) {
 	if s == nil || ctx == nil || !validProfile(p) {
@@ -112,6 +116,26 @@ func (s *ProfileStore) Put(ctx context.Context, scope registry.DescriptorBatchSc
 		return 0, fabric.NewError(fabric.CodeInvalidInput, "Private native profile exceeds byte budget")
 	}
 	defer clear(raw)
+	existing, generation, readErr := s.Get(ctx, scope)
+	if readErr == nil {
+		if scope.ExpectedProjectionRevision != 0 && scope.ExpectedProjectionRevision != generation {
+			return 0, fabric.NewError(fabric.CodeStaleReference, "Private profile generation changed")
+		}
+		current, e := json.Marshal(profileRecord{"pagnet.native.profile.v1", existing, existing.Native.Env})
+		if e != nil {
+			return 0, e
+		}
+		same := bytes.Equal(current, raw)
+		clear(current)
+		if !same {
+			return 0, fabric.NewError(fabric.CodeStaleReference, "Changing runtime or execution profile requires a new binding")
+		}
+		return generation, nil
+	}
+	var missing *fabric.Error
+	if !errors.As(readErr, &missing) || missing.Code != fabric.CodeNotFound {
+		return 0, readErr
+	}
 	sealed, err := s.protector.Seal(s.aad(scope), raw)
 	if err != nil || len(sealed) > 64<<10 {
 		return 0, checkpointDenied()

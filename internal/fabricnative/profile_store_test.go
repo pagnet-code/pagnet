@@ -37,8 +37,8 @@ func TestPrivateNativeProfileActualRegistryRestartRenewalAndCAS(t *testing.T) {
 	if generation, e := profiles.Put(t.Context(), scope, profile); e != nil || generation != 1 {
 		t.Fatal("private profile commit", generation, e)
 	}
-	if _, e := profiles.Put(t.Context(), scope, profile); e == nil {
-		t.Fatal("missing CAS permitted replacement")
+	if generation, e := profiles.Put(t.Context(), scope, profile); e != nil || generation != 1 {
+		t.Fatal("exact installation retry lost retained profile", generation, e)
 	}
 	page, err := c.store.ReadBindingProjection(t.Context(), c.owner, scope, "", 1)
 	if err != nil || bytes.Contains(page.PrivateConfig, []byte("private-profile-marker")) || len(page.Rows) != 0 {
