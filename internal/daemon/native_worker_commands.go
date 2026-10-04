@@ -71,6 +71,30 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 		if r.Proof.OwnershipID != ownership.ID || r.Proof.OwnershipGeneration != p.scope.Generation {
 			return nil, ErrNativeObservationConflict
 		}
+		if r.Proof.DispatchSequence == floor+1 && r.Kind == "attach" && r.State == "view_pending" {
+			// A disconnected terminal handler may never confirm its final view
+			// failure. Recover only the original worker's definitive failure;
+			// successful/ambiguous views still require their original handler.
+			original, readErr := p.call(ctx, sessionworker.Request{Type: "outcome", Sequence: r.OperationSequence})
+			if readErr != nil {
+				return nil, readErr
+			}
+			out := original.Outcome
+			if out == nil || out.Sequence != r.OperationSequence || out.CommandID != r.Proof.SourceCommandID || out.Kind != r.Kind || out.SourceAdmission == nil {
+				return nil, ErrNativeObservationConflict
+			}
+			a := out.SourceAdmission
+			if a.Scope != p.scope || a.NativeAdmissionID != r.Proof.SourceAdmissionID || a.RunnerID != r.Proof.SourceRunnerID || !a.RunnerEpoch.Equal(r.Proof.SourceRunnerEpoch) || a.BootID != r.Proof.SourceBootID {
+				return nil, ErrNativeObservationConflict
+			}
+			if out.State != "failed" {
+				break
+			}
+			if _, err = p.call(ctx, sessionworker.Request{Type: "terminal_view_commit", NativeDispatch: &r.Proof}); err != nil {
+				return nil, err
+			}
+			r.State = out.State
+		}
 		if r.Proof.DispatchSequence != floor+1 || (r.State != "completed" && r.State != "failed" && r.State != "cancelled" && r.State != sessionworker.ResourceInterrupted && r.State != sessionworker.OwnerStopped) {
 			break
 		}
