@@ -14,6 +14,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/internal/fabricmcp"
 	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -253,7 +255,7 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		return
 	}
 	instanceID := ""
-	defer d.releaseBridgeConn(instanceID)
+	defer func() { d.releaseBridgeConn(instanceID) }()
 	r := bufio.NewReader(c)
 
 	line, err := readLine(r)
@@ -262,12 +264,13 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	}
 	var auth struct {
 		Type       string `json:"type"`
+		Protocol   string `json:"protocol,omitempty"`
 		InstanceID string `json:"instanceId"`
 		NetworkID  string `json:"networkId"`
 		Nonce      string `json:"nonce"`
 		Kind       string `json:"kind"`
 	}
-	if err := json.Unmarshal(line, &auth); err != nil || auth.Type != "auth" {
+	if err := fabric.DecodeJSON(line, &auth); err != nil || auth.Type != "auth" || (auth.Protocol != "" && auth.Protocol != "fabric.mcp") {
 		writeBridgeError(c, "first message must be auth")
 		return
 	}
@@ -341,9 +344,24 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 		writeBridgeError(c, "peer process verification failed (identity rejected): "+err.Error())
 		return
 	}
-	if _, err := writeBridge(c, map[string]any{
-		"type": "auth_ok", "instanceId": row.InstanceID,
-	}); err != nil {
+	var localFactory fabricmcp.SessionFactory
+	if auth.Protocol == "fabric.mcp" {
+		localFactory, err = d.prepareManagedFabricPeer(d.turnCtx, c, row, wantKind, auth.Nonce, *rootPID)
+		if err != nil {
+			writeBridgeError(c, "local Fabric peer unavailable")
+			return
+		}
+	}
+	defer func() {
+		if localFactory != nil {
+			_ = localFactory.Close()
+		}
+	}()
+	ack := map[string]any{"type": "auth_ok", "instanceId": row.InstanceID}
+	if localFactory != nil {
+		ack["protocol"] = "fabric.mcp"
+	}
+	if _, err := writeBridge(c, ack); err != nil {
 		return
 	}
 	d.Log.Info("bridge authenticated", "instance", row.InstanceID, "kind", wantKind)
@@ -357,6 +375,12 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	// surface for the rest of the endpoint's life. Resource bounds for
 	// authenticated connections come from the caps above, not a timer.
 	_ = c.SetReadDeadline(time.Time{})
+	if localFactory != nil {
+		factory := localFactory
+		localFactory = nil // ServeVerified now owns factory/session closure.
+		d.serveManagedFabric(c, r, factory)
+		return
+	}
 
 	// Tool-call loop until the client disconnects.
 	for {
