@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,7 +37,7 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 	if e != nil || state.Exists {
 		t.Fatal("fresh claim invented", e)
 	}
-	ticket, e := c.BeginLaunch(t.Context(), scope, "launch-original")
+	ticket, e := c.BeginLaunch(t.Context(), scope, "launch-original", filepath.Join(dir, "original-worker"))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -54,10 +55,10 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 	if (&LaunchTicket{}).Run(t.Context(), func(context.Context) error { t.Fatal("zero ticket launched"); return nil }) == nil {
 		t.Fatal("uncommitted ticket admitted")
 	}
-	if _, e = c.BeginLaunch(t.Context(), scope, "launch-original"); e == nil {
+	if _, e = c.BeginLaunch(t.Context(), scope, "launch-original", filepath.Join(dir, "original-worker")); e == nil {
 		t.Fatal("same attempt relaunched uncertain effect")
 	}
-	if _, e = c.BeginLaunch(t.Context(), scope, "launch-another"); e == nil {
+	if _, e = c.BeginLaunch(t.Context(), scope, "launch-another", filepath.Join(dir, "original-worker")); e == nil {
 		t.Fatal("new attempt replayed same physical worker")
 	}
 	if e = c.store.Close(); e != nil {
@@ -76,7 +77,7 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = reopened.BeginLaunch(t.Context(), scope, "launch-after-restart"); e == nil {
+	if _, e = reopened.BeginLaunch(t.Context(), scope, "launch-after-restart", filepath.Join(dir, "changed-worker")); e == nil {
 		t.Fatal("root restart erased uncertain physical claim")
 	}
 	// A descriptor renewal preserves the physical slot, rather than creating
@@ -89,21 +90,25 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 		t.Fatal(e)
 	}
 	state, e = reopened.LookupLaunch(t.Context(), b)
-	if e != nil || !state.Exists || state.Ownership != scope || state.Observed != nil {
+	if e != nil || !state.Exists || state.Ownership != scope || state.Observed != nil || state.Directory != filepath.Join(dir, "original-worker") {
 		t.Fatal("retained claim lost original ownership", e)
 	}
-	if _, e = reopened.BeginLaunch(t.Context(), b, "launch-renamed"); e == nil {
+	page, e := reopened.ListLaunches(t.Context(), "", 1)
+	if e != nil || len(page.Claims) != 1 || page.Claims[0].Directory != filepath.Join(dir, "original-worker") || page.Claims[0].Ownership != scope {
+		t.Fatal("startup reconstructed original directory", e)
+	}
+	if _, e = reopened.BeginLaunch(t.Context(), b, "launch-renamed", filepath.Join(dir, "changed-worker")); e == nil {
 		t.Fatal("descriptor renewal reminted launch permit")
 	}
 }
 
 func TestCancelledLaunchPermitCannotBeReused(t *testing.T) {
-	c, value, _ := checkpointFixture(t, registry.DefaultOptions())
+	c, value, dir := checkpointFixture(t, registry.DefaultOptions())
 	scope, e := nativeauthority.NewLocalScope(c.root, value.OriginalBinding)
 	if e != nil {
 		t.Fatal(e)
 	}
-	ticket, e := c.BeginLaunch(t.Context(), scope, "launch-cancelled")
+	ticket, e := c.BeginLaunch(t.Context(), scope, "launch-cancelled", filepath.Join(dir, "original-worker"))
 	if e != nil {
 		t.Fatal(e)
 	}

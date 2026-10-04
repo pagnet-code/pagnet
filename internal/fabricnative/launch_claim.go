@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/pagnet-code/pagnet/fabric/events/durable"
+	"path/filepath"
 	"sync"
 	"unicode/utf8"
 
@@ -22,6 +24,8 @@ type launchClaim struct {
 	Attempt   string                     `json:"attempt"`
 	Phase     string                     `json:"phase"`
 	Process   *localpeer.ProcessSnapshot `json:"process,omitempty"`
+	Directory []byte                     `json:"directory"`
+	Key       durable.KeyReference       `json:"key"`
 }
 
 // LaunchState is retained infrastructure history, never process liveness.
@@ -30,6 +34,7 @@ type LaunchState struct {
 	Exists    bool
 	Ownership nativeauthority.Scope
 	Observed  *localpeer.ProcessSnapshot
+	Directory string
 }
 
 func (c *Checkpoints) LookupLaunch(ctx context.Context, physical nativeauthority.Scope) (LaunchState, error) {
@@ -45,6 +50,7 @@ func (c *Checkpoints) LookupLaunch(ctx context.Context, physical nativeauthority
 		return LaunchState{}, err
 	}
 	var state LaunchState
+	var sealed []byte
 	err = c.store.WithNativeAuthority(ctx, c.owner, registry.AuthorityScope{}, func(tx *registry.AuthorityTx) error {
 		record, err := tx.Get(key)
 		if err != nil {
@@ -55,12 +61,16 @@ func (c *Checkpoints) LookupLaunch(ctx context.Context, physical nativeauthority
 			return err
 		}
 		var claim launchClaim
-		if record.Retired || decodeCheckpoint(record.Value, &claim) != nil || claim.Version != "pagnet.native.launch-claim.v1" || claim.Ownership.Validate() != nil || !claim.Ownership.SamePhysical(physical) || claim.Attempt == "" || len(claim.Attempt) > 256 || !utf8.ValidString(claim.Attempt) {
+		if record.Retired || decodeCheckpoint(record.Value, &claim) != nil || claim.Version != "pagnet.native.launch-claim.v2" || claim.Ownership.Validate() != nil || !claim.Ownership.SamePhysical(physical) || claim.Attempt == "" || len(claim.Attempt) > 256 || !utf8.ValidString(claim.Attempt) {
 			return checkpointDenied()
 		}
 		if claim.Phase != "launching" && claim.Phase != "observed" || claim.Phase == "launching" && claim.Process != nil || claim.Phase == "observed" && (claim.Process == nil || claim.Process.PID <= 0 || claim.Process.Start <= 0) {
 			return checkpointDenied()
 		}
+		if claim.Key != c.key || len(claim.Directory) == 0 || len(claim.Directory) > 16<<10 {
+			return checkpointDenied()
+		}
+		sealed = append([]byte(nil), claim.Directory...)
 		state = LaunchState{Exists: true, Ownership: claim.Ownership}
 		if claim.Process != nil {
 			process := *claim.Process
@@ -70,6 +80,18 @@ func (c *Checkpoints) LookupLaunch(ctx context.Context, physical nativeauthority
 	})
 	if err != nil {
 		return LaunchState{}, err
+	}
+	if state.Exists {
+		raw, e := c.protector.Open(c.launchAAD(key), sealed)
+		if e != nil {
+			return LaunchState{}, checkpointDenied()
+		}
+		defer clear(raw)
+		var directory string
+		if decodeCheckpoint(raw, &directory) != nil || !validLaunchDirectory(directory) {
+			return LaunchState{}, checkpointDenied()
+		}
+		state.Directory = directory
 	}
 	return state, nil
 }
@@ -119,8 +141,8 @@ func launchClaimKey(scope nativeauthority.Scope) (registry.AuthorityKey, error) 
 // BeginLaunch never reissues a permit for an existing physical ownership slot,
 // including a retry with the SAME attempt. Explicit authenticated recovery must
 // observe the retained worker; absence of a socket is not proof it never ran.
-func (c *Checkpoints) BeginLaunch(ctx context.Context, ownership nativeauthority.Scope, attempt string) (*LaunchTicket, error) {
-	if c == nil || ctx == nil || attempt == "" || len(attempt) > 256 || !utf8.ValidString(attempt) {
+func (c *Checkpoints) BeginLaunch(ctx context.Context, ownership nativeauthority.Scope, attempt, directory string) (*LaunchTicket, error) {
+	if c == nil || ctx == nil || attempt == "" || len(attempt) > 256 || !utf8.ValidString(attempt) || !validLaunchDirectory(directory) {
 		return nil, checkpointDenied()
 	}
 	local, ok := ownership.Local()
@@ -131,7 +153,16 @@ func (c *Checkpoints) BeginLaunch(ctx context.Context, ownership nativeauthority
 	if err != nil {
 		return nil, err
 	}
-	raw, err := json.Marshal(launchClaim{Version: "pagnet.native.launch-claim.v1", Ownership: ownership, Attempt: attempt, Phase: "launching"})
+	plain, err := json.Marshal(directory)
+	if err != nil {
+		return nil, err
+	}
+	sealed, err := c.protector.Seal(c.launchAAD(key), plain)
+	clear(plain)
+	if err != nil || len(sealed) == 0 || len(sealed) > 16<<10 {
+		return nil, checkpointDenied()
+	}
+	raw, err := json.Marshal(launchClaim{Version: "pagnet.native.launch-claim.v2", Ownership: ownership, Attempt: attempt, Phase: "launching", Directory: sealed, Key: c.key})
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +213,7 @@ func (c *Checkpoints) ObserveLaunched(ctx context.Context, ownership nativeautho
 			return e
 		}
 		var claim launchClaim
-		if record.Retired || decodeCheckpoint(record.Value, &claim) != nil || claim.Version != "pagnet.native.launch-claim.v1" || claim.Ownership != ownership || claim.Attempt == "" {
+		if record.Retired || decodeCheckpoint(record.Value, &claim) != nil || claim.Version != "pagnet.native.launch-claim.v2" || claim.Ownership != ownership || claim.Attempt == "" || claim.Key != c.key || len(claim.Directory) == 0 || len(claim.Directory) > 16<<10 {
 			return checkpointDenied()
 		}
 		if claim.Phase == "observed" {
@@ -206,4 +237,15 @@ func (c *Checkpoints) ObserveLaunched(ctx context.Context, ownership nativeautho
 		return e
 	})
 	return process, err
+}
+
+func validLaunchDirectory(directory string) bool {
+	return directory != "" && len(directory) <= 4096 && utf8.ValidString(directory) && filepath.IsAbs(directory) && filepath.Clean(directory) == directory
+}
+func (c *Checkpoints) launchAAD(key registry.AuthorityKey) []byte {
+	raw, _ := json.Marshal(struct {
+		Purpose, Domain, Store, Claim string
+		Key                           durable.KeyReference
+	}{"pagnet.native.launch-directory.v1", c.root.Namespace, c.root.StoreID, key.ID, c.key})
+	return raw
 }
