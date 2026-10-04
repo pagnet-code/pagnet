@@ -164,6 +164,9 @@ func ServeOwner(ctx context.Context, owner *SessionOwner, key []byte, build stri
 	return serve(ctx, owner.journal, key, owner.Execute, owner, build)
 }
 func serve(ctx context.Context, j *Journal, key []byte, execute IntentExecutor, owner *SessionOwner, build string) error {
+	if j == nil || j.isLocal() {
+		return errors.New("cloud worker IPC requires genuine cloud authority")
+	}
 	if len(key) != 32 || execute == nil {
 		return errors.New("worker requires a private control key and owned executor")
 	}

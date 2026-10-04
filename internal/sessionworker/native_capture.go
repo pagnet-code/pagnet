@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/pagnet-code/pagnet/internal/nativeauthority"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 	"io"
@@ -55,14 +56,26 @@ func canonicalNativeJSON(value any) ([]byte, error) {
 }
 
 func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error) {
+	return captureAEADBound(key, scope, directory)
+}
+func captureAEADBound(key []byte, scope any, directory string) (cipher.AEAD, error) {
 	if len(key) != 32 || !filepath.IsAbs(directory) {
 		return nil, errors.New("private source capture authority is missing")
 	}
+	domain := "pagnet-worker-private-source-key-v2"
+	if local, ok := scope.(AuthorityScope); ok {
+		if local.Kind() != nativeauthority.Local || local.Validate() != nil {
+			return nil, ErrFenced
+		}
+		domain = "pagnet-worker-private-local-source-key-v1"
+	} else if _, ok := scope.(Scope); !ok {
+		return nil, ErrFenced
+	}
 	info, err := canonicalNativeJSON(struct {
 		Domain    string
-		Scope     Scope
+		Scope     any
 		Directory string
-	}{"pagnet-worker-private-source-key-v2", scope, filepath.Clean(directory)})
+	}{domain, scope, filepath.Clean(directory)})
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +92,9 @@ func captureAEAD(key []byte, scope Scope, directory string) (cipher.AEAD, error)
 }
 
 func captureAAD(scope Scope, directory string, observation NativeObservation) ([]byte, error) {
+	return captureAADBound(scope, directory, observation)
+}
+func captureAADBound(scope any, directory string, observation NativeObservation) ([]byte, error) {
 	// Origin bytes are retained exactly, rather than reconstructed on retry.
 	return canonicalNativeJSON(struct {
 		ResourceInterruption              *transport.NativeResourceInterruption `json:",omitempty"`
@@ -87,7 +103,7 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 		SourceUnavailable                 bool
 		Domain                            string
 		Version                           int
-		Scope                             Scope
+		Scope                             any
 		Directory                         string
 		ID                                string
 		Origin                            []byte
@@ -101,6 +117,9 @@ func captureAAD(scope Scope, directory string, observation NativeObservation) ([
 }
 
 func sealNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
+	return sealNativeCaptureBound(key, scope, directory, observation, source)
+}
+func sealNativeCaptureBound(key []byte, scope any, directory string, observation NativeObservation, source any) (*NativeCaptureRef, []byte, error) {
 	raw, err := canonicalNativeJSON(source)
 	if err != nil {
 		return nil, nil, err
@@ -126,11 +145,11 @@ func sealNativeCapture(key []byte, scope Scope, directory string, observation Na
 		raw = compressed.Bytes()
 		defer clear(raw)
 	}
-	aead, err := captureAEAD(key, scope, directory)
+	aead, err := captureAEADBound(key, scope, directory)
 	if err != nil {
 		return nil, nil, err
 	}
-	aad, err := captureAAD(scope, directory, observation)
+	aad, err := captureAADBound(scope, directory, observation)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -146,6 +165,9 @@ func sealNativeCapture(key []byte, scope Scope, directory string, observation Na
 // OpenNativeCapture is controller-local. Nothing here authorizes publication or
 // native actuation; the exact original source is authenticated before use.
 func OpenNativeCapture(key []byte, scope Scope, directory string, observation NativeObservation, encrypted []byte) (json.RawMessage, error) {
+	return openNativeCaptureBound(key, scope, directory, observation, encrypted)
+}
+func openNativeCaptureBound(key []byte, scope any, directory string, observation NativeObservation, encrypted []byte) (json.RawMessage, error) {
 	ref := observation.Capture
 	if ref == nil || (ref.Version != 2 && ref.Version != 3) || ref.CiphertextBytes != len(encrypted) || len(encrypted) > maxPrivateSourceBytes+64 {
 		return nil, errors.New("invalid private capture reference")
@@ -154,11 +176,11 @@ func OpenNativeCapture(key []byte, scope Scope, directory string, observation Na
 	if hex.EncodeToString(digest[:]) != ref.CiphertextDigest {
 		return nil, errors.New("private capture ciphertext differs")
 	}
-	aead, err := captureAEAD(key, scope, directory)
+	aead, err := captureAEADBound(key, scope, directory)
 	if err != nil {
 		return nil, err
 	}
-	aad, err := captureAAD(scope, directory, observation)
+	aad, err := captureAADBound(scope, directory, observation)
 	if err != nil {
 		return nil, err
 	}

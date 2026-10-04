@@ -82,6 +82,10 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 				return err
 			}
 		}
+		if o.journal.isLocal() && (source != nil && source.InputKind == "local-native" || originalEvent.Type == session.EventSessionStopped) {
+			copy := originalEvent
+			observation.localInvocationEvent = &copy
+		}
 		observation.TurnSource = source
 		observation.SourceUnavailable = unavailable
 		taskTransfer := o.captureOriginalTaskContent(originalEvent, &observation)
@@ -137,7 +141,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 			copy.NativePayload = nil
 			captureSource.Event.Interaction = &copy
 		}
-		ref, encrypted, err := sealNativeCapture(o.captureKey, o.journal.scope, o.journal.dir, observation, captureSource)
+		ref, encrypted, err := o.journal.sealNativeCapture(o.captureKey, observation, captureSource)
 		if err != nil {
 			return err
 		}
@@ -163,7 +167,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 			}
 		}
 		if event.Interaction != nil {
-			observation.InteractionID = nativeInteractionIdentity(o.journal.scope, origin, generation, event.SessionID, event.Interaction.NativeInteractionID)
+			observation.InteractionID = nativeInteractionIdentityBound(o.journal.privateCaptureAuthority(), origin, generation, event.SessionID, event.Interaction.NativeInteractionID)
 		}
 		digest, err := observationDigest(observation)
 		if err != nil {
@@ -362,6 +366,19 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 // Origin.ID is authority minted; fixed semantic fields avoid raw-JSON field
 // ordering becoming a different interaction identity on reconnect.
 func nativeInteractionIdentity(scope Scope, origin json.RawMessage, generation, nativeSession, nativeID string) string {
+	return nativeInteractionIdentityBound(scope, origin, generation, nativeSession, nativeID)
+}
+func nativeInteractionIdentityBound(scope any, origin json.RawMessage, generation, nativeSession, nativeID string) string {
+	domain := "pagnet-native-interaction-identity-v1"
+	if local, ok := scope.(AuthorityScope); ok {
+		_, isLocal := local.Local()
+		if local.Validate() != nil || !isLocal {
+			return ""
+		}
+		domain = "pagnet-native-local-interaction-identity-v1"
+	} else if _, ok := scope.(Scope); !ok {
+		return ""
+	}
 	var descriptor struct {
 		ID string `json:"id"`
 	}
@@ -370,12 +387,12 @@ func nativeInteractionIdentity(scope Scope, origin json.RawMessage, generation, 
 	}
 	binding := struct {
 		Domain              string
-		Scope               Scope
+		Scope               any
 		OriginID            string
 		NativeGeneration    string
 		NativeSessionID     string
 		NativeInteractionID string
-	}{"pagnet-native-interaction-identity-v1", scope, descriptor.ID, generation, nativeSession, nativeID}
+	}{domain, scope, descriptor.ID, generation, nativeSession, nativeID}
 	raw, _ := json.Marshal(binding)
 	return uuid.NewHash(sha256.New(), uuid.NameSpaceOID, raw, 8).String()
 }

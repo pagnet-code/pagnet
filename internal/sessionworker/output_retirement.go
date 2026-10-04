@@ -69,7 +69,7 @@ func (j *Journal) collectStoppedNativeReservationsTx(ctx context.Context, tx *sq
 			return ErrConflict
 		}
 		if len(c.cipher) > 0 {
-			tail, openErr := openOutputSpool(captureKey, j.scope, j.dir, generation, s.Sequence, c.cipher)
+			tail, openErr := openOutputSpoolBound(captureKey, j.privateCaptureAuthority(), j.dir, generation, s.Sequence, c.cipher)
 			clear(tail.Key)
 			var origin struct {
 				ID string `json:"id"`

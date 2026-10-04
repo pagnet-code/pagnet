@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/internal/nativeauthority"
 	"github.com/pagnet-code/pagnet/transport"
 	"io"
 	"net/url"
@@ -37,22 +38,16 @@ var (
 
 // Scope is immutable for the lifetime of a worker. Generation identifies this
 // durable ownership lifetime, not a native PID, controller connection, or bridge nonce.
-type Scope struct {
-	ServerURL  string `json:"serverUrl"`
-	TenantID   string `json:"tenantId"`
-	AccountID  string `json:"accountId"`
-	HostID     string `json:"hostId"`
-	InstanceID string `json:"instanceId"`
-	Generation string `json:"generation"`
-}
+type Scope = nativeauthority.CloudScope
 
 type Outcome struct {
-	SourceAdmission *Admission      `json:"sourceAdmission,omitempty"`
-	Sequence        int64           `json:"sequence"`
-	CommandID       string          `json:"commandId"`
-	Kind            string          `json:"kind"`
-	State           string          `json:"state"` // admitted | completed | failed | uncertain
-	Result          json.RawMessage `json:"result,omitempty"`
+	LocalSource     *LocalIntentSource `json:"localSource,omitempty"`
+	SourceAdmission *Admission         `json:"sourceAdmission,omitempty"`
+	Sequence        int64              `json:"sequence"`
+	CommandID       string             `json:"commandId"`
+	Kind            string             `json:"kind"`
+	State           string             `json:"state"` // admitted | completed | failed | uncertain
+	Result          json.RawMessage    `json:"result,omitempty"`
 }
 
 // Journal stores only intent digests and outcomes. Prompt bodies, arbitrary
@@ -72,17 +67,39 @@ type Journal struct {
 	mu                   sync.Mutex
 	db                   *sql.DB
 	scope                Scope
+	authority            AuthorityScope
 	owner                io.Closer
 	dir                  string
 }
 
+// OpenJournal retains the genuine existing cloud journal representation.
 func OpenJournal(dir string, scope Scope) (*Journal, error) {
-	server, serverErr := url.Parse(scope.ServerURL)
-	if serverErr != nil || (server.Scheme != "https" && server.Scheme != "http") || server.Host == "" || server.User != nil || server.RawQuery != "" || server.Fragment != "" || scope.TenantID == "" || len(scope.TenantID) > 256 || len(scope.ServerURL) > 2048 {
-		return nil, errors.New("worker authority scope is incomplete")
+	authority, e := nativeauthority.NewCloudScope(scope)
+	if e != nil {
+		return nil, e
 	}
-	if scope.AccountID == "" || scope.HostID == "" || scope.InstanceID == "" || scope.Generation == "" || len(scope.AccountID) > 256 || len(scope.HostID) > 256 || len(scope.InstanceID) > 256 || len(scope.Generation) > 256 {
-		return nil, errors.New("worker scope is incomplete")
+	return OpenAuthorityJournal(dir, authority)
+}
+
+// OpenAuthorityJournal opens immutable storage, not an authenticated operation
+// channel. Local owners still require independently pinned bootstrap, current
+// signed control/source admission and kernel ownership verification before work.
+func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error) {
+	if e := authority.Validate(); e != nil {
+		return nil, e
+	}
+	scope, cloud := authority.Cloud()
+	protocol := Protocol
+	var encoded []byte
+	var e error
+	if cloud {
+		encoded, e = json.Marshal(scope)
+	} else {
+		protocol = LocalProtocol
+		encoded, e = json.Marshal(authority)
+	}
+	if e != nil {
+		return nil, e
 	}
 	if err := privateDirectory(dir); err != nil {
 		return nil, err
@@ -118,7 +135,7 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	j := &Journal{db: db, scope: scope, owner: owner, dir: dir, observationCapacity: make(chan struct{})}
+	j := &Journal{db: db, scope: scope, authority: authority, owner: owner, dir: dir, observationCapacity: make(chan struct{})}
 	fail := func(e error) (*Journal, error) { _ = db.Close(); return nil, e }
 	for _, q := range []string{
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
@@ -131,16 +148,18 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 			return fail(err)
 		}
 	}
-	encoded, _ := json.Marshal(scope)
-	if _, err = db.Exec(`INSERT OR IGNORE INTO worker_meta VALUES(1,?,?,0,1,0)`, Protocol, string(encoded)); err != nil {
+	if _, err = db.Exec(`INSERT OR IGNORE INTO worker_meta VALUES(1,?,?,0,1,0)`, protocol, string(encoded)); err != nil {
 		return fail(err)
 	}
-	var protocol, stored string
-	if err = db.QueryRow(`SELECT protocol,scope FROM worker_meta WHERE singleton=1`).Scan(&protocol, &stored); err != nil {
+	var storedProtocol, stored string
+	if err = db.QueryRow(`SELECT protocol,scope FROM worker_meta WHERE singleton=1`).Scan(&storedProtocol, &stored); err != nil {
 		return fail(err)
 	}
-	if protocol != Protocol || stored != string(encoded) {
+	if storedProtocol != protocol || stored != string(encoded) {
 		return fail(errors.New("worker journal scope or protocol mismatch"))
+	}
+	if err = j.initializeLocalAuthority(); err != nil {
+		return fail(err)
 	}
 	if err = j.initializeOutputSpools(); err != nil {
 		return fail(err)
@@ -285,6 +304,11 @@ func (j *Journal) admit(ctx context.Context, lease, sequence int64, commandID, k
 }
 
 func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, commandID, kind string, payload json.RawMessage, authorizeNew func() (*Admission, error), dispatch *transport.NativeDispatchProof) (out Outcome, execute bool, err error) {
+	// Cloud transport proofs and unauthenticated generic admission cannot enter a
+	// local owner. Local admission is supplied by the dedicated authority port.
+	if j.isLocal() {
+		return out, false, ErrFenced
+	}
 	if (sequence <= 0 && dispatch == nil) || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
 		return out, false, errors.New("invalid or oversized intent")
 	}
@@ -472,6 +496,10 @@ func (j *Journal) Outcome(ctx context.Context, sequence int64) (out Outcome, err
 	if err != nil {
 		return
 	}
+	if j.isLocal() {
+		out.LocalSource, err = j.localIntentSource(ctx, j.db, sequence)
+		return
+	}
 	var source []byte
 	err = j.db.QueryRowContext(ctx, `SELECT admission FROM worker_intent_admission WHERE sequence=?`, sequence).Scan(&source)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -529,17 +557,30 @@ func (j *Journal) Acknowledge(ctx context.Context, lease, sequence int64) error 
 	}
 	for {
 		var ack int
-		err = tx.QueryRowContext(ctx, `SELECT acknowledged FROM worker_intent WHERE sequence=?`, floor+1).Scan(&ack)
+		nextAccepted := floor + 1
+		if j.isLocal() {
+			err = tx.QueryRowContext(ctx, `SELECT sequence,acknowledged FROM worker_intent WHERE sequence>? ORDER BY sequence LIMIT 1`, floor).Scan(&nextAccepted, &ack)
+		} else {
+			err = tx.QueryRowContext(ctx, `SELECT acknowledged FROM worker_intent WHERE sequence=?`, nextAccepted).Scan(&ack)
+		}
 		if errors.Is(err, sql.ErrNoRows) || (err == nil && ack != 1) {
 			break
 		}
 		if err != nil {
 			return err
 		}
-		floor++
+		floor = nextAccepted
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_intent_admission WHERE sequence<=?`, floor); err != nil {
 		return err
+	}
+	if j.isLocal() {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_local_cancellations WHERE sequence<=?`, floor); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM worker_local_intent WHERE sequence<=?`, floor); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_intent WHERE sequence<=?`, floor); err != nil {
 		return err
@@ -567,7 +608,7 @@ func (j *Journal) validateHistory() error {
 	if err := j.db.QueryRow(`SELECT lease,next_sequence,retired,(SELECT COUNT(*) FROM worker_intent) FROM worker_meta WHERE singleton=1`).Scan(&lease, &next, &retired, &count); err != nil {
 		return err
 	}
-	if lease < 0 || next < 1 || retired < 0 || retired >= next || count < 0 || count > maxCommands || next-retired-1 != count {
+	if lease < 0 || next < 1 || retired < 0 || retired >= next || count < 0 || count > maxCommands || (!j.isLocal() && next-retired-1 != count) {
 		return errors.New("worker journal sequence history is incomplete")
 	}
 	rows, err := j.db.Query(`SELECT sequence,command_id,digest,kind,state,result,acknowledged,(EXISTS(SELECT 1 FROM worker_resource_settlements r WHERE r.sequence=worker_intent.sequence) OR EXISTS(SELECT 1 FROM worker_owner_stop_settlements r WHERE r.sequence=worker_intent.sequence)) FROM worker_intent ORDER BY sequence`)
@@ -586,10 +627,13 @@ func (j *Journal) validateHistory() error {
 		}
 		_, digestErr := hex.DecodeString(digest)
 		validState := state == "admitted" || state == "completed" || state == "failed" || state == "uncertain" || (state == ResourceInterrupted || state == OwnerStopped)
-		if sequence != expected || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || ((state == ResourceInterrupted || state == OwnerStopped) && !interruptedProof) || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
+		if ((!j.isLocal() && sequence != expected) || (j.isLocal() && (sequence < expected || sequence >= next))) || id == "" || len(id) > 256 || kind == "" || len(kind) > 64 || len(digest) != 64 || digestErr != nil || !validState || ((state == ResourceInterrupted || state == OwnerStopped) && !interruptedProof) || len(result) > maxOutcomeBytes || (len(result) > 0 && !json.Valid(result)) || (ack != 0 && ack != 1) || (state == "admitted" && (ack != 0 || len(result) > 0)) {
 			return errors.New("worker journal contains an invalid intent")
 		}
-		expected++
+		expected = sequence + 1
+	}
+	if j.isLocal() && expected != next {
+		return errors.New("local worker highwater differs from accepted history")
 	}
 	return rows.Err()
 }

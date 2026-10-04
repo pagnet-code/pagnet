@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pagnet-code/pagnet/internal/nativeauthority"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/nativecontent"
 	"github.com/pagnet-code/pagnet/transport"
@@ -71,12 +72,19 @@ func (j *Journal) initializeOutputSpools() error {
 	return nil
 }
 func outputSpoolAAD(scope Scope, directory, generation string, sequence int64) []byte {
+	return outputSpoolAADBound(scope, directory, generation, sequence)
+}
+func outputSpoolAADBound(scope any, directory, generation string, sequence int64) []byte {
+	domain := NativeOutputStreamCaptureFormat
+	if local, ok := scope.(AuthorityScope); ok && local.Kind() == nativeauthority.Local {
+		domain = "pagnet-worker-private-local-output-head-v1"
+	}
 	raw, _ := canonicalNativeJSON(struct {
 		Domain                string
-		Scope                 Scope
+		Scope                 any
 		Directory, Generation string
 		Sequence              int64
-	}{NativeOutputStreamCaptureFormat, scope, directory, generation, sequence})
+	}{domain, scope, directory, generation, sequence})
 	return raw
 }
 
@@ -101,12 +109,18 @@ func (c *nativeOutputEncoder) close() {
 }
 
 func sealOutputSpool(key []byte, scope Scope, directory string, s nativeOutputSpool) ([]byte, error) {
+	return sealOutputSpoolBound(key, scope, directory, s)
+}
+func sealOutputSpoolBound(key []byte, scope any, directory string, s nativeOutputSpool) ([]byte, error) {
 	var encoder nativeOutputEncoder
 	defer encoder.close()
-	return encoder.seal(key, scope, directory, s)
+	return encoder.sealBound(key, scope, directory, s)
 }
 
 func (c *nativeOutputEncoder) seal(key []byte, scope Scope, directory string, s nativeOutputSpool) ([]byte, error) {
+	return c.sealBound(key, scope, directory, s)
+}
+func (c *nativeOutputEncoder) sealBound(key []byte, scope any, directory string, s nativeOutputSpool) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -140,7 +154,7 @@ func (c *nativeOutputEncoder) seal(key []byte, scope Scope, directory string, s 
 	if err = c.writer.Close(); err != nil {
 		return nil, err
 	}
-	aead, err := captureAEAD(key, scope, directory)
+	aead, err := captureAEADBound(key, scope, directory)
 	if err != nil {
 		return nil, err
 	}
@@ -148,15 +162,18 @@ func (c *nativeOutputEncoder) seal(key []byte, scope Scope, directory string, s 
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return aead.Seal(nonce, nonce, c.buffer.Bytes(), outputSpoolAAD(scope, directory, s.Source.NativeGeneration, s.Source.Sequence)), nil
+	return aead.Seal(nonce, nonce, c.buffer.Bytes(), outputSpoolAADBound(scope, directory, s.Source.NativeGeneration, s.Source.Sequence)), nil
 }
 func openOutputSpool(key []byte, scope Scope, directory, generation string, sequence int64, ciphertext []byte) (nativeOutputSpool, error) {
+	return openOutputSpoolBound(key, scope, directory, generation, sequence, ciphertext)
+}
+func openOutputSpoolBound(key []byte, scope any, directory, generation string, sequence int64, ciphertext []byte) (nativeOutputSpool, error) {
 	var result nativeOutputSpool
-	aead, err := captureAEAD(key, scope, directory)
+	aead, err := captureAEADBound(key, scope, directory)
 	if err != nil || len(ciphertext) < aead.NonceSize()+aead.Overhead() {
 		return result, ErrConflict
 	}
-	raw, err := aead.Open(nil, ciphertext[:aead.NonceSize()], ciphertext[aead.NonceSize():], outputSpoolAAD(scope, directory, generation, sequence))
+	raw, err := aead.Open(nil, ciphertext[:aead.NonceSize()], ciphertext[aead.NonceSize():], outputSpoolAADBound(scope, directory, generation, sequence))
 	if err != nil {
 		return result, ErrConflict
 	}
@@ -239,7 +256,7 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 	} else if err != nil {
 		return result, 0, err
 	} else {
-		result, err = openOutputSpool(key, j.scope, j.dir, source.NativeGeneration, source.Sequence, previous)
+		result, err = openOutputSpoolBound(key, j.privateCaptureAuthority(), j.dir, source.NativeGeneration, source.Sequence, previous)
 		if err != nil {
 			return result, 0, err
 		}
@@ -294,7 +311,7 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 		result.LastObservedAt = nativeSourceTime(time.Now())
 		result.PendingDeltas++
 		result.PendingBytes += len(event.Output)
-		delta, err := sealOutputDelta(key, j.scope, j.dir, source, result.DeltaCount, raw)
+		delta, err := sealOutputDeltaBound(key, j.privateCaptureAuthority(), j.dir, source, result.DeltaCount, raw)
 		if err != nil {
 			clear(result.Key)
 			return nativeOutputSpool{}, 0, err
@@ -313,12 +330,16 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 			break
 		}
 	}
+	if err := j.captureLocalInvocationDeltasTx(ctx, tx, key, source, int64(firstInvocationDelta), events[:consumed]); err != nil {
+		clear(result.Key)
+		return nativeOutputSpool{}, 0, err
+	}
 	if err := j.captureInvocationDeltasTx(ctx, tx, key, result, firstInvocationDelta, invocationDeltas); err != nil {
 		clear(result.Key)
 		return nativeOutputSpool{}, 0, err
 	}
 	result.LastDeltaID, result.LastDeltaDigest, result.LastCaptureCount = deltaID, deltaDigest, consumed
-	sealed, err := j.outputEncoder.seal(key, j.scope, j.dir, result)
+	sealed, err := j.outputEncoder.sealBound(key, j.privateCaptureAuthority(), j.dir, result)
 	if err != nil {
 		clear(result.Key)
 		return nativeOutputSpool{}, 0, err
@@ -394,7 +415,7 @@ func (j *Journal) readOutputSpool(ctx context.Context, key []byte, generation st
 	if err := j.db.QueryRowContext(ctx, `SELECT ciphertext,size FROM worker_output_spools WHERE sequence=? AND native_generation=?`, sequence, generation).Scan(&encrypted, &size); err != nil {
 		return nativeOutputSpool{}, nil, err
 	}
-	data, err := openOutputSpool(key, j.scope, j.dir, generation, sequence, encrypted)
+	data, err := openOutputSpoolBound(key, j.privateCaptureAuthority(), j.dir, generation, sequence, encrypted)
 	if err == nil {
 		err = j.assembleOutputDeltas(ctx, j.db, key, &data, size, len(encrypted))
 	}
@@ -530,7 +551,7 @@ func (o *SessionOwner) flushNativeOutput(generation string, sequence int64, forc
 		data.PendingDeltas, data.PendingBytes, data.PendingBaseDigest = 0, 0, ""
 		data.ByteOffset += int64(count)
 		data.BatchID = uuid.NewString()
-		remaining, err := o.journal.outputEncoder.seal(o.captureKey, o.journal.scope, o.journal.dir, data)
+		remaining, err := o.journal.outputEncoder.sealBound(o.captureKey, o.journal.privateCaptureAuthority(), o.journal.dir, data)
 		if err != nil {
 			clear(data.Key)
 			return err
@@ -603,7 +624,7 @@ func (o *SessionOwner) recoverCapturedNativeOutput() error {
 		}
 		origin := append(json.RawMessage(nil), data.Origin...)
 		clear(data.Key)
-		_, project, _ := o.nativeCapturedSourceObservers(o.journal.scope.InstanceID, nil, entry.generation, origin)
+		_, project, _ := o.nativeCapturedSourceObservers(o.journal.instanceID(), nil, entry.generation, origin)
 		if err = o.flushNativeOutput(entry.generation, entry.sequence, true, project); err != nil {
 			return err
 		}
@@ -630,7 +651,7 @@ func (j *Journal) prepareOutputReady(ctx context.Context, key []byte, p *outputS
 	if hex.EncodeToString(sum[:]) != p.PreviousDigest {
 		return ErrConflict
 	}
-	data, err := openOutputSpool(key, j.scope, j.dir, p.Generation, p.Sequence, previous)
+	data, err := openOutputSpoolBound(key, j.privateCaptureAuthority(), j.dir, p.Generation, p.Sequence, previous)
 	if err != nil {
 		return err
 	}
@@ -639,7 +660,7 @@ func (j *Journal) prepareOutputReady(ctx context.Context, key []byte, p *outputS
 		return ErrConflict
 	}
 	data.Ready = ready
-	encrypted, err := j.outputEncoder.seal(key, j.scope, j.dir, data)
+	encrypted, err := j.outputEncoder.sealBound(key, j.privateCaptureAuthority(), j.dir, data)
 	if err != nil {
 		return err
 	}

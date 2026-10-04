@@ -37,19 +37,23 @@ type VerifiedIntent struct {
 	CurrentController fabricidentity.Controller
 	OriginalAdmission fabricidentity.Admission
 	Commitment        fabricidentity.NativeIntentCommitment
+	Reservation       fabricidentity.NativeDispatchReservation
 	Operation         PreparedOperation
 	Finalized         json.RawMessage
+	// OriginalBinding is present only for stop-only historical cancellation.
+	OriginalBinding *fabricidentity.Binding
 }
 
 // LocalController connects trusted local domain authority to the actual worker
 // durable admission port. It holds no domain private key and exports no cloud
 // identity. The owner context comes from genuine trusted local authentication.
 type LocalController struct {
-	authority *fabricidentity.Authority
-	owner     fabric.ExecutionContext
-	binding   fabricidentity.Binding
-	scope     Scope
-	binder    OperationBinder
+	authority   *fabricidentity.Authority
+	owner       fabric.ExecutionContext
+	binding     fabricidentity.Binding
+	scope       Scope
+	binder      OperationBinder
+	maxCommands int64
 }
 
 func NewLocalController(authority *fabricidentity.Authority, owner fabric.ExecutionContext, binding fabricidentity.Binding, binder OperationBinder) (*LocalController, error) {
@@ -64,7 +68,7 @@ func NewLocalController(authority *fabricidentity.Authority, owner fabric.Execut
 	if e != nil {
 		return nil, e
 	}
-	return &LocalController{authority: authority, owner: owner, binding: binding, scope: scope, binder: binder}, nil
+	return &LocalController{authority: authority, owner: owner, binding: binding, scope: scope, binder: binder, maxCommands: 1000000}, nil
 }
 
 // NewLocalControllerForOwnership renews current descriptor authorization
@@ -80,13 +84,25 @@ func NewLocalControllerForOwnership(authority *fabricidentity.Authority, owner f
 	c.scope = ownership
 	return c, nil
 }
+
+// WithCommandCapacity returns a separate configured controller; the signed
+// physical worker counter pins this finite capacity on its first reservation.
+// Changing it after publication is rejected by the registry, never silently reset.
+func (c *LocalController) WithCommandCapacity(max int64) (*LocalController, error) {
+	if c == nil || max <= 0 || max > 1000000 {
+		return nil, errors.New("local command capacity invalid")
+	}
+	copy := *c
+	copy.maxCommands = max
+	return &copy, nil
+}
 func (c *LocalController) Scope() Scope {
 	if c == nil {
 		return Scope{}
 	}
 	return c.scope
 }
-func (c *LocalController) AdmitIntent(ctx context.Context, current fabricidentity.Controller, source fabricidentity.Admission, caller fabric.ExecutionContext, original, finalized []byte, commandID string, sequence int64, appendIntent func(context.Context, VerifiedIntent) (fabricidentity.NativeIntentReceipt, error)) (fabricidentity.NativeIntentReceipt, error) {
+func (c *LocalController) AdmitIntent(ctx context.Context, current fabricidentity.Controller, source fabricidentity.Admission, caller fabric.ExecutionContext, original, finalized []byte, appendIntent func(context.Context, VerifiedIntent) (fabricidentity.NativeIntentReceipt, error)) (fabricidentity.NativeIntentReceipt, error) {
 	if c == nil || c.authority == nil || c.binder == nil || ctx == nil || appendIntent == nil {
 		return fabricidentity.NativeIntentReceipt{}, errors.New("local native intent port missing")
 	}
@@ -116,8 +132,12 @@ func (c *LocalController) AdmitIntent(ctx context.Context, current fabricidentit
 	if e != nil {
 		return fabricidentity.NativeIntentReceipt{}, e
 	}
-	commitment := fabricidentity.NativeIntentCommitment{CommandID: commandID, Sequence: sequence, OperationDigest: sha256.Sum256(operation.Payload), SelectorDigest: sha256.Sum256(selector), SpecDigest: operation.SpecDigest}
-	verified := VerifiedIntent{Scope: c.scope, CurrentBinding: c.binding, CurrentController: current, OriginalAdmission: source, Commitment: commitment, Operation: operation, Finalized: bytes.Clone(finalized)}
+	reservation, e := c.authority.ReserveNativeDispatch(ctx, c.owner, current, c.binding, source, caller, original, finalized, fabricidentity.NativeDispatchSpec{OperationDigest: sha256.Sum256(operation.Payload), SelectorDigest: sha256.Sum256(selector), SpecDigest: operation.SpecDigest, MaxCommandsPerWorker: c.maxCommands})
+	if e != nil {
+		return fabricidentity.NativeIntentReceipt{}, e
+	}
+	commitment := reservation.Commitment()
+	verified := VerifiedIntent{Scope: c.scope, CurrentBinding: c.binding, CurrentController: current, OriginalAdmission: source, Commitment: commitment, Reservation: reservation, Operation: operation, Finalized: bytes.Clone(finalized)}
 	return c.authority.FenceNativeIntent(ctx, c.owner, current, c.binding, source, caller, original, finalized, commitment, func(lifetime context.Context) (fabricidentity.NativeIntentReceipt, error) {
 		return appendIntent(lifetime, verified)
 	})

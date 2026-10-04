@@ -18,17 +18,25 @@ import (
 // prompt alongside its derived operation would exceed the private frame budget.
 // Ownership always comes from the worker bootstrap, never this request.
 type IntentRequest struct {
-	CurrentBinding    fabricidentity.Binding                `json:"currentBinding"`
-	CurrentController fabricidentity.Controller             `json:"currentController"`
-	OriginalAdmission fabricidentity.Admission              `json:"originalAdmission"`
-	Commitment        fabricidentity.NativeIntentCommitment `json:"commitment"`
-	Finalized         json.RawMessage                       `json:"finalized"`
+	CurrentBinding    fabricidentity.Binding                   `json:"currentBinding"`
+	CurrentController fabricidentity.Controller                `json:"currentController"`
+	OriginalAdmission fabricidentity.Admission                 `json:"originalAdmission"`
+	Commitment        fabricidentity.NativeIntentCommitment    `json:"commitment"`
+	Reservation       fabricidentity.NativeDispatchReservation `json:"reservation"`
+	Finalized         json.RawMessage                          `json:"finalized"`
+	OriginalBinding   *fabricidentity.Binding                  `json:"originalBinding,omitempty"`
 }
 
 func (i VerifiedIntent) Request() IntentRequest {
-	return IntentRequest{i.CurrentBinding, i.CurrentController, i.OriginalAdmission, i.Commitment, bytes.Clone(i.Finalized)}
+	return IntentRequest{CurrentBinding: i.CurrentBinding, CurrentController: i.CurrentController, OriginalAdmission: i.OriginalAdmission, Commitment: i.Commitment, Reservation: i.Reservation, Finalized: bytes.Clone(i.Finalized), OriginalBinding: i.OriginalBinding}
 }
 func (i IntentRequest) Verify(pinned Scope, binder OperationBinder) (VerifiedIntent, error) {
+	return i.verify(pinned, binder, false)
+}
+func (i IntentRequest) VerifyCancellation(pinned Scope, binder OperationBinder) (VerifiedIntent, error) {
+	return i.verify(pinned, binder, true)
+}
+func (i IntentRequest) verify(pinned Scope, binder OperationBinder, cancellation bool) (VerifiedIntent, error) {
 	var final fabric.Envelope
 	if e := fabric.DecodeJSON(i.Finalized, &final); e != nil {
 		return VerifiedIntent{}, e
@@ -40,8 +48,8 @@ func (i IntentRequest) Verify(pinned Scope, binder OperationBinder) (VerifiedInt
 	if e != nil {
 		return VerifiedIntent{}, e
 	}
-	intent := VerifiedIntent{Scope: pinned, CurrentBinding: i.CurrentBinding, CurrentController: i.CurrentController, OriginalAdmission: i.OriginalAdmission, Commitment: i.Commitment, Operation: operation, Finalized: bytes.Clone(i.Finalized)}
-	if e = ValidateIntent(pinned, binder, intent); e != nil {
+	intent := VerifiedIntent{Scope: pinned, CurrentBinding: i.CurrentBinding, CurrentController: i.CurrentController, OriginalAdmission: i.OriginalAdmission, Commitment: i.Commitment, Reservation: i.Reservation, Operation: operation, Finalized: bytes.Clone(i.Finalized), OriginalBinding: i.OriginalBinding}
+	if e = validateIntent(pinned, binder, intent, cancellation); e != nil {
 		return VerifiedIntent{}, e
 	}
 	return intent, nil
@@ -52,13 +60,34 @@ func (i IntentRequest) Verify(pinned Scope, binder OperationBinder) (VerifiedInt
 // is current: the controller must hold FenceNativeIntent through the durable ACK,
 // and the journal independently fences its retained highest controller epoch.
 func ValidateIntent(pinned Scope, binder OperationBinder, i VerifiedIntent) error {
+	return validateIntent(pinned, binder, i, false)
+}
+
+// ValidateCancellationIntent authenticates the exact retained source without
+// treating its expired paid-work deadline as a reason to refuse cancellation.
+// This historical verifier never authorizes a new paid effect.
+func ValidateCancellationIntent(pinned Scope, binder OperationBinder, i VerifiedIntent) error {
+	return validateIntent(pinned, binder, i, true)
+}
+func validateIntent(pinned Scope, binder OperationBinder, i VerifiedIntent, cancellation bool) error {
 	local, ok := pinned.Local()
 	if !ok || pinned != i.Scope || binder == nil || pinned.Validate() != nil {
 		return errors.New("local native intent ownership differs")
 	}
 	root := registry.AuthorityIdentity{Namespace: local.Namespace, StoreID: local.StoreID, Owner: local.Owner, PublicKey: local.PublicKey[:], KeyRevision: local.KeyRevision}
+	originalBinding := i.CurrentBinding
+	if i.OriginalBinding != nil {
+		if !cancellation {
+			return errors.New("fresh native intent cannot carry historical binding")
+		}
+		originalBinding = *i.OriginalBinding
+	}
+	originalScope, e := NewLocalScope(root, originalBinding)
+	if e != nil || !pinned.SamePhysical(originalScope) || originalBinding.Scope != i.OriginalAdmission.Scope {
+		return errors.New("local native original binding differs")
+	}
 	currentScope, e := NewLocalScope(root, i.CurrentBinding)
-	if e != nil || !pinned.SamePhysical(currentScope) || i.CurrentBinding.Scope != i.CurrentController.Scope || i.CurrentBinding.Scope != i.OriginalAdmission.Scope {
+	if e != nil || !pinned.SamePhysical(currentScope) || i.CurrentBinding.Scope != i.CurrentController.Scope {
 		return errors.New("local native intent binding differs")
 	}
 	controllerFields, _ := json.Marshal([]string{local.Endpoint.String(), local.BindingID})
@@ -77,15 +106,15 @@ func ValidateIntent(pinned Scope, binder OperationBinder, i VerifiedIntent) erro
 		return e
 	}
 	source.Proof = i.OriginalAdmission.Proof
-	bindingBytes, _ := json.Marshal(i.CurrentBinding)
+	bindingBytes, _ := json.Marshal(originalBinding)
 	if !sameJSON(source, i.OriginalAdmission) || source.BindingDigest != sha256.Sum256(bindingBytes) || source.FinalizedDigest != sha256.Sum256(i.Finalized) || source.OriginalControllerEpoch == 0 || source.OriginalControllerEpoch > controller.Epoch() {
 		return errors.New("local native original admission differs from signed source")
 	}
 	var final fabric.Envelope
-	if e = fabric.DecodeJSON(i.Finalized, &final); e != nil || final.Validate() != nil || final.Target == nil || *final.Target != local.Endpoint || final.ExpectedRevision != controller.Scope.DescriptorRevision || final.ID != source.InvocationID {
+	if e = fabric.DecodeJSON(i.Finalized, &final); e != nil || final.Validate() != nil || final.Target == nil || *final.Target != local.Endpoint || final.ExpectedRevision != originalBinding.Scope.DescriptorRevision || final.ID != source.InvocationID {
 		return errors.New("local native finalized invocation differs")
 	}
-	if final.Context.Deadline != nil && !time.Now().Before(*final.Context.Deadline) {
+	if !cancellation && final.Context.Deadline != nil && !time.Now().Before(*final.Context.Deadline) {
 		return errors.New("local native finalized invocation expired")
 	}
 	operation, e := binder.Bind(final)
@@ -100,7 +129,7 @@ func ValidateIntent(pinned Scope, binder OperationBinder, i VerifiedIntent) erro
 	if !text(c.CommandID, 256) || c.Sequence <= 0 || c.Sequence == 9223372036854775807 || c.OperationDigest != sha256.Sum256(operation.Payload) || c.SelectorDigest != sha256.Sum256(selector) || c.SpecDigest != local.ProfileDigest {
 		return errors.New("local native intent commitment differs")
 	}
-	return nil
+	return fabricidentity.VerifyNativeDispatchReservation(root, i.Reservation, i.OriginalAdmission, originalBinding, c)
 }
 
 func sameJSON(a, b any) bool {

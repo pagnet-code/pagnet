@@ -6,6 +6,7 @@ type nativeOwnedOperation struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	done             chan struct{}
+	nativeOwned      bool
 	kind             string
 	activationCancel context.CancelFunc
 }

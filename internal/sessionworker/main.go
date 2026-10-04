@@ -46,6 +46,15 @@ func runMain(args []string, build string) error {
 	if err != nil {
 		return err
 	}
+	var kind struct {
+		Protocol string `json:"protocol"`
+	}
+	if json.Unmarshal(raw, &kind) != nil {
+		return errors.New("invalid private worker bootstrap")
+	}
+	if kind.Protocol == LocalProtocol {
+		return runLocalMain(raw, *dir, *envFD, build)
+	}
 	var bootstrap Bootstrap
 	if err = decodeClosed(raw, &bootstrap); err != nil || bootstrap.Protocol != Protocol {
 		return errors.New("invalid private worker bootstrap protocol")
@@ -154,6 +163,13 @@ func PrepareBootstrap(dir string, b Bootstrap, key []byte) error {
 	if b.Protocol != Protocol || len(key) != 32 || b.Scope.AccountID == "" || b.Scope.HostID == "" || b.Scope.InstanceID == "" || b.Scope.Generation == "" {
 		return errors.New("invalid worker bootstrap")
 	}
+	raw, err := json.Marshal(b)
+	if err != nil || len(raw) > 128<<10 {
+		return errors.New("worker bootstrap exceeds bound")
+	}
+	return prepareBootstrapFiles(dir, raw, key)
+}
+func prepareBootstrapFiles(dir string, raw, key []byte) error {
 	if err := privateDirectory(dir); err != nil {
 		return err
 	}
@@ -166,10 +182,6 @@ func PrepareBootstrap(dir string, b Bootstrap, key []byte) error {
 		if _, err := os.Lstat(filepath.Join(dir, name)); !os.IsNotExist(err) {
 			return errors.New("worker bootstrap identity already exists or is unavailable")
 		}
-	}
-	raw, err := json.Marshal(b)
-	if err != nil || len(raw) > 128<<10 {
-		return errors.New("worker bootstrap exceeds bound")
 	}
 	// The manifest is the final publication marker. In-process failures remove
 	// only files created by this invocation; existing identities are untouched.

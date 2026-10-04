@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/pagnet-code/pagnet/internal/nativeauthority"
 	"github.com/pagnet-code/pagnet/internal/session"
 )
 
@@ -16,17 +17,27 @@ import (
 // counters are rewritten; a growing plaintext tail is never rewritten per byte.
 // The ordinal AAD and authenticated metadata bind order, completeness and scope.
 func outputDeltaAAD(scope Scope, directory, generation string, sequence, ordinal int64) []byte {
+	return outputDeltaAADBound(scope, directory, generation, sequence, ordinal)
+}
+func outputDeltaAADBound(scope any, directory, generation string, sequence, ordinal int64) []byte {
+	domain := "pagnet-worker-private-output-delta-v1"
+	if s, ok := scope.(AuthorityScope); ok && s.Kind() == nativeauthority.Local {
+		domain = "pagnet-worker-private-local-output-delta-v1"
+	}
 	raw, _ := canonicalNativeJSON(struct {
 		Domain                string
-		Scope                 Scope
+		Scope                 any
 		Directory, Generation string
 		Sequence, Ordinal     int64
-	}{"pagnet-worker-private-output-delta-v1", scope, directory, generation, sequence, ordinal})
+	}{domain, scope, directory, generation, sequence, ordinal})
 	return raw
 }
 
 func sealOutputDelta(key []byte, scope Scope, directory string, source NativeTurnSource, ordinal int64, raw []byte) ([]byte, error) {
-	aead, err := captureAEAD(key, scope, directory)
+	return sealOutputDeltaBound(key, scope, directory, source, ordinal, raw)
+}
+func sealOutputDeltaBound(key []byte, scope any, directory string, source NativeTurnSource, ordinal int64, raw []byte) ([]byte, error) {
+	aead, err := captureAEADBound(key, scope, directory)
 	if err != nil {
 		return nil, err
 	}
@@ -34,7 +45,7 @@ func sealOutputDelta(key []byte, scope Scope, directory string, source NativeTur
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return aead.Seal(nonce, nonce, raw, outputDeltaAAD(scope, directory, source.NativeGeneration, source.Sequence, ordinal)), nil
+	return aead.Seal(nonce, nonce, raw, outputDeltaAADBound(scope, directory, source.NativeGeneration, source.Sequence, ordinal)), nil
 }
 
 type outputDeltaReader interface {
@@ -59,7 +70,7 @@ func (j *Journal) assembleOutputDeltas(ctx context.Context, reader outputDeltaRe
 	if data.PendingDeltas < 0 || data.PendingDeltas > data.DeltaCount || data.PendingBytes < 0 || len(data.Text)+data.PendingBytes > data.NativeBytes {
 		return ErrConflict
 	}
-	aead, err := captureAEAD(key, j.scope, j.dir)
+	aead, err := captureAEADBound(key, j.privateCaptureAuthority(), j.dir)
 	if err != nil {
 		return err
 	}
@@ -89,7 +100,7 @@ func (j *Journal) assembleOutputDeltas(ctx context.Context, reader outputDeltaRe
 			return ErrConflict
 		}
 		physical += len(cipher)
-		raw, err := aead.Open(nil, cipher[:aead.NonceSize()], cipher[aead.NonceSize():], outputDeltaAAD(j.scope, j.dir, data.Source.NativeGeneration, data.Source.Sequence, ordinal))
+		raw, err := aead.Open(nil, cipher[:aead.NonceSize()], cipher[aead.NonceSize():], outputDeltaAADBound(j.privateCaptureAuthority(), j.dir, data.Source.NativeGeneration, data.Source.Sequence, ordinal))
 		if err != nil {
 			return ErrConflict
 		}

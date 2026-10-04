@@ -107,6 +107,9 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
+	if j.isLocal() && (source.SourceTask != nil || source.SourceInvocation != nil || source.InputKind != "local-native") {
+		return ErrFenced
+	}
 	if source.SourceTask != nil && source.SourceInvocation != nil {
 		return errors.New("native turn has conflicting source authorities")
 	}
@@ -121,7 +124,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		return errors.New("invalid original task source descriptor")
 	}
 	source.SourceTask = cloneNativeTaskSource(source.SourceTask)
-	if (source.InputKind != "" && !ValidNativeInputKind(source.InputKind)) || source.Sequence <= 0 || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.NativeGeneration == "" || source.NativeSessionID == "" || len(source.NativeSessionID) > 1024 || len(source.NativeGeneration) > 256 || (source.SourceCommandID == "") != (source.SourceAdmissionID == "") || len(source.SourceCommandID) > 256 || len(source.SourceAdmissionID) > 256 {
+	if (source.InputKind != "" && !ValidNativeInputKind(source.InputKind) && !(j.isLocal() && source.InputKind == "local-native")) || source.Sequence <= 0 || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.NativeGeneration == "" || source.NativeSessionID == "" || len(source.NativeSessionID) > 1024 || len(source.NativeGeneration) > 256 || (source.SourceCommandID == "") != (source.SourceAdmissionID == "") || len(source.SourceCommandID) > 256 || len(source.SourceAdmissionID) > 256 {
 		return errors.New("invalid accepted native turn source")
 	}
 	j.mu.Lock()
@@ -131,6 +134,15 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		return err
 	}
 	defer tx.Rollback()
+	if j.isLocal() {
+		original, e := j.localIntentSource(ctx, tx, source.Sequence)
+		if e != nil {
+			return e
+		}
+		if original.Commitment.CommandID != source.SourceCommandID || original.Admission.ID != source.SourceAdmissionID {
+			return ErrConflict
+		}
+	}
 	var previous NativeTurnSource
 	previous, err = readNativeTurn(ctx, tx, source.NativeGeneration, source.LogicalTurnID)
 	if err == nil {
@@ -151,7 +163,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	}
 	// A source remains while its original outcome or any original event/choice
 	// still needs it. No current-controller admission is inferred during pruning.
-	_, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE NOT EXISTS(SELECT 1 FROM worker_invocation_streams s WHERE s.sequence=t.sequence AND s.closed=0) AND completed=1 AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`)
+	_, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE NOT EXISTS(SELECT 1 FROM worker_invocation_streams s WHERE s.sequence=t.sequence AND s.closed=0) AND completed=1 AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`+j.localStreamRetentionPredicate())
 	if err != nil {
 		return err
 	}
@@ -298,6 +310,12 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	source := o.candidateTurnSource
 	source.NativeGeneration = o.generation
 	o.mu.Unlock()
+	if cancelled, e := o.journal.localCancellationRequested(source.Sequence); e != nil || cancelled {
+		if e != nil {
+			return e
+		}
+		return context.Canceled
+	}
 	source.NativeSessionID = sess.NativeID
 	source.LogicalTurnID = req.TurnID
 	o.pinOriginalTaskContent(source)
@@ -310,6 +328,11 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	if err := o.journal.BindNativeTurn(ctx, source); err != nil {
 		o.releaseNativeTaskTurnPin(&source)
 		return err
+	}
+	if o.journal.isLocal() && source.InputKind == "local-native" {
+		if err := o.journal.BeginLocalInvocationStream(ctx, o.captureKey, source); err != nil {
+			return err
+		}
 	}
 	if source.SourceInvocation != nil {
 		key, available := o.originalTaskContentPin(&source)

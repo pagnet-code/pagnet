@@ -28,6 +28,7 @@ type NativeResolution struct {
 type NativeObservation struct {
 	ResourceInterruption     *transport.NativeResourceInterruption `json:"resourceInterruption,omitempty"`
 	outputProjection         *outputSpoolProjection
+	localInvocationEvent     *session.SessionEvent
 	invocationCaptureKey     []byte
 	OutputStream             *NativeOutputStreamProof          `json:"outputStream,omitempty"`
 	OutputContent            *transport.NativeContentReference `json:"outputContent,omitempty"`
@@ -226,6 +227,16 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 			return err
 		}
 		if err = j.recordInvocationTerminalTx(ctx, tx, observation.invocationCaptureKey, streamObservation); err != nil {
+			return err
+		}
+	}
+	if observation.localInvocationEvent != nil {
+		if observation.localInvocationEvent.Type == session.EventSessionStopped {
+			err = j.recordLocalInvocationStoppedTx(ctx, tx, observation.invocationCaptureKey, observation)
+		} else if observation.TurnSource != nil {
+			err = j.recordLocalInvocationEventTx(ctx, tx, observation.invocationCaptureKey, *observation.TurnSource, *observation.localInvocationEvent)
+		}
+		if err != nil {
 			return err
 		}
 	}
