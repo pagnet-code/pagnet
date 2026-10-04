@@ -158,6 +158,22 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 // discovery/policy composition. Query parameters never establish this identity.
 type callerContextKey struct{}
 type originalRequestKey struct{}
+type finalizedRequestKey struct{}
+
+// FinalizedRequestFromContext exposes the exact engine-selected invocation to
+// trusted admission/adapter composition, alongside its separately authenticated
+// original. Its private key cannot be installed by a wire/MCP assertion.
+func FinalizedRequestFromContext(ctx context.Context) (fabric.ExecutionContext, []byte, []byte, bool) {
+	caller, original, ok := OriginalRequestFromContext(ctx)
+	if !ok {
+		return fabric.ExecutionContext{}, nil, nil, false
+	}
+	finalized, ok := ctx.Value(finalizedRequestKey{}).([]byte)
+	if !ok {
+		return fabric.ExecutionContext{}, nil, nil, false
+	}
+	return caller, original, append([]byte(nil), finalized...), true
+}
 
 func CallerFromContext(ctx context.Context) (fabric.ExecutionContext, bool) {
 	if ctx == nil {
@@ -326,6 +342,19 @@ func (s *Service) invoke(ctx context.Context, trusted fabric.ExecutionContext, e
 	if err := request.Validate(); err != nil {
 		return Result{}, err
 	}
+	finalized, err := json.Marshal(envelope)
+	if err != nil {
+		return Result{}, fabric.NewError(fabric.CodeProtocolError, "Invalid finalized invocation")
+	}
+	var bounded fabric.Envelope
+	if fabric.DecodeJSON(finalized, &bounded) != nil {
+		return Result{}, fabric.NewError(fabric.CodeInvalidInput, "Finalized invocation exceeds wire bounds")
+	}
+	// Freeze input from the same bounded final representation. JSON marshaling
+	// may compact/escape RawMessage; the original authenticated bytes remain
+	// separately retained, including numbers that exceed IEEE-754 precision.
+	request.Input = append(json.RawMessage(nil), bounded.Payload...)
+	ctx = context.WithValue(ctx, finalizedRequestKey{}, finalized)
 	stream, err := s.config.Dispatcher.Invoke(ctx, trusted, request)
 	if err != nil {
 		return Result{}, publicError(err)
