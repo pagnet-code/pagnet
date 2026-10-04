@@ -9,7 +9,10 @@ implicit trusted peers, key conversion, fallback or retry is used.
 Composition must supply actual owner-certified peer bindings, explicitly pinned
 current roots, exchange-key revisions and a mandatory `TrustGate`. Its callback
 holds those current trust fences across each bounded cryptographic operation.
-`KeyProvider` selects only the certified local exchange private key. This package
+`KeyProvider` selects only the certified local exchange private key before the
+registry transaction opens. The current trust fence then rechecks that exact
+certificate immediately before synchronous cryptography; external credential
+resolution never runs while holding the registry transaction. This package
 does not create owner certificates or infer authority from received JSON.
 
 One channel has two independent authenticated HPKE contexts. Channel and receiver
@@ -62,3 +65,9 @@ cryptographic unit fixtures. Trusted test ingress contexts and exchange pins do
 not claim product root-issued peer certificates, a running production relay,
 node forwarding authorization, durable remote replay admission, catalog
 synchronization or end-to-end federation execution are already integrated.
+
+`internal/fabricfederation` supplies a concrete current-peer gate using genuine
+root-signed certificates and bilateral retained pins. Its tests cover the real
+root signer, HPKE, revocation, rotation and exact same-transaction admission
+checks. This is tested composition infrastructure; the daemon's remote transport,
+catalog synchronization and execution routes still require product integration.
