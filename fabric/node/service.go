@@ -160,7 +160,7 @@ type callerContextKey struct{}
 type originalRequestKey struct{}
 type finalizedRequestKey struct{}
 
-// FinalizedRequestFromContext exposes the exact engine-selected invocation to
+// FinalizedRequestFromContext exposes the exact engine-selected operation to
 // trusted admission/adapter composition, alongside its separately authenticated
 // original. Its private key cannot be installed by a wire/MCP assertion.
 func FinalizedRequestFromContext(ctx context.Context) (fabric.ExecutionContext, []byte, []byte, bool) {

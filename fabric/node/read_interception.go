@@ -10,6 +10,20 @@ import (
 )
 
 func (s *Service) read(ctx context.Context, envelope fabric.Envelope) (Result, error) {
+	if envelope.Operation != fabric.OperationDiscover && envelope.Operation != fabric.OperationDescribe {
+		return Result{}, fabric.NewError(fabric.CodeUnsupported, "Expected a read operation")
+	}
+	if err := envelope.Validate(); err != nil {
+		return Result{}, err
+	}
+	finalized, err := json.Marshal(envelope)
+	if err != nil {
+		return Result{}, fabric.NewError(fabric.CodeProtocolError, "Cannot encode finalized read request")
+	}
+	// Federation receives this capability only at the actual read boundary,
+	// after request interception. Original wire bytes remain independently
+	// authenticated; a search query cannot manufacture a finalized envelope.
+	ctx = context.WithValue(ctx, finalizedRequestKey{}, finalized)
 	switch envelope.Operation {
 	case fabric.OperationDiscover:
 		return s.discover(ctx, envelope)
@@ -34,7 +48,8 @@ func (s *Service) dispatchRead(ctx context.Context, caller fabric.ExecutionConte
 		placement = extension.PlacementSource
 	}
 	current := envelope
-	out, err := s.config.Interceptors.ExecuteStage(ctx, caller, original, s.config.Audience, string(envelope.Operation)+".request", placement, func(ctx context.Context, _ fabric.ExecutionContext, admitted fabric.Envelope) (extension.Outcome, error) {
+	out, err := s.config.Interceptors.ExecuteStage(ctx, caller, original, s.config.Audience, string(envelope.Operation)+".request", placement, func(ctx context.Context, admittedCaller fabric.ExecutionContext, admitted fabric.Envelope) (extension.Outcome, error) {
+		ctx = context.WithValue(ctx, callerContextKey{}, admittedCaller)
 		current = admitted
 		result, err := s.read(ctx, admitted)
 		if err != nil {
