@@ -24,3 +24,11 @@ missing-root tests use no cloud account, token, DNS lookup or endpoint effect.
 Trusted test authenticator refuses transport requests rather than impersonating
 a real peer. Real private-socket authentication and MCP sessions are composed by
 the corresponding host boundaries.
+
+Composition receives the actual retained store and restored index in one factory.
+Identity providers and binding catalogs share that exact root and sole writer,
+rather than opening a second store or reconstructing identity. Owned resources
+close on partial construction failure. Current authentication checks the open
+retained genesis; historical public verification material alone does not prove
+a live root. An optional explicitly configured search reader can compose hybrid
+retrieval; no provider or model is installed implicitly.

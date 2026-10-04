@@ -5,6 +5,7 @@ package fabricnode
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -19,6 +20,12 @@ import (
 type Config struct {
 	Directory       string
 	RegistryOptions registry.Options
+	// Compose receives the one actual retained store and restored compact index.
+	// It must not reopen the registry or manufacture a replacement root.
+	Compose func(context.Context, *registry.Store, *search.Backend) (Ports, error)
+}
+
+type Ports struct {
 	// Authentication and admission come from actual private peer/identity and
 	// adapter composition, never from caller assertions or descriptor prose.
 	Authenticator      fabric.Authenticator
@@ -28,11 +35,17 @@ type Config struct {
 	ValidateReadResult node.ReadResultValidator
 	Events             events.EventBus
 	Tracing            telemetry.Provider
+	// Search is optional explicit hybrid backend composition; nil uses
+	// the embedded lexical backend. Close owns any provider/session resources.
+	Search node.SearchReader
+	Close  io.Closer
 }
 type Node struct {
 	Store      *registry.Store
 	Service    *node.Service
 	index      *search.Backend
+	reader     node.SearchReader
+	resources  io.Closer
 	mu         sync.Mutex
 	quarantine error
 	closed     bool
@@ -42,7 +55,7 @@ type Node struct {
 // explicitly call registry.Bootstrap first; a missing/corrupt root is an error.
 // It does not install providers, pull models, contact the cloud or run endpoints.
 func Open(ctx context.Context, c Config) (*Node, error) {
-	if ctx == nil || c.Directory == "" || c.Authenticator == nil || c.Bindings == nil || c.Admission == nil {
+	if ctx == nil || c.Directory == "" || c.Compose == nil {
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Missing trusted local node composition")
 	}
 	options := c.RegistryOptions
@@ -54,8 +67,12 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 		return nil, err
 	}
 	keep := false
+	var resources io.Closer
 	defer func() {
 		if !keep {
+			if resources != nil {
+				resources.Close()
+			}
 			store.Close()
 		}
 	}()
@@ -63,13 +80,24 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	d, err := dispatch.New(dispatch.Config{Audience: store.AuthorityIdentity().Namespace, Descriptors: store, Bindings: c.Bindings, Admission: c.Admission})
+	ports, err := c.Compose(ctx, store, index)
+	resources = ports.Close
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{Store: store, index: index}
-	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: c.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: c.Interceptors, ValidateReadResult: c.ValidateReadResult, Events: c.Events, Tracing: c.Tracing}
-	if c.Events != nil {
+	if ports.Authenticator == nil {
+		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Missing actual node authenticator")
+	}
+	d, err := dispatch.New(dispatch.Config{Audience: store.AuthorityIdentity().Namespace, Descriptors: store, Bindings: ports.Bindings, Admission: ports.Admission})
+	if err != nil {
+		return nil, err
+	}
+	n := &Node{Store: store, index: index, reader: ports.Search, resources: resources}
+	if n.reader == nil {
+		n.reader = index
+	}
+	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing}
+	if ports.Events != nil {
 		cfg.EventSource = "pagnet://" + store.AuthorityIdentity().Namespace + "/node/local"
 	}
 	n.Service, err = node.New(cfg)
@@ -133,7 +161,7 @@ func (n *Node) Search(ctx context.Context, r fabric.DiscoverRequest) (fabric.Dis
 	}
 	n.mu.Lock()
 	err := n.available()
-	index := n.index
+	reader := n.reader
 	n.mu.Unlock()
 	if err != nil {
 		return fabric.DiscoverResult{}, err
@@ -150,19 +178,24 @@ func (n *Node) Search(ctx context.Context, r fabric.DiscoverRequest) (fabric.Dis
 			return fabric.DiscoverResult{}, fabric.NewError(fabric.CodeUnsupported, "Remote discovery requires an explicitly configured federation binding")
 		}
 	}
-	return index.Search(ctx, r)
+	return reader.Search(ctx, r)
 }
 
 // Close releases the registry's sole-writer lock. Transport owners must close
 // their sessions/streams before closing the composed node.
 func (n *Node) Close() error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.closed {
+		n.mu.Unlock()
 		return nil
 	}
 	n.closed = true
-	return n.Store.Close()
+	n.mu.Unlock()
+	var err error
+	if n.resources != nil {
+		err = n.resources.Close()
+	}
+	return errors.Join(err, n.Store.Close())
 }
 
 var _ node.SearchReader = (*Node)(nil)
