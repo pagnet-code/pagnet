@@ -372,6 +372,14 @@ func (b *Backend) Restore(ctx context.Context, r CommitRecord) error {
 	}
 	return b.publish(ctx, p, nil)
 }
+
+// IndexRevision reads the current generation without retrieval or model work.
+func (b *Backend) IndexRevision(ctx context.Context) (fabric.Revision, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return revision(b.current.Load()), nil
+}
 func (b *Backend) CurrentCursor() string { return b.current.Load().cursor }
 func revision(g *generation) fabric.Revision {
 	return fabric.Revision(fmt.Sprintf("lex-v1:%d", g.number))
