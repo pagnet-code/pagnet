@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -248,6 +247,7 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 		e.mu.Lock()
 		gone := e.turnEndpointGone
 		accepted := e.turnAccepted
+		cause := e.sourceFailure
 		e.mu.Unlock()
 		if gone {
 			// The process DIED mid-turn (the reader's EOF path woke this
@@ -263,7 +263,7 @@ func (f *PersistentFake) Submit(ctx context.Context, sess *session.RuntimeSessio
 			//   - not accepted: no work was consumed. ErrEndpointGone: the
 			//     Manager re-activates and retries the logical submit once.
 			if accepted {
-				return session.ErrTurnInterrupted
+				return errors.Join(session.ErrTurnInterrupted, cause)
 			}
 			return session.ErrEndpointGone
 		}
@@ -350,6 +350,7 @@ func (f *PersistentFake) BinaryPath() (string, bool) {
 // persistEndpoint is one live fake persistent endpoint process.
 type persistEndpoint struct {
 	nativeObserver       session.NativeEventObserver
+	nativeBatchObserver  session.NativeEventBatchObserver
 	retireNativeObserver func()
 	f                    *PersistentFake // back-reference (the reader's EOF path drops this record)
 	instanceID           string
@@ -383,6 +384,7 @@ type persistEndpoint struct {
 	// working with no endpoint. Kept in lockstep with QwenPersistent (see
 	// qwen_persistent.go); every persistent driver must carry it.
 	turnEndpointGone bool
+	sourceFailure    error
 	// turnAccepted is the fake's acceptance signal for the in-flight
 	// turn: set when the process's runtime.turn.started is routed to the
 	// current turn (the fake emits it the moment it starts working on the
@@ -619,6 +621,7 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	if f.NativeEventObserverRegistrationFactory != nil {
 		registration := f.NativeEventObserverRegistrationFactory(sess.InstanceID)
 		e.nativeObserver = registration.Observe
+		e.nativeBatchObserver = registration.ObserveBatch
 		e.retireNativeObserver = registration.Retire
 	} else if f.NativeEventObserverFactory != nil {
 		e.nativeObserver = f.NativeEventObserverFactory(sess.InstanceID)
@@ -653,34 +656,113 @@ func (e *persistEndpoint) readLoop() {
 	if e.retireNativeObserver != nil {
 		defer e.retireNativeObserver()
 	}
-	scanner := bufio.NewScanner(e.stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := newNativeFrameReader(e.stdout, 4*1024*1024)
+	defer reader.close()
 	activated := false
 	nativeSessionID := ""
-	for scanner.Scan() {
+	var pending *session.SessionEvent
+	parse := func(raw []byte) *session.SessionEvent {
 		var ev persistWireEvent
-		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
-			continue
+		if json.Unmarshal(raw, &ev) != nil {
+			return nil
 		}
 		norm := normalizePersist(ev)
+		return &norm
+	}
+	for {
+		var norm session.SessionEvent
+		if pending != nil {
+			norm = *pending
+			pending = nil
+		} else {
+			raw, ok := reader.next()
+			if !ok {
+				break
+			}
+			parsed := parse(raw)
+			if parsed == nil {
+				continue
+			}
+			norm = *parsed
+		}
 		if norm.Type == session.EventSessionStarted || norm.Type == session.EventSessionResumed {
 			nativeSessionID = norm.SessionID
 		}
-		if e.nativeObserver != nil {
-			if err := e.nativeObserver(norm); err != nil {
-				if errors.Is(err, session.ErrNativeResourceLimit) && e.h != nil {
-					_ = e.h.Terminate("native-source-resource-limit")
+		// Parsing the runtime's authentic acceptance signal prevents paid replay
+		// even when source capture fails before that event can be published.
+		if norm.Type == session.EventTurnStarted {
+			e.mu.Lock()
+			if e.currentTurnEvents != nil && norm.TurnID == e.currentTurnID {
+				e.turnAccepted = true
+			}
+			e.mu.Unlock()
+		}
+		batch := []session.SessionEvent{norm}
+		if e.nativeBatchObserver != nil && norm.Type == session.EventTurnOutput && norm.NativeOutput && norm.Output != "" {
+			raw, _ := json.Marshal(norm)
+			batchBytes := len(raw)
+			for len(batch) < session.NativeOutputBatchMaxEvents {
+				frame, ok := reader.ready()
+				if !ok {
+					break
 				}
-				break
+				next := parse(frame)
+				if next == nil {
+					continue
+				}
+				raw, _ = json.Marshal(next)
+				if next.Type != session.EventTurnOutput || !next.NativeOutput || next.Output == "" || next.SessionID != norm.SessionID || next.TurnID != norm.TurnID || len(raw) > session.NativeOutputBatchMaxBytes-batchBytes {
+					pending = next
+					break
+				}
+				batch = append(batch, *next)
+				batchBytes += len(raw)
 			}
 		}
-		if !activated {
-			activated = true
-			e.activationCh <- norm
-			close(e.activationCh)
-			continue
+		var err error
+		if len(batch) > 1 {
+			err = e.nativeBatchObserver(batch)
+		} else if e.nativeObserver != nil {
+			err = e.nativeObserver(norm)
 		}
-		e.routeTurnEvent(norm)
+		if err != nil {
+			e.mu.Lock()
+			e.sourceFailure = err
+			e.mu.Unlock()
+			if e.h != nil {
+				reason := "native-source-observer-failed"
+				if errors.Is(err, session.ErrNativeResourceLimit) {
+					reason = "native-source-resource-limit"
+				}
+				_ = e.h.Terminate(reason)
+			}
+			reader.close()
+			break
+		}
+		// Each original event is published only after the entire capture commits.
+		for _, event := range batch {
+			if !activated {
+				activated = true
+				e.activationCh <- event
+				close(e.activationCh)
+			} else {
+				e.routeTurnEvent(event)
+			}
+		}
+	}
+	reader.close()
+	reader.mu.Lock()
+	readErr := reader.err
+	reader.mu.Unlock()
+	if readErr != nil {
+		e.mu.Lock()
+		if e.sourceFailure == nil {
+			e.sourceFailure = readErr
+		}
+		e.mu.Unlock()
+		if e.h != nil {
+			_ = e.h.Terminate("native-source-reader-failed")
+		}
 	}
 	// EOF: the process exited. Reap it FIRST (single Wait owner: this
 	// goroutine read all of stdout). The reap unregisters the endpoint

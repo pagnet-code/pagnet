@@ -6,6 +6,12 @@ package session
 // durable admission, rather than acknowledge a failed journal write.
 type NativeEventObserver func(SessionEvent) error
 
+// No batch frame is accepted/published until its durable observer returns.
+type NativeEventBatchObserver func([]SessionEvent) error
+
+const NativeOutputBatchMaxEvents = 32
+const NativeOutputBatchMaxBytes = 64 << 10
+
 type NativeEventObserverFactory func(instanceID string) NativeEventObserver
 
 // NativeEventObserverRegistration owns the append capability for one endpoint.
@@ -13,8 +19,9 @@ type NativeEventObserverFactory func(instanceID string) NativeEventObserver
 // interaction resolution callbacks. The endpoint must call it when its reader
 // exits; no old reader or resolution callback can append after it returns.
 type NativeEventObserverRegistration struct {
-	Observe NativeEventObserver
-	Retire  func()
+	Observe      NativeEventObserver
+	ObserveBatch NativeEventBatchObserver
+	Retire       func()
 }
 type NativeEventObserverRegistrationFactory func(instanceID string) NativeEventObserverRegistration
 

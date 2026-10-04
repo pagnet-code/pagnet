@@ -239,19 +239,23 @@ func (o *SessionOwner) nativeEventRegistration(instanceID string) session.Native
 		o.failPersistence(err)
 		return session.NativeEventObserverRegistration{Observe: func(session.SessionEvent) error { return err }, Retire: func() {}}
 	}
-	observer := o.nativeSourceObserver(instanceID, producer)
+	observer, _, batch := o.nativeCapturedSourceObservers(instanceID, producer, generation, origin)
 	return nativeObserverRegistration(observer, func() {
 		defer o.nativeObserverWG.Done()
 		o.releaseNativeTaskPins(generation)
 		if err := o.journal.retireNativeSource(context.Background(), producer); err != nil {
 			o.failPersistence(err)
 		}
-	})
+	}, batch)
 }
-func nativeObserverRegistration(observer session.NativeEventObserver, retire func()) session.NativeEventObserverRegistration {
+func nativeObserverRegistration(observer session.NativeEventObserver, retire func(), batches ...session.NativeEventBatchObserver) session.NativeEventObserverRegistration {
 	var gate sync.RWMutex
 	closed := false
-	return session.NativeEventObserverRegistration{
+	var batch session.NativeEventBatchObserver
+	if len(batches) > 0 {
+		batch = batches[0]
+	}
+	registration := session.NativeEventObserverRegistration{
 		Observe: func(event session.SessionEvent) error {
 			gate.RLock()
 			defer gate.RUnlock()
@@ -270,6 +274,17 @@ func nativeObserverRegistration(observer session.NativeEventObserver, retire fun
 			retire()
 		},
 	}
+	if batch != nil {
+		registration.ObserveBatch = func(events []session.SessionEvent) error {
+			gate.RLock()
+			defer gate.RUnlock()
+			if closed {
+				return ErrFenced
+			}
+			return batch(events)
+		}
+	}
+	return registration
 }
 
 // Active original producers reserve their eventual genuine process EOF within

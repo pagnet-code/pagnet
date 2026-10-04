@@ -118,6 +118,10 @@ func (e *acpEndpoint) captureNativeMessage(message *acpMessage) error {
 	if e.observer == nil {
 		return nil
 	}
+	observe := e.observer
+	if e.nativeBatcher != nil {
+		observe = e.nativeBatcher.push
+	}
 	for _, event := range events {
 		event.SessionID = native
 		event.TurnID = turn
@@ -126,11 +130,11 @@ func (e *acpEndpoint) captureNativeMessage(message *acpMessage) error {
 		e.observedStart = e.observedStart || first
 		e.mu.Unlock()
 		if first {
-			if err := e.observer(session.SessionEvent{Type: session.EventTurnStarted, SessionID: native, TurnID: turn}); err != nil {
+			if err := observe(session.SessionEvent{Type: session.EventTurnStarted, SessionID: native, TurnID: turn}); err != nil {
 				return err
 			}
 		}
-		if err := e.observer(event); err != nil {
+		if err := observe(event); err != nil {
 			return err
 		}
 	}

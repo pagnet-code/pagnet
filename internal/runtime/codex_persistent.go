@@ -67,7 +67,6 @@ package runtime
 //     silently without its network tools).
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -481,6 +480,7 @@ func (c *CodexPersistent) Live(instanceID string) bool {
 // codexEndpoint is one live codex app-server endpoint process.
 type codexEndpoint struct {
 	nativeObserver       session.NativeEventObserver
+	nativeBatcher        *nativeEventBatcher
 	retireNativeObserver func()
 	generation           string
 	f                    *CodexPersistent // back-reference (the reader's exit path drops this record)
@@ -772,6 +772,7 @@ func (c *CodexPersistent) launchEndpoint(ctx context.Context, sess *session.Runt
 		registration := c.NativeEventObserverRegistrationFactory(sess.InstanceID)
 		e.nativeObserver = registration.Observe
 		e.retireNativeObserver = registration.Retire
+		e.nativeBatcher = &nativeEventBatcher{observe: registration.Observe, batch: registration.ObserveBatch, publish: e.routeCapturedEvent}
 	} else if c.NativeEventObserverFactory != nil {
 		e.nativeObserver = c.NativeEventObserverFactory(sess.InstanceID)
 	}
@@ -927,22 +928,45 @@ func (e *codexEndpoint) readLoop() {
 	if e.retireNativeObserver != nil {
 		defer e.retireNativeObserver()
 	}
-	scanner := bufio.NewScanner(e.stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	reader := newNativeFrameReader(e.stdout, 16*1024*1024)
+	defer reader.close()
+	var pending []byte
+	for {
+		line := pending
+		pending = nil
+		if line == nil {
+			raw, ok := reader.next()
+			if !ok {
+				break
+			}
+			line = raw
 		}
+		line = bytes.TrimSpace(line)
 		var msg codexRPCMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
-			// A non-JSON-RPC line (a stray log line): ignore — the
-			// protocol is one JSON object per line, and a malformed line
-			// must not kill the reader.
-			continue
+		if len(line) > 0 && json.Unmarshal(line, &msg) == nil {
+			// RPC responses/requests are control boundaries, not source batches.
+			if e.nativeBatcher != nil && (msg.Method == "" || len(msg.ID) > 0) {
+				if err := e.nativeBatcher.flush(); err != nil {
+					break
+				}
+			}
+			e.dispatchMessage(&msg)
 		}
-		e.dispatchMessage(&msg)
+		if e.nativeBatcher != nil && e.nativeBatcher.failure() != nil {
+			break
+		}
+		if raw, ok := reader.ready(); ok {
+			pending = raw
+		} else if e.nativeBatcher != nil {
+			if err := e.nativeBatcher.flush(); err != nil {
+				break
+			}
+		}
 	}
+	if e.nativeBatcher != nil {
+		_ = e.nativeBatcher.flush()
+	}
+	reader.close()
 	// EOF: the process exited (or closed its stdout). If the process is
 	// still alive, request bounded termination FIRST (TERM → grace → KILL
 	// through the supervisor). The owner Wait in cleanupOnExit must never
@@ -1014,18 +1038,31 @@ func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
 		copied.NativeInteractionID = e.generation + ":" + copied.NativeInteractionID
 		ev.Interaction = &copied
 	}
+	if e.nativeBatcher != nil {
+		if err := e.nativeBatcher.push(ev); err != nil && e.h != nil {
+			reason := "native-source-observer-failed"
+			if errors.Is(err, session.ErrNativeResourceLimit) {
+				reason = "native-source-resource-limit"
+			}
+			_ = e.h.Terminate(reason)
+		}
+		return
+	}
 	if e.nativeObserver != nil {
 		if err := e.nativeObserver(ev); err != nil {
-			if errors.Is(err, session.ErrNativeResourceLimit) && e.h != nil {
-				_ = e.h.Terminate("native-source-resource-limit")
+			if e.h != nil {
+				_ = e.h.Terminate("native-source-observer-failed")
 			}
 			return
 		}
 	}
+	_ = e.routeCapturedEvent(ev)
+}
+func (e *codexEndpoint) routeCapturedEvent(ev session.SessionEvent) error {
 	e.mu.Lock()
 	if !e.activationSent {
 		e.mu.Unlock()
-		return
+		return nil
 	}
 	ch := e.currentTurnEvents
 	turnID := e.currentTurnID
@@ -1046,7 +1083,7 @@ func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
 	}
 	e.mu.Unlock()
 	if !willSend {
-		return
+		return nil
 	}
 	ch <- ev
 	e.mu.Lock()
@@ -1059,6 +1096,7 @@ func (e *codexEndpoint) routeEvent(ev session.SessionEvent) {
 		e.settleTurn(ch)
 		e.state.clearMachineTurn()
 	}
+	return nil
 }
 
 // settleTurn settles the turn whose channel is ch (a no-op when ch is no

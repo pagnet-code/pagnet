@@ -30,13 +30,13 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 		generation = producer.generation
 		origin = append(json.RawMessage(nil), producer.origin...)
 	}
-	observer, _ := o.nativeCapturedSourceObservers(instanceID, producer, generation, origin)
+	observer, _, _ := o.nativeCapturedSourceObservers(instanceID, producer, generation, origin)
 	return observer
 }
 
 // Recovery can project only an already FULL-captured encrypted tail. It does
 // not register a producer or authorize native callbacks for its old generation.
-func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer *nativeSourceProducer, generation string, origin json.RawMessage) (session.NativeEventObserver, nativeOutputProjectionObserver) {
+func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer *nativeSourceProducer, generation string, origin json.RawMessage) (session.NativeEventObserver, nativeOutputProjectionObserver, session.NativeEventBatchObserver) {
 	observe := func(event session.SessionEvent, stream *NativeOutputStreamProof, projection *outputSpoolProjection) error {
 		observeCtx := o.ctx
 		if stream != nil || event.Type == session.EventSessionStopped || event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed {
@@ -308,7 +308,55 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		}
 		return err
 	}
-	return observer, observe
+	batch := func(events []session.SessionEvent) error {
+		if len(events) == 0 || len(events) > session.NativeOutputBatchMaxEvents {
+			return ErrConflict
+		}
+		first := events[0]
+		bytes := 0
+		for _, event := range events {
+			if event.Type != session.EventTurnOutput || !event.NativeOutput || event.Output == "" || event.SessionID != first.SessionID || event.TurnID != first.TurnID {
+				return ErrConflict
+			}
+			raw, err := canonicalNativeJSON(event)
+			if err != nil {
+				return err
+			}
+			bytes += len(raw)
+			clear(raw)
+		}
+		if len(events) > 1 && bytes > session.NativeOutputBatchMaxBytes {
+			return ErrConflict
+		}
+		o.outputMu.Lock()
+		defer o.outputMu.Unlock()
+		o.journal.mu.Lock()
+		fenced := producer != nil && (producer.closed || !o.journal.sourceProducers[producer])
+		o.journal.mu.Unlock()
+		if fenced {
+			return ErrFenced
+		}
+		captureCtx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
+		defer cancel()
+		source, unavailable, err := o.journal.NativeEventSource(captureCtx, generation, first)
+		if err != nil {
+			return err
+		}
+		if source == nil || unavailable || source.SourceCommandID == "" || source.SourceAdmissionID == "" {
+			for _, event := range events {
+				if err := observe(event, nil, nil); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		err = o.observeOutputDeltas(producer, *source, events, observe)
+		if nativeSourceResourceLimit(err) {
+			return o.nativeOutputResourceLimit(producer, source, err)
+		}
+		return err
+	}
+	return observer, observe, batch
 }
 
 // Origin.ID is authority minted; fixed semantic fields avoid raw-JSON field

@@ -5,7 +5,6 @@ package runtime
 // request, user messages, can_use_tool requests and control_response. The
 // endpoint is a machine plane; it does not advertise a second native TUI.
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -59,6 +58,7 @@ type claudeEndpoint struct {
 	acknowledged   bool
 	materialised   bool
 	observer       session.NativeEventObserver
+	nativeBatcher  *nativeEventBatcher
 	retire         func()
 	err            error
 }
@@ -253,6 +253,7 @@ func (d *ClaudePersistent) Activate(ctx context.Context, s *session.RuntimeSessi
 		r := d.NativeEventObserverRegistrationFactory(s.InstanceID)
 		e.observer = resourceBoundObserver(r.Observe, h.Terminate)
 		e.retire = r.Retire
+		e.nativeBatcher = &nativeEventBatcher{observe: e.observer, batch: r.ObserveBatch, publish: e.publishCaptured}
 	}
 	go e.writeLoop()
 	go e.readLoop()
@@ -361,11 +362,17 @@ func (e *claudeEndpoint) control(ctx context.Context, request any) error {
 	}
 }
 func (e *claudeEndpoint) publish(event session.SessionEvent) error {
+	if e.nativeBatcher != nil {
+		return e.nativeBatcher.push(event)
+	}
 	if e.observer != nil {
 		if err := e.observer(event); err != nil {
 			return err
 		}
 	}
+	return e.publishCaptured(event)
+}
+func (e *claudeEndpoint) publishCaptured(event session.SessionEvent) error {
 	// Unsolicited native events are retained by the observer, never misattributed
 	// to a later managed submit. Idle events do not fill the managed queue.
 	if event.TurnID == "" {
@@ -398,11 +405,31 @@ func (e *claudeEndpoint) readLoop() {
 		}
 	}()
 	defer e.shutdown(io.EOF)
-	scanner := bufio.NewScanner(e.out)
-	scanner.Buffer(make([]byte, 4096), acpMaxFrame)
+	reader := newNativeFrameReader(e.out, acpMaxFrame)
+	defer reader.close()
 	var plans claudePlanTracker
-	for scanner.Scan() {
-		raw := append(json.RawMessage(nil), scanner.Bytes()...)
+	var pending []byte
+	for {
+		frame := pending
+		pending = nil
+		if frame == nil {
+			if e.nativeBatcher != nil {
+				if err := e.nativeBatcher.flush(); err != nil {
+					e.shutdown(err)
+					return
+				}
+			}
+			var ok bool
+			frame, ok = reader.next()
+			if !ok {
+				break
+			}
+		}
+		raw := json.RawMessage(frame)
+		// Flush before the consumer blocks, never wait for another native frame.
+		if next, ok := reader.ready(); ok {
+			pending = next
+		}
 		// request_id is snake case; decode the SDK's explicit wire field names.
 		var wire struct {
 			Type      string          `json:"type"`
@@ -416,6 +443,14 @@ func (e *claudeEndpoint) readLoop() {
 		if json.Unmarshal(raw, &wire) != nil {
 			e.shutdown(errors.New("Claude malformed protocol frame"))
 			return
+		}
+		if wire.Type == "control_response" || wire.Type == "control_request" {
+			if e.nativeBatcher != nil {
+				if err := e.nativeBatcher.flush(); err != nil {
+					e.shutdown(err)
+					return
+				}
+			}
 		}
 		if wire.Type == "control_response" {
 			e.mu.Lock()

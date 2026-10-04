@@ -497,6 +497,7 @@ func (q *QwenPersistent) PTYMaster(instanceID string) *os.File {
 // qwenEndpoint is one live qwen dual-output endpoint process.
 type qwenEndpoint struct {
 	nativeObserver       session.NativeEventObserver
+	nativeBatcher        *nativeEventBatcher
 	retireNativeObserver func()
 	f                    *QwenPersistent // back-reference (the reader's exit path drops this record)
 	instanceID           string
@@ -994,6 +995,7 @@ func (q *QwenPersistent) launchEndpoint(sess *session.RuntimeSession) (*qwenEndp
 		registration := q.NativeEventObserverRegistrationFactory(sess.InstanceID)
 		e.nativeObserver = registration.Observe
 		e.retireNativeObserver = registration.Retire
+		e.nativeBatcher = &nativeEventBatcher{observe: registration.Observe, batch: registration.ObserveBatch, publish: e.routeCapturedEvent}
 	} else if q.NativeEventObserverFactory != nil {
 		e.nativeObserver = q.NativeEventObserverFactory(sess.InstanceID)
 	}
@@ -1068,6 +1070,13 @@ func (e *qwenEndpoint) readLoop() {
 		for _, line := range lines {
 			e.handleEventLine(line)
 		}
+		if e.nativeBatcher != nil {
+			if err := e.nativeBatcher.flush(); err != nil {
+				e.f.requestEndpointStop(e)
+				e.cleanupOnExit()
+				return
+			}
+		}
 		// Watchdog (B6 / B7): check the time-based conditions (submit
 		// correlation deadline, in-flight stall).
 		for _, ev := range e.state.tick() {
@@ -1088,6 +1097,12 @@ func (e *qwenEndpoint) readLoop() {
 				remaining, next, err := readNewLines(f, offset)
 				for _, line := range remaining {
 					e.handleEventLine(line)
+				}
+				if e.nativeBatcher != nil {
+					if flushErr := e.nativeBatcher.flush(); flushErr != nil {
+						e.f.requestEndpointStop(e)
+						break
+					}
 				}
 				if err != nil || next == offset {
 					break
@@ -1143,14 +1158,27 @@ func (e *qwenEndpoint) handleEventLine(line []byte) {
 // goes to activationCh; subsequent events go to the current turn (when the
 // TurnID matches).
 func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
+	if e.nativeBatcher != nil {
+		if err := e.nativeBatcher.push(ev); err != nil && e.h != nil {
+			reason := "native-source-observer-failed"
+			if errors.Is(err, session.ErrNativeResourceLimit) {
+				reason = "native-source-resource-limit"
+			}
+			_ = e.h.Terminate(reason)
+		}
+		return
+	}
 	if e.nativeObserver != nil {
 		if err := e.nativeObserver(ev); err != nil {
-			if errors.Is(err, session.ErrNativeResourceLimit) && e.h != nil {
-				_ = e.h.Terminate("native-source-resource-limit")
+			if e.h != nil {
+				_ = e.h.Terminate("native-source-observer-failed")
 			}
 			return
 		}
 	}
+	_ = e.routeCapturedEvent(ev)
+}
+func (e *qwenEndpoint) routeCapturedEvent(ev session.SessionEvent) error {
 	e.mu.Lock()
 	if !e.activationSent {
 		e.activationSent = true
@@ -1165,20 +1193,20 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 		e.activationCh <- ev // buffered (size 1); won't block
 		close(e.activationCh)
 		e.mu.Unlock()
-		return
+		return nil
 	}
 	ch := e.currentTurnEvents
 	turnID := e.currentTurnID
 	terminal := isTerminalSessionEvent(ev.Type)
 	e.mu.Unlock()
 	if ch == nil {
-		return
+		return nil
 	}
 	// A turn NOT initiated by the current machine submit (a human turn)
 	// carries a different (or empty) turn id. Its events are rendered to
 	// the TUI (the human plane) and are NOT part of this submit's stream.
 	if ev.TurnID != "" && ev.TurnID != turnID {
-		return
+		return nil
 	}
 	ch <- ev
 	if terminal {
@@ -1194,6 +1222,7 @@ func (e *qwenEndpoint) routeEvent(ev session.SessionEvent) {
 		e.mu.Unlock()
 		e.state.clearMachineTurn()
 	}
+	return nil
 }
 
 // cleanupOnExit runs from the reader goroutine when the process exits: it

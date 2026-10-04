@@ -325,7 +325,11 @@ func (e *acpEndpoint) resolve(ctx context.Context, req session.SubmitRequest) er
 	resolution := &session.InteractionEvent{NativeInteractionID: req.InteractionID, Kind: "permission", Resolved: true, Decision: decision, Answer: req.Answer, NativePayload: p.raw}
 	e.mu.Unlock()
 	if e.observer != nil {
-		if err := e.observer(session.SessionEvent{Type: session.EventInteractionResolved, SessionID: e.nativeID, TurnID: p.turn, Interaction: resolution}); err != nil {
+		observe := e.observer
+		if e.nativeBatcher != nil {
+			observe = e.nativeBatcher.push
+		}
+		if err := observe(session.SessionEvent{Type: session.EventInteractionResolved, SessionID: e.nativeID, TurnID: p.turn, Interaction: resolution}); err != nil {
 			e.mu.Lock()
 			return err
 		}

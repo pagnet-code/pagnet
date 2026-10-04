@@ -3,7 +3,6 @@ package runtime
 // ACP's newline-delimited JSON-RPC transport is independent of any vendor.
 // Stdout is exclusively protocol data; stderr stays in the process supervisor.
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,6 +43,7 @@ type acpCall struct {
 }
 type acpConnection struct {
 	observe        func(*acpMessage) error
+	flushNative    func() error
 	pendingMethods map[string]string
 	input          io.WriteCloser
 	output         io.ReadCloser
@@ -63,7 +63,11 @@ func newACPConnection(input io.WriteCloser, output io.ReadCloser) *acpConnection
 	return newOwnedACPConnection(input, output, nil)
 }
 func newOwnedACPConnection(input io.WriteCloser, output io.ReadCloser, retire func(), observers ...func(*acpMessage) error) *acpConnection {
+	return newOwnedACPConnectionWithFlush(input, output, retire, nil, observers...)
+}
+func newOwnedACPConnectionWithFlush(input io.WriteCloser, output io.ReadCloser, retire func(), flush func() error, observers ...func(*acpMessage) error) *acpConnection {
 	c := &acpConnection{input: input, output: output, writes: make(chan acpWrite, 16), messages: make(chan acpMessage, 128), done: make(chan struct{}), pending: map[string]chan acpMessage{}, readerDone: make(chan struct{}), retire: retire}
+	c.flushNative = flush
 	c.pendingMethods = map[string]string{}
 	if len(observers) > 0 {
 		c.observe = observers[0]
@@ -116,13 +120,59 @@ func (c *acpConnection) readLoop() {
 	if c.retire != nil {
 		defer c.retire()
 	}
-	scanner := bufio.NewScanner(c.output)
-	scanner.Buffer(make([]byte, 4096), acpMaxFrame)
-	for scanner.Scan() {
+	reader := newNativeFrameReader(c.output, acpMaxFrame)
+	defer reader.close()
+	var pendingFrame []byte
+	var pendingMessages []acpMessage
+	pendingBytes := 0
+	flush := func() error {
+		if c.flushNative != nil {
+			if err := c.flushNative(); err != nil {
+				return err
+			}
+		}
+		for _, m := range pendingMessages {
+			select {
+			case c.messages <- m:
+			case <-c.done:
+				return c.failure()
+			default:
+				return errors.New("ACP protocol event buffer overflow")
+			}
+		}
+		clear(pendingMessages)
+		pendingMessages = pendingMessages[:0]
+		pendingBytes = 0
+		return nil
+	}
+	for {
+		frame := pendingFrame
+		pendingFrame = nil
+		if frame == nil {
+			if err := flush(); err != nil {
+				c.close(err)
+				return
+			}
+			var ok bool
+			frame, ok = reader.next()
+			if !ok {
+				break
+			}
+		}
+		if next, ok := reader.ready(); ok {
+			pendingFrame = next
+		}
 		var m acpMessage
-		if json.Unmarshal(scanner.Bytes(), &m) != nil || m.JSONRPC != "2.0" {
+		if json.Unmarshal(frame, &m) != nil || m.JSONRPC != "2.0" {
 			c.close(errors.New("ACP received malformed protocol frame"))
 			return
+		}
+		outputUpdate := isACPOutputUpdate(m)
+		if !outputUpdate || len(pendingMessages) >= session.NativeOutputBatchMaxEvents || len(frame) > session.NativeOutputBatchMaxBytes-pendingBytes {
+			if err := flush(); err != nil {
+				c.close(err)
+				return
+			}
 		}
 		if m.Method == "" {
 			if len(m.ID) == 0 || (len(m.Result) == 0) == (m.Error == nil) {
@@ -138,6 +188,10 @@ func (c *acpConnection) readLoop() {
 					c.close(err)
 					return
 				}
+			}
+			if err := flush(); err != nil {
+				c.close(err)
+				return
 			}
 			if pending != nil {
 				select {
@@ -155,6 +209,15 @@ func (c *acpConnection) readLoop() {
 				return
 			}
 		}
+		if outputUpdate && c.flushNative != nil {
+			pendingMessages = append(pendingMessages, m)
+			pendingBytes += len(frame)
+			continue
+		}
+		if err := flush(); err != nil {
+			c.close(err)
+			return
+		}
 		select {
 		case c.messages <- m:
 		case <-c.done:
@@ -164,7 +227,13 @@ func (c *acpConnection) readLoop() {
 			return
 		}
 	}
-	err := scanner.Err()
+	if err := flush(); err != nil {
+		c.close(err)
+		return
+	}
+	reader.mu.Lock()
+	err := reader.err
+	reader.mu.Unlock()
 	if err == nil {
 		err = io.EOF
 	}
@@ -261,4 +330,18 @@ func (c *acpConnection) request(ctx context.Context, method string, params any, 
 			return c.failure()
 		}
 	}
+}
+
+// Only typed native text output notifications enter the capture batch.
+func isACPOutputUpdate(m acpMessage) bool {
+	if m.Method != "session/update" || len(m.ID) > 0 {
+		return false
+	}
+	var p struct {
+		Update struct {
+			Kind    string `json:"sessionUpdate"`
+			Content struct{ Type, Text string }
+		} `json:"update"`
+	}
+	return json.Unmarshal(m.Params, &p) == nil && p.Update.Kind == "agent_message_chunk" && p.Update.Content.Type == "text" && p.Update.Content.Text != ""
 }

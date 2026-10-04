@@ -49,6 +49,7 @@ type nativeOutputSpool struct {
 	KeyAvailable      bool
 	LastDeltaID       string
 	LastDeltaDigest   string
+	LastCaptureCount  int
 	PendingDeltas     int64
 	PendingBytes      int
 	PendingBaseDigest string
@@ -167,7 +168,7 @@ func openOutputSpool(key []byte, scope Scope, directory, generation string, sequ
 	decoded, err := io.ReadAll(io.LimitReader(reader, 7*transport.NativeContentMaxPlaintextBytes+1))
 	_ = reader.Close()
 	defer clear(decoded)
-	if err != nil || len(decoded) > 7*transport.NativeContentMaxPlaintextBytes || json.Unmarshal(decoded, &result) != nil || result.Source.Sequence != sequence || result.Source.NativeGeneration != generation || result.NativeBytes < 0 || result.NativeBytes > transport.NativeContentMaxPlaintextBytes || len(result.Text) > result.NativeBytes || result.DeltaCount < 1 || len(result.RollingDigest) != 64 || (result.KeyAvailable && len(result.Key) != 32) {
+	if err != nil || len(decoded) > 7*transport.NativeContentMaxPlaintextBytes || json.Unmarshal(decoded, &result) != nil || result.Source.Sequence != sequence || result.Source.NativeGeneration != generation || result.NativeBytes < 0 || result.NativeBytes > transport.NativeContentMaxPlaintextBytes || len(result.Text) > result.NativeBytes || result.DeltaCount < 1 || result.LastCaptureCount < 0 || result.LastCaptureCount > session.NativeOutputBatchMaxEvents || len(result.RollingDigest) != 64 || (result.KeyAvailable && len(result.Key) != 32) {
 		clear(result.Key)
 		return nativeOutputSpool{}, ErrConflict
 	}
@@ -181,22 +182,48 @@ func openOutputSpool(key []byte, scope Scope, directory, generation string, sequ
 // Serialized with projection flush by owner.outputMu. A callback's stable ID
 // pins ambiguous COMMIT recovery; no subsequent callback can displace it first.
 func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer, key []byte, source NativeTurnSource, event session.SessionEvent, deltaID string, originalKey [32]byte, available bool) (nativeOutputSpool, error) {
+	result, _, err := j.appendOutputDeltas(ctx, p, key, source, []session.SessionEvent{event}, deltaID, originalKey, available)
+	return result, err
+}
+
+// Distinct original frame ordinals/ciphertexts/hashes share one FULL commit.
+func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProducer, key []byte, source NativeTurnSource, events []session.SessionEvent, deltaID string, originalKey [32]byte, available bool) (nativeOutputSpool, int, error) {
 	var result nativeOutputSpool
-	raw, err := canonicalNativeJSON(event)
-	if err != nil {
-		return result, err
+	if len(events) == 0 || len(events) > session.NativeOutputBatchMaxEvents {
+		return result, 0, ErrConflict
 	}
-	sum := sha256.Sum256(raw)
-	deltaDigest := hex.EncodeToString(sum[:])
-	defer clear(raw)
+	raws := make([][]byte, len(events))
+	defer func() {
+		for _, raw := range raws {
+			clear(raw)
+		}
+	}()
+	commitDigest := sha256.New()
+	batchBytes := 0
+	for i, event := range events {
+		if event.Type != session.EventTurnOutput || !event.NativeOutput || event.SessionID != source.NativeSessionID || event.TurnID != source.LogicalTurnID {
+			return result, 0, ErrConflict
+		}
+		var err error
+		raws[i], err = canonicalNativeJSON(event)
+		if err != nil {
+			return result, 0, err
+		}
+		batchBytes += len(raws[i])
+		if len(events) > 1 && batchBytes > session.NativeOutputBatchMaxBytes {
+			return result, 0, ErrConflict
+		}
+		commitDigest.Write(raws[i])
+	}
+	deltaDigest := hex.EncodeToString(commitDigest.Sum(nil))
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if p == nil || p.closed || !j.sourceProducers[p] || p.generation != source.NativeGeneration {
-		return result, ErrFenced
+		return result, 0, ErrFenced
 	}
 	tx, err := j.db.BeginTx(ctx, nil)
 	if err != nil {
-		return result, err
+		return result, 0, err
 	}
 	defer tx.Rollback()
 	var previous []byte
@@ -210,95 +237,108 @@ func (j *Journal) appendOutputDelta(ctx context.Context, p *nativeSourceProducer
 			result.Key = append([]byte(nil), originalKey[:]...)
 		}
 	} else if err != nil {
-		return result, err
+		return result, 0, err
 	} else {
 		result, err = openOutputSpool(key, j.scope, j.dir, source.NativeGeneration, source.Sequence, previous)
 		if err != nil {
-			return result, err
+			return result, 0, err
 		}
 		original, _ := json.Marshal(result.Source)
 		current, _ := json.Marshal(source)
 		if !bytes.Equal(original, current) || !bytes.Equal(result.Origin, p.origin) {
 			clear(result.Key)
-			return nativeOutputSpool{}, ErrConflict
+			return nativeOutputSpool{}, 0, ErrConflict
 		}
 		if result.Ready != nil && result.LastDeltaID != deltaID {
-			return nativeOutputSpool{}, ErrConflict
+			return nativeOutputSpool{}, 0, ErrConflict
 		}
 		if result.LastDeltaID == deltaID {
-			if result.LastDeltaDigest != deltaDigest {
+			if result.LastDeltaDigest != deltaDigest || result.LastCaptureCount < 1 || result.LastCaptureCount > len(events) {
 				clear(result.Key)
-				return nativeOutputSpool{}, ErrConflict
+				return nativeOutputSpool{}, 0, ErrConflict
 			}
 			if err = j.assembleOutputDeltas(ctx, tx, key, &result, previousSize, len(previous)); err != nil {
 				clear(result.Key)
-				return nativeOutputSpool{}, err
+				return nativeOutputSpool{}, 0, err
 			}
-			return result, nil
+			return result, result.LastCaptureCount, nil
 		}
 	}
-	if len(event.Output) > transport.NativeContentMaxPlaintextBytes-result.NativeBytes {
-		clear(result.Key)
-		return nativeOutputSpool{}, ErrNativeOutputLimit
+	appendDelta := tx.StmtContext(ctx, j.outputDeltaAppend)
+	defer appendDelta.Close()
+	consumed, deltaBytes := 0, 0
+	for i, event := range events {
+		if len(event.Output) > transport.NativeContentMaxPlaintextBytes-result.NativeBytes {
+			if consumed == 0 {
+				clear(result.Key)
+				return nativeOutputSpool{}, 0, ErrNativeOutputLimit
+			}
+			break
+		}
+		raw := raws[i]
+		oldDigest, _ := hex.DecodeString(result.RollingDigest)
+		if result.PendingDeltas == 0 {
+			result.PendingBaseDigest = result.RollingDigest
+		}
+		chain := sha256.New()
+		chain.Write(oldDigest)
+		chain.Write(raw)
+		result.RollingDigest = hex.EncodeToString(chain.Sum(nil))
+		result.DeltaCount++
+		result.NativeBytes += len(event.Output)
+		if result.Text == "" && result.PendingBytes == 0 {
+			result.FirstObservedAt = nativeSourceTime(time.Now())
+		}
+		result.LastObservedAt = nativeSourceTime(time.Now())
+		result.PendingDeltas++
+		result.PendingBytes += len(event.Output)
+		delta, err := sealOutputDelta(key, j.scope, j.dir, source, result.DeltaCount, raw)
+		if err != nil {
+			clear(result.Key)
+			return nativeOutputSpool{}, 0, err
+		}
+		if _, err = appendDelta.ExecContext(ctx, source.Sequence, result.DeltaCount, delta); err != nil {
+			clear(result.Key)
+			return nativeOutputSpool{}, 0, err
+		}
+		deltaBytes += len(delta)
+		consumed++
+		// Preserve existing projection and resource-prefix boundaries.
+		if int64(result.NativeBytes)-result.ByteOffset >= nativeOutputBatchBytes {
+			break
+		}
 	}
-	oldDigest, _ := hex.DecodeString(result.RollingDigest)
-	if result.PendingDeltas == 0 {
-		result.PendingBaseDigest = result.RollingDigest
-	}
-	chain := sha256.New()
-	_, _ = chain.Write(oldDigest)
-	_, _ = chain.Write(raw)
-	result.RollingDigest = hex.EncodeToString(chain.Sum(nil))
-	result.DeltaCount++
-	result.NativeBytes += len(event.Output)
-	if result.Text == "" && result.PendingBytes == 0 {
-		result.FirstObservedAt = nativeSourceTime(time.Now())
-	}
-	result.LastObservedAt = nativeSourceTime(time.Now())
-	result.PendingDeltas++
-	result.PendingBytes += len(event.Output)
-	result.LastDeltaID, result.LastDeltaDigest = deltaID, deltaDigest
+	result.LastDeltaID, result.LastDeltaDigest, result.LastCaptureCount = deltaID, deltaDigest, consumed
 	sealed, err := j.outputEncoder.seal(key, j.scope, j.dir, result)
 	if err != nil {
 		clear(result.Key)
-		return nativeOutputSpool{}, err
+		return nativeOutputSpool{}, 0, err
 	}
-	// Private tail storage consumes only original reserved prefix capacity.
-	delta, err := sealOutputDelta(key, j.scope, j.dir, source, result.DeltaCount, raw)
-	if err != nil {
-		clear(result.Key)
-		return nativeOutputSpool{}, err
-	}
-	growth := len(sealed) - len(previous) + len(delta)
+	growth := len(sealed) - len(previous) + deltaBytes
 	reserve := tx.StmtContext(ctx, j.outputSpoolReserve)
 	defer reserve.Close()
 	changed, err := reserve.ExecContext(ctx, growth, source.Sequence, growth, terminalCaptureReserveBytes/2)
 	if err != nil {
-		return nativeOutputSpool{}, err
+		clear(result.Key)
+		return nativeOutputSpool{}, 0, err
 	}
 	n, _ := changed.RowsAffected()
 	if n != 1 {
 		clear(result.Key)
-		return nativeOutputSpool{}, ErrNativeOutputLimit
+		return nativeOutputSpool{}, 0, ErrNativeOutputLimit
 	}
 	appendStatement := tx.StmtContext(ctx, j.outputSpoolAppend)
 	defer appendStatement.Close()
 	if _, err = appendStatement.ExecContext(ctx, source.Sequence, source.NativeGeneration, sealed, previousSize+growth); err != nil {
 		clear(result.Key)
-		return nativeOutputSpool{}, err
-	}
-	appendDelta := tx.StmtContext(ctx, j.outputDeltaAppend)
-	defer appendDelta.Close()
-	if _, err = appendDelta.ExecContext(ctx, source.Sequence, result.DeltaCount, delta); err != nil {
-		clear(result.Key)
-		return nativeOutputSpool{}, err
+		return nativeOutputSpool{}, 0, err
 	}
 	err = tx.Commit()
 	if err != nil {
 		clear(result.Key)
-		return nativeOutputSpool{}, err
+		return nativeOutputSpool{}, 0, err
 	}
-	return result, nil
+	return result, consumed, nil
 }
 
 // Private projection capability: validated against an existing original FULL
@@ -376,42 +416,61 @@ func (j *Journal) outputSpoolSequences(ctx context.Context, generation string) (
 type nativeOutputProjectionObserver func(session.SessionEvent, *NativeOutputStreamProof, *outputSpoolProjection) error
 
 func (o *SessionOwner) observeOutputDelta(p *nativeSourceProducer, source NativeTurnSource, event session.SessionEvent, observe nativeOutputProjectionObserver) error {
-	// An empty output notification has no original text to capture or project.
-	// It must not leave a pending zero-byte stream blocking genuine EOF cleanup.
 	if event.Output == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
-	defer cancel()
+	return o.observeOutputDeltas(p, source, []session.SessionEvent{event}, observe)
+}
+
+func (o *SessionOwner) observeOutputDeltas(p *nativeSourceProducer, source NativeTurnSource, events []session.SessionEvent, observe nativeOutputProjectionObserver) error {
 	originalKey, available := o.originalTaskContentPin(&source)
 	defer clear(originalKey[:])
-	deltaID := uuid.NewString()
-	var err error
-	var needsProjection bool
-	for {
+	for len(events) > 0 {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
+		deltaID := uuid.NewString()
 		var data nativeOutputSpool
-		data, err = o.journal.appendOutputDelta(ctx, p, o.captureKey, source, event, deltaID, originalKey, available)
-		needsProjection = data.Ready != nil || int64(data.NativeBytes)-data.ByteOffset >= nativeOutputBatchBytes
+		var consumed int
+		var err error
+		for {
+			data, consumed, err = o.journal.appendOutputDeltas(ctx, p, o.captureKey, source, events, deltaID, originalKey, available)
+			if err == nil || errors.Is(err, ErrNativeOutputLimit) || errors.Is(err, ErrFenced) || errors.Is(err, ErrConflict) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				cancel()
+				return err
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		cancel()
+		if errors.Is(err, ErrNativeOutputLimit) && len(events) > 1 {
+			// The rejected transaction accepted no frame. Recover the exact
+			// admissible prefix individually before reporting exhausted capacity.
+			for _, event := range events {
+				if err := o.observeOutputDelta(p, source, event, observe); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if err != nil {
+			clear(data.Key)
+			return err
+		}
+		needsProjection := data.Ready != nil || int64(data.NativeBytes)-data.ByteOffset >= nativeOutputBatchBytes
 		clear(data.Key)
-		if err == nil {
-			break
+		if consumed < 1 || consumed > len(events) {
+			return ErrConflict
 		}
-		if errors.Is(err, ErrNativeOutputLimit) || errors.Is(err, ErrFenced) || errors.Is(err, ErrConflict) {
-			return err
+		if needsProjection {
+			if err := o.flushNativeOutput(source.NativeGeneration, source.Sequence, false, observe); err != nil {
+				return err
+			}
 		}
-		select {
-		case <-ctx.Done():
-			return err
-		case <-time.After(50 * time.Millisecond):
-		}
+		events = events[consumed:]
 	}
-	// The committed append already authenticated this tail. Below the batch
-	// threshold there is nothing to project; avoid loading and decrypting the
-	// same growing ciphertext a second time for every small native delta.
-	if !needsProjection {
-		return nil
-	}
-	return o.flushNativeOutput(source.NativeGeneration, source.Sequence, false, observe)
+	return nil
 }
 func (o *SessionOwner) flushNativeOutputGeneration(generation string, observe nativeOutputProjectionObserver) error {
 	sequences, err := o.journal.outputSpoolSequences(context.WithoutCancel(o.ctx), generation)
@@ -535,7 +594,7 @@ func (o *SessionOwner) recoverCapturedNativeOutput() error {
 		}
 		origin := append(json.RawMessage(nil), data.Origin...)
 		clear(data.Key)
-		_, project := o.nativeCapturedSourceObservers(o.journal.scope.InstanceID, nil, entry.generation, origin)
+		_, project, _ := o.nativeCapturedSourceObservers(o.journal.scope.InstanceID, nil, entry.generation, origin)
 		if err = o.flushNativeOutput(entry.generation, entry.sequence, true, project); err != nil {
 			return err
 		}

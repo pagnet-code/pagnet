@@ -45,6 +45,7 @@ type acpEndpoint struct {
 	retired        bool
 	announced      bool
 	observer       session.NativeEventObserver
+	nativeBatcher  *nativeEventBatcher
 	observedStart  bool
 	conn           *acpConnection
 	handle         *proc.Handle
@@ -238,7 +239,8 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 		planSource = "acp"
 	}
 	e := &acpEndpoint{planSource: planSource, observer: resourceBoundObserver(registration.Observe, h.Terminate), handle: h, id: string(domain.NewID()), started: time.Now(), permissions: map[string]acpPermission{}, tools: map[string]bool{}, resolutions: make(chan *session.InteractionEvent, 32)}
-	e.conn = newOwnedACPConnection(in, out, func() {
+	e.nativeBatcher = &nativeEventBatcher{observe: e.observer, batch: registration.ObserveBatch}
+	e.conn = newOwnedACPConnectionWithFlush(in, out, func() {
 		e.resolutionGate.Lock()
 		defer e.resolutionGate.Unlock()
 		h.Abort("ACP native reader closed")
@@ -254,7 +256,7 @@ func (d *ACPDriver) Activate(ctx context.Context, s *session.RuntimeSession, ch 
 		if registration.Retire != nil {
 			registration.Retire()
 		}
-	}, e.captureNativeMessage)
+	}, e.nativeBatcher.flush, e.captureNativeMessage)
 	success := false
 	defer func() {
 		if !success {
