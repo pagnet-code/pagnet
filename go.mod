@@ -23,6 +23,7 @@ require (
 	github.com/danieljoos/wincred v1.1.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/dvsekhvalnov/jose2go v1.11.0 // indirect
+	github.com/evanphx/json-patch/v5 v5.9.11
 	github.com/godbus/dbus v0.0.0-20190726142602-4481cbc300e2 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c // indirect

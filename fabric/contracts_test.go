@@ -250,3 +250,47 @@ func TestFrameSequenceNeverRoundsThroughJSON(t *testing.T) {
 		t.Fatalf("Sequence changed: %+v %v", reopened, err)
 	}
 }
+
+func TestCallerCannotForgeInterceptorExclusionOrOrigin(t *testing.T) {
+	e, _ := testEnvelope(t)
+	for _, mutate := range []func(*Envelope){
+		func(e *Envelope) { e.Context.ExtensionChain = []string{"acme.authorization"} },
+		func(e *Envelope) { e.Context.Origin = "local:administrator" },
+		func(e *Envelope) {
+			e.Context.ParentID = "foreign-parent"
+			e.Context.Ancestry = []string{"foreign-parent"}
+			e.Context.Hops = 1
+		},
+	} {
+		changed := e
+		mutate(&changed)
+		b, _ := json.Marshal(changed)
+		c, err := NewAuthenticatedContext(e.Principal, "local:domain", b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = c.DecodeVerifiedEnvelope(b, "local:domain"); err == nil {
+			t.Fatal("Caller-signed assertion forged engine ancestry")
+		}
+	}
+}
+
+func TestAuthenticatedForwardLineageIsPinnedAndImmutable(t *testing.T) {
+	e, _ := testEnvelope(t)
+	e.Context.ParentID = "parent"
+	e.Context.Ancestry = []string{"parent"}
+	e.Context.Hops = 1
+	e.Context.ExtensionChain = []string{"acme.audit"}
+	b, _ := json.Marshal(e)
+	p := Provenance{Origin: e.Principal.Ref, ParentID: "parent", Ancestry: []string{"parent"}, Hops: 1, ExtensionChain: []string{"acme.audit"}}
+	c, err := NewAuthenticatedForwardContext(e.Principal, "local:domain", b, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.ExtensionChain[0] = "acme.authorization"
+	view := c.ProvenanceView()
+	view.ExtensionChain[0] = "acme.authorization"
+	if _, err = c.DecodeVerifiedEnvelope(b, "local:domain"); err != nil {
+		t.Fatal("Caller mutated copied provenance", err)
+	}
+}
