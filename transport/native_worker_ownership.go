@@ -56,12 +56,15 @@ type NativeOwnershipDeletionProof struct {
 // Retirement advances only contiguous settled dispatch outcomes. Uncertain ordinals
 // are above the claimed floor and remain permanently non-replayable blockers.
 type NativeOwnershipRetirePayload struct {
-	RequestID                  string  `json:"requestId"`
-	OwnershipID                string  `json:"ownershipId"`
-	OwnershipGeneration        string  `json:"ownershipGeneration"`
-	RetiredDispatchSequence    int64   `json:"retiredDispatchSequence"`
-	UncertainDispatchSequences []int64 `json:"uncertainDispatchSequences,omitempty"`
-	Retire                     bool    `json:"retire,omitempty"`
+	// Explicit completed stop of an owner with no materialized native endpoint.
+	// This is controller lifecycle evidence, never a fabricated runtime EOF.
+	UnstartedStop              *NativeDispatchProof `json:"unstartedStop,omitempty"`
+	RequestID                  string               `json:"requestId"`
+	OwnershipID                string               `json:"ownershipId"`
+	OwnershipGeneration        string               `json:"ownershipGeneration"`
+	RetiredDispatchSequence    int64                `json:"retiredDispatchSequence"`
+	UncertainDispatchSequences []int64              `json:"uncertainDispatchSequences,omitempty"`
+	Retire                     bool                 `json:"retire,omitempty"`
 }
 type NativeDispatchProof struct {
 	TaskSource          *NativeTaskSource `json:"taskSource,omitempty"`
@@ -76,10 +79,11 @@ type NativeDispatchProof struct {
 }
 
 type NativeOwnershipRegisteredPayload struct {
-	RequestID   string                 `json:"requestId"`
-	Ownership   *NativeWorkerOwnership `json:"ownership,omitempty"`
-	PublicError string                 `json:"publicError,omitempty"`
-	Retryable   bool                   `json:"retryable,omitempty"`
+	UnstartedStop *NativeDispatchProof   `json:"unstartedStop,omitempty"`
+	RequestID     string                 `json:"requestId"`
+	Ownership     *NativeWorkerOwnership `json:"ownership,omitempty"`
+	PublicError   string                 `json:"publicError,omitempty"`
+	Retryable     bool                   `json:"retryable,omitempty"`
 }
 
 const MsgNativeOwnershipPrepare = "host.native_ownership_prepare"

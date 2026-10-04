@@ -70,15 +70,15 @@ func TestNativeOwnershipRPCPinsWorkerProfileAndCommittedRetirement(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false); err != nil {
+	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	mutation = "rollback"
-	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false); !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false, nil); !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
 		t.Fatal("rollback authorized prune", err)
 	}
 	mutation = "source"
-	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false); !errors.Is(err, ErrNativeObservationConflict) {
+	if _, err = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false, nil); !errors.Is(err, ErrNativeObservationConflict) {
 		t.Fatal("changed original source authorized prune", err)
 	}
 	for _, change := range []string{"scope", "profile"} {
@@ -113,5 +113,56 @@ func TestNativeOwnershipDisconnectAndPendingCapacity(t *testing.T) {
 	c.mu.Unlock()
 	if _, err := c.RegisterNativeWorkerOwnership(t.Context(), scope, spec, "", ""); !errors.Is(err, ErrNativeObservationCapacity) {
 		t.Fatal("ownership escaped shared pending limit", err)
+	}
+}
+
+func TestNativeUnstartedStopRetirementRequiresExactCommittedEcho(t *testing.T) {
+	var c *NativeObservationConnection
+	var owner *transport.NativeWorkerOwnership
+	mutation := ""
+	c, scope, spec := ownershipConnectionFixture(t, func(_ context.Context, typ string, raw any) error {
+		reply := transport.NativeOwnershipRegisteredPayload{}
+		if typ == transport.MsgNativeOwnershipRegister {
+			p := raw.(transport.NativeOwnershipRegisterPayload)
+			owner = &transport.NativeWorkerOwnership{ID: domain.NewID().String(), InstanceID: p.InstanceID, OwnershipGeneration: p.OwnershipGeneration, Runtime: p.Runtime, Profile: p.Profile, ProfileFingerprint: p.ProfileFingerprint, OriginalAdmissionID: p.NativeAdmissionID, State: "active", LastDispatchSequence: 1}
+			reply.RequestID = p.RequestID
+			reply.Ownership = owner
+		} else {
+			p := raw.(transport.NativeOwnershipRetirePayload)
+			o := *owner
+			o.RetiredFloor = p.RetiredDispatchSequence
+			reply.RequestID = p.RequestID
+			reply.Ownership = &o
+			if mutation != "missing" {
+				copy := *p.UnstartedStop
+				reply.UnstartedStop = &copy
+			}
+			if mutation == "foreign" {
+				reply.UnstartedStop.SourceCommandID = domain.NewID().String()
+			}
+			if mutation == "rollback" {
+				reply.Ownership = nil
+				reply.PublicError = "unavailable"
+				reply.Retryable = true
+			}
+		}
+		c.OwnershipDisposition(reply)
+		return nil
+	})
+	o, e := c.RegisterNativeWorkerOwnership(t.Context(), scope, spec, "", "")
+	if e != nil {
+		t.Fatal(e)
+	}
+	// Historical source is intentionally distinct from the current RPC connection.
+	proof := transport.NativeDispatchProof{OwnershipID: o.ID, OwnershipGeneration: scope.Generation, DispatchSequence: 1, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String(), SourceRunnerID: domain.NewID().String(), SourceRunnerEpoch: time.Now().UTC().Add(-time.Hour), SourceBootID: "original-boot"}
+	for _, m := range []string{"missing", "foreign", "rollback", ""} {
+		mutation = m
+		_, e = c.RetireNativeWorkerOwnership(t.Context(), scope, spec, "", *o, 1, nil, false, &proof)
+		if m == "" && e != nil {
+			t.Fatal(e)
+		}
+		if m != "" && !errors.Is(e, ErrNativeOriginAdmissionDeferred) {
+			t.Fatal("uncommitted or changed stop proof authorized prune", m, e)
+		}
 	}
 }

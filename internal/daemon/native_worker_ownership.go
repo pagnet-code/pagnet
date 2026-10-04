@@ -29,7 +29,7 @@ func (c *NativeObservationConnection) OwnershipDisposition(p transport.NativeOwn
 	}
 }
 
-func (c *NativeObservationConnection) ownershipExchange(ctx context.Context, requestID, typ string, payload any) (*transport.NativeWorkerOwnership, error) {
+func (c *NativeObservationConnection) ownershipExchange(ctx context.Context, requestID, typ string, payload any, unstartedStop *transport.NativeDispatchProof) (*transport.NativeWorkerOwnership, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	ch := make(chan transport.NativeOwnershipRegisteredPayload, 1)
@@ -79,6 +79,9 @@ func (c *NativeObservationConnection) ownershipExchange(ctx context.Context, req
 			}
 			return nil, ErrNativeOriginAdmissionRejected
 		}
+		if unstartedStop != nil && (p.UnstartedStop == nil || !transport.SameNativeDispatchProof(*unstartedStop, *p.UnstartedStop)) {
+			return nil, ErrNativeOriginAdmissionDeferred
+		}
 		return p.Ownership, nil
 	}
 }
@@ -102,7 +105,7 @@ func (c *NativeObservationConnection) RegisterNativeWorkerOwnership(ctx context.
 	}
 	id := domain.NewID().String()
 	p := transport.NativeOwnershipRegisterPayload{RequestID: id, NativeAdmissionID: admission.NativeAdmissionID, InstanceID: scope.InstanceID, OwnershipGeneration: scope.Generation, Runtime: string(spec.Runtime), Profile: profile, PreviousOwnershipID: previous, ProfileFingerprint: sessionworker.NativeProfileFingerprint(spec)}
-	o, err := c.ownershipExchange(ctx, id, transport.MsgNativeOwnershipRegister, p)
+	o, err := c.ownershipExchange(ctx, id, transport.MsgNativeOwnershipRegister, p, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -124,11 +127,14 @@ func (c *NativeObservationConnection) RegisterNativeWorkerOwnership(ctx context.
 
 // RetireNativeWorkerOwnership must commit remotely before the controller asks
 // the private worker to advance its replay floor or replace its ownership.
-func (c *NativeObservationConnection) RetireNativeWorkerOwnership(ctx context.Context, scope sessionworker.Scope, spec sessionworker.NativeSpec, profile string, o transport.NativeWorkerOwnership, floor int64, uncertain []int64, retire bool) (*transport.NativeWorkerOwnership, error) {
+func (c *NativeObservationConnection) RetireNativeWorkerOwnership(ctx context.Context, scope sessionworker.Scope, spec sessionworker.NativeSpec, profile string, o transport.NativeWorkerOwnership, floor int64, uncertain []int64, retire bool, unstartedStop *transport.NativeDispatchProof) (*transport.NativeWorkerOwnership, error) {
 	if err := validateOwnership(scope, spec, profile, &o); err != nil {
 		return nil, err
 	}
 	if floor < o.RetiredFloor || floor > o.LastDispatchSequence || len(uncertain) > 128 {
+		return nil, ErrNativeObservationConflict
+	}
+	if unstartedStop != nil && (unstartedStop.OwnershipID != o.ID || unstartedStop.OwnershipGeneration != scope.Generation || unstartedStop.DispatchSequence <= 0 || unstartedStop.DispatchSequence != floor) {
 		return nil, ErrNativeObservationConflict
 	}
 	previous := floor
@@ -143,8 +149,8 @@ func (c *NativeObservationConnection) RetireNativeWorkerOwnership(ctx context.Co
 		return nil, err
 	}
 	id := domain.NewID().String()
-	p := transport.NativeOwnershipRetirePayload{RequestID: id, OwnershipID: o.ID, OwnershipGeneration: scope.Generation, RetiredDispatchSequence: floor, UncertainDispatchSequences: append([]int64(nil), uncertain...), Retire: retire}
-	result, err := c.ownershipExchange(ctx, id, transport.MsgNativeOwnershipRetire, p)
+	p := transport.NativeOwnershipRetirePayload{UnstartedStop: unstartedStop, RequestID: id, OwnershipID: o.ID, OwnershipGeneration: scope.Generation, RetiredDispatchSequence: floor, UncertainDispatchSequences: append([]int64(nil), uncertain...), Retire: retire}
+	result, err := c.ownershipExchange(ctx, id, transport.MsgNativeOwnershipRetire, p, unstartedStop)
 	if err != nil {
 		return nil, err
 	}

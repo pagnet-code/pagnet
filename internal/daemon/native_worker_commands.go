@@ -53,7 +53,21 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 		return nil, err
 	}
 	floor := ownership.RetiredFloor
+	replay := len(response.Dispatches) > 0 && response.Dispatches[0].Proof.DispatchSequence <= floor
+	if replay {
+		// The private journal may still retain a cloud-committed prefix after
+		// acknowledgement loss. Revalidate its original contiguous evidence;
+		// a higher remote floor alone is never permission to prune locally.
+		floor = response.Dispatches[0].Proof.DispatchSequence - 1
+		if floor < 0 {
+			return nil, ErrNativeObservationConflict
+		}
+	}
+	var stop *sessionworker.NativeDispatchRecord
 	for _, r := range response.Dispatches {
+		if replay && r.Proof.DispatchSequence > ownership.RetiredFloor {
+			break
+		}
 		if r.Proof.OwnershipID != ownership.ID || r.Proof.OwnershipGeneration != p.scope.Generation {
 			return nil, ErrNativeObservationConflict
 		}
@@ -66,8 +80,16 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 			}
 		}
 		floor = r.Proof.DispatchSequence
+		stop = nil
+		if r.Kind == "stop" && r.State == "completed" {
+			copy := r
+			stop = &copy
+		}
 	}
-	if floor == ownership.RetiredFloor {
+	if replay && floor != ownership.RetiredFloor {
+		return nil, ErrNativeOriginAdmissionDeferred
+	}
+	if !replay && floor == ownership.RetiredFloor {
 		return &ownership, nil
 	}
 	// Local completion is not yet permission to retire its original source:
@@ -76,18 +98,38 @@ func (p *NativeWorkerProxy) SettleDispatches(ctx context.Context, ownership tran
 	if _, err = p.call(ctx, sessionworker.Request{Type: "dispatch_retire_check", Sequence: floor}); err != nil {
 		return nil, err
 	}
+	// The authenticated dispatch record retains original outcome kind/state and
+	// source proof after ack removes the operation. Readiness below proves all
+	// source evidence drained before that retained proof may be committed remotely.
+	var unstartedStop *transport.NativeDispatchProof
+	if stop != nil {
+		snapshot, err := p.Snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if snapshot.Scope != p.scope {
+			return nil, ErrNativeObservationConflict
+		}
+		if replay || (!snapshot.IdentityPending && snapshot.PID == 0 && !snapshot.HasTerminal) {
+			proof := stop.Proof
+			unstartedStop = &proof
+		}
+	}
 	// LastDispatchSequence in a replayed register response may lag newer
 	// admissions; exact authenticated local proofs bound this metadata advance.
 	if floor > ownership.LastDispatchSequence {
 		ownership.LastDispatchSequence = floor
 	}
-	updated, err := p.connection.RetireNativeWorkerOwnership(ctx, p.scope, p.bootstrap.Native, ownership.Profile, ownership, floor, nil, false)
+	updated, err := p.connection.RetireNativeWorkerOwnership(ctx, p.scope, p.bootstrap.Native, ownership.Profile, ownership, floor, nil, false, unstartedStop)
 	if err != nil {
 		return nil, err
 	}
 	_, err = p.call(ctx, sessionworker.Request{Type: "dispatch_retire", Sequence: floor})
 	if err != nil {
 		return nil, err
+	}
+	if replay {
+		return p.SettleDispatches(ctx, *updated)
 	}
 	return updated, nil
 }

@@ -88,7 +88,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 			return ErrDeferred
 		}
 		stage = "backend_retirement"
-		retired, err := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, *settled, settled.RetiredFloor, nil, true)
+		retired, err := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, *settled, settled.RetiredFloor, nil, true, nil)
 		if err != nil {
 			return errors.Join(ErrDeferred, err)
 		}
