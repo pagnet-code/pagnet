@@ -40,12 +40,19 @@ type ManagedPeer struct {
 // The returned principal is the exact managed endpoint, not the root owner.
 // Source Admission A is separate lifecycle evidence; no task lineage is guessed.
 type ManagedValidator func(context.Context, ManagedPeer) (fabric.Principal, error)
+
+// OwnerValidator distinguishes a genuine owner process from managed native
+// descendants using trusted current kernel/worker facts. Requested wire mode
+// and absence of managed environment variables cannot establish owner identity.
+// It is mandatory whenever this authority also admits managed processes.
+type OwnerValidator func(context.Context, localpeer.ProcessSnapshot) error
 type Config struct {
 	Root                   registry.AuthorityIdentity
 	RootOwner              fabric.Principal
 	Audience, SocketPath   string
 	CurrentRoot            func(context.Context) (registry.AuthorityIdentity, error)
 	ManagedValidator       ManagedValidator
+	OwnerValidator         OwnerValidator
 	MaxPending             int
 	ProofTTL, CheckTimeout time.Duration
 }
@@ -95,7 +102,7 @@ func New(c Config) (*Authority, error) {
 	if c.CheckTimeout == 0 {
 		c.CheckTimeout = 3 * time.Second
 	}
-	if !validRoot(c.Root) || c.RootOwner != c.Root.Owner || c.Audience != c.Root.Namespace || c.CurrentRoot == nil || !text(c.SocketPath, 4096) || c.MaxPending < 1 || c.MaxPending > 1024 || c.ProofTTL < time.Millisecond || c.ProofTTL > time.Minute || c.CheckTimeout < time.Millisecond || c.CheckTimeout > 30*time.Second {
+	if !validRoot(c.Root) || c.RootOwner != c.Root.Owner || c.Audience != c.Root.Namespace || c.CurrentRoot == nil || c.ManagedValidator != nil && c.OwnerValidator == nil || !text(c.SocketPath, 4096) || c.MaxPending < 1 || c.MaxPending > 1024 || c.ProofTTL < time.Millisecond || c.ProofTTL > time.Minute || c.CheckTimeout < time.Millisecond || c.CheckTimeout > 30*time.Second {
 		return nil, invalid()
 	}
 	c.Root.PublicKey = bytes.Clone(c.Root.PublicKey)
@@ -107,6 +114,12 @@ func (a *Authority) current(ctx context.Context) error {
 		return denied()
 	}
 	return nil
+}
+
+// SupportsManaged reports trusted composition capabilities, never a caller's
+// choice of mode. Hosts must require this before enabling managed resolution.
+func (a *Authority) SupportsManaged() bool {
+	return a != nil && a.config.ManagedValidator != nil && a.config.OwnerValidator != nil
 }
 func (a *Authority) BindOwner(ctx context.Context, conn *net.UnixConn) (*Session, error) {
 	return a.bind(ctx, conn, nil)
@@ -148,7 +161,16 @@ func (s *Session) verify(ctx context.Context) (fabric.Principal, error) {
 		return fabric.Principal{}, denied()
 	}
 	principal := s.authority.config.RootOwner
-	if s.activation != nil {
+	if s.activation == nil {
+		// Recheck on every request as ownership can change after the connection
+		// was established. Configuration mistakes must not elevate a managed peer.
+		if s.authority.config.ManagedValidator != nil && s.authority.config.OwnerValidator == nil {
+			return fabric.Principal{}, denied()
+		}
+		if guard := s.authority.config.OwnerValidator; guard != nil && guard(ctx, current) != nil {
+			return fabric.Principal{}, denied()
+		}
+	} else {
 		activation := *s.activation
 		if localpeer.VerifyOwned(s.conn, activation.RootPID, activation.StartIdentity) != nil {
 			return fabric.Principal{}, denied()

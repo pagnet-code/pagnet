@@ -21,6 +21,9 @@ type NativeAuthorityKind string
 
 const (
 	AuthorityController NativeAuthorityKind = "controller"
+	// Dispatch reservations are domain-wide invocation replay receipts and
+	// physical-worker sequence counters, never endpoint metadata or task state.
+	AuthorityDispatch   NativeAuthorityKind = "dispatch"
 	AuthorityBinding    NativeAuthorityKind = "binding"
 	AuthorityAdmission  NativeAuthorityKind = "admission"
 	AuthorityOrigin     NativeAuthorityKind = "origin"
@@ -30,10 +33,14 @@ const (
 
 func validAuthorityKind(k NativeAuthorityKind) bool {
 	switch k {
-	case AuthorityController, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
+	case AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
 		return true
 	}
 	return false
+}
+
+func globalAuthorityKind(k NativeAuthorityKind) bool {
+	return k == AuthorityController || k == AuthorityDispatch
 }
 
 // AuthorityIdentity is public verification material, never a signing capability.
@@ -77,7 +84,7 @@ func (k AuthorityKey) valid(domain string) bool {
 	if !validAuthorityKind(k.Kind) || !text(k.ID, 256, false) {
 		return false
 	}
-	if k.Kind == AuthorityController {
+	if globalAuthorityKind(k.Kind) {
 		return k.Endpoint.String() == ""
 	}
 	return !k.Endpoint.IsOffer() && k.Endpoint.Domain() == domain && k.Endpoint.String() != ""
@@ -179,7 +186,7 @@ func (a *AuthorityTx) guard() error {
 }
 func (a *AuthorityTx) close() { a.mu.Lock(); a.active = false; a.mu.Unlock() }
 func (a *AuthorityTx) key(k AuthorityKey) error {
-	if !k.valid(a.store.identity.Namespace) || k.Kind != AuthorityController && k.Endpoint != a.scope.Endpoint {
+	if !k.valid(a.store.identity.Namespace) || !globalAuthorityKind(k.Kind) && k.Endpoint != a.scope.Endpoint {
 		return invalid("Native authority key outside declared scope")
 	}
 	return nil

@@ -37,7 +37,7 @@ func (k *AuthorityKey) UnmarshalJSON(raw []byte) error {
 		}
 		next.Endpoint = ref
 	}
-	if !validAuthorityKind(next.Kind) || !text(next.ID, 256, false) || next.Kind == AuthorityController && v.Endpoint != "" || next.Kind != AuthorityController && v.Endpoint == "" {
+	if !validAuthorityKind(next.Kind) || !text(next.ID, 256, false) || globalAuthorityKind(next.Kind) && v.Endpoint != "" || !globalAuthorityKind(next.Kind) && v.Endpoint == "" {
 		return invalid("Malformed native authority key")
 	}
 	*k = next

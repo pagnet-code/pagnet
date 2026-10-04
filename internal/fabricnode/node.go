@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"sync"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -46,6 +47,7 @@ type Node struct {
 	index      *search.Backend
 	reader     node.SearchReader
 	resources  io.Closer
+	directory  string
 	mu         sync.Mutex
 	quarantine error
 	closed     bool
@@ -62,7 +64,11 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if options == (registry.Options{}) {
 		options = registry.DefaultOptions()
 	}
-	store, err := registry.OpenWithOptions(ctx, c.Directory, options)
+	directory, err := filepath.Abs(c.Directory)
+	if err != nil {
+		return nil, err
+	}
+	store, err := registry.OpenWithOptions(ctx, directory, options)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +98,7 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	n := &Node{Store: store, index: index, reader: ports.Search, resources: resources}
+	n := &Node{Store: store, index: index, reader: ports.Search, resources: resources, directory: directory}
 	if n.reader == nil {
 		n.reader = index
 	}
@@ -199,3 +205,7 @@ func (n *Node) Close() error {
 }
 
 var _ node.SearchReader = (*Node)(nil)
+
+// Directory is private trusted host configuration for native sandbox denial.
+// It must never be published in network descriptors, prompts or envelopes.
+func (n *Node) Directory() string { return n.directory }

@@ -384,6 +384,18 @@ func TestActualChildManagedPeerRequiresCurrentSource(t *testing.T) {
 		}
 		return principal, nil
 	}
+	if _, e = a.BindOwner(context.Background(), conn); e == nil {
+		t.Fatal("managed-enabled configuration without owner classification elevated child")
+	}
+	a.config.OwnerValidator = func(ctx context.Context, p localpeer.ProcessSnapshot) error {
+		if ctx.Err() != nil || p.PID == child.Process.Pid {
+			return denied()
+		}
+		return nil
+	}
+	if _, e = a.BindOwner(context.Background(), conn); e == nil {
+		t.Fatal("managed child omitted selectors and became the root owner")
+	}
 	s, e := a.BindManaged(context.Background(), conn, activation)
 	if e != nil {
 		t.Fatal(e)

@@ -50,6 +50,9 @@ func TestRetainedNodeIndexBoundedSyncAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer n.Close()
+	if n.Directory() != dir || !filepath.IsAbs(n.Directory()) {
+		t.Fatal("native sandbox configuration lost the actual retained authority directory")
+	}
 	owner, err := fabric.NewAuthenticatedContext(p, domain, []byte("trusted registration fixture"))
 	if err != nil {
 		t.Fatal(err)
