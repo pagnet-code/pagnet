@@ -25,12 +25,14 @@ func TestPrivateNativeProfileActualRegistryRestartRenewalAndCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	native := sessionworker.NativeSpec{Kind: "local", Runtime: domain.RuntimeFakePersistent, Binary: "/private/bin/native", MCPExecutable: "/private/bin/pagnet", Workspace: "/private/workspace", LocalAuthorityDirectory: directory, LocalFabricSocket: "/private/fabric.sock", Env: []string{"PATH=/usr/bin:/bin", "HOME=/private/workspace", "CUSTOM_PROFILE=private-profile-marker"}, CredentialEnvKeys: []string{"CUSTOM_SECRET"}}
+	private := t.TempDir()
+	workspace := filepath.Join(private, "workspace")
+	native := sessionworker.NativeSpec{Kind: "local", Runtime: domain.RuntimeFakePersistent, Binary: filepath.Join(private, "bin", "native"), MCPExecutable: filepath.Join(private, "bin", "pagnet"), Workspace: workspace, LocalAuthorityDirectory: directory, LocalFabricSocket: filepath.Join(private, "fabric.sock"), Env: []string{"PATH=/usr/bin:/bin", "HOME=" + workspace, "CUSTOM_PROFILE=private-profile-marker"}, CredentialEnvKeys: []string{"CUSTOM_SECRET"}}
 	worker := original.OriginalBinding.Worker
 	worker.ActualRuntime = string(native.Runtime)
 	digest, _ := hex.DecodeString(sessionworker.LocalNativeProfileFingerprint(native))
 	copy(worker.ProfileDigest[:], digest)
-	profile := Profile{Native: native, Worker: worker, Directory: "/private/workers/original"}
+	profile := Profile{Native: native, Worker: worker, Directory: filepath.Join(private, "workers", "original")}
 	scope := registry.DescriptorBatchScope{Endpoint: original.OriginalBinding.Scope.Endpoint, ExpectedEndpointRevision: original.OriginalBinding.Scope.DescriptorRevision, BindingID: "native"}
 	if generation, e := profiles.Put(t.Context(), scope, profile); e != nil || generation != 1 {
 		t.Fatal("private profile commit", generation, e)
@@ -85,7 +87,10 @@ func TestPrivateNativeProfileActualRegistryRestartRenewalAndCAS(t *testing.T) {
 		t.Fatal("wrong key accepted")
 	}
 	for _, name := range []string{"registry.sqlite", "registry.sqlite-journal"} {
-		raw, _ := os.ReadFile(filepath.Join(directory, name))
+		raw, readErr := os.ReadFile(filepath.Join(directory, name))
+		if readErr != nil && !(name == "registry.sqlite-journal" && os.IsNotExist(readErr)) {
+			t.Fatal(readErr)
+		}
 		if bytes.Contains(raw, []byte("must-never-persist")) {
 			t.Fatal("secret appeared on disk")
 		}
