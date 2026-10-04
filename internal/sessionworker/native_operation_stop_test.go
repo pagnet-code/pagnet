@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/e2ee"
+	hostcrypto "github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 func TestStopJoinsEarlierQueuedActivationBeforeDurableCompletion(t *testing.T) {
@@ -90,7 +93,7 @@ type refusedNativeStopDriver struct{ session.Driver }
 
 func (refusedNativeStopDriver) Stop(string) error { return errors.New("fixture original stop refused") }
 
-func testStopAcceptedPrompt(t *testing.T, refuseStop bool) {
+func testStopAcceptedPrompt(t *testing.T, refuseStop bool, invocation ...bool) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +111,20 @@ func testStopAcceptedPrompt(t *testing.T, refuseStop bool) {
 	}
 	defer j.Close()
 	spec := NativeSpec{Runtime: domain.RuntimeFakePersistent, Binary: binary, MCPExecutable: binary, Workspace: t.TempDir(), TenantID: j.scope.TenantID, NetworkTenantID: j.scope.TenantID, NetworkID: domain.NewID().String(), Kind: "worker", Env: []string{"PAGNET_FAKE_INTERACTION=permission"}}
+
+	var invocationSource *transport.NativeInvocationSource
+	if len(invocation) > 0 && invocation[0] {
+		spec.NetworkStateDir = t.TempDir()
+		ring := hostcrypto.NewKeyring(spec.NetworkID)
+		epoch, err := ring.Activate(time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = hostcrypto.SaveKeyring(spec.NetworkStateDir, ring); err != nil {
+			t.Fatal(err)
+		}
+		invocationSource = &transport.NativeInvocationSource{InvocationID: "original-stop-invocation", InputAAD: e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: spec.TenantID, NetworkID: spec.NetworkID, ObjectType: e2ee.ObjectTypeInvocationInput, ObjectID: "original-stop-invocation", KeyEpochID: epoch.ID}}
+	}
 	owner, err := NewSessionOwner(t.Context(), j, spec, bytes.Repeat([]byte{42}, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +139,12 @@ func testStopAcceptedPrompt(t *testing.T, refuseStop bool) {
 	admit := func(sequence int64, kind string) Outcome {
 		t.Helper()
 		command := domain.NewID().String()
-		raw, _ := json.Marshal(Operation{SourceCommandID: command, SourceAdmissionID: a.NativeAdmissionID, InputKind: "user_input", Input: "test original accepted prompt"})
+		op := Operation{SourceCommandID: command, SourceAdmissionID: a.NativeAdmissionID, InputKind: "user_input", Input: "test original accepted prompt"}
+		if kind == "prompt" && invocationSource != nil {
+			op.InputKind = "invocation"
+			op.SourceInvocation = invocationSource
+		}
+		raw, _ := json.Marshal(op)
 		out, run, err := j.admit(t.Context(), current, sequence, command, kind, raw, func() (*Admission, error) { copy := a; return &copy, nil })
 		if err != nil || !run {
 			t.Fatal("original admission", err)

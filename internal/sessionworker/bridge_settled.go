@@ -13,7 +13,7 @@ import (
 // fresh endpoint call; an unavailable or unbound source is not that proof.
 func (o *SessionOwner) forwardBridgeCall(ctx context.Context, call BridgeCall) BridgeResult {
 	result := o.relay.call(ctx, call)
-	if result.OK || result.ErrorCode != "source_settled" || !result.Retryable || len(result.Result) != 0 || call.TurnSource == nil || call.TurnSource.SourceTask != nil || call.TurnSource.InputKind == "task" || o.spec.NetworkID == "" || o.spec.Kind == "representative" || !strings.HasPrefix(call.Tool, "network_") {
+	if result.OK || result.ErrorCode != "source_settled" || !result.Retryable || len(result.Result) != 0 || call.TurnSource == nil || call.TurnSource.SourceTask != nil || call.TurnSource.SourceInvocation != nil || call.TurnSource.InputKind == "task" || o.spec.NetworkID == "" || o.spec.Kind == "representative" || !strings.HasPrefix(call.Tool, "network_") {
 		return result
 	}
 	o.bridgeSourceMu.Lock()
@@ -35,12 +35,12 @@ func (o *SessionOwner) forwardBridgeCall(ctx context.Context, call BridgeCall) B
 
 func (o *SessionOwner) proveCompletedBridgeSource(ctx context.Context, call BridgeCall) error {
 	expected := call.TurnSource
-	if expected == nil || expected.SourceTask != nil || expected.InputKind == "task" || expected.Sequence <= 0 || expected.NativeGeneration != call.NativeGeneration || expected.NativeSessionID != call.NativeSessionID || expected.LogicalTurnID != logicalWorkerTurn(expected.Sequence) || call.Scope != o.journal.scope {
+	if expected == nil || expected.SourceTask != nil || expected.SourceInvocation != nil || expected.InputKind == "task" || expected.Sequence <= 0 || expected.NativeGeneration != call.NativeGeneration || expected.NativeSessionID != call.NativeSessionID || expected.LogicalTurnID != logicalWorkerTurn(expected.Sequence) || call.Scope != o.journal.scope {
 		return ErrConflict
 	}
 	o.mu.Lock()
 	candidate := o.candidateTurnSource
-	valid := !o.closing && o.generation == call.NativeGeneration && bytes.Equal(o.origin, call.Origin) && candidate.Sequence == expected.Sequence && candidate.SourceCommandID == expected.SourceCommandID && candidate.SourceAdmissionID == expected.SourceAdmissionID && candidate.InputKind == expected.InputKind && candidate.SourceTask == nil
+	valid := !o.closing && o.generation == call.NativeGeneration && bytes.Equal(o.origin, call.Origin) && candidate.Sequence == expected.Sequence && candidate.SourceCommandID == expected.SourceCommandID && candidate.SourceAdmissionID == expected.SourceAdmissionID && candidate.InputKind == expected.InputKind && candidate.SourceTask == nil && candidate.SourceInvocation == nil
 	o.mu.Unlock()
 	if !valid {
 		return ErrFenced

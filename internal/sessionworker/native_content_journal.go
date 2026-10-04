@@ -62,8 +62,9 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 	if ref.Purpose == "native_turn_output" || ref.Purpose == "native_turn_plan" {
 		source := observation.TurnSource
 		binding := ref.ManifestAAD.NativeContent
-		if source == nil || source.SourceTask == nil || binding == nil || binding.SourceCommandID != source.SourceCommandID || binding.SourceAdmissionID != source.SourceAdmissionID || binding.LogicalTurnID != source.LogicalTurnID || ref.ManifestAAD.KeyEpochID != source.SourceTask.InputAAD.KeyEpochID || ref.ManifestAAD.NetworkID != source.SourceTask.InputAAD.NetworkID || ref.ManifestAAD.TenantID != source.SourceTask.InputAAD.TenantID || ref.ManifestAAD.Recipient != source.SourceTask.InputAAD.Recipient || !reflect.DeepEqual(ref.ManifestAAD.ProtectedContext, source.SourceTask.InputAAD.ProtectedContext) {
-			return errors.New("encrypted task content differs from accepted original source")
+		aad, valid := sourceContentAAD(source)
+		if !valid || binding == nil || binding.SourceCommandID != source.SourceCommandID || binding.SourceAdmissionID != source.SourceAdmissionID || binding.LogicalTurnID != source.LogicalTurnID || ref.ManifestAAD.KeyEpochID != aad.KeyEpochID || ref.ManifestAAD.NetworkID != aad.NetworkID || ref.ManifestAAD.TenantID != aad.TenantID || ref.ManifestAAD.Recipient != aad.Recipient || !reflect.DeepEqual(ref.ManifestAAD.ProtectedContext, aad.ProtectedContext) {
+			return errors.New("encrypted turn content differs from accepted original source")
 		}
 	} else if ref.SubjectID != observation.InteractionID || ref.SubjectType != "runtime_interaction" {
 		return errors.New("encrypted interaction content differs from original source")

@@ -11,7 +11,7 @@ import (
 // the original accepted operation. Empty legacy sources are never relabelled.
 func ValidNativeInputKind(kind string) bool {
 	switch kind {
-	case "task", "ask", "notice", "status", "wake", "user_input":
+	case "invocation", "task", "ask", "notice", "status", "wake", "user_input":
 		return true
 	default:
 		return false
@@ -49,7 +49,8 @@ func NativeSourceType(o NativeObservation) string {
 	if source == nil || o.SourceUnavailable || o.SourceContentUnavailable || source.Sequence <= 0 || source.LogicalTurnID != fmt.Sprintf("pagnet-worker-turn-%d", source.Sequence) || source.LogicalTurnID != o.Event.TurnID || source.NativeGeneration != o.NativeGeneration || source.NativeSessionID != o.NativeSessionID || source.NativeSessionID != o.Event.SessionID || source.SourceCommandID == "" || source.SourceAdmissionID == "" || !ValidNativeInputKind(source.InputKind) {
 		return ""
 	}
-	if (typ == transport.MsgRuntimeTurnOutput || typ == transport.MsgRuntimeTurnPlan || o.OutputContent != nil) && (source.InputKind != "task" || source.SourceTask == nil) {
+	_, contentSourceValid := sourceContentAAD(source)
+	if (typ == transport.MsgRuntimeTurnOutput || typ == transport.MsgRuntimeTurnPlan || o.OutputContent != nil) && !contentSourceValid {
 		return ""
 	}
 	return typ

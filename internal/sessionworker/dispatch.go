@@ -23,17 +23,35 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		return nil, ErrConflict
 	}
 	p := req.NativeDispatch
+	if p.TaskSource != nil && p.InvocationSource != nil || op.SourceTask != nil && op.SourceInvocation != nil {
+		return nil, ErrConflict
+	}
+	if p.InvocationSource != nil && p.InvocationSource.Validate() != nil {
+		return nil, ErrConflict
+	}
+	if op.SourceInvocation != nil && invocationSourceJSON(op.SourceInvocation) != invocationSourceJSON(p.InvocationSource) {
+		return nil, ErrConflict
+	}
 	if (op.SourceCommandID != "" && op.SourceCommandID != p.SourceCommandID) || (op.SourceAdmissionID != "" && op.SourceAdmissionID != p.SourceAdmissionID) || (op.SourceTask != nil && taskSourceJSON(op.SourceTask) != taskSourceJSON(p.TaskSource)) {
 		return nil, ErrConflict
 	}
 	op.SourceCommandID = p.SourceCommandID
 	op.SourceAdmissionID = p.SourceAdmissionID
 	op.SourceTask = cloneNativeTaskSource(p.TaskSource)
+	op.SourceInvocation = cloneNativeInvocationSource(p.InvocationSource)
 	if req.Kind == "resolve" {
-		if p.TaskSource != nil || ValidateNativeResolveOperation(op) != nil {
+		if p.TaskSource != nil || p.InvocationSource != nil || ValidateNativeResolveOperation(op) != nil {
 			return nil, ErrConflict
 		}
 		return json.Marshal(op)
+	}
+	if op.SourceInvocation != nil {
+		if req.Kind != "prompt" || op.InputKind != "" && op.InputKind != "invocation" {
+			return nil, ErrConflict
+		}
+		op.InputKind = "invocation"
+	} else if op.InputKind == "invocation" {
+		return nil, ErrConflict
 	}
 	if op.SourceTask != nil {
 		op.InputKind = "task"

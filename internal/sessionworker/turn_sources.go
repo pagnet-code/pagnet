@@ -15,14 +15,15 @@ import (
 )
 
 type NativeTurnSource struct {
-	SourceTask        *transport.NativeTaskSource `json:"sourceTask,omitempty"`
-	InputKind         string                      `json:"inputKind,omitempty"`
-	Sequence          int64                       `json:"sequence"`
-	LogicalTurnID     string                      `json:"logicalTurnId"`
-	NativeGeneration  string                      `json:"nativeGeneration"`
-	NativeSessionID   string                      `json:"nativeSessionId"`
-	SourceCommandID   string                      `json:"sourceCommandId,omitempty"`
-	SourceAdmissionID string                      `json:"sourceAdmissionId,omitempty"`
+	SourceInvocation  *transport.NativeInvocationSource `json:"sourceInvocation,omitempty"`
+	SourceTask        *transport.NativeTaskSource       `json:"sourceTask,omitempty"`
+	InputKind         string                            `json:"inputKind,omitempty"`
+	Sequence          int64                             `json:"sequence"`
+	LogicalTurnID     string                            `json:"logicalTurnId"`
+	NativeGeneration  string                            `json:"nativeGeneration"`
+	NativeSessionID   string                            `json:"nativeSessionId"`
+	SourceCommandID   string                            `json:"sourceCommandId,omitempty"`
+	SourceAdmissionID string                            `json:"sourceAdmissionId,omitempty"`
 }
 
 func logicalWorkerTurn(sequence int64) string { return fmt.Sprintf("pagnet-worker-turn-%d", sequence) }
@@ -39,7 +40,7 @@ func (j *Journal) initializeTurnSources() error {
 	if err != nil {
 		return err
 	}
-	hasKind, hasTask, hasStarted := false, false, false
+	hasKind, hasTask, hasStarted, hasInvocation := false, false, false, false
 	for columns.Next() {
 		var cid, notNull, pk int
 		var name, typ string
@@ -47,6 +48,9 @@ func (j *Journal) initializeTurnSources() error {
 		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
 			columns.Close()
 			return err
+		}
+		if name == "source_invocation" {
+			hasInvocation = true
 		}
 		if name == "started" {
 			hasStarted = true
@@ -78,6 +82,11 @@ func (j *Journal) initializeTurnSources() error {
 			return err
 		}
 	}
+	if !hasInvocation {
+		if _, err = j.db.Exec(`ALTER TABLE worker_turn_sources ADD COLUMN source_invocation TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
 	var count int
 	if err := j.db.QueryRow(`SELECT COUNT(*) FROM worker_turn_sources`).Scan(&count); err != nil {
 		return err
@@ -98,6 +107,16 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
+	if source.SourceTask != nil && source.SourceInvocation != nil {
+		return errors.New("native turn has conflicting source authorities")
+	}
+	if source.SourceInvocation != nil && (source.InputKind != "invocation" || source.SourceCommandID == "" || source.SourceAdmissionID == "" || source.SourceInvocation.Validate() != nil) {
+		return errors.New("invalid original invocation source descriptor")
+	}
+	if source.InputKind == "invocation" && source.SourceInvocation == nil {
+		return errors.New("native invocation source is missing")
+	}
+	source.SourceInvocation = cloneNativeInvocationSource(source.SourceInvocation)
 	if source.SourceTask != nil && (source.InputKind != "task" || source.SourceCommandID == "" || source.SourceTask.TaskID == "" || source.SourceTask.InputAAD.ObjectType != e2ee.ObjectTypeTask || source.SourceTask.InputAAD.ObjectID != source.SourceTask.TaskID || source.SourceTask.InputAAD.KeyEpochID == "" || source.SourceTask.InputAAD.NativeContent != nil || source.SourceTask.InputAAD.ValidateScope() != nil) {
 		return errors.New("invalid original task source descriptor")
 	}
@@ -132,7 +151,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	}
 	// A source remains while its original outcome or any original event/choice
 	// still needs it. No current-controller admission is inferred during pruning.
-	_, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE completed=1 AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`)
+	_, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE NOT EXISTS(SELECT 1 FROM worker_invocation_streams s WHERE s.sequence=t.sequence AND s.closed=0) AND completed=1 AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`)
 	if err != nil {
 		return err
 	}
@@ -143,7 +162,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	if count >= maxCommands {
 		return ErrFull
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task) VALUES(?,?,?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID, source.InputKind, taskSourceJSON(source.SourceTask))
+	_, err = tx.ExecContext(ctx, `INSERT INTO worker_turn_sources(sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task,source_invocation) VALUES(?,?,?,?,?,?,?,?,?)`, source.Sequence, source.LogicalTurnID, source.NativeGeneration, source.NativeSessionID, source.SourceCommandID, source.SourceAdmissionID, source.InputKind, taskSourceJSON(source.SourceTask), invocationSourceJSON(source.SourceInvocation))
 	if err != nil {
 		return err
 	}
@@ -155,10 +174,13 @@ func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (N
 
 func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	var task string
-	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task)
+	var task, invocation string
+	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation)
 	if err == nil && task != "" {
 		err = json.Unmarshal([]byte(task), &source.SourceTask)
+	}
+	if err == nil && invocation != "" {
+		err = json.Unmarshal([]byte(invocation), &source.SourceInvocation)
 	}
 	return source, err
 }
@@ -279,15 +301,30 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	source.NativeSessionID = sess.NativeID
 	source.LogicalTurnID = req.TurnID
 	o.pinOriginalTaskContent(source)
-	if source.SourceTask != nil {
+	if source.SourceTask != nil || source.SourceInvocation != nil {
 		if _, available := o.originalTaskContentPin(&source); !available {
 			o.releaseNativeTaskTurnPin(&source)
-			return errors.New("original task crypto authority unavailable")
+			return errors.New("original input crypto authority unavailable")
 		}
 	}
 	if err := o.journal.BindNativeTurn(ctx, source); err != nil {
 		o.releaseNativeTaskTurnPin(&source)
 		return err
+	}
+	if source.SourceInvocation != nil {
+		key, available := o.originalTaskContentPin(&source)
+		if !available {
+			return errors.New("original invocation crypto authority unavailable")
+		}
+		o.mu.Lock()
+		origin := append(json.RawMessage(nil), o.origin...)
+		o.mu.Unlock()
+		err := o.journal.beginInvocationStream(ctx, o.captureKey, source, origin, key)
+		clear(key[:])
+		if err != nil {
+			o.releaseNativeTaskTurnPin(&source)
+			return err
+		}
 	}
 	return d.Driver.Submit(ctx, sess, req, events)
 }
@@ -347,4 +384,48 @@ func (j *Journal) activeNativeBridgeSource(ctx context.Context, generation, sess
 		return nil, ErrConflict
 	}
 	return &source, nil
+}
+
+func cloneNativeInvocationSource(source *transport.NativeInvocationSource) *transport.NativeInvocationSource {
+	if source == nil {
+		return nil
+	}
+	var copy transport.NativeInvocationSource
+	_ = json.Unmarshal([]byte(invocationSourceJSON(source)), &copy)
+	return &copy
+}
+func invocationSourceJSON(source *transport.NativeInvocationSource) string {
+	if source == nil {
+		return ""
+	}
+	encoded, _ := json.Marshal(source)
+	return string(encoded)
+}
+
+// The source kind and full accepted descriptor remain part of a key pin. A
+// completed task cannot become an invocation merely by changing input labels.
+func sourceContentDescriptor(source *NativeTurnSource) string {
+	if source == nil || source.SourceTask != nil && source.SourceInvocation != nil {
+		return ""
+	}
+	if source.SourceInvocation != nil && source.InputKind == "invocation" && source.SourceInvocation.Validate() == nil {
+		return "invocation:" + invocationSourceJSON(source.SourceInvocation)
+	}
+	if source.SourceTask != nil {
+		return taskSourceJSON(source.SourceTask)
+	}
+	return ""
+}
+func sourceContentAAD(source *NativeTurnSource) (e2ee.AAD, bool) {
+	if sourceContentDescriptor(source) == "" || source.SourceTask != nil && source.InputKind != "task" {
+		return e2ee.AAD{}, false
+	}
+	if source.SourceInvocation != nil {
+		return source.SourceInvocation.InputAAD, true
+	}
+	aad := source.SourceTask.InputAAD
+	if source.SourceTask.TaskID == "" || aad.ObjectType != e2ee.ObjectTypeTask || aad.ObjectID != source.SourceTask.TaskID || aad.KeyEpochID == "" || aad.NativeContent != nil || aad.ValidateScope() != nil {
+		return e2ee.AAD{}, false
+	}
+	return aad, true
 }

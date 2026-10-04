@@ -28,6 +28,7 @@ type NativeResolution struct {
 type NativeObservation struct {
 	ResourceInterruption     *transport.NativeResourceInterruption `json:"resourceInterruption,omitempty"`
 	outputProjection         *outputSpoolProjection
+	invocationCaptureKey     []byte
 	OutputStream             *NativeOutputStreamProof          `json:"outputStream,omitempty"`
 	OutputContent            *transport.NativeContentReference `json:"outputContent,omitempty"`
 	PlanContent              *transport.NativeContentReference `json:"planContent,omitempty"`
@@ -217,6 +218,16 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	}
 	if err = allocateSourceSequence(ctx, tx, observation); err != nil {
 		return err
+	}
+	if len(observation.invocationCaptureKey) != 0 {
+		streamObservation := observation
+		err = tx.QueryRowContext(ctx, `SELECT source_sequence FROM worker_observation_sequence WHERE observation_id=?`, observation.ID).Scan(&streamObservation.SourceSequence)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err = j.recordInvocationTerminalTx(ctx, tx, observation.invocationCaptureKey, streamObservation); err != nil {
+			return err
+		}
 	}
 	if err = retainNativeEventSource(ctx, tx, observation); err != nil {
 		return err

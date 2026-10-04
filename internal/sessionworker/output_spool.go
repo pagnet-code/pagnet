@@ -267,6 +267,8 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 	appendDelta := tx.StmtContext(ctx, j.outputDeltaAppend)
 	defer appendDelta.Close()
 	consumed, deltaBytes := 0, 0
+	firstInvocationDelta := result.DeltaCount + 1
+	var invocationDeltas [][]byte
 	for i, event := range events {
 		if len(event.Output) > transport.NativeContentMaxPlaintextBytes-result.NativeBytes {
 			if consumed == 0 {
@@ -301,12 +303,19 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 			clear(result.Key)
 			return nativeOutputSpool{}, 0, err
 		}
+		if source.SourceInvocation != nil {
+			invocationDeltas = append(invocationDeltas, delta)
+		}
 		deltaBytes += len(delta)
 		consumed++
 		// Preserve existing projection and resource-prefix boundaries.
 		if int64(result.NativeBytes)-result.ByteOffset >= nativeOutputBatchBytes {
 			break
 		}
+	}
+	if err := j.captureInvocationDeltasTx(ctx, tx, key, result, firstInvocationDelta, invocationDeltas); err != nil {
+		clear(result.Key)
+		return nativeOutputSpool{}, 0, err
 	}
 	result.LastDeltaID, result.LastDeltaDigest, result.LastCaptureCount = deltaID, deltaDigest, consumed
 	sealed, err := j.outputEncoder.seal(key, j.scope, j.dir, result)
@@ -530,7 +539,7 @@ func (o *SessionOwner) flushNativeOutput(generation string, sequence int64, forc
 		projection := &outputSpoolProjection{Sequence: sequence, Generation: generation, PreviousDigest: hex.EncodeToString(sum[:]), Remaining: remaining}
 		// The original wrapped accepted key restores only output capture capability,
 		// never an input admission or a current-epoch read capability.
-		if data.Source.SourceTask != nil && data.KeyAvailable {
+		if sourceContentDescriptor(&data.Source) != "" && data.KeyAvailable {
 			var key [32]byte
 			copy(key[:], data.Key)
 			o.mu.Lock()
@@ -539,14 +548,14 @@ func (o *SessionOwner) flushNativeOutput(generation string, sequence int64, forc
 			}
 			id := taskPinID(data.Source)
 			pin, found := o.taskContentPins[id]
-			if found && (!pin.available || pin.descriptor != taskSourceJSON(data.Source.SourceTask) || !bytes.Equal(pin.key[:], key[:])) {
+			if found && (!pin.available || pin.descriptor != sourceContentDescriptor(&data.Source) || !bytes.Equal(pin.key[:], key[:])) {
 				o.mu.Unlock()
 				clear(key[:])
 				clear(data.Key)
 				return ErrConflict
 			}
 			if !found {
-				o.taskContentPins[id] = nativeTaskContentPin{descriptor: taskSourceJSON(data.Source.SourceTask), key: key, available: true}
+				o.taskContentPins[id] = nativeTaskContentPin{descriptor: sourceContentDescriptor(&data.Source), key: key, available: true}
 			}
 			o.mu.Unlock()
 			clear(key[:])

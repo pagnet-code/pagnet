@@ -2,7 +2,7 @@ package sessionworker
 
 import "database/sql"
 
-const nativeTurnLookupSQL = `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`
+const nativeTurnLookupSQL = `SELECT sequence,logical_turn,native_generation,native_session,source_command,source_admission,input_kind,source_task,source_invocation FROM worker_turn_sources WHERE native_generation=? AND logical_turn=?`
 const outputSpoolLookupSQL = `SELECT ciphertext,size FROM worker_output_spools WHERE sequence=? AND native_generation=?`
 const outputSpoolReserveSQL = `UPDATE worker_terminal_reservations SET capture_left=capture_left-? WHERE sequence=? AND observation_id='' AND capture_left-?>=?`
 const outputSpoolAppendSQL = `INSERT INTO worker_output_spools(sequence,native_generation,ciphertext,size) VALUES(?,?,?,?) ON CONFLICT(sequence) DO UPDATE SET ciphertext=excluded.ciphertext,size=excluded.size`

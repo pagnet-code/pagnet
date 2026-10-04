@@ -21,7 +21,7 @@ func taskPinID(source NativeTurnSource) string {
 	return source.NativeGeneration + "\x00" + source.LogicalTurnID
 }
 func (o *SessionOwner) pinOriginalTaskContent(source NativeTurnSource) {
-	if source.SourceTask == nil {
+	if source.SourceTask == nil && source.SourceInvocation == nil {
 		return
 	}
 	id := taskPinID(source)
@@ -33,15 +33,24 @@ func (o *SessionOwner) pinOriginalTaskContent(source NativeTurnSource) {
 	if _, exists := o.taskContentPins[id]; exists {
 		return
 	}
-	pin := nativeTaskContentPin{descriptor: taskSourceJSON(source.SourceTask)}
-	aad := source.SourceTask.InputAAD
+	pin := nativeTaskContentPin{descriptor: sourceContentDescriptor(&source)}
+	aad, valid := sourceContentAAD(&source)
+	// Key pinning is object-scoped. Input classification is separately fenced
+	// by dispatch/BindNativeTurn before a native request can consume this pin.
+	if source.SourceTask != nil && source.SourceInvocation == nil {
+		aad, valid = source.SourceTask.InputAAD, true
+	}
+	if !valid {
+		o.taskContentPins[id] = pin
+		return
+	}
 	// Failure is retained as an unavailable source capability: a later epoch
 	// must never silently substitute for the original accepted descriptor.
 	pin.key, pin.available = loadOriginalTaskKey(o.spec, aad)
 	o.taskContentPins[id] = pin
 }
 func loadOriginalTaskKey(spec NativeSpec, aad e2ee.AAD) ([32]byte, bool) {
-	if aad.ObjectType != e2ee.ObjectTypeTask || aad.ObjectID == "" || aad.KeyEpochID == "" || aad.NativeContent != nil || aad.ValidateScope() != nil {
+	if (aad.ObjectType != e2ee.ObjectTypeTask && aad.ObjectType != e2ee.ObjectTypeInvocationInput) || aad.ObjectID == "" || aad.KeyEpochID == "" || aad.NativeContent != nil || aad.ValidateScope() != nil {
 		return [32]byte{}, false
 	}
 	var epoch hostcrypto.KeyEpoch
@@ -76,13 +85,13 @@ func loadOriginalTaskKey(spec NativeSpec, aad e2ee.AAD) ([32]byte, bool) {
 	return key, err == nil
 }
 func (o *SessionOwner) originalTaskContentPin(source *NativeTurnSource) ([32]byte, bool) {
-	if source == nil || source.SourceTask == nil {
+	if source == nil || (source.SourceTask == nil && source.SourceInvocation == nil) {
 		return [32]byte{}, false
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	pin, exists := o.taskContentPins[taskPinID(*source)]
-	return pin.key, exists && pin.available && pin.descriptor == taskSourceJSON(source.SourceTask)
+	return pin.key, exists && pin.available && pin.descriptor == sourceContentDescriptor(source)
 }
 func (o *SessionOwner) releaseNativeTaskPins(generation string) {
 	o.mu.Lock()

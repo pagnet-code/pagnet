@@ -38,6 +38,7 @@ type handshake struct {
 }
 
 type Request struct {
+	InvocationStream *InvocationStreamRequest                      `json:"invocationStream,omitempty"`
 	DeletionProof    *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
 	CancelProposal   *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
 	CancelReceipt    *transport.NativeDispatchCancelledPayload     `json:"cancelReceipt,omitempty"`
@@ -63,20 +64,23 @@ type Request struct {
 }
 
 type Response struct {
-	Cancellation       *DispatchCancellationPreparation `json:"cancellation,omitempty"`
-	SourceDispositions *NativeSourceDispositionPage     `json:"sourceDispositions,omitempty"`
-	Dispatches         []NativeDispatchRecord           `json:"dispatches,omitempty"`
-	Retryable          bool                             `json:"retryable,omitempty"`
-	ObservationPage    *NativeObservationPage           `json:"observationPage,omitempty"`
-	ContentFragment    *transport.NativeContentFragment `json:"contentFragment,omitempty"`
-	Capture            *NativeCaptureChunk              `json:"capture,omitempty"`
-	Activation         *ActivationRequest               `json:"activation,omitempty"`
-	Observations       []NativeObservation              `json:"observations,omitempty"`
-	Snapshot           *NativeSnapshot                  `json:"snapshot,omitempty"`
-	Output             *OutputPage                      `json:"output,omitempty"`
-	Bridge             *BridgeCall                      `json:"bridge,omitempty"`
-	Outcome            *Outcome                         `json:"outcome,omitempty"`
-	Error              string                           `json:"error,omitempty"`
+	InvocationState        *InvocationStreamState           `json:"invocationState,omitempty"`
+	InvocationSubscription *InvocationStreamSubscription    `json:"invocationSubscription,omitempty"`
+	InvocationProjection   *InvocationStreamProjection      `json:"invocationProjection,omitempty"`
+	Cancellation           *DispatchCancellationPreparation `json:"cancellation,omitempty"`
+	SourceDispositions     *NativeSourceDispositionPage     `json:"sourceDispositions,omitempty"`
+	Dispatches             []NativeDispatchRecord           `json:"dispatches,omitempty"`
+	Retryable              bool                             `json:"retryable,omitempty"`
+	ObservationPage        *NativeObservationPage           `json:"observationPage,omitempty"`
+	ContentFragment        *transport.NativeContentFragment `json:"contentFragment,omitempty"`
+	Capture                *NativeCaptureChunk              `json:"capture,omitempty"`
+	Activation             *ActivationRequest               `json:"activation,omitempty"`
+	Observations           []NativeObservation              `json:"observations,omitempty"`
+	Snapshot               *NativeSnapshot                  `json:"snapshot,omitempty"`
+	Output                 *OutputPage                      `json:"output,omitempty"`
+	Bridge                 *BridgeCall                      `json:"bridge,omitempty"`
+	Outcome                *Outcome                         `json:"outcome,omitempty"`
+	Error                  string                           `json:"error,omitempty"`
 }
 
 // IntentExecutor must transfer ownership to the worker lifetime immediately.
@@ -453,6 +457,29 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "invocation_subscribe", "invocation_renew", "invocation_read", "invocation_ack", "invocation_unsubscribe", "invocation_status":
+		if req.InvocationStream == nil {
+			err = ErrConflict
+			break
+		}
+		switch req.Type {
+		case "invocation_status":
+			response.InvocationState, err = o.journal.invocationStreamStatus(ctx, o.captureKey, lease, *req.InvocationStream)
+		case "invocation_subscribe":
+			var sub InvocationStreamSubscription
+			sub, err = o.journal.subscribeInvocationStream(ctx, o.captureKey, lease, *req.InvocationStream)
+			if err == nil {
+				response.InvocationSubscription = &sub
+			}
+		case "invocation_renew":
+			err = o.journal.renewInvocationStream(ctx, lease, *req.InvocationStream)
+		case "invocation_read":
+			response.InvocationProjection, err = o.journal.readInvocationStream(ctx, o.captureKey, lease, *req.InvocationStream)
+		case "invocation_ack":
+			err = o.journal.ackInvocationStream(ctx, o.captureKey, lease, *req.InvocationStream)
+		case "invocation_unsubscribe":
+			err = o.journal.unsubscribeInvocationStream(ctx, o.captureKey, lease, *req.InvocationStream)
+		}
 	case "deletion_quarantines":
 		snapshot := o.Snapshot()
 		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal {

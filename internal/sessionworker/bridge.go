@@ -461,10 +461,10 @@ func (o *SessionOwner) bridgeTurnSourceForSession(ctx context.Context, generatio
 	if err != nil || source == nil {
 		return nil, err
 	}
-	if source.InputKind != "task" {
+	if source.InputKind != "task" && source.InputKind != "invocation" {
 		return source, nil
 	}
-	if source.SourceTask == nil {
+	if sourceContentDescriptor(source) == "" {
 		return nil, ErrConflict
 	}
 	key, available := o.originalTaskContentPin(source)
@@ -473,5 +473,6 @@ func (o *SessionOwner) bridgeTurnSourceForSession(ctx context.Context, generatio
 		return nil, ErrConflict
 	}
 	source.SourceTask = cloneNativeTaskSource(source.SourceTask)
+	source.SourceInvocation = cloneNativeInvocationSource(source.SourceInvocation)
 	return source, nil
 }

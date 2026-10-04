@@ -57,7 +57,7 @@ func validateOwnerStopSettlement(scope Scope, e ownerStopSettlement) error {
 	if err != nil || d.DeleteRequestID == "" || d.StoppedObservationID != o.ID || d.OriginID != wire.OriginID || d.NativeGeneration != o.NativeGeneration || d.NativeSessionID != o.NativeSessionID || d.StoppedDigest != wire.Digest || d.StoppedSourceSequence != o.SourceSequence || d.StoppedDisposition != e.Stopped.Receipt.Disposition || !d.StoppedObservedAt.Equal(wire.ObservedAt) || !d.StoppedExpiresAt.Equal(wire.ExpiresAt) {
 		return ErrConflict
 	}
-	if s.Sequence <= 0 || s.LogicalTurnID != logicalWorkerTurn(s.Sequence) || s.NativeGeneration != o.NativeGeneration || s.NativeSessionID != o.NativeSessionID || !ValidNativeInputKind(s.InputKind) || p.SourceCommandID != s.SourceCommandID || p.SourceAdmissionID != s.SourceAdmissionID || !reflect.DeepEqual(p.TaskSource, s.SourceTask) || p.OwnershipGeneration != scope.Generation || p.OwnershipID == "" || d.StopProof.OwnershipID != p.OwnershipID || d.StopProof.OwnershipGeneration != p.OwnershipGeneration || d.StopProof.DispatchSequence <= p.DispatchSequence {
+	if s.Sequence <= 0 || s.LogicalTurnID != logicalWorkerTurn(s.Sequence) || s.NativeGeneration != o.NativeGeneration || s.NativeSessionID != o.NativeSessionID || !ValidNativeInputKind(s.InputKind) || p.SourceCommandID != s.SourceCommandID || p.SourceAdmissionID != s.SourceAdmissionID || !reflect.DeepEqual(p.TaskSource, s.SourceTask) || !reflect.DeepEqual(p.InvocationSource, s.SourceInvocation) || p.OwnershipGeneration != scope.Generation || p.OwnershipID == "" || d.StopProof.OwnershipID != p.OwnershipID || d.StopProof.OwnershipGeneration != p.OwnershipGeneration || d.StopProof.DispatchSequence <= p.DispatchSequence {
 		return ErrConflict
 	}
 	return nil
@@ -203,7 +203,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 		return ErrConflict
 	}
 	stage = "accepted_turn_binding"
-	rows, err := tx.QueryContext(ctx, `SELECT t.sequence,t.logical_turn,t.native_generation,t.native_session,t.source_command,t.source_admission,t.input_kind,d.proof,a.admission,t.started,t.source_task FROM worker_turn_sources t JOIN worker_intent w ON w.sequence=t.sequence JOIN worker_dispatches d ON d.operation_sequence=t.sequence JOIN worker_intent_admission a ON a.sequence=t.sequence WHERE w.state='uncertain' AND w.kind='prompt' AND t.native_generation=? AND t.native_session=?`, d.NativeGeneration, d.NativeSessionID)
+	rows, err := tx.QueryContext(ctx, `SELECT t.sequence,t.logical_turn,t.native_generation,t.native_session,t.source_command,t.source_admission,t.input_kind,d.proof,a.admission,t.started,t.source_task,t.source_invocation FROM worker_turn_sources t JOIN worker_intent w ON w.sequence=t.sequence JOIN worker_dispatches d ON d.operation_sequence=t.sequence JOIN worker_intent_admission a ON a.sequence=t.sequence WHERE w.state='uncertain' AND w.kind='prompt' AND t.native_generation=? AND t.native_session=?`, d.NativeGeneration, d.NativeSessionID)
 	if err != nil {
 		return err
 	}
@@ -211,14 +211,18 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	for rows.Next() {
 		var e ownerStopSettlement
 		var proofRaw, admissionRaw []byte
-		var task string
+		var task, invocation string
 		var started bool
 		e.Stopped = stopped
 		e.Deletion = *d
 		s := &e.Turn
-		if err = rows.Scan(&s.Sequence, &s.LogicalTurnID, &s.NativeGeneration, &s.NativeSessionID, &s.SourceCommandID, &s.SourceAdmissionID, &s.InputKind, &proofRaw, &admissionRaw, &started, &task); err != nil {
+		if err = rows.Scan(&s.Sequence, &s.LogicalTurnID, &s.NativeGeneration, &s.NativeSessionID, &s.SourceCommandID, &s.SourceAdmissionID, &s.InputKind, &proofRaw, &admissionRaw, &started, &task, &invocation); err != nil {
 			rows.Close()
 			return err
+		}
+		if invocation != "" && json.Unmarshal([]byte(invocation), &s.SourceInvocation) != nil {
+			rows.Close()
+			return ErrConflict
 		}
 		if task != "" && json.Unmarshal([]byte(task), &s.SourceTask) != nil {
 			rows.Close()

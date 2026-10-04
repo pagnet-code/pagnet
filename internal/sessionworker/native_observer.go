@@ -67,7 +67,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		}
 		originalEvent := event
 		var transfers []nativecontent.Transfer
-		observation := NativeObservation{OutputStream: stream, outputProjection: projection, ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
+		observation := NativeObservation{invocationCaptureKey: o.captureKey, OutputStream: stream, outputProjection: projection, ID: uuid.NewString(), NativeGeneration: generation, NativeSessionID: event.SessionID, Origin: origin, ObservedAt: observedAt}
 		source, unavailable, err := o.journal.NativeEventSource(observeCtx, generation, event)
 		if err != nil {
 			return err

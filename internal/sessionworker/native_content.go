@@ -29,7 +29,7 @@ func buildOriginalContent(observation NativeObservation, subjectID, purpose, mim
 	return nativecontent.Build(plain, key, aad, binding, mimeType)
 }
 
-// New task purposes bind the accepted command's admission independently from
+// Turn content binds the accepted task or invocation admission independently from
 // the native origin's birth admission. A later accepted task can use its own
 // original crypto epoch without giving reconnect delivery new authority.
 func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose, mimeType string, plain []byte, key [32]byte) (nativecontent.Transfer, error) {
@@ -37,12 +37,12 @@ func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose
 	var origin struct {
 		ID string `json:"id"`
 	}
-	if source == nil || source.SourceTask == nil || source.InputKind != "task" || source.NativeGeneration != observation.NativeGeneration || source.NativeSessionID != observation.NativeSessionID || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.SourceCommandID == "" || source.SourceAdmissionID == "" || json.Unmarshal(observation.Origin, &origin) != nil || origin.ID == "" || observation.ObservedAt.IsZero() || (purpose != "native_turn_output" && purpose != "native_turn_plan") {
-		return nativecontent.Transfer{}, errors.New("original native task source binding is incomplete")
+	if source == nil || sourceContentDescriptor(source) == "" || source.NativeGeneration != observation.NativeGeneration || source.NativeSessionID != observation.NativeSessionID || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.SourceCommandID == "" || source.SourceAdmissionID == "" || json.Unmarshal(observation.Origin, &origin) != nil || origin.ID == "" || observation.ObservedAt.IsZero() || (purpose != "native_turn_output" && purpose != "native_turn_plan") {
+		return nativecontent.Transfer{}, errors.New("original native turn source binding is incomplete")
 	}
-	aad := source.SourceTask.InputAAD
-	if aad.ObjectType != e2ee.ObjectTypeTask || aad.ObjectID != source.SourceTask.TaskID || aad.NativeContent != nil || aad.ValidateScope() != nil {
-		return nativecontent.Transfer{}, errors.New("original task crypto descriptor is contradictory")
+	aad, valid := sourceContentAAD(source)
+	if !valid || aad.NativeContent != nil || aad.ValidateScope() != nil || source.SourceTask != nil && (aad.ObjectType != e2ee.ObjectTypeTask || aad.ObjectID != source.SourceTask.TaskID) {
+		return nativecontent.Transfer{}, errors.New("original input crypto descriptor is contradictory")
 	}
 	subject := uuid.NewSHA1(uuid.NameSpaceOID, []byte("pagnet-native-turn:"+origin.ID+":"+source.LogicalTurnID)).String()
 	aad.Sender = instanceID
@@ -55,7 +55,7 @@ func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose
 
 func (o *SessionOwner) captureOriginalTaskContent(event session.SessionEvent, observation *NativeObservation) *nativecontent.Transfer {
 	source := observation.TurnSource
-	if source == nil || source.InputKind != "task" {
+	if sourceContentDescriptor(source) == "" {
 		return nil
 	}
 	var plain []byte
