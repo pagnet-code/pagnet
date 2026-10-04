@@ -32,7 +32,11 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 	if err := agentruntime.ValidateExtraEnv(runtimeEnv); err != nil {
 		return err
 	}
-	envRaw, err := json.Marshal(runtimeEnv)
+	// The detached worker has its own deliberately minimal process environment.
+	// Capture the daemon's allowlisted execution environment in this private
+	// memory-only pipe before crossing that boundary, including PATH for CLI
+	// interpreters and provider authentication. Explicit runtime pairs still win.
+	envRaw, err := json.Marshal(agentruntime.ChildEnv(runtimeEnv))
 	if err != nil || len(envRaw) > 128<<10 {
 		return errors.New("native worker environment exceeds bound")
 	}

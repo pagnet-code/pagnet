@@ -440,9 +440,17 @@ func (o *SessionOwner) finish(sequence int64, result any, err error) {
 		if errors.Is(err, session.ErrTurnInterrupted) {
 			state = "uncertain"
 		}
-		result = struct {
-			Error string `json:"error"`
-		}{"native operation failed"}
+		failure := NativeOperationFailure{Error: "native operation failed"}
+		if outcome, readErr := o.journal.Outcome(context.Background(), sequence); readErr == nil && (outcome.Kind == "activate" || outcome.Kind == "attach" || outcome.Kind == "restart") {
+			failure.Code = "native_activation_failed"
+			if errors.Is(err, session.ErrSessionLost) {
+				failure.Code = "native_session_lost"
+			}
+			if errors.Is(err, session.ErrNotMaterialised) {
+				failure.Code = "native_session_not_materialised"
+			}
+		}
+		result = failure
 	}
 	raw, marshalErr := json.Marshal(result)
 	if marshalErr != nil {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -305,7 +306,7 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 		if callErr != nil || response.Outcome == nil || response.Outcome.State == "admitted" {
 			return ErrDeferred
 		}
-		return errors.New("This runtime does not expose an original interactive terminal")
+		return nativeTerminalActivationError(snapshot, *response.Outcome)
 	}
 	// A local live PTY is not yet proof that this fresh remote connection owns
 	// its original session. Commit the exact live source before publishing a key;
@@ -384,6 +385,33 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 	}
 	d.addAttach(p.InstanceID, p.SessionID)
 	return nil
+}
+
+func nativeTerminalActivationError(snapshot sessionworker.NativeSnapshot, outcome sessionworker.Outcome) error {
+	if outcome.State == "admitted" {
+		return ErrDeferred
+	}
+	if outcome.State != "completed" {
+		var failure sessionworker.NativeOperationFailure
+		_ = json.Unmarshal(outcome.Result, &failure)
+		switch failure.Code {
+		case "native_session_lost":
+			return errors.New("The runtime could not resume this session. Check the host runtime and saved conversation before retrying")
+		case "native_session_not_materialised":
+			return errors.New("The original runtime session has no confirmed saved conversation to resume. Check its history before explicitly starting a new session")
+		default:
+			return errors.New("The original runtime could not be started or resumed. Check the agent's activity and host runtime before retrying")
+		}
+	}
+	if snapshot.PID <= 0 || snapshot.NativeSessionID == "" {
+		return errors.New("The original runtime stopped before its terminal was available. Check the agent's activity before retrying")
+	}
+	switch snapshot.ActualRuntime {
+	case domain.RuntimeQwenCode, domain.RuntimeCodex, domain.RuntimeFakePersistent:
+		return errors.New("The original runtime is running but its interactive terminal is unavailable. Check the host runtime before retrying")
+	default:
+		return errors.New("This runtime does not expose an original interactive terminal")
+	}
 }
 func (d *Daemon) nativeTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSnapshotPayload) error {
 	capture, window, err := d.nativeTerminalWindowFor(conn, p.InstanceID, p.SessionID)

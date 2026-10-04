@@ -71,6 +71,21 @@ func TestNativeOwnerStoredSessionRequiresGenuineResume(t *testing.T) {
 	if _, err = owner.driver.Activate(ctx, owner.sess, make(chan session.SessionEvent, 64)); !errors.Is(err, session.ErrSessionLost) {
 		t.Fatalf("missing native history did not fail honestly: %v", err)
 	}
+	// Preserve the observed original resume failure through durable outcome
+	// recovery; a controller must not misclassify it as a headless runtime.
+	activationErr := err
+	if _, _, err = j.Admit(ctx, lease(t, j), 1, "original-resume-attach", "attach", json.RawMessage(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	owner.finish(1, nil, activationErr)
+	outcome, err := j.Outcome(ctx, 1)
+	var failure NativeOperationFailure
+	if err != nil || outcome.State != "failed" || json.Unmarshal(outcome.Result, &failure) != nil || failure.Code != "native_session_lost" || failure.Error != "native operation failed" {
+		t.Fatal("original resume failure classification lost", outcome, err)
+	}
+	if bytes.Contains(outcome.Result, []byte(spec.InitialNativeSessionID)) {
+		t.Fatal("public failure leaked original native session identity")
+	}
 	if owner.driver.Live(j.scope.InstanceID) {
 		t.Fatal("failed resume silently left a fresh runtime running")
 	}
