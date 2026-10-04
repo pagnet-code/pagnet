@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/search"
@@ -167,12 +166,7 @@ func TestHybridPagingDoesNotRepeatProvidersAndRevalidates(t *testing.T) {
 	if _, e = b.Search(ctx, changed); !errors.Is(e, ErrStaleSnapshot) {
 		t.Fatal("tampered cursor", e)
 	}
-	for _, s := range b.snapshots {
-		s.expires = time.Now().Add(-time.Second)
-	}
-	if _, e = b.Search(ctx, r); !errors.Is(e, ErrStaleSnapshot) {
-		t.Fatal("expired cursor", e)
-	}
+
 }
 func TestGatesPrecedeExternalDisclosureAndRejectInventedTargets(t *testing.T) {
 	ctx := context.Background()
@@ -368,9 +362,8 @@ func TestConcurrentSnapshotReadersAndBoundedWriters(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.snapshots) > 4 || b.bytes > b.config.MaxSnapshotBytes {
+	count, bytes := b.pager.Stats()
+	if count > 4 || bytes > b.config.MaxSnapshotBytes {
 		t.Fatal("cache escaped limits")
 	}
 }

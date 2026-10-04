@@ -4,25 +4,22 @@ package hybrid
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"sort"
-	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/search"
+	"github.com/pagnet-code/pagnet/fabric/search/internal/snapshot"
 )
 
-var ErrStaleSnapshot = errors.New("hybrid discovery snapshot expired or its authority/index changed")
+var ErrStaleSnapshot = snapshot.ErrStale
 var ErrProviderResult = errors.New("discovery provider returned invalid or inconsistent bounded candidates")
 
 type Retriever interface {
@@ -67,23 +64,9 @@ type Config struct {
 	// Omitted generates a private ephemeral key. Restart then invalidates cursors.
 	CursorKey []byte
 }
-type snapshot struct {
-	id, binding, scope string
-	policy             fabric.Revision
-	revisions          []fabric.Revision
-	candidates         []fabric.Candidate
-	revision           fabric.Revision
-	expires            time.Time
-	size               int
-	sequence           uint64
-}
 type Backend struct {
-	config    Config
-	key       []byte
-	mu        sync.Mutex
-	snapshots map[string]*snapshot
-	bytes     int
-	sequence  uint64
+	config Config
+	pager  *snapshot.Pager
 }
 
 func New(c Config) (*Backend, error) {
@@ -146,18 +129,12 @@ func New(c Config) (*Backend, error) {
 	if (c.Semantic != nil || c.Reranker != nil) && (c.Lexical.CurrentRevision == nil || c.Semantic != nil && c.Semantic.CurrentRevision == nil) {
 		return nil, errors.New("hybrid paging requires cheap current index revision callbacks")
 	}
-	key := append([]byte(nil), c.CursorKey...)
-	if len(key) == 0 {
-		key = make([]byte, 32)
-		if _, err := rand.Read(key); err != nil {
-			return nil, err
-		}
-	}
-	if len(key) < 32 || len(key) > 4096 {
-		return nil, errors.New("cursor authentication key must contain32..4096 bytes")
+	pager, err := snapshot.New(snapshot.Config{MaxSnapshots: c.MaxSnapshots, MaxBytes: c.MaxSnapshotBytes, TTL: c.SnapshotTTL, Key: c.CursorKey})
+	if err != nil {
+		return nil, err
 	}
 	c.CursorKey = nil
-	return &Backend{config: c, key: key, snapshots: map[string]*snapshot{}}, nil
+	return &Backend{config: c, pager: pager}, nil
 }
 func validProvider(p Provider) bool {
 	return p.ID != "" && len(p.ID) <= 256 && p.Version != "" && len(p.Version) <= 256 && p.Retriever != nil
@@ -378,30 +355,18 @@ func (b *Backend) Search(ctx context.Context, r fabric.DiscoverRequest) (fabric.
 		return fabric.DiscoverResult{}, err
 	}
 	pool = allowed.Candidates
-	s := &snapshot{scope: g.ScopeKey, policy: g.PolicyRevision, revisions: revisions, candidates: clone(pool), expires: time.Now().Add(b.config.SnapshotTTL)}
+	s := snapshot.State{Scope: g.ScopeKey, Policy: g.PolicyRevision, IndexRevisions: revisions, Candidates: clone(pool)}
 	raw, _ := json.Marshal(struct {
 		Revisions []fabric.Revision
 		Pool      []fabric.Candidate
 	}{revisions, pool})
 	hash := sha256.Sum256(raw)
-	s.revision = fabric.Revision("hybrid:" + hex.EncodeToString(hash[:]))
-	s.binding = b.binding(r)
-	s.size = len(raw) + len(s.binding) + len(s.scope) + len(s.policy) + 256
+	s.Revision = fabric.Revision("hybrid:" + hex.EncodeToString(hash[:]))
+	s.Binding = b.binding(r)
 	if err = b.checkRevisions(ctx, s); err != nil {
 		return fabric.DiscoverResult{}, err
 	}
-	if len(pool) <= r.Limit {
-		return fabric.DiscoverResult{Candidates: clone(pool), IndexRevision: s.revision}, ctx.Err()
-	}
-	id := make([]byte, 24)
-	if _, err = rand.Read(id); err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	s.id = base64.RawURLEncoding.EncodeToString(id)
-	if err = b.save(ctx, s); err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	return b.slice(s, 0, r.Limit), ctx.Err()
+	return b.pager.Store(ctx, r, s)
 }
 func fuse(sources [][]fabric.Candidate, weights []float64, k float64, limit int) ([]fabric.Candidate, error) {
 	m := map[string]fabric.Candidate{}
@@ -476,7 +441,7 @@ func rerankerVersion(p *RerankProvider) string {
 	}
 	return p.Version
 }
-func (b *Backend) checkRevisions(ctx context.Context, s *snapshot) error {
+func (b *Backend) checkRevisions(ctx context.Context, s snapshot.State) error {
 	ps := []Provider{b.config.Lexical}
 	if b.config.Semantic != nil {
 		ps = append(ps, *b.config.Semantic)
@@ -489,123 +454,33 @@ func (b *Backend) checkRevisions(ctx context.Context, s *snapshot) error {
 		if err != nil {
 			return err
 		}
-		if current != s.revisions[i] {
+		if current != s.IndexRevisions[i] {
 			return ErrStaleSnapshot
 		}
 	}
 	return ctx.Err()
 }
-func (b *Backend) save(ctx context.Context, s *snapshot) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if s.size > b.config.MaxSnapshotBytes {
-		return errors.New("ranked snapshot exceeds configured byte budget")
-	}
-	now := time.Now()
-	for id, old := range b.snapshots {
-		if !old.expires.After(now) {
-			delete(b.snapshots, id)
-			b.bytes -= old.size
-		}
-	}
-	for len(b.snapshots) >= b.config.MaxSnapshots || b.bytes+s.size > b.config.MaxSnapshotBytes {
-		var oldest *snapshot
-		for _, old := range b.snapshots {
-			if oldest == nil || old.sequence < oldest.sequence {
-				oldest = old
-			}
-		}
-		delete(b.snapshots, oldest.id)
-		b.bytes -= oldest.size
-	}
-	b.sequence++
-	s.sequence = b.sequence
-	b.snapshots[s.id] = s
-	b.bytes += s.size
-	return nil
-}
-
-type cursor struct {
-	Snapshot, Binding, Scope string
-	Policy                   fabric.Revision
-	Offset                   int
-}
-
-func (b *Backend) token(s *snapshot, offset int) string {
-	raw, _ := json.Marshal(cursor{s.id, s.binding, s.scope, s.policy, offset})
-	mac := hmac.New(sha256.New, b.key)
-	_, _ = mac.Write(raw)
-	return base64.RawURLEncoding.EncodeToString(raw) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-}
-func (b *Backend) decode(token string) (cursor, error) {
-	var c cursor
-	if len(token) > 4096 {
-		return c, ErrStaleSnapshot
-	}
-	var left, right string
-	for i, ch := range token {
-		if ch == '.' {
-			left, right = token[:i], token[i+1:]
-			break
-		}
-	}
-	raw, e := base64.RawURLEncoding.DecodeString(left)
-	sig, e2 := base64.RawURLEncoding.DecodeString(right)
-	if e != nil || e2 != nil {
-		return c, ErrStaleSnapshot
-	}
-	mac := hmac.New(sha256.New, b.key)
-	_, _ = mac.Write(raw)
-	if !hmac.Equal(sig, mac.Sum(nil)) || json.Unmarshal(raw, &c) != nil {
-		return c, ErrStaleSnapshot
-	}
-	return c, nil
-}
-func (b *Backend) slice(s *snapshot, offset, limit int) fabric.DiscoverResult {
-	end := offset + limit
-	if end > len(s.candidates) {
-		end = len(s.candidates)
-	}
-	result := fabric.DiscoverResult{Candidates: clone(s.candidates[offset:end]), IndexRevision: s.revision}
-	if end < len(s.candidates) {
-		result.NextCursor = b.token(s, end)
-	}
-	return result
-}
 func (b *Backend) page(ctx context.Context, r fabric.DiscoverRequest) (fabric.DiscoverResult, error) {
-	c, err := b.decode(r.Cursor)
-	if err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	b.mu.Lock()
-	s := b.snapshots[c.Snapshot]
-	b.mu.Unlock()
-	if s == nil || !s.expires.After(time.Now()) || c.Offset < 1 || c.Offset >= len(s.candidates) || c.Binding != s.binding || c.Scope != s.scope || c.Policy != s.policy || b.binding(r) != s.binding {
-		return fabric.DiscoverResult{}, ErrStaleSnapshot
-	}
-	expected := GateResult{ScopeKey: s.scope, PolicyRevision: s.policy}
-	if _, err = b.gate(ctx, r, nil, &expected); err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	if err = b.checkRevisions(ctx, s); err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	result := b.slice(s, c.Offset, r.Limit)
-	allowed, err := b.gate(ctx, r, result.Candidates, &expected)
-	if err != nil {
-		return fabric.DiscoverResult{}, err
-	}
-	if len(allowed.Candidates) != len(result.Candidates) {
-		return fabric.DiscoverResult{}, ErrStaleSnapshot
-	}
-	// Gate may filter or preserve order only; retain the authenticated snapshot order.
-	if _, err = subset(allowed.Candidates, result.Candidates, true); err != nil {
-		return fabric.DiscoverResult{}, ErrStaleSnapshot
-	}
-	return result, ctx.Err()
+	return b.pager.Page(ctx, r, b.binding(r), func(ctx context.Context, r fabric.DiscoverRequest, s snapshot.State, cs []fabric.Candidate) error {
+		expected := GateResult{ScopeKey: s.Scope, PolicyRevision: s.Policy}
+		if _, err := b.gate(ctx, r, nil, &expected); err != nil {
+			return err
+		}
+		if err := b.checkRevisions(ctx, s); err != nil {
+			return err
+		}
+		allowed, err := b.gate(ctx, r, cs, &expected)
+		if err != nil {
+			return err
+		}
+		if len(allowed.Candidates) != len(cs) {
+			return ErrStaleSnapshot
+		}
+		if _, err = subset(allowed.Candidates, cs, true); err != nil {
+			return ErrStaleSnapshot
+		}
+		return nil
+	})
 }
 
 // String reveals only explicitly configured providers, never key/snapshot contents.

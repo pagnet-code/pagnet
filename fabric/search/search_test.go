@@ -580,3 +580,43 @@ func TestIndependentFloatNeighbourParameterOracle(t *testing.T) {
 		equalHits(t, result.Candidates, oracle(docs, r, p, OR))
 	}
 }
+
+func TestExactCurrentAndStagedDocumentAccessors(t *testing.T) {
+	ctx := context.Background()
+	b := newBackend(t)
+	d := doc(1, "common")
+	if err := b.Upsert(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := b.Document(ctx, d.Ref, "r1")
+	if err != nil || !ok {
+		t.Fatal(err)
+	}
+	got.Tags[0] = "modified"
+	again, _, _ := b.Document(ctx, d.Ref, "r1")
+	if again.Tags[0] != "visible" {
+		t.Fatal("accessor leaked mutable tags")
+	}
+	if _, _, err = b.Document(ctx, d.Ref, "r2"); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatal(err)
+	}
+	next := d
+	next.Revision = "r2"
+	p, err := b.Prepare(ctx, Batch{Upserts: []fabric.SearchDocument{next}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, ok, err := p.Document(ctx, d.Ref)
+	if err != nil || !ok || staged.Revision != "r2" {
+		t.Fatal(err)
+	}
+	current, _, _ := b.Document(ctx, d.Ref, "")
+	if current.Revision != "r1" {
+		t.Fatal("staged state was published")
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err = p.Document(cancelCtx, d.Ref); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}

@@ -373,6 +373,38 @@ func (b *Backend) Restore(ctx context.Context, r CommitRecord) error {
 	return b.publish(ctx, p, nil)
 }
 
+// Document returns an isolated exact-current compact document, never a schema.
+func (b *Backend) Document(ctx context.Context, ref fabric.EndpointRef, expected fabric.Revision) (fabric.SearchDocument, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return fabric.SearchDocument{}, false, err
+	}
+	return generationDocument(b.current.Load(), ref, expected)
+}
+
+// Document reads desired staged state without publishing it.
+func (p *Prepared) Document(ctx context.Context, ref fabric.EndpointRef) (fabric.SearchDocument, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return fabric.SearchDocument{}, false, err
+	}
+	if p == nil || p.next == nil {
+		return fabric.SearchDocument{}, false, ErrStaleGeneration
+	}
+	return generationDocument(p.next, ref, "")
+}
+func generationDocument(g *generation, ref fabric.EndpointRef, expected fabric.Revision) (fabric.SearchDocument, bool, error) {
+	if _, err := fabric.ParseEndpointRef(ref.String()); err != nil {
+		return fabric.SearchDocument{}, false, err
+	}
+	e, ok := get(g.refs, ref.String())
+	if !ok || e.value == nil {
+		return fabric.SearchDocument{}, false, nil
+	}
+	if expected != "" && expected != e.revision {
+		return fabric.SearchDocument{}, false, ErrRevisionConflict
+	}
+	return cloneDocument(e.value.doc), true, nil
+}
+
 // IndexRevision reads the current generation without retrieval or model work.
 func (b *Backend) IndexRevision(ctx context.Context) (fabric.Revision, error) {
 	if err := ctx.Err(); err != nil {
