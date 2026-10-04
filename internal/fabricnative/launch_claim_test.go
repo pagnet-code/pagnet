@@ -32,6 +32,10 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	state, e := c.LookupLaunch(t.Context(), scope)
+	if e != nil || state.Exists {
+		t.Fatal("fresh claim invented", e)
+	}
 	ticket, e := c.BeginLaunch(t.Context(), scope, "launch-original")
 	if e != nil {
 		t.Fatal(e)
@@ -83,6 +87,10 @@ func TestLaunchClaimAllowsOneAttemptAndSurvivesActualRootRestart(t *testing.T) {
 	b, e := jsonLocalScope(local)
 	if e != nil {
 		t.Fatal(e)
+	}
+	state, e = reopened.LookupLaunch(t.Context(), b)
+	if e != nil || !state.Exists || state.Ownership != scope || state.Observed != nil {
+		t.Fatal("retained claim lost original ownership", e)
 	}
 	if _, e = reopened.BeginLaunch(t.Context(), b, "launch-renamed"); e == nil {
 		t.Fatal("descriptor renewal reminted launch permit")

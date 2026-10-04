@@ -62,3 +62,24 @@ func TestRetainedNativeControlPreservesPartialTakeoverAcrossRegistryRestart(t *t
 		t.Fatal(err)
 	}
 }
+
+func TestRetainedNativeControlStatePreservesProvisioningBoundary(t *testing.T) {
+	f := fixture(t)
+	state, err := f.a.RetainedNativeControlState(t.Context(), f.owner, f.scope)
+	if err != nil || state.Controller != nil || state.Binding != nil {
+		t.Fatal("fresh state was invented", err)
+	}
+	controller := f.controller(t, 0, "initial")
+	state, err = f.a.RetainedNativeControlState(t.Context(), f.owner, f.scope)
+	if err != nil || state.Controller == nil || state.Controller.Proof.Revision != controller.Proof.Revision || state.Binding != nil {
+		t.Fatal("partial provisioning lost", err)
+	}
+	if _, _, err = f.a.RetainedNativeControl(t.Context(), f.owner, f.scope); err == nil {
+		t.Fatal("partial provisioning treated as complete")
+	}
+	original := f.binding(t, controller)
+	state, err = f.a.RetainedNativeControlState(t.Context(), f.owner, f.scope)
+	if err != nil || state.Binding == nil || state.Binding.Worker != original.Worker {
+		t.Fatal("physical binding lost", err)
+	}
+}

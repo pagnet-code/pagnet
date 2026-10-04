@@ -24,6 +24,56 @@ type launchClaim struct {
 	Process   *localpeer.ProcessSnapshot `json:"process,omitempty"`
 }
 
+// LaunchState is retained infrastructure history, never process liveness.
+// Only actual authenticated worker IPC/kernel observation can establish that.
+type LaunchState struct {
+	Exists    bool
+	Ownership nativeauthority.Scope
+	Observed  *localpeer.ProcessSnapshot
+}
+
+func (c *Checkpoints) LookupLaunch(ctx context.Context, physical nativeauthority.Scope) (LaunchState, error) {
+	if c == nil || ctx == nil {
+		return LaunchState{}, checkpointDenied()
+	}
+	local, ok := physical.Local()
+	if !ok || local.Namespace != c.root.Namespace || local.StoreID != c.root.StoreID || local.Owner != c.root.Owner {
+		return LaunchState{}, checkpointDenied()
+	}
+	key, err := launchClaimKey(physical)
+	if err != nil {
+		return LaunchState{}, err
+	}
+	var state LaunchState
+	err = c.store.WithNativeAuthority(ctx, c.owner, registry.AuthorityScope{}, func(tx *registry.AuthorityTx) error {
+		record, err := tx.Get(key)
+		if err != nil {
+			var missing *fabric.Error
+			if errors.As(err, &missing) && missing.Code == fabric.CodeNotFound {
+				return nil
+			}
+			return err
+		}
+		var claim launchClaim
+		if record.Retired || decodeCheckpoint(record.Value, &claim) != nil || claim.Version != "pagnet.native.launch-claim.v1" || claim.Ownership.Validate() != nil || !claim.Ownership.SamePhysical(physical) || claim.Attempt == "" || len(claim.Attempt) > 256 || !utf8.ValidString(claim.Attempt) {
+			return checkpointDenied()
+		}
+		if claim.Phase != "launching" && claim.Phase != "observed" || claim.Phase == "launching" && claim.Process != nil || claim.Phase == "observed" && (claim.Process == nil || claim.Process.PID <= 0 || claim.Process.Start <= 0) {
+			return checkpointDenied()
+		}
+		state = LaunchState{Exists: true, Ownership: claim.Ownership}
+		if claim.Process != nil {
+			process := *claim.Process
+			state.Observed = &process
+		}
+		return nil
+	})
+	if err != nil {
+		return LaunchState{}, err
+	}
+	return state, nil
+}
+
 // LaunchTicket permits one local launch attempt after the real FULL claim.
 // Neither a lost reply nor a failed spawn erases its retained uncertainty.
 // Launching an idle worker grants no native effect authority; native intent
