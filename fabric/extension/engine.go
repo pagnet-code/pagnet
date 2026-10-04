@@ -298,17 +298,22 @@ func (e *Engine) call(ctx context.Context, r CompiledRegistration, request Inter
 	if ctx.Err() != nil {
 		return Decision{}, ctx.Err()
 	}
-	if err == nil {
-		err = ValidateDecision(request, decision, started, time.Now())
-	}
 	if err != nil {
-		if r.Registration.FailureMode == FailOpen {
+		// Availability policy never licenses corrupt control messages, invalid
+		// mutations or forged routing. Fail-open applies only to a timeout or an
+		// explicitly classified binding outage, before any decision is accepted.
+		var structured *fabric.Error
+		unavailable := errors.Is(err, context.DeadlineExceeded) || errors.As(err, &structured) && structured.Code == fabric.CodeTargetUnavailable
+		if r.Registration.FailureMode == FailOpen && unavailable {
 			return Decision{Action: Continue}, nil
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return Decision{}, fabric.NewError(fabric.CodeInterceptorTimeout, "Interceptor timed out")
 		}
 		return Decision{}, fabric.NewError(fabric.CodeProtocolError, "Interceptor failed")
+	}
+	if err := ValidateDecision(request, decision, started, time.Now()); err != nil {
+		return Decision{}, err
 	}
 	return decision, nil
 }

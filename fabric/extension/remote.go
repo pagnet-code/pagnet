@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -94,9 +95,12 @@ func (h *HTTPHandler) Intercept(ctx context.Context, request InterceptRequest) (
 		if ctx.Err() != nil {
 			return Decision{}, ctx.Err()
 		}
-		return failure()
+		return Decision{}, fabric.NewError(fabric.CodeTargetUnavailable, "Remote interceptor unavailable")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+		return Decision{}, fabric.NewError(fabric.CodeTargetUnavailable, "Remote interceptor unavailable")
+	}
 	if resp.StatusCode != http.StatusOK || resp.ContentLength > int64(MaxInterceptBytes) {
 		return failure()
 	}
@@ -176,7 +180,12 @@ func (x *Executor) Call(ctx context.Context, registration CompiledRegistration, 
 			answer.decision, answer.err = handler.Intercept(lifetime, isolated)
 		}()
 		if answer.err != nil && lifetime.Err() == nil {
-			answer.err = fabric.NewError(fabric.CodeProtocolError, "Interceptor failed")
+			var classified *fabric.Error
+			if errors.As(answer.err, &classified) && classified.Code == fabric.CodeTargetUnavailable {
+				answer.err = fabric.NewError(fabric.CodeTargetUnavailable, "Interceptor unavailable")
+			} else {
+				answer.err = fabric.NewError(fabric.CodeProtocolError, "Interceptor failed")
+			}
 		}
 		// Own the returned data before the handler can reuse its buffers. Local
 		// extensions are trusted code; remote response bytes remain untrusted.
