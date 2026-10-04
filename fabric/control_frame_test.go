@@ -8,7 +8,7 @@ import (
 
 func controlFixture(t *testing.T) ControlFrame {
 	f := forwardFixture(t)
-	return ControlFrame{ProtocolVersion: "1", SourceDomain: f.SourceDomain, SourceStoreID: f.SourceStoreID, SourceKeyRevision: f.SourceKeyRevision, DestinationDomain: f.DestinationDomain, DestinationStoreID: f.DestinationStoreID, SourcePeerBindingDigest: f.SourcePeerBindingDigest, DestinationPeerBindingDigest: f.DestinationPeerBindingDigest, Principal: f.Principal, InvocationID: f.InvocationID, ReceiptDigest: f.OriginalEnvelopeDigest, AttemptID: "original-attempt", Action: "pull", PayloadDigest: f.ForwardedEnvelopeDigest, ReplayID: "fresh-control", IssuedAt: f.IssuedAt, ExpiresAt: "2026-10-04T22:00:30Z", BindingProfile: ForwardBindingProfile}
+	return ControlFrame{ProtocolVersion: "1", SourceDomain: f.SourceDomain, SourceStoreID: f.SourceStoreID, SourceKeyRevision: f.SourceKeyRevision, DestinationDomain: f.DestinationDomain, DestinationStoreID: f.DestinationStoreID, SourcePeerBindingDigest: f.SourcePeerBindingDigest, DestinationPeerBindingDigest: f.DestinationPeerBindingDigest, Principal: f.Principal, OriginalPrincipal: f.Principal, InvocationID: f.InvocationID, ReceiptDigest: f.OriginalEnvelopeDigest, AttemptID: "original-attempt", Action: "pull", PayloadDigest: f.ForwardedEnvelopeDigest, ReplayID: "fresh-control", IssuedAt: f.IssuedAt, ExpiresAt: "2026-10-04T22:00:30Z", BindingProfile: ForwardBindingProfile}
 }
 func TestControlFrameBindsCurrentCallerReceiptAndExactOperation(t *testing.T) {
 	f := controlFixture(t)

@@ -16,6 +16,7 @@ type ControlFrame struct {
 	DestinationStoreID           string    `json:"destinationStoreId"`
 	SourcePeerBindingDigest      [32]byte  `json:"sourcePeerBindingDigest"`
 	DestinationPeerBindingDigest [32]byte  `json:"destinationPeerBindingDigest"`
+	OriginalPrincipal            Principal `json:"originalPrincipal"`
 	Principal                    Principal `json:"principal"`
 	InvocationID                 string    `json:"invocationId"`
 	ReceiptDigest                [32]byte  `json:"receiptDigest"`
@@ -34,7 +35,7 @@ type SignedControlProof struct {
 }
 
 func (f ControlFrame) SigningBytes() ([]byte, error) {
-	if f.ProtocolVersion != "1" || !canonicalDomainNamespace(f.SourceDomain) || !canonicalDomainNamespace(f.DestinationDomain) || f.SourceDomain == f.DestinationDomain || !forwardStoreID(f.SourceStoreID) || !forwardStoreID(f.DestinationStoreID) || f.SourceKeyRevision == 0 || f.SourcePeerBindingDigest == ([32]byte{}) || f.DestinationPeerBindingDigest == ([32]byte{}) || f.ReceiptDigest == ([32]byte{}) || f.PayloadDigest == ([32]byte{}) || !validSigningText(f.Principal.Ref, false) || !validSigningText(f.Principal.Issuer, false) || !ValidNamespacedName(f.Principal.Kind) || !validSigningText(f.InvocationID, false) || !validSigningText(f.ReplayID, false) || !validSigningText(f.AttemptID, true) || f.BindingProfile != ForwardBindingProfile {
+	if f.ProtocolVersion != "1" || !canonicalDomainNamespace(f.SourceDomain) || !canonicalDomainNamespace(f.DestinationDomain) || f.SourceDomain == f.DestinationDomain || !forwardStoreID(f.SourceStoreID) || !forwardStoreID(f.DestinationStoreID) || f.SourceKeyRevision == 0 || f.SourcePeerBindingDigest == ([32]byte{}) || f.DestinationPeerBindingDigest == ([32]byte{}) || f.ReceiptDigest == ([32]byte{}) || f.PayloadDigest == ([32]byte{}) || !validSigningText(f.OriginalPrincipal.Ref, false) || !validSigningText(f.OriginalPrincipal.Issuer, false) || !ValidNamespacedName(f.OriginalPrincipal.Kind) || !validSigningText(f.Principal.Ref, false) || !validSigningText(f.Principal.Issuer, false) || !ValidNamespacedName(f.Principal.Kind) || !validSigningText(f.InvocationID, false) || !validSigningText(f.ReplayID, false) || !validSigningText(f.AttemptID, true) || f.BindingProfile != ForwardBindingProfile {
 		return nil, referenceInputError("invalid control signing fields")
 	}
 	switch f.Action {
@@ -54,5 +55,5 @@ func (f ControlFrame) SigningBytes() ([]byte, error) {
 	if !expires.After(issued) || expires.Sub(issued) > 30*time.Second {
 		return nil, referenceInputError("unbounded control validity")
 	}
-	return encodeSigningFields(ControlSigningPurpose, []byte(f.ProtocolVersion), []byte(f.SourceDomain), []byte(f.SourceStoreID), signingCounter(f.SourceKeyRevision), []byte(f.DestinationDomain), []byte(f.DestinationStoreID), f.SourcePeerBindingDigest[:], f.DestinationPeerBindingDigest[:], []byte(f.Principal.Ref), []byte(f.Principal.Kind), []byte(f.Principal.Issuer), []byte(f.InvocationID), f.ReceiptDigest[:], []byte(f.AttemptID), []byte(f.Action), f.PayloadDigest[:], []byte(f.ReplayID), []byte(f.IssuedAt), []byte(f.ExpiresAt), []byte(f.BindingProfile))
+	return encodeSigningFields(ControlSigningPurpose, []byte(f.ProtocolVersion), []byte(f.SourceDomain), []byte(f.SourceStoreID), signingCounter(f.SourceKeyRevision), []byte(f.DestinationDomain), []byte(f.DestinationStoreID), f.SourcePeerBindingDigest[:], f.DestinationPeerBindingDigest[:], []byte(f.Principal.Ref), []byte(f.Principal.Kind), []byte(f.Principal.Issuer), []byte(f.OriginalPrincipal.Ref), []byte(f.OriginalPrincipal.Kind), []byte(f.OriginalPrincipal.Issuer), []byte(f.InvocationID), f.ReceiptDigest[:], []byte(f.AttemptID), []byte(f.Action), f.PayloadDigest[:], []byte(f.ReplayID), []byte(f.IssuedAt), []byte(f.ExpiresAt), []byte(f.BindingProfile))
 }

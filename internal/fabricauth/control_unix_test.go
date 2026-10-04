@@ -24,7 +24,7 @@ func TestControlAuthenticatesActualCurrentKernelSession(t *testing.T) {
 	payload := []byte(`{"credit":1}`)
 	digest := sha256.Sum256(payload)
 	now := time.Now().UTC()
-	f := fabric.ControlFrame{ProtocolVersion: "1", SourceDomain: root.Namespace, SourceStoreID: root.StoreID, SourceKeyRevision: root.KeyRevision, DestinationDomain: dest.Namespace, DestinationStoreID: dest.StoreID, SourcePeerBindingDigest: digest, DestinationPeerBindingDigest: digest, Principal: root.Owner, InvocationID: "original", ReceiptDigest: digest, AttemptID: "original-attempt", Action: "pull", PayloadDigest: digest, ReplayID: "fresh-control", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(30 * time.Second).Format(time.RFC3339Nano), BindingProfile: fabric.ForwardBindingProfile}
+	f := fabric.ControlFrame{ProtocolVersion: "1", SourceDomain: root.Namespace, SourceStoreID: root.StoreID, SourceKeyRevision: root.KeyRevision, DestinationDomain: dest.Namespace, DestinationStoreID: dest.StoreID, SourcePeerBindingDigest: digest, DestinationPeerBindingDigest: digest, Principal: root.Owner, OriginalPrincipal: root.Owner, InvocationID: "original", ReceiptDigest: digest, AttemptID: "original-attempt", Action: "pull", PayloadDigest: digest, ReplayID: "fresh-control", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(30 * time.Second).Format(time.RFC3339Nano), BindingProfile: fabric.ForwardBindingProfile}
 	called := 0
 	callback := func(ctx context.Context, c fabric.ExecutionContext) error {
 		called++

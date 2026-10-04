@@ -19,7 +19,7 @@ func TestActualRootControlSignerRequiresFreshExactControlAuthentication(t *testi
 	s, owner, historical, _, _, f := actualForwardFixture(t)
 	payload := []byte(`{"credit":1}`)
 	now := time.Now().UTC()
-	frame := fabric.ControlFrame{ProtocolVersion: "1", SourceDomain: f.SourceDomain, SourceStoreID: f.SourceStoreID, SourceKeyRevision: f.SourceKeyRevision, DestinationDomain: f.DestinationDomain, DestinationStoreID: f.DestinationStoreID, SourcePeerBindingDigest: f.SourcePeerBindingDigest, DestinationPeerBindingDigest: f.DestinationPeerBindingDigest, Principal: f.Principal, InvocationID: f.InvocationID, ReceiptDigest: f.OriginalEnvelopeDigest, AttemptID: "actual-attempt", Action: "pull", PayloadDigest: sha256.Sum256(payload), ReplayID: "fresh-control", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(30 * time.Second).Format(time.RFC3339Nano), BindingProfile: fabric.ForwardBindingProfile}
+	frame := fabric.ControlFrame{ProtocolVersion: "1", SourceDomain: f.SourceDomain, SourceStoreID: f.SourceStoreID, SourceKeyRevision: f.SourceKeyRevision, DestinationDomain: f.DestinationDomain, DestinationStoreID: f.DestinationStoreID, SourcePeerBindingDigest: f.SourcePeerBindingDigest, DestinationPeerBindingDigest: f.DestinationPeerBindingDigest, Principal: f.Principal, OriginalPrincipal: f.Principal, InvocationID: f.InvocationID, ReceiptDigest: f.OriginalEnvelopeDigest, AttemptID: "actual-attempt", Action: "pull", PayloadDigest: sha256.Sum256(payload), ReplayID: "fresh-control", IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(30 * time.Second).Format(time.RFC3339Nano), BindingProfile: fabric.ForwardBindingProfile}
 	raw, err := frame.SigningBytes()
 	if err != nil {
 		t.Fatal(err)
