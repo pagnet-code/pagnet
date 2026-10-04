@@ -129,3 +129,63 @@ func (a *Authority) BindWorker(ctx context.Context, owner fabric.ExecutionContex
 	}
 	return result, nil
 }
+
+// RenewWorkerBinding explicitly updates descriptor authorization for the SAME
+// physical worker. It preserves its worker/state directory/generation/runtime /
+// profile identity. Original binding proofs/capture scope remain unchanged; the
+// new signed CAS proves current descriptor authorization for subsequent work.
+func (a *Authority) RenewWorkerBinding(ctx context.Context, owner fabric.ExecutionContext, c Controller, original Binding) (Binding, error) {
+	var result Binding
+	if c.Scope.Endpoint != original.Scope.Endpoint || c.Scope.BindingID != original.Scope.BindingID {
+		return result, invalid("Physical binding renewal endpoint or binding identity changed")
+	}
+	e := a.transact(ctx, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+		if e := a.currentController(tx, c); e != nil {
+			return e
+		}
+		if e := a.currentBinding(tx, original); e != nil {
+			// Recover the exact previous CAS after a lost acknowledgement. An old
+			// signed proof is provenance only; it cannot authorize a further CAS.
+			if original.Proof.Retired || original.Proof.Key != bindingKey(original.Scope) || registry.VerifyAuthorityRecord(a.root, original.Proof) != nil {
+				return e
+			}
+			var previous Binding
+			if decodeValue(original.Proof, &previous) != nil {
+				return e
+			}
+			previous.Proof = original.Proof
+			one, _ := digest(previous)
+			two, _ := digest(original)
+			if one != two {
+				return e
+			}
+			current, readErr := tx.Get(bindingKey(c.Scope))
+			if readErr != nil || current.Retired || registry.VerifyAuthorityRecord(a.root, current) != nil || current.Revision != original.Proof.Revision+1 {
+				return e
+			}
+			var recovered Binding
+			if decodeValue(current, &recovered) != nil || recovered.Scope != c.Scope || recovered.Worker != original.Worker {
+				return e
+			}
+			recovered.Proof = current
+			result = recovered
+			return nil
+		}
+		if original.Scope == c.Scope {
+			result = original
+			return nil
+		}
+		result = Binding{Scope: c.Scope, Worker: original.Worker}
+		raw, e := storedValue(result)
+		if e != nil {
+			return e
+		}
+		proof, e := tx.CAS(bindingKey(c.Scope), original.Proof.Revision, raw, false)
+		result.Proof = proof
+		return e
+	})
+	if e != nil {
+		return Binding{}, e
+	}
+	return result, nil
+}

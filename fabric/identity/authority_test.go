@@ -392,3 +392,81 @@ func TestOfflinePanickingFenceClosesCapturedCallback(t *testing.T) {
 		t.Fatal("panicking fence retained executable callback")
 	}
 }
+
+func TestOfflineDescriptorRenameRenewsSamePhysicalBindingWithoutOldRevisionActuation(t *testing.T) {
+	f := fixture(t)
+	ctx := context.Background()
+	controlA := f.controller(t, 0, "A")
+	bindingA := f.binding(t, controlA)
+	caller, original, final := f.invocation(t)
+	sourceA, e := f.a.Admit(ctx, f.owner, controlA, bindingA, caller, original, final, "source-A", "attempt-A", "replay-A")
+	if e != nil {
+		t.Fatal(e)
+	}
+	originA, e := f.a.RegisterOrigin(ctx, f.owner, controlA, bindingA, sourceA, caller, original, final, "origin-A", "native-generation-A")
+	if e != nil {
+		t.Fatal(e)
+	}
+	descriptor, e := f.store.GetEndpoint(ctx, f.scope.Endpoint, f.scope.DescriptorRevision)
+	if e != nil {
+		t.Fatal(e)
+	}
+	descriptor.Name = "Renamed native endpoint"
+	descriptor.Revision = ""
+	revisionB, e := f.store.Update(ctx, f.owner, fabric.RegistryUpdate{Descriptor: descriptor, ExpectedRevision: f.scope.DescriptorRevision})
+	if e != nil {
+		t.Fatal(e)
+	}
+	originalScope := f.scope
+	f.scope.DescriptorRevision = revisionB
+	controlB := f.controller(t, controlA.Epoch(), "B")
+	bindingB, e := f.a.RenewWorkerBinding(ctx, f.owner, controlB, bindingA)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if bindingB.Worker != bindingA.Worker || bindingB.Proof.Revision != bindingA.Proof.Revision+1 || bindingB.Scope.BindingID != bindingA.Scope.BindingID {
+		t.Fatal("rename changed physical worker ownership")
+	}
+	readback, e := f.a.RenewWorkerBinding(ctx, f.owner, controlB, bindingA)
+	if e != nil || readback.Proof.Sequence != bindingB.Proof.Sequence {
+		t.Fatal("ambiguous binding renewal advanced physical authority", e)
+	}
+	unchanged, e := f.a.RenewWorkerBinding(ctx, f.owner, controlB, bindingB)
+	if e != nil || unchanged.Proof.Sequence != bindingB.Proof.Sequence {
+		t.Fatal("unchanged binding invented a new revision", e)
+	}
+	forged := bindingA
+	forged.Worker.WorkerID = "different-worker"
+	if _, e = f.a.RenewWorkerBinding(ctx, f.owner, controlB, forged); e == nil {
+		t.Fatal("forged historical binding acquired current authority")
+	}
+	if _, e = f.a.Admit(ctx, f.owner, controlA, bindingA, caller, original, final, "stale-source", "attempt", "replay"); e == nil {
+		t.Fatal("old expected descriptor revision executed new work")
+	}
+	freshCaller, freshOriginal, freshFinal := f.invocation(t)
+	sourceB, e := f.a.Admit(ctx, f.owner, controlB, bindingB, freshCaller, freshOriginal, freshFinal, "source-B", "attempt-B", "replay-B")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if sourceB.Scope.DescriptorRevision != revisionB || sourceA.Scope.DescriptorRevision != originalScope.DescriptorRevision {
+		t.Fatal("original or current source revision rewritten")
+	}
+	receipt, e := f.a.CommitSource(ctx, f.owner, originA, SourceOutcome{OriginID: originA.ID, NativeGeneration: originA.NativeGeneration, NativeSessionID: "actual-native-session-A", SourceID: "complete-A", CiphertextCommitment: sha256.Sum256([]byte("encrypted complete original source")), Effect: fabric.EffectCompleted})
+	if e != nil {
+		t.Fatal("original A history stranded by rename", e)
+	}
+	f.store.Close()
+	s, e := registry.Open(ctx, f.dir)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	a, e := New(s, f.fence)
+	if e != nil {
+		t.Fatal(e)
+	}
+	exact, e := a.CommitSource(ctx, f.owner, originA, SourceOutcome{OriginID: originA.ID, NativeGeneration: originA.NativeGeneration, NativeSessionID: "actual-native-session-A", SourceID: "complete-A", CiphertextCommitment: sha256.Sum256([]byte("encrypted complete original source")), Effect: fabric.EffectCompleted})
+	if e != nil || exact.Sequence != receipt.Sequence {
+		t.Fatal("restart lost original A receipt after rename", e)
+	}
+}
