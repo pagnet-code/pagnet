@@ -42,6 +42,8 @@ func (a *Authority) FenceNativeControl(ctx context.Context, owner fabric.Executi
 	var mu sync.Mutex
 	active := true
 	calls := 0
+	var callbackError error
+	misused := false
 	defer func() {
 		mu.Lock()
 		active = false
@@ -54,10 +56,11 @@ func (a *Authority) FenceNativeControl(ctx context.Context, owner fabric.Executi
 		mu.Lock()
 		defer mu.Unlock()
 		if !active || calls != 0 {
+			misused = true
 			return invalid("Native control fence callback closed or reused")
 		}
 		calls++
-		return a.transact(lifetime, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+		callbackError = a.transact(lifetime, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
 			if e := a.currentController(tx, c); e != nil {
 				return e
 			}
@@ -66,10 +69,14 @@ func (a *Authority) FenceNativeControl(ctx context.Context, owner fabric.Executi
 			}
 			return ack(lifetime)
 		})
+		return callbackError
 	})
 	mu.Lock()
 	active = false
-	if err == nil && calls != 1 {
+	if err == nil && callbackError != nil {
+		err = callbackError
+	}
+	if err == nil && (calls != 1 || misused) {
 		err = invalid("Native control fence did not authorize ACK")
 	}
 	mu.Unlock()

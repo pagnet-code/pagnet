@@ -101,6 +101,8 @@ func (a *Authority) FenceCurrentNativeOrigin(ctx context.Context, owner fabric.E
 	var mu sync.Mutex
 	active := true
 	calls := 0
+	var callbackError error
+	misused := false
 	defer func() {
 		mu.Lock()
 		active = false
@@ -113,10 +115,11 @@ func (a *Authority) FenceCurrentNativeOrigin(ctx context.Context, owner fabric.E
 		mu.Lock()
 		defer mu.Unlock()
 		if !active || calls != 0 {
+			misused = true
 			return invalid("Native peer fence callback closed or reused")
 		}
 		calls++
-		return a.transact(lifetime, owner, current, false, func(tx *registry.AuthorityTx) error {
+		callbackError = a.transact(lifetime, owner, current, false, func(tx *registry.AuthorityTx) error {
 			c, b, e := a.currentNativeOriginTx(tx, current, origin)
 			if e != nil {
 				return e
@@ -128,10 +131,14 @@ func (a *Authority) FenceCurrentNativeOrigin(ctx context.Context, owner fabric.E
 			}
 			return check(lifetime)
 		})
+		return callbackError
 	})
 	mu.Lock()
 	active = false
-	if err == nil && calls != 1 {
+	if err == nil && callbackError != nil {
+		err = callbackError
+	}
+	if err == nil && (calls != 1 || misused) {
 		err = invalid("Native peer fence did not authorize a check")
 	}
 	mu.Unlock()

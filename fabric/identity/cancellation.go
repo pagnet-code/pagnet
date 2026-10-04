@@ -52,6 +52,8 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 	var mu sync.Mutex
 	active := true
 	calls := 0
+	var callbackError error
+	misused := false
 	defer func() {
 		mu.Lock()
 		active = false
@@ -64,10 +66,11 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 		mu.Lock()
 		defer mu.Unlock()
 		if !active || calls != 0 {
+			misused = true
 			return invalid("Native cancellation callback closed or reused")
 		}
 		calls++
-		return a.transact(lifetime, owner, current.Scope, false, func(tx *registry.AuthorityTx) error {
+		callbackError = a.transact(lifetime, owner, current.Scope, false, func(tx *registry.AuthorityTx) error {
 			if err := a.currentController(tx, current); err != nil {
 				return err
 			}
@@ -82,10 +85,14 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 			}
 			return ack(lifetime)
 		})
+		return callbackError
 	})
 	mu.Lock()
 	active = false
-	if err == nil && calls != 1 {
+	if err == nil && callbackError != nil {
+		err = callbackError
+	}
+	if err == nil && (calls != 1 || misused) {
 		err = invalid("Native cancellation was not authorized")
 	}
 	mu.Unlock()
