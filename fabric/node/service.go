@@ -11,6 +11,7 @@ import (
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/events"
 	"github.com/pagnet-code/pagnet/fabric/extension"
+	"github.com/pagnet-code/pagnet/fabric/telemetry"
 )
 
 type SearchReader interface {
@@ -33,6 +34,7 @@ type Config struct {
 	InvocationPlacement extension.Placement
 	Events              events.EventBus
 	EventSource         string
+	Tracing             telemetry.Provider
 }
 
 type Service struct {
@@ -84,17 +86,29 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 	}
 	ctx = context.WithValue(ctx, callerContextKey{}, trusted)
 	ctx = context.WithValue(ctx, originalRequestKey{}, append([]byte(nil), exact...))
-	if s.config.Events != nil {
+	var span telemetry.Span
+	if s.config.Tracing != nil {
+		target := ""
+		if envelope.Target != nil {
+			target = envelope.Target.String()
+		}
+		ctx, span = s.config.Tracing.Start(ctx, telemetry.Specification{Name: "pagnet." + string(envelope.Operation), InvocationID: envelope.ID, Target: target, Incoming: envelope.Trace})
+	}
+	if s.config.Events != nil || span != nil {
 		s.publishLifecycle(ctx, envelope, "started")
 		defer func() {
+			disposition := "completed"
 			if failure != nil {
-				s.publishLifecycle(ctx, envelope, "failed")
+				disposition = "failed"
 			} else if result.DeferredID != "" {
-				s.publishLifecycle(ctx, envelope, "deferred")
+				disposition = "deferred"
 			} else if result.Stream != nil {
-				result.Stream = &observedStream{InvocationStream: result.Stream, node: s, envelope: envelope, lifetime: ctx}
-			} else {
-				s.publishLifecycle(ctx, envelope, "completed")
+				result.Stream = &observedStream{InvocationStream: result.Stream, node: s, envelope: envelope, lifetime: ctx, span: span}
+				return
+			}
+			s.publishLifecycle(ctx, envelope, disposition)
+			if span != nil {
+				span.End(disposition)
 			}
 		}()
 	}

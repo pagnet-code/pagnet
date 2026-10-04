@@ -7,6 +7,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/events"
+	"github.com/pagnet-code/pagnet/fabric/telemetry"
 )
 
 // EventLoss reports observation admission loss independently of operation
@@ -14,6 +15,9 @@ import (
 func (s *Service) EventLoss() uint64 { return s.eventLoss.Load() }
 
 func (s *Service) publishLifecycle(ctx context.Context, envelope fabric.Envelope, disposition string) {
+	if s.config.Events == nil {
+		return
+	}
 	subject := ""
 	if envelope.Target != nil {
 		subject = envelope.Target.String()
@@ -38,10 +42,16 @@ type observedStream struct {
 	envelope fabric.Envelope
 	lifetime context.Context
 	once     sync.Once
+	span     telemetry.Span
 }
 
 func (s *observedStream) finish(disposition string) {
-	s.once.Do(func() { s.node.publishLifecycle(s.lifetime, s.envelope, disposition) })
+	s.once.Do(func() {
+		s.node.publishLifecycle(s.lifetime, s.envelope, disposition)
+		if s.span != nil {
+			s.span.End(disposition)
+		}
+	})
 }
 
 func (s *observedStream) Next(ctx context.Context) (fabric.InvocationFrame, error) {

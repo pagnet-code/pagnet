@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/telemetry"
 )
 
 // Outcome contains either a bounded unary result, a pull stream, or a durable
@@ -56,9 +57,12 @@ type Engine struct {
 	validate      FinalValidator
 	continuations ContinuationRecorder
 	maxRedirects  uint32
+	tracing       telemetry.Provider
 }
 
-func NewEngine(plan *Plan, bindings *HandlerRegistry, executor *Executor, resolver MatchResolver, validator FinalValidator, continuations ContinuationRecorder, maxRedirects uint32) (*Engine, error) {
+type EngineOptions struct{ Tracing telemetry.Provider }
+
+func NewEngine(plan *Plan, bindings *HandlerRegistry, executor *Executor, resolver MatchResolver, validator FinalValidator, continuations ContinuationRecorder, maxRedirects uint32, options ...EngineOptions) (*Engine, error) {
 	if plan == nil || bindings == nil || executor == nil || resolver == nil || validator == nil || maxRedirects < 1 || maxRedirects > 64 {
 		return nil, invalidRegistration()
 	}
@@ -75,7 +79,14 @@ func NewEngine(plan *Plan, bindings *HandlerRegistry, executor *Executor, resolv
 			}
 		}
 	}
-	return &Engine{plan: plan, handlers: handlers, executor: executor, resolver: resolver, validate: validator, continuations: continuations, maxRedirects: maxRedirects}, nil
+	if len(options) > 1 {
+		return nil, invalidRegistration()
+	}
+	var tracing telemetry.Provider
+	if len(options) == 1 {
+		tracing = options[0].Tracing
+	}
+	return &Engine{plan: plan, handlers: handlers, executor: executor, resolver: resolver, validate: validator, continuations: continuations, maxRedirects: maxRedirects, tracing: tracing}, nil
 }
 
 // ExecuteStage starts from exact authenticated bytes. The configured downstream
@@ -327,9 +338,29 @@ func registrationIDs(chain []CompiledRegistration) []string {
 func (e *Engine) request(envelope fabric.Envelope, stage string, r CompiledRegistration, phase Phase) InterceptRequest {
 	return InterceptRequest{ProtocolVersion: fabric.CurrentProtocolVersion, InterceptorID: r.Registration.ID, Operation: envelope.Operation, Stage: stage, Phase: phase, Envelope: envelope}
 }
-func (e *Engine) call(ctx context.Context, r CompiledRegistration, request InterceptRequest, started bool) (Decision, error) {
+func (e *Engine) call(ctx context.Context, r CompiledRegistration, request InterceptRequest, started bool) (result Decision, failure error) {
 	if ctx.Err() != nil {
 		return Decision{}, ctx.Err()
+	}
+	if e.tracing != nil {
+		target := ""
+		if request.Envelope.Target != nil {
+			target = request.Envelope.Target.String()
+		}
+		var span telemetry.Span
+		ctx, span = e.tracing.Start(ctx, telemetry.Specification{Name: "pagnet.interceptor", InvocationID: request.Envelope.ID, Target: target, InterceptorID: r.Registration.ID, Stage: request.Stage})
+		defer func() {
+			if span == nil {
+				return
+			}
+			if failure != nil || result.Action == Reject {
+				span.End("failed")
+			} else if result.Action == Defer {
+				span.End("deferred")
+			} else {
+				span.End("completed")
+			}
+		}()
 	}
 	decision, err := e.executor.Call(ctx, r, e.handlers[r.Registration.Binding], request)
 	if ctx.Err() != nil {
