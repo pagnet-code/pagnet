@@ -8,6 +8,7 @@ import (
 	"math"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/extension"
 )
 
 type SearchReader interface {
@@ -16,12 +17,18 @@ type SearchReader interface {
 
 // Config is supplied by trusted composition. It does not select a cloud, model,
 // authorization policy, or endpoint automatically.
+type InvocationInterceptors interface {
+	ExecuteStage(context.Context, fabric.ExecutionContext, []byte, string, string, extension.Placement, extension.Downstream) (extension.Outcome, error)
+}
+
 type Config struct {
-	Audience      string
-	Authenticator fabric.Authenticator
-	Search        SearchReader
-	Descriptors   fabric.DescriptorStore
-	Dispatcher    fabric.InvocationDispatcher
+	Audience            string
+	Authenticator       fabric.Authenticator
+	Search              SearchReader
+	Descriptors         fabric.DescriptorStore
+	Dispatcher          fabric.InvocationDispatcher
+	Interceptors        InvocationInterceptors
+	InvocationPlacement extension.Placement
 }
 
 type Service struct{ config Config }
@@ -30,15 +37,19 @@ func New(config Config) (*Service, error) {
 	if config.Authenticator == nil || config.Audience == "" {
 		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Node requires an explicit authenticator and audience")
 	}
+	if config.Interceptors != nil && config.InvocationPlacement != "" && config.InvocationPlacement != extension.PlacementSource && config.InvocationPlacement != extension.PlacementDestination {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "Invalid trusted node invocation placement")
+	}
 	return &Service{config: config}, nil
 }
 
 // Result carries exactly one operation result. Streams remain pull-driven;
 // bindings encode frames without collecting the entire invocation response.
 type Result struct {
-	Discover *fabric.DiscoverResult
-	Describe *fabric.DescribeResult
-	Stream   fabric.InvocationStream
+	Discover   *fabric.DiscoverResult
+	Describe   *fabric.DescribeResult
+	Stream     fabric.InvocationStream
+	DeferredID string
 }
 
 // Execute authenticates the ORIGINAL exact bytes before interpreting them.
@@ -60,6 +71,7 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 	if err != nil {
 		return Result{}, err
 	}
+	ctx = context.WithValue(ctx, callerContextKey{}, trusted)
 	if envelope.Context.Deadline != nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, *envelope.Context.Deadline)
@@ -67,12 +79,16 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 		if envelope.Operation != fabric.OperationInvoke {
 			defer cancel()
 		} else {
-			result, err := s.invoke(ctx, trusted, envelope)
+			result, err := s.dispatchInvoke(ctx, trusted, exact, envelope)
 			if err != nil {
 				cancel()
 				return Result{}, err
 			}
-			result.Stream = &cancelStream{InvocationStream: result.Stream, cancel: cancel}
+			if result.Stream == nil {
+				cancel()
+			} else {
+				result.Stream = &cancelStream{InvocationStream: result.Stream, cancel: cancel}
+			}
 			return result, nil
 		}
 	}
@@ -85,10 +101,52 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 	case fabric.OperationDescribe:
 		return s.describe(ctx, envelope)
 	case fabric.OperationInvoke:
-		return s.invoke(ctx, trusted, envelope)
+		return s.dispatchInvoke(ctx, trusted, exact, envelope)
 	default:
 		return Result{}, fabric.NewError(fabric.CodeUnsupported, "Unsupported operation")
 	}
+}
+
+// CallerFromContext exposes only the verified in-process identity to trusted
+// discovery/policy composition. Query parameters never establish this identity.
+type callerContextKey struct{}
+
+func CallerFromContext(ctx context.Context) (fabric.ExecutionContext, bool) {
+	if ctx == nil {
+		return fabric.ExecutionContext{}, false
+	}
+	c, ok := ctx.Value(callerContextKey{}).(fabric.ExecutionContext)
+	return c, ok
+}
+
+func (s *Service) dispatchInvoke(ctx context.Context, caller fabric.ExecutionContext, original []byte, envelope fabric.Envelope) (Result, error) {
+	if s.config.Interceptors == nil {
+		return s.invoke(ctx, caller, envelope)
+	}
+	placement := s.config.InvocationPlacement
+	if placement == "" {
+		placement = extension.PlacementSource
+	}
+	outcome, err := s.config.Interceptors.ExecuteStage(ctx, caller, original, s.config.Audience, "invoke.dispatch", placement, func(ctx context.Context, c fabric.ExecutionContext, current fabric.Envelope) (extension.Outcome, error) {
+		result, err := s.invoke(ctx, c, current)
+		return extension.Outcome{Stream: result.Stream}, err
+	})
+	if err != nil {
+		return Result{}, publicError(err)
+	}
+	if outcome.DeferredID != "" {
+		if outcome.Stream != nil || len(outcome.Response) != 0 {
+			return Result{}, fabric.NewError(fabric.CodeProtocolError, "Contradictory pipeline result")
+		}
+		return Result{DeferredID: outcome.DeferredID}, nil
+	}
+	if outcome.Stream != nil {
+		return Result{Stream: outcome.Stream}, nil
+	}
+	if len(outcome.Response) != 0 {
+		return Result{Stream: newUnaryStream(envelope.ID, outcome.Response)}, nil
+	}
+	return Result{}, fabric.NewError(fabric.CodeProtocolError, "Invocation pipeline returned no result")
 }
 
 func (s *Service) discover(ctx context.Context, envelope fabric.Envelope) (Result, error) {
@@ -186,6 +244,12 @@ func (s *Service) describe(ctx context.Context, envelope fabric.Envelope) (Resul
 }
 
 func (s *Service) invoke(ctx context.Context, trusted fabric.ExecutionContext, envelope fabric.Envelope) (Result, error) {
+	if envelope.Operation != fabric.OperationInvoke {
+		return Result{}, fabric.NewError(fabric.CodeProtocolError, "Expected invocation envelope")
+	}
+	if err := envelope.Validate(); err != nil {
+		return Result{}, err
+	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, contextError(err)
 	}
@@ -229,7 +293,15 @@ func (s *cancelStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 func publicError(err error) *fabric.Error {
 	var structured *fabric.Error
 	if errors.As(err, &structured) {
-		return structured
+		copy := fabric.NewError(structured.Code, structured.Message)
+		if len(copy.Code) > 256 {
+			copy.Code = fabric.CodeProtocolError
+		}
+		switch structured.Effect {
+		case fabric.EffectUnknown, fabric.EffectNotStarted, fabric.EffectCompleted:
+			copy.Effect = structured.Effect
+		}
+		return copy
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return contextError(err)

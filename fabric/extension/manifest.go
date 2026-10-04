@@ -2,7 +2,10 @@ package extension
 
 import (
 	"container/heap"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -105,7 +108,9 @@ type chainKey struct {
 	placement Placement
 }
 type Plan struct {
-	chains map[chainKey][]CompiledRegistration
+	chains   map[chainKey][]CompiledRegistration
+	revision string
+	byID     map[string]CompiledRegistration
 }
 
 func Compile(manifests []ExtensionManifest, maxInterceptors int) (*Plan, error) {
@@ -212,7 +217,7 @@ func Compile(manifests []ExtensionManifest, maxInterceptors int) (*Plan, error) 
 			heap.Push(ready, n)
 		}
 	}
-	plan := &Plan{chains: make(map[chainKey][]CompiledRegistration)}
+	plan := &Plan{chains: make(map[chainKey][]CompiledRegistration), byID: nodes}
 	visited := 0
 	for ready.Len() > 0 {
 		n := heap.Pop(ready).(CompiledRegistration)
@@ -230,7 +235,21 @@ func Compile(manifests []ExtensionManifest, maxInterceptors int) (*Plan, error) 
 	if visited != len(nodes) {
 		return nil, fabric.NewError(fabric.CodeExtensionCycle, "Interceptor dependency cycle")
 	}
+	canonical := append([]ExtensionManifest(nil), manifests...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].ID < canonical[j].ID })
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return nil, invalidRegistration()
+	}
+	digest := sha256.Sum256(encoded)
+	plan.revision = hex.EncodeToString(digest[:])
 	return plan, nil
+}
+func (p *Plan) Revision() string {
+	if p == nil {
+		return ""
+	}
+	return p.revision
 }
 
 func (p *Plan) Select(ctx MatchContext) []CompiledRegistration {
