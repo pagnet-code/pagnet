@@ -83,6 +83,7 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 	if err != nil {
 		t.Fatal(err)
 	}
+	fixtureStarted := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	if _, err = owner.driver.Activate(ctx, owner.sess, make(chan session.SessionEvent, 64)); err != nil {
@@ -158,6 +159,7 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 	if err = j.journalCapturedObservation(ctx, producer, extra, nil); !errors.Is(err, ErrFull) {
 		t.Fatal("ordinary setup did not exercise full quota", err)
 	}
+	setupDuration := time.Since(fixtureStarted)
 	events := make(chan session.SessionEvent, 64)
 	drained := make(chan struct{})
 	go func() {
@@ -170,9 +172,28 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 		input = strings.Repeat("tiny-original-private ", 1900)
 	}
 	wrapped := &ownedDriver{Driver: owner.driver, owner: owner}
+	submitStarted := time.Now()
 	err = wrapped.Submit(ctx, owner.sess, session.SubmitRequest{Kind: session.SubmitPrompt, TurnID: logicalWorkerTurn(1), InputKind: "task", Input: input}, events)
 	if !resourceLimit && err != nil {
-		t.Fatal("accepted genuine source stranded by ordinary quota", err)
+		t.Logf("native fixture phases: activation_and_quota_setup=%s submit=%s ordinary_rows=%d", setupDuration, time.Since(submitStarted), count)
+		// The request deadline alone does not distinguish exhausted original
+		// reserve from slow continuous FULL capture. Preserve safe counts from
+		// the failed source, never its private payload or key, before teardown.
+		diagnosticCtx, diagnosticCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer diagnosticCancel()
+		var rowsLeft, captureLeft, contentLeft, pendingRows, deltaRows int
+		if diagnosticErr := j.db.QueryRowContext(diagnosticCtx, `SELECT rows_left,capture_left,content_left,(SELECT COUNT(*) FROM worker_observations),(SELECT COUNT(*) FROM worker_output_deltas WHERE sequence=1) FROM worker_terminal_reservations WHERE sequence=1`).Scan(&rowsLeft, &captureLeft, &contentLeft, &pendingRows, &deltaRows); diagnosticErr == nil {
+			t.Logf("failed source quota: rows_left=%d capture_left=%d content_left=%d pending_observations=%d retained_delta_rows=%d", rowsLeft, captureLeft, contentLeft, pendingRows, deltaRows)
+		} else {
+			t.Logf("failed source quota inspection: %v", diagnosticErr)
+		}
+		if captured, _, diagnosticErr := j.readOutputSpool(diagnosticCtx, owner.captureKey, producer.generation, 1); diagnosticErr == nil {
+			t.Logf("failed source progress: committed_deltas=%d committed_native_bytes=%d projected_bytes=%d pending_deltas=%d pending_bytes=%d", captured.DeltaCount, captured.NativeBytes, captured.ByteOffset, captured.PendingDeltas, captured.PendingBytes)
+			clear(captured.Key)
+		} else {
+			t.Logf("failed source progress inspection: %v", diagnosticErr)
+		}
+		t.Fatal("accepted genuine source did not complete within the fixture budget", err)
 	}
 	if resourceLimit && !errors.Is(err, session.ErrTurnInterrupted) {
 		t.Fatal("resource stop invented successful/vendor outcome", err)
@@ -209,6 +230,10 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 		t.Fatal(err)
 	}
 	rows.Close()
+	// Reopened evidence verification is not part of the native request. Keep
+	// its own bounded budget without extending activation or Submit.
+	verificationCtx, verificationCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer verificationCancel()
 	key, _ := epoch.KeyArray()
 	var text, finalText bytes.Buffer
 	chunks, completed, stopped := 0, 0, 0
@@ -233,7 +258,7 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 			}
 			var finalFragments []transport.NativeContentFragment
 			for ordinal := 0; ordinal < o.OutputContent.FragmentCount; ordinal++ {
-				f, readErr := j.ReadContentFragment(ctx, leaseB, o.ID, o.SourceDigest, o.OutputContent.ContentID, ordinal)
+				f, readErr := j.ReadContentFragment(verificationCtx, leaseB, o.ID, o.SourceDigest, o.OutputContent.ContentID, ordinal)
 				if readErr != nil {
 					t.Fatal(readErr)
 				}
@@ -250,7 +275,7 @@ func runActualNativeReservedSource(t *testing.T, resourceLimit bool, outputOverf
 		if o.OutputStream == nil || (!resourceLimit && o.OutputStream.DeltaCount <= 4096) || o.OutputStream.ByteOffset != int64(text.Len()) {
 			t.Fatal("tiny parser delta provenance/ordered range lost", o.OutputStream)
 		}
-		f, err := j.ReadContentFragment(ctx, leaseB, o.ID, o.SourceDigest, o.OutputContent.ContentID, 0)
+		f, err := j.ReadContentFragment(verificationCtx, leaseB, o.ID, o.SourceDigest, o.OutputContent.ContentID, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
