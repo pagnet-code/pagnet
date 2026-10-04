@@ -25,6 +25,8 @@ const (
 	// a native worker binding or publicly callable offer.
 	AuthorityExtensionConfiguration NativeAuthorityKind = "extension_configuration"
 	AuthorityNativeCheckpoint       NativeAuthorityKind = "native_checkpoint"
+	AuthorityFederationPeer         NativeAuthorityKind = "federation_peer"
+	AuthorityFederationInvocation   NativeAuthorityKind = "federation_invocation"
 	// Dispatch reservations are domain-wide invocation replay receipts and
 	// physical-worker sequence counters, never endpoint metadata or task state.
 	AuthorityDispatch   NativeAuthorityKind = "dispatch"
@@ -37,14 +39,14 @@ const (
 
 func validAuthorityKind(k NativeAuthorityKind) bool {
 	switch k {
-	case AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
+	case AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
 		return true
 	}
 	return false
 }
 
 func globalAuthorityKind(k NativeAuthorityKind) bool {
-	return k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
+	return k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
 }
 
 // AuthorityIdentity is public verification material, never a signing capability.

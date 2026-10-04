@@ -28,6 +28,14 @@ type ForwardGate interface {
 	WithForward(context.Context, ForwardFacts, func(context.Context) error) error
 }
 
+// ForwardTransactionGate validates peer pins retained in THIS authority ledger
+// without opening a nested transaction. Its WithForward must not hold the same
+// store's SQL/mutex; it may hold independent operator authorization instead.
+// Independent external trust stores may use the ordinary ForwardGate fence.
+type ForwardTransactionGate interface {
+	CheckForwardTx(context.Context, *AuthorityTx, ForwardFacts) error
+}
+
 func forwardProvenance(e fabric.Envelope) fabric.Provenance {
 	c := e.Context
 	return fabric.Provenance{Origin: c.Origin, ParentID: c.ParentID, Ancestry: c.Ancestry, Hops: c.Hops, ExtensionChain: c.ExtensionChain, TriggerLineage: c.TriggerLineage}
@@ -123,6 +131,15 @@ func (s *Store) SignForwardExact(ctx context.Context, owner, caller fabric.Execu
 			currentFrame, _ := json.Marshal(facts.Frame)
 			if !bytes.Equal(currentFrame, frameRaw) || !bytes.Equal(facts.Original, original) || !bytes.Equal(facts.Forwarded, forwarded) {
 				return invalid("Forward trust facts changed")
+			}
+			if sameStore, ok := gate.(ForwardTransactionGate); ok {
+				if e := sameStore.CheckForwardTx(current, tx, facts); e != nil {
+					return e
+				}
+				currentFrame, _ = json.Marshal(facts.Frame)
+				if !bytes.Equal(currentFrame, frameRaw) || !bytes.Equal(facts.Original, original) || !bytes.Equal(facts.Forwarded, forwarded) {
+					return invalid("Forward transaction facts changed")
+				}
 			}
 			tx.mu.Lock()
 			defer tx.mu.Unlock()
