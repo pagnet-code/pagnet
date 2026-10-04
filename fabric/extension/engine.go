@@ -431,6 +431,15 @@ func (e *Engine) unwind(ctx context.Context, envelope fabric.Envelope, stack []C
 			outcome = Outcome{}
 			continue
 		}
+		if decision.Action == Modify {
+			projected, err := applyOutputJSON(envelope, r.Registration.ID, "response", outcome.Response, decision.Patch, MaxOutputResponseBytes)
+			if err != nil {
+				failure = err
+				outcome = Outcome{}
+				continue
+			}
+			outcome.Response = projected
+		}
 		if decision.Action == Reject {
 			failure = decision.Failure
 			outcome = Outcome{}

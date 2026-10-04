@@ -1,6 +1,7 @@
 package extension
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -57,6 +58,12 @@ func (s *interceptedStream) Next(ctx context.Context) (fabric.InvocationFrame, e
 		_ = s.Close()
 		return fabric.InvocationFrame{}, err
 	}
+	if len(frame.Data) > fabric.MaxFrameBytes {
+		s.terminal = true
+		_ = s.Close()
+		return fabric.InvocationFrame{}, fabric.NewError(fabric.CodeProtocolError, "Source frame exceeds size limit")
+	}
+	frame.Data = bytes.Clone(frame.Data)
 	phase := PhaseChunk
 	switch frame.Kind {
 	case fabric.FrameStart:
@@ -95,6 +102,9 @@ func (s *interceptedStream) observe(ctx context.Context, phase Phase, frame *fab
 		}
 		request := s.engine.request(s.envelope, registration.Registration.Match.Stage, registration, currentPhase)
 		request.Frame = frame
+		if frame != nil {
+			request.Content, request.ContentEncoding = frameContent(*frame)
+		}
 		if frame != nil && frame.Error != nil {
 			request.Failure = frame.Error
 		}
@@ -110,6 +120,18 @@ func (s *interceptedStream) observe(ctx context.Context, phase Phase, frame *fab
 		if err != nil {
 			currentFailure = err
 			continue
+		}
+		if decision.Action == Modify {
+			if frame == nil {
+				currentFailure = fabric.NewError(fabric.CodeInvalidMutation, "Missing content frame")
+				continue
+			}
+			projected, err := applyFrameOutput(s.envelope, registration.Registration.ID, *frame, decision.Patch)
+			if err != nil {
+				currentFailure = err
+				continue
+			}
+			*frame = projected
 		}
 		if decision.Action == Reject {
 			currentFailure = decision.Failure

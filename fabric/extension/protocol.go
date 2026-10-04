@@ -29,6 +29,8 @@ type InterceptRequest struct {
 	Stage           string                  `json:"stage"`
 	Phase           Phase                   `json:"phase"`
 	Envelope        fabric.Envelope         `json:"envelope"`
+	Content         json.RawMessage         `json:"content,omitempty"`
+	ContentEncoding string                  `json:"contentEncoding,omitempty"`
 	Response        json.RawMessage         `json:"response,omitempty"`
 	Failure         *fabric.Error           `json:"failure,omitempty"`
 	Frame           *fabric.InvocationFrame `json:"frame,omitempty"`
@@ -64,7 +66,16 @@ func ValidateDecision(req InterceptRequest, d Decision, outputStarted bool, now 
 			return invalid()
 		}
 	case Modify:
-		if len(d.Patch) == 0 || len(d.Response) != 0 || d.Failure != nil || d.Redirect != nil || d.Deferral != nil || req.Phase != PhaseRequest {
+		if len(d.Patch) == 0 || len(d.Response) != 0 || d.Failure != nil || d.Redirect != nil || d.Deferral != nil || (req.Phase != PhaseRequest && req.Phase != PhaseResponse && req.Phase != PhaseChunk) {
+			return invalid()
+		}
+		if req.Phase == PhaseChunk && req.Frame == nil || req.Phase == PhaseResponse && req.Frame == nil && len(req.Response) == 0 {
+			return invalid()
+		}
+		if req.Frame != nil && (req.Frame.Kind != fabric.FrameChunk && req.Frame.Kind != fabric.FrameProgress) {
+			return invalid()
+		}
+		if req.Frame != nil && req.ContentEncoding == "unavailable" {
 			return invalid()
 		}
 	case Reject:
