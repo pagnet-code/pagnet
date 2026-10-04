@@ -56,24 +56,32 @@ func NewAuthenticatedForwardContext(principal Principal, audience string, exactB
 	if err != nil {
 		return ExecutionContext{}, err
 	}
-	if !validText(verifiedProvenance.Origin, 4096) || verifiedProvenance.Hops > 64 || len(verifiedProvenance.Ancestry) > 64 || len(verifiedProvenance.ExtensionChain) > 64 || len(verifiedProvenance.TriggerLineage) > 64 {
-		return ExecutionContext{}, NewError(CodeUnauthenticated, "Invalid authenticated engine lineage")
-	}
-	for _, list := range [][]string{verifiedProvenance.Ancestry, verifiedProvenance.ExtensionChain, verifiedProvenance.TriggerLineage} {
-		for _, value := range list {
-			if !validText(value, 256) {
-				return ExecutionContext{}, NewError(CodeUnauthenticated, "Invalid authenticated engine lineage")
-			}
-		}
-	}
-	if verifiedProvenance.ParentID != "" && !validText(verifiedProvenance.ParentID, 256) {
-		return ExecutionContext{}, NewError(CodeUnauthenticated, "Invalid authenticated parent")
+	if err = validateProvenance(verifiedProvenance); err != nil {
+		return ExecutionContext{}, err
 	}
 	verifiedProvenance.Ancestry = slices.Clone(verifiedProvenance.Ancestry)
 	verifiedProvenance.ExtensionChain = slices.Clone(verifiedProvenance.ExtensionChain)
 	verifiedProvenance.TriggerLineage = slices.Clone(verifiedProvenance.TriggerLineage)
 	c.provenance = verifiedProvenance
 	return c, nil
+}
+
+// Shape validation alone never authenticates lineage or constructs authority.
+func validateProvenance(p Provenance) error {
+	if !validText(p.Origin, 4096) || p.Hops > 64 || len(p.Ancestry) > 64 || len(p.ExtensionChain) > 64 || len(p.TriggerLineage) > 64 {
+		return NewError(CodeUnauthenticated, "Invalid authenticated engine lineage")
+	}
+	for _, list := range [][]string{p.Ancestry, p.ExtensionChain, p.TriggerLineage} {
+		for _, value := range list {
+			if !validText(value, 256) {
+				return NewError(CodeUnauthenticated, "Invalid authenticated engine lineage")
+			}
+		}
+	}
+	if p.ParentID != "" && !validText(p.ParentID, 256) {
+		return NewError(CodeUnauthenticated, "Invalid authenticated parent")
+	}
+	return nil
 }
 
 func (c ExecutionContext) ProvenanceView() Provenance {
