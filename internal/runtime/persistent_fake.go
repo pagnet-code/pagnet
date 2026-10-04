@@ -157,6 +157,11 @@ func (f *PersistentFake) Activate(ctx context.Context, sess *session.RuntimeSess
 	var actEv session.SessionEvent
 	select {
 	case actEv = <-e.activationCh:
+	case <-e.readerDone:
+		// The original reader has observed EOF and reaped the process.
+		// No handshake can now arrive; do not spend the startup budget
+		// waiting for a dead endpoint or invent a native session event.
+		return nil, session.ErrSessionLost
 	case <-ctx.Done():
 		f.dropEndpoint(sess.InstanceID)
 		return nil, ctx.Err()
@@ -618,10 +623,13 @@ func (f *PersistentFake) launchEndpoint(sess *session.RuntimeSession) (*persistE
 	} else if f.NativeEventObserverFactory != nil {
 		e.nativeObserver = f.NativeEventObserverFactory(sess.InstanceID)
 	}
-	go e.readLoop()
 	f.mu.Lock()
 	f.endpoints[sess.InstanceID] = e
 	f.mu.Unlock()
+	// Publish the endpoint before its reader can reap an immediately exiting
+	// child. Otherwise EOF cleanup can run before insertion and leave the
+	// already-dead endpoint registered after the original reader has finished.
+	go e.readLoop()
 	// The PTY (when the launch owns one) is live from here: hand the
 	// master to the observer BEFORE the activation wait so the terminal
 	// plane reads it from the first byte (the fake's TUI boot bytes are

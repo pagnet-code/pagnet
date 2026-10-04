@@ -22,6 +22,8 @@ type NativeWorkerProxy struct {
 	bootstrap                           sessionworker.Bootstrap
 	done                                chan struct{}
 	closeOnce                           sync.Once
+	reconcileOnce                       sync.Once
+	reconcileGate                       chan struct{}
 	confirmedMu                         sync.Mutex
 	confirmedGeneration, confirmedStart string
 	confirmedAt                         time.Time
@@ -170,6 +172,20 @@ func (p *NativeWorkerProxy) SourceCall(ctx context.Context, request sessionworke
 // live session under this connection. Repeated calls are safe across transient
 // server failure; original source admission is supplied by the worker.
 func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
+	// The pump and a terminal command can reconcile concurrently. A poll
+	// transfers one issued ticket to this controller lease; it is not a peek.
+	// The worker reissues the same ticket to this lease after transient remote
+	// failure. Serialize delivery so concurrent callers cannot race completion;
+	// cancellation or replacement remains owned by the worker, not a local cache.
+	p.reconcileOnce.Do(func() { p.reconcileGate = make(chan struct{}, 1) })
+	select {
+	case p.reconcileGate <- struct{}{}:
+		defer func() { <-p.reconcileGate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.done:
+		return ErrNativeOriginAdmissionDeferred
+	}
 	if err := p.RefreshAdmission(ctx); err != nil {
 		return err
 	}

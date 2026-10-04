@@ -82,9 +82,12 @@ func (b *relayBroker) pollActivation(lease int64) (*ActivationRequest, error) {
 	if b.admission == nil {
 		return nil, errors.New("fresh control-plane admission is required")
 	}
-	if b.activation == nil || b.activation.issued {
+	if b.activation == nil {
 		return nil, nil
 	}
+	// Re-delivery under this authenticated lease retries the exact outstanding
+	// ticket after a lost authority reply. Cancellation removes the ticket; no
+	// controller can retain authority for an operation the owner has stopped.
 	b.activation.issued = true
 	b.activation.lease = lease
 	if b.activation.request.Admission.RunnerID == "" {

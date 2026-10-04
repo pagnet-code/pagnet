@@ -88,6 +88,9 @@ type SessionOwner struct {
 	driver                   session.Driver
 	supervisor               *proc.Supervisor
 	sess                     *session.RuntimeSession
+	operations               map[int64]*nativeOwnedOperation
+	stopSequence             int64
+	lastStopDone             chan struct{}
 	prompt                   sync.Mutex
 	terminalWrite            sync.Mutex
 	mu                       sync.Mutex
@@ -248,7 +251,22 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 		o.finish(out.Sequence, nil, errors.New("session worker is stopping"))
 		return
 	}
+	operation, previousStop, earlier := o.registerOperationLocked(out)
 	o.wg.Go(func() {
+		defer o.finishOwnedOperation(out.Sequence, operation)
+		if previousStop != nil {
+			select {
+			case <-previousStop:
+			case <-operation.ctx.Done():
+				o.finish(out.Sequence, nil, operation.ctx.Err())
+				return
+			}
+		}
+		if err := operation.ctx.Err(); err != nil {
+			o.finish(out.Sequence, nil, err)
+			return
+		}
+
 		var op Operation
 		decoder := json.NewDecoder(bytes.NewReader(payload))
 		decoder.DisallowUnknownFields()
@@ -289,7 +307,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 				}
 			}()
 			if out.Kind == "activate" {
-				_, err = o.manager.EnsureActive(o.ctx, o.sess, events)
+				_, err = o.manager.EnsureActive(operation.ctx, o.sess, events)
 				close(events)
 
 			} else {
@@ -297,7 +315,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 					close(events)
 					err = errors.New("invalid or oversized prompt")
 				} else {
-					result, err = o.manager.Submit(o.ctx, o.sess, session.SubmitRequest{TurnID: logicalWorkerTurn(out.Sequence), Input: op.Input, InputKind: op.InputKind, Kind: session.SubmitPrompt}, events)
+					result, err = o.manager.Submit(operation.ctx, o.sess, session.SubmitRequest{TurnID: logicalWorkerTurn(out.Sequence), Input: op.Input, InputKind: op.InputKind, Kind: session.SubmitPrompt}, events)
 				}
 			}
 			<-drained
@@ -311,8 +329,8 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			}
 			for !o.prompt.TryLock() {
 				select {
-				case <-o.ctx.Done():
-					err = o.ctx.Err()
+				case <-operation.ctx.Done():
+					err = operation.ctx.Err()
 				case <-time.After(20 * time.Millisecond):
 				}
 				if err != nil {
@@ -329,7 +347,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			}
 			o.mu.Unlock()
 			if blocked == nil {
-				blocked = o.journal.requireNativeReadersQuiesced(o.ctx)
+				blocked = o.journal.requireNativeReadersQuiesced(operation.ctx)
 			}
 			if blocked != nil {
 				o.prompt.Unlock()
@@ -351,7 +369,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 					}
 				}
 			}()
-			_, err = o.manager.StartFresh(o.ctx, o.sess, events)
+			_, err = o.manager.StartFresh(operation.ctx, o.sess, events)
 			close(events)
 			<-drained
 			o.prompt.Unlock()
@@ -376,15 +394,15 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 							}
 						}
 					}()
-					_, err = o.manager.EnsureActive(o.ctx, o.sess, events)
+					_, err = o.manager.EnsureActive(operation.ctx, o.sess, events)
 					close(events)
 					<-drained
 					o.prompt.Unlock()
 					break
 				}
 				select {
-				case <-o.ctx.Done():
-					err = o.ctx.Err()
+				case <-operation.ctx.Done():
+					err = operation.ctx.Err()
 				case <-time.After(20 * time.Millisecond):
 				}
 				if err != nil {
@@ -410,9 +428,42 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 				break
 			}
 			defer o.prompt.Unlock()
-			err = o.manager.Hibernate(o.ctx, o.sess)
+			err = o.manager.Hibernate(operation.ctx, o.sess)
 		case "stop":
+			// Interrupt existing native work before joining it. A running prompt
+			// cannot finish merely because the controller requested a stop.
 			err = o.manager.Stop(o.journal.scope.InstanceID)
+			for _, pending := range earlier {
+				if err != nil {
+					break
+				}
+				select {
+				case <-pending.done:
+				case <-operation.ctx.Done():
+					err = operation.ctx.Err()
+				}
+				if err != nil {
+					break
+				}
+			}
+			if err == nil {
+				err = o.manager.Stop(o.journal.scope.InstanceID)
+			}
+			if err == nil {
+				// A cancelled startup may already have detached its driver entry.
+				// The original supervisor still owns any unreaped process; stop it
+				// before claiming completion and join its native source reader.
+				err = o.supervisor.StopEndpoint(o.journal.scope.InstanceID)
+			}
+			if err == nil {
+				quiesced := make(chan struct{})
+				go func() { o.nativeObserverWG.Wait(); close(quiesced) }()
+				select {
+				case <-quiesced:
+				case <-operation.ctx.Done():
+					err = operation.ctx.Err()
+				}
+			}
 		default:
 			err = errors.New("unsupported native operation")
 		}
@@ -633,6 +684,28 @@ type ownedDriver struct {
 }
 
 func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
+	o := d.owner
+	activationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	o.mu.Lock()
+	sequence := o.candidateTurnSource.Sequence
+	if sequence > 0 && sequence < o.stopSequence {
+		o.mu.Unlock()
+		return nil, context.Canceled
+	}
+	operation := o.operations[sequence]
+	if operation != nil {
+		operation.activationCancel = cancel
+	}
+	o.mu.Unlock()
+	defer func() {
+		o.mu.Lock()
+		if operation != nil {
+			operation.activationCancel = nil
+		}
+		o.mu.Unlock()
+	}()
+	ctx = activationCtx
 	if !d.Driver.Live(sess.InstanceID) {
 		generation, err := freshNonce()
 		if err != nil {
@@ -642,7 +715,6 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		if err != nil {
 			return nil, err
 		}
-		o := d.owner
 		o.mu.Lock()
 		commandID := o.candidateCommandID
 		admission := o.candidateAdmission
