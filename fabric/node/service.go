@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"sync/atomic"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events"
 	"github.com/pagnet-code/pagnet/fabric/extension"
 )
 
@@ -29,9 +31,14 @@ type Config struct {
 	Dispatcher          fabric.InvocationDispatcher
 	Interceptors        InvocationInterceptors
 	InvocationPlacement extension.Placement
+	Events              events.EventBus
+	EventSource         string
 }
 
-type Service struct{ config Config }
+type Service struct {
+	config    Config
+	eventLoss atomic.Uint64
+}
 
 func New(config Config) (*Service, error) {
 	if config.Authenticator == nil || config.Audience == "" {
@@ -39,6 +46,9 @@ func New(config Config) (*Service, error) {
 	}
 	if config.Interceptors != nil && config.InvocationPlacement != "" && config.InvocationPlacement != extension.PlacementSource && config.InvocationPlacement != extension.PlacementDestination {
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Invalid trusted node invocation placement")
+	}
+	if config.Events != nil && (config.EventSource == "" || len(config.EventSource) > 4096) {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "Event observation requires an explicit node source")
 	}
 	return &Service{config: config}, nil
 }
@@ -55,7 +65,7 @@ type Result struct {
 
 // Execute authenticates the ORIGINAL exact bytes before interpreting them.
 // Every operation uses the same explicit caller-decides invocation model.
-func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (Result, error) {
+func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (result Result, failure error) {
 	if ctx == nil {
 		return Result{}, fabric.NewError(fabric.CodeInvalidInput, "Missing operation context")
 	}
@@ -73,6 +83,20 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 		return Result{}, err
 	}
 	ctx = context.WithValue(ctx, callerContextKey{}, trusted)
+	if s.config.Events != nil {
+		s.publishLifecycle(ctx, envelope, "started")
+		defer func() {
+			if failure != nil {
+				s.publishLifecycle(ctx, envelope, "failed")
+			} else if result.DeferredID != "" {
+				s.publishLifecycle(ctx, envelope, "deferred")
+			} else if result.Stream != nil {
+				result.Stream = &observedStream{InvocationStream: result.Stream, node: s, envelope: envelope, lifetime: ctx}
+			} else {
+				s.publishLifecycle(ctx, envelope, "completed")
+			}
+		}()
+	}
 	if envelope.Context.Deadline != nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, *envelope.Context.Deadline)
