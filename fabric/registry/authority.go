@@ -21,6 +21,7 @@ import (
 	"sync"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/internal/privatefs"
 	_ "modernc.org/sqlite"
 )
 
@@ -278,7 +279,7 @@ func installPrivate(dir, path string, b []byte) error {
 	if e = publishPrivate(f.Name(), path); e != nil {
 		return e
 	}
-	return syncDirectory(dir)
+	return privatefs.SyncDirectory(dir, "genesis.key")
 }
 
 func invalid(message string) error  { return fabric.NewError(fabric.CodeInvalidInput, message) }
