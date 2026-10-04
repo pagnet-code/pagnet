@@ -284,6 +284,24 @@ func (s *Store) mutate(ctx context.Context, c fabric.ExecutionContext, ref fabri
 	if e := s.authorize(c); e != nil {
 		return "", e
 	}
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return "", e
+	}
+	defer tx.Rollback()
+	rev, e := s.mutateTx(ctx, tx, ref, expected, action, unsigned, encode)
+	if e != nil {
+		return "", e
+	}
+	if e = tx.Commit(); e != nil {
+		return "", e
+	}
+	return rev, nil
+}
+
+// mutateTx is used only while the original registry writer lock, authenticated
+// owner authorization and caller-owned transaction are held.
+func (s *Store) mutateTx(ctx context.Context, tx *sql.Tx, ref fabric.EndpointRef, expected fabric.Revision, action string, unsigned []byte, encode func(fabric.Revision) ([]byte, error)) (fabric.Revision, error) {
 	if ref.Domain() != s.identity.Namespace {
 		return "", fabric.NewError(fabric.CodeUnauthenticated, "cannot modify foreign domain")
 	}
@@ -291,11 +309,6 @@ func (s *Store) mutate(ctx context.Context, c fabric.ExecutionContext, ref fabri
 		return "", invalid("descriptor exceeds bound")
 	}
 	m := mutationDigest(action, ref, expected, unsigned)
-	tx, e := s.db.BeginTx(ctx, nil)
-	if e != nil {
-		return "", e
-	}
-	defer tx.Rollback()
 	old, e := loadObject(ctx, tx, ref.String())
 	exists := e == nil
 	if e != nil && !errors.Is(e, sql.ErrNoRows) {
@@ -396,11 +409,9 @@ func (s *Store) mutate(ctx context.Context, c fabric.ExecutionContext, ref fabri
 	if e = s.insertRecord(ctx, tx, r, o, true); e != nil {
 		return "", e
 	}
-	if e = tx.Commit(); e != nil {
-		return "", e
-	}
 	return rev, nil
 }
+
 func (s *Store) insertRecord(ctx context.Context, tx *sql.Tx, r Record, o storedObject, outbox bool) error {
 	encoded, e := json.Marshal(r)
 	if e != nil {

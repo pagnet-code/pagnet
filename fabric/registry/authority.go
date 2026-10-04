@@ -355,9 +355,11 @@ func (s *Store) readback(ctx context.Context) error {
 		return e
 	}
 	if version == 2 {
-		return s.verifyNativeAuthority(ctx)
+		if e = s.verifyNativeAuthority(ctx); e != nil {
+			return e
+		}
 	}
-	return nil
+	return s.verifyDescriptorProjections(ctx)
 }
 
 func (s *Store) authorize(c fabric.ExecutionContext) error {

@@ -60,6 +60,12 @@ func (s *Store) verifyLedgerStream(ctx context.Context) error {
 	if e := s.db.QueryRowContext(ctx, "SELECT records,bytes FROM ledger_budget WHERE singleton=1").Scan(&claimedCount, &claimedTotal); e != nil {
 		return e
 	}
+	projectionCount, projectionBytes, e := s.descriptorProjectionUsage(ctx)
+	if e != nil {
+		return e
+	}
+	count += projectionCount
+	total += projectionBytes
 	if count != claimedCount || total != claimedTotal || uint64(count) > s.options.Limits.MaxRecords || total > s.options.Limits.MaxLedgerBytes {
 		return invalid("signed ledger quota counters are inconsistent")
 	}
