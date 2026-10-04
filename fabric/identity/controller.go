@@ -103,9 +103,10 @@ func (a *Authority) currentBinding(tx *registry.AuthorityTx, b Binding) error {
 	return nil
 }
 
-// BindWorker records authenticated local ownership facts. Its caller must be
-// trusted composition AFTER kernel peer + exact worker ownership authentication;
-// this method does not treat the public WorkerBinding as evidence of liveness.
+// BindWorker records an explicitly assigned private physical ownership slot.
+// The signed slot is infrastructure configuration, never evidence of a running
+// process or session. Trusted composition must independently authenticate actual
+// kernel peer, worker ownership and current native state before any effect.
 func (a *Authority) BindWorker(ctx context.Context, owner fabric.ExecutionContext, c Controller, expectedRevision uint64, worker WorkerBinding) (Binding, error) {
 	var result Binding
 	if !text(worker.WorkerID) || !text(worker.StateDirectoryID) || !text(worker.OwnershipGeneration) || !text(worker.ActualRuntime) || worker.ProfileDigest == ([32]byte{}) {
