@@ -83,6 +83,7 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 		return Result{}, err
 	}
 	ctx = context.WithValue(ctx, callerContextKey{}, trusted)
+	ctx = context.WithValue(ctx, originalRequestKey{}, append([]byte(nil), exact...))
 	if s.config.Events != nil {
 		s.publishLifecycle(ctx, envelope, "started")
 		defer func() {
@@ -135,6 +136,7 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 // CallerFromContext exposes only the verified in-process identity to trusted
 // discovery/policy composition. Query parameters never establish this identity.
 type callerContextKey struct{}
+type originalRequestKey struct{}
 
 func CallerFromContext(ctx context.Context) (fabric.ExecutionContext, bool) {
 	if ctx == nil {
@@ -142,6 +144,23 @@ func CallerFromContext(ctx context.Context) (fabric.ExecutionContext, bool) {
 	}
 	c, ok := ctx.Value(callerContextKey{}).(fabric.ExecutionContext)
 	return c, ok
+}
+
+// OriginalRequestFromContext is for trusted operation-stage composition only.
+// The private key is installed AFTER authentication. Search parameters, tool
+// arguments and serialized context assertions cannot create this capability.
+// The returned bytes are an owned copy of the verified original, not a mutable
+// reference into ingress storage or credentials for a downstream adapter.
+func OriginalRequestFromContext(ctx context.Context) (fabric.ExecutionContext, []byte, bool) {
+	caller, ok := CallerFromContext(ctx)
+	if !ok {
+		return fabric.ExecutionContext{}, nil, false
+	}
+	exact, ok := ctx.Value(originalRequestKey{}).([]byte)
+	if !ok {
+		return fabric.ExecutionContext{}, nil, false
+	}
+	return caller, append([]byte(nil), exact...), true
 }
 
 func (s *Service) dispatchInvoke(ctx context.Context, caller fabric.ExecutionContext, original []byte, envelope fabric.Envelope) (Result, error) {

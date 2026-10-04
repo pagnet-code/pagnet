@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -96,6 +97,42 @@ func (e *Engine) ExecuteStage(ctx context.Context, caller fabric.ExecutionContex
 		state.VisitedTargets = []string{envelope.Target.String()}
 	}
 	return e.runWithDeadline(ctx, caller, append([]byte(nil), original...), state, downstream, false)
+}
+
+// ExecuteReadProjection is a trusted composition boundary for stages such as
+// discover.candidates. It preserves verified system identity and lineage while
+// replacing ONLY the read operation's application projection. Wire callers and
+// MCP arguments never select this stage or supply its candidate set. It has no
+// invocation adapter and cannot redirect/defer/emit an invocation.
+func (e *Engine) ExecuteReadProjection(ctx context.Context, caller fabric.ExecutionContext, original []byte, audience, stage string, placement Placement, payload json.RawMessage, downstream Downstream) (Outcome, error) {
+	if ctx == nil || downstream == nil || !fabric.ValidNamespacedName(stage) || placement != PlacementSource && placement != PlacementDestination {
+		return Outcome{}, fabric.NewError(fabric.CodeInvalidInput, "Invalid read projection stage")
+	}
+	envelope, err := caller.DecodeVerifiedEnvelope(original, audience)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if envelope.Operation != fabric.OperationDiscover && envelope.Operation != fabric.OperationDescribe || !strings.HasPrefix(stage, string(envelope.Operation)+".") {
+		return Outcome{}, fabric.NewError(fabric.CodeUnsupported, "Projection cannot execute or change an operation")
+	}
+	envelope.Payload = append(json.RawMessage(nil), payload...)
+	if err := envelope.Validate(); err != nil {
+		return Outcome{}, err
+	}
+	state := PipelineState{Format: "pagnet.pipeline.v1", PlanRevision: e.plan.Revision(), Envelope: envelope, Stage: stage, Placement: placement}
+	return e.runWithDeadline(ctx, caller, append([]byte(nil), original...), state, downstream, false)
+}
+
+type validationStageKey struct{}
+
+// ValidationStage identifies the engine-owned barrier to trusted validators.
+// An interceptor cannot manufacture it with a field in an application payload.
+func ValidationStage(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	stage, _ := ctx.Value(validationStageKey{}).(string)
+	return stage
 }
 
 // ResumeStage accepts only a freshly claimed, authenticated infrastructure
@@ -233,7 +270,7 @@ func (e *Engine) run(ctx context.Context, caller fabric.ExecutionContext, origin
 		}
 		break
 	}
-	if err := e.validate(ctx, caller, state.Envelope); err != nil {
+	if err := e.validate(context.WithValue(ctx, validationStageKey{}, state.Stage), caller, state.Envelope); err != nil {
 		return e.unwind(ctx, state.Envelope, stack, Outcome{}, err)
 	}
 	if ctx.Err() != nil {
