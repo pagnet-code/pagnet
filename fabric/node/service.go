@@ -46,10 +46,11 @@ func New(config Config) (*Service, error) {
 // Result carries exactly one operation result. Streams remain pull-driven;
 // bindings encode frames without collecting the entire invocation response.
 type Result struct {
-	Discover   *fabric.DiscoverResult
-	Describe   *fabric.DescribeResult
-	Stream     fabric.InvocationStream
-	DeferredID string
+	Discover                  *fabric.DiscoverResult
+	Describe                  *fabric.DescribeResult
+	Stream                    fabric.InvocationStream
+	DeferredID                string
+	DeferredNotificationError *fabric.Error
 }
 
 // Execute authenticates the ORIGINAL exact bytes before interpreting them.
@@ -138,7 +139,7 @@ func (s *Service) dispatchInvoke(ctx context.Context, caller fabric.ExecutionCon
 		if outcome.Stream != nil || len(outcome.Response) != 0 {
 			return Result{}, fabric.NewError(fabric.CodeProtocolError, "Contradictory pipeline result")
 		}
-		return Result{DeferredID: outcome.DeferredID}, nil
+		return Result{DeferredID: outcome.DeferredID, DeferredNotificationError: outcome.DeferredNotificationError}, nil
 	}
 	if outcome.Stream != nil {
 		return Result{Stream: outcome.Stream}, nil

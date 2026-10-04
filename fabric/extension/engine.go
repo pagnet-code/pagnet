@@ -14,9 +14,10 @@ import (
 // Outcome contains either a bounded unary result, a pull stream, or a durable
 // suspension identity. Resume capabilities never form part of caller results.
 type Outcome struct {
-	Response   json.RawMessage
-	Stream     fabric.InvocationStream
-	DeferredID string
+	Response                  json.RawMessage
+	Stream                    fabric.InvocationStream
+	DeferredID                string
+	DeferredNotificationError *fabric.Error
 }
 type Downstream func(context.Context, fabric.ExecutionContext, fabric.Envelope) (Outcome, error)
 type MatchResolver func(context.Context, fabric.ExecutionContext, fabric.Envelope, string, Placement) (MatchContext, error)
@@ -213,6 +214,9 @@ func (e *Engine) run(ctx context.Context, caller fabric.ExecutionContext, origin
 				state.DeferralID = hex.EncodeToString(hash[:])
 				id, err := e.continuations.Save(ctx, caller, original, state, *decision.Deferral, registration)
 				if err != nil {
+					if id != "" {
+						return Outcome{DeferredID: id, DeferredNotificationError: fabric.NewError(fabric.CodeTargetUnavailable, "Extension notification unavailable")}, nil
+					}
 					return Outcome{}, err
 				}
 				if id == "" {
