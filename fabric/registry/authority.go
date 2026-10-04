@@ -309,8 +309,17 @@ func decodeGenesis(g GenesisRecord) (GenesisBody, error) {
 }
 func (s *Store) readback(ctx context.Context) error {
 	var version int
-	if e := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); e != nil || version != 1 {
+	if e := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); e != nil || (version != 1 && version != 2) {
 		return invalid("unsupported or missing registry format")
+	}
+	if version == 1 {
+		var nativeTables int
+		if e := s.db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('native_authority_head','native_authority_log','native_authority_state')").Scan(&nativeTables); e != nil {
+			return e
+		}
+		if nativeTables != 0 {
+			return invalid("Native authority schema disagrees with registry format")
+		}
 	}
 	var raw []byte
 	if e := s.db.QueryRowContext(ctx, "SELECT CASE WHEN length(genesis)<=65536 THEN genesis END FROM identity WHERE singleton=1").Scan(&raw); e != nil {
@@ -342,7 +351,13 @@ func (s *Store) readback(ctx context.Context) error {
 	if e = s.verifyOutbox(ctx); e != nil {
 		return e
 	}
-	return s.verifyIndex(ctx)
+	if e = s.verifyIndex(ctx); e != nil {
+		return e
+	}
+	if version == 2 {
+		return s.verifyNativeAuthority(ctx)
+	}
+	return nil
 }
 
 func (s *Store) authorize(c fabric.ExecutionContext) error {

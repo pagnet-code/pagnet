@@ -1,0 +1,131 @@
+package identity
+
+import (
+	"context"
+
+	"errors"
+
+	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/registry"
+)
+
+type controlRequestReceipt struct {
+	RequestDigest [32]byte   `json:"requestDigest"`
+	Controller    Controller `json:"controller"`
+}
+
+// AcquireController advances a durable monotonic control epoch. RequestID is a
+// stable trusted-controller retry identity. Replaying it after replacement
+// returns its original proof, never a new executable epoch. Every effect must
+// independently recheck that proof against the CURRENT control row.
+func (a *Authority) AcquireController(ctx context.Context, owner fabric.ExecutionContext, s Scope, expectedEpoch uint64, requestID, controllerID string) (Controller, error) {
+	var result Controller
+	if !text(requestID) || !text(controllerID) {
+		return result, invalid("Invalid local controller request")
+	}
+	request := Controller{Scope: s, ControllerID: controllerID, RequestID: requestID, ExpectedEpoch: expectedEpoch}
+	commitment, e := digest(request)
+	if e != nil {
+		return result, e
+	}
+	receiptKey := registry.AuthorityKey{Kind: registry.AuthorityController, ID: keyID("request:", s.Endpoint.String(), requestID)}
+	e = a.transact(ctx, owner, s, false, func(tx *registry.AuthorityTx) error {
+		existing, e := tx.Get(receiptKey)
+		if e == nil {
+			var receipt controlRequestReceipt
+			if e = decodeValue(existing, &receipt); e != nil {
+				return e
+			}
+			if receipt.RequestDigest != commitment || registry.VerifyAuthorityRecord(a.root, receipt.Controller.Proof) != nil {
+				return conflict("Controller request identity reused with changed input")
+			}
+			result = receipt.Controller
+			return nil
+		}
+		var typed *fabric.Error
+		if !errors.As(e, &typed) || typed.Code != fabric.CodeNotFound {
+			return e
+		}
+		raw, e := storedValue(request)
+		if e != nil {
+			return e
+		}
+		r, e := tx.CAS(controllerKey(s), expectedEpoch, raw, false)
+		if e != nil {
+			return e
+		}
+		result = request
+		result.Proof = r
+		raw, e = encode(controlRequestReceipt{commitment, result})
+		if e != nil {
+			return e
+		}
+		_, e = tx.CAS(receiptKey, 0, raw, false)
+		return e
+	})
+	if e != nil {
+		return Controller{}, e
+	}
+	return result, nil
+}
+func (a *Authority) currentController(tx *registry.AuthorityTx, c Controller) error {
+	r, e := exactRecord(tx, a.root, c.Proof, controllerKey(c.Scope))
+	if e != nil {
+		return e
+	}
+	var stored Controller
+	if e = decodeValue(r, &stored); e != nil {
+		return e
+	}
+	stored.Proof = r
+	one, _ := digest(c)
+	two, _ := digest(stored)
+	if one != two {
+		return invalid("Controller proof and fields differ")
+	}
+	return nil
+}
+func (a *Authority) currentBinding(tx *registry.AuthorityTx, b Binding) error {
+	r, e := exactRecord(tx, a.root, b.Proof, bindingKey(b.Scope))
+	if e != nil {
+		return e
+	}
+	var stored Binding
+	if e = decodeValue(r, &stored); e != nil {
+		return e
+	}
+	stored.Proof = r
+	one, _ := digest(b)
+	two, _ := digest(stored)
+	if one != two {
+		return invalid("Worker binding proof and fields differ")
+	}
+	return nil
+}
+
+// BindWorker records authenticated local ownership facts. Its caller must be
+// trusted composition AFTER kernel peer + exact worker ownership authentication;
+// this method does not treat the public WorkerBinding as evidence of liveness.
+func (a *Authority) BindWorker(ctx context.Context, owner fabric.ExecutionContext, c Controller, expectedRevision uint64, worker WorkerBinding) (Binding, error) {
+	var result Binding
+	if !text(worker.WorkerID) || !text(worker.StateDirectoryID) || !text(worker.OwnershipGeneration) || !text(worker.ActualRuntime) || worker.ProfileDigest == ([32]byte{}) {
+		return result, invalid("Incomplete native worker ownership binding")
+	}
+	e := a.transact(ctx, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+		if e := a.currentController(tx, c); e != nil {
+			return e
+		}
+		result = Binding{Scope: c.Scope, Worker: worker}
+		raw, e := storedValue(result)
+		if e != nil {
+			return e
+		}
+		r, e := tx.CAS(bindingKey(c.Scope), expectedRevision, raw, false)
+		result.Proof = r
+		return e
+	})
+	if e != nil {
+		return Binding{}, e
+	}
+	return result, nil
+}

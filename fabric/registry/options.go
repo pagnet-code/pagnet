@@ -23,7 +23,7 @@ func DefaultOptions() Options {
 }
 func (o Options) validate() error {
 	l := o.Limits
-	if l.MaxRecords == 0 || l.MaxRecords > math.MaxInt64 || l.MaxLedgerBytes < 1 || l.MaxPayloadBytes < 1 || l.MaxPayloadBytes > math.MaxInt-65536 || l.MaxDatabaseBytes < 65536 {
+	if l.MaxRecords == 0 || l.MaxRecords > math.MaxInt64 || l.MaxLedgerBytes < 1 || l.MaxPayloadBytes < 1 || l.MaxPayloadBytes > (math.MaxInt-65536)/2 || l.MaxDatabaseBytes < 65536 {
 		return invalid("registry storage limits must be positive finite representable bounds")
 	}
 	return nil
