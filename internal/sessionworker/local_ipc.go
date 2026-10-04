@@ -18,6 +18,7 @@ import (
 )
 
 type localHandshake struct {
+	Mode         string         `json:"mode,omitempty"`
 	Protocol     string         `json:"protocol"`
 	Authority    AuthorityScope `json:"authority"`
 	WorkerBuild  string         `json:"workerBuild"`
@@ -116,7 +117,14 @@ func serveLocalController(ctx context.Context, c *net.UnixConn, owner *SessionOw
 		return
 	}
 	var auth localHandshake
-	if readFrame(c, &auth) != nil || auth.Protocol != hello.Protocol || auth.Authority != hello.Authority || auth.WorkerBuild != build || auth.ServerNonce != nonce || !validNonce(auth.ClientNonce) || auth.ControllerID == "" || len(auth.ControllerID) > 256 || auth.Lease != 0 || !equalProof(auth.Proof, localAuthenticationProof(key, "controller", auth)) {
+	if readFrame(c, &auth) != nil {
+		return
+	}
+	if auth.Mode == "readiness" {
+		serveLocalReadiness(ctx, c, owner, key, build, hello, auth, controllers)
+		return
+	}
+	if auth.Mode != "" || auth.Protocol != hello.Protocol || auth.Authority != hello.Authority || auth.WorkerBuild != build || auth.ServerNonce != nonce || !validNonce(auth.ClientNonce) || auth.ControllerID == "" || len(auth.ControllerID) > 256 || auth.Lease != 0 || !equalProof(auth.Proof, localAuthenticationProof(key, "controller", auth)) {
 		return
 	}
 	auth.Lease, e = controllers.advanceAndInstall(ctx, owner.journal, auth.ControllerID, c)
@@ -215,6 +223,7 @@ func serveLocalController(ctx context.Context, c *net.UnixConn, owner *SessionOw
 			if req.Type == "stream_page" {
 				var page LocalInvocationPage
 				page, e = owner.journal.LocalStreamPage(ctx, owner.captureKey, auth.Lease, req.Sequence, req.Cursor, req.Limit)
+				response.Readiness = &page.Readiness
 				if e == nil {
 					response.Stream = &page
 				}
@@ -296,6 +305,8 @@ func serveLocalController(ctx context.Context, c *net.UnixConn, owner *SessionOw
 // not a fabricated cloud account. Private MAC possession is not current registry
 // authorization: AdmitIntent must run under LocalController's actual fence.
 type LocalClient struct {
+	controllerID string
+	directory    string
 	mu           sync.Mutex
 	conn         net.Conn
 	Lease        int64
@@ -369,7 +380,7 @@ func DialLocal(ctx context.Context, dir string, scope AuthorityScope, key []byte
 		}
 		return fail(e)
 	}
-	return &LocalClient{conn: c, Lease: reply.Lease, WorkerBuild: reply.WorkerBuild, authority: scope, ownerProcess: ownerProcess}, nil
+	return &LocalClient{controllerID: id, directory: dir, conn: c, Lease: reply.Lease, WorkerBuild: reply.WorkerBuild, authority: scope, ownerProcess: ownerProcess}, nil
 }
 func (c *LocalClient) Close() error { return c.conn.Close() }
 func (c *LocalClient) Call(ctx context.Context, req LocalRequest) (LocalResponse, error) {

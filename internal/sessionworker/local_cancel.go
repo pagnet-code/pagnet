@@ -57,7 +57,11 @@ func (j *Journal) requestLocalCancellation(ctx context.Context, lease int64, bin
 	if e != nil {
 		return e
 	}
-	return tx.Commit()
+	e = tx.Commit()
+	if e == nil {
+		j.pulseLocalReady()
+	}
+	return e
 }
 func (j *Journal) localCancellationRequested(sequence int64) (bool, error) {
 	if !j.isLocal() {

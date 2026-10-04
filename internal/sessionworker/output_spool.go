@@ -278,6 +278,7 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 				clear(result.Key)
 				return nativeOutputSpool{}, 0, err
 			}
+			j.pulseLocalReady()
 			return result, result.LastCaptureCount, nil
 		}
 	}
@@ -368,6 +369,7 @@ func (j *Journal) appendOutputDeltas(ctx context.Context, p *nativeSourceProduce
 		clear(result.Key)
 		return nativeOutputSpool{}, 0, err
 	}
+	j.pulseLocalReady()
 	return result, consumed, nil
 }
 

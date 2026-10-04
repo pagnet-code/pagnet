@@ -28,6 +28,13 @@ func (j *Journal) initializeLocalAuthority() error {
 	if !j.isLocal() {
 		return nil
 	}
+	if j.localReadiness == nil {
+		var e error
+		j.localReadiness, e = newLocalReadiness()
+		if e != nil {
+			return e
+		}
+	}
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS worker_local_stream_heads(sequence INTEGER PRIMARY KEY,payload BLOB NOT NULL,closed INTEGER NOT NULL CHECK(closed IN(0,1)))`,
 		`CREATE TABLE IF NOT EXISTS worker_local_cancellations(sequence INTEGER PRIMARY KEY,command_id TEXT NOT NULL,admission_id TEXT NOT NULL,controller_epoch INTEGER NOT NULL CHECK(controller_epoch>0))`,

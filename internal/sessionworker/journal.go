@@ -54,6 +54,7 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
+	localReadiness       *localReadiness
 	outputEncoder        nativeOutputEncoder
 	nativeTurnLookup     *sql.Stmt
 	outputSpoolLookup    *sql.Stmt
@@ -250,6 +251,7 @@ func privateDirectory(dir string) error {
 }
 
 func (j *Journal) Close() error {
+	j.localReadiness.close()
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.outputEncoder.close()
@@ -484,7 +486,11 @@ func (j *Journal) Settle(ctx context.Context, sequence int64, state string, resu
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	j.pulseLocalReady()
+	return nil
 }
 
 func (j *Journal) Outcome(ctx context.Context, sequence int64) (out Outcome, err error) {

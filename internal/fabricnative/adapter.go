@@ -364,7 +364,6 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 	stop := context.AfterFunc(ctx, cancel)
 	defer stop()
 	defer cancel()
-	delay := 20 * time.Millisecond
 	fail := func(e error) (fabric.InvocationFrame, error) {
 		_ = s.Close()
 		if errors.Is(e, context.Canceled) {
@@ -458,19 +457,21 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 				return fail(adapterError(fabric.CodeTargetUnavailable, "Native terminal evidence was already consumed"))
 			}
 		}
-		timer := time.NewTimer(delay)
-		if delay < 250*time.Millisecond {
-			delay *= 2
-			if delay > 250*time.Millisecond {
-				delay = 250 * time.Millisecond
+		// Ticket publication may have preceded the Page token after the first
+		// poll. Check it once more before sleeping; subsequent publication changes
+		// that captured token, so the auxiliary wait cannot miss readiness.
+		if !s.started {
+			if e = s.adapter.activation(life, h); e != nil {
+				return fail(e)
 			}
 		}
-		select {
-		case <-life.Done():
-			timer.Stop()
-			return fail(life.Err())
-		case <-timer.C:
+		if response.Readiness == nil {
+			return fail(adapterError(fabric.CodeProtocolError, "Native readiness token unavailable"))
 		}
+		if _, e = h.Client.WaitReady(life, h.ControlKey, *response.Readiness); e != nil {
+			return fail(e)
+		}
+
 	}
 }
 func (s *nativeStream) Close() (result error) {

@@ -149,6 +149,9 @@ func actualAdapterRig(t *testing.T, pressure ...bool) *adapterRig {
 	if len(pressure) > 0 && pressure[0] {
 		spec.Env = append(spec.Env, "PAGNET_FAKE_FULL_OUTPUT=1", "PAGNET_FAKE_OUTPUT_CHUNK_BYTES=8")
 	}
+	if len(pressure) > 1 && pressure[1] {
+		spec.Env = append(spec.Env, "PAGNET_FAKE_INTERACTION=permission")
+	}
 	profile, err := hex.DecodeString(sessionworker.LocalNativeProfileFingerprint(spec))
 	if err != nil {
 		t.Fatal(err)
@@ -540,4 +543,163 @@ func TestActualNativeAdapterPrecancelledPullStopsPrelaunchWithoutEffect(t *testi
 		t.Fatal("Pre-cancelled source launched native effect", e)
 	}
 	_ = result.Stream.Close()
+}
+
+func TestActualNativeAdapterQuietReadinessDoesNotPollAndCancelIsIndependent(t *testing.T) {
+	r := actualAdapterRig(t, false, true)
+	result, _, e := r.execute(t, "adapter-quiet-notification", "real native approval wait")
+	if e != nil {
+		t.Fatal(e)
+	}
+	frame, e := result.Stream.Next(r.ctx)
+	if e != nil || frame.Kind != fabric.FrameStart {
+		t.Fatal("No native Start", e)
+	}
+	next := make(chan error, 1)
+	go func() {
+		frame, e := result.Stream.Next(r.ctx)
+		if e == nil {
+			e = errors.New("Quiet native unexpectedly produced a frame " + string(frame.Kind))
+		}
+		next <- e
+	}()
+	// Actual parser commits permission state once, then blocks without output.
+	// This is the same stream readiness boundary as a long silent model turn.
+	time.Sleep(250 * time.Millisecond)
+	before := r.reads.Load()
+	// Cross the 5s private-handshake deadline: it must not truncate the
+	// distinct 30s readiness wait into repeated source SQL acquisitions.
+	time.Sleep(6 * time.Second)
+	if after := r.reads.Load(); after != before {
+		t.Fatal("Quiet source repeatedly acquired root SQL", before, after)
+	}
+	saved, _, e := r.adapter.config.Checkpoints.Load(r.ctx, r.owner.PrincipalView(), "adapter-quiet-notification")
+	if e != nil {
+		t.Fatal(e)
+	}
+	reservation, e := r.authority.LookupNativeDispatch(r.ctx, r.owner, saved.Admission, saved.OriginalBinding)
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := r.resolver.handle
+	response, e := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "stream_page", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: reservation.Sequence, Cursor: 0, Limit: 1})
+	if e != nil || response.Readiness == nil {
+		t.Fatal("No quiet token", e)
+	}
+	oldToken := *response.Readiness
+	wrong := bytes.Repeat([]byte{93}, 32)
+	if _, e = h.Client.WaitReady(r.ctx, wrong, oldToken); e == nil {
+		t.Fatal("Wrong control key authenticated readiness")
+	}
+	if _, e = h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "snapshot"}); e != nil {
+		t.Fatal("Unauthenticated readiness displaced primary", e)
+	}
+	preStop, preErr := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "snapshot"})
+	if preStop.Snapshot == nil || preStop.Snapshot.PID <= 1 || preStop.Snapshot.NativeSessionID == "" {
+		t.Fatal("Quiet source lacks genuine native ownership")
+	}
+	if preErr != nil {
+		t.Fatal(preErr)
+	}
+	started := time.Now()
+	if e = result.Stream.Close(); e != nil {
+		t.Fatal("Readiness blocked primary cancellation", e)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("Auxiliary wait blocked cancellation")
+	}
+	select {
+	case nextErr := <-next:
+		var cancelled *fabric.Error
+		if !errors.As(nextErr, &cancelled) || cancelled.Code != fabric.CodeCancelled || cancelled.Effect != fabric.EffectUnknown {
+			t.Fatal("Auxiliary cancellation lost structured effect state", nextErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Cancelled auxiliary wait was stranded")
+	}
+	// The fake runtime deliberately drains a held permission for 2s on TERM.
+	// Allow that genuine shutdown plus bounded source capture, independently
+	// of the immediate cancellation ACK/wait cancellation assertions above.
+	// Genuine stop/EOF commits source frames before the next waiter registers.
+	// The old captured token must wake immediately rather than miss that commit.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, e = h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "stream_page", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: reservation.Sequence, Cursor: 0, Limit: 1})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if response.Stream != nil && response.Stream.Terminal && response.Readiness != nil && response.Readiness.Counter > oldToken.Counter {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Genuine native stop/EOF did not settle source")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(response.Stream.Frames) != 1 {
+		t.Fatal("Missing exact native cancellation evidence")
+	}
+	terminal, e := sessionworker.OpenLocalInvocationFrame(h.ControlKey, h.Ownership, h.Directory, response.Stream.Source, response.Stream.Frames[0])
+	if e != nil || terminal.Kind != fabric.FrameError || terminal.Error == nil || terminal.Error.Code != fabric.CodeCancelled || terminal.Error.Effect != fabric.EffectUnknown {
+		t.Fatal("Cancelled native EOF fabricated completion", e)
+	}
+	stopped, e := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "snapshot"})
+	if e != nil || stopped.Snapshot == nil || stopped.Snapshot.PID != 0 {
+		t.Fatal("Genuine native stop did not join", e)
+	}
+	waitCtx, stop := context.WithTimeout(r.ctx, time.Second)
+	defer stop()
+	token, e := h.Client.WaitReady(waitCtx, h.ControlKey, oldToken)
+	if e != nil || token.Boot != oldToken.Boot || token.Counter <= oldToken.Counter {
+		t.Fatal("Genuine committed change-before-wait was lost", e)
+	}
+}
+
+func TestActualNativeReadinessWaitIsFencedByPrimaryTakeover(t *testing.T) {
+	r := actualAdapterRig(t, false, true)
+	result, _, e := r.execute(t, "adapter-readiness-takeover", "real native approval wait")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if frame, e := result.Stream.Next(r.ctx); e != nil || frame.Kind != fabric.FrameStart {
+		t.Fatal(e)
+	}
+	time.Sleep(200 * time.Millisecond)
+	saved, _, e := r.adapter.config.Checkpoints.Load(r.ctx, r.owner.PrincipalView(), "adapter-readiness-takeover")
+	if e != nil {
+		t.Fatal(e)
+	}
+	reservation, e := r.authority.LookupNativeDispatch(r.ctx, r.owner, saved.Admission, saved.OriginalBinding)
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := r.resolver.handle
+	response, e := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "stream_page", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: reservation.Sequence, Cursor: 0, Limit: 1})
+	if e != nil || response.Readiness == nil {
+		t.Fatal("No actual readiness token", e)
+	}
+	waiting := make(chan error, 1)
+	go func() { _, e := h.Client.WaitReady(r.ctx, h.ControlKey, *response.Readiness); waiting <- e }()
+	time.Sleep(50 * time.Millisecond)
+	next, e := sessionworker.DialLocal(r.ctx, h.Directory, h.Ownership, h.ControlKey, "actual-readiness-B")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer next.Close()
+	select {
+	case e := <-waiting:
+		if e == nil {
+			t.Fatal("Replaced primary lease retained readiness authority")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Takeover did not invalidate readiness wait")
+	}
+	B, e := r.authority.AcquireController(r.ctx, r.owner, h.Current.Scope, h.Current.Epoch(), "ready-current-B", "ready-current-B")
+	if e != nil {
+		t.Fatal(e)
+	}
+	r.resolver.handle = WorkerHandle{Current: B, Binding: h.Binding, Ownership: h.Ownership, Directory: h.Directory, ControlKey: h.ControlKey, Client: next}
+	if e = result.Stream.Close(); e != nil {
+		t.Fatal(e)
+	}
 }

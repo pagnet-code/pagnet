@@ -242,6 +242,7 @@ func newSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKe
 	}
 	if local {
 		owner.localActivation = newLocalActivationBroker(j.authority)
+		owner.localActivation.ready = j.localReadiness
 		owner.localActivation.persist = func(r LocalActivationRequest, origin fabricidentity.Origin) error {
 			return j.retainLocalActivation(owner.ctx, owner.captureKey, r, origin)
 		}

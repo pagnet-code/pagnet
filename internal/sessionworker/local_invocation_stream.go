@@ -42,10 +42,11 @@ type LocalInvocationCipherFrame struct {
 	Digest     string `json:"digest"`
 }
 type LocalInvocationPage struct {
-	Source   LocalStreamSource            `json:"source"`
-	Frames   []LocalInvocationCipherFrame `json:"frames"`
-	Floor    int64                        `json:"floor,string"`
-	Terminal bool                         `json:"terminal"`
+	Readiness ReadinessToken               `json:"readiness"`
+	Source    LocalStreamSource            `json:"source"`
+	Frames    []LocalInvocationCipherFrame `json:"frames"`
+	Floor     int64                        `json:"floor,string"`
+	Terminal  bool                         `json:"terminal"`
 }
 type localStreamMeta struct {
 	Version           string

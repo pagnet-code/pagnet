@@ -34,6 +34,7 @@ type localActivationTicket struct {
 	done        chan activationReply
 }
 type localActivationBroker struct {
+	ready   *localReadiness
 	mu      sync.Mutex
 	scope   AuthorityScope
 	lease   int64
@@ -96,6 +97,9 @@ func (b *localActivationBroker) await(ctx context.Context, source *LocalIntentSo
 	}
 	ticket := &localActivationTicket{request: LocalActivationRequest{ID: uuid.NewString(), Authority: b.scope, SourceCommandID: source.Commitment.CommandID, NativeGeneration: generation, ActualRuntime: runtime, OriginalSource: *source}, done: make(chan activationReply, 1)}
 	b.ticket = ticket
+	if b.ready != nil {
+		b.ready.pulse()
+	}
 	b.mu.Unlock()
 	defer func() {
 		b.mu.Lock()

@@ -140,6 +140,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		if previous != digest {
 			return ErrConflict
 		}
+		j.pulseLocalReady()
 		if producer != nil && observation.Event.Type == session.EventSessionStopped {
 			producer.stoppedCommitted = true
 		}
@@ -254,6 +255,9 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		}
 	}
 	err = tx.Commit()
+	if err == nil {
+		j.pulseLocalReady()
+	}
 	if err == nil && terminal {
 		producer.stoppedCommitted = true
 	}

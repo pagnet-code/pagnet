@@ -292,6 +292,13 @@ func TestLocalInvocationRestartAndStaleFloorNeverRegenerates(t *testing.T) {
 		t.Fatal(e)
 	}
 	retained, _ := localPageFrames(t, f, -1)
+	if !page.Readiness.valid() || !retained.Readiness.valid() || retained.Readiness.Boot == page.Readiness.Boot {
+		t.Fatal("Genuine restart reused invalid or previous notification boot")
+	}
+	// A new worker notification boot cannot rewrite original signed source
+	// identity or any retained ciphertext/frame/floor/terminal evidence.
+	page.Readiness = ReadinessToken{}
+	retained.Readiness = ReadinessToken{}
 	if !sameLocalJSON(retained, page) {
 		t.Fatal("restarted stream changed original evidence")
 	}
@@ -392,14 +399,23 @@ func TestLocalInvocationPageExactAdmissionBeforeBeginIsPending(t *testing.T) {
 	f := newLocalStreamFixtureWithBegin(t, DefaultLocalStreamConfig(), false)
 	ctx := context.Background()
 	page, e := f.j.LocalStreamPage(ctx, f.key, f.lease, f.turn.Sequence, -1, 4)
+	if !page.Readiness.valid() {
+		t.Fatal("Authenticated pending admission omitted readiness")
+	}
+	page.Readiness = ReadinessToken{}
 	if !errors.Is(e, ErrLocalInvocationNotReady) || !reflect.DeepEqual(page, LocalInvocationPage{}) {
 		t.Fatal("pre-materialization invented stream/source", e)
 	}
 	if _, e = f.j.LocalStreamPage(ctx, f.key, f.lease, f.turn.Sequence+1, -1, 4); !errors.Is(e, ErrRetired) {
 		t.Fatal("never-admitted pending", e)
 	}
-	if _, e = f.j.LocalStreamPage(ctx, bytes.Repeat([]byte{9}, 32), f.lease, f.turn.Sequence, -1, 4); e == nil || errors.Is(e, ErrLocalInvocationNotReady) {
-		t.Fatal("wrong key saw pending state", e)
+	denied, deniedErr := f.j.LocalStreamPage(ctx, bytes.Repeat([]byte{9}, 32), f.lease, f.turn.Sequence, -1, 4)
+	if deniedErr == nil || errors.Is(deniedErr, ErrLocalInvocationNotReady) || !reflect.DeepEqual(denied, LocalInvocationPage{}) {
+		t.Fatal("Wrong key saw pending source/readiness", deniedErr)
+	}
+	denied, deniedErr = f.j.LocalStreamPage(ctx, f.key, f.lease+1, f.turn.Sequence, -1, 4)
+	if deniedErr == nil || !reflect.DeepEqual(denied, LocalInvocationPage{}) {
+		t.Fatal("Foreign lease saw pending source/readiness", deniedErr)
 	}
 	if e = f.j.Settle(ctx, f.turn.Sequence, "uncertain", json.RawMessage(`{}`)); e != nil {
 		t.Fatal(e)
@@ -497,6 +513,13 @@ func TestLocalInvocationBatchProjectionPreservesOriginalEvidence(t *testing.T) {
 				t.Fatal("exact FULL retry", count, e)
 			}
 			replay, _ := localPageFrames(t, f, -1)
+			if !page.Readiness.valid() || replay.Readiness.Boot != page.Readiness.Boot || replay.Readiness.Counter < page.Readiness.Counter {
+				t.Fatal("Authentic batch retry changed notification boot or reset counter")
+			}
+			// Readiness reports a commit reconciliation, not immutable source
+			// identity. Every source field and exact sealed frame stays equal.
+			page.Readiness = ReadinessToken{}
+			replay.Readiness = ReadinessToken{}
 			if !reflect.DeepEqual(page, replay) || sourceCount(t, f.j, "worker_output_deltas") != len(events) {
 				t.Fatal("retry duplicated original rows or projection")
 			}

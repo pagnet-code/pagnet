@@ -98,7 +98,11 @@ func (j *Journal) BeginLocalInvocationStream(ctx context.Context, key []byte, tu
 	if e = j.writeLocalStreamMeta(ctx, tx, key, m); e != nil {
 		return e
 	}
-	return tx.Commit()
+	if e := tx.Commit(); e != nil {
+		return e
+	}
+	j.pulseLocalReady()
+	return nil
 }
 
 // Caller holds original native producer and journal transaction. Repeated
@@ -334,13 +338,18 @@ func (j *Journal) localStreamAbsentHead(ctx context.Context, tx *sql.Tx, sequenc
 
 // LocalStreamPage never grants authority: the private control composition must
 // additionally fresh-authorize the original caller and current root per pull.
-func (j *Journal) LocalStreamPage(ctx context.Context, key []byte, lease, sequence, afterCursor int64, limit int) (LocalInvocationPage, error) {
-	var out LocalInvocationPage
+func (j *Journal) LocalStreamPage(ctx context.Context, key []byte, lease, sequence, afterCursor int64, limit int) (out LocalInvocationPage, err error) {
 	if ctx == nil || !j.isLocal() || sequence <= 0 || afterCursor < -1 || limit < 1 || limit > 4 {
 		return out, ErrFenced
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	token := j.localReadiness.snapshot()
+	defer func() {
+		if err == nil || errors.Is(err, ErrLocalInvocationNotReady) {
+			out.Readiness = token
+		}
+	}()
 	tx, e := j.db.BeginTx(ctx, nil)
 	if e != nil {
 		return out, e

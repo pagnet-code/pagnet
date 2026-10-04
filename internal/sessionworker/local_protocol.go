@@ -22,6 +22,7 @@ type LocalRequest struct {
 	Sequence         int64                          `json:"sequence,omitempty"`
 }
 type LocalResponse struct {
+	Readiness    *ReadinessToken                     `json:"readiness,omitempty"`
 	Observations []NativeObservation                 `json:"observations,omitempty"`
 	Capture      *NativeCaptureChunk                 `json:"capture,omitempty"`
 	Stream       *LocalInvocationPage                `json:"stream,omitempty"`
