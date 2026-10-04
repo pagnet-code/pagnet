@@ -27,7 +27,13 @@ func TestNativeProofIdentityPreservesExactInstantsAndEverySourceField(t *testing
 		case reflect.Int64:
 			field.SetInt(field.Int() + 1)
 		case reflect.Pointer:
-			field.SetZero()
+			if field.IsNil() {
+				// Optional source alternatives are nil in this task fixture. Setting
+				// nil to nil would test no mutation at all; introduction must differ.
+				field.Set(reflect.New(field.Type().Elem()))
+			} else {
+				field.SetZero()
+			}
 		case reflect.Struct:
 			mutated.SourceRunnerEpoch = epoch.Add(time.Nanosecond)
 		default:

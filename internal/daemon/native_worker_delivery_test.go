@@ -277,7 +277,14 @@ func TestNativeTaskContentCapabilityRequiredBeforeAnyBackendWrite(t *testing.T) 
 	writes, acknowledgements := 0, 0
 	c, o := deliveryFixture(t, func(context.Context, string, any) error { writes++; return nil })
 	o.Event = session.SessionEvent{Type: session.EventTurnOutput, SessionID: o.NativeSessionID, TurnID: "pagnet-worker-turn-1", NativeOutput: true, Output: "private native text must never reach wire"}
-	o.TurnSource = &sessionworker.NativeTurnSource{Sequence: 1, LogicalTurnID: o.Event.TurnID, NativeGeneration: o.NativeGeneration, NativeSessionID: o.NativeSessionID, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String(), InputKind: "task", SourceTask: &transport.NativeTaskSource{TaskID: domain.NewID().String()}}
+	taskID := domain.NewID().String()
+	admission, err := c.AuthenticatedNativeHostSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a structurally valid original task source. The missing backend
+	// capability, not a missing source crypto scope, is the guard under test.
+	o.TurnSource = &sessionworker.NativeTurnSource{Sequence: 1, LogicalTurnID: o.Event.TurnID, NativeGeneration: o.NativeGeneration, NativeSessionID: o.NativeSessionID, SourceCommandID: domain.NewID().String(), SourceAdmissionID: domain.NewID().String(), InputKind: "task", SourceTask: &transport.NativeTaskSource{TaskID: taskID, InputAAD: e2ee.AAD{TenantID: admission.TenantID, NetworkID: domain.NewID().String(), ObjectType: e2ee.ObjectTypeTask, ObjectID: taskID, KeyEpochID: domain.NewID().String()}}}
 	o.OutputContent = &transport.NativeContentReference{}
 	a, err := NativeWorkerWireObservation(o)
 	if err != nil {

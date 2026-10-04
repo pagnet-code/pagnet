@@ -25,6 +25,7 @@ type Specification struct {
 	Target          string
 	InterceptorID   string
 	Stage           string
+	Phase           string
 	AdapterProtocol string
 	Incoming        fabric.TraceContext
 }
@@ -96,6 +97,10 @@ func (p *OpenTelemetry) Start(ctx context.Context, spec Specification) (context.
 	if len(spec.Stage) <= 128 && fabric.ValidNamespacedName(spec.Stage) {
 		attrs = append(attrs, attribute.String("pagnet.operation.stage", spec.Stage))
 	}
+	switch spec.Phase {
+	case "request", "response", "error", "chunk", "completion":
+		attrs = append(attrs, attribute.String("pagnet.interceptor.phase", spec.Phase))
+	}
 	if len(spec.AdapterProtocol) <= 128 && fabric.ValidNamespacedName(spec.AdapterProtocol) {
 		attrs = append(attrs, attribute.String("pagnet.adapter.protocol", spec.AdapterProtocol))
 	}
@@ -119,6 +124,10 @@ func (s *otelSpan) End(disposition string) {
 			s.span.SetStatus(codes.Ok, "")
 		case "cancelled":
 			s.span.SetStatus(codes.Error, "operation cancelled")
+		case "timeout":
+			s.span.SetStatus(codes.Error, "operation timed out")
+		case "rejected":
+			s.span.SetStatus(codes.Error, "operation rejected")
 		default:
 			disposition = "failed"
 			s.span.SetStatus(codes.Error, "operation failed")

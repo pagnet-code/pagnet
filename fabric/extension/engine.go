@@ -345,19 +345,23 @@ func (e *Engine) call(ctx context.Context, r CompiledRegistration, request Inter
 	if ctx.Err() != nil {
 		return Decision{}, ctx.Err()
 	}
+	var span telemetry.Span
 	if e.tracing != nil {
 		target := ""
 		if request.Envelope.Target != nil {
 			target = request.Envelope.Target.String()
 		}
-		var span telemetry.Span
-		ctx, span = e.tracing.Start(ctx, telemetry.Specification{Name: "pagnet.interceptor", InvocationID: request.Envelope.ID, Target: target, InterceptorID: r.Registration.ID, Stage: request.Stage})
+		ctx, span = e.tracing.Start(ctx, telemetry.Specification{Name: "pagnet.interceptor", InvocationID: request.Envelope.ID, Target: target, InterceptorID: r.Registration.ID, Stage: request.Stage, Phase: string(request.Phase)})
 		defer func() {
 			if span == nil {
 				return
 			}
-			if failure != nil || result.Action == Reject {
+			if errors.Is(failure, context.Canceled) {
+				span.End("cancelled")
+			} else if failure != nil {
 				span.End("failed")
+			} else if result.Action == Reject {
+				span.End("rejected")
 			} else if result.Action == Defer {
 				span.End("deferred")
 			} else {
@@ -370,6 +374,13 @@ func (e *Engine) call(ctx context.Context, r CompiledRegistration, request Inter
 		return Decision{}, ctx.Err()
 	}
 	if err != nil {
+		if span != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				span.End("timeout")
+			} else {
+				span.End("failed")
+			}
+		}
 		// Availability policy never licenses corrupt control messages, invalid
 		// mutations or forged routing. Fail-open applies only to a timeout or an
 		// explicitly classified binding outage, before any decision is accepted.
