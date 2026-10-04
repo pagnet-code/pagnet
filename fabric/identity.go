@@ -106,6 +106,16 @@ func (c ExecutionContext) VerifyAuthenticated(audience string) error {
 	return nil
 }
 
+// VerifyAuthenticatedData verifies exact bytes for private infrastructure control
+// protocols. It does not parse an envelope or grant current operation authority.
+// Trusted transport authentication and a current control gate remain mandatory.
+func (c ExecutionContext) VerifyAuthenticatedData(exact []byte, audience string) error {
+	if !c.verified || c.audience != audience || len(exact) == 0 || c.originalDigest != sha256.Sum256(exact) {
+		return NewError(CodeUnauthenticated, "Authenticated control binding mismatch")
+	}
+	return nil
+}
+
 // VerifyBinding checks context against the ORIGINAL envelope and bytes. The
 // engine separately authorizes finalized transformed/redirected dispatch.
 func (c ExecutionContext) VerifyBinding(original Envelope, exactBytes []byte, audience string) error {
