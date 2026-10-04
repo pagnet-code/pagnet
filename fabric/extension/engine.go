@@ -100,6 +100,9 @@ func (e *Engine) ExecuteStage(ctx context.Context, caller fabric.ExecutionContex
 	if err != nil {
 		return Outcome{}, err
 	}
+	if !strings.HasPrefix(stage, string(envelope.Operation)+".") {
+		return Outcome{}, fabric.NewError(fabric.CodeInvalidInput, "Stage does not belong to authenticated operation")
+	}
 	if placement != PlacementSource && placement != PlacementDestination {
 		return Outcome{}, invalidRegistration()
 	}

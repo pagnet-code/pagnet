@@ -20,9 +20,15 @@ type SearchReader interface {
 
 // Config is supplied by trusted composition. It does not select a cloud, model,
 // authorization policy, or endpoint automatically.
-type InvocationInterceptors interface {
+type OperationInterceptors interface {
 	ExecuteStage(context.Context, fabric.ExecutionContext, []byte, string, string, extension.Placement, extension.Downstream) (extension.Outcome, error)
+	ExecuteReadProjection(context.Context, fabric.ExecutionContext, []byte, string, string, extension.Placement, json.RawMessage, extension.Downstream) (extension.Outcome, error)
 }
+
+// ReadResultValidator is current authority/disclosure validation supplied by
+// trusted composition. It runs after cache shortcuts and response interception,
+// so an extension cannot substitute stale or unauthorized registry data.
+type ReadResultValidator func(context.Context, fabric.ExecutionContext, fabric.Envelope, Result) error
 
 type Config struct {
 	Audience            string
@@ -30,7 +36,8 @@ type Config struct {
 	Search              SearchReader
 	Descriptors         fabric.DescriptorStore
 	Dispatcher          fabric.InvocationDispatcher
-	Interceptors        InvocationInterceptors
+	Interceptors        OperationInterceptors
+	ValidateReadResult  ReadResultValidator
 	InvocationPlacement extension.Placement
 	Events              events.EventBus
 	EventSource         string
@@ -137,9 +144,9 @@ func (s *Service) Execute(ctx context.Context, exact []byte, peerEvidence any) (
 	}
 	switch envelope.Operation {
 	case fabric.OperationDiscover:
-		return s.discover(ctx, envelope)
+		return s.dispatchRead(ctx, trusted, exact, envelope)
 	case fabric.OperationDescribe:
-		return s.describe(ctx, envelope)
+		return s.dispatchRead(ctx, trusted, exact, envelope)
 	case fabric.OperationInvoke:
 		return s.dispatchInvoke(ctx, trusted, exact, envelope)
 	default:
