@@ -27,10 +27,13 @@ import (
 // NativeSpec contains immutable host-local configuration. Env is memory-only:
 // it is never encoded into the intent/output journal or sent to controllers.
 type NativeSpec struct {
-	Runtime                                  domain.RuntimeName
-	Binary                                   string
-	PrefixArgs, NativeDirs                   []string
-	Env                                      []string `json:"-"`
+	Runtime                domain.RuntimeName
+	Binary                 string
+	PrefixArgs, NativeDirs []string
+	Env                    []string `json:"-"`
+	// CredentialEnvKeys are explicitly selected memory-only credential slots.
+	// Names are profile metadata; their values never enter a local bootstrap.
+	CredentialEnvKeys                        []string `json:",omitempty"`
 	Workspace, Model, StandingInstructions   string
 	MCPExecutable, NetworkID, Kind, TenantID string
 	NetworkTenantID                          string

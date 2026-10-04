@@ -105,7 +105,7 @@ func runLocalMain(raw []byte, dir string, envFD int, build string) error {
 		if e != nil {
 			return ErrFenced
 		}
-		b.Native.Env, e = mergeLocalRuntimeEnvironment(b.Native.Env, inherited)
+		b.Native.Env, e = mergeLocalRuntimeEnvironment(b.Native, inherited)
 		if e != nil {
 			return e
 		}
