@@ -19,7 +19,7 @@ func mcpCmd() *cobra.Command {
 		Short:  "MCP bridges for managed and external agents",
 		Hidden: false,
 	}
-	cmd.AddCommand(mcpWorkerCmd(), mcpControlCmd(), mcpExternalCmd(), mcpConnectCmd(), mcpExternalProfileCmd(), mcpRuntimeConnectCmd(), mcpRuntimeDisconnectCmd())
+	cmd.AddCommand(mcpFabricCmd(), mcpWorkerCmd(), mcpControlCmd(), mcpExternalCmd(), mcpConnectCmd(), mcpExternalProfileCmd(), mcpRuntimeConnectCmd(), mcpRuntimeDisconnectCmd())
 	return cmd
 }
 
