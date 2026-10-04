@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/identity"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
@@ -60,6 +61,51 @@ func launcherBinding(t *testing.T, c *Checkpoints, value OriginalCheckpoint, bin
 	key := sha256.Sum256([]byte("private controller fixture key"))
 	return LaunchSpec{Directory: filepath.Join(dir, "worker"), Ownership: scope, Native: spec, ControlKey: key[:], RuntimeEnvironment: []string{"ACME_SESSION_CREDENTIAL=pipe-only-credential-marker"}, Attempt: "original-launch", ControllerID: "controller-original"}, peers
 }
+
+// Create genuine signed separate physical ownership, not a synthetic map slot.
+func additionalLauncherBinding(t *testing.T, c *Checkpoints, original LaunchSpec, name string) LaunchSpec {
+	t.Helper()
+	ref, err := fabric.NewEndpointRef(c.store.AuthorityIdentity().PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := c.store.Register(t.Context(), c.owner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{Ref: ref, Kind: "agent.local", Name: name, Description: "Additional capacity fixture", Bindings: []fabric.BindingSummary{{ID: "native", Protocol: "local.native", Version: "1"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := identity.Scope{Endpoint: ref, DescriptorRevision: revision, BindingID: "native"}
+	control, err := c.authority.AcquireController(t.Context(), c.owner, scope, 0, "capacity-"+name, "capacity-controller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, _ := original.Ownership.Local()
+	binding, err := c.authority.BindWorker(t.Context(), c.owner, control, 0, identity.WorkerBinding{WorkerID: name, StateDirectoryID: name + "-state", OwnershipGeneration: name + "-generation", ActualRuntime: local.ActualRuntime, ProfileDigest: local.ProfileDigest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy := original
+	copy.Ownership, err = nativeauthority.NewLocalScope(c.authority.Identity(), binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy.Directory = filepath.Join(filepath.Dir(original.Directory), name)
+	copy.Attempt = "capacity-" + name
+	return copy
+}
+func assertNoCapacityLaunch(t *testing.T, c *Checkpoints, l *Launcher, additional LaunchSpec) {
+	t.Helper()
+	if _, err := l.Launch(t.Context(), additional); err == nil {
+		t.Fatal("physical directory capacity admitted another worker")
+	}
+	state, err := c.LookupLaunch(t.Context(), additional.Ownership)
+	if err != nil || state.Exists {
+		t.Fatal("capacity rejection happened after FULL launch claim", err)
+	}
+	if _, err = os.Stat(additional.Directory); !os.IsNotExist(err) {
+		t.Fatal("capacity rejection prepared/spawned worker")
+	}
+}
+
 func TestActualDetachedLauncherAdoptsSameOriginalWorkerWithoutNativeEffectOrCredentialPersistence(t *testing.T) {
 	c, value, authorityDir := checkpointFixture(t, registry.DefaultOptions())
 	root, e := filepath.Abs("../..")
@@ -192,6 +238,7 @@ func TestActualDetachedLauncherAdoptsSameOriginalWorkerWithoutNativeEffectOrCred
 		t.Fatal(e)
 	}
 	config.Peers = freshPeers
+	config.MaxWorkers = 1
 	recovered, e := NewLauncher(config)
 	if e != nil {
 		t.Fatal(e)
@@ -210,6 +257,8 @@ func TestActualDetachedLauncherAdoptsSameOriginalWorkerWithoutNativeEffectOrCred
 	if freshPeers.ValidateOwner(t.Context(), adopted.Process) == nil {
 		t.Fatal("adopted worker downgraded to owner")
 	}
+	additional := additionalLauncherBinding(t, retainedCheckpoints, s, "after-adoption")
+	assertNoCapacityLaunch(t, retainedCheckpoints, recovered, additional)
 	if _, e = recovered.Launch(t.Context(), s); e == nil {
 		t.Fatal("recovered claim emitted another process")
 	}
@@ -290,7 +339,7 @@ func TestLauncherRejectsEnvironmentBeforeClaimAndCancelledAttemptNeverRelaunches
 		t.Fatal("invalid environment created bootstrap")
 	}
 	// Successful claim consumes a ticket even if its supplied callback is canceled.
-	ticket, e := c.BeginLaunch(t.Context(), s.Ownership, s.Attempt)
+	ticket, e := c.BeginLaunch(t.Context(), s.Ownership, s.Attempt, s.Directory)
 	if e != nil {
 		t.Fatal("invalid env consumed durable claim", e)
 	}
@@ -360,7 +409,7 @@ func TestActualCancellationAfterSpawnPreservesOriginalWorkerForAuthenticatedAdop
 		t.Fatal(e)
 	}
 	s, peers := launcherBinding(t, c, value, wrapper, dir, authorityDir, "cancel-original")
-	l, e := NewLauncher(LauncherConfig{c, peers, wrapper, authorityDir, 10 * time.Second, 2})
+	l, e := NewLauncher(LauncherConfig{c, peers, wrapper, authorityDir, 10 * time.Second, 1})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -405,6 +454,8 @@ func TestActualCancellationAfterSpawnPreservesOriginalWorkerForAuthenticatedAdop
 			}
 		}
 	}()
+	additional := additionalLauncherBinding(t, c, s, "while-original-starts")
+	assertNoCapacityLaunch(t, c, l, additional)
 	cancel()
 	select {
 	case e = <-result:

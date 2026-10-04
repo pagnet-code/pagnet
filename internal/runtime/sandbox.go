@@ -126,11 +126,20 @@ type driverSandboxOpts struct {
 // its network tools at first use.
 func driverSandbox(o driverSandboxOpts) *sandbox.Spec {
 	mcp := pagnetMCPConfig(o.env)
+	// Explicit finalized runtime profile HOME wins over the controller process
+	// environment, exactly as ChildEnv does when constructing the launched child.
+	var home string
+	for _, pair := range o.env {
+		if key, value, ok := strings.Cut(pair, "="); ok && key == "HOME" {
+			home = value
+		}
+	}
 	return sandbox.NewSpec(sandbox.Options{
 		Workspace:  o.workspace,
 		StateDirs:  []string{o.stateDir},
 		NativeDirs: o.nativeDirs,
 		Binary:     o.binary,
+		Home:       home,
 		Socket:     sandbox.SocketFromMCPConfig(mcp),
 		BridgeDir:  sandbox.BridgeDirFromMCPConfig(mcp),
 		ExtraRW:    o.extraRW,

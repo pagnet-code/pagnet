@@ -98,7 +98,24 @@ func NewLauncher(c LauncherConfig) (*Launcher, error) {
 func (l *Launcher) reserve(directory string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed || l.slots[directory] || len(l.slots) >= l.config.MaxWorkers || (l.processes[directory] == nil && len(l.processes) >= l.config.MaxWorkers) {
+	if l.closed || l.slots[directory] {
+		return launchDenied()
+	}
+	// A directory is one physical slot whether it is launching, adopted, or
+	// retains an uncertain/reaped spawn. Count the union before any FULL claim.
+	count := len(l.processes)
+	for dir := range l.clients {
+		if l.processes[dir] == nil {
+			count++
+		}
+	}
+	for dir := range l.slots {
+		if l.processes[dir] == nil && l.clients[dir] == nil {
+			count++
+		}
+	}
+	known := l.processes[directory] != nil || l.clients[directory] != nil
+	if !known && count >= l.config.MaxWorkers {
 		return launchDenied()
 	}
 	l.slots[directory] = true
@@ -157,7 +174,7 @@ func (l *Launcher) Launch(ctx context.Context, s LaunchSpec) (*WorkerConnection,
 	bounded, cancel := context.WithTimeout(ctx, l.config.StartupTimeout)
 	defer cancel()
 	ctx = bounded
-	ticket, e := l.config.Checkpoints.BeginLaunch(ctx, s.Ownership, s.Attempt)
+	ticket, e := l.config.Checkpoints.BeginLaunch(ctx, s.Ownership, s.Attempt, s.Directory)
 	if e != nil {
 		return nil, e
 	}

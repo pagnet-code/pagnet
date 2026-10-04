@@ -91,3 +91,27 @@ func TestDriverSandbox_DeniedEveryDriver(t *testing.T) {
 		t.Fatal("persistent-driver shape: workspace = the denied state dir: spec valid, want a refusal")
 	}
 }
+
+// A private worker intentionally has a minimal process environment. Its signed
+// runtime HOME controls support-path inference, not the controller's HOME.
+func TestDriverSandboxFinalRuntimeHomePreservesProtectedOwnerDirectory(t *testing.T) {
+	selected := t.TempDir()
+	unrelated := t.TempDir()
+	t.Setenv("HOME", unrelated)
+	worker := filepath.Join(selected, "worker")
+	spec := driverSandbox(driverSandboxOpts{workspace: filepath.Join(selected, "workspace"), stateDir: filepath.Join(worker, "native"), binary: filepath.Join(selected, "bin", "runtime"), env: []string{"HOME=" + unrelated, "HOME=" + selected}, denied: []string{worker}})
+	err := spec.Normalize()
+	if err != nil {
+		t.Fatal("final runtime HOME was ignored, support grant swallowed owner state", err)
+	}
+	for _, path := range spec.RO {
+		if path == selected || path == unrelated {
+			t.Fatal("runtime home was granted", path)
+		}
+	}
+	// HOME never weakens an explicit protected-directory refusal.
+	bad := driverSandbox(driverSandboxOpts{workspace: selected, stateDir: filepath.Join(worker, "native"), binary: filepath.Join(selected, "bin", "runtime"), env: []string{"HOME=" + selected}, denied: []string{worker}})
+	if err = bad.Normalize(); err == nil {
+		t.Fatal("runtime HOME bypassed denied containment")
+	}
+}
