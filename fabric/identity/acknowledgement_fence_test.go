@@ -2,10 +2,37 @@ package identity
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/fabric"
 )
+
+type swallowedAdmissionFence struct{ invalidWitness bool }
+
+func (f swallowedAdmissionFence) WithAdmission(_ context.Context, facts AdmissionFacts, next func(Witness) error) error {
+	w := Witness{Version: "test.admission.v1", FinalizedDigest: facts.FinalizedDigest, Value: json.RawMessage(`{}`)}
+	if f.invalidWitness {
+		w.FinalizedDigest = [32]byte{}
+	}
+	_ = next(w)
+	return nil
+}
+func TestAdmissionCannotSwallowCommitOrWitnessFailure(t *testing.T) {
+	for _, invalidWitness := range []bool{false, true} {
+		f := fixture(t)
+		f.a.fence = swallowedAdmissionFence{invalidWitness}
+		calls := 0
+		err := f.a.withFence(t.Context(), AdmissionFacts{FinalizedDigest: sha256.Sum256([]byte("actual finalized request"))}, func(Witness) error {
+			calls++
+			return fabric.NewError(fabric.CodeTargetUnavailable, "Actual durable commit failed")
+		})
+		if err == nil || invalidWitness && calls != 0 || !invalidWitness && calls != 1 {
+			t.Fatal("admission swallowed failed commit or invalid witness", err, calls)
+		}
+	}
+}
 
 type swallowedAcknowledgementFence struct {
 	*ownerFence

@@ -209,6 +209,7 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 	var gate sync.Mutex
 	active := true
 	calls := 0
+	var callbackError error
 	defer func() {
 		gate.Lock()
 		active = false
@@ -228,12 +229,17 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 			return invalid("Local admission fence attempted multiple commits")
 		}
 		if e := validWitness(w, facts); e != nil {
+			callbackError = e
 			return e
 		}
-		return commit(w)
+		callbackError = commit(w)
+		return callbackError
 	})
 	gate.Lock()
 	active = false
+	if err == nil && callbackError != nil {
+		err = callbackError
+	}
 	if err == nil && calls != 1 {
 		err = invalid("Local admission fence did not authorize a commit")
 	}
