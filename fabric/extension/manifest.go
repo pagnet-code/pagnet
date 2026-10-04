@@ -245,6 +245,25 @@ func Compile(manifests []ExtensionManifest, maxInterceptors int) (*Plan, error) 
 	plan.revision = hex.EncodeToString(digest[:])
 	return plan, nil
 }
+
+// CompileConfigured binds operator-private installation and provider/profile
+// configuration to the plan identity used by durable continuations. The digest
+// is supplied by trusted composition, never by an interceptor or invocation.
+// Ordinary Compile intentionally retains its existing manifest-only identity.
+func CompileConfigured(manifests []ExtensionManifest, maxInterceptors int, configurationDigest string) (*Plan, error) {
+	digestBytes, e := hex.DecodeString(configurationDigest)
+	if e != nil || len(digestBytes) != sha256.Size || hex.EncodeToString(digestBytes) != configurationDigest {
+		return nil, invalidRegistration()
+	}
+	plan, e := Compile(manifests, maxInterceptors)
+	if e != nil {
+		return nil, e
+	}
+	raw, _ := json.Marshal(struct{ Purpose, Manifest, Configuration string }{"pagnet.extension.configured-plan.v1", plan.revision, configurationDigest})
+	digest := sha256.Sum256(raw)
+	plan.revision = hex.EncodeToString(digest[:])
+	return plan, nil
+}
 func (p *Plan) Revision() string {
 	if p == nil {
 		return ""
