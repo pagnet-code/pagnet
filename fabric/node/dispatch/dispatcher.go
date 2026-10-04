@@ -107,14 +107,18 @@ func (d *Dispatcher) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 	}
 	var gate sync.Mutex
 	active, called := true, false
+	misused := false
+	var stepError error
 	var produced *admissionStream
 	defer func() { gate.Lock(); active = false; gate.Unlock() }()
-	stream, err := d.config.Admission.WithDispatch(ctx, caller, original, finalized, endpoint, offer, selection, func(admitted context.Context) (fabric.InvocationStream, error) {
+	stream, err := d.config.Admission.WithDispatch(ctx, caller, original, finalized, endpoint, offer, selection, func(admitted context.Context) (result fabric.InvocationStream, callError error) {
 		gate.Lock()
 		defer gate.Unlock()
 		if !active || called {
+			misused = true
 			return nil, fabric.NewError(fabric.CodeProtocolError, "Dispatch admission callback already closed or used")
 		}
+		defer func() { stepError = callError }()
 		called = true
 		if ctx.Err() != nil || admitted == nil || admitted.Err() != nil {
 			return nil, fabric.NewError(fabric.CodeCancelled, "Dispatch admission context ended")
@@ -148,6 +152,12 @@ func (d *Dispatcher) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 	active = false
 	used := called
 	owned := produced
+	if err == nil && stepError != nil {
+		err = stepError
+	}
+	if err == nil && misused {
+		err = fabric.NewError(fabric.CodeProtocolError, "Dispatch admission callback was reused")
+	}
 	gate.Unlock()
 	if err != nil {
 		if owned != nil {

@@ -84,6 +84,9 @@ func (a *admission) WithDispatch(ctx context.Context, _ fabric.ExecutionContext,
 		return nil, errors.New("admission failed after dispatch")
 	case "missing":
 		return nil, nil
+	case "swallow-endpoint-error":
+		_, _ = next(ctx)
+		return nil, nil
 	case "detached":
 		return next(context.WithoutCancel(ctx))
 	case "lost-context":
@@ -235,13 +238,8 @@ func TestAdmissionCannotReplayOrEscapeCallback(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			s, _, e, _, _, adm, a := setup(t)
 			adm.mode = mode
-			r, err := execute(t, s, e)
-			if mode == "double" {
-				if err != nil || a.calls != 1 {
-					t.Fatal(err, a.calls)
-				}
-				r.Stream.Close()
-			} else if mode == "substitute" || mode == "discard-error" {
+			_, err := execute(t, s, e)
+			if mode == "double" || mode == "substitute" || mode == "discard-error" {
 				if err == nil || a.calls != 1 || a.stream.closed != 1 || a.ctx.Err() == nil {
 					t.Fatal("substituted or leaked adapter stream", err)
 				}
@@ -255,6 +253,18 @@ func TestAdmissionCannotReplayOrEscapeCallback(t *testing.T) {
 				t.Fatal("callback replayed endpoint")
 			}
 		})
+	}
+}
+
+func TestAdmissionCannotSwallowEndpointError(t *testing.T) {
+	s, _, e, _, _, adm, a := setup(t)
+	adm.mode = "swallow-endpoint-error"
+	failed := fabric.NewError(fabric.CodeTargetUnavailable, "Actual selected endpoint unavailable")
+	a.err = failed
+	_, err := execute(t, s, e)
+	var typed *fabric.Error
+	if !errors.As(err, &typed) || typed.Code != failed.Code || typed.Message != failed.Message || a.calls != 1 {
+		t.Fatal("admission lost actual endpoint failure", err, a.calls)
 	}
 }
 func TestDirectAuthenticatedRequestStillRequiresNodeFinalization(t *testing.T) {
