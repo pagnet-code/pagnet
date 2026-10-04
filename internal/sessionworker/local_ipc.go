@@ -317,6 +317,8 @@ func DialLocal(ctx context.Context, dir string, scope AuthorityScope, key []byte
 		return nil, e
 	}
 	fail := func(e error) (*LocalClient, error) { c.Close(); return nil, e }
+	stopHandshake := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stopHandshake()
 	if _, _, e = localpeer.Owner(c); e != nil {
 		return fail(e)
 	}
@@ -328,7 +330,11 @@ func DialLocal(ctx context.Context, dir string, scope AuthorityScope, key []byte
 	if e != nil || ownerProcess.UID != uid || ownerProcess.Start <= 0 {
 		return fail(ErrFenced)
 	}
-	c.SetDeadline(time.Now().Add(handshakeTimeout))
+	deadline := time.Now().Add(handshakeTimeout)
+	if requested, ok := ctx.Deadline(); ok && requested.Before(deadline) {
+		deadline = requested
+	}
+	c.SetDeadline(deadline)
 	var h localHandshake
 	if e = readFrame(c, &h); e != nil {
 		return fail(e)
@@ -356,6 +362,12 @@ func DialLocal(ctx context.Context, dir string, scope AuthorityScope, key []byte
 	fresh, e := localpeer.ReadProcess(pid)
 	if e != nil || fresh.PID != ownerProcess.PID || fresh.UID != ownerProcess.UID || fresh.Start != ownerProcess.Start {
 		return fail(ErrFenced)
+	}
+	if !stopHandshake() {
+		if e = ctx.Err(); e == nil {
+			e = ErrFenced
+		}
+		return fail(e)
 	}
 	return &LocalClient{conn: c, Lease: reply.Lease, WorkerBuild: reply.WorkerBuild, authority: scope, ownerProcess: ownerProcess}, nil
 }

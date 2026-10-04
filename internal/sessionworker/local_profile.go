@@ -81,6 +81,14 @@ func validateLocalEnvironment(spec NativeSpec, persisted bool) error {
 	return nil
 }
 
+// ValidateLocalRuntimeEnvironment checks the same environment boundary used by
+// the real worker before a launcher commits its one-attempt spawn claim. It
+// neither returns credential values nor changes the signed bootstrap profile.
+func ValidateLocalRuntimeEnvironment(spec NativeSpec, inherited []string) error {
+	_, err := mergeLocalRuntimeEnvironment(spec, inherited)
+	return err
+}
+
 // The inherited memory-only pipe cannot replace executable/profile settings.
 // Every noncredential pair must match a previously signed bootstrap pair.
 func mergeLocalRuntimeEnvironment(spec NativeSpec, inherited []string) ([]string, error) {
