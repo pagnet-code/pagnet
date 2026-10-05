@@ -23,6 +23,18 @@ func TestLocalExpiredCancellationAfterRenameRetainsOriginalSource(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Construct and initialize the real persistent journal BEFORE issuing the
+	// finite invocation deadline. Filesystem setup is not an admitted invocation
+	// and must not consume the fixture's intentionally short execution lifetime.
+	j, err := OpenAuthorityJournal(filepath.Join(t.TempDir(), "worker"), f.scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	lease, err := j.AdvanceLease(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().UTC().Add(time.Second)
 	envelope := fabric.Envelope{ProtocolVersion: fabric.CurrentProtocolVersion, ID: "expired-original", Operation: fabric.OperationInvoke, Principal: f.owner.PrincipalView(), Source: f.owner.PrincipalView().Ref, Target: &f.binding.Scope.Endpoint, ExpectedRevision: f.binding.Scope.DescriptorRevision, CreatedAt: time.Now().UTC(), Payload: json.RawMessage(`{"input":"original exact prompt"}`), Context: fabric.EnvelopeContext{Origin: f.owner.PrincipalView().Ref, Deadline: &deadline}}
 	raw, _ := json.Marshal(envelope)
@@ -31,15 +43,6 @@ func TestLocalExpiredCancellationAfterRenameRetainsOriginalSource(t *testing.T) 
 		t.Fatal(err)
 	}
 	source, err := f.authority.Admit(ctx, f.owner, f.controller, f.binding, caller, raw, raw, "cancel-source-A", "attempt", "replay")
-	if err != nil {
-		t.Fatal(err)
-	}
-	j, err := OpenAuthorityJournal(filepath.Join(t.TempDir(), "worker"), f.scope)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer j.Close()
-	lease, err := j.AdvanceLease(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

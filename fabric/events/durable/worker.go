@@ -73,7 +73,22 @@ func StartWorkers(ctx context.Context, s *Store, c WorkerConfig) (*Workers, erro
 					until = delivery.LeaseUntil
 				}
 				callCtx, callCancel := context.WithDeadline(lifetime, until)
-				err = callHandler(callCtx, h, delivery.Event)
+				// FULL claim IO may exhaust the lease before a callback can begin.
+				// Never start an effect with an already-expired/cancelled context.
+				err = callCtx.Err()
+				if err == nil && !time.Now().Before(until) {
+					err = context.DeadlineExceeded
+				}
+				if err == nil {
+					err = callHandler(callCtx, h, delivery.Event)
+				}
+				// A handler ignoring its timeout cannot turn a late return into ACK.
+				if err == nil {
+					err = callCtx.Err()
+					if err == nil && !time.Now().Before(until) {
+						err = context.DeadlineExceeded
+					}
+				}
 				callCancel()
 				if err == nil {
 					err = s.Ack(lifetime, delivery.Claim, time.Now().UTC())
