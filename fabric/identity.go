@@ -11,11 +11,12 @@ import (
 // be decoded from wire JSON. Code installed in this process is trusted code;
 // this is not a sandbox against a malicious Go plugin.
 type ExecutionContext struct {
-	principal      Principal
-	audience       string
-	originalDigest [32]byte
-	verified       bool
-	provenance     Provenance
+	authenticationEvidence any
+	principal              Principal
+	audience               string
+	originalDigest         [32]byte
+	verified               bool
+	provenance             Provenance
 }
 
 // Provenance is authenticated ENGINE lineage, not an arbitrary assertion
@@ -46,6 +47,35 @@ func NewAuthenticatedContext(principal Principal, audience string, originalBytes
 		return ExecutionContext{}, NewError(CodeUnauthenticated, "Invalid authenticated context")
 	}
 	return ExecutionContext{principal: principal, audience: audience, originalDigest: sha256.Sum256(originalBytes), verified: true, provenance: Provenance{Origin: principal.Ref}}, nil
+}
+
+// NewAuthenticatedContextWithEvidence is for trusted ingress authenticators only.
+// Evidence is an in-process capability belonging to that authenticator, never
+// caller assertions or a protocol value. Consumers must verify its concrete
+// private type and actual current source; its presence alone grants no authority.
+func NewAuthenticatedContextWithEvidence(principal Principal, audience string, exactOriginal []byte, evidence any) (ExecutionContext, error) {
+	if evidence == nil {
+		return ExecutionContext{}, NewError(CodeUnauthenticated, "Missing private authentication evidence")
+	}
+	c, err := NewAuthenticatedContext(principal, audience, exactOriginal)
+	if err != nil {
+		return c, err
+	}
+	c.authenticationEvidence = evidence
+	return c, nil
+}
+
+// AuthenticationEvidence is for trusted infrastructure only. It must never be
+// copied into envelopes, search, events, telemetry or extension wire payloads.
+func (c ExecutionContext) AuthenticationEvidence() any { return c.authenticationEvidence }
+
+// VerifyAuthenticatedDigest checks an authenticator's private original binding
+// without exposing its payload fingerprint as protocol data.
+func (c ExecutionContext) VerifyAuthenticatedDigest(expected [32]byte, audience string) error {
+	if c.VerifyAuthenticated(audience) != nil || c.originalDigest != expected {
+		return NewError(CodeUnauthenticated, "Private authenticated original binding mismatch")
+	}
+	return nil
 }
 
 // NewAuthenticatedForwardContext is for a trusted authenticator AFTER verifying

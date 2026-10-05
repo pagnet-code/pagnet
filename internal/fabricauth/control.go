@@ -12,7 +12,8 @@ import (
 // WithAuthenticatedControl binds a private fresh control to the actual current
 // kernel peer and retained root. It grants no invocation or ledger permission.
 // Current policy and peer pins must still be checked by the control consumer.
-// Callback is synchronous and bounded; it must not re-enter this Session.
+// Callback is synchronous and bounded. The peer-check mutex is released before
+// recursively composed current-source/authority checks.
 func (s *Session) WithAuthenticatedControl(ctx context.Context, frame fabric.ControlFrame, payload []byte, next func(context.Context, fabric.ExecutionContext) error) error {
 	if s == nil || ctx == nil || next == nil || len(payload) == 0 || len(payload) > 64<<10 {
 		return denied()
@@ -23,7 +24,12 @@ func (s *Session) WithAuthenticatedControl(ctx context.Context, frame fabric.Con
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			s.mu.Unlock()
+		}
+	}()
 	if s.closed || ctx.Err() != nil {
 		return denied()
 	}
@@ -40,8 +46,14 @@ func (s *Session) WithAuthenticatedControl(ctx context.Context, frame fabric.Con
 	if frame.Principal != principal || frame.SourceDomain != root.Namespace || frame.SourceStoreID != root.StoreID || frame.SourceKeyRevision != root.KeyRevision || frame.PayloadDigest != sha256.Sum256(payload) || now.Before(issued) || !now.Before(expires) {
 		return denied()
 	}
-	caller, err := fabric.NewAuthenticatedContext(principal, root.Namespace, raw)
+	binding := &sessionBinding{authority: s.authority, session: s, principal: principal, originalDigest: sha256.Sum256(raw)}
+	caller, err := fabric.NewAuthenticatedContextWithEvidence(principal, root.Namespace, raw, binding)
 	if err != nil {
+		return err
+	}
+	s.mu.Unlock()
+	locked = false
+	if err = current.Err(); err != nil {
 		return err
 	}
 	return next(current, caller)

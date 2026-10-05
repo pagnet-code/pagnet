@@ -12,6 +12,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -52,6 +53,7 @@ type Config struct {
 	Audience, SocketPath   string
 	CurrentRoot            func(context.Context) (registry.AuthorityIdentity, error)
 	ManagedValidator       ManagedValidator
+	ManagedFacts           ManagedFactsProvider
 	OwnerValidator         OwnerValidator
 	MaxPending             int
 	ProofTTL, CheckTimeout time.Duration
@@ -66,6 +68,7 @@ type Session struct {
 	activation *Activation
 	pending    map[*proof]time.Time
 	closed     bool
+	revoked    atomic.Bool
 }
 type proof struct {
 	session *Session
@@ -196,6 +199,7 @@ func (s *Session) verify(ctx context.Context) (fabric.Principal, error) {
 	return principal, nil
 }
 func (s *Session) Close() error {
+	s.revoked.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
@@ -320,7 +324,8 @@ func (a *Authority) Authenticate(ctx context.Context, r fabric.AuthenticationReq
 	if e != nil {
 		return fabric.ExecutionContext{}, e
 	}
-	trusted, e := fabric.NewAuthenticatedContext(principal, a.config.Audience, r.ExactEnvelope)
+	binding := &sessionBinding{authority: a, session: s, principal: principal, originalDigest: sha256.Sum256(r.ExactEnvelope)}
+	trusted, e := fabric.NewAuthenticatedContextWithEvidence(principal, a.config.Audience, r.ExactEnvelope, binding)
 	if e != nil {
 		return fabric.ExecutionContext{}, e
 	}
