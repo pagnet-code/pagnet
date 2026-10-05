@@ -16,6 +16,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
+	"github.com/pagnet-code/pagnet/internal/fabricnode"
 )
 
 func TestActualLocalInitCLIStableOfflineAndProjectModePreserved(t *testing.T) {
@@ -77,6 +78,10 @@ func TestActualLocalInitCLIStableOfflineAndProjectModePreserved(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	settings, e := fabricnode.LoadInstalledServiceSettings(t.Context(), loaded)
+	if e != nil || settings == nil || *settings != fabricnode.DefaultInstalledServiceSettings() {
+		t.Fatal("explicit local init lacks default service infrastructure", e)
+	}
 	original := loaded.Store.AuthorityIdentity()
 	loaded.Close()
 	raw, e = run("init", "--local", "--local-socket", filepath.Join(private, "replacement.sock"), "--json")
@@ -90,6 +95,10 @@ func TestActualLocalInitCLIStableOfflineAndProjectModePreserved(t *testing.T) {
 	loaded, e = localinstallation.Load(t.Context(), authority, registry.Options{})
 	if e != nil {
 		t.Fatal(e)
+	}
+	settings, e = fabricnode.LoadInstalledServiceSettings(t.Context(), loaded)
+	if e != nil || settings == nil || *settings != fabricnode.DefaultInstalledServiceSettings() {
+		t.Fatal("repeat changed retained service configuration", e)
 	}
 	if loaded.Store.AuthorityIdentity().StoreID != original.StoreID {
 		t.Fatal("repeat changed root")
