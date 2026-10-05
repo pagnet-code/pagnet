@@ -59,6 +59,11 @@ type Config struct {
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard
+	// HostedInvocationGuard is the explicit original-invocation composition over
+	// the signed initial-effect journal. When configured, kind="invocation"
+	// delivery is verified against the retained original and accepted as the
+	// native prompt; unconfigured daemons refuse it fail-closed.
+	HostedInvocationGuard *HostedInvocationGuard
 	// FabricMCP is trusted local-node composition; nil refuses the explicit
 	// fabric.mcp protocol instead of falling back to the cloud tool relay.
 	FabricMCP    *ManagedFabricMCP

@@ -22,6 +22,12 @@ func (d *Daemon) doNativeDeliver(conn *websocket.Conn, p transport.NetworkEventP
 	if !ok {
 		return ErrDeferred
 	}
+	if p.Kind == "invocation" {
+		// The retained original prompt is verified against the signed
+		// initial-effect journal and never falls through the legacy
+		// wrapper path.
+		return d.deliverHostedInvocation(conn, p)
+	}
 	kind := p.Kind
 	if kind == "" {
 		kind = "notice"
