@@ -185,8 +185,9 @@ func (s *Server) ServeVerified(ctx context.Context, connection net.Conn, input i
 			}
 			handler := s.config.Handlers[request.Operation]
 			if handler == nil {
-				clear(line)
-				return fabric.NewError(fabric.CodeUnsupported, "Private administration operation is not registered")
+				handler = func(context.Context, *fabricauth.OwnerAdministration, Request) (json.RawMessage, error) {
+					return nil, fabric.NewError(fabric.CodeUnsupported, "Private administration operation is not registered")
+				}
 			}
 			call, callCancel := context.WithTimeout(lifetime, s.config.OperationTimeout)
 			var result json.RawMessage

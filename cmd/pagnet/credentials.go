@@ -287,9 +287,9 @@ func kindIs(want principalKind, got string) bool {
 func agentCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agent",
-		Short: "Manage one agent (its credentials)",
+		Short: "Create an agent or manage its credentials",
 	}
-	cmd.AddCommand(credentialParentCmd(principalAgent))
+	cmd.AddCommand(localAgentCreateCmd(), credentialParentCmd(principalAgent))
 	return cmd
 }
 

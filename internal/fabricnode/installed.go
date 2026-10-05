@@ -13,6 +13,7 @@ import (
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
 	"github.com/pagnet-code/pagnet/fabric/telemetry"
+	"github.com/pagnet-code/pagnet/internal/fabricadmin"
 	"github.com/pagnet-code/pagnet/internal/fabrichost"
 	"github.com/pagnet-code/pagnet/internal/fabricmcp"
 	"github.com/pagnet-code/pagnet/internal/fabricnative"
@@ -46,6 +47,7 @@ type InstalledNode struct {
 	Publisher    *IndexPublisher
 	Host         *fabrichost.Host
 	server       *fabricmcp.Server
+	admin        *fabricadmin.Server
 	incomplete   *CompositionError
 	mu           sync.Mutex
 }
@@ -176,7 +178,11 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 	if err != nil {
 		return nil, err
 	}
-	result.Host, err = fabrichost.Start(ctx, fabrichost.Config{SocketPath: settings.SocketPath, Authority: result.Runtime.Authenticator, Server: result.server, ResolveManaged: result.Runtime.ManagedResolver()})
+	result.admin, err = fabricadmin.New(fabricadmin.Config{Handlers: result.AgentAdministration(result.Publisher.Notify)})
+	if err != nil {
+		return nil, err
+	}
+	result.Host, err = fabrichost.Start(ctx, fabrichost.Config{Protocols: map[string]fabrichost.VerifiedSessionServer{fabrichost.AdminProtocol: result.admin}, SocketPath: settings.SocketPath, Authority: result.Runtime.Authenticator, Server: result.server, ResolveManaged: result.Runtime.ManagedResolver()})
 	if err != nil {
 		return nil, err
 	}
@@ -199,9 +205,16 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 		if err := n.Host.CloseContext(ctx); err != nil {
 			return err
 		}
-	} else if n.server != nil {
-		if err := n.server.CloseContext(ctx); err != nil {
-			return err
+	} else {
+		if n.admin != nil {
+			if err := n.admin.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
+		if n.server != nil {
+			if err := n.server.CloseContext(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	if n.incomplete != nil {
