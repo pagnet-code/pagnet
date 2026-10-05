@@ -384,7 +384,7 @@ func initCmd() *cobra.Command {
 	var networkName, runtimeName, role string
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Generate .pagnet.yaml in this directory (spec §13)",
+		Short: "Initialize a project, or use --local for a private local installation",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if ai {
@@ -471,6 +471,7 @@ func initCmd() *cobra.Command {
 	cmd.Flags().StringVar(&networkName, "network", "", "network name to record (default: the saved/only network)")
 	cmd.Flags().StringVarP(&runtimeName, "runtime", "r", "qwen", "suggested runtime (qwen|claude|fake)")
 	cmd.Flags().StringVarP(&role, "role", "p", "", "role for the suggested agent (e.g. coder)")
+	configureLocalFabricInit(cmd)
 	return cmd
 }
 
