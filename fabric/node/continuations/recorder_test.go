@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events/durable"
 	"github.com/pagnet-code/pagnet/fabric/extension"
 	"github.com/pagnet-code/pagnet/fabric/extension/continuation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
@@ -96,7 +97,7 @@ func fixture(t *testing.T) *rig {
 		t.Fatal(e)
 	}
 	r.dir = filepath.Join(t.TempDir(), "continuations")
-	r.store, e = continuation.Bootstrap(background, r.dir, continuation.Scope{Audience: r.domain.Namespace()}, continuation.DefaultOptions())
+	r.store, e = continuation.Bootstrap(background, r.dir, continuation.Scope{Audience: r.domain.Namespace()}, continuation.DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -220,7 +221,7 @@ func (r *rig) restart() {
 	if e := r.store.Close(); e != nil {
 		r.t.Fatal(e)
 	}
-	s, e := continuation.Open(background, r.dir, continuation.Scope{Audience: r.domain.Namespace()}, continuation.DefaultOptions())
+	s, e := continuation.Open(background, r.dir, continuation.Scope{Audience: r.domain.Namespace()}, continuation.DefaultOptions(), testProtector(r.t))
 	if e != nil {
 		r.t.Fatal(e)
 	}
@@ -585,4 +586,13 @@ func TestApprovedResumeCacheRespondHasNoEndpointEffects(t *testing.T) {
 	if e != nil || retry.Claim.Outcome == nil || retry.Claim.Outcome.Effect != fabric.EffectNotStarted {
 		t.Fatal("cache pretended endpoint completion", retry, e)
 	}
+}
+
+func testProtector(t *testing.T) durable.DataProtector {
+	t.Helper()
+	p, e := durable.NewAESGCM(durable.KeyReference{ID: "test-continuation-private", Version: "1"}, bytes.Repeat([]byte{91}, 32))
+	if e != nil {
+		t.Fatal(e)
+	}
+	return p
 }

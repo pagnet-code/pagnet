@@ -145,7 +145,7 @@ func TestActualKernelConfiguredDeferRestartResumeSameDispatchNoSecondEffect(t *t
 		t.Fatal(err)
 	}
 	storeDir := filepath.Join(private, "continuations")
-	store, err := continuation.Bootstrap(ctx, storeDir, continuation.Scope{Audience: root.Namespace}, continuation.DefaultOptions())
+	store, err := continuation.Bootstrap(ctx, storeDir, continuation.Scope{Audience: root.Namespace}, continuation.DefaultOptions(), installed.Keys)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestActualKernelConfiguredDeferRestartResumeSameDispatchNoSecondEffect(t *t
 	if err = store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = continuation.Open(ctx, storeDir, continuation.Scope{Audience: root.Namespace}, continuation.DefaultOptions())
+	store, err = continuation.Open(ctx, storeDir, continuation.Scope{Audience: root.Namespace}, continuation.DefaultOptions(), installed.Keys)
 	if err != nil {
 		t.Fatal(err)
 	}

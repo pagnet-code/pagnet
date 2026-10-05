@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events/durable"
 )
 
 var ctx = context.Background()
@@ -35,7 +36,7 @@ func auth(t *testing.T, p fabric.Principal, audience string, raw []byte) fabric.
 func fixture(t *testing.T) (*Store, string, Snapshot, fabric.ExecutionContext, fabric.ExecutionContext, time.Time) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "private")
-	s, e := Bootstrap(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e := Bootstrap(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -83,7 +84,7 @@ func TestExactDedupClaimRestartSettlement(t *testing.T) {
 	if e = s.Close(); e != nil {
 		t.Fatal(e)
 	}
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -234,7 +235,7 @@ func TestTransactionalRollbackExpiryAndBounds(t *testing.T) {
 	}
 	s.db.QueryRow("SELECT records,bytes FROM budget").Scan(&rows, &used)
 	b, _ := json.Marshal(v)
-	if used != int64(len(b)) {
+	if used != int64(len(b)+28) {
 		t.Fatal("failed claim reserved quota")
 	}
 	s.db.Exec("DROP TRIGGER reject_claim")
@@ -248,17 +249,17 @@ func TestTransactionalRollbackExpiryAndBounds(t *testing.T) {
 	if e := s.Close(); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := Open(ctx, dir, Scope{"wrong"}, DefaultOptions()); e == nil {
+	if _, e := Open(ctx, dir, Scope{"wrong"}, DefaultOptions(), testProtector(t)); e == nil {
 		t.Fatal("foreign audience opened")
 	}
 	o := DefaultOptions()
 	o.MaxRecords = 0
-	if _, e := Open(ctx, dir, Scope{"test:audience"}, o); e == nil {
+	if _, e := Open(ctx, dir, Scope{"test:audience"}, o, testProtector(t)); e == nil {
 		t.Fatal("invalid limits")
 	}
 	o = DefaultOptions()
 	o.MaxRecords = 1
-	s, e := Open(ctx, dir, Scope{"test:audience"}, o)
+	s, e := Open(ctx, dir, Scope{"test:audience"}, o, testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -271,7 +272,7 @@ func TestTransactionalRollbackExpiryAndBounds(t *testing.T) {
 func TestCrashAfterClaimNoReexecution(t *testing.T) {
 	if os.Getenv("PAGNET_CONTINUATION_CRASH_CHILD") == "1" {
 		dir := os.Getenv("PAGNET_CONTINUATION_DIR")
-		s, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+		s, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 		if e != nil {
 			os.Exit(31)
 		}
@@ -294,7 +295,7 @@ func TestCrashAfterClaimNoReexecution(t *testing.T) {
 	if !errors.As(e, &exit) || exit.ExitCode() != 37 {
 		t.Fatal("child did not crash after durable claim", e)
 	}
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -319,7 +320,7 @@ func TestCapabilityHashOnlyAndPendingReopenRotation(t *testing.T) {
 	if bytes.Contains(data, []byte(token)) || bytes.Contains(data, []byte(token[65:])) {
 		t.Fatal("private capability persisted")
 	}
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -333,7 +334,7 @@ func TestCapabilityHashOnlyAndPendingReopenRotation(t *testing.T) {
 		t.Fatal(e)
 	}
 	s.Close()
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -373,7 +374,7 @@ func TestReceiptTamperingAndCompleteAfterExpiry(t *testing.T) {
 		t.Fatal("truthful expired settlement denied", e)
 	}
 	s.Close()
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -386,18 +387,18 @@ func TestReceiptTamperingAndCompleteAfterExpiry(t *testing.T) {
 func TestMissingCorruptStateFailsClosed(t *testing.T) {
 	s, dir, v, c, _, expiry := fixture(t)
 	issue(t, s, c, v, expiry)
-	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions()); e == nil {
+	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t)); e == nil {
 		t.Fatal("second writer")
 	}
 	s.db.Exec("UPDATE continuations SET snapshot_digest=?", ident("corrupted"))
 	s.Close()
-	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions()); e == nil {
+	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t)); e == nil {
 		t.Fatal("corrupt commitment reopened")
 	}
 	if e := os.Remove(filepath.Join(dir, "continuations.sqlite")); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions()); e == nil {
+	if _, e := Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t)); e == nil {
 		t.Fatal("missing database regenerated")
 	}
 }
@@ -447,7 +448,7 @@ func TestDefaultCapacityMaxEnvelopeStateAnd500StagePipeline(t *testing.T) {
 		t.Fatal("full evidence changed", e)
 	}
 	s.Close()
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -478,7 +479,7 @@ func TestSelectedOutcomeGrammarSurvivesRestart(t *testing.T) {
 		t.Fatal("selected grammar rejected", e)
 	}
 	s.Close()
-	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions())
+	s, e = Open(ctx, dir, Scope{"test:audience"}, DefaultOptions(), testProtector(t))
 	if e != nil {
 		t.Fatal("completion readback grammar changed", e)
 	}
@@ -487,4 +488,13 @@ func TestSelectedOutcomeGrammarSurvivesRestart(t *testing.T) {
 	if e != nil || again.Fresh || again.Outcome == nil || !bytes.Equal(again.Outcome.Data, raw) {
 		t.Fatal("outcome mismatch", e)
 	}
+}
+
+func testProtector(t *testing.T) durable.DataProtector {
+	t.Helper()
+	p, e := durable.NewAESGCM(durable.KeyReference{ID: "test-continuation-private", Version: "1"}, bytes.Repeat([]byte{91}, 32))
+	if e != nil {
+		t.Fatal(e)
+	}
+	return p
 }

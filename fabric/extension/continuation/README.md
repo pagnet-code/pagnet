@@ -5,6 +5,15 @@ an authenticated context. The engine resolves exact allowed resumer principals
 bytes remain immutable and separately committed; transformed data belongs in
 State. The stable engine DeferralID must already be durable before Create.
 
+Bootstrap and Open require an explicit external DataProtector owned by trusted
+composition. Format 2 encrypts snapshots, claim receipts and outcomes with exact
+purpose, audience, deferral identity and pinned key-reference AAD. Even an empty
+store verifies key custody through its protected identity pin. No key is created
+by this adapter and the old plaintext storage format fails closed. Canonical
+plaintext commitments preserve exact retry semantics; quotas charge the actual
+stored ciphertext bytes. Installation composition separately signs the store
+path, options and key-reference pin in its retained root.
+
 Bootstrap creates new state explicitly. Open never regenerates missing or corrupt
 state. A lifetime native OS lock admits one writer; disconnected writable copies
 of one store are unsupported, and restoring an older complete backup requires

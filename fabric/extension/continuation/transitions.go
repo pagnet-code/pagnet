@@ -22,14 +22,17 @@ type row struct {
 	receipt, outcome []byte
 }
 
-func load(ctx context.Context, tx *sql.Tx, id string) (row, error) {
+func (s *Store) load(ctx context.Context, tx *sql.Tx, id string) (row, error) {
 	var r row
-	e := tx.QueryRowContext(ctx, "SELECT snapshot,snapshot_digest,expires,cap_hash,cap_revision,state,receipt,outcome FROM continuations WHERE id=?", id).Scan(&r.snapshot, &r.digest, &r.expires, &r.hash, &r.revision, &r.state, &r.receipt, &r.outcome)
+	e := tx.QueryRowContext(ctx, "SELECT CASE WHEN length(snapshot)<=? THEN snapshot END,snapshot_digest,expires,cap_hash,cap_revision,state,CASE WHEN length(receipt)<=? THEN receipt END,CASE WHEN length(outcome)<=? THEN outcome END FROM continuations WHERE id=?", s.options.MaxSnapshotBytes+maxSealOverhead, 16384+maxSealOverhead, s.options.MaxOutcomeBytes+maxSealOverhead, id).Scan(&r.snapshot, &r.digest, &r.expires, &r.hash, &r.revision, &r.state, &r.receipt, &r.outcome)
 	if errors.Is(e, sql.ErrNoRows) {
 		return r, stale()
 	}
 	if e != nil {
 		return r, internal()
+	}
+	if e = s.openRow(id, &r); e != nil {
+		return row{}, e
 	}
 	return r, nil
 }
@@ -75,7 +78,7 @@ func (s *Store) Create(ctx context.Context, c fabric.ExecutionContext, v Snapsho
 		return Issued{}, e
 	}
 	defer tx.Rollback()
-	prior, e := load(ctx, tx, v.DeferralID)
+	prior, e := s.load(ctx, tx, v.DeferralID)
 	if e == nil {
 		if string(prior.snapshot) != string(b) || prior.expires != expiry {
 			return Issued{}, stale()
@@ -94,10 +97,14 @@ func (s *Store) Create(ctx context.Context, c fabric.ExecutionContext, v Snapsho
 	if e != nil {
 		return Issued{}, e
 	}
-	if e = s.charge(ctx, tx, 1, int64(len(b))); e != nil {
+	sealed, e := s.sealBlob("snapshot", v.DeferralID, b, s.options.MaxSnapshotBytes)
+	if e != nil {
 		return Issued{}, e
 	}
-	if _, e = tx.ExecContext(ctx, "INSERT INTO continuations VALUES(?,?,?,?,?,1,'pending',NULL,NULL)", v.DeferralID, b, digest(b), expiry, hash); e != nil {
+	if e = s.charge(ctx, tx, 1, int64(len(sealed))); e != nil {
+		return Issued{}, e
+	}
+	if _, e = tx.ExecContext(ctx, "INSERT INTO continuations VALUES(?,?,?,?,?,1,'pending',NULL,NULL)", v.DeferralID, sealed, digest(b), expiry, hash); e != nil {
 		return Issued{}, internal()
 	}
 	if e = tx.Commit(); e != nil {
@@ -119,7 +126,7 @@ func (s *Store) RotatePendingCapability(ctx context.Context, c fabric.ExecutionC
 		return Issued{}, e
 	}
 	defer tx.Rollback()
-	r, e := load(ctx, tx, id)
+	r, e := s.load(ctx, tx, id)
 	if e != nil {
 		return Issued{}, e
 	}
@@ -169,7 +176,7 @@ func (s *Store) Claim(ctx context.Context, c fabric.ExecutionContext, token stri
 		return ClaimResult{}, e
 	}
 	defer tx.Rollback()
-	r, e := load(ctx, tx, id)
+	r, e := s.load(ctx, tx, id)
 	if e != nil {
 		return ClaimResult{}, e
 	}
@@ -210,10 +217,14 @@ func (s *Store) Claim(ctx context.Context, c fabric.ExecutionContext, token stri
 	if e != nil || len(b) > 16384 {
 		return ClaimResult{}, internal()
 	}
-	if e = s.charge(ctx, tx, 0, int64(len(b))); e != nil {
+	sealed, e := s.sealBlob("receipt", id, b, 16384)
+	if e != nil {
 		return ClaimResult{}, e
 	}
-	res, e := tx.ExecContext(ctx, "UPDATE continuations SET state='claimed',receipt=? WHERE id=? AND state='pending' AND cap_revision=?", b, id, r.revision)
+	if e = s.charge(ctx, tx, 0, int64(len(sealed))); e != nil {
+		return ClaimResult{}, e
+	}
+	res, e := tx.ExecContext(ctx, "UPDATE continuations SET state='claimed',receipt=? WHERE id=? AND state='pending' AND cap_revision=?", sealed, id, r.revision)
 	if e != nil {
 		return ClaimResult{}, internal()
 	}
@@ -262,7 +273,7 @@ func (s *Store) Complete(ctx context.Context, c fabric.ExecutionContext, receipt
 		return Outcome{}, e
 	}
 	defer tx.Rollback()
-	r, e := load(ctx, tx, receipt.ID)
+	r, e := s.load(ctx, tx, receipt.ID)
 	if e != nil {
 		return Outcome{}, e
 	}
@@ -275,10 +286,14 @@ func (s *Store) Complete(ctx context.Context, c fabric.ExecutionContext, receipt
 		}
 		return out, nil
 	}
-	if e = s.charge(ctx, tx, 0, int64(len(b))); e != nil {
+	sealed, e := s.sealBlob("outcome", receipt.ID, b, s.options.MaxOutcomeBytes)
+	if e != nil {
 		return Outcome{}, e
 	}
-	res, e := tx.ExecContext(ctx, "UPDATE continuations SET state='complete',outcome=? WHERE id=? AND state='claimed'", b, receipt.ID)
+	if e = s.charge(ctx, tx, 0, int64(len(sealed))); e != nil {
+		return Outcome{}, e
+	}
+	res, e := tx.ExecContext(ctx, "UPDATE continuations SET state='complete',outcome=? WHERE id=? AND state='claimed'", sealed, receipt.ID)
 	if e != nil {
 		return Outcome{}, internal()
 	}

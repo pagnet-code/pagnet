@@ -12,7 +12,7 @@ func (s *Store) verify(ctx context.Context) error {
 	// Reject oversized stored blobs before asking the driver to allocate them.
 	var malformed int
 	if e := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM continuations
- WHERE length(snapshot)>? OR length(receipt)>16384 OR length(outcome)>? OR length(cap_hash)!=32 OR cap_revision<1)`, s.options.MaxSnapshotBytes, s.options.MaxOutcomeBytes).Scan(&malformed); e != nil || malformed != 0 {
+ WHERE length(snapshot)>? OR length(receipt)>16384+65536 OR length(outcome)>? OR length(cap_hash)!=32 OR cap_revision<1)`, s.options.MaxSnapshotBytes+maxSealOverhead, s.options.MaxOutcomeBytes+maxSealOverhead).Scan(&malformed); e != nil || malformed != 0 {
 		return internal()
 	}
 	var count, total int64
@@ -33,6 +33,9 @@ func (s *Store) verify(ctx context.Context) error {
 			return internal()
 		}
 		total += n
+		if e = s.openRow(id, &r); e != nil {
+			return e
+		}
 		if len(r.snapshot) > s.options.MaxSnapshotBytes || len(r.receipt) > 16384 || len(r.outcome) > s.options.MaxOutcomeBytes || len(r.hash) != 32 || r.revision < 1 || r.digest != digest(r.snapshot) {
 			return internal()
 		}

@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -20,24 +19,27 @@ import (
 	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events/durable"
 	"github.com/pagnet-code/pagnet/fabric/internal/privatefs"
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	mu      sync.Mutex
-	db      *sql.DB
-	lock    io.Closer
-	scope   Scope
-	options Options
-	closed  bool
+	mu        sync.Mutex
+	db        *sql.DB
+	lock      io.Closer
+	scope     Scope
+	options   Options
+	closed    bool
+	protector durable.DataProtector
+	keyRef    durable.KeyReference
 }
 
 const schema = `CREATE TABLE identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),scope BLOB NOT NULL);
 CREATE TABLE budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),records INTEGER NOT NULL,bytes INTEGER NOT NULL);
 INSERT INTO budget VALUES(1,0,0);
 CREATE TABLE continuations(id TEXT PRIMARY KEY,snapshot BLOB NOT NULL,snapshot_digest TEXT NOT NULL,expires TEXT NOT NULL,cap_hash BLOB NOT NULL,cap_revision INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','claimed','complete')),receipt BLOB,outcome BLOB);
-PRAGMA user_version=1;`
+PRAGMA user_version=2;`
 
 func invalid(s string) error { return fabric.NewError(fabric.CodeInvalidInput, s) }
 func stale() error {
@@ -65,13 +67,16 @@ func (o Options) validate() error {
 
 // Bootstrap creates a new private store explicitly. Open never regenerates a
 // missing database. Both hold a lifetime native OS writer lock, not a PID file.
-func Bootstrap(ctx context.Context, dir string, scope Scope, options Options) (*Store, error) {
-	return open(ctx, dir, scope, options, true)
+func Bootstrap(ctx context.Context, dir string, scope Scope, options Options, protector durable.DataProtector) (*Store, error) {
+	return open(ctx, dir, scope, options, protector, true)
 }
-func Open(ctx context.Context, dir string, scope Scope, options Options) (*Store, error) {
-	return open(ctx, dir, scope, options, false)
+func Open(ctx context.Context, dir string, scope Scope, options Options, protector durable.DataProtector) (*Store, error) {
+	return open(ctx, dir, scope, options, protector, false)
 }
-func open(ctx context.Context, dir string, scope Scope, o Options, create bool) (s *Store, err error) {
+func open(ctx context.Context, dir string, scope Scope, o Options, protector durable.DataProtector, create bool) (s *Store, err error) {
+	if ctx == nil || protector == nil || !text(protector.Reference().ID, 4096) || !text(protector.Reference().Version, 256) {
+		return nil, invalid("Private continuation protector required")
+	}
 	if e := o.validate(); e != nil {
 		return nil, e
 	}
@@ -137,6 +142,7 @@ func open(ctx context.Context, dir string, scope Scope, o Options, create bool) 
 	if _, e = db.ExecContext(ctx, "PRAGMA max_page_count="+formatInt(o.MaxDatabaseBytes/4096)); e != nil {
 		return nil, internal()
 	}
+	s = &Store{db: db, lock: lock, scope: scope, options: o, protector: protector, keyRef: protector.Reference()}
 	if create {
 		tx, e := db.BeginTx(ctx, nil)
 		if e != nil {
@@ -146,7 +152,10 @@ func open(ctx context.Context, dir string, scope Scope, o Options, create bool) 
 		if _, e = tx.ExecContext(ctx, schema); e != nil {
 			return nil, internal()
 		}
-		b, _ := json.Marshal(scope)
+		b, e := s.sealIdentity()
+		if e != nil {
+			return nil, e
+		}
 		if _, e = tx.ExecContext(ctx, "INSERT INTO identity VALUES(1,?)", b); e != nil {
 			return nil, internal()
 		}
@@ -160,20 +169,18 @@ func open(ctx context.Context, dir string, scope Scope, o Options, create bool) 
 	var v int
 	var check string
 	var saved []byte
-	if e = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); e != nil || v != 1 {
+	if e = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); e != nil || v != 2 {
 		return nil, internal()
 	}
 	if e = db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&check); e != nil || check != "ok" {
 		return nil, internal()
 	}
-	if e = db.QueryRowContext(ctx, "SELECT scope FROM identity WHERE singleton=1").Scan(&saved); e != nil {
+	if e = db.QueryRowContext(ctx, "SELECT CASE WHEN length(scope)<=? THEN scope END FROM identity WHERE singleton=1", maxSealOverhead+1024).Scan(&saved); e != nil {
 		return nil, internal()
 	}
-	want, _ := json.Marshal(scope)
-	if string(saved) != string(want) {
-		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Continuation audience mismatch")
+	if e = s.verifyIdentity(saved); e != nil {
+		return nil, e
 	}
-	s = &Store{db: db, lock: lock, scope: scope, options: o}
 	if e = s.verify(ctx); e != nil {
 		return nil, e
 	}

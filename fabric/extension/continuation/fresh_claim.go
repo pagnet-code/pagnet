@@ -47,7 +47,7 @@ func (p *FreshClaim) Consume(ctx context.Context, s *Store, resumer fabric.Execu
 		return Snapshot{}, err
 	}
 	defer tx.Rollback()
-	r, err := load(ctx, tx, receipt.ID)
+	r, err := s.load(ctx, tx, receipt.ID)
 	if err != nil {
 		return Snapshot{}, err
 	}
