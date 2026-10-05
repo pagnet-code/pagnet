@@ -752,7 +752,7 @@ func TestInvokeEndToEnd(t *testing.T) {
 				CreatedAt:       time.Now().UTC().Format(time.RFC3339),
 				KeyEpochID:      epoch.ID,
 			}
-			resEnv, err := e2ee.Encrypt([]byte(`{"ok":true,"text":"hello"}`), key, outAAD)
+			resEnv, err := e2ee.Encrypt([]byte(`{"ok":true,"text":"hello","exact":9007199254740993}`), key, outAAD)
 			if err != nil {
 				http.Error(w, "result: "+err.Error(), 500)
 				return
@@ -823,7 +823,7 @@ func TestInvokeEndToEnd(t *testing.T) {
 	if gotAAD.ObjectID != gotInvokeID {
 		t.Errorf("AAD.ObjectID = %q, want the invocationId %q", gotAAD.ObjectID, gotInvokeID)
 	}
-	want := "{\n  \"ok\": true,\n  \"text\": \"hello\"\n}\n"
+	want := "{\n  \"ok\": true,\n  \"text\": \"hello\",\n  \"exact\": 9007199254740993\n}\n"
 	if out != want {
 		t.Fatalf("invoke output = %q, want the decrypted result %q", out, want)
 	}

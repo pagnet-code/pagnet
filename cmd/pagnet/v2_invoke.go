@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -171,12 +172,10 @@ credential already stored on this host. pagnet service credential create
 					return err
 				}
 				// Pretty-print JSON results; pass through anything else.
-				var pretty any
-				if json.Unmarshal([]byte(plain), &pretty) == nil {
-					if b, err := json.MarshalIndent(pretty, "", "  "); err == nil {
-						fmt.Println(string(b))
-						return nil
-					}
+				var pretty bytes.Buffer
+				if json.Indent(&pretty, []byte(plain), "", "  ") == nil {
+					fmt.Println(pretty.String())
+					return nil
 				}
 				fmt.Println(plain)
 				return nil
