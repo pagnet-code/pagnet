@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/internal/fabricnode"
@@ -150,5 +152,22 @@ func TestLocalFabricPathsExplicitAndDefault(t *testing.T) {
 	authority, socket, e = localFabricPaths("explicit-root", "explicit.sock")
 	if e != nil || !filepath.IsAbs(authority) || !filepath.IsAbs(socket) || filepath.Base(authority) != "explicit-root" {
 		t.Fatal("explicit paths not canonicalized", e)
+	}
+}
+
+func TestLocalInitRejectsOverlongSocketBeforeAnyInstallationState(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "not-created", "authority")
+	socket := filepath.Join(parent, strings.Repeat("x", 200), "node.sock")
+	command := initCmd()
+	command.SetContext(t.Context())
+	command.SetArgs([]string{"--local", "--local-dir", directory, "--local-socket", socket})
+	err := command.Execute()
+	var typed *fabric.Error
+	if !errors.As(err, &typed) || typed.Code != fabric.CodeInvalidInput || !strings.Contains(typed.Message, "shorter socket path") {
+		t.Fatal("socket limit not reported before init", err)
+	}
+	if _, err = os.Lstat(filepath.Join(parent, "not-created")); !os.IsNotExist(err) {
+		t.Fatal("invalid socket initialized immutable state or parents", err)
 	}
 }

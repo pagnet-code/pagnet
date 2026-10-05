@@ -9,6 +9,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
+	"github.com/pagnet-code/pagnet/internal/fabrichost"
 	"github.com/pagnet-code/pagnet/internal/fabricnode"
 	"github.com/spf13/cobra"
 )
@@ -61,6 +62,9 @@ func configureLocalFabricInit(cmd *cobra.Command) {
 		if e != nil {
 			return e
 		}
+		if e = fabrichost.ValidateSocketPath(socket); e != nil {
+			return e
+		}
 		settings := localinstallation.DefaultSettings(socket)
 		if e = localinstallation.PrepareBootstrapParents(authority, settings); e != nil {
 			return e
@@ -76,6 +80,9 @@ func configureLocalFabricInit(cmd *cobra.Command) {
 			retained, err := localinstallation.Load(cmd.Context(), authority, registry.Options{})
 			if err != nil {
 				return err
+			}
+			if err = fabrichost.ValidateSocketPath(retained.Configuration().Settings.SocketPath); err != nil {
+				return errors.Join(err, retained.Close())
 			}
 			if err = fabricnode.InitializeDefaultServices(cmd.Context(), retained); err != nil {
 				return errors.Join(err, retained.Close())

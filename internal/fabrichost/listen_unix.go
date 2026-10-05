@@ -15,6 +15,9 @@ import (
 )
 
 func listenPrivate(path string) (*net.UnixListener, func(), error) {
+	if err := ValidateSocketPath(path); err != nil {
+		return nil, nil, err
+	}
 	parent := filepath.Dir(path)
 	directory, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {

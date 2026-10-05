@@ -104,6 +104,9 @@ func (a Authentication) Validate() error {
 	return nil
 }
 func Start(ctx context.Context, config Config) (*Host, error) {
+	if err := ValidateSocketPath(config.SocketPath); err != nil {
+		return nil, err
+	}
 	if ctx == nil || ctx.Err() != nil || config.Authority == nil || config.ResolveManaged != nil && !config.Authority.SupportsManaged() || !filepath.IsAbs(config.SocketPath) || filepath.Clean(config.SocketPath) != config.SocketPath {
 		return nil, failure()
 	}

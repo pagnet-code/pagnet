@@ -40,6 +40,9 @@ func Dial(ctx context.Context, path string, auth Authentication) (*net.UnixConn,
 // DialProtocol requires an explicitly selected supported protocol and exact
 // ready response. It never negotiates or falls back to privileged owner mode.
 func DialProtocol(ctx context.Context, path string, auth Authentication, protocol string) (*net.UnixConn, *bufio.Reader, error) {
+	if err := ValidateSocketPath(path); err != nil {
+		return nil, nil, err
+	}
 	if protocol != Protocol && protocol != AdminProtocol || auth.Protocol != "" && auth.Protocol != protocol {
 		return nil, nil, failure()
 	}
