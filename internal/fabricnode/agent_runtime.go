@@ -68,7 +68,13 @@ func (n *InstalledNode) selectedAgentRuntime(ctx context.Context, input AgentCre
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Agent working folder must be a directory")
 	}
 	paths := n.Runtime.ExecutionPaths()
-	spec := sessionworker.NativeSpec{Kind: "local", Runtime: selected.Runtime, Binary: selected.Executable, PrefixArgs: append([]string(nil), selected.Profile.Args...), NativeDirs: selected.Profile.Directories(), Workspace: workspace, Model: input.Model, StandingInstructions: input.Role, MCPExecutable: paths.Binary, LocalAuthorityDirectory: paths.AuthorityDirectory, LocalFabricSocket: paths.SocketPath, Env: append([]string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}, selected.Profile.Environment()...)}
+	role := input.Role
+	if role == "" {
+		// A simple description-only agent has useful standing behavior. This
+		// text never affects authentication, grants or executable selection.
+		role = input.Description
+	}
+	spec := sessionworker.NativeSpec{Kind: "local", Runtime: selected.Runtime, Binary: selected.Executable, PrefixArgs: append([]string(nil), selected.Profile.Args...), NativeDirs: selected.Profile.Directories(), Workspace: workspace, Model: input.Model, StandingInstructions: role, MCPExecutable: paths.Binary, LocalAuthorityDirectory: paths.AuthorityDirectory, LocalFabricSocket: paths.SocketPath, Env: append([]string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}, selected.Profile.Environment()...)}
 	if sessionworker.ValidateLocalRuntimeEnvironment(spec, nil) != nil {
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Selected runtime profile contains unsupported or persisted credential settings; select a private credential provider instead")
 	}
@@ -123,7 +129,8 @@ func (n *InstalledNode) ProvisionAgentRuntime(ctx context.Context, access *fabri
 		if e != nil {
 			return result, e
 		}
-		descriptor.Bindings = []fabric.BindingSummary{{ID: "native", Protocol: "local.native", Version: "1", Cancellation: true}}
+		descriptor.Bindings = []fabric.BindingSummary{{ID: "native", Protocol: "local.native", Version: "1", Streaming: true, Cancellation: true}}
+		descriptor.Metadata = fabricagent.NativePromptMetadata()
 		result.Runtime = spec.Runtime
 	}
 	if e = access.VerifyCurrent(ctx); e != nil {

@@ -185,6 +185,24 @@ func TestAgentCreateProvisionsActualClaudeWithoutPaidLaunchAndRetainsWorker(t *t
 	if e != nil || described.IsError || !strings.Contains(described.Content[0].(*sdk.TextContent).Text, "local.native") {
 		t.Fatal("actual bound description unavailable", e)
 	}
+	var fullDescription fabric.DescribeResult
+	if e = fabric.DecodeJSON([]byte(described.Content[0].(*sdk.TextContent).Text), &fullDescription); e != nil || len(fullDescription.Descriptions) != 1 || fullDescription.Descriptions[0].Endpoint == nil {
+		t.Fatal("full endpoint description missing", e)
+	}
+	if string(fullDescription.Descriptions[0].Endpoint.Metadata["extensions.pagnet.agent.input_schema"]) != string(fabricagent.NativePromptMetadata()["extensions.pagnet.agent.input_schema"]) {
+		t.Fatal("actual SDK describe omitted default endpoint input schema")
+	}
+	if strings.Contains(discovered.Content[0].(*sdk.TextContent).Text, "inputSchema") {
+		t.Fatal("schema leaked into hot discovery result")
+	}
+	invalidArgs, _ := json.Marshal(map[string]any{"target": setup.Ref, "expectedRevision": setup.Revision, "input": map[string]any{"input": "valid", "binary": "caller-injection"}})
+	invalid, e := client.Call(ctx, fabric.OperationInvoke, invalidArgs)
+	if e != nil || !invalid.IsError {
+		t.Fatal("descriptor's additionalProperties=false differs from actual native input admission", e)
+	}
+	if _, e = os.Stat(filepath.Join(workspace, "effects")); !os.IsNotExist(e) {
+		t.Fatal("invalid advertised input caused native effect", e)
+	}
 	if out := installedNativeOutput(t, ctx, client, setup.Ref, setup.Revision, "exact user prompt"); out != "exact user prompt" {
 		t.Fatal("direct native input changed", out)
 	}
