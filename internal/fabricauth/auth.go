@@ -60,15 +60,16 @@ type Config struct {
 }
 type Authority struct{ config Config }
 type Session struct {
-	mu         sync.Mutex
-	authority  *Authority
-	conn       *net.UnixConn
-	process    localpeer.ProcessSnapshot
-	principal  fabric.Principal
-	activation *Activation
-	pending    map[*proof]time.Time
-	closed     bool
-	revoked    atomic.Bool
+	mu             sync.Mutex
+	authority      *Authority
+	conn           *net.UnixConn
+	process        localpeer.ProcessSnapshot
+	principal      fabric.Principal
+	activation     *Activation
+	pending        map[*proof]time.Time
+	closed         bool
+	revoked        atomic.Bool
+	revocationDone chan struct{}
 }
 type proof struct {
 	session *Session
@@ -202,7 +203,12 @@ func (s *Session) Close() error {
 	s.revoked.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		if s.revocationDone != nil {
+			close(s.revocationDone)
+		}
+	}
 	for p := range s.pending {
 		delete(s.pending, p)
 	}
