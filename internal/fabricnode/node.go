@@ -42,15 +42,18 @@ type Ports struct {
 	Close  io.Closer
 }
 type Node struct {
-	Store      *registry.Store
-	Service    *node.Service
-	index      *search.Backend
-	reader     node.SearchReader
-	resources  io.Closer
-	directory  string
-	mu         sync.Mutex
-	quarantine error
-	closed     bool
+	Store           *registry.Store
+	Service         *node.Service
+	index           *search.Backend
+	reader          node.SearchReader
+	resources       io.Closer
+	directory       string
+	mu              sync.Mutex
+	quarantine      error
+	closed          bool
+	closeMu         sync.Mutex
+	resourcesClosed bool
+	ownsStore       bool
 }
 
 // Open restores the retained registry and index history. Registration commands
@@ -72,21 +75,47 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	n, err := ComposeRetained(ctx, store, c.Compose)
+	if err != nil {
+		// ComposeRetained joins resources before returning an error. The
+		// original writer remains owned here until that join has completed.
+		var incomplete *CompositionError
+		if errors.As(err, &incomplete) {
+			incomplete.node.ownsStore = true
+		} else {
+			store.Close()
+		}
+		return nil, err
+	}
+	n.ownsStore = true
+	return n, nil
+}
+
+// ComposeRetained shares an already-open installation Store. It never opens or
+// closes that Store: the installation owner releases it after Node.Close joins
+// all composed resources and transports have been joined by their owner.
+func ComposeRetained(ctx context.Context, store *registry.Store, compose func(context.Context, *registry.Store, *search.Backend) (Ports, error)) (_ *Node, err error) {
+	if ctx == nil || store == nil || compose == nil {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "Missing retained node composition")
+	}
+	directory, err := store.CurrentAuthorityDirectory(ctx)
+	if err != nil {
+		return nil, err
+	}
 	keep := false
 	var resources io.Closer
 	defer func() {
-		if !keep {
-			if resources != nil {
-				resources.Close()
+		if !keep && resources != nil {
+			if joinErr := resources.Close(); joinErr != nil {
+				err = &CompositionError{cause: errors.Join(err, joinErr), node: &Node{Store: store, resources: resources, closed: true}}
 			}
-			store.Close()
 		}
 	}()
 	index, err := store.LoadIndex(ctx, store.IndexConfig())
 	if err != nil {
 		return nil, err
 	}
-	ports, err := c.Compose(ctx, store, index)
+	ports, err := compose(ctx, store, index)
 	resources = ports.Close
 	if err != nil {
 		return nil, err
@@ -118,6 +147,18 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	keep = true
 	return n, nil
 }
+
+// CompositionError means construction failed and joining its resources also
+// failed. The original writer remains held. Close retries the join; callers of
+// ComposeRetained must not close their installation before it succeeds.
+type CompositionError struct {
+	cause error
+	node  *Node
+}
+
+func (e *CompositionError) Error() string { return "Node composition failed with resources still held" }
+func (e *CompositionError) Unwrap() error { return e.cause }
+func (e *CompositionError) Close() error  { return e.node.Close() }
 
 // Synchronize publishes only bounded outbox pages. The caller schedules this
 // after registration/synchronization; searches never scan or drain the registry.
@@ -195,18 +236,28 @@ func (n *Node) Search(ctx context.Context, r fabric.DiscoverRequest) (fabric.Dis
 // Close releases the registry's sole-writer lock. Transport owners must close
 // their sessions/streams before closing the composed node.
 func (n *Node) Close() error {
-	n.mu.Lock()
-	if n.closed {
-		n.mu.Unlock()
+	if n == nil {
 		return nil
 	}
+	n.closeMu.Lock()
+	defer n.closeMu.Unlock()
+	n.mu.Lock()
 	n.closed = true
 	n.mu.Unlock()
-	var err error
-	if n.resources != nil {
-		err = n.resources.Close()
+	// A failed or incomplete join must retain the writer. A later Close can
+	// retry joining; resources never become a license to release live state.
+	if !n.resourcesClosed {
+		if n.resources != nil {
+			if err := n.resources.Close(); err != nil {
+				return err
+			}
+		}
+		n.resourcesClosed = true
 	}
-	return errors.Join(err, n.Store.Close())
+	if n.ownsStore {
+		return n.Store.Close()
+	}
+	return nil
 }
 
 var _ node.SearchReader = (*Node)(nil)
