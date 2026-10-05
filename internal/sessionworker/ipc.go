@@ -38,6 +38,7 @@ type handshake struct {
 }
 
 type Request struct {
+	InvocationSource *CloudInvocationSourceRequest                 `json:"invocationSource,omitempty"`
 	InvocationStream *InvocationStreamRequest                      `json:"invocationStream,omitempty"`
 	DeletionProof    *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
 	CancelProposal   *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
@@ -64,6 +65,7 @@ type Request struct {
 }
 
 type Response struct {
+	InvocationSource       *CloudInvocationSourceResult     `json:"invocationSource,omitempty"`
 	InvocationState        *InvocationStreamState           `json:"invocationState,omitempty"`
 	InvocationSubscription *InvocationStreamSubscription    `json:"invocationSubscription,omitempty"`
 	InvocationProjection   *InvocationStreamProjection      `json:"invocationProjection,omitempty"`
@@ -275,6 +277,10 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		serveTerminalStream(ctx, c, owner, controllers, auth.Lease)
 		return
 	}
+	if auth.Mode == "cloud-readiness" {
+		serveCloudReadiness(ctx, c, j, key, auth, controllers)
+		return
+	}
 	if auth.Mode != "" || auth.Lease != 0 || auth.NativeGeneration != "" || auth.Error != "" {
 		return
 	}
@@ -460,6 +466,12 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "invocation_source":
+		if req.InvocationSource == nil {
+			err = ErrConflict
+			break
+		}
+		response.InvocationSource, err = o.journal.cloudInvocationSource(ctx, lease, *req.InvocationSource)
 	case "invocation_subscribe", "invocation_renew", "invocation_read", "invocation_ack", "invocation_unsubscribe", "invocation_status":
 		if req.InvocationStream == nil {
 			err = ErrConflict

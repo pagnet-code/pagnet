@@ -87,6 +87,9 @@ func (j *Journal) initializeTurnSources() error {
 			return err
 		}
 	}
+	if _, err = j.db.Exec(`CREATE INDEX IF NOT EXISTS worker_turn_original_invocation ON worker_turn_sources(sequence,source_command,source_admission)`); err != nil {
+		return err
+	}
 	var count int
 	if err := j.db.QueryRow(`SELECT COUNT(*) FROM worker_turn_sources`).Scan(&count); err != nil {
 		return err
@@ -178,7 +181,11 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	j.pulseLocalReady()
+	return nil
 }
 func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (NativeTurnSource, error) {
 	return scanNativeTurn(tx.QueryRowContext(ctx, nativeTurnLookupSQL, generation, turn))

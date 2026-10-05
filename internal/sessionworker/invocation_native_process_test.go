@@ -83,6 +83,25 @@ func TestActualNativeInvocationParserOutputOriginalEncryption(t *testing.T) {
 		t.Fatal("original admission not durably bound")
 	}
 	owner.Execute(out, raw)
+	// The hosted adapter discovers the actual original generation from committed
+	// operation provenance, never the current SID or a fabricated adoption spec.
+	lookup := CloudInvocationSourceRequest{Sequence: out.Sequence, CommandID: op.SourceCommandID, AdmissionID: op.SourceAdmissionID, Invocation: *op.SourceInvocation}
+	var observed *CloudInvocationSourceResult
+	for {
+		observed, err = j.cloudInvocationSource(ctx, current, lookup)
+		if err != nil {
+			t.Fatal("actual original source lookup", err)
+		}
+		if observed.Source != nil {
+			break
+		}
+		if _, err = j.cloudReadiness.wait(ctx, observed.Ready); err != nil {
+			t.Fatal("actual original source notification", err)
+		}
+	}
+	if observed.Source.NativeSessionID != sid || observed.Source.NativeGeneration != owner.generation || observed.Source.SourceCommandID != op.SourceCommandID || observed.Source.SourceAdmissionID != op.SourceAdmissionID {
+		t.Fatal("lookup replaced genuine original runtime provenance", observed.Source)
+	}
 	for {
 		out, err = j.Outcome(ctx, 1)
 		if err != nil {

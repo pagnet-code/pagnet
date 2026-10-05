@@ -101,5 +101,7 @@ func (n *localReadiness) wait(ctx context.Context, last ReadinessToken) (Readine
 func (j *Journal) pulseLocalReady() {
 	if j.isLocal() {
 		j.localReadiness.pulse()
+	} else {
+		j.cloudReadiness.pulse()
 	}
 }

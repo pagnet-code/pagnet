@@ -26,6 +26,7 @@ type NativeObservationConnection struct {
 	pendingSessions      map[string]chan transport.NativeOriginSessionConfirmedPayload
 	pendingContent       map[string]chan transport.NativeContentStagedPayload
 	pendingObservations  map[string]chan transport.NativeObservationReceiptPayload
+	pendingHostedFabric  map[string]chan transport.FabricHostedResult
 	pendingOwnership     map[string]chan transport.NativeOwnershipRegisteredPayload
 	pendingTaskInputs    map[string]chan transport.NativeTaskInputReadPayload
 	pendingCancellations map[string]chan transport.Envelope

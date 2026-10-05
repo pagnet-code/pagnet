@@ -55,6 +55,7 @@ type Outcome struct {
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
 	localReadiness       *localReadiness
+	cloudReadiness       *localReadiness
 	outputEncoder        nativeOutputEncoder
 	nativeTurnLookup     *sql.Stmt
 	outputSpoolLookup    *sql.Stmt
@@ -138,6 +139,12 @@ func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error
 	db.SetMaxOpenConns(1)
 	j := &Journal{db: db, scope: scope, authority: authority, owner: owner, dir: dir, observationCapacity: make(chan struct{})}
 	fail := func(e error) (*Journal, error) { _ = db.Close(); return nil, e }
+	if !j.isLocal() {
+		j.cloudReadiness, err = newLocalReadiness()
+		if err != nil {
+			return fail(err)
+		}
+	}
 	for _, q := range []string{
 		"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
 		`CREATE TABLE IF NOT EXISTS worker_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), protocol TEXT NOT NULL, scope TEXT NOT NULL, lease INTEGER NOT NULL, next_sequence INTEGER NOT NULL, retired INTEGER NOT NULL)`,
@@ -252,6 +259,7 @@ func privateDirectory(dir string) error {
 
 func (j *Journal) Close() error {
 	j.localReadiness.close()
+	j.cloudReadiness.close()
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	j.outputEncoder.close()

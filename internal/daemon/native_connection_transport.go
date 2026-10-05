@@ -31,6 +31,11 @@ func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnec
 // select a replacement controller, and malformed admission closes this lane.
 func (c *NativeObservationConnection) HandleEnvelope(env transport.Envelope) (handled bool, err error) {
 	switch env.Type {
+	case transport.MsgFabricHostedPublished, transport.MsgFabricHostedInvoked:
+		var p transport.FabricHostedResult
+		if err = env.DecodePayload(&p); err == nil {
+			c.hostedFabricDisposition(p)
+		}
 	case transport.MsgHostSession:
 		var p transport.HostSessionPayload
 		if err = env.DecodePayload(&p); err == nil {

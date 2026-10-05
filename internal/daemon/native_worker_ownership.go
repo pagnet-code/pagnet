@@ -10,7 +10,7 @@ import (
 )
 
 func (c *NativeObservationConnection) pendingCountLocked() int {
-	return len(c.pending) + len(c.pendingSessions) + len(c.pendingContent) + len(c.pendingObservations) + len(c.pendingOwnership) + len(c.pendingTaskInputs) + len(c.pendingCancellations)
+	return len(c.pendingHostedFabric) + len(c.pending) + len(c.pendingSessions) + len(c.pendingContent) + len(c.pendingObservations) + len(c.pendingOwnership) + len(c.pendingTaskInputs) + len(c.pendingCancellations)
 }
 
 func (c *NativeObservationConnection) OwnershipDisposition(p transport.NativeOwnershipRegisteredPayload) {
