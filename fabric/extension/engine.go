@@ -22,6 +22,10 @@ type Outcome struct {
 	DeferredNotificationError *fabric.Error
 }
 type Downstream func(context.Context, fabric.ExecutionContext, fabric.Envelope) (Outcome, error)
+
+// MatchResolver is a trusted local execution boundary. ExecutingInterceptors
+// requires current, domain-bound extension actor evidence; signed transport
+// lineage alone never proves that a local interceptor initiated this call.
 type MatchResolver func(context.Context, fabric.ExecutionContext, fabric.Envelope, string, Placement) (MatchContext, error)
 
 // FinalValidator runs after all request mutations and on every redirected
@@ -317,7 +321,8 @@ func (e *Engine) selectChain(ctx context.Context, caller fabric.ExecutionContext
 	match.Operation = state.Envelope.Operation
 	match.Stage = state.Stage
 	match.Placement = state.Placement
-	match.ExecutingInterceptors = caller.ProvenanceView().ExtensionChain
+	// Preserve the resolver's locally verified execution set. Foreign or
+	// caller-asserted names in provenance must not suppress security middleware.
 	return e.plan.Select(match), nil
 }
 func (e *Engine) resolveEntered(ids []string) ([]CompiledRegistration, error) {
