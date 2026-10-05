@@ -102,6 +102,9 @@ type hostedGuardFixture struct {
 	keyEpochID string
 	key        [32]byte
 	plan       [32]byte
+	// installation is the genuine local installation the fixture bootstraps
+	// (step 3's sideport tests compose the real node over its store).
+	installation *localinstallation.Installation
 }
 
 func newHostedGuardFixture(t *testing.T) *hostedGuardFixture {
@@ -326,6 +329,7 @@ func newHostedGuardFixture(t *testing.T) *hostedGuardFixture {
 		session: session, owner: owner, root: root, ref: ref, revision: revision, scope: scope,
 		profile: profile, principal: principal, journal: journal, profiles: profiles,
 		admission: admission, networkID: networkID, keyEpochID: st.EpochID, key: key,
+		installation: installation,
 	}
 	f.plan[0], f.plan[31] = 0x01, 0x02
 	return f

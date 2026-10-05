@@ -158,6 +158,7 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 		return err
 	}
 	d.invalidateBridgeNonce(p.InstanceID)
+	d.invalidateHostedSideport(p.InstanceID)
 	d.removeSessionGuidance(p.InstanceID)
 	d.finishQueue(p.InstanceID)
 	return nil

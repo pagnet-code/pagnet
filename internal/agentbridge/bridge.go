@@ -37,6 +37,15 @@ type Bridge struct {
 	conn     net.Conn
 	instance string
 
+	// sideport is the hosted Fabric sideport the daemon's authenticated
+	// bridge handshake (auth_ok) advertised for this instance, when the
+	// owner administration associated one. It has no nonce, principal or
+	// signing key: the bridge's own per-activation nonce and instance
+	// identity supply the original-worker proof when this original MCP
+	// subprocess opens the SECOND socket. A bridge whose authentication
+	// failed never has one — the daemon only advertises it in auth_ok.
+	sideport *HostedFabricSideport
+
 	writeGate chan struct{}
 	nextID    int
 
@@ -83,8 +92,9 @@ func Dial(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 		return nil, err
 	}
 	var resp struct {
-		Type string `json:"type"`
-		Err  string `json:"error"`
+		Type     string                `json:"type"`
+		Err      string                `json:"error"`
+		Sideport *HostedFabricSideport `json:"sideport"`
 	}
 	if err := json.Unmarshal(line, &resp); err != nil {
 		_ = conn.Close()
@@ -97,15 +107,42 @@ func Dial(socket, instanceID, networkID, nonce, kind string) (*Bridge, error) {
 		}
 		return nil, errors.New(resp.Err)
 	}
+	// The sideport is an additive advertisement inside the REAL auth_ok: it
+	// is present only because this bridge authenticated. A present-but
+	// malformed sideport is a daemon bug — refuse the sideport loudly (the
+	// bridge keeps its original tools) instead of failing the bridge or
+	// silently keeping an invalid credential set.
+	var sp *HostedFabricSideport
+	if resp.Sideport != nil {
+		if err := resp.Sideport.Validate(); err != nil {
+			log.Error("hosted fabric sideport invalid; ignoring it", "error", err.Error())
+		} else {
+			sp = resp.Sideport
+		}
+	}
 	_ = conn.SetDeadline(time.Time{})
 	b := &Bridge{
 		conn:      conn,
 		instance:  instanceID,
+		sideport:  sp,
 		pending:   map[string]chan bridgeResponse{},
 		writeGate: make(chan struct{}, 1),
 	}
 	go b.readLoop(r)
 	return b, nil
+}
+
+// Sideport returns the hosted Fabric sideport the daemon's authenticated
+// bridge handshake advertised for this instance, if any. It carries the node
+// private socket, the stable endpoint and the original generation only — no
+// nonce, principal or signing key. The bool is false for every ordinary
+// bridge (no association) and for a bridge that failed authentication (such
+// a bridge has no *Bridge at all).
+func (b *Bridge) Sideport() (HostedFabricSideport, bool) {
+	if b == nil || b.sideport == nil {
+		return HostedFabricSideport{}, false
+	}
+	return *b.sideport, true
 }
 
 // readLoop is the single reader of the connection. Every response line is

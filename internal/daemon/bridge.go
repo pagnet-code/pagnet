@@ -361,6 +361,16 @@ func (d *Daemon) handleBridgeConn(c net.Conn) {
 	if localFactory != nil {
 		ack["protocol"] = "fabric.mcp"
 	}
+	// Hosted Fabric sideport (Phase A step 3): the owner-administration
+	// association for this instance is advertised ONLY here — inside the
+	// REAL authenticated handshake, after every identity check above
+	// (nonce, kind, live process, kernel peer tree) has passed. A bridge
+	// that fails any of them never sees it. It carries no nonce or
+	// credential: the worker's own per-activation nonce and kernel ancestry
+	// are what the node verifies on the second socket.
+	if sp, ok := d.hostedFabricSideportFor(row.InstanceID); ok {
+		ack["sideport"] = sp
+	}
 	if _, err := writeBridge(c, ack); err != nil {
 		return
 	}

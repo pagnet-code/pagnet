@@ -64,6 +64,13 @@ type Config struct {
 	// delivery is verified against the retained original and accepted as the
 	// native prompt; unconfigured daemons refuse it fail-closed.
 	HostedInvocationGuard *HostedInvocationGuard
+	// HostedFabricSideports is the explicit owner-administration association
+	// between a launched original worker's journal/controller IPC and the
+	// node's private socket/stable endpoint/original generation. When
+	// configured, the association is advertised in the instance's
+	// authenticated bridge handshake (auth_ok) and nowhere else;
+	// unconfigured daemons advertise no sideport (fail-closed).
+	HostedFabricSideports *HostedFabricSideports
 	// FabricMCP is trusted local-node composition; nil refuses the explicit
 	// fabric.mcp protocol instead of falling back to the cloud tool relay.
 	FabricMCP    *ManagedFabricMCP
@@ -2712,6 +2719,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 		d.Log.Warn("stop: turn not fully reaped within the wait window", "instance", instanceID)
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the activation's bridge credential dies with the process
+	d.invalidateHostedSideport(instanceID) // the dead activation advertises no sideport
 	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err
 	}
@@ -2754,6 +2762,7 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 		d.removeWorktree(row)
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the instance is gone for good
+	d.invalidateHostedSideport(instanceID)
 	if err := d.state.DeleteInstance(instanceID); err != nil {
 		return err
 	}
@@ -2787,6 +2796,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	// session reference is cleared so the next turn starts fresh (this is
 	// the explicit "Start fresh session" path after a lost session, §74).
 	d.invalidateBridgeNonce(instanceID) // S1: activation reset — the next launch mints a fresh nonce
+	d.invalidateHostedSideport(instanceID)
 	if err := d.state.SetInstanceSession(instanceID, ""); err != nil {
 		return err
 	}
@@ -2967,6 +2977,7 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 		}
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
+	d.invalidateHostedSideport(instanceID)
 	_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
 	_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 		"instanceId": instanceID, "sessionId": row.SessionID,

@@ -261,6 +261,17 @@ func spawnBridgeFixture(stopping <-chan struct{}) {
 		"params": map[string]any{"name": tool, "arguments": toolArgs},
 	})
 	observed = append(observed, readLineUntil(2))
+	// Optional: capture the tool list as well, so the test can assert what
+	// a fresh MCP client actually sees after initialize (the honesty
+	// contract: no tools/list_changed claim, original tools intact).
+	if os.Getenv("PAGNET_FAKE_BRIDGE_LIST_TOOLS") == "1" {
+		writeLine(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+		observed = append(observed, readLineUntil(3))
+	}
+	// Always record the child's stderr last: the bridge's explicit error
+	// logs (for example a refused sideport dial) are a behavioral contract
+	// and must be assertable, not silently swallowed.
+	observed = append(observed, mustJSONLine(map[string]any{"fixture": "done", "stderr": stderr.String()}))
 	writeBridgeResultFile(observed)
 }
 
