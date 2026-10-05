@@ -20,14 +20,14 @@ const (
 const MaxFrameBytes = 64 << 10
 
 type InvocationFrame struct {
-	InvocationID string    `json:"invocationId"`
+	InvocationID string `json:"invocationId"`
 	// Decimal string on JSON transports: browser Number cannot exactly carry
 	// every uint64. In-process adapters retain the native integer.
-	Sequence     uint64    `json:"sequence,string"`
-	Kind         FrameKind `json:"kind"`
-	ContentType  string    `json:"contentType,omitempty"`
-	Data         []byte    `json:"data,omitempty"`
-	Error        *Error    `json:"error,omitempty"`
+	Sequence    uint64    `json:"sequence,string"`
+	Kind        FrameKind `json:"kind"`
+	ContentType string    `json:"contentType,omitempty"`
+	Data        []byte    `json:"data,omitempty"`
+	Error       *Error    `json:"error,omitempty"`
 }
 
 // InvocationStream is pull-driven: Next provides backpressure. Close must be
@@ -59,6 +59,15 @@ func NewCheckedStream(parent context.Context, id string, upstream InvocationStre
 	}
 	lifetime, cancel := context.WithCancel(parent)
 	return &CheckedStream{upstream: upstream, id: id, lifetime: lifetime, cancel: cancel}, nil
+}
+
+// NewCheckedReplayStream accepts original identity only through a verified
+// current-request association; it never rewrites original frames.
+func NewCheckedReplayStream(parent context.Context, requestID string, upstream InvocationStream, correlation *VerifiedReplayCorrelation) (*CheckedStream, error) {
+	if correlation == nil || correlation.association.Validate() != nil || correlation.association.RequestID != requestID {
+		return nil, NewError(CodeUnauthenticated, "Missing verified replay correlation")
+	}
+	return NewCheckedStream(parent, correlation.association.ExecutionID, upstream)
 }
 
 func (s *CheckedStream) Close() error {

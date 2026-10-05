@@ -3,6 +3,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"math"
@@ -42,6 +43,7 @@ type Config struct {
 	Events              events.EventBus
 	EventSource         string
 	Tracing             telemetry.Provider
+	ReplayVerifier      fabric.ReplayVerifier
 }
 
 type Service struct {
@@ -68,6 +70,7 @@ type Result struct {
 	Discover                  *fabric.DiscoverResult
 	Describe                  *fabric.DescribeResult
 	Stream                    fabric.InvocationStream
+	Replay                    *fabric.ReplayAssociation
 	DeferredID                string
 	DeferredNotificationError *fabric.Error
 }
@@ -208,8 +211,13 @@ func (s *Service) dispatchInvoke(ctx context.Context, caller fabric.ExecutionCon
 	if placement == "" {
 		placement = extension.PlacementSource
 	}
+	var replay *fabric.ReplayAssociation
 	outcome, err := s.config.Interceptors.ExecuteStage(ctx, caller, original, s.config.Audience, "invoke.dispatch", placement, func(ctx context.Context, c fabric.ExecutionContext, current fabric.Envelope) (extension.Outcome, error) {
 		result, err := s.invoke(ctx, c, current)
+		if result.Replay != nil {
+			owned := result.Replay.Clone()
+			replay = &owned
+		}
 		return extension.Outcome{Stream: result.Stream}, err
 	})
 	if err != nil {
@@ -222,7 +230,7 @@ func (s *Service) dispatchInvoke(ctx context.Context, caller fabric.ExecutionCon
 		return Result{DeferredID: outcome.DeferredID, DeferredNotificationError: outcome.DeferredNotificationError}, nil
 	}
 	if outcome.Stream != nil {
-		return Result{Stream: outcome.Stream}, nil
+		return Result{Stream: outcome.Stream, Replay: replay}, nil
 	}
 	if len(outcome.Response) != 0 {
 		return Result{Stream: newUnaryStream(envelope.ID, outcome.Response)}, nil
@@ -359,14 +367,38 @@ func (s *Service) invoke(ctx context.Context, trusted fabric.ExecutionContext, e
 	if err != nil {
 		return Result{}, publicError(err)
 	}
-	checked, err := fabric.NewCheckedStream(ctx, envelope.ID, stream)
+	var checked *fabric.CheckedStream
+	var replay *fabric.ReplayAssociation
+	var metadata *fabric.ReplayAssociation
+	if associated, ok := stream.(fabric.ReplayAssociatedStream); ok {
+		metadata = associated.ReplayAssociation()
+	}
+	if metadata != nil {
+		a := metadata.Clone()
+		_, original, ok := OriginalRequestFromContext(ctx)
+		if !ok || request.IdempotencyKey == "" {
+			_ = stream.Close()
+			return Result{}, fabric.NewError(fabric.CodeUnauthenticated, "Replay requires authenticated original and explicit idempotency key")
+		}
+		current := fabric.ReplayRequest{Principal: envelope.Principal, RequestID: envelope.ID, Target: request.Target, ExpectedRevision: request.ExpectedRevision,
+			OriginalRequestSHA: sha256.Sum256(original), FinalizedRequestSHA: sha256.Sum256(finalized), InputSHA: sha256.Sum256(request.Input), IdempotencySHA: sha256.Sum256([]byte(request.IdempotencyKey))}
+		verified, verifyErr := fabric.VerifyReplayCorrelation(ctx, trusted, current, a, s.config.ReplayVerifier)
+		if verifyErr != nil {
+			_ = stream.Close()
+			return Result{}, publicError(verifyErr)
+		}
+		replay = verified.Association()
+		checked, err = fabric.NewCheckedReplayStream(ctx, envelope.ID, stream, verified)
+	} else {
+		checked, err = fabric.NewCheckedStream(ctx, envelope.ID, stream)
+	}
 	if err != nil {
 		if stream != nil {
 			_ = stream.Close()
 		}
 		return Result{}, err
 	}
-	return Result{Stream: checked}, nil
+	return Result{Stream: checked, Replay: replay}, nil
 }
 
 type cancelStream struct {

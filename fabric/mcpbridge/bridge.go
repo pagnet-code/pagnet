@@ -48,7 +48,8 @@ type Limits struct {
 	TTL                                          time.Duration
 }
 
-const frameWindowBytes = (fabric.MaxFrameBytes+2)/3*4 + 8192
+// Reserve worst-case retained association plus frame encoding BEFORE dispatch.
+const frameWindowBytes = (fabric.MaxFrameBytes+2)/3*4 + 8192 + fabric.MaxReplayAssociationBytes
 
 var DefaultLimits = Limits{32, 4 << 20, 1 << 20, 30 * time.Second}
 
@@ -86,11 +87,13 @@ type streamEntry struct {
 	lastAfter     uint64
 	hasAfter      bool
 	terminal      bool
+	replay        *fabric.ReplayAssociation
 }
 type Page struct {
-	Handle string                   `json:"handle,omitempty"`
-	Frames []fabric.InvocationFrame `json:"frames"`
-	More   bool                     `json:"more"`
+	Handle string                    `json:"handle,omitempty"`
+	Frames []fabric.InvocationFrame  `json:"frames"`
+	More   bool                      `json:"more"`
+	Replay *fabric.ReplayAssociation `json:"replay,omitempty"`
 }
 type StreamControl struct {
 	Handle        string `json:"handle"`
@@ -266,7 +269,12 @@ func (b *Bridge) handle(ctx context.Context, r *sdk.CallToolRequest, name string
 		return toolError(fabric.NewError(fabric.CodeTargetUnavailable, "Stream control entropy unavailable")), nil
 	}
 	handle := base64.RawURLEncoding.EncodeToString(entropy[:])
-	entry := &streamEntry{owner: bound.Key, handle: handle, stream: result.Stream, cancel: cancel, expires: time.Now().Add(b.config.Limits.TTL)}
+	var replay *fabric.ReplayAssociation
+	if result.Replay != nil {
+		owned := result.Replay.Clone()
+		replay = &owned
+	}
+	entry := &streamEntry{replay: replay, owner: bound.Key, handle: handle, stream: result.Stream, cancel: cancel, expires: time.Now().Add(b.config.Limits.TTL)}
 	page, err := b.firstPage(ctx, entry)
 	if err != nil {
 		cancel()
@@ -326,7 +334,7 @@ func (b *Bridge) firstPage(ctx context.Context, e *streamEntry) (Page, error) {
 	if frame.Kind != fabric.FrameStart || frame.Sequence != 0 || len(frame.Data) > fabric.MaxFrameBytes {
 		return Page{}, fabric.NewError(fabric.CodeProtocolError, "Invalid original stream start")
 	}
-	page := Page{Handle: e.handle, Frames: []fabric.InvocationFrame{frame}, More: true}
+	page := Page{Replay: e.replay, Handle: e.handle, Frames: []fabric.InvocationFrame{frame}, More: true}
 	e.last = page
 	return page, nil
 }
@@ -340,7 +348,7 @@ func (b *Bridge) control(ctx context.Context, owner string, c StreamControl) (Pa
 	b.mu.Unlock()
 	if c.Cancel {
 		b.remove(e)
-		return Page{Handle: e.handle, Frames: []fabric.InvocationFrame{}, More: false}, nil
+		return Page{Replay: e.replay, Handle: e.handle, Frames: []fabric.InvocationFrame{}, More: false}, nil
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -370,7 +378,7 @@ func (b *Bridge) control(ctx context.Context, owner string, c StreamControl) (Pa
 		return Page{}, fabric.NewError(fabric.CodeProtocolError, "Invalid original stream frame")
 	}
 	terminal := frame.Kind == fabric.FrameComplete || frame.Kind == fabric.FrameError
-	page := Page{Handle: e.handle, Frames: []fabric.InvocationFrame{frame}, More: !terminal}
+	page := Page{Replay: e.replay, Handle: e.handle, Frames: []fabric.InvocationFrame{frame}, More: !terminal}
 	b.mu.Lock()
 	if b.streams[e.handle] != e || b.bytes-pageSize(e.last)+pageSize(page) > b.config.Limits.MaxRetainedBytes {
 		b.mu.Unlock()

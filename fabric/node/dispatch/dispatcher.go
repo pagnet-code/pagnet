@@ -99,11 +99,18 @@ func (d *Dispatcher) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 		return nil, fabric.NewError(fabric.CodeStaleReference, "Selected private binding is unavailable or stale")
 	}
 	published := false
+	supportsIdempotency := false
 	for _, binding := range endpoint.Bindings {
 		published = published || binding.ID == selection.BindingID
+		if binding.ID == selection.BindingID {
+			supportsIdempotency = binding.Idempotency
+		}
 	}
 	if !published {
 		return nil, fabric.NewError(fabric.CodeStaleReference, "Selected binding is not published by this endpoint")
+	}
+	if request.IdempotencyKey != "" && !supportsIdempotency {
+		return nil, fabric.NewError(fabric.CodeUnsupported, "Selected binding does not support invocation idempotency")
 	}
 	var gate sync.Mutex
 	active, called := true, false
@@ -212,4 +219,16 @@ func (s *admissionStream) Next(ctx context.Context) (fabric.InvocationFrame, err
 		_ = s.Close()
 	}
 	return frame, err
+}
+
+// ReplayAssociation forwards actual retained source metadata; a fresh stream
+// remains explicitly unassociated. Admission never invents a replay relation.
+func (s *admissionStream) ReplayAssociation() *fabric.ReplayAssociation {
+	if source, ok := s.InvocationStream.(fabric.ReplayAssociatedStream); ok {
+		if a := source.ReplayAssociation(); a != nil {
+			owned := a.Clone()
+			return &owned
+		}
+	}
+	return nil
 }

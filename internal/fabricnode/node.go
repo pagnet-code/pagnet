@@ -36,6 +36,7 @@ type Ports struct {
 	ValidateReadResult node.ReadResultValidator
 	Events             events.EventBus
 	Tracing            telemetry.Provider
+	ReplayVerifier     fabric.ReplayVerifier
 	// Search is optional explicit hybrid backend composition; nil uses
 	// the embedded lexical backend. Close owns any provider/session resources.
 	Search node.SearchReader
@@ -136,7 +137,7 @@ func ComposeRetained(ctx context.Context, store *registry.Store, compose func(co
 		n.reader = index
 	}
 	n.reader = telemetry.ObserveSearch(n.reader, ports.Tracing)
-	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing}
+	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing, ReplayVerifier: ports.ReplayVerifier}
 	if ports.Events != nil {
 		cfg.EventSource = "pagnet://" + store.AuthorityIdentity().Namespace + "/node/local"
 	}
