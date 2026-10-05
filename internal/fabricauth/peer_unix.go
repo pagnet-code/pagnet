@@ -3,6 +3,7 @@
 package fabricauth
 
 import (
+	"context"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"golang.org/x/sys/unix"
 	"net"
@@ -10,7 +11,10 @@ import (
 	"path/filepath"
 )
 
-func peer(conn *net.UnixConn, path string) (localpeer.ProcessSnapshot, error) {
+func peer(ctx context.Context, conn *net.UnixConn, path string) (localpeer.ProcessSnapshot, error) {
+	if ctx == nil || ctx.Err() != nil || conn == nil {
+		return localpeer.ProcessSnapshot{}, denied()
+	}
 	addr, ok := conn.LocalAddr().(*net.UnixAddr)
 	if !ok || addr.Name != path || !filepath.IsAbs(path) {
 		return localpeer.ProcessSnapshot{}, denied()
@@ -34,16 +38,10 @@ func peer(conn *net.UnixConn, path string) (localpeer.ProcessSnapshot, error) {
 	}
 	var liveErr error
 	e = raw.Control(func(fd uintptr) {
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		if _, err := unix.Poll(fds, 0); err != nil || fds[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0 {
-			liveErr = denied()
-			return
-		}
-		var b [1]byte
-		n, _, err := unix.Recvfrom(int(fd), b[:], unix.MSG_PEEK|unix.MSG_DONTWAIT)
-		if (err == nil && n == 0) || (err != nil && err != unix.EAGAIN && err != unix.EWOULDBLOCK) {
-			liveErr = denied()
-		}
+		liveErr = checkSocketLiveness(ctx, int(fd), unix.Poll, func(fd int, bytes []byte, flags int) (int, error) {
+			n, _, err := unix.Recvfrom(fd, bytes, flags)
+			return n, err
+		})
 	})
 	if e != nil || liveErr != nil {
 		return localpeer.ProcessSnapshot{}, denied()
@@ -53,7 +51,7 @@ func peer(conn *net.UnixConn, path string) (localpeer.ProcessSnapshot, error) {
 		return localpeer.ProcessSnapshot{}, denied()
 	}
 	endPID, endUID, e := localpeer.Owner(conn)
-	if e != nil || endPID != pid || endUID != uid {
+	if e != nil || endPID != pid || endUID != uid || ctx.Err() != nil {
 		return localpeer.ProcessSnapshot{}, denied()
 	}
 	return process, nil

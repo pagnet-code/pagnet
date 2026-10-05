@@ -8,9 +8,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,7 @@ import (
 )
 
 const Protocol = "fabric.mcp"
+const AdminProtocol = "fabric.admin.v1"
 const (
 	EndpointEnvironment   = "PAGNET_FABRIC_ENDPOINT"
 	WorkerEnvironment     = "PAGNET_FABRIC_WORKER_ID"
@@ -37,10 +40,18 @@ type ManagedSelector struct {
 // ResolveManaged consults actual current signed binding and authenticated worker
 // facts. Selection fields are untrusted selectors, never authentication.
 type ManagedResolver func(context.Context, ManagedSelector) (fabricauth.Activation, error)
+
+// VerifiedSessionServer owns a kernel-verified private connection and session.
+// Protocol selection never creates authority or changes runtime MCP tools.
+type VerifiedSessionServer interface {
+	ServeVerified(context.Context, net.Conn, io.Reader, fabricmcp.SessionFactory) error
+	CloseContext(context.Context) error
+}
 type Config struct {
 	SocketPath                   string
 	Authority                    *fabricauth.Authority
-	Server                       *fabricmcp.Server
+	Server                       VerifiedSessionServer
+	Protocols                    map[string]VerifiedSessionServer
 	ResolveManaged               ManagedResolver
 	MaxConnections, MaxAuthBytes int
 	AuthTimeout                  time.Duration
@@ -60,6 +71,7 @@ type Host struct {
 }
 type Authentication struct {
 	Type       string             `json:"type"`
+	Protocol   string             `json:"protocol,omitempty"`
 	Mode       string             `json:"mode"`
 	Endpoint   fabric.EndpointRef `json:"endpoint,omitempty"`
 	WorkerID   string             `json:"workerId,omitempty"`
@@ -74,7 +86,7 @@ func bounded(v string, max int) bool {
 	return v != "" && len(v) <= max && utf8.ValidString(v) && !strings.ContainsAny(v, "\x00\r\n")
 }
 func (a Authentication) Validate() error {
-	if a.Type != "fabric.auth" {
+	if a.Type != "fabric.auth" || a.Protocol != "" && a.Protocol != Protocol && a.Protocol != AdminProtocol {
 		return failure()
 	}
 	switch a.Mode {
@@ -92,9 +104,34 @@ func (a Authentication) Validate() error {
 	return nil
 }
 func Start(ctx context.Context, config Config) (*Host, error) {
-	if ctx == nil || ctx.Err() != nil || config.Authority == nil || config.Server == nil || config.ResolveManaged != nil && !config.Authority.SupportsManaged() || !filepath.IsAbs(config.SocketPath) || filepath.Clean(config.SocketPath) != config.SocketPath {
+	if ctx == nil || ctx.Err() != nil || config.Authority == nil || config.ResolveManaged != nil && !config.Authority.SupportsManaged() || !filepath.IsAbs(config.SocketPath) || filepath.Clean(config.SocketPath) != config.SocketPath {
 		return nil, failure()
 	}
+	protocols := make(map[string]VerifiedSessionServer, 2)
+	if config.Server != nil {
+		protocols[Protocol] = config.Server
+	}
+	if len(config.Protocols) > 2 {
+		return nil, failure()
+	}
+	for name, server := range config.Protocols {
+		if name != Protocol && name != AdminProtocol || server == nil || protocols[name] != nil {
+			return nil, failure()
+		}
+		protocols[name] = server
+	}
+	if len(protocols) == 0 {
+		return nil, failure()
+	}
+	seen := make(map[VerifiedSessionServer]bool, 2)
+	for _, server := range protocols {
+		value := reflect.ValueOf(server)
+		if !value.IsValid() || !value.Type().Comparable() || (value.Kind() == reflect.Pointer && value.IsNil()) || seen[server] {
+			return nil, failure()
+		}
+		seen[server] = true
+	}
+	config.Protocols = protocols
 	if config.MaxConnections == 0 {
 		config.MaxConnections = 64
 	}
@@ -117,7 +154,20 @@ func Start(ctx context.Context, config Config) (*Host, error) {
 	go func() {
 		<-lifetime.Done()
 		host.Close()
-		shutdownErr := config.Server.CloseContext(context.Background())
+		var joined sync.WaitGroup
+		var errorsMu sync.Mutex
+		var shutdownErr error
+		for _, server := range config.Protocols {
+			joined.Add(1)
+			go func(server VerifiedSessionServer) {
+				defer joined.Done()
+				err := server.CloseContext(context.Background())
+				errorsMu.Lock()
+				shutdownErr = errors.Join(shutdownErr, err)
+				errorsMu.Unlock()
+			}(server)
+		}
+		joined.Wait()
 		host.mu.Lock()
 		host.shutdownErr = shutdownErr
 		host.serverJoined = true
@@ -193,6 +243,14 @@ func (h *Host) serve(c *net.UnixConn) {
 	if err != nil {
 		return
 	}
+	protocol := request.Protocol
+	if protocol == "" {
+		protocol = Protocol
+	}
+	server := h.config.Protocols[protocol]
+	if server == nil || protocol == AdminProtocol && request.Mode != "owner" {
+		return
+	}
 	var session *fabricauth.Session
 	if request.Mode == "owner" {
 		session, err = h.config.Authority.BindOwner(authenticated, c)
@@ -220,12 +278,12 @@ func (h *Host) serve(c *net.UnixConn) {
 			session.Close()
 		}
 	}()
-	if _, err = io.WriteString(c, "{\"type\":\"fabric.ready\",\"protocol\":\"fabric.mcp\"}\n"); err != nil {
+	if _, err = io.WriteString(c, "{\"type\":\"fabric.ready\",\"protocol\":\""+protocol+"\"}\n"); err != nil {
 		return
 	}
 	c.SetDeadline(time.Time{})
 	transferred = true
-	_ = h.config.Server.ServeVerified(h.ctx, c, reader, session)
+	_ = server.ServeVerified(h.ctx, c, reader, session)
 }
 func (h *Host) Close() error {
 	h.mu.Lock()

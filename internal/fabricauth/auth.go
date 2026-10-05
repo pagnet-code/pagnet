@@ -140,7 +140,7 @@ func (a *Authority) bind(ctx context.Context, conn *net.UnixConn, activation *Ac
 	}
 	checked, cancel := context.WithTimeout(ctx, a.config.CheckTimeout)
 	defer cancel()
-	process, e := peer(conn, a.config.SocketPath)
+	process, e := peer(checked, conn, a.config.SocketPath)
 	if e != nil {
 		return nil, denied()
 	}
@@ -159,7 +159,7 @@ func (s *Session) verify(ctx context.Context) (fabric.Principal, error) {
 	if s.closed || ctx.Err() != nil || s.authority.current(ctx) != nil {
 		return fabric.Principal{}, denied()
 	}
-	current, e := peer(s.conn, s.authority.config.SocketPath)
+	current, e := peer(ctx, s.conn, s.authority.config.SocketPath)
 	if e != nil || current != s.process {
 		return fabric.Principal{}, denied()
 	}
@@ -189,7 +189,7 @@ func (s *Session) verify(ctx context.Context) (fabric.Principal, error) {
 			return fabric.Principal{}, denied()
 		}
 	}
-	after, e := peer(s.conn, s.authority.config.SocketPath)
+	after, e := peer(ctx, s.conn, s.authority.config.SocketPath)
 	if e != nil || after != current || ctx.Err() != nil || s.authority.current(ctx) != nil {
 		return fabric.Principal{}, denied()
 	}

@@ -34,6 +34,16 @@ func FromEnvironment(get func(string) string) (Authentication, error) {
 // authentication or falls back to a cloud/owner path. The caller owns the
 // returned connection and buffered reader for original MCP initialization.
 func Dial(ctx context.Context, path string, auth Authentication) (*net.UnixConn, *bufio.Reader, error) {
+	return DialProtocol(ctx, path, auth, Protocol)
+}
+
+// DialProtocol requires an explicitly selected supported protocol and exact
+// ready response. It never negotiates or falls back to privileged owner mode.
+func DialProtocol(ctx context.Context, path string, auth Authentication, protocol string) (*net.UnixConn, *bufio.Reader, error) {
+	if protocol != Protocol && protocol != AdminProtocol || auth.Protocol != "" && auth.Protocol != protocol {
+		return nil, nil, failure()
+	}
+	auth.Protocol = protocol
 	if ctx == nil || !filepath.IsAbs(path) || filepath.Clean(path) != path || auth.Validate() != nil || checkSocket(path) != nil {
 		return nil, nil, failure()
 	}
@@ -78,7 +88,7 @@ func Dial(ctx context.Context, path string, auth Authentication) (*net.UnixConn,
 		Type     string `json:"type"`
 		Protocol string `json:"protocol"`
 	}
-	if fabric.DecodeJSON(reply, &ready) != nil || ready.Type != "fabric.ready" || ready.Protocol != Protocol {
+	if fabric.DecodeJSON(reply, &ready) != nil || ready.Type != "fabric.ready" || ready.Protocol != protocol {
 		return nil, nil, failure()
 	}
 	if ctx.Err() != nil {
@@ -102,9 +112,10 @@ func (a Authentication) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		Type       string              `json:"type"`
 		Mode       string              `json:"mode"`
+		Protocol   string              `json:"protocol,omitempty"`
 		Endpoint   *fabric.EndpointRef `json:"endpoint,omitempty"`
 		WorkerID   string              `json:"workerId,omitempty"`
 		Generation string              `json:"generation,omitempty"`
 		Nonce      string              `json:"nonce,omitempty"`
-	}{a.Type, a.Mode, endpoint, a.WorkerID, a.Generation, a.Nonce})
+	}{a.Type, a.Mode, a.Protocol, endpoint, a.WorkerID, a.Generation, a.Nonce})
 }
