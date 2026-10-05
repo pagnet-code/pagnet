@@ -97,6 +97,9 @@ type Connections struct {
 	entries                map[string]*connectedMCP
 	pending                map[string]bool
 	closed                 bool
+	sources                int
+	closeDone              chan struct{}
+	closeErr               error
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
@@ -108,7 +111,7 @@ func NewConnections(profiles *ProfileStore, credentials CredentialProvider, invo
 		return nil, denied()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Connections{profiles: profiles, credentials: credentials, invocations: invocations, max: max, entries: map[string]*connectedMCP{}, pending: map[string]bool{}, ctx: ctx, cancel: cancel}, nil
+	return &Connections{profiles: profiles, credentials: credentials, invocations: invocations, max: max, entries: map[string]*connectedMCP{}, pending: map[string]bool{}, ctx: ctx, cancel: cancel, closeDone: make(chan struct{})}, nil
 }
 func connectionKey(scope registry.DescriptorBatchScope) string {
 	return scope.Endpoint.String() + "\x00" + scope.BindingID
@@ -268,7 +271,18 @@ func (a *guardedMCP) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 	if _, e := a.entry.credentials.Credentials(ctx, a.entry.scope.BindingID); e != nil {
 		return nil, e
 	}
-	receipt, fresh, e := a.connections.invocations.Reserve(ctx, caller, a.entry.scope, a.entry.fingerprint, r)
+	releaseSource, finishCall, e := a.connections.reserveSourceSlot()
+	if e != nil {
+		return nil, e
+	}
+	defer finishCall()
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseSource()
+		}
+	}()
+	receipt, fresh, capture, e := a.connections.invocations.reserveSource(ctx, caller, a.entry.scope, a.entry.fingerprint, r, a.connections.ctx, a.entry)
 	if e != nil {
 		return nil, e
 	}
@@ -278,11 +292,15 @@ func (a *guardedMCP) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 		}
 		return newReplayStream(ctx, a.connections.invocations, caller, receipt), nil
 	}
-	stream, e := a.entry.adapter.Invoke(ctx, caller, d, r)
+	capture.beginDrain = a.connections.beginSourceDrain
+	capture.releaseSource = releaseSource
+	transferred = true
+	stream, e := a.entry.adapter.Invoke(capture.ctx, caller, d, r)
 	if e != nil {
+		capture.close()
 		return nil, e
 	}
-	return &retainedStream{InvocationStream: stream, ledger: a.connections.invocations, caller: caller, receipt: receipt, ctx: ctx}, nil
+	return &retainedStream{InvocationStream: stream, ledger: a.connections.invocations, caller: caller, receipt: receipt, ctx: ctx, capture: capture}, nil
 }
 func (c *Connections) Close() error {
 	if c == nil {
@@ -290,8 +308,13 @@ func (c *Connections) Close() error {
 	}
 	c.mu.Lock()
 	if c.closed {
+		done := c.closeDone
 		c.mu.Unlock()
-		return nil
+		<-done
+		c.mu.Lock()
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
 	}
 	c.closed = true
 	c.cancel()
@@ -308,6 +331,10 @@ func (c *Connections) Close() error {
 			e.transport.CloseIdleConnections()
 		}
 	}
+	c.mu.Lock()
+	c.closeErr = first
+	close(c.closeDone)
+	c.mu.Unlock()
 	return first
 }
 
@@ -357,3 +384,30 @@ type lifetimeBody struct {
 }
 
 func (b *lifetimeBody) Close() error { e := b.ReadCloser.Close(); b.once.Do(b.cleanup); return e }
+
+func (c *Connections) beginSourceDrain() (func(), error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, denied()
+	}
+	c.wg.Add(1)
+	return c.wg.Done, nil
+}
+
+// reserveSourceSlot bounds independent original source lifetimes, including
+// SDK calls and detached drains, by the explicit connection capacity. It runs
+// before a FULL paid reservation; a later detach cannot exhaust new capacity.
+func (c *Connections) reserveSourceSlot() (func(), func(), error) {
+	c.mu.Lock()
+	if c.closed || c.sources >= c.max {
+		c.mu.Unlock()
+		return nil, nil, fabric.NewError(fabric.CodeTargetUnavailable, "Original service source capacity exhausted")
+	}
+	c.sources++
+	c.wg.Add(1)
+	c.mu.Unlock()
+	var once sync.Once
+	release := func() { once.Do(func() { c.mu.Lock(); c.sources--; c.mu.Unlock() }) }
+	return release, c.wg.Done, nil
+}

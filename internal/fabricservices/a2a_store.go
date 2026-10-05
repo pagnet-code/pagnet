@@ -74,6 +74,21 @@ func (s *A2AAssociations) Admit(ctx context.Context, a a2a.Association) error {
 	if r.Facts.Principal != a.Key.Principal || r.Facts.InvocationID != a.Key.InvocationID {
 		return a2a.ErrConflict
 	}
+	if slot, ok := ctx.Value(sourceCaptureSlotKey{}).(*sourceCaptureSlot); ok {
+		if slot == nil || slot.ledger != s.ledger || slot.capture.Load() != nil {
+			return a2a.ErrAssociation
+		}
+		capture, e := s.ledger.newAcceptedSource(ctx, r, slot.parent, slot.provider, request.Deadline)
+		if e != nil {
+			return e
+		}
+		capture.beginDrain = slot.beginDrain
+		capture.releaseSource = slot.releaseSource
+		if !slot.capture.CompareAndSwap(nil, capture) {
+			capture.close()
+			return a2a.ErrAssociation
+		}
+	}
 	// This additional FULL association pin is still BEFORE any SDK paid effect.
 	// Failure leaves the earlier attempt unknown, never permission to resend.
 	return s.ledger.read(ctx, caller, a.Key.Principal, a.Key.InvocationID, s.scope, "associate_admission", func(_ context.Context, tx *registry.AuthorityTx, r Receipt, row registry.AuthorityRecord) error {

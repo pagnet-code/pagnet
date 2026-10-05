@@ -352,6 +352,10 @@ func (i *Invocations) read(ctx context.Context, caller fabric.ExecutionContext, 
 // Append preserves actual returned frames before delivery, in one FULL commit.
 // Large frames are bounded sealed chunks; chunks are never public extra events.
 func (i *Invocations) Append(ctx context.Context, caller fabric.ExecutionContext, receipt Receipt, f fabric.InvocationFrame) error {
+	return i.appendSourceFrame(ctx, caller, receipt, f, nil)
+}
+
+func (i *Invocations) appendSourceFrame(ctx context.Context, caller fabric.ExecutionContext, receipt Receipt, f fabric.InvocationFrame, capture *sourceCapture) error {
 	if !boundedValue(f, 96<<10, 2048) || f.InvocationID != receipt.Facts.InvocationID || len(f.Data) > fabric.MaxFrameBytes {
 		return denied()
 	}
@@ -374,7 +378,15 @@ func (i *Invocations) Append(ctx context.Context, caller fabric.ExecutionContext
 			return e
 		}
 	}
-	return i.read(ctx, caller, receipt.Facts.Principal, receipt.Facts.InvocationID, receipt.Facts.Scope, "append", func(_ context.Context, tx *registry.AuthorityTx, r Receipt, row registry.AuthorityRecord) error {
+	read := func(step func(context.Context, *registry.AuthorityTx, Receipt, registry.AuthorityRecord) error) error {
+		return i.read(ctx, caller, receipt.Facts.Principal, receipt.Facts.InvocationID, receipt.Facts.Scope, "append", step)
+	}
+	if capture != nil {
+		read = func(step func(context.Context, *registry.AuthorityTx, Receipt, registry.AuthorityRecord) error) error {
+			return capture.withReceipt(ctx, step)
+		}
+	}
+	return read(func(_ context.Context, tx *registry.AuthorityTx, r Receipt, row registry.AuthorityRecord) error {
 		if r.Facts != receipt.Facts {
 			return denied()
 		}

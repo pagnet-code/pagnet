@@ -23,6 +23,12 @@ type A2AConnections struct {
 	mu          sync.Mutex
 	entries     map[string]*connectedA2A
 	closed      bool
+	sources     int
+	closeDone   chan struct{}
+	closeErr    error
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 type connectedA2A struct {
 	adapter     *a2a.Adapter
@@ -36,7 +42,8 @@ func NewA2AConnections(p *ProfileStore, i *Invocations, credentials CredentialPr
 	if p == nil || i == nil || i.profiles != p || credentials == nil || disclosure == nil || max < 1 || max > 256 {
 		return nil, denied()
 	}
-	return &A2AConnections{profiles: p, ledger: i, credentials: credentials, disclosure: disclosure, max: max, entries: map[string]*connectedA2A{}}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	return &A2AConnections{profiles: p, ledger: i, credentials: credentials, disclosure: disclosure, max: max, entries: map[string]*connectedA2A{}, ctx: ctx, cancel: cancel, closeDone: make(chan struct{})}, nil
 }
 
 // Connect is explicit setup from an operator-selected exact retained AgentCard
@@ -151,16 +158,53 @@ func (a *guardedA2A) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 	if !missing(e) {
 		return nil, e
 	}
-	stream, e := a.entry.adapter.Invoke(ctx, caller, d, r)
+	releaseSource, finishCall, e := a.connections.reserveSourceSlot()
 	if e != nil {
 		return nil, e
 	}
-	receipt, e = a.connections.ledger.FindExact(ctx, caller, a.entry.scope, a.entry.fingerprint, r)
+	defer finishCall()
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseSource()
+		}
+	}()
+	slot := &sourceCaptureSlot{ledger: a.connections.ledger, parent: a.connections.ctx, provider: a.entry, beginDrain: a.connections.beginSourceDrain, releaseSource: releaseSource}
+	owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if r.Deadline != nil {
+		var stop context.CancelFunc
+		owned, stop = context.WithDeadline(owned, *r.Deadline)
+		previous := cancel
+		cancel = func() { stop(); previous() }
+	}
+	parentStop := context.AfterFunc(a.connections.ctx, cancel)
+	owned = context.WithValue(owned, sourceCaptureSlotKey{}, slot)
+	stream, e := a.entry.adapter.Invoke(owned, caller, d, r)
 	if e != nil {
+		parentStop()
+		cancel()
+		if slot.capture.Load() != nil {
+			slot.capture.Load().close()
+		}
+		return nil, e
+	}
+	if slot.capture.Load() == nil {
 		stream.Close()
-		return nil, e
+		parentStop()
+		cancel()
+		return nil, denied()
 	}
-	return &retainedStream{InvocationStream: stream, ledger: a.connections.ledger, caller: caller, receipt: receipt, ctx: ctx}, nil
+	// The source capability was minted inside the genuine SDK's first FULL Admit,
+	// before its original send. Reading after the send never reauthenticates a
+	// dropped caller or substitutes another source.
+	capture := slot.capture.Load()
+	transferred = true
+	originalCancel := capture.cancel
+	originalStop := capture.stopParent
+	capture.cancel = func() { cancel(); originalCancel() }
+	capture.stopParent = func() bool { parentStop(); return originalStop() }
+	return &retainedStream{InvocationStream: stream, ledger: a.connections.ledger, caller: caller, receipt: capture.receipt, ctx: ctx, capture: capture}, nil
+
 }
 func (c *A2AConnections) Close() error {
 	if c == nil {
@@ -168,18 +212,56 @@ func (c *A2AConnections) Close() error {
 	}
 	c.mu.Lock()
 	if c.closed {
+		done := c.closeDone
 		c.mu.Unlock()
-		return nil
+		<-done
+		c.mu.Lock()
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
 	}
 	c.closed = true
+	c.cancel()
 	entries := c.entries
 	c.entries = map[string]*connectedA2A{}
 	c.mu.Unlock()
+	c.wg.Wait()
 	var first error
 	for _, entry := range entries {
 		if e := entry.adapter.Close(); e != nil && first == nil {
 			first = e
 		}
 	}
+	c.mu.Lock()
+	c.closeErr = first
+	close(c.closeDone)
+	c.mu.Unlock()
 	return first
+}
+
+func (c *A2AConnections) beginSourceDrain() (func(), error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, denied()
+	}
+	c.wg.Add(1)
+	return c.wg.Done, nil
+}
+
+// reserveSourceSlot bounds independent original source lifetimes, including
+// SDK calls and detached drains, by the explicit connection capacity. It runs
+// before a FULL paid reservation; a later detach cannot exhaust new capacity.
+func (c *A2AConnections) reserveSourceSlot() (func(), func(), error) {
+	c.mu.Lock()
+	if c.closed || c.sources >= c.max {
+		c.mu.Unlock()
+		return nil, nil, fabric.NewError(fabric.CodeTargetUnavailable, "Original service source capacity exhausted")
+	}
+	c.sources++
+	c.wg.Add(1)
+	c.mu.Unlock()
+	var once sync.Once
+	release := func() { once.Do(func() { c.mu.Lock(); c.sources--; c.mu.Unlock() }) }
+	return release, c.wg.Done, nil
 }
