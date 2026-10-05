@@ -153,3 +153,10 @@ func (s *CheckedStream) fail(message string) (InvocationFrame, error) {
 	_ = s.Close()
 	return InvocationFrame{}, NewError(CodeProtocolError, message)
 }
+
+func (s *CheckedStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return WithOriginalSourceCapture(ctx, s.upstream, next)
+}
+func (s *CheckedStream) OriginalSourceOwnership(ctx context.Context) (OriginalSourceOwnership, error) {
+	return OriginalStreamOwnership(ctx, s.upstream)
+}

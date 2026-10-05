@@ -446,3 +446,10 @@ func contextError(err error) *fabric.Error {
 	}
 	return fabric.NewError(fabric.CodeCancelled, "Operation cancelled")
 }
+
+func (s *cancelStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return fabric.WithOriginalSourceCapture(ctx, s.InvocationStream, next)
+}
+func (s *cancelStream) OriginalSourceOwnership(ctx context.Context) (fabric.OriginalSourceOwnership, error) {
+	return fabric.OriginalStreamOwnership(ctx, s.InvocationStream)
+}

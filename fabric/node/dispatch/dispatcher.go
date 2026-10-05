@@ -237,3 +237,10 @@ func (s *admissionStream) ReplayAssociation() *fabric.ReplayAssociation {
 	}
 	return nil
 }
+
+func (s *admissionStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return fabric.WithOriginalSourceCapture(ctx, s.InvocationStream, next)
+}
+func (s *admissionStream) OriginalSourceOwnership(ctx context.Context) (fabric.OriginalSourceOwnership, error) {
+	return fabric.OriginalStreamOwnership(ctx, s.InvocationStream)
+}

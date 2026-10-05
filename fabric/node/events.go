@@ -70,3 +70,10 @@ func (s *observedStream) Close() error {
 	s.finish("cancelled")
 	return s.InvocationStream.Close()
 }
+
+func (s *observedStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return fabric.WithOriginalSourceCapture(ctx, s.InvocationStream, next)
+}
+func (s *observedStream) OriginalSourceOwnership(ctx context.Context) (fabric.OriginalSourceOwnership, error) {
+	return fabric.OriginalStreamOwnership(ctx, s.InvocationStream)
+}

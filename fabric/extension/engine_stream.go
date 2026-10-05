@@ -155,3 +155,17 @@ func (s *lifetimeStream) Next(ctx context.Context) (fabric.InvocationFrame, erro
 	}
 	return frame, err
 }
+
+func (s *interceptedStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return fabric.WithOriginalSourceCapture(ctx, s.upstream, next)
+}
+func (s *interceptedStream) OriginalSourceOwnership(ctx context.Context) (fabric.OriginalSourceOwnership, error) {
+	return fabric.OriginalStreamOwnership(ctx, s.upstream)
+}
+
+func (s *lifetimeStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
+	return fabric.WithOriginalSourceCapture(ctx, s.upstream, next)
+}
+func (s *lifetimeStream) OriginalSourceOwnership(ctx context.Context) (fabric.OriginalSourceOwnership, error) {
+	return fabric.OriginalStreamOwnership(ctx, s.upstream)
+}
