@@ -43,12 +43,12 @@ type ServiceAddResult struct {
 func validateServiceAdd(v *ServiceAddInput) error {
 	u, e := url.Parse(v.URL)
 	if e != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || len(v.URL) > 4096 || strings.ContainsAny(v.URL, "\x00\r\n") || (u.Scheme != "https" && u.Scheme != "http") {
-		return fabric.NewError(fabric.CodeInvalidInput, "Provide a selected MCP URL without embedded credentials or query tokens")
+		return fabric.NewError(fabric.CodeInvalidInput, "Provide a selected service URL without embedded credentials or query tokens")
 	}
 	if u.Scheme == "http" && !v.AllowHTTP {
 		ip := net.ParseIP(u.Hostname())
 		if u.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return fabric.NewError(fabric.CodeInvalidInput, "Use HTTPS or explicitly select --allow-http for this MCP endpoint")
+			return fabric.NewError(fabric.CodeInvalidInput, "Use HTTPS or explicitly select --allow-http for this service endpoint")
 		}
 		v.AllowHTTP = true
 	}
@@ -70,7 +70,7 @@ func validateServiceAdd(v *ServiceAddInput) error {
 // ServiceAdministration performs metadata setup through current kernel-owner
 // administration, never invocation authority or a provider paid effect.
 func (n *InstalledNode) ServiceAdministration() map[string]fabricadmin.Handler {
-	return map[string]fabricadmin.Handler{"service.add": func(ctx context.Context, access *fabricauth.OwnerAdministration, r fabricadmin.Request) (json.RawMessage, error) {
+	return map[string]fabricadmin.Handler{"service.a2a.add": n.a2aServiceAdd, "service.add": func(ctx context.Context, access *fabricauth.OwnerAdministration, r fabricadmin.Request) (json.RawMessage, error) {
 		if n == nil || n.Installation == nil || access == nil || r.Operation != "service.add" || r.ExpectedRevision != "" || access.VerifyCurrent(ctx) != nil {
 			return nil, localDenied()
 		}

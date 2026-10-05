@@ -4,6 +4,29 @@ This private node composition uses the **same retained registry Store** for encr
 
 `ProfileStore.Install` selects an exact already-published endpoint/binding/revision, protocol/version, account/profile digest, and credential selector. HTTP addresses and A2A Agent Cards remain encrypted private configuration. Stdio runs an absolute installed executable with explicit arguments and memory-only credential environment, without a shell or inherited shell environment. URLs reject credentials, query parameters, fragments and unselected HTTP. Profiles are immutable: exact setup retries return the retained generation; changing account, URL, executable, interface, or limits requires a new published binding. Missing/wrong-key retained state never initializes through `Get` or `Open`.
 
+The installed local node accepts explicit A2A registration through the same
+owner-authenticated service administration socket:
+
+```sh
+pagnet service add https://provider.example/a2a --a2a-card ./agent-card.json \
+  --name "Invoice expert" --description "Retrieves invoices" \
+  --request-id invoice-agent-setup
+```
+
+The selected URL must exactly match one supported JSON-RPC interface in the
+operator-supplied official Agent Card. The card stays in the encrypted private
+profile; network discovery publishes only the chosen name and description.
+DESCRIBE includes the actual adapter input schema and a send example. No
+capability declaration is required. Credentials use the installation's explicit
+private provider and never come from the card URL or ambient environment.
+Cancellation requires the explicit `--cancellation` option. Setup creates the
+adapter without calling the remote agent, so `configured` does not claim the
+provider is online. An exact retry retains the original reference and account;
+changing the card, selected interface or account under that request ID fails.
+Local cards are bounded regular files; FIFOs and final-component symlinks are
+refused without blocking. Native local sockets currently require Linux/macOS;
+Windows users can run this path through WSL.
+
 MCP uses the maintained official SDK through `ConnectMCP`/`Sync`, and the existing same-root encrypted MCP catalog. `bootstrapCatalog=true` is explicit first installation; later connections open that actual catalog. One connection/catalog is shared by authorized callers, not attached separately per agent. Router selection performs no connection, spawn, discovery, provider lookup or fallback. MCP requires a specific published offer, not an endpoint that silently chooses a tool. The negotiated SDK version must equal the installed advertised binding version. Background tool-change synchronization preserves actual stable offer IDs and revisions; invocation rechecks actual current offer schema and profile inside the admission transaction.
 
 A2A selects exactly `a2a.jsonrpc` / `1.0`, an operator-selected private interface and trusted installed Agent Card. The official adapter supplies the genuine SDK HTTP/events, precision-preserving raw records, bounded pull stream, and explicit task status semantics. `A2AAssociations` implements its protocol-local task/context map in the **same root invocation ledger**, not the optional standalone adapter SQLite store. A new get/subscribe/cancel request must select a retained owned original invocation; its current caller/policy is independent of that old invocation. Task IDs are adapter protocol associations, not Pagnet planning state.

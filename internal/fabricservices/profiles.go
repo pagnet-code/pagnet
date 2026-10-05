@@ -134,6 +134,11 @@ func validate(p Profile) error {
 	}
 	return nil
 }
+
+// ValidateProfile performs pure bounded configuration validation before an
+// operator publishes an endpoint. It opens no store and resolves no provider.
+func ValidateProfile(p Profile) error { return validate(p) }
+
 func NewProfileStore(ctx context.Context, s *registry.Store, owner OwnerProvider, p durable.DataProtector) (*ProfileStore, error) {
 	if ctx == nil || s == nil || owner == nil || p == nil || !validText(p.Reference().ID, 256) || !validText(p.Reference().Version, 128) {
 		return nil, denied()
