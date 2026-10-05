@@ -50,6 +50,18 @@ type NativeRuntime struct {
 	router          *Router
 	admission       dispatch.Admission
 	closing         atomic.Bool
+	executionPaths  NativeExecutionPaths
+}
+
+// NativeExecutionPaths are immutable host-private launcher selections.
+// They are never descriptor fields or request-selected execution authority.
+type NativeExecutionPaths struct{ Binary, AuthorityDirectory, SocketPath string }
+
+func (r *NativeRuntime) ExecutionPaths() NativeExecutionPaths {
+	if r == nil {
+		return NativeExecutionPaths{}
+	}
+	return r.executionPaths
 }
 
 func NewNativeRuntime(ctx context.Context, store *registry.Store, c NativeRuntimeConfig) (_ *NativeRuntime, err error) {
@@ -70,7 +82,7 @@ func NewNativeRuntime(ctx context.Context, store *registry.Store, c NativeRuntim
 	if c.Owner.VerifyAuthenticated(root.Namespace) != nil || c.Owner.PrincipalView() != root.Owner {
 		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Current retained root owner required")
 	}
-	r := &NativeRuntime{admission: c.Admission}
+	r := &NativeRuntime{admission: c.Admission, executionPaths: NativeExecutionPaths{c.Binary, c.AuthorityDirectory, c.SocketPath}}
 	var launcher *fabricnative.Launcher
 	defer func() {
 		if err != nil {

@@ -16,6 +16,11 @@ import (
 type AgentCreateInput struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Role        string `json:"role,omitempty"`
+	Runtime     string `json:"runtime,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Workspace   string `json:"workspace,omitempty"`
+	Model       string `json:"model,omitempty"`
 }
 
 // AgentAdministration consumes genuine owner callbacks and the installation's
@@ -49,33 +54,14 @@ func (n *InstalledNode) AgentAdministration(committed func()) map[string]fabrica
 			if e := access.VerifyCurrent(current); e != nil {
 				return e
 			}
-			// Retain the random reference before publication. An interrupted setup
-			// repeats the exact registry mutation on that same identity, never creates
-			// another agent or changes an existing identity under the same request ID.
-			raw, e := json.Marshal(input)
-			if e != nil {
-				return e
-			}
-			defer clear(raw)
-			ref, e := n.ReserveSetupEndpoint(current, access, "agent.create", request.ID, raw)
-			if e != nil {
-				return e
-			}
-			if e = access.VerifyCurrent(current); e != nil {
-				return e
-			}
-			revision, e := n.Installation.Store.Register(current, owner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{Ref: ref, Kind: "actor.agent", Name: input.Name, Description: input.Description}})
+			result, e := n.ProvisionAgentRuntime(current, access, request.ID, input)
 			if e != nil {
 				return e
 			}
 			if committed != nil {
 				committed()
 			}
-			output, e = json.Marshal(struct {
-				Ref      fabric.EndpointRef `json:"ref"`
-				Revision fabric.Revision    `json:"revision"`
-				Name     string             `json:"name"`
-			}{ref, revision, input.Name})
+			output, e = json.Marshal(result)
 			return e
 		})
 		return output, err
