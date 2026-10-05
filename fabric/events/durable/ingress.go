@@ -37,8 +37,15 @@ type Ingress struct {
 	closed    bool
 }
 
+// ValidateIngressConfig performs no IO and starts no background worker.
+func ValidateIngressConfig(c IngressConfig) error {
+	if c.QueueDepth < 1 || c.QueueDepth > 65536 || c.MaxBytes < 1 || c.MaxBytes > 1<<30 || c.MaxEventBytes < 1 || c.MaxEventBytes > 1<<20 || c.MaxBytes < int64(c.MaxEventBytes) || int64(c.QueueDepth)*24+int64(c.MaxEventBytes) > c.MaxBytes || c.WriteTimeout < time.Millisecond || c.WriteTimeout > time.Minute {
+		return invalid("Invalid volatile event ingress limits")
+	}
+	return nil
+}
 func NewIngress(ctx context.Context, p Publisher, c IngressConfig) (*Ingress, error) {
-	if ctx == nil || p == nil || c.QueueDepth < 1 || c.QueueDepth > 65536 || c.MaxBytes < 1 || c.MaxBytes > 1<<30 || c.MaxEventBytes < 1 || c.MaxEventBytes > 1<<20 || c.MaxBytes < int64(c.MaxEventBytes) || int64(c.QueueDepth)*24+int64(c.MaxEventBytes) > c.MaxBytes || c.WriteTimeout < time.Millisecond || c.WriteTimeout > time.Minute {
+	if ctx == nil || p == nil || ValidateIngressConfig(c) != nil {
 		return nil, invalid("Invalid volatile event ingress limits")
 	}
 	lifetime, cancel := context.WithCancel(ctx)

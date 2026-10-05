@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events/httpbinding"
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
@@ -33,6 +35,8 @@ type InstalledConfig struct {
 	Services *ServiceRuntimeConfig
 	// ServiceProviders resolves only the explicitly retained provider selector.
 	ServiceProviders map[string]fabricservices.CredentialProvider
+	// EventProviders resolve only explicitly retained private observer selectors.
+	EventProviders map[string]httpbinding.CredentialProvider
 	// ObserveIndexPublication is trusted bounded observation, never authorization.
 	ObserveIndexPublication func(bool, error)
 }
@@ -44,6 +48,7 @@ type InstalledNode struct {
 	Node         *Node
 	Runtime      *LocalRuntime
 	Services     *ServiceRuntime
+	Events       *EventRuntime
 	Publisher    *IndexPublisher
 	Host         *fabrichost.Host
 	server       *fabricmcp.Server
@@ -160,6 +165,18 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			ports.ReplayVerifier = result.Services.Invocations
 			resources.services = result.Services
 		}
+		result.Events, err = OpenInstalledEvents(ctx, installation, c.EventProviders)
+		if err != nil {
+			var held *EventRuntimeOpenError
+			if errors.As(err, &held) {
+				resources.events = held.retained
+			}
+			return Ports{}, fmt.Errorf("opening configured event delivery: %w", err)
+		}
+		if result.Events != nil {
+			resources.events = result.Events
+			ports.Events = result.Events
+		}
 		ports.Tracing = c.Tracing
 		return ports, nil
 	})
@@ -245,6 +262,11 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 				return err
 			}
 		}
+		if n.Events != nil {
+			if err := n.Events.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
 		if n.Runtime != nil {
 			if err := n.Runtime.CloseContext(ctx); err != nil {
 				return err
@@ -268,6 +290,7 @@ type installedRuntimes struct {
 	native    *LocalRuntime
 	publisher *IndexPublisher
 	services  *ServiceRuntime
+	events    *EventRuntime
 	mu        sync.Mutex
 }
 
@@ -279,6 +302,11 @@ func (r *installedRuntimes) CloseContext(ctx context.Context) error {
 	defer r.mu.Unlock()
 	if r.publisher != nil {
 		if e := r.publisher.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
+	if r.events != nil {
+		if e := r.events.CloseContext(ctx); e != nil {
 			return e
 		}
 	}

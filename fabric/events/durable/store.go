@@ -93,6 +93,11 @@ func normalize(c Config) (Config, error) {
 	c.Subscriptions = copySubs
 	return c, nil
 }
+
+// ValidateConfig validates and owns normalized finite configuration without IO.
+// Explicit composition uses it before committing a setup intent.
+func ValidateConfig(c Config) (Config, error) { return normalize(c) }
+
 func Bootstrap(ctx context.Context, dir string, scope Scope, c Config, p DataProtector) (*Store, error) {
 	return open(ctx, dir, scope, c, p, true)
 }
