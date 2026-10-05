@@ -21,5 +21,10 @@ messages and descriptive endpoint names are outside the tracing interface.
 `Outgoing` supplies standard traceparent/tracestate for adapters inside the
 explicit trust boundary. It never adds baggage. Relay transport composition must
 not copy private application tracing into its visible envelope automatically.
-Exporter configuration, adapter/search spans and specialized operational metrics are separate
-composition work; this package alone does not claim complete product observability.
+Trusted node composition now wraps its actual search reader and selected adapter
+with explicit tracing. Search queries and results are not attributes. Adapter
+spans follow the original demand-driven stream; observation never prefetches,
+buffers, retries, changes a frame or turns premature EOF into completion. These
+wrappers install no exporter. Exporter configuration and specialized operational
+metrics remain product composition work; this package alone does not claim
+complete product observability.

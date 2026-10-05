@@ -94,7 +94,11 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if ports.Authenticator == nil {
 		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Missing actual node authenticator")
 	}
-	d, err := dispatch.New(dispatch.Config{Audience: store.AuthorityIdentity().Namespace, Descriptors: store, Bindings: ports.Bindings, Admission: ports.Admission})
+	bindings := ports.Bindings
+	if ports.Tracing != nil && bindings != nil {
+		bindings = observedBindings{bindings, ports.Tracing}
+	}
+	d, err := dispatch.New(dispatch.Config{Audience: store.AuthorityIdentity().Namespace, Descriptors: store, Bindings: bindings, Admission: ports.Admission})
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +106,7 @@ func Open(ctx context.Context, c Config) (*Node, error) {
 	if n.reader == nil {
 		n.reader = index
 	}
+	n.reader = telemetry.ObserveSearch(n.reader, ports.Tracing)
 	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing}
 	if ports.Events != nil {
 		cfg.EventSource = "pagnet://" + store.AuthorityIdentity().Namespace + "/node/local"
