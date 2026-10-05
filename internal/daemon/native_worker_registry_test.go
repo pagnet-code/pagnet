@@ -164,6 +164,23 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 		t.Fatal(err)
 	}
 	originalBuild := a.WorkerBuild
+	guard, err := NewHostedOwnerGuard(func(context.Context, localpeer.ProcessSnapshot) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Classification is taken from the actual mutually authenticated detached
+	// owner socket, before any native child. This fixture starts no paid turn.
+	if err = guard.Register(&NativeWorkerProxy{controller: a, scope: s}); err != nil {
+		t.Fatal("genuine original worker owner fence", err)
+	}
+	hostedDaemon := &Daemon{Config: Config{HostedOwnerGuard: guard}, nativeRegistry: r}
+	if err = hostedDaemon.HostedOwnerGuardReady(ctx, guard); err != nil {
+		t.Fatal("actual detached owner not ready", err)
+	}
+	workerRoot, err := a.OwnerProcess()
+	if err != nil || guard.Validate(ctx, workerRoot) == nil {
+		t.Fatal("real detached worker entered owner mode", err)
+	}
 	// Lifecycle cleanup signals only the mutually authenticated worker through
 	// its original bootstrap process identity (PID inspected via private socket).
 	socket, err := sessionworker.SocketPath(record.Dir)
@@ -192,6 +209,9 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 	}
 	if err := a.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if err = hostedDaemon.HostedOwnerGuardReady(ctx, guard); err != nil || guard.Validate(ctx, workerRoot) == nil {
+		t.Fatal("controller disconnect released original live worker fence", err)
 	}
 	cancel() // controller lifetime cancellation must not terminate detached owner
 	fresh, stop := context.WithTimeout(t.Context(), 5*time.Second)

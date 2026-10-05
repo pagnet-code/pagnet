@@ -54,6 +54,8 @@ type Config struct {
 	CurrentRoot            func(context.Context) (registry.AuthorityIdentity, error)
 	ManagedValidator       ManagedValidator
 	ManagedFacts           ManagedFactsProvider
+	HostedValidator        HostedValidator
+	HostedFacts            HostedFactsProvider
 	OwnerValidator         OwnerValidator
 	MaxPending             int
 	ProofTTL, CheckTimeout time.Duration
@@ -66,6 +68,7 @@ type Session struct {
 	process        localpeer.ProcessSnapshot
 	principal      fabric.Principal
 	activation     *Activation
+	hosted         *HostedActivation
 	pending        map[*proof]time.Time
 	closed         bool
 	revoked        atomic.Bool
@@ -106,7 +109,7 @@ func New(c Config) (*Authority, error) {
 	if c.CheckTimeout == 0 {
 		c.CheckTimeout = 3 * time.Second
 	}
-	if !validRoot(c.Root) || c.RootOwner != c.Root.Owner || c.Audience != c.Root.Namespace || c.CurrentRoot == nil || c.ManagedValidator != nil && c.OwnerValidator == nil || !text(c.SocketPath, 4096) || c.MaxPending < 1 || c.MaxPending > 1024 || c.ProofTTL < time.Millisecond || c.ProofTTL > time.Minute || c.CheckTimeout < time.Millisecond || c.CheckTimeout > 30*time.Second {
+	if !validRoot(c.Root) || c.RootOwner != c.Root.Owner || c.Audience != c.Root.Namespace || c.CurrentRoot == nil || (c.ManagedValidator != nil || c.HostedValidator != nil) && c.OwnerValidator == nil || (c.HostedValidator == nil) != (c.HostedFacts == nil) || !text(c.SocketPath, 4096) || c.MaxPending < 1 || c.MaxPending > 1024 || c.ProofTTL < time.Millisecond || c.ProofTTL > time.Minute || c.CheckTimeout < time.Millisecond || c.CheckTimeout > 30*time.Second {
 		return nil, invalid()
 	}
 	c.Root.PublicKey = bytes.Clone(c.Root.PublicKey)
@@ -124,6 +127,9 @@ func (a *Authority) current(ctx context.Context) error {
 // choice of mode. Hosts must require this before enabling managed resolution.
 func (a *Authority) SupportsManaged() bool {
 	return a != nil && a.config.ManagedValidator != nil && a.config.OwnerValidator != nil
+}
+func (a *Authority) SupportsHosted() bool {
+	return a != nil && a.config.HostedValidator != nil && a.config.HostedFacts != nil && a.config.OwnerValidator != nil
 }
 func (a *Authority) BindOwner(ctx context.Context, conn *net.UnixConn) (*Session, error) {
 	return a.bind(ctx, conn, nil)
@@ -165,7 +171,12 @@ func (s *Session) verify(ctx context.Context) (fabric.Principal, error) {
 		return fabric.Principal{}, denied()
 	}
 	principal := s.authority.config.RootOwner
-	if s.activation == nil {
+	if s.hosted != nil {
+		principal, e = s.verifyHosted(ctx, current)
+		if e != nil {
+			return fabric.Principal{}, e
+		}
+	} else if s.activation == nil {
 		// Recheck on every request as ownership can change after the connection
 		// was established. Configuration mistakes must not elevate a managed peer.
 		if s.authority.config.ManagedValidator != nil && s.authority.config.OwnerValidator == nil {

@@ -254,7 +254,10 @@ func (b *LocalBoundary) WithAdmission(ctx context.Context, f identity.AdmissionF
 			association := b.sessions
 			b.mu.RUnlock()
 			w := identity.Witness{CurrentCallerOpen: func() bool { return association != nil && association.AssociationOpen(f.Caller) }, Version: "pagnet.local-boundary.v1", FinalizedDigest: f.FinalizedDigest, Value: json.RawMessage(`{"boundary":"local-installation"}`)}
-			if facts.Managed != nil {
+			if facts.Hosted != nil {
+				w.CurrentCallerKind = "local-peer.hosted"
+				w.HostedCaller = hostedCallerWitness(facts.Hosted)
+			} else if facts.Managed != nil {
 				authority := facts.Managed.Authority
 				w.CurrentCallerKind = "local-peer.managed"
 				w.CurrentCallerAuthority = &authority
@@ -337,7 +340,9 @@ func (b *LocalBoundary) WithDispatch(ctx context.Context, caller fabric.Executio
 				}
 			}
 		}
-		if facts.Managed != nil {
+		if facts.Hosted != nil {
+			stamp.hosted = facts.Hosted
+		} else if facts.Managed != nil {
 			f := facts.Managed.Authority
 			stamp.managed = &f
 		} else if facts.Principal != b.root.Owner {
@@ -452,7 +457,10 @@ func (b *LocalBoundary) CurrentNativeCallerWitness(ctx context.Context, caller f
 	var witness identity.Witness
 	err := b.callerFacts(ctx, caller, func(c context.Context, facts fabricauth.CurrentCallerFacts) error {
 		witness.CurrentCallerOpen = func() bool { return association.AssociationOpen(caller) }
-		if facts.Managed != nil {
+		if facts.Hosted != nil {
+			witness.CurrentCallerKind = "local-peer.hosted"
+			witness.HostedCaller = hostedCallerWitness(facts.Hosted)
+		} else if facts.Managed != nil {
 			authority := facts.Managed.Authority
 			witness.CurrentCallerKind = "local-peer.managed"
 			witness.CurrentCallerAuthority = &authority

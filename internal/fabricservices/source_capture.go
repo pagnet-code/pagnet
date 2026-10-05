@@ -22,6 +22,7 @@ type sourceCapture struct {
 	cancel        context.CancelFunc
 	stopParent    func() bool
 	closed        atomic.Bool
+	pipelineClaim atomic.Bool
 	beginDrain    func() (func(), error)
 	releaseSource func()
 }

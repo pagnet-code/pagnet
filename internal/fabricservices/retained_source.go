@@ -232,3 +232,23 @@ func (s *RetainedSource) VerifyFrameTx(ctx context.Context, tx *registry.Authori
 	}
 	return nil
 }
+
+// VerifyReferenceTx verifies the immutable original source relation under the
+// independently current disclosure policy. It returns no raw SDK frame.
+func (s *RetainedSource) VerifyReferenceTx(ctx context.Context, tx *registry.AuthorityTx, caller fabric.ExecutionContext) error {
+	if s == nil || s.closed.Load() || tx == nil || caller.VerifyAuthenticated(s.ledger.profiles.root.Namespace) != nil {
+		return denied()
+	}
+	var r Receipt
+	if _, e := s.ledger.decode(tx, "invocation/"+invocationKey(s.reference.Principal, s.reference.InvocationID), &r); e != nil {
+		return e
+	}
+	if !s.ledger.validOriginalReceipt(r) || serviceReference(r) != s.reference {
+		return denied()
+	}
+	policy, ok := s.ledger.policy.(RetainedSourcePolicy)
+	if !ok {
+		return fabric.NewError(fabric.CodeUnsupported, "Current retained-service source policy unavailable")
+	}
+	return policy.AuthorizeRetainedSourceTx(ctx, tx, caller, r, "source_verify")
+}

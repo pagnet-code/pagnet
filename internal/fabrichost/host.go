@@ -21,6 +21,7 @@ import (
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/internal/fabricauth"
 	"github.com/pagnet-code/pagnet/internal/fabricmcp"
+	"github.com/pagnet-code/pagnet/internal/localpeer"
 )
 
 const Protocol = "fabric.mcp"
@@ -41,6 +42,20 @@ type ManagedSelector struct {
 // facts. Selection fields are untrusted selectors, never authentication.
 type ManagedResolver func(context.Context, ManagedSelector) (fabricauth.Activation, error)
 
+// Hosted selectors are private IPC, never authority supplied by the caller.
+// Peer is captured by this listener's actual kernel socket. The resolver must
+// validate the original activation through authenticated original worker IPC.
+type HostedSelector struct {
+	Endpoint                      fabric.EndpointRef
+	InstanceID, Generation, Nonce string
+	Peer                          localpeer.ProcessSnapshot
+}
+
+func (HostedSelector) MarshalJSON() ([]byte, error) { return nil, failure() }
+func (*HostedSelector) UnmarshalJSON([]byte) error  { return failure() }
+
+type HostedResolver func(context.Context, HostedSelector) (fabricauth.HostedActivation, error)
+
 // VerifiedSessionServer owns a kernel-verified private connection and session.
 // Protocol selection never creates authority or changes runtime MCP tools.
 type VerifiedSessionServer interface {
@@ -53,6 +68,7 @@ type Config struct {
 	Server                       VerifiedSessionServer
 	Protocols                    map[string]VerifiedSessionServer
 	ResolveManaged               ManagedResolver
+	ResolveHosted                HostedResolver
 	MaxConnections, MaxAuthBytes int
 	AuthTimeout                  time.Duration
 }
@@ -94,7 +110,7 @@ func (a Authentication) Validate() error {
 		if a.Endpoint.String() != "" || a.WorkerID != "" || a.Generation != "" || a.Nonce != "" {
 			return failure()
 		}
-	case "managed":
+	case "managed", "hosted":
 		if a.Endpoint.IsOffer() || a.Endpoint.String() == "" || !bounded(a.WorkerID, 256) || !bounded(a.Generation, 256) || !bounded(a.Nonce, 512) {
 			return failure()
 		}
@@ -107,7 +123,7 @@ func Start(ctx context.Context, config Config) (*Host, error) {
 	if err := ValidateSocketPath(config.SocketPath); err != nil {
 		return nil, err
 	}
-	if ctx == nil || ctx.Err() != nil || config.Authority == nil || config.ResolveManaged != nil && !config.Authority.SupportsManaged() || !filepath.IsAbs(config.SocketPath) || filepath.Clean(config.SocketPath) != config.SocketPath {
+	if ctx == nil || ctx.Err() != nil || config.Authority == nil || config.ResolveManaged != nil && !config.Authority.SupportsManaged() || config.ResolveHosted != nil && !config.Authority.SupportsHosted() || !filepath.IsAbs(config.SocketPath) || filepath.Clean(config.SocketPath) != config.SocketPath {
 		return nil, failure()
 	}
 	protocols := make(map[string]VerifiedSessionServer, 2)
@@ -257,6 +273,21 @@ func (h *Host) serve(c *net.UnixConn) {
 	var session *fabricauth.Session
 	if request.Mode == "owner" {
 		session, err = h.config.Authority.BindOwner(authenticated, c)
+	} else if request.Mode == "hosted" {
+		if h.config.ResolveHosted == nil {
+			return
+		}
+		pid, uid, peerErr := localpeer.Owner(c)
+		peer, readErr := localpeer.ReadProcess(pid)
+		if peerErr != nil || readErr != nil || peer.UID != uid {
+			return
+		}
+		activation, resolveErr := h.config.ResolveHosted(authenticated, HostedSelector{request.Endpoint, request.WorkerID, request.Generation, request.Nonce, peer})
+		cloud, ok := activation.Scope.Cloud()
+		if resolveErr != nil || !ok || cloud.InstanceID != request.WorkerID || activation.Endpoint != request.Endpoint || activation.NativeGeneration != request.Generation || !bounded(activation.Nonce, 512) || !hmac.Equal([]byte(request.Nonce), []byte(activation.Nonce)) {
+			return
+		}
+		session, err = h.config.Authority.BindHosted(authenticated, c, activation)
 	} else {
 		if h.config.ResolveManaged == nil {
 			return

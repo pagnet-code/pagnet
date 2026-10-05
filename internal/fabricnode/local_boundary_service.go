@@ -23,6 +23,7 @@ type dispatchStamp struct {
 	scope                               registry.DescriptorBatchScope
 	fingerprint                         [32]byte
 	managed                             *registry.NativeCallerAuthority
+	hosted                              *fabricauth.HostedCallerAuthority
 }
 
 // AuthorizeTx consumes only the private stamp minted by this boundary from an

@@ -50,7 +50,7 @@ func (a *OwnerAdministration) VerifyCurrent(ctx context.Context) error {
 	defer cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !a.active.Load() || s.revoked.Load() || s.activation != nil {
+	if !a.active.Load() || s.revoked.Load() || s.activation != nil || s.hosted != nil {
 		return denied()
 	}
 	principal, err := s.verify(checked)

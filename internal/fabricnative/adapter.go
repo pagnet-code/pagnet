@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -190,7 +191,7 @@ func (a *Adapter) Invoke(ctx context.Context, caller fabric.ExecutionContext, en
 	if e != nil {
 		return nil, e
 	}
-	receipt, e := controller.AdmitIntent(ctx, h.Current, source, caller, original, finalized, func(c context.Context, v nativeauthority.VerifiedIntent) (identity.NativeIntentReceipt, error) {
+	receipt, capture, e := controller.AdmitIntentForOriginalOutput(ctx, h.Current, source, caller, original, finalized, func(c context.Context, v nativeauthority.VerifiedIntent) (identity.NativeIntentReceipt, error) {
 		req := v.Request()
 		response, err := h.Client.Call(c, sessionworker.LocalRequest{Type: "intent", Intent: &req})
 		if err != nil {
@@ -211,7 +212,9 @@ func (a *Adapter) Invoke(ctx context.Context, caller fabric.ExecutionContext, en
 	if receipt.CommandID != reservation.CommandID || receipt.Sequence != reservation.Sequence || receipt.OriginalAdmissionID != source.ID {
 		return nil, adapterError(fabric.CodeProtocolError, "Native acknowledgement source differs")
 	}
-	return a.stream(ctx, caller, checkpoint, reservation, h, true), nil
+	stream := a.stream(ctx, caller, checkpoint, reservation, h, true)
+	stream.outputCapture = capture
+	return stream, nil
 }
 
 // Recover restores original evidence only. It performs no admission/reservation
@@ -328,23 +331,26 @@ func (a *Adapter) activation(ctx context.Context, h WorkerHandle, expected ...So
 }
 
 type nativeStream struct {
-	adapter     *Adapter
-	caller      fabric.ExecutionContext
-	checkpoint  OriginalCheckpoint
-	reservation identity.NativeDispatchReservation
-	ownership   nativeauthority.Scope
-	directory   string
-	lifetime    context.Context
-	cancel      context.CancelFunc
-	nextMu      sync.Mutex
-	mu          sync.Mutex
-	closed      bool
-	closeDone   chan struct{}
-	closeError  error
-	terminal    bool
-	started     bool
-	pending     *sessionworker.LocalInvocationCipherFrame
-	cursor      int64
+	outputCapture *identity.OriginalOutputCapture
+	captureClaim  atomic.Bool
+	detached      bool
+	adapter       *Adapter
+	caller        fabric.ExecutionContext
+	checkpoint    OriginalCheckpoint
+	reservation   identity.NativeDispatchReservation
+	ownership     nativeauthority.Scope
+	directory     string
+	lifetime      context.Context
+	cancel        context.CancelFunc
+	nextMu        sync.Mutex
+	mu            sync.Mutex
+	closed        bool
+	closeDone     chan struct{}
+	closeError    error
+	terminal      bool
+	started       bool
+	pending       *sessionworker.LocalInvocationCipherFrame
+	cursor        int64
 }
 
 func (a *Adapter) stream(ctx context.Context, caller fabric.ExecutionContext, checkpoint OriginalCheckpoint, r identity.NativeDispatchReservation, h WorkerHandle, executionDeadline bool) *nativeStream {
@@ -384,7 +390,14 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 		_ = s.Close()
 		return fabric.InvocationFrame{}, adapterError(fabric.CodeCancelled, "Native pull was cancelled; source effects require retained evidence")
 	}
-	life, cancel := context.WithCancel(s.lifetime)
+	// The exact accepted-output capability lives in the callback context. Keep
+	// it for original pipeline consumption; recreating a context from lifetime
+	// would silently downgrade this pull to an external viewer request.
+	base := s.lifetime
+	if s.outputCapture != nil && s.outputCapture.Active(ctx) {
+		base = ctx
+	}
+	life, cancel := context.WithCancel(base)
 	stop := context.AfterFunc(ctx, cancel)
 	defer stop()
 	defer cancel()
@@ -401,7 +414,7 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 		if e := life.Err(); e != nil {
 			return fail(e)
 		}
-		h, e := s.adapter.config.Workers.Refresh(life, s.caller, s.ownership)
+		h, e := s.refreshOutput(life)
 		if e != nil {
 			return fail(e)
 		}
@@ -415,7 +428,7 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 		ack := s.pending
 		s.mu.Unlock()
 		if ack != nil {
-			e = s.adapter.read(life, s.caller, h, s.checkpoint, s.reservation, identity.NativeSourceAck, func(c context.Context) error {
+			e = s.readOutput(life, h, identity.NativeSourceAck, func(c context.Context) error {
 				_, err := h.Client.Call(c, sessionworker.LocalRequest{Type: "stream_ack", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: s.reservation.Sequence, Cursor: ack.Cursor, Digest: ack.Digest})
 				return err
 			})
@@ -437,7 +450,7 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 			}
 		}
 		var response sessionworker.LocalResponse
-		e = s.adapter.read(life, s.caller, h, s.checkpoint, s.reservation, identity.NativeSourcePage, func(c context.Context) error {
+		e = s.readOutput(life, h, identity.NativeSourcePage, func(c context.Context) error {
 			var err error
 			response, err = h.Client.Call(c, sessionworker.LocalRequest{Type: "stream_page", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: s.reservation.Sequence, Cursor: s.cursor, Limit: 1})
 			return err
@@ -511,6 +524,15 @@ func (s *nativeStream) Close() (result error) {
 	}
 	s.closed = true
 	defer func() { s.mu.Lock(); s.closeError = result; close(s.closeDone); s.mu.Unlock() }()
+	// Once an actual accepted source owns final-pipeline capture, closing a
+	// delivery/wrapper cannot become a paid native cancellation. Exact current
+	// explicit source cancellation remains the separate Authority control path.
+	if s.captureClaim.Load() && !s.terminal {
+		s.detached = true
+		s.mu.Unlock()
+		s.cancel()
+		return nil
+	}
 	terminal := s.terminal
 	ack := s.pending
 	s.mu.Unlock()

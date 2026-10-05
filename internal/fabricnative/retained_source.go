@@ -261,3 +261,21 @@ func (s *RetainedSource) RequestCancellation(ctx context.Context, caller fabric.
 		return e
 	})
 }
+
+// PrepareReferenceVerifier performs current caller/kernel checks before SQL.
+// Its returned verifier consumes the exact existing source inside a consumer's
+// same-root transaction, without IPC or nested registry calls.
+func (s *RetainedSource) PrepareReferenceVerifier(ctx context.Context, caller fabric.ExecutionContext) (*identity.NativeSourceReadVerifier, error) {
+	if s == nil || s.closed.Load() || ctx == nil {
+		return nil, checkpointDenied()
+	}
+	h, err := s.adapter.config.Workers.Refresh(ctx, caller, s.ownership)
+	if err != nil {
+		return nil, err
+	}
+	// Shared fixture/resolver ownership differs; do not mutate borrowed handle keys.
+	if h.Directory != s.directory {
+		return nil, checkpointDenied()
+	}
+	return s.adapter.config.Authority.PrepareNativeSourceReadVerifier(ctx, caller, h.Current, h.Binding, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation)
+}

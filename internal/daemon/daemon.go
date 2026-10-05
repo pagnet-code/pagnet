@@ -56,6 +56,9 @@ var ErrOutdated = errors.New("control plane requires a newer protocol — update
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
+	// HostedOwnerGuard is explicit original-worker composition. When configured,
+	// authenticated worker roots are fenced before link publication/native work.
+	HostedOwnerGuard *HostedOwnerGuard
 	// FabricMCP is trusted local-node composition; nil refuses the explicit
 	// fabric.mcp protocol instead of falling back to the cloud tool relay.
 	FabricMCP    *ManagedFabricMCP

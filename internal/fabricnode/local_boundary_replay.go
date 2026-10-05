@@ -64,7 +64,9 @@ func (b *LocalBoundary) WithReplayRequest(ctx context.Context, caller fabric.Exe
 		association := b.sessions
 		b.mu.RUnlock()
 		stamp := &dispatchStamp{boundary: b, association: association, authenticatedCaller: caller, caller: f.Principal, originalSHA: f.OriginalSHA, finalizedSHA: f.FinalizedSHA, inputSHA: f.InputSHA, invocationID: f.InvocationID, target: f.Target, revision: f.Revision, scope: f.Scope, fingerprint: f.Fingerprint}
-		if facts.Managed != nil {
+		if facts.Hosted != nil {
+			stamp.hosted = facts.Hosted
+		} else if facts.Managed != nil {
 			authority := facts.Managed.Authority
 			stamp.managed = &authority
 		} else if facts.Principal != b.root.Owner {
@@ -147,6 +149,12 @@ func (b *LocalBoundary) authorizeStampTx(tx *registry.AuthorityTx, s *dispatchSt
 			return localDenied()
 		}
 		return tx.VerifyCurrentNativeCaller(*s.managed)
+	}
+	if s.hosted != nil {
+		if s.managed != nil || s.hosted.PrincipalView() != s.caller {
+			return localDenied()
+		}
+		return s.hosted.VerifyTx(tx)
 	}
 	if s.caller != b.root.Owner {
 		return localDenied()

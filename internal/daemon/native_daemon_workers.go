@@ -259,6 +259,12 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		_ = proxy.Close()
 		return err
 	}
+	if d.HostedOwnerGuard != nil {
+		if err = d.HostedOwnerGuard.Register(proxy); err != nil {
+			_ = proxy.Close()
+			return err
+		}
+	}
 	link := &nativeWorkerLink{proxy: proxy, conn: conn, ownership: *ownership}
 	d.nativeWorkersMu.Lock()
 	if d.nativeWorkers == nil {

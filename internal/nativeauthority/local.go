@@ -103,26 +103,31 @@ func (c *LocalController) Scope() Scope {
 	return c.scope
 }
 func (c *LocalController) AdmitIntent(ctx context.Context, current fabricidentity.Controller, source fabricidentity.Admission, caller fabric.ExecutionContext, original, finalized []byte, appendIntent func(context.Context, VerifiedIntent) (fabricidentity.NativeIntentReceipt, error)) (fabricidentity.NativeIntentReceipt, error) {
+	receipt, _, err := c.AdmitIntentForOriginalOutput(ctx, current, source, caller, original, finalized, appendIntent)
+	return receipt, err
+}
+
+func (c *LocalController) AdmitIntentForOriginalOutput(ctx context.Context, current fabricidentity.Controller, source fabricidentity.Admission, caller fabric.ExecutionContext, original, finalized []byte, appendIntent func(context.Context, VerifiedIntent) (fabricidentity.NativeIntentReceipt, error)) (fabricidentity.NativeIntentReceipt, *fabricidentity.OriginalOutputCapture, error) {
 	if c == nil || c.authority == nil || c.binder == nil || ctx == nil || appendIntent == nil {
-		return fabricidentity.NativeIntentReceipt{}, errors.New("local native intent port missing")
+		return fabricidentity.NativeIntentReceipt{}, nil, errors.New("local native intent port missing")
 	}
 	var final fabric.Envelope
 	if e := fabric.DecodeJSON(finalized, &final); e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	if e := final.Validate(); e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	operation, e := c.binder.Bind(final)
 	if e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	if !text(operation.Kind, 64) || len(operation.Payload) == 0 || len(operation.Payload) > MaxNativeOperationBytes || operation.SpecDigest != c.binding.Worker.ProfileDigest {
-		return fabricidentity.NativeIntentReceipt{}, errors.New("native binder returned invalid selector or executable commitment")
+		return fabricidentity.NativeIntentReceipt{}, nil, errors.New("native binder returned invalid selector or executable commitment")
 	}
 	var bounded any
 	if e = fabric.DecodeJSONWithLimits(operation.Payload, &bounded, fabric.WireLimits{MaxBytes: MaxNativeOperationBytes, MaxDepth: 16, MaxMembers: 1024}); e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	operation.Payload = bytes.Clone(operation.Payload)
 	selector, e := json.Marshal(struct {
@@ -130,15 +135,15 @@ func (c *LocalController) AdmitIntent(ctx context.Context, current fabricidentit
 		SpecDigest    [32]byte
 	}{"pagnet.native-local-selector.v1", operation.Kind, operation.SpecDigest})
 	if e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	reservation, e := c.authority.ReserveNativeDispatch(ctx, c.owner, current, c.binding, source, caller, original, finalized, fabricidentity.NativeDispatchSpec{OperationDigest: sha256.Sum256(operation.Payload), SelectorDigest: sha256.Sum256(selector), SpecDigest: operation.SpecDigest, MaxCommandsPerWorker: c.maxCommands})
 	if e != nil {
-		return fabricidentity.NativeIntentReceipt{}, e
+		return fabricidentity.NativeIntentReceipt{}, nil, e
 	}
 	commitment := reservation.Commitment()
 	verified := VerifiedIntent{Scope: c.scope, CurrentBinding: c.binding, CurrentController: current, OriginalAdmission: source, Commitment: commitment, Reservation: reservation, Operation: operation, Finalized: bytes.Clone(finalized)}
-	return c.authority.FenceNativeIntent(ctx, c.owner, current, c.binding, source, caller, original, finalized, commitment, func(lifetime context.Context) (fabricidentity.NativeIntentReceipt, error) {
+	return c.authority.FenceNativeIntentForOriginalOutput(ctx, c.owner, current, c.binding, source, caller, original, finalized, commitment, func(lifetime context.Context) (fabricidentity.NativeIntentReceipt, error) {
 		return appendIntent(lifetime, verified)
 	})
 }

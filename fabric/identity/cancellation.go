@@ -29,6 +29,13 @@ type NativeCancellationFence interface {
 	WithNativeCancellation(context.Context, NativeCancellationFacts, func() error) error
 }
 
+// CurrentNativeCancellationCallerWitness captures current caller evidence against the
+// exact original source, after reservation validation and before SQL. It does
+// not establish paid authority or permit IO inside the transaction verifier.
+type CurrentNativeCancellationCallerWitness interface {
+	CurrentNativeCancellationCallerWitness(context.Context, fabric.ExecutionContext, NativeCancellationFacts) (Witness, error)
+}
+
 // FenceNativeCancellation holds current controller/binding, the exact original
 // source and durable reservation through ONLY a bounded FULL source-specific
 // cancellation ACK. Native process stopping/joining happens outside this fence.
@@ -49,7 +56,14 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 		return invalid("Invalid source cancellation facts")
 	}
 	facts.CurrentCaller = caller
-	callerWitness, e := a.currentCallerWitness(ctx, caller)
+	var callerWitness Witness
+	var e error
+	if provider, ok := a.fence.(CurrentNativeCancellationCallerWitness); ok {
+		callerWitness, e = provider.CurrentNativeCancellationCallerWitness(ctx, caller, facts)
+		callerWitness = cloneWitness(callerWitness)
+	} else {
+		callerWitness, e = a.currentCallerWitness(ctx, caller)
+	}
 	if e != nil {
 		return e
 	}

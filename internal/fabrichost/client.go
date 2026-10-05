@@ -109,7 +109,7 @@ func (a Authentication) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	var endpoint *fabric.EndpointRef
-	if a.Mode == "managed" {
+	if a.Mode == "managed" || a.Mode == "hosted" {
 		endpoint = &a.Endpoint
 	}
 	return json.Marshal(struct {

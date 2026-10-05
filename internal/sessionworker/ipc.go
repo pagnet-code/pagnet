@@ -38,6 +38,7 @@ type handshake struct {
 }
 
 type Request struct {
+	HostedPeer       *HostedPeerVerificationRequest                `json:"hostedPeer,omitempty"`
 	InvocationSource *CloudInvocationSourceRequest                 `json:"invocationSource,omitempty"`
 	InvocationStream *InvocationStreamRequest                      `json:"invocationStream,omitempty"`
 	DeletionProof    *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
@@ -65,6 +66,7 @@ type Request struct {
 }
 
 type Response struct {
+	HostedPeer             *HostedPeerVerificationResult    `json:"hostedPeer,omitempty"`
 	InvocationSource       *CloudInvocationSourceResult     `json:"invocationSource,omitempty"`
 	InvocationState        *InvocationStreamState           `json:"invocationState,omitempty"`
 	InvocationSubscription *InvocationStreamSubscription    `json:"invocationSubscription,omitempty"`
@@ -466,6 +468,12 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
 	var err error
 	switch req.Type {
+	case "hosted_peer_verify":
+		if req.HostedPeer == nil {
+			err = ErrConflict
+		} else {
+			response.HostedPeer, err = o.verifyHostedPeer(ctx, lease, *req.HostedPeer)
+		}
 	case "invocation_source":
 		if req.InvocationSource == nil {
 			err = ErrConflict

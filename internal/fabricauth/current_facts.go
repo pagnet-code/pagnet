@@ -19,6 +19,7 @@ type CurrentCallerFacts struct {
 	Principal fabric.Principal
 	Process   localpeer.ProcessSnapshot
 	Managed   *ManagedCallerFacts
+	Hosted    *HostedCallerAuthority
 }
 
 func (CurrentCallerFacts) MarshalJSON() ([]byte, error) { return nil, denied() }
@@ -39,6 +40,18 @@ func (a *Authority) WithCurrentFacts(ctx context.Context, caller fabric.Executio
 	s.mu.Lock()
 	principal, err := s.verify(checked)
 	facts := CurrentCallerFacts{Principal: principal, Process: s.process}
+	if err == nil && s.hosted != nil {
+		root := a.config.Root
+		root.PublicKey = append([]byte(nil), root.PublicKey...)
+		if a.config.HostedFacts == nil {
+			err = denied()
+		} else {
+			facts.Hosted, err = a.config.HostedFacts(checked, HostedPeer{s.process, *s.hosted, root})
+			if err == nil && (facts.Hosted == nil || facts.Hosted.PrincipalView() != principal) {
+				err = denied()
+			}
+		}
+	}
 	if err == nil && s.activation != nil {
 		if a.config.ManagedFacts == nil {
 			err = denied()

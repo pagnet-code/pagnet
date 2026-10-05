@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -130,6 +131,10 @@ func TestCloudReadinessNotificationCancellationLeavesPrimaryLeaseCurrent(t *test
 		t.Fatal(e)
 	}
 	defer controller.Close()
+	actualOwner, ownerErr := controller.OwnerProcess()
+	if ownerErr != nil || actualOwner.PID != os.Getpid() || actualOwner.Start <= 0 {
+		t.Fatal("private controller lost actual kernel worker incarnation", actualOwner, ownerErr)
+	}
 	wait, cancelWait := context.WithCancel(t.Context())
 	waiting := make(chan error, 1)
 	token := j.cloudReadiness.snapshot()

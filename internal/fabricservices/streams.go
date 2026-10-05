@@ -51,7 +51,7 @@ func (s *retainedStream) Next(ctx context.Context) (fabric.InvocationFrame, erro
 		}
 		return fabric.InvocationFrame{}, e
 	}
-	if s.capture != nil {
+	if s.capture != nil && !s.isOriginalCapture(ctx) {
 		if _, e = s.ledger.Frame(s.ctx, s.caller, s.receipt, f.Sequence); e != nil {
 			return fabric.InvocationFrame{}, e
 		}

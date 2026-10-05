@@ -64,6 +64,7 @@ type AdmissionFacts struct {
 	ReplayID        string
 }
 type Witness struct {
+	HostedCaller *HostedCallerWitness `json:"-"`
 	// CurrentPlanVerifier is trusted infrastructure evidence, never a serialized interceptor or permission.
 	CurrentPlanVerifier    func(*registry.AuthorityTx) error `json:"-"`
 	RemoteCaller           *RemoteCallerWitness              `json:"-"`
@@ -278,6 +279,10 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 // cloneWitness detaches authority records before a trusted external fence can
 // reuse or mutate its storage. Current caller facts never enter signed JSON.
 func cloneWitness(w Witness) Witness {
+	if w.HostedCaller != nil {
+		copy := *w.HostedCaller
+		w.HostedCaller = &copy
+	}
 	if w.RemoteCaller != nil {
 		r := *w.RemoteCaller
 		w.RemoteCaller = &r

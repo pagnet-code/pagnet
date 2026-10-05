@@ -29,6 +29,9 @@ func (a *Authority) verifyCurrentCallerTx(tx *registry.AuthorityTx, w Witness, p
 	if err := verifyCurrentPlanTx(tx, w); err != nil {
 		return err
 	}
+	if w.HostedCaller != nil {
+		return a.verifyHostedCallerTx(tx, w, principal)
+	}
 	if w.DeferredCaller != nil {
 		return a.verifyDeferredCallerTx(tx, w, principal)
 	}

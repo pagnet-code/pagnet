@@ -44,26 +44,33 @@ func (r NativeIntentReceipt) matches(i NativeIntentCommitment, c Controller, b B
 // never by replaying native effects. A returned receipt remains truthful even if
 // a configured fence subsequently fails; that error never authorizes new work.
 func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.ExecutionContext, c Controller, b Binding, source Admission, caller fabric.ExecutionContext, original, finalized []byte, intent NativeIntentCommitment, appendDurableIntent func(context.Context) (NativeIntentReceipt, error)) (receipt NativeIntentReceipt, err error) {
+	receipt, _, err = a.FenceNativeIntentForOriginalOutput(ctx, owner, c, b, source, caller, original, finalized, intent, appendDurableIntent)
+	return receipt, err
+}
+
+// FenceNativeIntentForOriginalOutput separately returns an ephemeral capture;
+// the durable receipt remains identical and fully serializable.
+func (a *Authority) FenceNativeIntentForOriginalOutput(ctx context.Context, owner fabric.ExecutionContext, c Controller, b Binding, source Admission, caller fabric.ExecutionContext, original, finalized []byte, intent NativeIntentCommitment, appendDurableIntent func(context.Context) (NativeIntentReceipt, error)) (receipt NativeIntentReceipt, capture *OriginalOutputCapture, err error) {
 	if ctx == nil || appendDurableIntent == nil || source.Scope != c.Scope || b.Scope != c.Scope || !text(intent.CommandID) || intent.Sequence <= 0 || intent.Sequence == 9223372036854775807 || intent.OperationDigest == ([32]byte{}) || intent.SelectorDigest == ([32]byte{}) || intent.SpecDigest != b.Worker.ProfileDigest {
-		return receipt, invalid("Incomplete native intent commitment")
+		return receipt, nil, invalid("Incomplete native intent commitment")
 	}
 	lifetime, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	facts, env, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
 	if e != nil {
-		return receipt, e
+		return receipt, nil, e
 	}
 	facts = withNativeSourceFacts(facts, PurposeNativeIntent, source)
 	if facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest || facts.OriginalCaller != source.OriginalCaller {
-		return receipt, invalid("Native intent original or final admission bytes differ")
+		return receipt, nil, invalid("Native intent original or final admission bytes differ")
 	}
 	prepared, e := a.store.PrepareInvocationTarget(ctx, source.Target, source.TargetRevision, env.Payload)
 	if e != nil {
-		return receipt, e
+		return receipt, nil, e
 	}
 	bindingDigest, e := digest(b)
 	if e != nil || bindingDigest != source.BindingDigest {
-		return receipt, conflict("Native intent original worker binding changed")
+		return receipt, nil, conflict("Native intent original worker binding changed")
 	}
 	err = a.withFence(lifetime, facts, func(w Witness) error {
 		return a.transact(lifetime, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
@@ -91,8 +98,14 @@ func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.Executio
 			} else if e == nil {
 				return invalid("Native intent ACK missing genuine journal evidence")
 			}
+			if e == nil {
+				capture, e = newOriginalOutputCapture(a, source, b, intent, receipt, w)
+			}
 			return e
 		})
 	})
-	return receipt, err
+	if err != nil {
+		capture = nil
+	}
+	return receipt, capture, err
 }

@@ -38,6 +38,13 @@ type NativeSourceReadFence interface {
 	WithNativeSourceRead(context.Context, NativeSourceReadFacts, func() error) error
 }
 
+// CurrentNativeSourceCallerWitness captures current caller evidence against the
+// exact original source, after reservation validation and before SQL. It does
+// not establish paid authority or permit IO inside the transaction verifier.
+type CurrentNativeSourceCallerWitness interface {
+	CurrentNativeSourceCallerWitness(context.Context, fabric.ExecutionContext, NativeSourceReadFacts) (Witness, error)
+}
+
 // FenceNativeSourceRead holds current controller/binding, exact original source
 // and reservation retirement through ONLY bounded private IPC Page/ACK. Prepare
 // identity lookups outside this callback; it must not reenter the registry.
@@ -58,7 +65,14 @@ func (a *Authority) FenceNativeSourceRead(ctx context.Context, owner, caller fab
 		return invalid("Invalid source read facts")
 	}
 	facts.CurrentCaller = caller
-	callerWitness, e := a.currentCallerWitness(ctx, caller)
+	var callerWitness Witness
+	var e error
+	if provider, ok := a.fence.(CurrentNativeSourceCallerWitness); ok {
+		callerWitness, e = provider.CurrentNativeSourceCallerWitness(ctx, caller, facts)
+		callerWitness = cloneWitness(callerWitness)
+	} else {
+		callerWitness, e = a.currentCallerWitness(ctx, caller)
+	}
 	if e != nil {
 		return e
 	}
@@ -121,4 +135,73 @@ func (a *Authority) FenceNativeSourceRead(ctx context.Context, owner, caller fab
 		}
 	}
 	return err
+}
+
+// NativeSourceReadVerifier is purpose-bound prepared current disclosure
+// evidence. Preparing performs external caller checks; VerifyTx performs only
+// exact signed source/control lookups inside the caller's same transaction.
+type NativeSourceReadVerifier struct {
+	authority   *Authority
+	caller      fabric.Principal
+	witness     Witness
+	current     Controller
+	binding     Binding
+	source      Admission
+	original    Binding
+	reservation NativeDispatchReservation
+}
+
+func (a *Authority) PrepareNativeSourceReadVerifier(ctx context.Context, caller fabric.ExecutionContext, current Controller, b Binding, original Binding, source Admission, r NativeDispatchReservation) (*NativeSourceReadVerifier, error) {
+	if a == nil || ctx == nil || caller.VerifyAuthenticated(a.root.Namespace) != nil || current.Scope != b.Scope || source.Scope != original.Scope || original.Worker != b.Worker || original.Scope.Endpoint != b.Scope.Endpoint || original.Scope.BindingID != b.Scope.BindingID {
+		return nil, invalid("Current source verifier invalid")
+	}
+	if err := VerifyNativeDispatchReservation(a.root, r, source, original, r.Commitment()); err != nil {
+		return nil, err
+	}
+	var facts NativeSourceReadFacts
+	raw, err := json.Marshal(NativeSourceReadFacts{Operation: NativeSourcePage, Owner: a.root.Owner, Caller: caller.PrincipalView(), Controller: current, CurrentBinding: b, OriginalBinding: original, Admission: source, Reservation: r})
+	if err != nil || fabric.DecodeJSON(raw, &facts) != nil {
+		return nil, invalid("Invalid prepared source read facts")
+	}
+	facts.CurrentCaller = caller
+	var w Witness
+	if p, ok := a.fence.(CurrentNativeSourceCallerWitness); ok {
+		w, err = p.CurrentNativeSourceCallerWitness(ctx, caller, facts)
+		w = cloneWitness(w)
+	} else {
+		w, err = a.currentCallerWitness(ctx, caller)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &NativeSourceReadVerifier{a, caller.PrincipalView(), w, facts.Controller, facts.CurrentBinding, facts.Admission, facts.OriginalBinding, facts.Reservation}, nil
+}
+func (v *NativeSourceReadVerifier) VerifyTx(tx *registry.AuthorityTx) error {
+	if v == nil || v.authority == nil || tx == nil {
+		return invalid("Source verifier unavailable")
+	}
+	a := v.authority
+	if err := a.verifyCurrentCallerTx(tx, v.witness, v.caller); err != nil {
+		return err
+	}
+	if err := a.currentController(tx, v.current); err != nil {
+		return err
+	}
+	if err := a.currentBinding(tx, v.binding); err != nil {
+		return err
+	}
+	if err := a.originalAdmission(tx, v.source); err != nil {
+		return err
+	}
+	_, err := exactRecord(tx, a.root, v.reservation.Proof, dispatchKey(v.source.OriginalCaller, v.source.InvocationID))
+	return err
+}
+
+// Scope is prepared actual current binding metadata for same-root transaction
+// composition, not caller-supplied scope or a standalone authorization.
+func (v *NativeSourceReadVerifier) Scope() Scope {
+	if v == nil {
+		return Scope{}
+	}
+	return v.current.Scope
 }

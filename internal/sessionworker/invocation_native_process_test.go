@@ -15,6 +15,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	hostcrypto "github.com/pagnet-code/pagnet/internal/crypto"
+	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/nativecontent"
 	"github.com/pagnet-code/pagnet/transport"
@@ -54,6 +55,7 @@ func TestActualNativeInvocationParserOutputOriginalEncryption(t *testing.T) {
 	}
 	defer owner.Close()
 	owner.generation = "actual-original-generation"
+	owner.nonce = "fixture-only-nonce"
 	owner.origin = json.RawMessage(`{"id":"` + uuid.NewString() + `","nativeGeneration":"actual-original-generation"}`)
 	owner.sess.Env, err = owner.launchEnvironment("fixture-only-nonce")
 	if err != nil {
@@ -75,6 +77,42 @@ func TestActualNativeInvocationParserOutputOriginalEncryption(t *testing.T) {
 	raw, _ := json.Marshal(op)
 	current := lease(t, j)
 	grant := &Admission{NativeAdmissionID: op.SourceAdmissionID, Scope: scope, TenantID: scope.TenantID, NetworkID: network, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
+	owner.relay.bindLease(current)
+	if err = owner.relay.admit(current, *grant); err != nil {
+		t.Fatal("actual controller admission", err)
+	}
+	t.Run("hosted caller retains original physical identity", func(t *testing.T) {
+		snapshot := owner.physicalSnapshot()
+		peer, readErr := localpeer.ReadProcess(snapshot.PID)
+		if readErr != nil {
+			t.Fatal("actual original process", readErr)
+		}
+		request := HostedPeerVerificationRequest{Peer: peer, Nonce: owner.nonce, NativeGeneration: owner.generation, NativeSessionID: sid}
+		proof, verifyErr := owner.verifyHostedPeer(ctx, current, request)
+		if verifyErr != nil || proof.Scope != scope || proof.NativeSessionID != sid || proof.Peer != peer || proof.RootPID != snapshot.PID {
+			t.Fatal("original physical caller proof", proof, verifyErr)
+		}
+		for _, change := range []func(*HostedPeerVerificationRequest){
+			func(r *HostedPeerVerificationRequest) { r.Nonce = "wrong activation" },
+			func(r *HostedPeerVerificationRequest) { r.NativeGeneration = "old generation" },
+			func(r *HostedPeerVerificationRequest) { r.NativeSessionID = "another session" },
+			func(r *HostedPeerVerificationRequest) { r.Peer.Start++ },
+			func(r *HostedPeerVerificationRequest) { r.Peer, _ = localpeer.ReadProcess(os.Getpid()) },
+		} {
+			invalid := request
+			change(&invalid)
+			if _, verifyErr = owner.verifyHostedPeer(ctx, current, invalid); verifyErr == nil {
+				t.Fatal("forged activation or same-UID unrelated process accepted")
+			}
+		}
+		if _, verifyErr = owner.verifyHostedPeer(ctx, current+1, request); verifyErr == nil {
+			t.Fatal("foreign controller lease accepted")
+		}
+		encoded, _ := json.Marshal(proof)
+		if bytes.Contains(encoded, []byte(owner.nonce)) {
+			t.Fatal("original nonce exposed in proof")
+		}
+	})
 	out, execute, err := j.admit(ctx, current, 1, op.SourceCommandID, "prompt", raw, func() (*Admission, error) { return grant, nil })
 	if err != nil || !execute {
 		t.Fatal(err)

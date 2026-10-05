@@ -134,6 +134,19 @@ func TestActualSDKSourceCaptureDroppedCallerDetachOriginalOnceAndRestart(t *test
 	if !ok {
 		t.Fatal("source-owned retention unavailable")
 	}
+	ownership, err := fabric.OriginalStreamOwnership(t.Context(), stream)
+	if err != nil {
+		t.Fatal("genuine original ownership", err)
+	}
+	capability, ok := ownership.(*OriginalCaptureOwnership)
+	if !ok {
+		t.Fatal("missing actual service capture capability")
+	}
+	if err = ledger.with(t.Context(), scope, func(ctx context.Context, tx *registry.AuthorityTx) error {
+		return ledger.VerifyOriginalCaptureTx(ctx, tx, capability)
+	}); err == nil {
+		t.Fatal("copied source ownership authorized outside its active capture callback")
+	}
 	policy.denied.Store(true)
 	ref, e := retainer.DetachOriginalDelivery()
 	if e != nil {
