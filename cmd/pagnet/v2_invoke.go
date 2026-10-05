@@ -67,6 +67,8 @@ func (r invocationRecord) envelopeAAD() (*e2ee.EncryptedPayloadV1, *e2ee.AAD) {
 
 func invokeCmd() *cobra.Command {
 	var (
+		socket         string
+		revision       string
 		network        string
 		inputPath      string
 		idempotencyKey string
@@ -75,23 +77,37 @@ func invokeCmd() *cobra.Command {
 		actor          principalActorOptions
 	)
 	cmd := &cobra.Command{
-		Use:   "invoke <agent-or-service> <capability> [--input file|-]",
-		Short: "Invoke a network capability (the input is encrypted end-to-end on this host)",
-		Long: `Call a capability an agent or a service offers. The input is encrypted on
-this host and only the target decrypts it.
+		Use:   "invoke <ref> --revision <revision> [--input file|-]",
+		Short: "Invoke exactly the selected network endpoint or operation",
+		Long: `Invoke a stable reference on your local Pagnet node. Use the revision
+returned by discover or describe. Results stream directly; no alternative target
+or automatic retry is selected.
 
-An invocation is made BY an agent or a service — the control plane refuses a
-signed-in user, because the record's caller must be a network participant. This
-host makes the call as one when it holds that participant's credential:
+  pagnet invoke <ref> --revision <revision> --input in.json
 
-  pagnet invoke docs-svc documents.extract --input in.json
-  pagnet invoke docs-svc documents.extract --credential ` + tokenPrefixEndpoint + `... --async
+Existing cloud participant integrations also accept:
 
-Without --credential the credential comes from $` + sdk.EnvCredential + `, then from the endpoint
-credential already stored on this host. pagnet service credential create
-<service> (or pagnet agent credential create <agent>) prints one once.`,
-		Args: cobra.ExactArgs(2),
+  pagnet invoke <participant> <capability> --input in.json
+
+Cloud calls encrypt input on this host and require the participant credential
+(--credential, $PAGNET_CREDENTIAL, or its credential already stored on this host).
+Use --async to return once a cloud invocation is queued.`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				if cmd.Flags().Changed("network") || asynchronous || cmd.Flags().Changed("credential") || cmd.Flags().Changed("as") {
+					return fmt.Errorf("local reference invocation does not use account or cloud participant credentials")
+				}
+				return nil
+			}
+			if len(args) == 2 && !cmd.Flags().Changed("socket") && !cmd.Flags().Changed("revision") {
+				return nil
+			}
+			return fmt.Errorf("invoke requires one stable reference, or a participant and capability")
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				return runLocalInvoke(cmd, args[0], socket, revision, inputPath, idempotencyKey, waitTimeout)
+			}
 			c, err := invokeCLI(actor)
 			if err != nil {
 				return err
@@ -192,9 +208,11 @@ credential already stored on this host. pagnet service credential create
 			}
 		},
 	}
+	cmd.Flags().StringVar(&socket, "socket", "", "private local socket for stable-reference invocation")
+	cmd.Flags().StringVar(&revision, "revision", "", "exact selected descriptor revision for stable-reference invocation")
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network (default: the saved/only network)")
 	cmd.Flags().StringVar(&inputPath, "input", "", "invocation input as a JSON file (or '-' for stdin; default: an empty object)")
-	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "idempotency key (a retried call with the same key is not re-executed)")
+	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "optional target idempotency key (no automatic retries)")
 	cmd.Flags().BoolVar(&asynchronous, "async", false, "return after the invocation is queued (do not wait for the result)")
 	cmd.Flags().DurationVar(&waitTimeout, "timeout", 120*time.Second, "how long to wait for the result (sync mode)")
 	actor.register(cmd)

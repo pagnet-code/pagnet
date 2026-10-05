@@ -41,10 +41,12 @@ import (
 // the `serve` subcommand; both write these variables, and only one
 // command runs per invocation.
 var (
-	daemonStateDir     string
-	daemonLogLevel     string
-	daemonDebug        bool
-	daemonNoAutoUpdate bool
+	daemonLocal          bool
+	daemonLocalDirectory string
+	daemonStateDir       string
+	daemonLogLevel       string
+	daemonDebug          bool
+	daemonNoAutoUpdate   bool
 	// detach is the root-level -d/--detach flag (see runDetach).
 	detach bool
 )
@@ -63,6 +65,8 @@ func daemonCmd() *cobra.Command {
 
 // registerDaemonFlags binds the daemon flag set to cmd.
 func registerDaemonFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&daemonLocal, "local", false, "serve an explicitly initialized local Fabric node without cloud enrollment")
+	cmd.Flags().StringVar(&daemonLocalDirectory, "local-dir", "", "private local installation directory (with --local)")
 	cmd.Flags().StringVar(&daemonStateDir, "state-dir", "", "daemon state dir (default ~/.pagnet)")
 	cmd.Flags().StringVar(&daemonLogLevel, "log-level", envOrDefault("PAGNET_LOG_LEVEL", "info"),
 		"log level: debug|info|warn|error (default from PAGNET_LOG_LEVEL, else info)")
@@ -92,6 +96,18 @@ func needsEnroll(cfg config.Daemon) bool {
 // runDaemon is the `pagnet serve` foreground body: state-dir config,
 // daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
+	if daemonLocal {
+		for _, name := range []string{"state-dir", "debug", "server", "account", "token"} {
+			if cmd.Flags().Changed(name) {
+				return fmt.Errorf("--%s does not apply to local Fabric serve", name)
+			}
+		}
+		return runLocalFabricDaemon(cmd, daemonLocalDirectory)
+	}
+	if cmd.Flags().Changed("local-dir") {
+		return fmt.Errorf("--local-dir requires --local")
+	}
+
 	if err := hostPlatformError(); err != nil {
 		return err
 	}
@@ -285,6 +301,12 @@ func countNetworks(base, bearer string) int {
 // convenience, not a second runtime mode: the child runs the identical
 // foreground `serve` path.
 func runDetach(cmd *cobra.Command) error {
+	if daemonLocal {
+		return runLocalFabricDetached(cmd, daemonLocalDirectory)
+	}
+	if cmd.Flags().Changed("local-dir") {
+		return fmt.Errorf("--local-dir requires --local")
+	}
 	if err := hostPlatformError(); err != nil {
 		return err
 	}
@@ -390,6 +412,8 @@ func daemonizeSelf(stateDir string, args []string) error {
 	// The child owns its session; the parent must not wait on it.
 	_ = child.Process.Release()
 	f.Close()
-	fmt.Printf("pagnet service started (pid %d) — log: %s\n", pid, logPath)
+	if !silent {
+		fmt.Printf("pagnet service started (pid %d) — log: %s\n", pid, logPath)
+	}
 	return nil
 }

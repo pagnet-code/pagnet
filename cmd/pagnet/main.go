@@ -117,7 +117,7 @@ func main() {
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "pagnet",
-		Short:         "pagnet CLI — control plane for AI coding agent networks",
+		Short:         "Pagnet — connect agents, people and services",
 		SilenceUsage:  true,
 		SilenceErrors: false,
 		Args:          cobra.NoArgs,
@@ -214,6 +214,8 @@ func newRootCmd() *cobra.Command {
 		serviceCmd(),
 		searchCmd(),
 		invokeCmd(),
+		discoverCmd(),
+		describeCmd(),
 		eventCmd(),
 		subscribeCmd(),
 		subscriptionsCmd(),
