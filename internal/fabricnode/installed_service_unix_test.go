@@ -86,7 +86,7 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	defer setup.CloseContext(ctx)
 	digest := [32]byte{131}
 	config := DefaultInstalledServiceConfig(serviceRouterCredentials{digest})
-	config.MaxConnections = 2
+	config.MaxConnections = 3
 	config.SetupTimeout = time.Second
 	config.SetupConcurrency = 2
 	if e = InitializeServiceState(ctx, setup.Installation, setup.Runtime.Boundary, config); e != nil {
@@ -98,15 +98,16 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	}
 	defer serviceSetup.CloseContext(ctx)
 	var effects atomic.Int32
-	server := func() *httptest.Server {
-		official := sdk.NewServer(&sdk.Implementation{Name: "installed official SDK service", Version: "1"}, nil)
+	server := func() (*httptest.Server, *sdk.Server) {
+		official := sdk.NewServer(&sdk.Implementation{Name: "installed official SDK service", Version: "1"}, &sdk.ServerOptions{SupportedProtocolVersions: []string{"2025-11-25"}})
 		official.AddTool(&sdk.Tool{Name: "echo", Description: "Echo an exact integer", InputSchema: json.RawMessage(`{"type":"object","properties":{"number":{"type":"integer"}},"required":["number"]}`)}, func(_ context.Context, r *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 			effects.Add(1)
 			return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: string(r.Params.Arguments)}}}, nil
 		})
-		return httptest.NewServer(sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return official }, &sdk.StreamableHTTPOptions{Stateless: true}))
+		return httptest.NewServer(sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return official }, &sdk.StreamableHTTPOptions{Stateless: false})), official
 	}
-	healthy, offline := server(), server()
+	healthy, healthySDK := server()
+	offline, _ := server()
 	defer healthy.Close()
 	defer offline.Close()
 	owner, e := setup.Installation.Operator(ctx)
@@ -116,13 +117,13 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	scopes := make([]registry.DescriptorBatchScope, 0, 2)
 	for _, url := range []string{healthy.URL, offline.URL} {
 		ref, _ := fabric.NewEndpointRef(root.PublicKey)
-		revision, e := setup.Installation.Store.Register(ctx, owner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{Ref: ref, Kind: "service.mcp", Name: "Operator customer support", Description: "installedservicemarker", Bindings: []fabric.BindingSummary{{ID: "mcp", Protocol: "mcp.tools", Version: "2026-07-28", Cancellation: true}}}})
+		revision, e := setup.Installation.Store.Register(ctx, owner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{Ref: ref, Kind: "service.mcp", Name: "Operator customer support", Description: "installedservicemarker", Bindings: []fabric.BindingSummary{{ID: "mcp", Protocol: "mcp.tools", Version: "2025-11-25", Cancellation: true}}}})
 		if e != nil {
 			t.Fatal(e)
 		}
 		scope := registry.DescriptorBatchScope{Endpoint: ref, ExpectedEndpointRevision: revision, BindingID: "mcp"}
 		scopes = append(scopes, scope)
-		if _, e = serviceSetup.Profiles.Install(ctx, scope, fabricservices.Profile{Protocol: "mcp.tools", Version: "2026-07-28", CredentialSelector: "private configured SDK account", BindingDigest: digest, MCP: &fabricservices.MCPProfile{URL: url, AllowHTTP: true, Limits: mcp.DefaultLimits}}); e != nil {
+		if _, e = serviceSetup.Profiles.Install(ctx, scope, fabricservices.Profile{Protocol: "mcp.tools", Version: "2025-11-25", CredentialSelector: "private configured SDK account", BindingDigest: digest, MCP: &fabricservices.MCPProfile{URL: url, AllowHTTP: true, Limits: mcp.DefaultLimits}}); e != nil {
 			t.Fatal(e)
 		}
 		if e = serviceSetup.Connect(ctx, scope, true); e != nil {
@@ -157,7 +158,16 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 		t.Fatal(e)
 	}
 	offline.Close()
-	product, e := OpenInstalled(ctx, InstalledConfig{Directory: dir, Binary: binary, Services: &config})
+	published := make(chan error, 32)
+	observe := func(more bool, e error) {
+		if !more || e != nil {
+			select {
+			case published <- e:
+			default:
+			}
+		}
+	}
+	product, e := OpenInstalled(ctx, InstalledConfig{Directory: dir, Binary: binary, ServiceProviders: map[string]fabricservices.CredentialProvider{"operator.private": config.Credentials}, ObserveIndexPublication: observe})
 	if e != nil {
 		t.Fatal("offline service disabled installed local node", e)
 	}
@@ -184,8 +194,13 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 		case <-tick.C:
 		}
 	}
-	if _, e = product.Node.Synchronize(ctx, 16); e != nil {
-		t.Fatal(e)
+	select {
+	case err := <-published:
+		if err != nil {
+			t.Fatal("actual index publication failed", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("actual publisher never drained initial descriptors")
 	}
 	client, e := fabricclient.Dial(ctx, socket, fabrichost.Authentication{Type: "fabric.auth", Mode: "owner"})
 	if e != nil {
@@ -196,6 +211,44 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	var found fabric.DiscoverResult
 	if e = json.Unmarshal(discovery, &found); e != nil || len(found.Candidates) < 2 {
 		t.Fatal("service catalog unavailable over genuine installed socket", e, string(discovery))
+	}
+	// Connect another operator-selected SDK endpoint AFTER the node has loaded
+	// its index. Only the real committed catalog notice can publish this delta.
+	for draining := true; draining; {
+		select {
+		case <-published:
+		default:
+			draining = false
+		}
+	}
+	currentOwner, err := product.Installation.Operator(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateRef, _ := fabric.NewEndpointRef(root.PublicKey)
+	lateRevision, err := product.Installation.Store.Register(ctx, currentOwner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{Ref: lateRef, Kind: "service.mcp", Name: "Late installed service", Description: "latecommittedcatalogmarker", Bindings: []fabric.BindingSummary{{ID: "mcp", Protocol: "mcp.tools", Version: "2025-11-25", Cancellation: true}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateScope := registry.DescriptorBatchScope{Endpoint: lateRef, ExpectedEndpointRevision: lateRevision, BindingID: "mcp"}
+	if _, err = product.Services.Profiles.Install(ctx, lateScope, fabricservices.Profile{Protocol: "mcp.tools", Version: "2025-11-25", CredentialSelector: "private configured SDK account", BindingDigest: digest, MCP: &fabricservices.MCPProfile{URL: healthy.URL, AllowHTTP: true, Limits: mcp.DefaultLimits}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = product.Services.Connect(ctx, lateScope, true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-published:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("post-start catalog was never published")
+	}
+	lateDiscovery := installedServiceCall(t, ctx, client, fabric.OperationDiscover, map[string]any{"query": "latecommittedcatalogmarker", "limit": 10})
+	var lateFound fabric.DiscoverResult
+	if json.Unmarshal(lateDiscovery, &lateFound) != nil || len(lateFound.Candidates) == 0 {
+		t.Fatal("new real SDK catalog requires restart/manual index sync", string(lateDiscovery))
 	}
 	offers, _, e := product.Node.Store.ListOffers(ctx, scopes[0].Endpoint, scopes[0].ExpectedEndpointRevision, "", 1)
 	if e != nil || len(offers) != 1 {
@@ -228,6 +281,30 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	if !strings.Contains(output.String(), "9007199254740993") || effects.Load() != 1 {
 		t.Fatal("actual SDK precision/effect count", effects.Load(), output.Len())
 	}
+	// A genuine background SDK tools/list_changed must follow the SAME
+	// post-commit publication path, without explicit Sync or reconnect.
+	healthySDK.AddTool(&sdk.Tool{Name: "notificationtoolmarker", Description: "notificationtoolmarker", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		effects.Add(1)
+		return &sdk.CallToolResult{}, nil
+	})
+	for {
+		select {
+		case err = <-published:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("SDK tool notification not indexed")
+		}
+		raw := installedServiceCall(t, ctx, client, fabric.OperationDiscover, map[string]any{"query": "notificationtoolmarker", "limit": 10})
+		var result fabric.DiscoverResult
+		if json.Unmarshal(raw, &result) != nil {
+			t.Fatal(string(raw))
+		}
+		if len(result.Candidates) > 0 {
+			break
+		}
+	}
 	failed, _, e := product.Node.Store.ListOffers(ctx, scopes[1].Endpoint, scopes[1].ExpectedEndpointRevision, "", 1)
 	if e != nil || len(failed) != 1 {
 		t.Fatal(e)
@@ -247,7 +324,7 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	if e != nil {
 		t.Fatal(e)
 	}
-	currentOwner, e := product.Installation.Operator(ctx)
+	currentOwner, e = product.Installation.Operator(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -269,7 +346,7 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 		t.Fatal(e)
 	}
 	// Another real restart owns exactly the same catalog/receipts and native ports.
-	reopened, e := OpenInstalled(ctx, InstalledConfig{Directory: dir, Binary: binary, Services: &config})
+	reopened, e := OpenInstalled(ctx, InstalledConfig{Directory: dir, Binary: binary, ServiceProviders: map[string]fabricservices.CredentialProvider{"operator.private": config.Credentials}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -282,6 +359,33 @@ func TestActualInstalledServiceSocketSharedCatalogRestartAndOfflineIsolation(t *
 	if effects.Load() != 1 {
 		t.Fatal("restart retried original paid invocation")
 	}
+	// The retained named provider is unavailable unless explicitly installed;
+	// this never becomes credential-free and never disables local discovery.
+	missingProvider, err := OpenInstalled(ctx, InstalledConfig{Directory: dir, Binary: binary})
+	if err != nil {
+		t.Fatal("unresolved private provider disabled local node", err)
+	}
+	defer missingProvider.CloseContext(ctx)
+	if missingProvider.Services == nil || missingProvider.Runtime == nil {
+		t.Fatal("retained selection lost")
+	}
+	if _, err = missingProvider.Services.config.Credentials.Resolve(ctx, "none"); err == nil {
+		t.Fatal("named provider silently became credential-free")
+	}
+	missingClient, err := fabricclient.Dial(ctx, socket, fabrichost.Authentication{Type: "fabric.auth", Mode: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer missingClient.Close()
+	missingDiscovery := installedServiceCall(t, ctx, missingClient, fabric.OperationDiscover, map[string]any{"query": "latecommittedcatalogmarker", "limit": 10})
+	var metadata fabric.DiscoverResult
+	if json.Unmarshal(missingDiscovery, &metadata) != nil || len(metadata.Candidates) == 0 {
+		t.Fatal("missing provider disabled existing discovery", string(missingDiscovery))
+	}
+	if effects.Load() != 1 {
+		t.Fatal("restart/unavailable provider executed paid effect")
+	}
+
 }
 func TestInstalledServiceMissingInfrastructureDoesNotBootstrapOrLeakWriter(t *testing.T) {
 	ctx := t.Context()

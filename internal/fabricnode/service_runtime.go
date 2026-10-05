@@ -21,6 +21,8 @@ type ServiceRuntimeConfig struct {
 	MaxConnections   int
 	SetupTimeout     time.Duration
 	SetupConcurrency int
+	// OnDescriptorsCommitted is a trusted nonblocking coalesced notice, after FULL catalog commit.
+	OnDescriptorsCommitted func()
 }
 type ServiceConnectionStatus struct {
 	Selection             fabricservices.StartupSelection
@@ -61,23 +63,15 @@ func serviceRuntimeKey(scope registry.DescriptorBatchScope) string {
 
 // InitializeServiceState is EXPLICIT operator setup, never called by Open or
 // discovery. It fails on existing/missing-inconsistent replay state rather than
-// resetting it. Both records are retained in the installation's only Store.
+// resetting it. All three configured records use the installation's only Store.
 func InitializeServiceState(ctx context.Context, i *localinstallation.Installation, b *LocalBoundary, c ServiceRuntimeConfig) error {
 	if i == nil || b == nil || b.store != i.Store || !validServiceRuntimeConfig(c) {
 		return localDenied()
 	}
-	owner, e := i.Operator(ctx)
-	if e != nil {
-		return e
+	if c.SetupTimeout%time.Millisecond != 0 {
+		return localDenied()
 	}
-	return i.WithCurrentOperator(ctx, owner, func(current context.Context) error {
-		p, e := fabricservices.NewProfileStore(current, i.Store, i.Operator, i.Keys)
-		if e != nil {
-			return e
-		}
-		_, _, e = fabricservices.BootstrapServiceState(current, p, c.InvocationConfig, b, c.MaxConnections)
-		return e
-	})
+	return InitializeConfiguredServices(ctx, i, b, settingsFromConfig("operator.private", c))
 }
 
 // NewServiceRuntime verifies the entire bounded startup manifest and every
@@ -117,6 +111,11 @@ func NewServiceRuntime(ctx context.Context, i *localinstallation.Installation, b
 	r.MCP, e = fabricservices.NewConnections(p, c.Credentials, ledger, c.MaxConnections)
 	if e != nil {
 		cancel()
+		return nil, e
+	}
+	if e = r.MCP.SetDescriptorsCommittedHook(c.OnDescriptorsCommitted); e != nil {
+		cancel()
+		r.MCP.Close()
 		return nil, e
 	}
 	disclosure := func(current context.Context, caller fabric.ExecutionContext, d fabric.EndpointDescriptor, _ fabric.InvokeRequest) error {

@@ -14,6 +14,7 @@ import (
 type IndexPublisher struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
+	notices chan struct{}
 	mu      sync.Mutex
 	failure error
 	passes  uint64
@@ -23,12 +24,12 @@ type IndexPublisher struct {
 // channel may collect commits during setup. The initial pass includes commits
 // that occurred between loading the retained index and starting this worker.
 // observe runs outside Node locks; it reports actual passes, never effects.
-func NewIndexPublisher(ctx context.Context, n *Node, notices <-chan struct{}, observe func(bool, error)) (*IndexPublisher, error) {
+func NewIndexPublisher(ctx context.Context, n *Node, notices chan struct{}, observe func(bool, error)) (*IndexPublisher, error) {
 	if ctx == nil || ctx.Err() != nil || n == nil || notices == nil {
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Missing retained index publication resources")
 	}
 	life, cancel := context.WithCancel(ctx)
-	p := &IndexPublisher{cancel: cancel, done: make(chan struct{})}
+	p := &IndexPublisher{cancel: cancel, done: make(chan struct{}), notices: notices}
 	go func() {
 		defer close(p.done)
 		pending := true
@@ -101,3 +102,20 @@ func (p *IndexPublisher) CloseContext(ctx context.Context) error {
 	}
 }
 func (p *IndexPublisher) Close() error { return p.CloseContext(context.Background()) }
+
+// Notify coalesces a known committed catalog mutation without blocking its
+// caller. It conveys no descriptors, credentials or execution authority.
+func (p *IndexPublisher) Notify() {
+	if p == nil {
+		return
+	}
+	select {
+	case <-p.done:
+		return
+	default:
+	}
+	select {
+	case p.notices <- struct{}{}:
+	default:
+	}
+}

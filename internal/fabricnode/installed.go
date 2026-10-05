@@ -27,9 +27,13 @@ type InstalledConfig struct {
 	Binary      string
 	Credentials fabricnative.CredentialProvider
 	Tracing     telemetry.Provider
-	// Services is an explicit operator selection; nil keeps native-only startup.
-	// State must have been initialized by an explicit service setup operation.
+	// Services optionally supplies the explicitly retained operator.private provider.
+	// Persisted limits must match; startup never initializes infrastructure.
 	Services *ServiceRuntimeConfig
+	// ServiceProviders resolves only the explicitly retained provider selector.
+	ServiceProviders map[string]fabricservices.CredentialProvider
+	// ObserveIndexPublication is trusted bounded observation, never authorization.
+	ObserveIndexPublication func(bool, error)
 }
 
 // InstalledNode is the actual local socket/product composition. The installation
@@ -39,6 +43,7 @@ type InstalledNode struct {
 	Node         *Node
 	Runtime      *LocalRuntime
 	Services     *ServiceRuntime
+	Publisher    *IndexPublisher
 	Host         *fabrichost.Host
 	server       *fabricmcp.Server
 	incomplete   *CompositionError
@@ -70,6 +75,14 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		return nil, err
 	}
 	result := &InstalledNode{Installation: installation}
+	notices := make(chan struct{}, 1)
+	notice := func() {
+		select {
+		case notices <- struct{}{}:
+		default:
+		}
+	}
+	var resources *installedRuntimes
 	keep := false
 	defer func() {
 		if !keep {
@@ -81,6 +94,14 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		}
 	}()
 	owner, err := installation.Operator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	retained, err := LoadInstalledServiceSettings(ctx, installation)
+	if err != nil {
+		return nil, err
+	}
+	serviceConfig, err := selectedInstalledServiceConfig(retained, c)
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +133,18 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			return Ports{}, err
 		}
 		ports := result.Runtime.Ports()
-		if c.Services != nil {
-			result.Services, err = NewServiceRuntime(ctx, installation, result.Runtime.Boundary, *c.Services)
+		resources = &installedRuntimes{native: result.Runtime}
+		ports.Close = resources
+		if serviceConfig != nil {
+			selected := *serviceConfig
+			operatorHook := selected.OnDescriptorsCommitted
+			selected.OnDescriptorsCommitted = func() {
+				notice()
+				if operatorHook != nil {
+					operatorHook()
+				}
+			}
+			result.Services, err = NewServiceRuntime(ctx, installation, result.Runtime.Boundary, selected)
 			if err != nil {
 				return Ports{}, err
 			}
@@ -125,7 +156,7 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			}
 			ports.Bindings = router
 			ports.ReplayVerifier = result.Services.Invocations
-			ports.Close = &installedRuntimes{native: result.Runtime, services: result.Services}
+			resources.services = result.Services
 		}
 		ports.Tracing = c.Tracing
 		return ports, nil
@@ -134,6 +165,13 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		errors.As(err, &result.incomplete)
 		return nil, err
 	}
+	result.Publisher, err = NewIndexPublisher(ctx, result.Node, notices, c.ObserveIndexPublication)
+	if err != nil {
+		return nil, err
+	}
+	resources.mu.Lock()
+	resources.publisher = result.Publisher
+	resources.mu.Unlock()
 	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
 	if err != nil {
 		return nil, err
@@ -177,6 +215,11 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 			return err
 		}
 	} else {
+		if n.Publisher != nil {
+			if err := n.Publisher.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
 		if n.Services != nil {
 			if err := n.Services.CloseContext(ctx); err != nil {
 				return err
@@ -202,9 +245,10 @@ func DefaultInstalledServiceConfig(credentials fabricservices.CredentialProvider
 // installedRuntimes owns the dependency order without reacquiring InstalledNode
 // locks. An incomplete join never releases the installation key or Store.
 type installedRuntimes struct {
-	native   *LocalRuntime
-	services *ServiceRuntime
-	mu       sync.Mutex
+	native    *LocalRuntime
+	publisher *IndexPublisher
+	services  *ServiceRuntime
+	mu        sync.Mutex
 }
 
 func (r *installedRuntimes) CloseContext(ctx context.Context) error {
@@ -213,6 +257,11 @@ func (r *installedRuntimes) CloseContext(ctx context.Context) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.publisher != nil {
+		if e := r.publisher.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
 	if r.services != nil {
 		if e := r.services.CloseContext(ctx); e != nil {
 			return e

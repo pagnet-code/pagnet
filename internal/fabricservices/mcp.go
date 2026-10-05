@@ -89,17 +89,18 @@ type connectedMCP struct {
 // Connections are bounded node-owned installations shared by callers. Resolve
 // performs no discovery, handshake, spawn or fallback. Close joins SDK sessions.
 type Connections struct {
-	profiles    *ProfileStore
-	credentials CredentialProvider
-	max         int
-	invocations *Invocations
-	mu          sync.Mutex
-	entries     map[string]*connectedMCP
-	pending     map[string]bool
-	closed      bool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	profiles               *ProfileStore
+	credentials            CredentialProvider
+	max                    int
+	invocations            *Invocations
+	mu                     sync.Mutex
+	entries                map[string]*connectedMCP
+	pending                map[string]bool
+	closed                 bool
+	ctx                    context.Context
+	cancel                 context.CancelFunc
+	wg                     sync.WaitGroup
+	onDescriptorsCommitted func()
 }
 
 func NewConnections(profiles *ProfileStore, credentials CredentialProvider, invocations *Invocations, max int) (*Connections, error) {
@@ -174,12 +175,12 @@ func (c *Connections) ConnectMCP(ctx context.Context, scope registry.DescriptorB
 		owned.MaxResponseHeaderBytes = 64 << 10
 		owned.ResponseHeaderTimeout = 15 * time.Second
 		owned.IdleConnTimeout = 30 * time.Second
-		transport = mcp.RemoteFactory{Endpoint: p.MCP.URL, AllowHTTP: p.MCP.AllowHTTP, Reconnects: 0, Client: &http.Client{Transport: &lifetimeTransport{c.ctx, owned}}}
+		transport = mcp.RemoteFactory{Endpoint: p.MCP.URL, AllowHTTP: p.MCP.AllowHTTP, Reconnects: 0, Client: &http.Client{Transport: &lifetimeTransport{ctx: c.ctx, base: owned, endpoint: p.MCP.URL}}}
 	} else {
 		transport = stdioFactory{*p.MCP}
 	}
 	// Adapter lifetime is owned by Connections, never a transient setup context.
-	adapter, e := mcp.New(c.ctx, mcp.Config{BindingID: scope.BindingID, Audience: c.profiles.root.Namespace, Endpoint: scope.Endpoint, Credentials: cb, Transport: transport, Catalog: cat, Limits: p.MCP.Limits, ProtocolVersion: p.Version})
+	adapter, e := mcp.New(c.ctx, mcp.Config{BindingID: scope.BindingID, Audience: c.profiles.root.Namespace, Endpoint: scope.Endpoint, Credentials: cb, Transport: transport, Catalog: committedCatalog{Catalog: cat, hook: c.onDescriptorsCommitted}, Limits: p.MCP.Limits, ProtocolVersion: p.Version})
 	if e != nil {
 		return e
 	}
@@ -314,11 +315,25 @@ func (c *Connections) Close() error {
 // setup. Bind every actual HTTP request to node ownership as well, retaining
 // the request deadline and raw SDK response stream until Body.Close.
 type lifetimeTransport struct {
-	ctx  context.Context
-	base *http.Transport
+	ctx      context.Context
+	base     *http.Transport
+	endpoint string
 }
 
 func (t *lifetimeTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	// The maintained SDK issues its exact session DELETE during Close AFTER
+	// local operation cancellation. This cleanup has its own finite lifetime;
+	// no POST/GET/tool request can escape the owned operation cancellation.
+	if r.Method == http.MethodDelete && r.URL.String() == t.endpoint && r.Header.Get("Mcp-Session-Id") != "" && r.Body == nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		resp, err := t.base.RoundTrip(r.Clone(ctx))
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		resp.Body = &lifetimeBody{ReadCloser: resp.Body, cleanup: cancel}
+		return resp, nil
+	}
 	ctx, cancel := context.WithCancel(r.Context())
 	stop := context.AfterFunc(t.ctx, cancel)
 	cleanup := func() { stop(); cancel() }

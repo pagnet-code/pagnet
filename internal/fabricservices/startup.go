@@ -249,6 +249,9 @@ func (s *Startup) Remove(ctx context.Context, scope registry.DescriptorBatchScop
 // transaction, so interrupted initialization cannot strand a half-created
 // replay fence. It remains an explicit operator initialization command.
 func BootstrapServiceState(ctx context.Context, p *ProfileStore, c InvocationConfig, policy InvocationPolicy, max int) (*Invocations, *Startup, error) {
+	return bootstrapServiceState(ctx, p, c, policy, max, nil)
+}
+func bootstrapServiceState(ctx context.Context, p *ProfileStore, c InvocationConfig, policy InvocationPolicy, max int, setting []byte) (*Invocations, *Startup, error) {
 	i, e := newInvocations(p, c, policy)
 	if e != nil {
 		return nil, nil, e
@@ -269,6 +272,14 @@ func BootstrapServiceState(ctx context.Context, p *ProfileStore, c InvocationCon
 		for _, id := range []string{"configuration", "startup/header"} {
 			if _, e := tx.Get(serviceKey(id)); !missing(e) {
 				return denied()
+			}
+		}
+		if len(setting) > 0 {
+			if _, e := tx.Get(InstalledServiceConfigurationKey()); !missing(e) {
+				return denied()
+			}
+			if _, e := tx.CAS(InstalledServiceConfigurationKey(), 0, setting, false); e != nil {
+				return e
 			}
 		}
 		if _, e := tx.CAS(serviceKey("configuration"), 0, state, false); e != nil {
