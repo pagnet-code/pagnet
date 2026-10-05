@@ -66,7 +66,7 @@ func (ConfiguredSnapshot) MarshalJSON() ([]byte, error) {
 }
 
 type Page struct {
-	Generation uint64
-	Entries    []Reference
-	NextCursor string
+	Generation uint64      `json:"generation,string"`
+	Entries    []Reference `json:"entries"`
+	NextCursor string      `json:"nextCursor,omitempty"`
 }

@@ -87,12 +87,18 @@ func configureLocalFabricInit(cmd *cobra.Command) {
 			if err = fabricnode.InitializeDefaultServices(cmd.Context(), retained); err != nil {
 				return errors.Join(err, retained.Close())
 			}
+			if err = fabricnode.InitializeExtensionInfrastructure(cmd.Context(), retained, fabricnode.DefaultExtensionSettings()); err != nil {
+				return errors.Join(err, retained.Close())
+			}
 			socket = retained.Configuration().Settings.SocketPath
 			if err = retained.Close(); err != nil {
 				return err
 			}
 		} else {
 			if e = fabricnode.InitializeDefaultServices(cmd.Context(), installed); e != nil {
+				return errors.Join(e, installed.Close())
+			}
+			if e = fabricnode.InitializeExtensionInfrastructure(cmd.Context(), installed, fabricnode.DefaultExtensionSettings()); e != nil {
 				return errors.Join(e, installed.Close())
 			}
 			domain = installed.Configuration().Domain

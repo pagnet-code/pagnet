@@ -11,6 +11,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/events/httpbinding"
+	"github.com/pagnet-code/pagnet/fabric/extension"
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
@@ -37,6 +38,11 @@ type InstalledConfig struct {
 	ServiceProviders map[string]fabricservices.CredentialProvider
 	// EventProviders resolve only explicitly retained private observer selectors.
 	EventProviders map[string]httpbinding.CredentialProvider
+	// ExtensionCredentials serves only explicitly configured private slots.
+	// Starting a node never installs extensions or initializes their state.
+	ExtensionCredentials extension.CredentialProvider
+	// ExtensionPaging selects explicit finite private disclosure budgets.
+	ExtensionPaging *ExtensionPagerOptions
 	// ObserveIndexPublication is trusted bounded observation, never authorization.
 	ObserveIndexPublication func(bool, error)
 }
@@ -44,17 +50,19 @@ type InstalledConfig struct {
 // InstalledNode is the actual local socket/product composition. The installation
 // owns the only writer and key; transport joins before runtime, key and Store.
 type InstalledNode struct {
-	Installation *localinstallation.Installation
-	Node         *Node
-	Runtime      *LocalRuntime
-	Services     *ServiceRuntime
-	Events       *EventRuntime
-	Publisher    *IndexPublisher
-	Host         *fabrichost.Host
-	server       *fabricmcp.Server
-	admin        *fabricadmin.Server
-	incomplete   *CompositionError
-	mu           sync.Mutex
+	Installation   *localinstallation.Installation
+	Node           *Node
+	Runtime        *LocalRuntime
+	Services       *ServiceRuntime
+	Events         *EventRuntime
+	Extensions     *ExtensionRuntime
+	Publisher      *IndexPublisher
+	Host           *fabrichost.Host
+	server         *fabricmcp.Server
+	admin          *fabricadmin.Server
+	extensionAdmin *InstalledExtensionAdministration
+	incomplete     *CompositionError
+	mu             sync.Mutex
 }
 
 type InstalledOpenError struct {
@@ -165,6 +173,15 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			ports.ReplayVerifier = result.Services.Invocations
 			resources.services = result.Services
 		}
+		result.Extensions, err = NewExtensionRuntime(ctx, installation, result.Runtime.Boundary, ExtensionRuntimeConfig{Lifetime: ctx, Credentials: c.ExtensionCredentials, Bindings: ports.Bindings})
+		if err != nil {
+			return Ports{}, fmt.Errorf("opening configured extension execution: %w", err)
+		}
+		if result.Extensions != nil {
+			resources.extensions = result.Extensions
+			ports.Interceptors = result.Extensions
+			ports.ResumeDispatchVerifier = result.Extensions.authority
+		}
 		result.Events, err = OpenInstalledEvents(ctx, installation, c.EventProviders)
 		if err != nil {
 			var held *EventRuntimeOpenError
@@ -201,6 +218,25 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
 		}
 		handlers[operation] = handler
+	}
+	if result.Extensions != nil {
+		paging := DefaultExtensionPagerOptions()
+		if c.ExtensionPaging != nil {
+			paging = *c.ExtensionPaging
+		}
+		result.extensionAdmin, err = NewInstalledExtensionAdministration(result, paging)
+		if err != nil {
+			return nil, err
+		}
+		resources.mu.Lock()
+		resources.extensionAdmin = result.extensionAdmin
+		resources.mu.Unlock()
+		for operation, handler := range result.extensionAdmin.Handlers() {
+			if handlers[operation] != nil {
+				return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
+			}
+			handlers[operation] = handler
+		}
 	}
 	result.admin, err = fabricadmin.New(fabricadmin.Config{Handlers: handlers})
 	if err != nil {
@@ -257,6 +293,16 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 				return err
 			}
 		}
+		if n.extensionAdmin != nil {
+			if err := n.extensionAdmin.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
+		if n.Extensions != nil {
+			if err := n.Extensions.Close(ctx); err != nil {
+				return err
+			}
+		}
 		if n.Services != nil {
 			if err := n.Services.CloseContext(ctx); err != nil {
 				return err
@@ -287,11 +333,13 @@ func DefaultInstalledServiceConfig(credentials fabricservices.CredentialProvider
 // installedRuntimes owns the dependency order without reacquiring InstalledNode
 // locks. An incomplete join never releases the installation key or Store.
 type installedRuntimes struct {
-	native    *LocalRuntime
-	publisher *IndexPublisher
-	services  *ServiceRuntime
-	events    *EventRuntime
-	mu        sync.Mutex
+	native         *LocalRuntime
+	publisher      *IndexPublisher
+	services       *ServiceRuntime
+	events         *EventRuntime
+	extensions     *ExtensionRuntime
+	extensionAdmin *InstalledExtensionAdministration
+	mu             sync.Mutex
 }
 
 func (r *installedRuntimes) CloseContext(ctx context.Context) error {
@@ -302,6 +350,16 @@ func (r *installedRuntimes) CloseContext(ctx context.Context) error {
 	defer r.mu.Unlock()
 	if r.publisher != nil {
 		if e := r.publisher.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
+	if r.extensionAdmin != nil {
+		if e := r.extensionAdmin.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
+	if r.extensions != nil {
+		if e := r.extensions.Close(ctx); e != nil {
 			return e
 		}
 	}
