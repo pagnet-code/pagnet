@@ -11,6 +11,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/events"
+	"github.com/pagnet-code/pagnet/fabric/extension"
 	"github.com/pagnet-code/pagnet/fabric/node"
 	"github.com/pagnet-code/pagnet/fabric/node/dispatch"
 	"github.com/pagnet-code/pagnet/fabric/registry"
@@ -29,10 +30,13 @@ type Config struct {
 type Ports struct {
 	// Authentication and admission come from actual private peer/identity and
 	// adapter composition, never from caller assertions or descriptor prose.
-	Authenticator          fabric.Authenticator
-	Bindings               dispatch.BindingResolver
-	Admission              dispatch.Admission
-	Interceptors           node.OperationInterceptors
+	Authenticator fabric.Authenticator
+	Bindings      dispatch.BindingResolver
+	Admission     dispatch.Admission
+	Interceptors  node.OperationInterceptors
+	// InvocationPlacement selects this trusted node's physical boundary.
+	// Remote destination composition must not run source-only interceptors.
+	InvocationPlacement    extension.Placement
 	ValidateReadResult     node.ReadResultValidator
 	Events                 events.EventBus
 	Tracing                telemetry.Provider
@@ -138,7 +142,7 @@ func ComposeRetained(ctx context.Context, store *registry.Store, compose func(co
 		n.reader = index
 	}
 	n.reader = telemetry.ObserveSearch(n.reader, ports.Tracing)
-	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing, ReplayVerifier: ports.ReplayVerifier, ResumeDispatchVerifier: ports.ResumeDispatchVerifier}
+	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, InvocationPlacement: ports.InvocationPlacement, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing, ReplayVerifier: ports.ReplayVerifier, ResumeDispatchVerifier: ports.ResumeDispatchVerifier}
 	if ports.Events != nil {
 		cfg.EventSource = "pagnet://" + store.AuthorityIdentity().Namespace + "/node/local"
 	}
