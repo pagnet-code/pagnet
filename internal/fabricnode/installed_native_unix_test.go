@@ -140,7 +140,10 @@ func TestActualInstalledNativeMCPInvokeRetainedHistoryAndProductRestart(t *testi
 		t.Fatal(e)
 	}
 	defer client.Close()
-	originalDeadline := time.Now().UTC().Add(2 * time.Second)
+	// Cold startup includes real process launch and FULL durable journals.
+	// Use the ordinary invocation budget; expiry is checked only AFTER the
+	// genuine original effect completes, never assumed before admission.
+	originalDeadline := time.Now().UTC().Add(30 * time.Second)
 	var originalInvocation string
 	if out := installedNativeOutputAt(t, ctx, client, ref, rev, "let retained once", originalDeadline, &originalInvocation); out != "[fake-persist local-native] let retained = once" {
 		t.Fatal("first actual native output differs", len(out))

@@ -265,7 +265,7 @@ func (a *Adapter) recover(ctx context.Context, caller, originalCaller fabric.Exe
 func (a *Adapter) read(ctx context.Context, caller fabric.ExecutionContext, h WorkerHandle, checkpoint OriginalCheckpoint, reservation identity.NativeDispatchReservation, operation identity.NativeSourceReadOperation, callback func(context.Context) error) error {
 	return a.config.Authority.FenceNativeSourceRead(ctx, a.config.Owner, caller, h.Current, h.Binding, checkpoint.OriginalBinding, checkpoint.Admission, reservation, operation, callback)
 }
-func (a *Adapter) activation(ctx context.Context, h WorkerHandle) error {
+func (a *Adapter) activation(ctx context.Context, h WorkerHandle, expected ...SourceReference) error {
 	a.mu.Lock()
 	gate := a.gates[h.Ownership]
 	if gate == nil {
@@ -289,6 +289,15 @@ func (a *Adapter) activation(ctx context.Context, h WorkerHandle) error {
 	}
 	if ticket.Authority != h.Ownership || !equalNativeValue(ticket.CurrentController, h.Current) || !equalNativeValue(ticket.CurrentBinding, h.Binding) || ticket.NativeGeneration == "" {
 		return adapterError(fabric.CodeStaleReference, "Native activation ticket authority changed")
+	}
+	if len(expected) > 1 {
+		return adapterError(fabric.CodeInvalidInput, "Ambiguous native activation source")
+	}
+	if len(expected) == 1 {
+		original := OriginalCheckpoint{Admission: ticket.OriginalSource.Admission, OriginalBinding: ticket.OriginalSource.Binding}
+		if referenceFor(original, ticket.OriginalSource.Reservation) != expected[0] || ticket.SourceCommandID != ticket.OriginalSource.Reservation.CommandID {
+			return adapterError(fabric.CodeTargetUnavailable, "Native activation ticket belongs to another original source")
+		}
 	}
 	checkpoint, caller, e := a.config.Checkpoints.Load(ctx, ticket.OriginalSource.Admission.OriginalCaller, ticket.OriginalSource.Admission.InvocationID)
 	if e == nil && !equalNativeValue(checkpoint.Admission, ticket.OriginalSource.Admission) {
@@ -358,6 +367,14 @@ func (s *nativeStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 	closed, terminal := s.closed, s.terminal
 	s.mu.Unlock()
 	if closed {
+		if !terminal {
+			if errors.Is(s.lifetime.Err(), context.DeadlineExceeded) {
+				return fabric.InvocationFrame{}, adapterError(fabric.CodeDeadlineExceeded, "Native invocation deadline elapsed; source effects require retained evidence")
+			}
+			// Close publishes closed before cancelling the owned lifetime. A
+			// concurrent first pull in that interval is stopped, never normal EOF.
+			return fabric.InvocationFrame{}, adapterError(fabric.CodeCancelled, "Native invocation was cancelled; source effects require retained evidence")
+		}
 		return fabric.InvocationFrame{}, io.EOF
 	}
 	if ctx == nil {

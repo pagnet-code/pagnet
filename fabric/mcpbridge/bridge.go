@@ -334,6 +334,16 @@ func pageSize(p Page) int { raw, _ := json.Marshal(p); return len(raw) }
 func (b *Bridge) firstPage(ctx context.Context, e *streamEntry) (Page, error) {
 	frame, err := e.stream.Next(ctx)
 	if err != nil {
+		var typed *fabric.Error
+		if errors.As(err, &typed) {
+			return Page{}, err
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return Page{}, fabric.NewError(fabric.CodeDeadlineExceeded, "Invocation deadline elapsed before its original start")
+		}
+		if errors.Is(err, context.Canceled) {
+			return Page{}, fabric.NewError(fabric.CodeCancelled, "Invocation cancelled before its original start")
+		}
 		return Page{}, fabric.NewError(fabric.CodeProtocolError, "Invocation ended without an original start")
 	}
 	if frame.Kind != fabric.FrameStart || frame.Sequence != 0 || len(frame.Data) > fabric.MaxFrameBytes {
