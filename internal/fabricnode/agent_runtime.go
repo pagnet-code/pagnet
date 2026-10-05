@@ -14,6 +14,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/fabricagent"
 	"github.com/pagnet-code/pagnet/internal/fabricauth"
 	"github.com/pagnet-code/pagnet/internal/runtimeprofile"
+	"github.com/pagnet-code/pagnet/internal/sandbox"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 )
 
@@ -77,6 +78,17 @@ func (n *InstalledNode) selectedAgentRuntime(ctx context.Context, input AgentCre
 	spec := sessionworker.NativeSpec{Kind: "local", Runtime: selected.Runtime, Binary: selected.Executable, PrefixArgs: append([]string(nil), selected.Profile.Args...), NativeDirs: selected.Profile.Directories(), Workspace: workspace, Model: input.Model, StandingInstructions: role, MCPExecutable: paths.Binary, LocalAuthorityDirectory: paths.AuthorityDirectory, LocalFabricSocket: paths.SocketPath, Env: append([]string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}, selected.Profile.Environment()...)}
 	if sessionworker.ValidateLocalRuntimeEnvironment(spec, nil) != nil {
 		return nil, fabric.NewError(fabric.CodeInvalidInput, "Selected runtime profile contains unsupported or persisted credential settings; select a private credential provider instead")
+	}
+	// Validate the static grants before reserving an identity or persisting a
+	// profile. Launch still validates its complete per-instance sandbox, including
+	// native state and scratch. Neither stage silently relocates the workspace.
+	preflight := sandbox.NewSpec(sandbox.Options{
+		Workspace: workspace, NativeDirs: spec.NativeDirs, Binary: spec.Binary,
+		Home: home, Socket: paths.SocketPath, BridgeDir: filepath.Dir(paths.Binary),
+		Denied: []string{paths.AuthorityDirectory, filepath.Join(filepath.Dir(paths.SocketPath), "workers")},
+	})
+	if err := preflight.Normalize(); err != nil {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "The working folder or runtime profile would expose private Pagnet state. Choose a separate project folder with --workspace; keep runtime executables and profile directories outside Pagnet's private state")
 	}
 	return &spec, nil
 }
