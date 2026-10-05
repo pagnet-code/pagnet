@@ -172,12 +172,8 @@ func TestNativeDispatchChangedSourceFinalOperationAndQuotaDenied(t *testing.T) {
 	fabric.DecodeJSON(final, &changed)
 	changed.Payload = json.RawMessage(`{"text":"another operation"}`)
 	changedFinal, _ := json.Marshal(changed)
-	newSource, e := f.a.Admit(ctx, f.owner, c, b, caller, original, changedFinal, "fresh-source-same-invocation", "fresh-attempt", "fresh-replay")
-	if e != nil {
-		t.Fatal(e)
-	}
-	if _, e = f.a.ReserveNativeDispatch(ctx, f.owner, c, b, newSource, caller, original, changedFinal, spec); e == nil {
-		t.Fatal("fresh source ID bypassed global invocation fence")
+	if _, e = f.a.Admit(ctx, f.owner, c, b, caller, original, changedFinal, "fresh-source-same-invocation", "fresh-attempt", "fresh-replay"); e == nil {
+		t.Fatal("fresh source ID bypassed global invocation fence before paid mapping")
 	}
 	nextSource, nextCaller, nextOriginal, nextFinal := dispatchAdmission(t, f, c, b, "next")
 	next, e := f.a.ReserveNativeDispatch(ctx, f.owner, c, b, nextSource, nextCaller, nextOriginal, nextFinal, spec)
@@ -242,12 +238,8 @@ func TestNativeDispatchChangedTargetAndBindingNeverFreshMapping(t *testing.T) {
 			envelope.Target = &scope.Endpoint
 			envelope.ExpectedRevision = rev
 			otherFinal, _ := json.Marshal(envelope)
-			redirected, e := f.a.Admit(ctx, f.owner, replacement, otherBinding, caller, original, otherFinal, "new-source", "new-attempt", "new-replay")
-			if e != nil {
-				t.Fatal(e)
-			}
-			if _, e = f.a.ReserveNativeDispatch(ctx, f.owner, replacement, otherBinding, redirected, caller, original, otherFinal, dispatchSpec(otherBinding)); e == nil {
-				t.Fatal("changed target/binding acquired second mapping")
+			if _, e = f.a.Admit(ctx, f.owner, replacement, otherBinding, caller, original, otherFinal, "new-source", "new-attempt", "new-replay"); e == nil {
+				t.Fatal("changed target/binding acquired second admission before paid mapping")
 			}
 		})
 	}

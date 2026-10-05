@@ -444,6 +444,19 @@ func TestOfflineDescriptorRenameRenewsSamePhysicalBindingWithoutOldRevisionActua
 		t.Fatal("old expected descriptor revision executed new work")
 	}
 	freshCaller, freshOriginal, freshFinal := f.invocation(t)
+	// This is genuinely NEW work after rename. Original invocation identity
+	// remains pinned to source A and can never become a fresh paid admission B.
+	var freshBefore, freshAfter fabric.Envelope
+	if fabric.DecodeJSON(freshOriginal, &freshBefore) != nil || fabric.DecodeJSON(freshFinal, &freshAfter) != nil {
+		t.Fatal("fresh invocation fixture malformed")
+	}
+	freshBefore.ID, freshAfter.ID = "native-invoke-after-rename", "native-invoke-after-rename"
+	freshOriginal, _ = json.Marshal(freshBefore)
+	freshFinal, _ = json.Marshal(freshAfter)
+	freshCaller, e = fabric.NewAuthenticatedContext(localOwner, f.store.Namespace(), freshOriginal)
+	if e != nil {
+		t.Fatal(e)
+	}
 	sourceB, e := f.a.Admit(ctx, f.owner, controlB, bindingB, freshCaller, freshOriginal, freshFinal, "source-B", "attempt-B", "replay-B")
 	if e != nil {
 		t.Fatal(e)

@@ -386,6 +386,9 @@ func (a *AuthorityTx) SignDispatchAdmission(c fabric.ExecutionContext, original,
 	if e != nil {
 		return nil, e
 	}
+	if e = a.claimOriginalDispatch(c, original, finalized, frame, after); e != nil {
+		return nil, e
+	}
 	return ed25519.Sign(a.store.key, frame), nil
 }
 func authorityDeadline(env fabric.Envelope) string {
