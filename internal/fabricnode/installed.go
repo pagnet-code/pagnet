@@ -178,7 +178,14 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 	if err != nil {
 		return nil, err
 	}
-	result.admin, err = fabricadmin.New(fabricadmin.Config{Handlers: result.AgentAdministration(result.Publisher.Notify)})
+	handlers := result.AgentAdministration(result.Publisher.Notify)
+	for operation, handler := range result.ServiceAdministration() {
+		if handlers[operation] != nil {
+			return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
+		}
+		handlers[operation] = handler
+	}
+	result.admin, err = fabricadmin.New(fabricadmin.Config{Handlers: handlers})
 	if err != nil {
 		return nil, err
 	}

@@ -3,15 +3,10 @@ package fabricnode
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"strings"
-	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
-	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/internal/fabricadmin"
 	"github.com/pagnet-code/pagnet/internal/fabricauth"
 )
@@ -21,15 +16,6 @@ import (
 type AgentCreateInput struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-}
-type agentCreateCipher struct {
-	Cipher []byte `json:"cipher"`
-}
-
-type agentCreateReservation struct {
-	Version  int                `json:"version"`
-	InputSHA [32]byte           `json:"inputSha"`
-	Ref      fabric.EndpointRef `json:"ref"`
 }
 
 // AgentAdministration consumes genuine owner callbacks and the installation's
@@ -71,60 +57,7 @@ func (n *InstalledNode) AgentAdministration(committed func()) map[string]fabrica
 				return e
 			}
 			defer clear(raw)
-			digest := sha256.Sum256(raw)
-			keyDigest := sha256.Sum256([]byte("pagnet.agent.create.v1\x00" + request.ID))
-			key := registry.AuthorityKey{Kind: registry.AuthorityLocalInstallation, ID: "agent/create/" + hex.EncodeToString(keyDigest[:])}
-			aad := []byte(n.Installation.Store.Namespace() + "/" + key.ID)
-			var ref fabric.EndpointRef
-			root := n.Installation.Store.AuthorityIdentity()
-			e = n.Installation.Store.WithNativeAuthority(current, owner, registry.AuthorityScope{MaxOperations: 4, Timeout: 5 * time.Second}, func(tx *registry.AuthorityTx) error {
-				row, readErr := tx.Get(key)
-				if readErr == nil {
-					if row.Retired {
-						return localDenied()
-					}
-					var box agentCreateCipher
-					if fabric.DecodeJSON(row.Value, &box) != nil {
-						return localDenied()
-					}
-					plain, decryptErr := n.Installation.Keys.Open(aad, box.Cipher)
-					if decryptErr != nil {
-						return localDenied()
-					}
-					defer clear(plain)
-					var saved agentCreateReservation
-					if fabric.DecodeJSON(plain, &saved) != nil || saved.Version != 1 || saved.InputSHA != digest || saved.Ref.IsOffer() || saved.Ref.Domain() != n.Installation.Store.Namespace() {
-						return fabric.NewError(fabric.CodeInvalidMutation, "Agent setup request conflicts with its retained identity")
-					}
-					ref = saved.Ref
-					return nil
-				}
-				var failure *fabric.Error
-				if !errors.As(readErr, &failure) || failure.Code != fabric.CodeNotFound {
-					return readErr
-				}
-				ref, e = fabric.NewEndpointRef(root.PublicKey)
-				if e != nil {
-					return e
-				}
-				value, e := json.Marshal(agentCreateReservation{1, digest, ref})
-				if e != nil {
-					return e
-				}
-				defer clear(value)
-				encrypted, e := n.Installation.Keys.Seal(aad, value)
-				if e != nil {
-					return e
-				}
-				defer clear(encrypted)
-				encoded, e := json.Marshal(agentCreateCipher{Cipher: encrypted})
-				if e != nil {
-					return e
-				}
-				defer clear(encoded)
-				_, e = tx.CAS(key, 0, encoded, false)
-				return e
-			})
+			ref, e := n.ReserveSetupEndpoint(current, access, "agent.create", request.ID, raw)
 			if e != nil {
 				return e
 			}

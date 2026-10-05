@@ -35,3 +35,17 @@ The installed node reads a separate encrypted signed services setting from its e
 Catalog notices carry no descriptor or credential data. The actual SDK catalog invokes the nonblocking notice only after its registry commit; initial connection and background tool changes use the same hook. The installed node's bounded coalesced index publisher drains real committed deltas, including catalogs added after startup, without discovery-time scans, database polling or manual synchronization. Native-only installations also own that publisher for explicit local administration.
 
 Operation cancellation remains separate from session cleanup. Stateful SDK shutdown sends only its exact configured session-bearing DELETE using a separate five-second cleanup lifetime; POST/GET/tool operations still obey node cancellation. A DELETE is neither a tool retry nor proof that arbitrary remote work stopped. Actual provider cancellation uses the maintained SDK's request cancellation semantics; unknown remote outcomes remain unknown.
+
+## Add an installed MCP service
+
+Initialize the local node with `pagnet init`, run `pagnet serve`, then connect an already-running MCP endpoint:
+
+```sh
+pagnet service add http://127.0.0.1:8080/mcp \
+  --name "Customer support" \
+  --description "Look up support records and customer questions"
+```
+
+The command negotiates the supported version using the official SDK, retains the selected profile/account under the installation's original signed root, and connects its tool catalog. Setup runs only initialize/list metadata, never a tool. Tools become discoverable through the live catalog publisher; no installation per agent is needed. An unresolved endpoint reports incomplete setup with an exact request ID for retry. `--protocol-version` explicitly selects a supported version when preparing an offline endpoint; no guessed version is published. Offline/connecting states remain distinct from connected. Repeating the same request/body retains the same reference across crashes and restarts; changing URL/account/name/description under that request is denied. Changed choices need a new setup request.
+
+Fresh local setup explicitly selects credential-free services. The `none` selector emits no authentication headers and reads no environment tokens. A custom account requires the installation's explicitly retained private provider and `--credential-selector`; credentials cannot be embedded in the URL or query. HTTPS is used beyond loopback unless `--allow-http` explicitly selects plaintext transport. URL/account/provider selectors stay in encrypted private configuration; the chosen public name/description are the network-facing metadata. The old hosted Jev/credential commands remain separate until their actor migration.
