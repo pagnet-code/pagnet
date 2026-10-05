@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package fabricmcp
+package fabricmcp_test
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
 	"github.com/pagnet-code/pagnet/internal/fabricauth"
+	"github.com/pagnet-code/pagnet/internal/fabricmcp"
 	"github.com/pagnet-code/pagnet/internal/fabricnode"
 )
 
@@ -109,7 +110,7 @@ func TestRealUnixOwnerRetainedNodeOfficialMCPAndRestart(t *testing.T) {
 				t.Fatal("genuine signed descriptor did not index", err)
 			}
 		}
-		server, err := New(Config{Executor: n.Service})
+		server, err := fabricmcp.New(fabricmcp.Config{Executor: n.Service})
 		if err != nil {
 			t.Fatal(err)
 		}
