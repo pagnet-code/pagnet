@@ -89,6 +89,10 @@ func NewLauncher(c LauncherConfig) (*Launcher, error) {
 	if c.Checkpoints == nil || c.Peers == nil || c.Checkpoints.store != c.Peers.store || !filepath.IsAbs(c.Binary) || filepath.Clean(c.Binary) != c.Binary || !filepath.IsAbs(c.AuthorityDirectory) || filepath.Clean(c.AuthorityDirectory) != c.AuthorityDirectory || c.StartupTimeout < time.Second || c.StartupTimeout > time.Minute || c.MaxWorkers < 1 || c.MaxWorkers > 4096 {
 		return nil, launchDenied()
 	}
+	actualDirectory, err := c.Checkpoints.store.CurrentAuthorityDirectory(context.Background())
+	if err != nil || actualDirectory != c.AuthorityDirectory {
+		return nil, launchDenied()
+	}
 	stat, e := os.Stat(c.Binary)
 	if e != nil || !stat.Mode().IsRegular() || stat.Mode().Perm()&0111 == 0 {
 		return nil, launchDenied()
