@@ -21,6 +21,7 @@ import (
 // authenticated against this retained root. Protector keys and runtime
 // credentials are supplied by the operator, never generated or persisted here.
 type NativeRuntimeConfig struct {
+	CleanupCaller                                            func(context.Context) (fabric.ExecutionContext, error)
 	Owner                                                    fabric.ExecutionContext
 	Fence                                                    identity.AdmissionFence
 	Protector                                                durable.DataProtector
@@ -104,7 +105,7 @@ func NewNativeRuntime(ctx context.Context, store *registry.Store, c NativeRuntim
 	if err != nil {
 		return nil, err
 	}
-	r.Adapter, err = fabricnative.NewAdapter(fabricnative.AdapterConfig{Authority: r.Authority, Owner: c.Owner, Checkpoints: r.Checkpoints, ManagedPeers: r.Peers, Workers: r.Resolver, MaxWorkers: c.MaxWorkers, MaxInvocationDuration: c.MaxInvocationDuration, CleanupTimeout: c.CleanupTimeout})
+	r.Adapter, err = fabricnative.NewAdapter(fabricnative.AdapterConfig{CleanupCaller: c.CleanupCaller, Authority: r.Authority, Owner: c.Owner, Checkpoints: r.Checkpoints, ManagedPeers: r.Peers, Workers: r.Resolver, MaxWorkers: c.MaxWorkers, MaxInvocationDuration: c.MaxInvocationDuration, CleanupTimeout: c.CleanupTimeout})
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +118,7 @@ func NewNativeRuntime(ctx context.Context, store *registry.Store, c NativeRuntim
 			return registry.AuthorityIdentity{}, fabric.NewError(fabric.CodeTargetUnavailable, "Native runtime is closing")
 		}
 		return store.CurrentAuthorityIdentity(ctx)
-	}, OwnerValidator: r.Peers.ValidateOwner, ManagedValidator: r.Peers.ValidateManaged})
+	}, OwnerValidator: r.Peers.ValidateOwner, ManagedValidator: r.Peers.ValidateManaged, ManagedFacts: r.Peers.CurrentCallerFacts})
 	if err != nil {
 		return nil, err
 	}

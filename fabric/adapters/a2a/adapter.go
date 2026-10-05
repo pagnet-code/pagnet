@@ -107,7 +107,7 @@ func (a *Adapter) validate(caller fabric.ExecutionContext, d fabric.EndpointDesc
 		return failure(fabric.CodeStaleReference, fabric.EffectNotStarted)
 	}
 	for _, b := range d.Bindings {
-		if b.ID == a.config.BindingID && b.Protocol == "a2a" && b.Version == string(sdk.Version) && b.Streaming == a.card.Capabilities.Streaming && b.Cancellation == a.config.Cancellation && !b.Idempotency {
+		if b.ID == a.config.BindingID && b.Protocol == "a2a.jsonrpc" && b.Version == string(sdk.Version) && b.Streaming == a.card.Capabilities.Streaming && b.Cancellation == a.config.Cancellation && !b.Idempotency {
 			return nil
 		}
 	}

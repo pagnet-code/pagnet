@@ -50,6 +50,7 @@ func (a *Authority) RegisterHistoricalOrigin(ctx context.Context, owner fabric.E
 	if e != nil {
 		return result, e
 	}
+	facts = withNativeSourceFacts(facts, PurposeNativeOrigin, source)
 	if facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest || facts.OriginalCaller != source.OriginalCaller {
 		return result, invalid("Historical original admission bytes changed")
 	}

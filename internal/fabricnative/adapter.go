@@ -37,6 +37,8 @@ type WorkerResolver interface {
 	Refresh(context.Context, fabric.ExecutionContext, nativeauthority.Scope) (WorkerHandle, error)
 }
 type AdapterConfig struct {
+	// CleanupCaller is protected operator authority for exact-source stop only.
+	CleanupCaller         func(context.Context) (fabric.ExecutionContext, error)
 	Authority             *identity.Authority
 	Owner                 fabric.ExecutionContext
 	Checkpoints           *Checkpoints
@@ -499,7 +501,15 @@ func (s *nativeStream) Close() (result error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.adapter.config.CleanupTimeout)
 	defer cancel()
-	h, e := s.adapter.config.Workers.Refresh(ctx, s.caller, s.ownership)
+	cleanupCaller := s.caller
+	if !terminal && s.adapter.config.CleanupCaller != nil {
+		var err error
+		cleanupCaller, err = s.adapter.config.CleanupCaller(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	h, e := s.adapter.config.Workers.Refresh(ctx, cleanupCaller, s.ownership)
 	if e != nil {
 		return e
 	}
@@ -530,7 +540,7 @@ func (s *nativeStream) Close() (result error) {
 	if e != nil {
 		return e
 	}
-	return s.adapter.config.Authority.FenceNativeCancellation(ctx, s.adapter.config.Owner, s.caller, h.Current, h.Binding, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation, func(c context.Context) error {
+	return s.adapter.config.Authority.FenceNativeCancellation(ctx, s.adapter.config.Owner, cleanupCaller, h.Current, h.Binding, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation, func(c context.Context) error {
 		request := intent.Request()
 		_, err := h.Client.Call(c, sessionworker.LocalRequest{Type: "cancel", Intent: &request})
 		return err

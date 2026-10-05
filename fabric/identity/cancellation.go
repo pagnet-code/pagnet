@@ -15,6 +15,7 @@ import (
 // original invocation remains immutable; cancellation never renews its deadline
 // or reserves another operation. Policies explicitly decide who may stop it.
 type NativeCancellationFacts struct {
+	CurrentCaller   fabric.ExecutionContext `json:"-"`
 	Owner           fabric.Principal
 	Caller          fabric.Principal
 	Controller      Controller
@@ -43,9 +44,14 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 		return err
 	}
 	var facts NativeCancellationFacts
-	raw, err := json.Marshal(NativeCancellationFacts{a.root.Owner, caller.PrincipalView(), current, currentBinding, originalBinding, source, reservation})
+	raw, err := json.Marshal(NativeCancellationFacts{Owner: a.root.Owner, Caller: caller.PrincipalView(), Controller: current, CurrentBinding: currentBinding, OriginalBinding: originalBinding, Admission: source, Reservation: reservation})
 	if err != nil || fabric.DecodeJSON(raw, &facts) != nil {
 		return invalid("Invalid source cancellation facts")
+	}
+	facts.CurrentCaller = caller
+	callerWitness, e := a.currentCallerWitness(ctx, caller)
+	if e != nil {
+		return e
 	}
 	lifetime, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -71,6 +77,9 @@ func (a *Authority) FenceNativeCancellation(ctx context.Context, owner, caller f
 		}
 		calls++
 		callbackError = a.transact(lifetime, owner, current.Scope, false, func(tx *registry.AuthorityTx) error {
+			if e := a.verifyCurrentCallerTx(tx, callerWitness, caller.PrincipalView()); e != nil {
+				return e
+			}
 			if err := a.currentController(tx, current); err != nil {
 				return err
 			}

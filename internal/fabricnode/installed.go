@@ -1,0 +1,166 @@
+package fabricnode
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/localinstallation"
+	"github.com/pagnet-code/pagnet/fabric/registry"
+	"github.com/pagnet-code/pagnet/fabric/search"
+	"github.com/pagnet-code/pagnet/fabric/telemetry"
+	"github.com/pagnet-code/pagnet/internal/fabrichost"
+	"github.com/pagnet-code/pagnet/internal/fabricmcp"
+	"github.com/pagnet-code/pagnet/internal/fabricnative"
+)
+
+// InstalledConfig loads one explicitly initialized local trust boundary. Native
+// credentials are an explicit private provider; nil permits credential-free
+// profiles only, and never scrapes environment/provider configuration.
+type InstalledConfig struct {
+	Directory   string
+	Binary      string
+	Credentials fabricnative.CredentialProvider
+	Tracing     telemetry.Provider
+}
+
+// InstalledNode is the actual local socket/product composition. The installation
+// owns the only writer and key; transport joins before runtime, key and Store.
+type InstalledNode struct {
+	Installation *localinstallation.Installation
+	Node         *Node
+	Runtime      *LocalRuntime
+	Host         *fabrichost.Host
+	server       *fabricmcp.Server
+	incomplete   *CompositionError
+	mu           sync.Mutex
+}
+
+type InstalledOpenError struct {
+	cause    error
+	retained *InstalledNode
+}
+
+func (e *InstalledOpenError) Error() string {
+	return "Local node could not start; original resources remain held until cleanup completes"
+}
+func (e *InstalledOpenError) Unwrap() error { return e.cause }
+func (e *InstalledOpenError) CloseContext(ctx context.Context) error {
+	return e.retained.CloseContext(ctx)
+}
+
+// OpenInstalled never initializes, installs software, contacts the cloud or
+// launches a native turn. Startup authenticates retained workers before exposing
+// the direct owner/managed MCP listener with exactly three network operations.
+func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, err error) {
+	if ctx == nil || c.Binary == "" {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "Explicit installed node and binary required")
+	}
+	installation, err := localinstallation.Load(ctx, c.Directory, registry.DefaultOptions())
+	if err != nil {
+		return nil, err
+	}
+	result := &InstalledNode{Installation: installation}
+	keep := false
+	defer func() {
+		if !keep {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if cleanupErr := result.CloseContext(cleanupCtx); cleanupErr != nil {
+				err = &InstalledOpenError{cause: errors.Join(err, cleanupErr), retained: result}
+			}
+		}
+	}()
+	owner, err := installation.Operator(ctx)
+	if err != nil {
+		return nil, err
+	}
+	settings := installation.Configuration().Settings
+	boot := make([]byte, 32)
+	if _, err = rand.Read(boot); err != nil {
+		return nil, err
+	}
+	credentials := c.Credentials
+	if credentials == nil {
+		credentials = func(ctx context.Context, slots []string) ([]string, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if len(slots) != 0 {
+				return nil, fabric.NewError(fabric.CodeUnsupported, "Configure a private credential provider for this runtime profile")
+			}
+			return nil, nil
+		}
+	}
+	result.Node, err = ComposeRetained(ctx, installation.Store, func(ctx context.Context, store *registry.Store, _ *search.Backend) (Ports, error) {
+		result.Runtime, err = NewLocalRuntime(ctx, store, LocalRuntimeConfig{Operator: installation, Native: NativeRuntimeConfig{
+			Owner: owner, Protector: installation.Keys, Credentials: credentials, CleanupCaller: installation.Operator,
+			Binary: c.Binary, AuthorityDirectory: c.Directory, SocketPath: settings.SocketPath,
+			ControllerBootID: hex.EncodeToString(boot), MaxWorkers: settings.MaxWorkers,
+			MaxStartupMetadataBytes: settings.MaxStartupMetadataBytes, StartupTimeout: time.Duration(settings.StartupTimeoutMillis) * time.Millisecond,
+		}})
+		if err != nil {
+			return Ports{}, err
+		}
+		ports := result.Runtime.Ports()
+		ports.Tracing = c.Tracing
+		return ports, nil
+	})
+	if err != nil {
+		errors.As(err, &result.incomplete)
+		return nil, err
+	}
+	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
+	if err != nil {
+		return nil, err
+	}
+	result.Host, err = fabrichost.Start(ctx, fabrichost.Config{SocketPath: settings.SocketPath, Authority: result.Runtime.Authenticator, Server: result.server, ResolveManaged: result.Runtime.ManagedResolver()})
+	if err != nil {
+		return nil, err
+	}
+	keep = true
+	return result, nil
+}
+
+// CloseContext retains the installation on an incomplete join and is retryable.
+// Ending a transport does not mean a native/business turn completed.
+func (n *InstalledNode) CloseContext(ctx context.Context) error {
+	if n == nil {
+		return nil
+	}
+	if ctx == nil {
+		return fabric.NewError(fabric.CodeInvalidInput, "Missing local node shutdown context")
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.Host != nil {
+		if err := n.Host.CloseContext(ctx); err != nil {
+			return err
+		}
+	} else if n.server != nil {
+		if err := n.server.CloseContext(ctx); err != nil {
+			return err
+		}
+	}
+	if n.incomplete != nil {
+		if err := n.incomplete.CloseContext(ctx); err != nil {
+			return err
+		}
+		n.incomplete = nil
+	}
+	if n.Node != nil {
+		if err := n.Node.CloseContext(ctx); err != nil {
+			return err
+		}
+	} else if n.Runtime != nil {
+		if err := n.Runtime.CloseContext(ctx); err != nil {
+			return err
+		}
+	}
+	return n.Installation.CloseContext(ctx)
+}
+func (n *InstalledNode) Close() error { return n.CloseContext(context.Background()) }

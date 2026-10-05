@@ -156,9 +156,10 @@ type CompositionError struct {
 	node  *Node
 }
 
-func (e *CompositionError) Error() string { return "Node composition failed with resources still held" }
-func (e *CompositionError) Unwrap() error { return e.cause }
-func (e *CompositionError) Close() error  { return e.node.Close() }
+func (e *CompositionError) Error() string                          { return "Node composition failed with resources still held" }
+func (e *CompositionError) Unwrap() error                          { return e.cause }
+func (e *CompositionError) Close() error                           { return e.node.Close() }
+func (e *CompositionError) CloseContext(ctx context.Context) error { return e.node.CloseContext(ctx) }
 
 // Synchronize publishes only bounded outbox pages. The caller schedules this
 // after registration/synchronization; searches never scan or drain the registry.
@@ -235,7 +236,12 @@ func (n *Node) Search(ctx context.Context, r fabric.DiscoverRequest) (fabric.Dis
 
 // Close releases the registry's sole-writer lock. Transport owners must close
 // their sessions/streams before closing the composed node.
-func (n *Node) Close() error {
+func (n *Node) Close() error { return n.CloseContext(context.Background()) }
+
+func (n *Node) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return fabric.NewError(fabric.CodeInvalidInput, "Missing node shutdown context")
+	}
 	if n == nil {
 		return nil
 	}
@@ -248,7 +254,13 @@ func (n *Node) Close() error {
 	// retry joining; resources never become a license to release live state.
 	if !n.resourcesClosed {
 		if n.resources != nil {
-			if err := n.resources.Close(); err != nil {
+			var err error
+			if bounded, ok := n.resources.(interface{ CloseContext(context.Context) error }); ok {
+				err = bounded.CloseContext(ctx)
+			} else {
+				err = n.resources.Close()
+			}
+			if err != nil {
 				return err
 			}
 		}

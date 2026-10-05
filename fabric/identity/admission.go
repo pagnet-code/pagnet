@@ -47,7 +47,7 @@ func (a *Authority) facts(caller fabric.ExecutionContext, s Scope, original, fin
 	if final.Context.Deadline != nil && !time.Now().Before(*final.Context.Deadline) {
 		return facts, final, invalid("Finalized local invocation expired")
 	}
-	facts = AdmissionFacts{Target: *final.Target, TargetRevision: final.ExpectedRevision, Scope: s, OriginalCaller: caller.PrincipalView(), Provenance: caller.ProvenanceView(), OriginalDigest: sha256.Sum256(original), FinalizedDigest: sha256.Sum256(finalized), OriginalBytes: bytes.Clone(original), FinalizedBytes: bytes.Clone(finalized), InvocationID: final.ID, AttemptID: attemptID, ReplayID: replayID}
+	facts = AdmissionFacts{Caller: caller, Purpose: PurposeInvokeAdmission, Target: *final.Target, TargetRevision: final.ExpectedRevision, Scope: s, OriginalCaller: caller.PrincipalView(), Provenance: caller.ProvenanceView(), OriginalDigest: sha256.Sum256(original), FinalizedDigest: sha256.Sum256(finalized), OriginalBytes: bytes.Clone(original), FinalizedBytes: bytes.Clone(finalized), InvocationID: final.ID, AttemptID: attemptID, ReplayID: replayID}
 	return facts, final, nil
 }
 func validWitness(w Witness, facts AdmissionFacts) error {
@@ -96,6 +96,9 @@ func (a *Authority) Admit(ctx context.Context, owner fabric.ExecutionContext, c 
 	}
 	e = a.withFence(ctx, facts, func(w Witness) error {
 		return a.transact(ctx, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+			if e := a.verifyCurrentCallerTx(tx, w, facts.OriginalCaller); e != nil {
+				return e
+			}
 			if e := a.currentController(tx, c); e != nil {
 				return e
 			}

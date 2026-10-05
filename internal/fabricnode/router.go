@@ -48,6 +48,8 @@ func (r *Router) Select(ctx context.Context, caller fabric.ExecutionContext, end
 				break
 			}
 		}
+	} else if len(endpoint.Bindings) == 0 {
+		return dispatch.Selection{}, fabric.NewError(fabric.CodeTargetUnavailable, "Endpoint has no connected execution binding")
 	} else if len(endpoint.Bindings) == 1 {
 		selected = &endpoint.Bindings[0]
 	} else {

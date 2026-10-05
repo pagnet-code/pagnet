@@ -120,6 +120,10 @@ func (m *ManagedPeers) lookup(key managedKey) *managedWorker {
 }
 
 func (m *ManagedPeers) checked(ctx context.Context, key managedKey) (fabricauth.Activation, fabric.Principal, error) {
+	return m.checkedWithFacts(ctx, key, nil)
+}
+
+func (m *ManagedPeers) checkedWithFacts(ctx context.Context, key managedKey, facts *fabricauth.ManagedCallerFacts) (fabricauth.Activation, fabric.Principal, error) {
 	if m == nil || ctx == nil || ctx.Err() != nil {
 		return fabricauth.Activation{}, fabric.Principal{}, guardDenied()
 	}
@@ -149,7 +153,7 @@ func (m *ManagedPeers) checked(ctx context.Context, key managedKey) (fabricauth.
 		return fabricauth.Activation{}, fabric.Principal{}, guardDenied()
 	}
 	currentScope := identity.Scope{Endpoint: local.Endpoint, DescriptorRevision: descriptor.Revision, BindingID: local.BindingID}
-	_, binding, err := m.authority.VerifyCurrentNativeOrigin(ctx, m.owner, currentScope, origin)
+	controller, binding, err := m.authority.VerifyCurrentNativeOrigin(ctx, m.owner, currentScope, origin)
 	if err != nil {
 		return fabricauth.Activation{}, fabric.Principal{}, guardDenied()
 	}
@@ -193,6 +197,9 @@ func (m *ManagedPeers) checked(ctx context.Context, key managedKey) (fabricauth.
 	}
 	if m.lookup(key) != w {
 		return fabricauth.Activation{}, fabric.Principal{}, guardDenied()
+	}
+	if facts != nil {
+		facts.Authority = registry.NativeCallerAuthority{Principal: fabric.Principal{Ref: local.Endpoint.String(), Kind: descriptor.Kind, Issuer: local.Namespace}, Endpoint: local.Endpoint, DescriptorRevision: descriptor.Revision, BindingID: local.BindingID, NativeGeneration: s.NativeGeneration, Controller: controller.Proof, Binding: binding.Proof, Origin: origin.Proof}
 	}
 	activation := fabricauth.Activation{Scope: w.scope, RootPID: s.PID, StartIdentity: s.NativeStartIdentity, Nonce: s.ActivationNonce, NativeGeneration: s.NativeGeneration, NativeSessionID: s.NativeSessionID}
 	return activation, fabric.Principal{Ref: local.Endpoint.String(), Kind: descriptor.Kind, Issuer: local.Namespace}, nil

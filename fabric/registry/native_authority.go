@@ -27,6 +27,8 @@ const (
 	AuthorityNativeCheckpoint       NativeAuthorityKind = "native_checkpoint"
 	AuthorityFederationPeer         NativeAuthorityKind = "federation_peer"
 	AuthorityFederationInvocation   NativeAuthorityKind = "federation_invocation"
+	AuthorityServiceBinding         NativeAuthorityKind = "service_binding"
+	AuthorityServiceInvocation      NativeAuthorityKind = "service_invocation"
 	AuthorityLocalInstallation      NativeAuthorityKind = "local_installation"
 	// Dispatch reservations are domain-wide invocation replay receipts and
 	// physical-worker sequence counters, never endpoint metadata or task state.
@@ -40,14 +42,14 @@ const (
 
 func validAuthorityKind(k NativeAuthorityKind) bool {
 	switch k {
-	case AuthorityLocalInstallation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
+	case AuthorityLocalInstallation, AuthorityServiceBinding, AuthorityServiceInvocation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
 		return true
 	}
 	return false
 }
 
 func globalAuthorityKind(k NativeAuthorityKind) bool {
-	return k == AuthorityLocalInstallation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
+	return k == AuthorityLocalInstallation || k == AuthorityServiceInvocation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
 }
 
 // AuthorityIdentity is public verification material, never a signing capability.

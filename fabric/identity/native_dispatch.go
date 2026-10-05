@@ -148,6 +148,7 @@ func (a *Authority) ReserveNativeDispatch(ctx context.Context, owner fabric.Exec
 	if e != nil {
 		return result, e
 	}
+	facts = withNativeSourceFacts(facts, PurposeNativeReservation, source)
 	if facts.OriginalCaller != source.OriginalCaller || facts.InvocationID != source.InvocationID || facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest {
 		return result, conflict("Native dispatch original or finalized admission differs")
 	}

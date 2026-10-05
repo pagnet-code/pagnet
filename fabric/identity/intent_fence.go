@@ -53,6 +53,7 @@ func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.Executio
 	if e != nil {
 		return receipt, e
 	}
+	facts = withNativeSourceFacts(facts, PurposeNativeIntent, source)
 	if facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest || facts.OriginalCaller != source.OriginalCaller {
 		return receipt, invalid("Native intent original or final admission bytes differ")
 	}

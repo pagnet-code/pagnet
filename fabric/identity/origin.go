@@ -63,6 +63,7 @@ func (a *Authority) RegisterOrigin(ctx context.Context, owner fabric.ExecutionCo
 	if e != nil {
 		return result, e
 	}
+	facts = withNativeSourceFacts(facts, PurposeNativeOrigin, source)
 	if facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest || facts.OriginalCaller != source.OriginalCaller {
 		return result, invalid("Native origin original admission bytes differ")
 	}

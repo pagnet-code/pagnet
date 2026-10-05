@@ -47,6 +47,9 @@ type Binding struct {
 // AdmissionFacts are exact finalized ENGINE facts, not caller assertions. Byte
 // slices are private ephemeral input to the configured fence, never persisted.
 type AdmissionFacts struct {
+	Caller          fabric.ExecutionContext `json:"-"`
+	Purpose         string                  `json:"purpose"`
+	Source          *Admission              `json:"source,omitempty"`
 	Target          fabric.EndpointRef
 	TargetRevision  fabric.Revision
 	Scope           Scope
@@ -61,9 +64,12 @@ type AdmissionFacts struct {
 	ReplayID        string
 }
 type Witness struct {
-	Version         string          `json:"version"`
-	FinalizedDigest [32]byte        `json:"finalizedDigest"`
-	Value           json.RawMessage `json:"value"`
+	CurrentCallerOpen      func() bool                     `json:"-"`
+	CurrentCallerAuthority *registry.NativeCallerAuthority `json:"-"`
+	CurrentCallerKind      string                          `json:"-"`
+	Version                string                          `json:"version"`
+	FinalizedDigest        [32]byte                        `json:"finalizedDigest"`
+	Value                  json.RawMessage                 `json:"value"`
 }
 
 // AdmissionFence is trusted infrastructure. It validates current authorization
@@ -233,6 +239,7 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 		if calls != 1 {
 			return invalid("Local admission fence attempted multiple commits")
 		}
+		w = cloneWitness(w)
 		if e := validWitness(w, facts); e != nil {
 			callbackError = e
 			return e
@@ -256,4 +263,19 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 		}
 	}
 	return err
+}
+
+// cloneWitness detaches authority records before a trusted external fence can
+// reuse or mutate its storage. Current caller facts never enter signed JSON.
+func cloneWitness(w Witness) Witness {
+	w.Value = append(json.RawMessage(nil), w.Value...)
+	if w.CurrentCallerAuthority != nil {
+		f := *w.CurrentCallerAuthority
+		for _, r := range []*registry.AuthorityRecord{&f.Controller, &f.Binding, &f.Origin} {
+			r.Value = append([]byte(nil), r.Value...)
+			r.Signature = append([]byte(nil), r.Signature...)
+		}
+		w.CurrentCallerAuthority = &f
+	}
+	return w
 }

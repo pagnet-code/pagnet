@@ -23,6 +23,7 @@ const (
 // NativeSourceReadFacts require a separate configured current disclosure policy.
 // Signed historical provenance alone never authorizes disclosure.
 type NativeSourceReadFacts struct {
+	CurrentCaller   fabric.ExecutionContext `json:"-"`
 	Operation       NativeSourceReadOperation
 	Owner           fabric.Principal
 	Caller          fabric.Principal
@@ -52,9 +53,14 @@ func (a *Authority) FenceNativeSourceRead(ctx context.Context, owner, caller fab
 		return err
 	}
 	var facts NativeSourceReadFacts
-	raw, err := json.Marshal(NativeSourceReadFacts{operation, a.root.Owner, caller.PrincipalView(), current, currentBinding, originalBinding, source, reservation})
+	raw, err := json.Marshal(NativeSourceReadFacts{Operation: operation, Owner: a.root.Owner, Caller: caller.PrincipalView(), Controller: current, CurrentBinding: currentBinding, OriginalBinding: originalBinding, Admission: source, Reservation: reservation})
 	if err != nil || fabric.DecodeJSON(raw, &facts) != nil {
 		return invalid("Invalid source read facts")
+	}
+	facts.CurrentCaller = caller
+	callerWitness, e := a.currentCallerWitness(ctx, caller)
+	if e != nil {
+		return e
 	}
 	lifetime, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -80,6 +86,9 @@ func (a *Authority) FenceNativeSourceRead(ctx context.Context, owner, caller fab
 		}
 		calls++
 		callbackError = a.transact(lifetime, owner, current.Scope, false, func(tx *registry.AuthorityTx) error {
+			if e := a.verifyCurrentCallerTx(tx, callerWitness, caller.PrincipalView()); e != nil {
+				return e
+			}
 			if err := a.currentController(tx, current); err != nil {
 				return err
 			}

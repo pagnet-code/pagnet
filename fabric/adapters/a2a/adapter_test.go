@@ -95,7 +95,7 @@ func setupConfig(t *testing.T, state sdk.TaskState, streaming bool, storeConfig 
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { _ = f.adapter.Close() })
-	f.endpoint = fabric.EndpointDescriptor{Ref: ref, Revision: "r1", Name: "remote", Kind: "service.a2a", Bindings: []fabric.BindingSummary{{ID: "remote", Protocol: "a2a", Version: "1.0", Streaming: streaming, Cancellation: true}}}
+	f.endpoint = fabric.EndpointDescriptor{Ref: ref, Revision: "r1", Name: "remote", Kind: "service.a2a", Bindings: []fabric.BindingSummary{{ID: "remote", Protocol: "a2a.jsonrpc", Version: "1.0", Streaming: streaming, Cancellation: true}}}
 	f.caller, _ = fabric.NewAuthenticatedContext(fabric.Principal{Ref: "local:alice", Issuer: "local:owner", Kind: "actor.human"}, "test.audience", []byte("verified fixture"))
 	return f
 }
