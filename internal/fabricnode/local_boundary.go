@@ -37,6 +37,7 @@ type LocalBoundary struct {
 	timeout  time.Duration
 	mu       sync.RWMutex
 	sessions *fabricauth.Authority
+	planGate *extensionPlanGate
 	closed   bool
 }
 
@@ -222,6 +223,10 @@ func (b *LocalBoundary) verifySource(f identity.AdmissionFacts) error {
 	return nil
 }
 func (b *LocalBoundary) WithAdmission(ctx context.Context, f identity.AdmissionFacts, next func(identity.Witness) error) error {
+	if b != nil && next != nil {
+		originalNext := next
+		next = func(w identity.Witness) error { return b.selectedPlanWitness(ctx, f.Source, w, originalNext) }
+	}
 	if b == nil || next == nil {
 		return localDenied()
 	}
@@ -351,6 +356,10 @@ func (b *LocalBoundary) WithNativeControl(ctx context.Context, f identity.Native
 	return b.operatorCurrent(ctx, b.owner, func(context.Context) error { return next() })
 }
 func (b *LocalBoundary) WithHistoricalNativeOrigin(ctx context.Context, f identity.HistoricalNativeOriginFacts, next func(identity.Witness) error) error {
+	if b != nil && next != nil {
+		originalNext := next
+		next = func(w identity.Witness) error { return b.selectedPlanWitness(ctx, &f.Admission, w, originalNext) }
+	}
 	if b == nil || next == nil || f.Current.Owner != b.root.Owner || b.verifyFacts(f.Original) != nil || b.verifySource(f.Original) != nil || f.Admission.ID != f.Original.Source.ID {
 		return localDenied()
 	}

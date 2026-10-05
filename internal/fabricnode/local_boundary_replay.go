@@ -83,6 +83,10 @@ func (b *LocalBoundary) AuthorizeHistoryTx(ctx context.Context, tx *registry.Aut
 	if b == nil || ctx == nil || tx == nil || ctx.Err() != nil {
 		return localDenied()
 	}
+	if err := b.verifyExtensionPlanTx(ctx, tx); err != nil {
+		return err
+	}
+
 	switch action {
 	case "alias_admit", "alias_verify", "alias_pull":
 	default:

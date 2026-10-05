@@ -33,6 +33,10 @@ func (b *LocalBoundary) AuthorizeTx(ctx context.Context, tx *registry.AuthorityT
 	if b == nil || ctx == nil || ctx.Err() != nil || tx == nil {
 		return localDenied()
 	}
+	if err := b.verifyExtensionPlanTx(ctx, tx); err != nil {
+		return err
+	}
+
 	s, ok := ctx.Value(dispatchStampKey{}).(*dispatchStamp)
 	if !ok || s == nil || s.boundary != b || s.caller != caller.PrincipalView() || caller.VerifyAuthenticatedDigest(s.originalSHA, b.root.Namespace) != nil || f.Principal != s.caller || f.Target != s.target || f.Revision != s.revision || f.Scope != s.scope || f.Fingerprint != s.fingerprint {
 		return localDenied()
