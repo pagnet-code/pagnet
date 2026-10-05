@@ -108,6 +108,10 @@ func OpenState(path string) (*State, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate native observation journal: %w", err)
 	}
+	if err := state.initHostedSourceFinals(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate hosted source finals: %w", err)
+	}
 	return state, nil
 }
 

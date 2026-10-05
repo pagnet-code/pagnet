@@ -114,7 +114,22 @@ func (d *Daemon) deliverHostedInvocation(conn *websocket.Conn, p transport.Netwo
 	if err != nil {
 		return fmt.Errorf("retained hosted invocation is not the exact prompt binding: %w", err)
 	}
-	return d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "prompt", sessionworker.Operation{Input: prompt, InputKind: "invocation"})
+	if err := d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "prompt", sessionworker.Operation{Input: prompt, InputKind: "invocation"}); err != nil {
+		return err
+	}
+	// The accepted original invocation's paid output is consumed by the DAEMON
+	// as an async daemon-scoped task (bound to d.turnCtx, never to this
+	// delivery connection): a control-plane detach — or a daemon restart —
+	// must not stop the paid work or lose its retained final output. The
+	// consumption is idempotent and restartable from daemon state; errors are
+	// logged honestly and never panic the delivery path. The local admission
+	// path (AdmitHostedFabric) reaches the SAME entry point in step 6.
+	go func() {
+		if err := d.ConsumeHostedInvocationFinalOutput(d.turnCtx, profile, *p.NativeDispatch); err != nil && !errors.Is(err, context.Canceled) {
+			d.Log.Warn("hosted invocation final output consumption stopped", "instance", p.InstanceID, "command", p.CommandID, "err", err)
+		}
+	}()
+	return nil
 }
 
 // hostedInvocationPromptInput is the exact BindHostedPrompt input grammar: a

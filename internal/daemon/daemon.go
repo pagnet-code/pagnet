@@ -228,6 +228,13 @@ type Daemon struct {
 	turnCtx    context.Context
 	turnCancel context.CancelFunc
 
+	// hostedSourceMu guards hostedSourceConsumers: the in-flight hosted
+	// invocation final-output consumption per "instanceID\x00commandID", so
+	// the startup-resume pass (and a replayed trigger) never double-launches
+	// a running consumer.
+	hostedSourceMu        sync.Mutex
+	hostedSourceConsumers map[string]*hostedSourceConsumerHolder
+
 	// closeOnce makes Close idempotent: tests and shutdown paths may call
 	// it more than once (explicit Close + t.Cleanup), and the underlying
 	// resources (sql.DB, supervisor) must not be torn down twice.

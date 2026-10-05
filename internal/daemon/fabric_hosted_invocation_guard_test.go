@@ -105,12 +105,31 @@ type hostedGuardFixture struct {
 	// installation is the genuine local installation the fixture bootstraps
 	// (step 3's sideport tests compose the real node over its store).
 	installation *localinstallation.Installation
+	// workerEnv is applied to the daemon before the native worker is
+	// launched (the fake runtime's deterministic output knobs).
+	workerEnv []string
 }
 
-func newHostedGuardFixture(t *testing.T) *hostedGuardFixture {
+type hostedGuardFixtureOption func(*hostedGuardFixture)
+
+// withWorkerEnv appends env to the daemon's RuntimeEnv before the native
+// worker is launched (the fake runtime's deterministic output knobs, e.g.
+// PAGNET_FAKE_OUTPUT_CHUNK_BYTES / PAGNET_FAKE_FULL_OUTPUT_REPEAT).
+func withWorkerEnv(env ...string) hostedGuardFixtureOption {
+	return func(f *hostedGuardFixture) { f.workerEnv = env }
+}
+
+func newHostedGuardFixture(t *testing.T, opts ...hostedGuardFixtureOption) *hostedGuardFixture {
 	t.Helper()
 	ctx := t.Context()
 	d := newTestDaemon(t)
+	f := &hostedGuardFixture{t: t, d: d}
+	for _, opt := range opts {
+		opt(f)
+	}
+	if len(f.workerEnv) > 0 {
+		d.RuntimeEnv = append([]string(nil), f.workerEnv...)
+	}
 	d.ServerURL = "https://app.pagnet.dev"
 	d.HostID = domain.NewID().String()
 	pf, ok := d.sessions.DriverFor(domain.RuntimeFakePersistent).(*agentruntime.PersistentFake)
@@ -324,13 +343,11 @@ func newHostedGuardFixture(t *testing.T) *hostedGuardFixture {
 	}
 	d.HostedInvocationGuard = NewHostedInvocationGuard(journal, func(context.Context) (fabric.ExecutionContext, error) { return caller, nil }, resolve)
 
-	f := &hostedGuardFixture{
-		t: t, d: d, conn: client, server: server, ownerConn: ownerConn, record: record,
-		session: session, owner: owner, root: root, ref: ref, revision: revision, scope: scope,
-		profile: profile, principal: principal, journal: journal, profiles: profiles,
-		admission: admission, networkID: networkID, keyEpochID: st.EpochID, key: key,
-		installation: installation,
-	}
+	f.conn, f.server, f.ownerConn, f.record = client, server, ownerConn, record
+	f.session, f.owner, f.root, f.ref, f.revision = session, owner, root, ref, revision
+	f.scope, f.profile, f.principal, f.journal, f.profiles = scope, profile, principal, journal, profiles
+	f.admission, f.networkID, f.keyEpochID, f.key = admission, networkID, st.EpochID, key
+	f.installation = installation
 	f.plan[0], f.plan[31] = 0x01, 0x02
 	return f
 }

@@ -411,6 +411,12 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 		if stopped {
 			return
 		}
+		// A fresh/recovered host session also resumes the consumed hosted
+		// final outputs: a daemon restart (or controller replacement) must
+		// retain the SAME original source. Rows with a live consumer are
+		// skipped; deterministic conflicts finalize the row, transient
+		// failures retry on the next pass.
+		d.resumeHostedSourceConsumers(conn)
 		select {
 		case <-d.turnCtx.Done():
 			return
