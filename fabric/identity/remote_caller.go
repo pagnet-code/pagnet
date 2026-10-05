@@ -9,8 +9,9 @@ import (
 // identity or an original paid receipt. A finite freshly authenticated source
 // assertion is bound to the exact encrypted channel/request and bilateral pins.
 // It does not claim instantaneous remote kernel revocation after issuance.
-// VerifyCurrent must check SAME-transaction peer pins and current operation
-// grants; external IO or nested Store calls are forbidden in that callback.
+// VerifyCurrent must check SAME-transaction peer pins and explicitly published
+// exposure integrity; business authorization belongs to extensions. External IO
+// or nested Store calls are forbidden in that callback.
 type RemoteCallerWitness struct {
 	Principal       fabric.Principal
 	RequestDigest   [32]byte
