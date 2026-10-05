@@ -79,6 +79,7 @@ type ledgerFixture struct {
 	ledger                        *federation.AdmissionLedger
 	destinationPath               string
 	sourceCaller                  fabric.ExecutionContext
+	sourceKey                     testKey
 }
 
 func newLedgerFixture(t *testing.T, limit uint64) ledgerFixture {
@@ -157,6 +158,7 @@ func newLedgerFixture(t *testing.T, limit uint64) ledgerFixture {
 	rand.Read(channel.ID[:])
 	rand.Read(channel.SourceRoute[:])
 	rand.Read(channel.DestinationRoute[:])
+	f.sourceKey = keys[0]
 	f.cfg = federation.Config{Local: local, Remote: remote, Keys: keys[1], Trust: f.gate, Channel: channel, MaxRecords: 128}
 	target, e := fabric.NewEndpointRef(f.destination.AuthorityIdentity().PublicKey)
 	if e != nil {
