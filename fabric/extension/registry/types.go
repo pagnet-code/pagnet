@@ -45,9 +45,26 @@ type Reference struct {
 	Digest     string `json:"digest"`
 }
 type Snapshot struct {
+	Generation      uint64
+	Plan            *extension.Plan
+	evidence        []byte
+	purpose         domain.AuthorityRecord
+	directoryDigest [32]byte
+}
+
+// ConfiguredSnapshot carries private operator configuration evidence from the
+// SAME immutable publication as Plan. It is explicitly retrieved for durable
+// continuation checkpoints, never serialized into public results or events.
+type ConfiguredSnapshot struct {
 	Generation uint64
 	Plan       *extension.Plan
+	Evidence   []byte
 }
+
+func (ConfiguredSnapshot) MarshalJSON() ([]byte, error) {
+	return nil, fabric.NewError(fabric.CodeUnsupported, "Private configured plan evidence cannot be serialized")
+}
+
 type Page struct {
 	Generation uint64
 	Entries    []Reference

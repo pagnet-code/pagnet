@@ -32,18 +32,19 @@ type OperationInterceptors interface {
 type ReadResultValidator func(context.Context, fabric.ExecutionContext, fabric.Envelope, Result) error
 
 type Config struct {
-	Audience            string
-	Authenticator       fabric.Authenticator
-	Search              SearchReader
-	Descriptors         fabric.DescriptorStore
-	Dispatcher          fabric.InvocationDispatcher
-	Interceptors        OperationInterceptors
-	ValidateReadResult  ReadResultValidator
-	InvocationPlacement extension.Placement
-	Events              events.EventBus
-	EventSource         string
-	Tracing             telemetry.Provider
-	ReplayVerifier      fabric.ReplayVerifier
+	Audience               string
+	Authenticator          fabric.Authenticator
+	Search                 SearchReader
+	Descriptors            fabric.DescriptorStore
+	Dispatcher             fabric.InvocationDispatcher
+	Interceptors           OperationInterceptors
+	ValidateReadResult     ReadResultValidator
+	InvocationPlacement    extension.Placement
+	Events                 events.EventBus
+	EventSource            string
+	Tracing                telemetry.Provider
+	ReplayVerifier         fabric.ReplayVerifier
+	ResumeDispatchVerifier ResumeDispatchVerifier
 }
 
 type Service struct {

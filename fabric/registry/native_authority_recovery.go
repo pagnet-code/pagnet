@@ -75,6 +75,7 @@ func (s *Store) verifyNativeAuthority(ctx context.Context) error {
 	identity := AuthorityIdentity{s.identity.Namespace, s.identity.StoreID, s.identity.Owner, bytes.Clone(s.identity.PublicKey), 1}
 	var previous [32]byte
 	var next uint64 = 1
+	var extensionGeneration, pendingExtension uint64
 	for rows.Next() {
 		var seq uint64
 		var raw []byte
@@ -87,6 +88,18 @@ func (s *Store) verifyNativeAuthority(ctx context.Context) error {
 		}
 		if seq != next || record.Sequence != seq || record.PreviousHead != previous || len(record.Value) > s.options.Limits.MaxPayloadBytes || VerifyAuthorityRecord(identity, record) != nil {
 			return invalid("Native authority signed history mismatch")
+		}
+		if pendingExtension != 0 && record.Key.Kind != AuthorityPurposeGeneration {
+			return invalid("Extension mutation lacks intrinsic signed generation")
+		}
+		if record.Key.Kind == AuthorityExtensionConfiguration {
+			pendingExtension = record.Sequence
+		} else if record.Key.Kind == AuthorityPurposeGeneration {
+			if validatePurposeGeneration(record) != nil || pendingExtension == 0 || record.Sequence != pendingExtension+1 || record.Revision != extensionGeneration+1 {
+				return invalid("Intrinsic extension generation history mismatch")
+			}
+			extensionGeneration++
+			pendingExtension = 0
 		}
 		var payload any
 		if e = s.decode(record.Value, &payload); e != nil {
@@ -110,6 +123,9 @@ func (s *Store) verifyNativeAuthority(ctx context.Context) error {
 		}
 		previous = digest
 		next++
+	}
+	if pendingExtension != 0 {
+		return invalid("Extension mutation lacks intrinsic signed generation")
 	}
 	if rows.Err() != nil {
 		return rows.Err()

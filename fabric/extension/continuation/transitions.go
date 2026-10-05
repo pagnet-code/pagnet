@@ -227,6 +227,7 @@ func (s *Store) Claim(ctx context.Context, c fabric.ExecutionContext, token stri
 	result.State = Claimed
 	result.Fresh = true
 	result.Receipt = receipt
+	result.Claim = &FreshClaim{store: s, receipt: append([]byte(nil), b...), snapshot: append([]byte(nil), r.snapshot...)}
 	return result, nil
 }
 

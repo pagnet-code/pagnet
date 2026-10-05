@@ -67,7 +67,7 @@ func key(id string) domain.AuthorityKey {
 	return domain.AuthorityKey{Kind: domain.AuthorityExtensionConfiguration, ID: id}
 }
 func scope(c Config) domain.AuthorityScope {
-	return domain.AuthorityScope{MaxOperations: c.MaxExtensions + 4, Timeout: 5 * time.Second}
+	return domain.AuthorityScope{MaxOperations: c.MaxExtensions + 5, Timeout: 5 * time.Second}
 }
 func Bootstrap(ctx context.Context, owner fabric.ExecutionContext, c Config) (*Store, error) {
 	return open(ctx, owner, c, true)
@@ -211,7 +211,7 @@ func (s *Store) validateInstallation(input Installation) (Installation, error) {
 	sort.Slice(owned.Bindings, func(i, j int) bool { return owned.Bindings[i].ID < owned.Bindings[j].ID })
 	return owned, nil
 }
-func (s *Store) compile(entries map[string]Installation, refs map[string]Reference, generation uint64) (*extension.Plan, error) {
+func (s *Store) compile(entries map[string]Installation, refs map[string]Reference, generation uint64) (*extension.Plan, []byte, error) {
 	ids := make([]string, 0, len(entries))
 	for id := range entries {
 		ids = append(ids, id)
@@ -237,7 +237,8 @@ func (s *Store) compile(entries map[string]Installation, refs map[string]Referen
 		Generation         uint64
 		Installations      any
 	}{1, s.identity.Namespace, s.identity.StoreID, generation, installed})
-	return extension.CompileConfigured(manifests, s.config.MaxInterceptors, hash(raw))
+	plan, err := extension.CompileConfigured(manifests, s.config.MaxInterceptors, hash(raw))
+	return plan, raw, err
 }
 func (s *Store) reload(ctx context.Context, owner fabric.ExecutionContext) error {
 	if e := s.authorize(ctx, owner); e != nil {
@@ -246,6 +247,8 @@ func (s *Store) reload(ctx context.Context, owner fabric.ExecutionContext) error
 	refs := map[string]Reference{}
 	entries := map[string]Installation{}
 	var generation uint64
+	var purpose domain.AuthorityRecord
+	var directoryDigest [32]byte
 	e := s.config.Root.WithNativeAuthority(ctx, owner, scope(s.config), func(tx *domain.AuthorityTx) error {
 		saved, e := tx.Get(key(directoryID))
 		if e != nil || saved.Retired {
@@ -284,12 +287,14 @@ func (s *Store) reload(ctx context.Context, owner fabric.ExecutionContext) error
 			entries[ref.ID] = installed
 		}
 		generation = saved.Revision
-		return nil
+		directoryDigest = sha256.Sum256(saved.Value)
+		purpose, e = tx.ExtensionPurposeGeneration()
+		return e
 	})
 	if e != nil {
 		return e
 	}
-	plan, e := s.compile(entries, refs, generation)
+	plan, evidence, e := s.compile(entries, refs, generation)
 	if e != nil {
 		return e
 	}
@@ -299,7 +304,7 @@ func (s *Store) reload(ctx context.Context, owner fabric.ExecutionContext) error
 	s.generation = generation
 	s.plan = plan
 	s.quarantined = false
-	s.snapshot.Store(&Snapshot{s.generation, s.plan})
+	s.snapshot.Store(&Snapshot{Generation: s.generation, Plan: s.plan, evidence: evidence, purpose: purpose, directoryDigest: directoryDigest})
 	return nil
 }
 func (s *Store) Reload(ctx context.Context, owner fabric.ExecutionContext) error {
@@ -317,7 +322,15 @@ func (s *Store) Snapshot() (Snapshot, error) {
 	if snapshot == nil {
 		return Snapshot{}, failure()
 	}
-	return *snapshot, nil
+	return Snapshot{Generation: snapshot.Generation, Plan: snapshot.Plan}, nil
+}
+
+func (s *Store) ConfiguredSnapshot() (ConfiguredSnapshot, error) {
+	snapshot := s.snapshot.Load()
+	if snapshot == nil {
+		return ConfiguredSnapshot{}, failure()
+	}
+	return ConfiguredSnapshot{Generation: snapshot.Generation, Plan: snapshot.Plan, Evidence: append([]byte(nil), snapshot.evidence...)}, nil
 }
 func (s *Store) Close() error {
 	s.mu.Lock()

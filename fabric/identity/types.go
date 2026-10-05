@@ -64,6 +64,8 @@ type AdmissionFacts struct {
 	ReplayID        string
 }
 type Witness struct {
+	RemoteCaller           *RemoteCallerWitness            `json:"-"`
+	DeferredCaller         *DeferredCallerWitness          `json:"-"`
 	CurrentCallerOpen      func() bool                     `json:"-"`
 	CurrentCallerAuthority *registry.NativeCallerAuthority `json:"-"`
 	CurrentCallerKind      string                          `json:"-"`
@@ -259,6 +261,12 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 	if err != nil {
 		var typed *fabric.Error
 		if !errors.As(err, &typed) {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fabric.NewError(fabric.CodeDeadlineExceeded, "Local admission deadline elapsed")
+			}
+			if errors.Is(err, context.Canceled) {
+				return fabric.NewError(fabric.CodeCancelled, "Local admission was cancelled")
+			}
 			return fabric.NewError(fabric.CodeProtocolError, "Local admission fence failed")
 		}
 	}
@@ -268,6 +276,17 @@ func (a *Authority) withFence(ctx context.Context, facts AdmissionFacts, commit 
 // cloneWitness detaches authority records before a trusted external fence can
 // reuse or mutate its storage. Current caller facts never enter signed JSON.
 func cloneWitness(w Witness) Witness {
+	if w.RemoteCaller != nil {
+		r := *w.RemoteCaller
+		w.RemoteCaller = &r
+	}
+	if w.DeferredCaller != nil {
+		d := *w.DeferredCaller
+		d.Original = append([]byte(nil), d.Original...)
+		d.Admission.Value = append([]byte(nil), d.Admission.Value...)
+		d.Admission.Signature = append([]byte(nil), d.Admission.Signature...)
+		w.DeferredCaller = &d
+	}
 	w.Value = append(json.RawMessage(nil), w.Value...)
 	if w.CurrentCallerAuthority != nil {
 		f := *w.CurrentCallerAuthority

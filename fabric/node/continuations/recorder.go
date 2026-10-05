@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"sort"
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -24,12 +23,15 @@ type PrincipalResolver func(context.Context, string) (fabric.Principal, error)
 // explicitly endorse the issuer, original identity and provenance; final current
 // target authorization is rerun by Engine.ResumeStage.
 type HistoricalAdmission struct {
-	SnapshotDigest string
-	Principal      fabric.Principal
-	Audience       string
-	OriginalBytes  []byte
-	Provenance     fabric.Provenance
-	Claim          continuation.Receipt
+	SnapshotDigest     string
+	Principal          fabric.Principal
+	Audience           string
+	OriginalBytes      []byte
+	Provenance         fabric.Provenance
+	Claim              continuation.Receipt
+	DeferredProof      []byte
+	SnapshotCommitment [32]byte
+	PlanRevision       fabric.Revision
 }
 type OriginalAdmissionRestorer func(context.Context, HistoricalAdmission) (fabric.ExecutionContext, error)
 
@@ -68,16 +70,17 @@ type Evidence struct {
 }
 type EvidenceValidator func(context.Context, fabric.ExecutionContext, Evidence) (continuation.Outcome, error)
 type Config struct {
-	Store             *continuation.Store
-	Audience          string
-	Manifests         []extension.ExtensionManifest
-	MaxInterceptors   int
-	ResolvePrincipal  PrincipalResolver
-	RestoreOriginal   OriginalAdmissionRestorer
-	Notify            PrivateNotificationSink
-	VerifyEvidence    EvidenceValidator
-	SettlementTimeout time.Duration
-	SnapshotLimits    fabric.WireLimits
+	Store                 *continuation.Store
+	Audience              string
+	ConfiguredPlan        ConfiguredPlanProvider
+	SaveDeferredAdmission DeferredAdmissionWriter
+	ResumeAuthority       ResumeAuthority
+	ResolvePrincipal      PrincipalResolver
+	RestoreOriginal       OriginalAdmissionRestorer
+	Notify                PrivateNotificationSink
+	VerifyEvidence        EvidenceValidator
+	SettlementTimeout     time.Duration
+	SnapshotLimits        fabric.WireLimits
 }
 type Recorder struct {
 	config       Config
@@ -97,7 +100,7 @@ func stale() error {
 	return fabric.NewError(fabric.CodeStaleContinuation, "Continuation configuration or authority is stale")
 }
 func New(config Config) (*Recorder, error) {
-	if config.Store == nil || config.Audience == "" || config.ResolvePrincipal == nil || config.RestoreOriginal == nil || config.Notify == nil || config.VerifyEvidence == nil || config.SettlementTimeout <= 0 || config.SettlementTimeout > time.Minute {
+	if config.Store == nil || config.SaveDeferredAdmission == nil || config.ResumeAuthority == nil || config.Audience == "" || config.ResolvePrincipal == nil || config.RestoreOriginal == nil || config.Notify == nil || config.VerifyEvidence == nil || config.SettlementTimeout <= 0 || config.SettlementTimeout > time.Minute {
 		return nil, invalid("Incomplete trusted continuation composition")
 	}
 	if config.SnapshotLimits == (fabric.WireLimits{}) {
@@ -106,24 +109,23 @@ func New(config Config) (*Recorder, error) {
 	if config.SnapshotLimits.MaxBytes <= 0 || config.SnapshotLimits.MaxDepth <= 0 || config.SnapshotLimits.MaxMembers <= 0 {
 		return nil, invalid("Invalid private snapshot limits")
 	}
-	plan, e := extension.Compile(config.Manifests, config.MaxInterceptors)
+	plan, e := configuredPlan(context.Background(), config.ConfiguredPlan, config.SnapshotLimits)
 	if e != nil {
 		return nil, e
 	}
-	manifests := append([]extension.ExtensionManifest(nil), config.Manifests...)
-	sort.Slice(manifests, func(i, j int) bool { return manifests[i].ID < manifests[j].ID })
-	raw, e := json.Marshal(manifests)
-	if e != nil || hash(raw) != plan.Revision() {
-		return nil, invalid("Invalid immutable pipeline evidence")
-	}
-	// Only immutable canonical bytes/revision survive constructor input mutation.
-	config.Manifests = nil
-	return &Recorder{config: config, planRevision: plan.Revision(), pipeline: raw}, nil
+	return &Recorder{config: config, planRevision: plan.Plan.Revision(), pipeline: plan.Evidence}, nil
 }
 func hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func (r *Recorder) Save(ctx context.Context, caller fabric.ExecutionContext, original []byte, state extension.PipelineState, deferral extension.Deferral, registration extension.CompiledRegistration) (string, error) {
 	if ctx == nil {
 		return "", invalid("Missing continuation context")
+	}
+	current, e := configuredPlan(ctx, r.config.ConfiguredPlan, r.config.SnapshotLimits)
+	if e != nil {
+		return "", e
+	}
+	if current.Plan.Revision() != r.planRevision || string(current.Evidence) != string(r.pipeline) {
+		return "", stale()
 	}
 	if len(deferral.ResumePrincipals) < 1 || len(deferral.ResumePrincipals) > 64 {
 		return "", invalid("Invalid bounded resume principals")
@@ -149,6 +151,19 @@ func (r *Recorder) Save(ctx context.Context, caller fabric.ExecutionContext, ori
 		return "", invalid("Invalid pipeline state")
 	}
 	snapshot := continuation.Snapshot{Format: 1, DeferralID: state.DeferralID, OriginalEnvelope: append([]byte(nil), original...), OriginalPrincipal: caller.PrincipalView(), AllowedResumePrincipals: allowed, PlanRevision: fabric.Revision(r.planRevision), PlanVersion: "pagnet.extension-plan.v1", PlanDigest: hash(r.pipeline), Pipeline: append([]byte(nil), r.pipeline...), State: raw}
+	privateRaw, e := json.Marshal(snapshot)
+	var ownedSnapshot continuation.Snapshot
+	if e != nil || fabric.DecodeJSONWithLimits(privateRaw, &ownedSnapshot, r.config.SnapshotLimits) != nil {
+		return "", invalid("Invalid private deferred snapshot")
+	}
+	proof, e := r.config.SaveDeferredAdmission(ctx, caller, ownedSnapshot)
+	if e != nil {
+		return "", e
+	}
+	if len(proof) == 0 || len(proof) > 64<<10 {
+		return "", invalid("Missing bounded deferred admission proof")
+	}
+	snapshot.DeferredAdmission = append([]byte(nil), proof...)
 	issued, e := r.config.Store.Create(ctx, caller, snapshot, deferral.ExpiresAt)
 	if e != nil {
 		return "", e

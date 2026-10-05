@@ -163,6 +163,14 @@ func (b *LocalBoundary) WithCurrent(ctx context.Context, caller fabric.Execution
 	if b == nil || descriptor.Ref.IsOffer() || descriptor.Ref.Domain() != b.root.Namespace || descriptor.Revision == "" {
 		return localDenied()
 	}
+	if resume, ok := b.resumeBinding(caller); ok {
+		actual, original, final, qualified := node.FinalizedRequestFromContext(ctx)
+		var env fabric.Envelope
+		if !qualified || actual.PrincipalView() != resume.original || !bytes.Equal(original, resume.originalBytes) || fabric.DecodeJSON(final, &env) != nil || env.Operation != fabric.OperationInvoke || env.Target == nil || env.Target.Endpoint() != descriptor.Ref || !resume.dispatched.Load() {
+			return localDenied()
+		}
+		return b.callerCurrent(ctx, resume.resumer, next)
+	}
 	// Protected operator setup/recovery is a separate concrete capability. Never
 	// replace an incoming caller with the configured owner to make it pass.
 	if caller.AuthenticationEvidence() != nil {
@@ -229,7 +237,14 @@ func (b *LocalBoundary) WithAdmission(ctx context.Context, f identity.AdmissionF
 		if !ok || caller.PrincipalView() != f.OriginalCaller || !bytes.Equal(original, f.OriginalBytes) || !bytes.Equal(final, f.FinalizedBytes) || caller.VerifyAuthenticatedDigest(f.OriginalDigest, b.root.Namespace) != nil || f.Source != nil {
 			return localDenied()
 		}
-		return b.callerFacts(ctx, f.Caller, func(current context.Context, facts fabricauth.CurrentCallerFacts) error {
+		return b.dispatchCallerFacts(ctx, f.Caller, func(current context.Context, facts fabricauth.CurrentCallerFacts) error {
+			if resume, ok := b.resumeBinding(f.Caller); ok {
+				w := resume.witness(facts)
+				w.Version = "pagnet.local-boundary.resume.v1"
+				w.FinalizedDigest = f.FinalizedDigest
+				w.Value = json.RawMessage(`{"boundary":"local-continuation"}`)
+				return next(w)
+			}
 			b.mu.RLock()
 			association := b.sessions
 			b.mu.RUnlock()
@@ -282,7 +297,7 @@ func (b *LocalBoundary) WithDispatch(ctx context.Context, caller fabric.Executio
 	if !published {
 		return nil, localDenied()
 	}
-	err = b.callerFacts(ctx, caller, func(current context.Context, facts fabricauth.CurrentCallerFacts) error {
+	err = b.dispatchCallerFacts(ctx, caller, func(current context.Context, facts fabricauth.CurrentCallerFacts) error {
 		// Refresh actual current descriptors before handing off. The adapter's SAME
 		// transaction is the effect authority; no provider call runs under this read.
 		currentEndpoint, e := b.store.GetEndpoint(current, endpoint.Ref, endpoint.Revision)
@@ -305,6 +320,10 @@ func (b *LocalBoundary) WithDispatch(ctx context.Context, caller fabric.Executio
 		association := b.sessions
 		b.mu.RUnlock()
 		stamp := dispatchStamp{association: association, authenticatedCaller: caller, boundary: b, caller: caller.PrincipalView(), originalSHA: sha256.Sum256(original), finalizedSHA: sha256.Sum256(final), inputSHA: sha256.Sum256(env.Payload), invocationID: env.ID, target: *env.Target, revision: env.ExpectedRevision, scope: registry.DescriptorBatchScope{Endpoint: endpoint.Ref, ExpectedEndpointRevision: endpoint.Revision, BindingID: selection.BindingID}, fingerprint: selection.Fingerprint}
+		if resume, ok := b.resumeBinding(caller); ok {
+			stamp.resume = resume
+			stamp.authenticatedCaller = resume.resumer
+		}
 		for _, binding := range endpoint.Bindings {
 			if binding.ID == selection.BindingID && binding.Protocol == "a2a.jsonrpc" {
 				var input a2a.Input
@@ -340,6 +359,9 @@ func (b *LocalBoundary) WithHistoricalNativeOrigin(ctx context.Context, f identi
 	})
 }
 func (b *LocalBoundary) currentSourceCaller(ctx context.Context, caller fabric.ExecutionContext, next func(context.Context) error) error {
+	if resume, ok := b.resumeBinding(caller); ok {
+		return b.callerCurrent(ctx, resume.resumer, next)
+	}
 	b.mu.RLock()
 	sessions := b.sessions
 	b.mu.RUnlock()
@@ -349,12 +371,18 @@ func (b *LocalBoundary) currentSourceCaller(ctx context.Context, caller fabric.E
 	return b.operatorCurrent(ctx, caller, next)
 }
 func (b *LocalBoundary) WithNativeSourceRead(ctx context.Context, f identity.NativeSourceReadFacts, next func() error) error {
+	if resume, ok := b.resumeBinding(f.CurrentCaller); ok && sha256.Sum256(resume.originalBytes) != f.Admission.OriginalDigest {
+		return localDenied()
+	}
 	if b == nil || next == nil || f.Owner != b.root.Owner || f.CurrentCaller.PrincipalView() != f.Caller || (f.Caller != f.Admission.OriginalCaller && f.Caller != b.root.Owner) || (f.Operation != identity.NativeSourcePage && f.Operation != identity.NativeSourceAck) {
 		return localDenied()
 	}
 	return b.currentSourceCaller(ctx, f.CurrentCaller, func(context.Context) error { return next() })
 }
 func (b *LocalBoundary) WithNativeCancellation(ctx context.Context, f identity.NativeCancellationFacts, next func() error) error {
+	if resume, ok := b.resumeBinding(f.CurrentCaller); ok && sha256.Sum256(resume.originalBytes) != f.Admission.OriginalDigest {
+		return localDenied()
+	}
 	if b == nil || next == nil || f.Owner != b.root.Owner || f.CurrentCaller.PrincipalView() != f.Caller || (f.Caller != f.Admission.OriginalCaller && f.Caller != b.root.Owner) {
 		return localDenied()
 	}
@@ -394,6 +422,14 @@ type currentFactsKey struct{}
 func (b *LocalBoundary) CurrentNativeCallerWitness(ctx context.Context, caller fabric.ExecutionContext) (identity.Witness, error) {
 	if b == nil {
 		return identity.Witness{}, localDenied()
+	}
+	if resume, ok := b.resumeBinding(caller); ok {
+		var witness identity.Witness
+		err := b.callerFacts(ctx, resume.resumer, func(_ context.Context, facts fabricauth.CurrentCallerFacts) error {
+			witness = resume.witness(facts)
+			return nil
+		})
+		return witness, err
 	}
 	b.mu.RLock()
 	association := b.sessions

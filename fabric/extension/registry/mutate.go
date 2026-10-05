@@ -3,6 +3,7 @@ package registry
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -78,7 +79,7 @@ func (s *Store) mutate(ctx context.Context, owner fabric.ExecutionContext, gener
 	if e != nil {
 		return Reference{}, e
 	}
-	plan, e := s.compile(entries, refs, s.generation+1)
+	plan, evidence, e := s.compile(entries, refs, s.generation+1)
 	if e != nil {
 		return Reference{}, e
 	}
@@ -89,6 +90,7 @@ func (s *Store) mutate(ctx context.Context, owner fabric.ExecutionContext, gener
 	}
 	// Fence new runtime snapshots through commit/readback. Already-held immutable
 	// snapshots may finish; no partial candidate or uncertain new plan is exposed.
+	var purpose domain.AuthorityRecord
 	s.quarantined = true
 	s.snapshot.Store(nil)
 	e = s.transaction(ctx, owner, scope(s.config), func(tx *domain.AuthorityTx) error {
@@ -119,6 +121,10 @@ func (s *Store) mutate(ctx context.Context, owner fabric.ExecutionContext, gener
 			return failure()
 		}
 		_, e = tx.CAS(key(directoryID), generation, directoryValue, false)
+		if e != nil {
+			return e
+		}
+		purpose, e = tx.ExtensionPurposeGeneration()
 		return e
 	})
 	if e != nil {
@@ -146,7 +152,7 @@ func (s *Store) mutate(ctx context.Context, owner fabric.ExecutionContext, gener
 	s.generation = generation + 1
 	s.plan = plan
 	s.quarantined = false
-	s.snapshot.Store(&Snapshot{s.generation, s.plan})
+	s.snapshot.Store(&Snapshot{Generation: s.generation, Plan: s.plan, evidence: evidence, purpose: purpose, directoryDigest: sha256.Sum256(directoryValue)})
 	if remove {
 		return Reference{id, physical, revision + 1, ""}, nil
 	}

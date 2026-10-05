@@ -30,13 +30,26 @@ func (r *Recorder) Resume(ctx context.Context, resumer fabric.ExecutionContext, 
 		return result, nil
 	}
 	settlement := &settler{recorder: r, resumer: resumer, claim: claim.Receipt, lifetime: ctx}
-	snapshot := claim.Snapshot
+	snapshot, e := claim.Claim.Consume(ctx, r.config.Store, resumer, claim.Receipt)
+	if e != nil {
+		return result, settlement.fail(e, Evidence{Kind: NoTarget})
+	}
+	current, e := configuredPlan(ctx, r.config.ConfiguredPlan, r.config.SnapshotLimits)
+	if e != nil || current.Plan.Revision() != r.planRevision || string(current.Evidence) != string(r.pipeline) {
+		return result, settlement.fail(stale(), Evidence{Kind: NoTarget})
+	}
 	var stored persistedState
 	limits := r.config.SnapshotLimits
 	if snapshot.PlanVersion != "pagnet.extension-plan.v1" || string(snapshot.PlanRevision) != r.planRevision || snapshot.PlanDigest != hash(r.pipeline) || string(snapshot.Pipeline) != string(r.pipeline) || fabric.DecodeJSONWithLimits(snapshot.State, &stored, limits) != nil || stored.Format != "pagnet.node-continuation.v1" || stored.State.DeferralID != claim.Receipt.ID || stored.State.PlanRevision != r.planRevision {
 		return result, settlement.fail(stale(), Evidence{Kind: NoTarget})
 	}
 	admission := HistoricalAdmission{SnapshotDigest: claim.Receipt.SnapshotDigest, Principal: snapshot.OriginalPrincipal, Audience: r.config.Audience, OriginalBytes: append([]byte(nil), snapshot.OriginalEnvelope...), Provenance: stored.Provenance, Claim: claim.Receipt}
+	admission.SnapshotCommitment, e = SnapshotCommitment(snapshot)
+	if e != nil {
+		return result, settlement.fail(e, Evidence{Kind: NoTarget})
+	}
+	admission.DeferredProof = append([]byte(nil), snapshot.DeferredAdmission...)
+	admission.PlanRevision = snapshot.PlanRevision
 	caller, e := r.config.RestoreOriginal(ctx, admission)
 	if e != nil {
 		return result, settlement.fail(fabric.NewError(fabric.CodeUnauthenticated, "Historical original admission restoration failed"), Evidence{Kind: NoTarget})
@@ -75,7 +88,17 @@ func (r *Recorder) Resume(ctx context.Context, resumer fabric.ExecutionContext, 
 		}
 		return target, e
 	}
-	outcome, e := engine.ResumeStage(ctx, permit, caller, snapshot.OriginalEnvelope, stored.State, wrapped)
+	var outcome extension.Outcome
+	resumeClaim := &ResumeClaim{snapshot: snapshot, receipt: claim.Receipt}
+	settlement.release = resumeClaim.Release
+	e = runResumeAuthority(r.config.ResumeAuthority, ctx, resumer, caller, resumeClaim, func(authorized context.Context, original fabric.ExecutionContext) error {
+		if original.PrincipalView() != caller.PrincipalView() || original.VerifyAuthenticatedData(snapshot.OriginalEnvelope, r.config.Audience) != nil {
+			return stale()
+		}
+		var engineErr error
+		outcome, engineErr = engine.ResumeStage(authorized, permit, original, snapshot.OriginalEnvelope, stored.State, wrapped)
+		return engineErr
+	})
 	result.Outcome = outcome
 	if outcome.Stream != nil && e == nil {
 		result.Outcome.Stream = &resultStream{InvocationStream: outcome.Stream, settlement: settlement}
@@ -102,6 +125,7 @@ type settler struct {
 	lifetime     context.Context
 	invocationID string
 	settled      bool
+	release      func()
 }
 
 func (s *settler) done() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.settled }
@@ -110,6 +134,9 @@ func (s *settler) record(evidence Evidence) error {
 	defer s.mu.Unlock()
 	if s.settled {
 		return nil
+	}
+	if s.release != nil {
+		defer s.release()
 	}
 	// Persistence is independently bounded even when the consumer's context has
 	// cancelled. Failure leaves the claim uncertain; it never grants another resume.

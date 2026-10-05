@@ -102,7 +102,26 @@ func fixture(t *testing.T) *rig {
 	}
 	r.manifests = []extension.ExtensionManifest{{ManifestVersion: "1.0", ID: "local.approval", Version: "1", MinProtocol: "1.0", MaxProtocol: "1.9", Interceptors: []extension.Registration{{ID: "local.approval.check", Match: extension.Match{Operation: fabric.OperationInvoke, Stage: "invoke.dispatch"}, Placement: extension.PlacementSource, NeedsPlaintext: true, Phases: []extension.Phase{extension.PhaseRequest, extension.PhaseResponse, extension.PhaseCompletion}, TimeoutMillis: 1000, Binding: "private.approval"}}}}
 	r.targetProof = []byte(`{"targetReceipt":"genuine-committed-private-adapter"}`)
-	r.config = Config{Store: r.store, Audience: r.domain.Namespace(), Manifests: r.manifests, MaxInterceptors: 100, SettlementTimeout: time.Second,
+	r.config = Config{Store: r.store, Audience: r.domain.Namespace(), ConfiguredPlan: func(context.Context) (ConfiguredPlan, error) {
+		plan, e := extension.Compile(r.manifests, 100)
+		raw, _ := json.Marshal(r.manifests)
+		return ConfiguredPlan{Plan: plan, Evidence: raw}, e
+	}, SettlementTimeout: time.Second,
+		SaveDeferredAdmission: func(_ context.Context, c fabric.ExecutionContext, snapshot continuation.Snapshot) ([]byte, error) {
+			if c.PrincipalView() != r.owner || !bytes.Equal(snapshot.OriginalEnvelope, r.original) {
+				return nil, errors.New("fixture original mismatch")
+			}
+			return []byte(`{"fixtureAdmission":"explicit trusted test root"}`), nil
+		},
+		ResumeAuthority: func(ctx context.Context, resumer, original fabric.ExecutionContext, claim *ResumeClaim, next func(context.Context, fabric.ExecutionContext) error) error {
+			if resumer.PrincipalView() != r.human {
+				return errors.New("wrong fixture resumer")
+			}
+			if _, _, e := claim.Consume(resumer); e != nil {
+				return e
+			}
+			return next(ctx, original)
+		},
 		ResolvePrincipal: func(_ context.Context, ref string) (fabric.Principal, error) {
 			if ref != r.human.Ref {
 				return fabric.Principal{}, errors.New("not bound")
@@ -542,7 +561,6 @@ func TestApprovedResumeCacheRespondHasNoEndpointEffects(t *testing.T) {
 	cache.ID = "local.approval.cached"
 	cache.After = []string{"local.approval.check"}
 	r.manifests[0].Interceptors = append(r.manifests[0].Interceptors, cache)
-	r.config.Manifests = r.manifests
 	var e error
 	r.recorder, e = New(r.config)
 	if e != nil {

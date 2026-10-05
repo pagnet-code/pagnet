@@ -26,6 +26,12 @@ func (a *Authority) currentCallerWitness(ctx context.Context, caller fabric.Exec
 	return cloneWitness(w), nil
 }
 func (a *Authority) verifyCurrentCallerTx(tx *registry.AuthorityTx, w Witness, principal fabric.Principal) error {
+	if w.DeferredCaller != nil {
+		return a.verifyDeferredCallerTx(tx, w, principal)
+	}
+	if w.RemoteCaller != nil {
+		return a.verifyRemoteCallerTx(tx, w, principal)
+	}
 	switch w.CurrentCallerKind {
 	case "":
 		if w.CurrentCallerAuthority != nil || w.CurrentCallerOpen != nil {

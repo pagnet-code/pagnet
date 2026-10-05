@@ -69,6 +69,21 @@ func NewAuthenticatedContextWithEvidence(principal Principal, audience string, e
 // copied into envelopes, search, events, telemetry or extension wire payloads.
 func (c ExecutionContext) AuthenticationEvidence() any { return c.authenticationEvidence }
 
+// NewAuthenticatedForwardContextWithEvidence is trusted composition only. It
+// retains verified historical identity/lineage while attaching a private,
+// purpose-specific capability. It does not create a current ingress session.
+func NewAuthenticatedForwardContextWithEvidence(principal Principal, audience string, exactOriginal []byte, provenance Provenance, evidence any) (ExecutionContext, error) {
+	if evidence == nil {
+		return ExecutionContext{}, NewError(CodeUnauthenticated, "Missing private forward evidence")
+	}
+	c, err := NewAuthenticatedForwardContext(principal, audience, exactOriginal, provenance)
+	if err != nil {
+		return c, err
+	}
+	c.authenticationEvidence = evidence
+	return c, nil
+}
+
 // VerifyAuthenticatedDigest checks an authenticator's private original binding
 // without exposing its payload fingerprint as protocol data.
 func (c ExecutionContext) VerifyAuthenticatedDigest(expected [32]byte, audience string) error {

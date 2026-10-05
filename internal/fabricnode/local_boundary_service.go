@@ -10,6 +10,7 @@ import (
 
 type dispatchStampKey struct{}
 type dispatchStamp struct {
+	resume                              *localResumeBinding
 	associationInvocation               string
 	association                         *fabricauth.Authority
 	authenticatedCaller                 fabric.ExecutionContext

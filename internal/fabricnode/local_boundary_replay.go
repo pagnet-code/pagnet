@@ -120,6 +120,24 @@ func (b *LocalBoundary) authorizeStampTx(tx *registry.AuthorityTx, s *dispatchSt
 	if s.association == nil || !s.association.AssociationOpen(s.authenticatedCaller) {
 		return localDenied()
 	}
+	if s.resume != nil {
+		if s.resume.original != s.caller || s.resume.resumer.PrincipalView() != s.authenticatedCaller.PrincipalView() {
+			return localDenied()
+		}
+		if err := s.resume.verifyTx(tx); err != nil {
+			return err
+		}
+		if s.managed != nil {
+			if s.managed.Principal != s.resume.resumer.PrincipalView() {
+				return localDenied()
+			}
+			return tx.VerifyCurrentNativeCaller(*s.managed)
+		}
+		if s.resume.resumer.PrincipalView() != b.root.Owner {
+			return localDenied()
+		}
+		return nil
+	}
 	if s.managed != nil {
 		if s.managed.Principal != s.caller {
 			return localDenied()

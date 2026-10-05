@@ -29,14 +29,15 @@ type Config struct {
 type Ports struct {
 	// Authentication and admission come from actual private peer/identity and
 	// adapter composition, never from caller assertions or descriptor prose.
-	Authenticator      fabric.Authenticator
-	Bindings           dispatch.BindingResolver
-	Admission          dispatch.Admission
-	Interceptors       node.OperationInterceptors
-	ValidateReadResult node.ReadResultValidator
-	Events             events.EventBus
-	Tracing            telemetry.Provider
-	ReplayVerifier     fabric.ReplayVerifier
+	Authenticator          fabric.Authenticator
+	Bindings               dispatch.BindingResolver
+	Admission              dispatch.Admission
+	Interceptors           node.OperationInterceptors
+	ValidateReadResult     node.ReadResultValidator
+	Events                 events.EventBus
+	Tracing                telemetry.Provider
+	ReplayVerifier         fabric.ReplayVerifier
+	ResumeDispatchVerifier node.ResumeDispatchVerifier
 	// Search is optional explicit hybrid backend composition; nil uses
 	// the embedded lexical backend. Close owns any provider/session resources.
 	Search node.SearchReader
@@ -137,7 +138,7 @@ func ComposeRetained(ctx context.Context, store *registry.Store, compose func(co
 		n.reader = index
 	}
 	n.reader = telemetry.ObserveSearch(n.reader, ports.Tracing)
-	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing, ReplayVerifier: ports.ReplayVerifier}
+	cfg := node.Config{Audience: store.AuthorityIdentity().Namespace, Authenticator: ports.Authenticator, Search: n, Descriptors: store, Dispatcher: d, Interceptors: ports.Interceptors, ValidateReadResult: ports.ValidateReadResult, Events: ports.Events, Tracing: ports.Tracing, ReplayVerifier: ports.ReplayVerifier, ResumeDispatchVerifier: ports.ResumeDispatchVerifier}
 	if ports.Events != nil {
 		cfg.EventSource = "pagnet://" + store.AuthorityIdentity().Namespace + "/node/local"
 	}

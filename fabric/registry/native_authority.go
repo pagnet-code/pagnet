@@ -20,12 +20,15 @@ import (
 type NativeAuthorityKind string
 
 const (
-	AuthorityController NativeAuthorityKind = "controller"
+	AuthorityController        NativeAuthorityKind = "controller"
+	AuthorityDeferredAdmission NativeAuthorityKind = "deferred_admission"
+	AuthorityPurposeGeneration NativeAuthorityKind = "purpose_generation"
 	// Extension configuration is a separate global signed private purpose, not
 	// a native worker binding or publicly callable offer.
 	AuthorityExtensionConfiguration NativeAuthorityKind = "extension_configuration"
 	AuthorityNativeCheckpoint       NativeAuthorityKind = "native_checkpoint"
 	AuthorityFederationPeer         NativeAuthorityKind = "federation_peer"
+	AuthorityFederationExposure     NativeAuthorityKind = "federation_exposure"
 	AuthorityFederationInvocation   NativeAuthorityKind = "federation_invocation"
 	AuthorityServiceBinding         NativeAuthorityKind = "service_binding"
 	AuthorityServiceInvocation      NativeAuthorityKind = "service_invocation"
@@ -42,14 +45,14 @@ const (
 
 func validAuthorityKind(k NativeAuthorityKind) bool {
 	switch k {
-	case AuthorityLocalInstallation, AuthorityServiceBinding, AuthorityServiceInvocation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
+	case AuthorityFederationExposure, AuthorityPurposeGeneration, AuthorityDeferredAdmission, AuthorityLocalInstallation, AuthorityServiceBinding, AuthorityServiceInvocation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
 		return true
 	}
 	return false
 }
 
 func globalAuthorityKind(k NativeAuthorityKind) bool {
-	return k == AuthorityLocalInstallation || k == AuthorityServiceInvocation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
+	return k == AuthorityFederationExposure || k == AuthorityPurposeGeneration || k == AuthorityDeferredAdmission || k == AuthorityLocalInstallation || k == AuthorityServiceInvocation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
 }
 
 // AuthorityIdentity is public verification material, never a signing capability.
@@ -178,9 +181,13 @@ type AuthorityTx struct {
 	active        bool
 	operations    int
 	maxOperations int
+	failure       error
 }
 
 func (a *AuthorityTx) guard() error {
+	if a.failure != nil {
+		return a.failure
+	}
 	if !a.active {
 		return invalid("Native authority transaction is closed")
 	}
@@ -239,6 +246,17 @@ func (a *AuthorityTx) CAS(k AuthorityKey, expected uint64, value []byte, retire 
 	if e := a.key(k); e != nil {
 		return AuthorityRecord{}, e
 	}
+	if k.Kind == AuthorityPurposeGeneration {
+		return AuthorityRecord{}, invalid("Intrinsic purpose generation cannot be published by callers")
+	}
+	if k.Kind != AuthorityExtensionConfiguration {
+		return a.cas(k, expected, value, retire)
+	}
+	return a.casExtensionConfiguration(k, expected, value, retire)
+}
+
+// cas is private and called only while the transaction mutex is held.
+func (a *AuthorityTx) cas(k AuthorityKey, expected uint64, value []byte, retire bool) (AuthorityRecord, error) {
 	if a.scope.HistoryOnly && k.Kind != AuthoritySource && k.Kind != AuthorityRetirement {
 		return AuthorityRecord{}, invalid("History-only scope cannot publish new native authority")
 	}
@@ -446,7 +464,13 @@ func (s *Store) WithNativeAuthority(ctx context.Context, owner fabric.ExecutionC
 	if err = callback(a); err != nil {
 		return err
 	}
-	a.close()
+	a.mu.Lock()
+	a.active = false
+	failed := a.failure
+	a.mu.Unlock()
+	if failed != nil {
+		return failed
+	}
 	if err = lifetime.Err(); err != nil {
 		return err
 	}

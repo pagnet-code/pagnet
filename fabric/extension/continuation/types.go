@@ -39,6 +39,7 @@ type Snapshot struct {
 	PlanDigest              string             `json:"planDigest"`
 	Pipeline                []byte             `json:"pipeline"`
 	State                   []byte             `json:"state"`
+	DeferredAdmission       []byte             `json:"deferredAdmission,omitempty"`
 }
 
 // Capability deliberately redacts formatting and refuses wire serialization.
@@ -81,9 +82,10 @@ type Outcome struct {
 	Data   []byte             `json:"data"`
 }
 type ClaimResult struct {
-	Receipt  Receipt  `json:"receipt"`
-	Snapshot Snapshot `json:"snapshot"`
-	State    State    `json:"state"`
-	Fresh    bool     `json:"fresh"`
-	Outcome  *Outcome `json:"outcome,omitempty"`
+	Claim    *FreshClaim `json:"-"`
+	Receipt  Receipt     `json:"receipt"`
+	Snapshot Snapshot    `json:"snapshot"`
+	State    State       `json:"state"`
+	Fresh    bool        `json:"fresh"`
+	Outcome  *Outcome    `json:"outcome,omitempty"`
 }
