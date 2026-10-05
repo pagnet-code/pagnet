@@ -23,7 +23,7 @@ func (s *targetStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 	f, e := s.InvocationStream.Next(ctx)
 	if e != nil {
 		if !errors.Is(e, io.EOF) {
-			if se := s.settlement.record(Evidence{Kind: TargetFailure, InvocationID: s.settlement.invocationID, Failure: e}); se != nil {
+			if se := s.settlement.recordRetained(Evidence{Kind: TargetFailure, InvocationID: s.settlement.invocationID, Failure: e}); se != nil {
 				return fabric.InvocationFrame{}, se
 			}
 		}
@@ -37,7 +37,7 @@ func (s *targetStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 		}
 		copy := f
 		copy.Data = append([]byte(nil), f.Data...)
-		if se := s.settlement.record(Evidence{Kind: kind, InvocationID: f.InvocationID, Frame: &copy, Failure: failure}); se != nil {
+		if se := s.settlement.recordRetained(Evidence{Kind: kind, InvocationID: f.InvocationID, Frame: &copy, Failure: failure}); se != nil {
 			return fabric.InvocationFrame{}, se
 		}
 	}
@@ -59,6 +59,9 @@ func (s *resultStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 	s.nextMu.Lock()
 	defer s.nextMu.Unlock()
 	f, e := s.InvocationStream.Next(ctx)
+	if e != nil || f.Kind == fabric.FrameComplete || f.Kind == fabric.FrameError {
+		defer s.settlement.releaseBinding()
+	}
 	if e != nil && !s.settlement.done() {
 		if se := s.settlement.record(Evidence{Kind: Abandoned, InvocationID: s.settlement.invocationID, Failure: e}); se != nil {
 			return fabric.InvocationFrame{}, se
@@ -68,6 +71,7 @@ func (s *resultStream) Next(ctx context.Context) (fabric.InvocationFrame, error)
 }
 func (s *resultStream) Close() error {
 	s.closeOnce.Do(func() {
+		defer s.settlement.releaseBinding()
 		e := s.InvocationStream.Close()
 		s.nextMu.Lock()
 		defer s.nextMu.Unlock()

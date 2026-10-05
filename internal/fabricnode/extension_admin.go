@@ -215,6 +215,7 @@ func (r *ExtensionRuntime) Resume(ctx context.Context, admin *fabricauth.OwnerAd
 			if e != nil {
 				return e
 			}
+			owned = context.WithValue(owned, extensionPhaseActorKey{}, &extensionPhaseActors{runtime: r})
 			result, e = bundle.recorder.Resume(owned, resumer, delivery.Capability().Token(), claimID, bundle.engine, func(call context.Context, original fabric.ExecutionContext, envelope fabric.Envelope) (extension.Outcome, error) {
 				binding, ok := r.boundary.resumeBinding(original)
 				if !ok {
@@ -227,7 +228,7 @@ func (r *ExtensionRuntime) Resume(ctx context.Context, admin *fabricauth.OwnerAd
 				release()
 				return e
 			}
-			stream := &extensionRuntimeStream{runtime: r, upstream: result.Outcome.Stream, release: release}
+			stream := &extensionRuntimeStream{runtime: r, upstream: result.Outcome.Stream, release: release, phase: owned}
 			r.mu.Lock()
 			r.streams[stream] = struct{}{}
 			r.pulseLocked()

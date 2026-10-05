@@ -28,7 +28,9 @@ type ExtensionRuntimeConfig struct {
 	VerifyEvidence   continuations.EvidenceValidator
 	// Optional explicit destination authority composition; local defaults use
 	// the genuine bound kernel/resumer path. Remote evidence is never local owner.
-	CurrentCaller func(context.Context, fabric.ExecutionContext, func(context.Context) error) error
+	CurrentCaller       func(context.Context, fabric.ExecutionContext, func(context.Context) error) error
+	VerifyOriginalPhase OriginalPhaseVerifier
+	CurrentPhaseWitness CurrentPhaseWitness
 }
 type extensionRuntimeBundle struct {
 	selected   *extensionPlanSelection
@@ -147,7 +149,14 @@ func (h extensionOwnedHandler) Intercept(ctx context.Context, request extension.
 	r.providers.Add(1)
 	r.mu.Unlock()
 	defer r.providers.Done()
-	return h.handler.Intercept(ctx, request)
+	if err := r.authorizePhase(ctx, request); err != nil {
+		return extension.Decision{}, err
+	}
+	decision, err := h.handler.Intercept(ctx, request)
+	if check := r.authorizePhase(ctx, request); check != nil {
+		return extension.Decision{}, check
+	}
+	return decision, err
 }
 
 func (r *ExtensionRuntime) reload(ctx context.Context) error {
@@ -389,12 +398,13 @@ func (r *ExtensionRuntime) ExecuteStage(ctx context.Context, caller fabric.Execu
 	if e != nil {
 		return extension.Outcome{}, e
 	}
+	owned = r.phaseActor(owned, caller, original)
 	out, e := bundle.engine.ExecuteStage(owned, caller, original, audience, stage, placement, downstream)
 	if e != nil || out.Stream == nil {
 		release()
 		return out, e
 	}
-	stream := &extensionRuntimeStream{runtime: r, upstream: out.Stream, release: release}
+	stream := &extensionRuntimeStream{runtime: r, upstream: out.Stream, release: release, phase: owned}
 	r.mu.Lock()
 	r.streams[stream] = struct{}{}
 	r.pulseLocked()
@@ -414,6 +424,7 @@ func (r *ExtensionRuntime) ExecuteReadProjection(ctx context.Context, caller fab
 		return extension.Outcome{}, e
 	}
 	defer release()
+	owned = r.phaseActor(owned, caller, original)
 	out, e := bundle.engine.ExecuteReadProjection(owned, caller, original, audience, stage, placement, payload, downstream)
 	if out.Stream != nil {
 		out.Stream.Close()
@@ -425,6 +436,7 @@ func (r *ExtensionRuntime) ExecuteReadProjection(ctx context.Context, caller fab
 type extensionRuntimeStream struct {
 	runtime  *ExtensionRuntime
 	upstream fabric.InvocationStream
+	phase    context.Context
 	release  func()
 	once     sync.Once
 	closeMu  sync.Mutex
@@ -432,7 +444,10 @@ type extensionRuntimeStream struct {
 }
 
 func (s *extensionRuntimeStream) Next(ctx context.Context) (fabric.InvocationFrame, error) {
-	f, e := s.upstream.Next(ctx)
+	if ctx == nil {
+		return fabric.InvocationFrame{}, localDenied()
+	}
+	f, e := s.upstream.Next(extensionPhaseContext{Context: ctx, captured: s.phase})
 	if errors.Is(e, io.EOF) || e == nil && (f.Kind == fabric.FrameComplete || f.Kind == fabric.FrameError) {
 		s.finish()
 	}
@@ -465,7 +480,13 @@ func (s *extensionRuntimeStream) OriginalSourceOwnership(ctx context.Context) (f
 	return fabric.OriginalStreamOwnership(ctx, s.upstream)
 }
 func (s *extensionRuntimeStream) WithOriginalCapture(ctx context.Context, next func(context.Context) error) error {
-	return fabric.WithOriginalSourceCapture(ctx, s.upstream, next)
+	ownership, err := fabric.OriginalStreamOwnership(ctx, s.upstream)
+	if err != nil {
+		return err
+	}
+	return fabric.WithOriginalSourceCapture(ctx, s.upstream, func(capture context.Context) error {
+		return next(context.WithValue(capture, extensionPhaseSourceKey{}, &extensionPhaseSource{s.runtime, ownership}))
+	})
 }
 
 type extensionCloseAttempt struct {

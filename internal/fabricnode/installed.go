@@ -173,7 +173,11 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			ports.ReplayVerifier = result.Services.Invocations
 			resources.services = result.Services
 		}
-		result.Extensions, err = NewExtensionRuntime(ctx, installation, result.Runtime.Boundary, ExtensionRuntimeConfig{Lifetime: ctx, Credentials: c.ExtensionCredentials, Bindings: ports.Bindings})
+		var originalServices *fabricservices.Invocations
+		if result.Services != nil {
+			originalServices = result.Services.Invocations
+		}
+		result.Extensions, err = NewExtensionRuntime(ctx, installation, result.Runtime.Boundary, ExtensionRuntimeConfig{Lifetime: ctx, Credentials: c.ExtensionCredentials, Bindings: ports.Bindings, VerifyOriginalPhase: NewOriginalExtensionPhaseVerifier(result.Runtime.Adapter, originalServices)})
 		if err != nil {
 			return Ports{}, fmt.Errorf("opening configured extension execution: %w", err)
 		}

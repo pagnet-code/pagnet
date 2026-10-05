@@ -171,6 +171,9 @@ func (a *LocalContinuationAuthority) WithResume(ctx context.Context, resumer, or
 			return err
 		}
 		// Preserve the actual invocation lifetime, not the preflight timeout.
+		if actors, ok := ctx.Value(extensionPhaseActorKey{}).(*extensionPhaseActors); ok && actors != nil && actors.runtime != nil && actors.runtime.authority == a {
+			actors.current.Store(&extensionPhaseActor{bound, append([]byte(nil), p.originalBytes...)})
+		}
 		return next(ctx, bound)
 	})
 }

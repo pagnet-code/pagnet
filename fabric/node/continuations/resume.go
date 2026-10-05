@@ -126,17 +126,36 @@ type settler struct {
 	invocationID string
 	settled      bool
 	release      func()
+	releaseOnce  sync.Once
 }
 
 func (s *settler) done() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.settled }
+func (s *settler) releaseBinding() {
+	s.releaseOnce.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
+}
+
 func (s *settler) record(evidence Evidence) error {
+	return s.recordWithRelease(evidence, true)
+}
+
+// A genuine target terminal is persisted before outer hooks. Its claim/session
+// remains owned until those hooks finish, even when persistence fails.
+func (s *settler) recordRetained(evidence Evidence) error {
+	return s.recordWithRelease(evidence, false)
+}
+
+func (s *settler) recordWithRelease(evidence Evidence, release bool) error {
+	if release {
+		defer s.releaseBinding()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.settled {
 		return nil
-	}
-	if s.release != nil {
-		defer s.release()
 	}
 	// Persistence is independently bounded even when the consumer's context has
 	// cancelled. Failure leaves the claim uncertain; it never grants another resume.
