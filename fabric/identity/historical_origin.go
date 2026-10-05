@@ -90,6 +90,9 @@ func (a *Authority) RegisterHistoricalOrigin(ctx context.Context, owner fabric.E
 			return e
 		}
 		return a.transact(lifetime, owner, current.Scope, false, func(tx *registry.AuthorityTx) error {
+			if err := verifyCurrentPlanTx(tx, w); err != nil {
+				return err
+			}
 			if e := a.currentController(tx, current); e != nil {
 				return e
 			}

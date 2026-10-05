@@ -235,11 +235,13 @@ func TestTransactionalRollbackExpiryAndBounds(t *testing.T) {
 	}
 	s.db.QueryRow("SELECT records,bytes FROM budget").Scan(&rows, &used)
 	b, _ := json.Marshal(v)
-	if used != int64(len(b)+28) {
+	var notificationBytes int64
+	s.db.QueryRow("SELECT COALESCE(sum(length(payload)),0) FROM private_notifications").Scan(&notificationBytes)
+	if used != int64(len(b)+28)+notificationBytes {
 		t.Fatal("failed claim reserved quota")
 	}
 	s.db.Exec("DROP TRIGGER reject_claim")
-	s.db.Exec("UPDATE continuations SET expires=?", time.Now().UTC().Add(-time.Second).Format(time.RFC3339Nano))
+	setFixtureExpiry(t, s, x.ID, x.Capability, time.Now().UTC().Add(-time.Second))
 	if _, e := s.Claim(ctx, h, x.Capability.Token(), ident("claim")); e == nil {
 		t.Fatal("expired claim accepted")
 	}
@@ -367,9 +369,7 @@ func TestReceiptTamperingAndCompleteAfterExpiry(t *testing.T) {
 	if wait := time.Until(short); wait > 0 {
 		time.Sleep(wait)
 	}
-	if _, e = s.db.Exec("UPDATE continuations SET expires=?", short.Format(time.RFC3339Nano)); e != nil {
-		t.Fatal(e)
-	}
+	setFixtureExpiry(t, s, x.ID, x.Capability, short)
 	if _, e = s.Complete(ctx, h, r.Receipt, out); e != nil {
 		t.Fatal("truthful expired settlement denied", e)
 	}
@@ -497,4 +497,31 @@ func testProtector(t *testing.T) durable.DataProtector {
 		t.Fatal(e)
 	}
 	return p
+}
+
+// Test-controlled expiry remains consistent with authenticated private delivery.
+func setFixtureExpiry(t *testing.T, s *Store, id string, cap Capability, expiry time.Time) {
+	t.Helper()
+	tx, e := s.db.BeginTx(t.Context(), nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer tx.Rollback()
+	r, e := s.load(t.Context(), tx, id)
+	if e != nil {
+		t.Fatal(e)
+	}
+	v, e := s.snapshot(r.snapshot)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = tx.ExecContext(t.Context(), "UPDATE continuations SET expires=? WHERE id=?", expiry.UTC().Format(time.RFC3339Nano), id); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.writeNotifications(t.Context(), tx, v, cap, uint64(r.revision), expiry.UTC().Format(time.RFC3339Nano)); e != nil {
+		t.Fatal(e)
+	}
+	if e = tx.Commit(); e != nil {
+		t.Fatal(e)
+	}
 }

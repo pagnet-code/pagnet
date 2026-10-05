@@ -26,6 +26,9 @@ func (a *Authority) currentCallerWitness(ctx context.Context, caller fabric.Exec
 	return cloneWitness(w), nil
 }
 func (a *Authority) verifyCurrentCallerTx(tx *registry.AuthorityTx, w Witness, principal fabric.Principal) error {
+	if err := verifyCurrentPlanTx(tx, w); err != nil {
+		return err
+	}
 	if w.DeferredCaller != nil {
 		return a.verifyDeferredCallerTx(tx, w, principal)
 	}

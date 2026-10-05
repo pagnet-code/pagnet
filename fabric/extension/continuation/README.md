@@ -6,7 +6,7 @@ bytes remain immutable and separately committed; transformed data belongs in
 State. The stable engine DeferralID must already be durable before Create.
 
 Bootstrap and Open require an explicit external DataProtector owned by trusted
-composition. Format 2 encrypts snapshots, claim receipts and outcomes with exact
+composition. Format 3 encrypts snapshots, claim receipts and outcomes with exact
 purpose, audience, deferral identity and pinned key-reference AAD. Even an empty
 store verifies key custody through its protected identity pin. No key is created
 by this adapter and the old plaintext storage format fails closed. Canonical
@@ -48,3 +48,9 @@ these are operational capacities rather than fixed protocol limits. Startup read
 and verifies one bounded row at a time and reconciles durable quota counters.
 No automatic receipt deletion weakens replay evidence; archival or store replacement
 needs explicit engine/external fencing rather than silently purging old claim IDs.
+
+Encrypted private notification rows share the exact Create/Rotate FULL transaction.
+Each recipient and capability revision has separate AAD. A signed root publication
+is a later acknowledged phase; publication failure never destroys the committed
+private token. Retrieval checks the current authenticated allowed recipient,
+pending state, expiry and capability hash/revision. Tools/events expose no token.

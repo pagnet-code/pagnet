@@ -3,6 +3,7 @@ package fabricauth
 import (
 	"context"
 	"crypto/sha256"
+	"sync"
 	"sync/atomic"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -17,6 +18,9 @@ type OwnerAdministration struct {
 	active    atomic.Bool
 	principal fabric.Principal
 	digest    [32]byte
+	exact     []byte
+	controlMu sync.Mutex
+	resumer   atomic.Bool
 }
 
 func (*OwnerAdministration) MarshalJSON() ([]byte, error) { return nil, denied() }
@@ -68,9 +72,9 @@ func (s *Session) WithOwnerAdministration(ctx context.Context, exact []byte, nex
 	if fabric.DecodeJSONWithLimits(exact, &request, fabric.WireLimits{MaxBytes: 64 << 10, MaxDepth: 64, MaxMembers: 4096}) != nil {
 		return denied()
 	}
-	capability := &OwnerAdministration{session: s, principal: s.authority.config.RootOwner, digest: sha256.Sum256(exact), lifetime: ctx}
+	capability := &OwnerAdministration{session: s, principal: s.authority.config.RootOwner, digest: sha256.Sum256(exact), lifetime: ctx, exact: append([]byte(nil), exact...)}
 	capability.active.Store(true)
-	defer capability.active.Store(false)
+	defer func() { capability.controlMu.Lock(); capability.active.Store(false); capability.controlMu.Unlock() }()
 	if err := capability.VerifyCurrent(ctx); err != nil {
 		return err
 	}

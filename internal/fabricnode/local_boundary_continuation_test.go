@@ -236,11 +236,31 @@ func TestActualKernelConfiguredDeferRestartResumeSameDispatchNoSecondEffect(t *t
 	}
 	claimID := sha256.Sum256([]byte("stable actual approval claim"))
 	claim := fmt.Sprintf("%x", claimID)
-	result, err := recorder.Resume(ctx, resumer, notification.Capability.Token(), claim, engine, downstream)
-	if err != nil || result.Outcome.Stream == nil {
-		t.Fatal("actual resumed node dispatch", err)
-	}
+	var result continuations.ResumeResult
 	var complete bool
+	err = session.WithOwnerAdministration(ctx, []byte(`{"version":1,"operation":"continuation.resume"}`), func(current context.Context, admin *fabricauth.OwnerAdministration) error {
+		return admin.WithResumerContext(current, func(current context.Context, actualResumer fabric.ExecutionContext) error {
+			var e error
+			result, e = recorder.Resume(current, actualResumer, notification.Capability.Token(), claim, engine, downstream)
+			if e != nil {
+				return e
+			}
+			if result.Outcome.Stream == nil {
+				return errors.New("missing actual resumed stream")
+			}
+			f, e := result.Outcome.Stream.Next(current)
+			if e != nil {
+				return e
+			}
+			complete = f.Kind == fabric.FrameComplete
+			return nil
+		})
+	})
+	if err != nil || result.Outcome.Stream == nil {
+		t.Fatal("actual admin first-page resumed node dispatch", err)
+	}
+	// Remaining pages run after the synchronous admin response. The fresh claim
+	// owns the same real resumer session until actual stream settlement.
 	for {
 		f, x := result.Outcome.Stream.Next(ctx)
 		if errors.Is(x, io.EOF) {

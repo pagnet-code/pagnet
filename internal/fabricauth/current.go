@@ -3,6 +3,7 @@ package fabricauth
 import (
 	"context"
 	"crypto/sha256"
+	"sync/atomic"
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/registry"
@@ -15,6 +16,9 @@ type sessionBinding struct {
 	session        *Session
 	principal      fabric.Principal
 	originalDigest [32]byte
+	administration *OwnerAdministration
+	retained       atomic.Bool
+	released       atomic.Bool
 }
 
 func (*sessionBinding) MarshalJSON() ([]byte, error) { return nil, denied() }
@@ -28,7 +32,7 @@ func (a *Authority) WithCurrentCaller(ctx context.Context, caller fabric.Executi
 		return denied()
 	}
 	b, ok := caller.AuthenticationEvidence().(*sessionBinding)
-	if !ok || b == nil || len(original) == 0 || sha256.Sum256(original) != b.originalDigest {
+	if !ok || b == nil || b.administration != nil || len(original) == 0 || sha256.Sum256(original) != b.originalDigest {
 		return denied()
 	}
 	if _, err := caller.DecodeVerifiedEnvelope(original, a.config.Audience); err != nil {
@@ -46,7 +50,7 @@ func (a *Authority) WithCurrentContext(ctx context.Context, caller fabric.Execut
 		return denied()
 	}
 	b, ok := caller.AuthenticationEvidence().(*sessionBinding)
-	if !ok || b == nil || b.authority != a || b.session == nil || b.session.authority != a || b.principal != caller.PrincipalView() || caller.VerifyAuthenticatedDigest(b.originalDigest, a.config.Audience) != nil {
+	if !ok || b == nil || b.authority != a || b.session == nil || b.session.authority != a || !b.open() || b.principal != caller.PrincipalView() || caller.VerifyAuthenticatedDigest(b.originalDigest, a.config.Audience) != nil {
 		return denied()
 	}
 	checked, cancel := context.WithTimeout(ctx, a.config.CheckTimeout)
@@ -54,7 +58,7 @@ func (a *Authority) WithCurrentContext(ctx context.Context, caller fabric.Execut
 	b.session.mu.Lock()
 	principal, err := b.session.verify(checked)
 	b.session.mu.Unlock()
-	if err != nil || principal != b.principal {
+	if err != nil || principal != b.principal || !b.open() {
 		return denied()
 	}
 	if err = ctx.Err(); err != nil {
@@ -70,7 +74,7 @@ func (a *Authority) RecognizesCurrentCaller(caller fabric.ExecutionContext) bool
 		return false
 	}
 	b, ok := caller.AuthenticationEvidence().(*sessionBinding)
-	return ok && b != nil && b.authority == a && b.session != nil && b.session.authority == a && b.principal == caller.PrincipalView() && caller.VerifyAuthenticatedDigest(b.originalDigest, a.config.Audience) == nil
+	return ok && b != nil && b.authority == a && b.session != nil && b.session.authority == a && b.open() && b.principal == caller.PrincipalView() && caller.VerifyAuthenticatedDigest(b.originalDigest, a.config.Audience) == nil
 }
 
 // VerifyRetainedRoot lets trusted private composition seal this authority to

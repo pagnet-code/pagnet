@@ -65,8 +65,11 @@ func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.Executio
 	if e != nil || bindingDigest != source.BindingDigest {
 		return receipt, conflict("Native intent original worker binding changed")
 	}
-	err = a.withFence(lifetime, facts, func(Witness) error {
+	err = a.withFence(lifetime, facts, func(w Witness) error {
 		return a.transact(lifetime, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+			if err := verifyCurrentPlanTx(tx, w); err != nil {
+				return err
+			}
 			if e := a.currentController(tx, c); e != nil {
 				return e
 			}

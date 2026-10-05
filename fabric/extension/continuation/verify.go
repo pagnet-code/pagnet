@@ -15,7 +15,7 @@ func (s *Store) verify(ctx context.Context) error {
  WHERE length(snapshot)>? OR length(receipt)>16384+65536 OR length(outcome)>? OR length(cap_hash)!=32 OR cap_revision<1)`, s.options.MaxSnapshotBytes+maxSealOverhead, s.options.MaxOutcomeBytes+maxSealOverhead).Scan(&malformed); e != nil || malformed != 0 {
 		return internal()
 	}
-	var count, total int64
+	var count, total, notifications int64
 	rows, e := s.db.QueryContext(ctx, "SELECT id,snapshot,snapshot_digest,expires,cap_hash,cap_revision,state,receipt,outcome FROM continuations ORDER BY id")
 	if e != nil {
 		return internal()
@@ -43,6 +43,7 @@ func (s *Store) verify(ctx context.Context) error {
 		if e != nil || v.DeferralID != id {
 			return internal()
 		}
+		notifications += int64(len(v.AllowedResumePrincipals))
 		expiry, e := time.Parse(time.RFC3339Nano, r.expires)
 		if e != nil || expiry.IsZero() || expiry.UTC().Format(time.RFC3339Nano) != r.expires {
 			return internal()
@@ -83,6 +84,9 @@ func (s *Store) verify(ctx context.Context) error {
 	}
 	if e = rows.Close(); e != nil {
 		return internal()
+	}
+	if e = s.verifyNotifications(ctx, &total, notifications); e != nil {
+		return e
 	}
 	var records, bytes int64
 	if e = s.db.QueryRowContext(ctx, "SELECT records,bytes FROM budget WHERE singleton=1").Scan(&records, &bytes); e != nil || records != count || bytes != total {

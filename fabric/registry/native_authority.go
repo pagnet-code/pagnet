@@ -20,9 +20,10 @@ import (
 type NativeAuthorityKind string
 
 const (
-	AuthorityController        NativeAuthorityKind = "controller"
-	AuthorityDeferredAdmission NativeAuthorityKind = "deferred_admission"
-	AuthorityPurposeGeneration NativeAuthorityKind = "purpose_generation"
+	AuthorityController           NativeAuthorityKind = "controller"
+	AuthorityDeferredAdmission    NativeAuthorityKind = "deferred_admission"
+	AuthorityDeferredNotification NativeAuthorityKind = "deferred_notification"
+	AuthorityPurposeGeneration    NativeAuthorityKind = "purpose_generation"
 	// Extension configuration is a separate global signed private purpose, not
 	// a native worker binding or publicly callable offer.
 	AuthorityExtensionConfiguration NativeAuthorityKind = "extension_configuration"
@@ -45,14 +46,14 @@ const (
 
 func validAuthorityKind(k NativeAuthorityKind) bool {
 	switch k {
-	case AuthorityFederationExposure, AuthorityPurposeGeneration, AuthorityDeferredAdmission, AuthorityLocalInstallation, AuthorityServiceBinding, AuthorityServiceInvocation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
+	case AuthorityDeferredNotification, AuthorityFederationExposure, AuthorityPurposeGeneration, AuthorityDeferredAdmission, AuthorityLocalInstallation, AuthorityServiceBinding, AuthorityServiceInvocation, AuthorityFederationInvocation, AuthorityFederationPeer, AuthorityNativeCheckpoint, AuthorityExtensionConfiguration, AuthorityController, AuthorityDispatch, AuthorityBinding, AuthorityAdmission, AuthorityOrigin, AuthoritySource, AuthorityRetirement:
 		return true
 	}
 	return false
 }
 
 func globalAuthorityKind(k NativeAuthorityKind) bool {
-	return k == AuthorityFederationExposure || k == AuthorityPurposeGeneration || k == AuthorityDeferredAdmission || k == AuthorityLocalInstallation || k == AuthorityServiceInvocation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
+	return k == AuthorityDeferredNotification || k == AuthorityFederationExposure || k == AuthorityPurposeGeneration || k == AuthorityDeferredAdmission || k == AuthorityLocalInstallation || k == AuthorityServiceInvocation || k == AuthorityFederationInvocation || k == AuthorityFederationPeer || k == AuthorityController || k == AuthorityDispatch || k == AuthorityExtensionConfiguration || k == AuthorityNativeCheckpoint
 }
 
 // AuthorityIdentity is public verification material, never a signing capability.

@@ -64,14 +64,16 @@ type AdmissionFacts struct {
 	ReplayID        string
 }
 type Witness struct {
-	RemoteCaller           *RemoteCallerWitness            `json:"-"`
-	DeferredCaller         *DeferredCallerWitness          `json:"-"`
-	CurrentCallerOpen      func() bool                     `json:"-"`
-	CurrentCallerAuthority *registry.NativeCallerAuthority `json:"-"`
-	CurrentCallerKind      string                          `json:"-"`
-	Version                string                          `json:"version"`
-	FinalizedDigest        [32]byte                        `json:"finalizedDigest"`
-	Value                  json.RawMessage                 `json:"value"`
+	// CurrentPlanVerifier is trusted infrastructure evidence, never a serialized interceptor or permission.
+	CurrentPlanVerifier    func(*registry.AuthorityTx) error `json:"-"`
+	RemoteCaller           *RemoteCallerWitness              `json:"-"`
+	DeferredCaller         *DeferredCallerWitness            `json:"-"`
+	CurrentCallerOpen      func() bool                       `json:"-"`
+	CurrentCallerAuthority *registry.NativeCallerAuthority   `json:"-"`
+	CurrentCallerKind      string                            `json:"-"`
+	Version                string                            `json:"version"`
+	FinalizedDigest        [32]byte                          `json:"finalizedDigest"`
+	Value                  json.RawMessage                   `json:"value"`
 }
 
 // AdmissionFence is trusted infrastructure. It validates current authorization

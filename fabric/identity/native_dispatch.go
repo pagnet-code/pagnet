@@ -171,8 +171,11 @@ func (a *Authority) ReserveNativeDispatch(ctx context.Context, owner fabric.Exec
 	}
 	lifetime, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	e = a.withFence(lifetime, facts, func(Witness) error {
+	e = a.withFence(lifetime, facts, func(w Witness) error {
 		return a.transact(lifetime, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+			if err := verifyCurrentPlanTx(tx, w); err != nil {
+				return err
+			}
 			if e := a.currentController(tx, c); e != nil {
 				return e
 			}

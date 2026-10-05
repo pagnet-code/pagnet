@@ -107,6 +107,9 @@ func (s *Store) Create(ctx context.Context, c fabric.ExecutionContext, v Snapsho
 	if _, e = tx.ExecContext(ctx, "INSERT INTO continuations VALUES(?,?,?,?,?,1,'pending',NULL,NULL)", v.DeferralID, sealed, digest(b), expiry, hash); e != nil {
 		return Issued{}, internal()
 	}
+	if e = s.writeNotifications(ctx, tx, v, cap, 1, expiry); e != nil {
+		return Issued{}, e
+	}
 	if e = tx.Commit(); e != nil {
 		return Issued{}, internal()
 	}
@@ -152,6 +155,9 @@ func (s *Store) RotatePendingCapability(ctx context.Context, c fabric.ExecutionC
 	n, e := res.RowsAffected()
 	if e != nil || n != 1 {
 		return Issued{}, stale()
+	}
+	if e = s.writeNotifications(ctx, tx, v, cap, expected+1, r.expires); e != nil {
+		return Issued{}, e
 	}
 	if e = tx.Commit(); e != nil {
 		return Issued{}, internal()

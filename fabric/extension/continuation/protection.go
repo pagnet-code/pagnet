@@ -20,7 +20,7 @@ func (s *Store) protectionAAD(purpose, id string) []byte {
 	raw, _ := json.Marshal(struct {
 		Format, Purpose, Audience, ID string
 		Key                           durable.KeyReference
-	}{"pagnet.continuation.private.v2", purpose, s.scope.Audience, id, s.keyRef})
+	}{"pagnet.continuation.private.v3", purpose, s.scope.Audience, id, s.keyRef})
 	return raw
 }
 func (s *Store) sealBlob(purpose, id string, plain []byte, max int) ([]byte, error) {
@@ -44,19 +44,19 @@ func (s *Store) openBlob(purpose, id string, cipher []byte, max int) ([]byte, er
 	return plain, nil
 }
 func (s *Store) sealIdentity() ([]byte, error) {
-	proof, err := s.sealBlob("identity", "configuration", []byte("pagnet.continuation.identity.v2"), 64)
+	proof, err := s.sealBlob("identity", "configuration", []byte("pagnet.continuation.identity.v3"), 64)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(protectedIdentity{2, s.scope, s.keyRef, proof})
+	return json.Marshal(protectedIdentity{3, s.scope, s.keyRef, proof})
 }
 func (s *Store) verifyIdentity(raw []byte) error {
 	var pin protectedIdentity
-	if decode(raw, &pin, maxSealOverhead+1024) != nil || pin.Format != 2 || pin.Scope != s.scope || pin.Key != s.keyRef {
+	if decode(raw, &pin, maxSealOverhead+1024) != nil || pin.Format != 3 || pin.Scope != s.scope || pin.Key != s.keyRef {
 		return internal()
 	}
 	plain, err := s.openBlob("identity", "configuration", pin.Proof, 64)
-	if err != nil || !bytes.Equal(plain, []byte("pagnet.continuation.identity.v2")) {
+	if err != nil || !bytes.Equal(plain, []byte("pagnet.continuation.identity.v3")) {
 		return internal()
 	}
 	return nil

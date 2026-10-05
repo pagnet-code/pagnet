@@ -62,7 +62,7 @@ func (a *Authority) WithCurrentFacts(ctx context.Context, caller fabric.Executio
 		}
 	}
 	s.mu.Unlock()
-	if err != nil || principal != b.principal {
+	if err != nil || principal != b.principal || !b.open() {
 		return denied()
 	}
 	if err = ctx.Err(); err != nil {

@@ -39,7 +39,8 @@ const schema = `CREATE TABLE identity(singleton INTEGER PRIMARY KEY CHECK(single
 CREATE TABLE budget(singleton INTEGER PRIMARY KEY CHECK(singleton=1),records INTEGER NOT NULL,bytes INTEGER NOT NULL);
 INSERT INTO budget VALUES(1,0,0);
 CREATE TABLE continuations(id TEXT PRIMARY KEY,snapshot BLOB NOT NULL,snapshot_digest TEXT NOT NULL,expires TEXT NOT NULL,cap_hash BLOB NOT NULL,cap_revision INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','claimed','complete')),receipt BLOB,outcome BLOB);
-PRAGMA user_version=2;`
+CREATE TABLE private_notifications(id TEXT NOT NULL,recipient TEXT NOT NULL,revision INTEGER NOT NULL,payload BLOB NOT NULL,published INTEGER NOT NULL CHECK(published IN(0,1)),PRIMARY KEY(id,recipient));
+PRAGMA user_version=3;`
 
 func invalid(s string) error { return fabric.NewError(fabric.CodeInvalidInput, s) }
 func stale() error {
@@ -169,7 +170,7 @@ func open(ctx context.Context, dir string, scope Scope, o Options, protector dur
 	var v int
 	var check string
 	var saved []byte
-	if e = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); e != nil || v != 2 {
+	if e = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); e != nil || v != 3 {
 		return nil, internal()
 	}
 	if e = db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&check); e != nil || check != "ok" {

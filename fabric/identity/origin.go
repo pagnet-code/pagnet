@@ -83,6 +83,9 @@ func (a *Authority) RegisterOrigin(ctx context.Context, owner fabric.ExecutionCo
 	}
 	e = a.withFence(ctx, facts, func(w Witness) error {
 		return a.transact(ctx, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
+			if err := verifyCurrentPlanTx(tx, w); err != nil {
+				return err
+			}
 			if e := a.currentController(tx, c); e != nil {
 				return e
 			}

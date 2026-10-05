@@ -129,7 +129,18 @@ func (a *LocalContinuationAuthority) WithResume(ctx context.Context, resumer, or
 		return localDenied()
 	}
 	p := &localResumeBinding{authority: a, resumer: resumer, original: original.PrincipalView(), originalBytes: append([]byte(nil), snapshot.OriginalEnvelope...), snapshot: snapshot, proof: proof, commitment: commitment}
-	if err = claim.OnRelease(func() { p.released.Store(true) }); err != nil {
+	a.boundary.mu.RLock()
+	sessions := a.boundary.sessions
+	a.boundary.mu.RUnlock()
+	if sessions == nil {
+		return localDenied()
+	}
+	release, err := sessions.RetainOwnerResumer(ctx, resumer)
+	if err != nil {
+		return err
+	}
+	if err = claim.OnRelease(func() { p.released.Store(true); release() }); err != nil {
+		release()
 		return err
 	}
 	return a.boundary.callerFacts(ctx, resumer, func(current context.Context, facts fabricauth.CurrentCallerFacts) error {
