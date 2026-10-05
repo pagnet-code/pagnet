@@ -78,3 +78,13 @@ func newReplayStream(ctx context.Context, i *Invocations, caller fabric.Executio
 	life, cancel := context.WithCancel(ctx)
 	return &replayStream{ledger: i, caller: caller, receipt: r, ctx: life, cancel: cancel}
 }
+
+// ReplayAssociation returns only an actual retained fresh-ID association.
+// Original-ID retries need no alias and retain their original stream identity.
+func (s *replayStream) ReplayAssociation() *fabric.ReplayAssociation {
+	if s.receipt.Replay == nil {
+		return nil
+	}
+	a := s.receipt.Replay.Clone()
+	return &a
+}

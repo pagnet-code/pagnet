@@ -374,6 +374,10 @@ func (s *Service) invoke(ctx context.Context, trusted fabric.ExecutionContext, e
 		metadata = associated.ReplayAssociation()
 	}
 	if metadata != nil {
+		if err := metadata.Validate(); err != nil {
+			_ = stream.Close()
+			return Result{}, publicError(err)
+		}
 		a := metadata.Clone()
 		_, original, ok := OriginalRequestFromContext(ctx)
 		if !ok || request.IdempotencyKey == "" {

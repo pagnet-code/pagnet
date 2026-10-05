@@ -271,6 +271,11 @@ func (b *Bridge) handle(ctx context.Context, r *sdk.CallToolRequest, name string
 	handle := base64.RawURLEncoding.EncodeToString(entropy[:])
 	var replay *fabric.ReplayAssociation
 	if result.Replay != nil {
+		if err := result.Replay.Validate(); err != nil {
+			cancel()
+			_ = result.Stream.Close()
+			return toolError(err), nil
+		}
 		owned := result.Replay.Clone()
 		replay = &owned
 	}

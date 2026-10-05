@@ -40,6 +40,12 @@ func New(c Config) (*Adapter, error) {
 	if c.BindingDigest == ([32]byte{}) || c.Revision == "" || len(c.Revision) > 256 || c.BindingID == "" || len(c.BindingID) > 256 || c.Audience == "" || c.Card == nil || c.Credentials == nil || c.DisclosureGate == nil || c.Associations == nil || c.Interface.ProtocolVersion != sdk.Version || c.Interface.ProtocolBinding != sdk.TransportProtocolJSONRPC {
 		return nil, failure(fabric.CodeInvalidInput, fabric.EffectNotStarted)
 	}
+	if c.RootIdempotency {
+		store, ok := c.Associations.(RootIdempotencyStore)
+		if !ok || !store.SupportsRootIdempotency() {
+			return nil, failure(fabric.CodeUnsupported, fabric.EffectNotStarted)
+		}
+	}
 	if c.Associations.Scope().Audience != c.Audience || c.Associations.Scope().Domain == "" || c.Associations.Scope().ID == "" {
 		return nil, failure(fabric.CodeInvalidInput, fabric.EffectNotStarted)
 	}
@@ -103,11 +109,11 @@ func New(c Config) (*Adapter, error) {
 	return &Adapter{config: c, binding: sum(bindingRaw), card: &card, baseClient: base, ownedTransport: owned, lifetime: root, shutdown: shutdown}, nil
 }
 func (a *Adapter) validate(caller fabric.ExecutionContext, d fabric.EndpointDescriptor, r fabric.InvokeRequest) error {
-	if caller.VerifyAuthenticated(a.config.Audience) != nil || d.Ref != a.config.Ref || d.Revision != a.config.Revision || r.Target != a.config.Ref || r.ExpectedRevision != a.config.Revision || r.InvocationID == "" || len(r.InvocationID) > 256 || r.IdempotencyKey != "" {
+	if caller.VerifyAuthenticated(a.config.Audience) != nil || d.Ref != a.config.Ref || d.Revision != a.config.Revision || r.Target != a.config.Ref || r.ExpectedRevision != a.config.Revision || r.InvocationID == "" || len(r.InvocationID) > 256 || len(r.IdempotencyKey) > 256 || (r.IdempotencyKey != "" && !a.config.RootIdempotency) {
 		return failure(fabric.CodeStaleReference, fabric.EffectNotStarted)
 	}
 	for _, b := range d.Bindings {
-		if b.ID == a.config.BindingID && b.Protocol == "a2a.jsonrpc" && b.Version == string(sdk.Version) && b.Streaming == a.card.Capabilities.Streaming && b.Cancellation == a.config.Cancellation && !b.Idempotency {
+		if b.ID == a.config.BindingID && b.Protocol == "a2a.jsonrpc" && b.Version == string(sdk.Version) && b.Streaming == a.card.Capabilities.Streaming && b.Cancellation == a.config.Cancellation && b.Idempotency == a.config.RootIdempotency {
 			return nil
 		}
 	}

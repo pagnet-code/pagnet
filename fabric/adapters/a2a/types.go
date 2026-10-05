@@ -18,6 +18,9 @@ type Limits struct {
 	Lifetime                       time.Duration
 }
 type Config struct {
+	// RootIdempotency opts into a trusted signed local alias ledger. It does
+	// not assert upstream A2A retry support or emit remote idempotency headers.
+	RootIdempotency     bool
 	Ref                 fabric.EndpointRef
 	Revision            fabric.Revision
 	BindingID, Audience string
@@ -58,4 +61,11 @@ type AssociationStore interface {
 	Admit(context.Context, Association) error
 	Associate(context.Context, AssociationKey, string, string) error
 	Lookup(context.Context, AssociationKey) (Association, error)
+}
+
+// RootIdempotencyStore is trusted composition, not a remote AgentCard claim.
+// Only a real same-root admission/alias ledger may opt into this capability.
+type RootIdempotencyStore interface {
+	AssociationStore
+	SupportsRootIdempotency() bool
 }

@@ -76,7 +76,20 @@ func (c *A2AConnections) Connect(ctx context.Context, scope registry.DescriptorB
 		}
 		return h, nil
 	}
-	adapter, e := a2a.New(a2a.Config{Ref: scope.Endpoint, Revision: scope.ExpectedEndpointRevision, BindingID: scope.BindingID, Audience: c.profiles.root.Namespace, BindingDigest: p.BindingDigest, Card: p.A2A.Card, Interface: p.A2A.Interface, Credentials: creds, DisclosureGate: c.disclosure, Associations: store, AllowHTTP: p.A2A.AllowHTTP, Cancellation: p.A2A.Cancellation, Limits: p.A2A.Limits})
+	descriptor, e := c.profiles.store.GetEndpoint(ctx, scope.Endpoint, scope.ExpectedEndpointRevision)
+	if e != nil {
+		return e
+	}
+	rootIdempotency := false
+	for _, binding := range descriptor.Bindings {
+		if binding.ID == scope.BindingID {
+			rootIdempotency = binding.Idempotency
+		}
+	}
+	if rootIdempotency && !store.SupportsRootIdempotency() {
+		return fabric.NewError(fabric.CodeUnsupported, "Service replay policy is not configured")
+	}
+	adapter, e := a2a.New(a2a.Config{RootIdempotency: rootIdempotency, Ref: scope.Endpoint, Revision: scope.ExpectedEndpointRevision, BindingID: scope.BindingID, Audience: c.profiles.root.Namespace, BindingDigest: p.BindingDigest, Card: p.A2A.Card, Interface: p.A2A.Interface, Credentials: creds, DisclosureGate: c.disclosure, Associations: store, AllowHTTP: p.A2A.AllowHTTP, Cancellation: p.A2A.Cancellation, Limits: p.A2A.Limits})
 	if e != nil {
 		return e
 	}
@@ -119,6 +132,12 @@ func (a *guardedA2A) Invoke(ctx context.Context, caller fabric.ExecutionContext,
 	}
 	if _, _, e := a.connections.Resolve(ctx, a.entry.scope); e != nil {
 		return nil, e
+	}
+	// Pin the currently selected credential account outside SQL even for a
+	// retained alias; changed provider-account resolution cannot expose old data.
+	credential, e := a.connections.credentials.Resolve(ctx, a.entry.profile.CredentialSelector)
+	if e != nil || credential.BindingDigest != a.entry.profile.BindingDigest {
+		return nil, denied()
 	}
 	// Lookups do not authorize a fresh send. The SDK AssociationStore performs
 	// the actual first FULL Reserve before the original call on absent receipts.

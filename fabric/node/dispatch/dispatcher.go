@@ -226,6 +226,11 @@ func (s *admissionStream) Next(ctx context.Context) (fabric.InvocationFrame, err
 func (s *admissionStream) ReplayAssociation() *fabric.ReplayAssociation {
 	if source, ok := s.InvocationStream.(fabric.ReplayAssociatedStream); ok {
 		if a := source.ReplayAssociation(); a != nil {
+			if a.Validate() != nil {
+				// Preserve an invalid association as a rejection, never as a fresh
+				// stream, without copying oversized adapter-owned metadata.
+				return &fabric.ReplayAssociation{}
+			}
 			owned := a.Clone()
 			return &owned
 		}

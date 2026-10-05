@@ -153,3 +153,11 @@ func (i *Invocations) updateReceipt(tx *registry.AuthorityTx, row registry.Autho
 }
 
 var _ a2a.AssociationStore = (*A2AAssociations)(nil)
+
+func (s *A2AAssociations) SupportsRootIdempotency() bool {
+	if s == nil || s.ledger == nil {
+		return false
+	}
+	_, ok := s.ledger.policy.(InvocationHistoryPolicy)
+	return ok
+}

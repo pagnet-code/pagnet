@@ -13,6 +13,9 @@ const MaxReplayAssociationBytes = 128 << 10
 // authorization. Proof must be checked against the current trusted same-root
 // alias ledger and original receipt, not merely a historical public signature.
 // Frames retain ExecutionID and their original sequence and source evidence.
+// Hashes/private account fingerprints and Proof are disclosed only to the SAME
+// authenticated caller over private or encrypted transport. Composition must
+// never publish them in catalogs, search, events, telemetry or relay metadata.
 type ReplayAssociation struct {
 	Version              uint32      `json:"version"`
 	AuthorityNamespace   string      `json:"authorityNamespace"`
@@ -92,10 +95,10 @@ func VerifyReplayCorrelation(ctx context.Context, caller ExecutionContext, curre
 	if caller.PrincipalView() != current.Principal || caller.VerifyAuthenticatedDigest(current.OriginalRequestSHA, caller.Audience()) != nil {
 		return nil, NewError(CodeUnauthenticated, "Replay requires the fresh authenticated original")
 	}
-	a := association.Clone()
-	if err := a.Validate(); err != nil {
+	if err := association.Validate(); err != nil {
 		return nil, err
 	}
+	a := association.Clone()
 	if a.Principal != current.Principal || a.RequestID != current.RequestID || a.Target != current.Target || a.ExpectedRevision != current.ExpectedRevision ||
 		a.OriginalRequestSHA != current.OriginalRequestSHA || a.FinalizedRequestSHA != current.FinalizedRequestSHA || a.InputSHA != current.InputSHA || a.IdempotencySHA != current.IdempotencySHA {
 		return nil, NewError(CodeUnauthenticated, "Replay association does not match current request")

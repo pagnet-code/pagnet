@@ -48,20 +48,5 @@ func (b *LocalBoundary) AuthorizeTx(ctx context.Context, tx *registry.AuthorityT
 	default:
 		return fabric.NewError(fabric.CodeUnsupported, "Local service action is not supported")
 	}
-	b.mu.RLock()
-	closed := b.closed
-	b.mu.RUnlock()
-	if closed {
-		return localDenied()
-	}
-	if s.association == nil || !s.association.AssociationOpen(s.authenticatedCaller) {
-		return localDenied()
-	}
-	if s.managed != nil {
-		return tx.VerifyCurrentNativeCaller(*s.managed)
-	}
-	if s.caller != b.root.Owner {
-		return localDenied()
-	}
-	return nil
+	return b.authorizeStampTx(tx, s)
 }

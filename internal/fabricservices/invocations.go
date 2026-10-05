@@ -45,6 +45,7 @@ type InvocationFacts struct {
 	InputSHA     [32]byte                      `json:"inputSha"`
 }
 type Receipt struct {
+	Replay             *fabric.ReplayAssociation     `json:"-"`
 	Facts              InvocationFacts               `json:"facts"`
 	Dispatch           fabric.DispatchAdmissionFrame `json:"dispatch"`
 	Signature          []byte                        `json:"signature"`
@@ -212,6 +213,10 @@ func (i *Invocations) original(ctx context.Context, caller fabric.ExecutionConte
 // full original principal+invocation identity is global, independent of target,
 // revision, private account, replay labels or protocol. False never permits send.
 func (i *Invocations) Reserve(ctx context.Context, caller fabric.ExecutionContext, scope registry.DescriptorBatchScope, fingerprint [32]byte, request fabric.InvokeRequest) (Receipt, bool, error) {
+	return i.reserve(ctx, caller, scope, fingerprint, request, false)
+}
+
+func (i *Invocations) reserve(ctx context.Context, caller fabric.ExecutionContext, scope registry.DescriptorBatchScope, fingerprint [32]byte, request fabric.InvokeRequest, lookupOnly bool) (Receipt, bool, error) {
 	facts, env, original, finalized, e := i.original(ctx, caller, scope, fingerprint)
 	if e != nil {
 		return Receipt{}, false, e
@@ -233,6 +238,18 @@ func (i *Invocations) Reserve(ctx context.Context, caller fabric.ExecutionContex
 		if e != nil {
 			return e
 		}
+		if ctx.Err() != nil || env.Context.Deadline != nil && !time.Now().Before(*env.Context.Deadline) {
+			return fabric.NewError(fabric.CodeCancelled, "Service invocation deadline ended")
+		}
+		if request.IdempotencyKey != "" {
+			if _, ok := i.policy.(InvocationHistoryPolicy); !ok {
+				return fabric.NewError(fabric.CodeUnsupported, "Service replay policy is not configured")
+			}
+		}
+		if handled, replay, err := i.resolveAliasTx(ctx, tx, caller, facts, request.IdempotencyKey, &s, stateRow); handled || err != nil {
+			result = replay
+			return err
+		}
 		var old Receipt
 		_, e = i.decode(tx, "invocation/"+id, &old)
 		if e == nil {
@@ -247,6 +264,9 @@ func (i *Invocations) Reserve(ctx context.Context, caller fabric.ExecutionContex
 		}
 		if !missing(e) {
 			return e
+		}
+		if lookupOnly {
+			return fabric.NewError(fabric.CodeNotFound, "Original service receipt absent")
 		}
 		if ctx.Err() != nil || env.Context.Deadline != nil && !time.Now().Before(*env.Context.Deadline) {
 			return fabric.NewError(fabric.CodeCancelled, "Service invocation deadline ended")
@@ -279,6 +299,11 @@ func (i *Invocations) Reserve(ctx context.Context, caller fabric.ExecutionContex
 		}
 		s.Invocations++
 		s.Bytes += uint64(len(value))
+		if request.IdempotencyKey != "" {
+			if e := i.installIdempotencyTx(tx, facts, request.IdempotencyKey, r, &s); e != nil {
+				return e
+			}
+		}
 		value, e = i.encode("configuration", s)
 		if e != nil {
 			return e
@@ -431,6 +456,9 @@ func (i *Invocations) Append(ctx context.Context, caller fabric.ExecutionContext
 
 // Frame loads one exact ordinal, never scans history or infers EOF completion.
 func (i *Invocations) Frame(ctx context.Context, caller fabric.ExecutionContext, receipt Receipt, ordinal uint64) (fabric.InvocationFrame, error) {
+	if receipt.Replay != nil {
+		return i.frameReplay(ctx, caller, *receipt.Replay, ordinal)
+	}
 	var f fabric.InvocationFrame
 	e := i.read(ctx, caller, receipt.Facts.Principal, receipt.Facts.InvocationID, receipt.Facts.Scope, "pull", func(_ context.Context, tx *registry.AuthorityTx, r Receipt, _ registry.AuthorityRecord) error {
 		var e error
@@ -485,22 +513,6 @@ func equalDeadline(a, b *time.Time) bool {
 // FindExact is a current-policy lookup, not a new admission or permission to
 // retry. Missing and uncertain receipts remain distinct.
 func (i *Invocations) FindExact(ctx context.Context, caller fabric.ExecutionContext, scope registry.DescriptorBatchScope, fingerprint [32]byte, request fabric.InvokeRequest) (Receipt, error) {
-	facts, env, original, finalized, e := i.original(ctx, caller, scope, fingerprint)
-	defer clear(original)
-	defer clear(finalized)
-	if e != nil {
-		return Receipt{}, e
-	}
-	if request.Validate() != nil || request.InvocationID != env.ID || env.Target == nil || request.Target != *env.Target || request.ExpectedRevision != env.ExpectedRevision || !bytes.Equal(request.Input, env.Payload) || request.IdempotencyKey != env.Context.IdempotencyKey || !equalDeadline(request.Deadline, env.Context.Deadline) {
-		return Receipt{}, denied()
-	}
-	var out Receipt
-	e = i.read(ctx, caller, facts.Principal, facts.InvocationID, scope, "replay", func(_ context.Context, _ *registry.AuthorityTx, r Receipt, _ registry.AuthorityRecord) error {
-		if r.Facts != facts {
-			return denied()
-		}
-		out = r
-		return nil
-	})
-	return out, e
+	receipt, _, err := i.reserve(ctx, caller, scope, fingerprint, request, true)
+	return receipt, err
 }

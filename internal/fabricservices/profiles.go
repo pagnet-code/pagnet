@@ -182,7 +182,7 @@ func (s *ProfileStore) Install(ctx context.Context, scope registry.DescriptorBat
 	found := false
 	for _, b := range d.Bindings {
 		if b.ID == scope.BindingID && b.Protocol == p.Protocol && b.Version == p.Version {
-			if p.A2A != nil && (b.Streaming != p.A2A.Card.Capabilities.Streaming || b.Cancellation != p.A2A.Cancellation || b.Idempotency) {
+			if p.A2A != nil && (b.Streaming != p.A2A.Card.Capabilities.Streaming || b.Cancellation != p.A2A.Cancellation) {
 				return 0, denied()
 			}
 			found = true

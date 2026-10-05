@@ -16,6 +16,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/fabrichost"
 	"github.com/pagnet-code/pagnet/internal/fabricmcp"
 	"github.com/pagnet-code/pagnet/internal/fabricnative"
+	"github.com/pagnet-code/pagnet/internal/fabricservices"
 )
 
 // InstalledConfig loads one explicitly initialized local trust boundary. Native
@@ -26,6 +27,9 @@ type InstalledConfig struct {
 	Binary      string
 	Credentials fabricnative.CredentialProvider
 	Tracing     telemetry.Provider
+	// Services is an explicit operator selection; nil keeps native-only startup.
+	// State must have been initialized by an explicit service setup operation.
+	Services *ServiceRuntimeConfig
 }
 
 // InstalledNode is the actual local socket/product composition. The installation
@@ -34,6 +38,7 @@ type InstalledNode struct {
 	Installation *localinstallation.Installation
 	Node         *Node
 	Runtime      *LocalRuntime
+	Services     *ServiceRuntime
 	Host         *fabrichost.Host
 	server       *fabricmcp.Server
 	incomplete   *CompositionError
@@ -107,6 +112,21 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			return Ports{}, err
 		}
 		ports := result.Runtime.Ports()
+		if c.Services != nil {
+			result.Services, err = NewServiceRuntime(ctx, installation, result.Runtime.Boundary, *c.Services)
+			if err != nil {
+				return Ports{}, err
+			}
+			providers := result.Services.Bindings()
+			providers[BindingProtocol{Protocol: "local.native", Version: "1"}] = result.Runtime.BindingProvider
+			router, e := NewRouter(providers)
+			if e != nil {
+				return Ports{}, e
+			}
+			ports.Bindings = router
+			ports.ReplayVerifier = result.Services.Invocations
+			ports.Close = &installedRuntimes{native: result.Runtime, services: result.Services}
+		}
 		ports.Tracing = c.Tracing
 		return ports, nil
 	})
@@ -156,11 +176,51 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 		if err := n.Node.CloseContext(ctx); err != nil {
 			return err
 		}
-	} else if n.Runtime != nil {
-		if err := n.Runtime.CloseContext(ctx); err != nil {
-			return err
+	} else {
+		if n.Services != nil {
+			if err := n.Services.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
+		if n.Runtime != nil {
+			if err := n.Runtime.CloseContext(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	return n.Installation.CloseContext(ctx)
 }
 func (n *InstalledNode) Close() error { return n.CloseContext(context.Background()) }
+
+// DefaultInstalledServiceConfig selects finite SDK connection infrastructure
+// limits, not a provider/account. Credentials must be explicitly supplied and
+// remain private; nil is rejected by service setup/open, never scraped from env.
+func DefaultInstalledServiceConfig(credentials fabricservices.CredentialProvider) ServiceRuntimeConfig {
+	return ServiceRuntimeConfig{Credentials: credentials, InvocationConfig: fabricservices.DefaultInvocationConfig(), MaxConnections: 128, SetupTimeout: 10 * time.Second, SetupConcurrency: 4}
+}
+
+// installedRuntimes owns the dependency order without reacquiring InstalledNode
+// locks. An incomplete join never releases the installation key or Store.
+type installedRuntimes struct {
+	native   *LocalRuntime
+	services *ServiceRuntime
+	mu       sync.Mutex
+}
+
+func (r *installedRuntimes) CloseContext(ctx context.Context) error {
+	if ctx == nil {
+		return fabric.NewError(fabric.CodeInvalidInput, "Missing installed runtime shutdown context")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.services != nil {
+		if e := r.services.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
+	if r.native != nil {
+		return r.native.CloseContext(ctx)
+	}
+	return nil
+}
+func (r *installedRuntimes) Close() error { return r.CloseContext(context.Background()) }
