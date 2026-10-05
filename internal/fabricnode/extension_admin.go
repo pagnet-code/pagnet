@@ -47,10 +47,10 @@ func (r *ExtensionRuntime) PutProfile(ctx context.Context, admin *fabricauth.Own
 func (r *ExtensionRuntime) Install(ctx context.Context, admin *fabricauth.OwnerAdministration, generation uint64, input extregistry.Installation) (extregistry.Reference, error) {
 	var result extregistry.Reference
 	e := r.administration(ctx, admin, func(c context.Context) error {
-		if r.config.Credentials == nil {
-			return fabric.NewError(fabric.CodeUnsupported, "Selected interceptor credential provider unavailable")
-		}
 		for _, binding := range input.Bindings {
+			if r.config.Credentials == nil && binding.Selector != "credentials.none" {
+				return fabric.NewError(fabric.CodeUnsupported, "Selected interceptor credential provider unavailable")
+			}
 			profile, e := r.infrastructure.Profiles.Get(c, binding.ProfileDigest)
 			if e != nil || profile.Protocol != binding.Protocol || binding.Selector != profile.CredentialSelector {
 				return localDenied()
@@ -71,10 +71,10 @@ func (r *ExtensionRuntime) Install(ctx context.Context, admin *fabricauth.OwnerA
 func (r *ExtensionRuntime) Update(ctx context.Context, admin *fabricauth.OwnerAdministration, generation, revision uint64, input extregistry.Installation) (extregistry.Reference, error) {
 	var result extregistry.Reference
 	err := r.administration(ctx, admin, func(c context.Context) error {
-		if r.config.Credentials == nil {
-			return fabric.NewError(fabric.CodeUnsupported, "Selected interceptor credential provider unavailable")
-		}
 		for _, binding := range input.Bindings {
+			if r.config.Credentials == nil && binding.Selector != "credentials.none" {
+				return fabric.NewError(fabric.CodeUnsupported, "Selected interceptor credential provider unavailable")
+			}
 			profile, e := r.infrastructure.Profiles.Get(c, binding.ProfileDigest)
 			if e != nil || profile.Protocol != binding.Protocol || binding.Selector != profile.CredentialSelector {
 				return localDenied()

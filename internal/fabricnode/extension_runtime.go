@@ -120,8 +120,14 @@ type extensionSelectedCredential struct {
 }
 
 func (c extensionSelectedCredential) Authorization(ctx context.Context, binding string) (string, error) {
-	if c.provider == nil || binding != c.binding {
+	if ctx == nil || ctx.Err() != nil || binding != c.binding {
 		return "", localDenied()
+	}
+	if c.selector == "credentials.none" {
+		return "", nil
+	}
+	if c.provider == nil {
+		return "", fabric.NewError(fabric.CodeUnsupported, "Selected interceptor credential provider unavailable")
 	}
 	return c.provider.Authorization(ctx, c.selector)
 }
@@ -187,7 +193,7 @@ func (r *ExtensionRuntime) reload(ctx context.Context) error {
 					}
 					continue
 				}
-				if binding.Protocol != extensionHTTPProtocol || r.config.Credentials == nil {
+				if binding.Protocol != extensionHTTPProtocol || (r.config.Credentials == nil && binding.Selector != "credentials.none") {
 					closeHandlers()
 					return fabric.NewError(fabric.CodeUnsupported, "Selected interceptor provider unavailable")
 				}
