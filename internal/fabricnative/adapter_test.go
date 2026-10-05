@@ -87,6 +87,10 @@ type adapterRig struct {
 }
 
 func actualAdapterRig(t *testing.T, pressure ...bool) *adapterRig {
+	return actualAdapterRigWithProfile(t, "", pressure...)
+}
+
+func actualAdapterRigWithProfile(t *testing.T, inputProfile string, pressure ...bool) *adapterRig {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	t.Cleanup(cancel)
@@ -145,7 +149,7 @@ func actualAdapterRig(t *testing.T, pressure ...bool) *adapterRig {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := sessionworker.NativeSpec{Kind: "local", Runtime: domain.RuntimeFakePersistent, Binary: native, MCPExecutable: binary, Workspace: workspace, LocalAuthorityDirectory: registryDir, LocalFabricSocket: filepath.Join(dir, "fabric.sock"), Env: []string{"PATH=/usr/bin:/bin", "HOME=" + workspace}}
+	spec := sessionworker.NativeSpec{InputBindingProfile: inputProfile, Kind: "local", Runtime: domain.RuntimeFakePersistent, Binary: native, MCPExecutable: binary, Workspace: workspace, LocalAuthorityDirectory: registryDir, LocalFabricSocket: filepath.Join(dir, "fabric.sock"), Env: []string{"PATH=/usr/bin:/bin", "HOME=" + workspace}}
 	if len(pressure) > 0 && pressure[0] {
 		spec.Env = append(spec.Env, "PAGNET_FAKE_FULL_OUTPUT=1", "PAGNET_FAKE_OUTPUT_CHUNK_BYTES=8")
 	}
@@ -216,7 +220,7 @@ func actualAdapterRig(t *testing.T, pressure ...bool) *adapterRig {
 	if e != nil {
 		t.Fatal(e)
 	}
-	resolver := &adapterResolver{WorkerHandle{Current: A, Binding: binding, Ownership: scope, Directory: state, ControlKey: key, Client: client}}
+	resolver := &adapterResolver{WorkerHandle{InputBindingProfile: inputProfile, Current: A, Binding: binding, Ownership: scope, Directory: state, ControlKey: key, Client: client}}
 	adapter, e := NewAdapter(AdapterConfig{Authority: authority, Owner: owner, Checkpoints: checkpoints, ManagedPeers: peers, Workers: resolver})
 	if e != nil {
 		t.Fatal(e)

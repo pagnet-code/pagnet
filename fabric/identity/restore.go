@@ -33,7 +33,7 @@ func (a *Authority) RestoreOriginalCaller(ctx context.Context, owner fabric.Exec
 		if after.Context.Deadline != nil {
 			deadline = after.Context.Deadline.UTC().Format(time.RFC3339Nano)
 		}
-		if before.Principal != source.OriginalCaller || after.Principal != source.OriginalCaller || before.ID != source.InvocationID || after.ID != source.InvocationID || after.Operation != fabric.OperationInvoke || after.Target == nil || *after.Target != source.Scope.Endpoint || after.ExpectedRevision != source.Scope.DescriptorRevision || source.Deadline != deadline {
+		if before.Principal != source.OriginalCaller || after.Principal != source.OriginalCaller || before.ID != source.InvocationID || after.ID != source.InvocationID || after.Operation != fabric.OperationInvoke || after.Target == nil || *after.Target != source.Target || source.Target.Endpoint() != source.Scope.Endpoint || after.ExpectedRevision != source.TargetRevision || source.Deadline != deadline {
 			return invalid("Original admission identity or target differs")
 		}
 		x, y := before, after

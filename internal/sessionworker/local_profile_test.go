@@ -91,3 +91,17 @@ func TestLocalCustomCredentialSlotsStayPrivateAndCannotReplaceSelectors(t *testi
 		t.Fatal("duplicate credential slots accepted")
 	}
 }
+
+func TestLocalInputBindingProfileIsPartOfPhysicalFingerprint(t *testing.T) {
+	base := NativeSpec{Kind: "local"}
+	prompt := base
+	prompt.InputBindingProfile = "pagnet.native.input.prompt.v1"
+	if LocalNativeProfileFingerprint(base) != LocalNativeProfileFingerprint(prompt) {
+		t.Fatal("default local prompt profile is not canonical")
+	}
+	structured := base
+	structured.InputBindingProfile = "pagnet.native.input.json.v1"
+	if LocalNativeProfileFingerprint(base) == LocalNativeProfileFingerprint(structured) {
+		t.Fatal("structured input format is not bound to actual worker profile")
+	}
+}

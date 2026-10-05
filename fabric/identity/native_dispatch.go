@@ -144,12 +144,16 @@ func (a *Authority) ReserveNativeDispatch(ctx context.Context, owner fabric.Exec
 	if !validDispatchSpec(spec) || spec.SpecDigest != b.Worker.ProfileDigest || source.Scope != c.Scope || b.Scope != c.Scope {
 		return result, invalid("Incomplete native dispatch reservation commitment")
 	}
-	facts, _, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
+	facts, env, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
 	if e != nil {
 		return result, e
 	}
 	if facts.OriginalCaller != source.OriginalCaller || facts.InvocationID != source.InvocationID || facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest {
 		return result, conflict("Native dispatch original or finalized admission differs")
+	}
+	prepared, e := a.store.PrepareInvocationTarget(ctx, source.Target, source.TargetRevision, env.Payload)
+	if e != nil {
+		return result, e
 	}
 	bindingDigest, e := digest(b)
 	if e != nil || bindingDigest != source.BindingDigest {
@@ -175,6 +179,9 @@ func (a *Authority) ReserveNativeDispatch(ctx context.Context, owner fabric.Exec
 				return e
 			}
 			if e := a.originalAdmission(tx, source); e != nil {
+				return e
+			}
+			if e := verifySelectedSource(tx, source, env, prepared); e != nil {
 				return e
 			}
 			key := dispatchKey(facts.OriginalCaller, facts.InvocationID)

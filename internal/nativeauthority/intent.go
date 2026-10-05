@@ -111,7 +111,7 @@ func validateIntent(pinned Scope, binder OperationBinder, i VerifiedIntent, canc
 		return errors.New("local native original admission differs from signed source")
 	}
 	var final fabric.Envelope
-	if e = fabric.DecodeJSON(i.Finalized, &final); e != nil || final.Validate() != nil || final.Target == nil || *final.Target != local.Endpoint || final.ExpectedRevision != originalBinding.Scope.DescriptorRevision || final.ID != source.InvocationID {
+	if e = fabric.DecodeJSON(i.Finalized, &final); e != nil || final.Validate() != nil || final.Target == nil || *final.Target != source.Target || source.Target.Endpoint() != local.Endpoint || final.ExpectedRevision != source.TargetRevision || final.ID != source.InvocationID {
 		return errors.New("local native finalized invocation differs")
 	}
 	if !cancellation && final.Context.Deadline != nil && !time.Now().Before(*final.Context.Deadline) {
@@ -148,7 +148,7 @@ func verifyRecord(root registry.AuthorityIdentity, proof registry.AuthorityRecor
 // it cannot authorize a new native operation or establish a current controller.
 func ValidateOriginalAdmission(pinned Scope, source fabricidentity.Admission) error {
 	local, ok := pinned.Local()
-	if !ok || pinned.Validate() != nil || source.Scope.Endpoint != local.Endpoint || source.Scope.BindingID != local.BindingID || source.ID == "" || source.OriginalControllerEpoch == 0 {
+	if !ok || pinned.Validate() != nil || source.Scope.Endpoint != local.Endpoint || source.Target.Endpoint() != local.Endpoint || source.TargetRevision == "" || source.Scope.BindingID != local.BindingID || source.ID == "" || source.OriginalControllerEpoch == 0 {
 		return errors.New("local native source scope differs")
 	}
 	root := registry.AuthorityIdentity{Namespace: local.Namespace, StoreID: local.StoreID, Owner: local.Owner, PublicKey: local.PublicKey[:], KeyRevision: local.KeyRevision}

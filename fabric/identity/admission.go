@@ -25,7 +25,7 @@ func (a *Authority) facts(caller fabric.ExecutionContext, s Scope, original, fin
 	if e = final.Validate(); e != nil {
 		return facts, final, e
 	}
-	if final.Operation != fabric.OperationInvoke || final.Target == nil || *final.Target != s.Endpoint || final.ExpectedRevision != s.DescriptorRevision || !text(attemptID) || !text(replayID) {
+	if final.Operation != fabric.OperationInvoke || final.Target == nil || final.Target.Endpoint() != s.Endpoint || !final.Target.IsOffer() && final.ExpectedRevision != s.DescriptorRevision || !text(attemptID) || !text(replayID) {
 		return facts, final, invalid("Final local invocation scope or retry identity invalid")
 	}
 	// This is not authentication of transformed bytes. Exact caller/system fields
@@ -47,7 +47,7 @@ func (a *Authority) facts(caller fabric.ExecutionContext, s Scope, original, fin
 	if final.Context.Deadline != nil && !time.Now().Before(*final.Context.Deadline) {
 		return facts, final, invalid("Finalized local invocation expired")
 	}
-	facts = AdmissionFacts{Scope: s, OriginalCaller: caller.PrincipalView(), Provenance: caller.ProvenanceView(), OriginalDigest: sha256.Sum256(original), FinalizedDigest: sha256.Sum256(finalized), OriginalBytes: bytes.Clone(original), FinalizedBytes: bytes.Clone(finalized), InvocationID: final.ID, AttemptID: attemptID, ReplayID: replayID}
+	facts = AdmissionFacts{Target: *final.Target, TargetRevision: final.ExpectedRevision, Scope: s, OriginalCaller: caller.PrincipalView(), Provenance: caller.ProvenanceView(), OriginalDigest: sha256.Sum256(original), FinalizedDigest: sha256.Sum256(finalized), OriginalBytes: bytes.Clone(original), FinalizedBytes: bytes.Clone(finalized), InvocationID: final.ID, AttemptID: attemptID, ReplayID: replayID}
 	return facts, final, nil
 }
 func validWitness(w Witness, facts AdmissionFacts) error {
@@ -82,17 +82,17 @@ func (a *Authority) Admit(ctx context.Context, owner fabric.ExecutionContext, c 
 	if e != nil {
 		return result, e
 	}
+	prepared, e := a.store.PrepareInvocationTarget(ctx, facts.Target, facts.TargetRevision, env.Payload)
+	if e != nil {
+		return result, e
+	}
 	bindingDigest, e := digest(b)
 	if e != nil {
 		return result, e
 	}
-	base := Admission{ID: id, Scope: c.Scope, OriginalCaller: facts.OriginalCaller, Provenance: facts.Provenance, OriginalDigest: facts.OriginalDigest, FinalizedDigest: facts.FinalizedDigest, InvocationID: facts.InvocationID, AttemptID: attemptID, ReplayID: replayID, OriginalControllerEpoch: c.Epoch(), BindingDigest: bindingDigest}
+	base := Admission{Target: facts.Target, TargetRevision: facts.TargetRevision, ID: id, Scope: c.Scope, OriginalCaller: facts.OriginalCaller, Provenance: facts.Provenance, OriginalDigest: facts.OriginalDigest, FinalizedDigest: facts.FinalizedDigest, InvocationID: facts.InvocationID, AttemptID: attemptID, ReplayID: replayID, OriginalControllerEpoch: c.Epoch(), BindingDigest: bindingDigest}
 	if env.Context.Deadline != nil {
 		base.Deadline = env.Context.Deadline.UTC().Format(time.RFC3339Nano)
-	}
-	requestDigest, e := admissionRequestDigest(base)
-	if e != nil {
-		return result, e
 	}
 	e = a.withFence(ctx, facts, func(w Witness) error {
 		return a.transact(ctx, owner, c.Scope, false, func(tx *registry.AuthorityTx) error {
@@ -100,6 +100,14 @@ func (a *Authority) Admit(ctx context.Context, owner fabric.ExecutionContext, c 
 				return e
 			}
 			if e := a.currentBinding(tx, b); e != nil {
+				return e
+			}
+			base.InputSchemaDigest, e = tx.VerifyInvocationTarget(base.Target, base.TargetRevision, env.Payload, prepared)
+			if e != nil {
+				return e
+			}
+			requestDigest, e := admissionRequestDigest(base)
+			if e != nil {
 				return e
 			}
 			existing, e := tx.Get(admissionKey(c.Scope, id))
@@ -127,7 +135,7 @@ func (a *Authority) Admit(ctx context.Context, owner fabric.ExecutionContext, c 
 				return e
 			}
 			base.DispatchFrame = fabric.DispatchAdmissionFrame{SourceDomain: a.root.Namespace, CallerRef: base.OriginalCaller.Ref, AudienceDomain: a.root.Namespace, InvocationID: env.ID, AttemptID: attemptID, ReplayID: replayID, FinalizedDispatchDigest: facts.FinalizedDigest, Deadline: base.Deadline}
-			base.DispatchSignature, e = tx.SignDispatchAdmission(caller, original, finalized, base.DispatchFrame)
+			base.DispatchSignature, e = tx.SignDispatchAdmission(caller, original, finalized, base.DispatchFrame, prepared)
 			if e != nil {
 				return e
 			}

@@ -47,6 +47,8 @@ type Binding struct {
 // AdmissionFacts are exact finalized ENGINE facts, not caller assertions. Byte
 // slices are private ephemeral input to the configured fence, never persisted.
 type AdmissionFacts struct {
+	Target          fabric.EndpointRef
+	TargetRevision  fabric.Revision
 	Scope           Scope
 	OriginalCaller  fabric.Principal
 	Provenance      fabric.Provenance
@@ -73,6 +75,9 @@ type AdmissionFence interface {
 	WithAdmission(context.Context, AdmissionFacts, func(Witness) error) error
 }
 type Admission struct {
+	Target                  fabric.EndpointRef            `json:"target"`
+	TargetRevision          fabric.Revision               `json:"targetRevision"`
+	InputSchemaDigest       [32]byte                      `json:"inputSchemaDigest"`
 	ID                      string                        `json:"id"`
 	Scope                   Scope                         `json:"scope"`
 	OriginalCaller          fabric.Principal              `json:"originalCaller"`

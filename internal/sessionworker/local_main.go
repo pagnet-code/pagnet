@@ -125,7 +125,10 @@ func runLocalMain(raw []byte, dir string, envFD int, build string) error {
 	}
 	defer owner.Close()
 	local, _ := b.Authority.Local()
-	binder := nativeauthority.JSONPromptBinder{ProfileDigest: local.ProfileDigest}
+	binder, err := nativeauthority.NewInputBinder(b.Native.InputBindingProfile, local.ProfileDigest)
+	if err != nil {
+		return err
+	}
 	e = ServeLocalOwner(ctx, owner, key, build, binder)
 	if ctx.Err() != nil {
 		return nil

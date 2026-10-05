@@ -27,6 +27,7 @@ import (
 // NativeSpec contains immutable host-local configuration. Env is memory-only:
 // it is never encoded into the intent/output journal or sent to controllers.
 type NativeSpec struct {
+	InputBindingProfile    string `json:"inputBindingProfile,omitempty"`
 	Runtime                domain.RuntimeName
 	Binary                 string
 	PrefixArgs, NativeDirs []string

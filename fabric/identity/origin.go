@@ -59,7 +59,7 @@ func (a *Authority) RegisterOrigin(ctx context.Context, owner fabric.ExecutionCo
 	if !text(id) || !text(nativeGeneration) || source.Scope != c.Scope || b.Scope != c.Scope {
 		return result, invalid("Native origin scope or generation invalid")
 	}
-	facts, _, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
+	facts, env, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
 	if e != nil {
 		return result, e
 	}
@@ -74,6 +74,7 @@ func (a *Authority) RegisterOrigin(ctx context.Context, owner fabric.ExecutionCo
 	if e != nil {
 		return result, e
 	}
+	prepared, preparationErr := a.store.PrepareInvocationTarget(ctx, source.Target, source.TargetRevision, env.Payload)
 	base := Origin{ID: id, Scope: c.Scope, AdmissionID: source.ID, AdmissionDigest: admissionDigest, OriginalControllerEpoch: source.OriginalControllerEpoch, RegisteredControllerEpoch: c.Epoch(), Worker: b.Worker, NativeGeneration: nativeGeneration}
 	commitment, e := originRequestDigest(base)
 	if e != nil {
@@ -88,6 +89,12 @@ func (a *Authority) RegisterOrigin(ctx context.Context, owner fabric.ExecutionCo
 				return e
 			}
 			if e := a.originalAdmission(tx, source); e != nil {
+				return e
+			}
+			if preparationErr != nil {
+				return preparationErr
+			}
+			if e := verifySelectedSource(tx, source, env, prepared); e != nil {
 				return e
 			}
 			if _, e := tx.Get(retirementKey(c.Scope, id)); e == nil {

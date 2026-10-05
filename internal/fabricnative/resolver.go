@@ -121,6 +121,12 @@ func (r *Resolver) resolve(ctx context.Context, caller fabric.ExecutionContext, 
 	if r == nil || ctx == nil || caller.VerifyAuthenticated(r.config.Authority.Identity().Namespace) != nil {
 		return result, checkpointDenied()
 	}
+	successful := false
+	defer func() {
+		if !successful {
+			clear(result.ControlKey)
+		}
+	}()
 	bounded, cancel := context.WithTimeout(ctx, r.config.Launcher.config.StartupTimeout)
 	stop := context.AfterFunc(r.lifetime, cancel)
 	defer func() { stop(); cancel() }()
@@ -231,13 +237,14 @@ func (r *Resolver) resolve(ctx context.Context, caller fabric.ExecutionContext, 
 			clear(key)
 			return launchDenied()
 		}
-		result = WorkerHandle{Current: control, Binding: binding, Ownership: e.original, Directory: profile.Directory, ControlKey: key, Client: e.connection.Client}
+		result = WorkerHandle{InputBindingProfile: profile.Native.InputBindingProfile, Current: control, Binding: binding, Ownership: e.original, Directory: profile.Directory, ControlKey: key, Client: e.connection.Client}
 		return nil
 	})
 	if err != nil {
 		clear(result.ControlKey)
 		return WorkerHandle{}, err
 	}
+	successful = true
 	return result, nil
 }
 
@@ -248,6 +255,7 @@ func (r *Resolver) resolve(ctx context.Context, caller fabric.ExecutionContext, 
 func onceCurrentPolicy(ctx context.Context, policy func(func(context.Context) error) error, step func(context.Context) error) error {
 	var mu sync.Mutex
 	active, calls, misused := true, 0, false
+	defer func() { mu.Lock(); active = false; mu.Unlock() }()
 	var stepError error
 	outer := policy(func(current context.Context) error {
 		mu.Lock()

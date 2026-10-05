@@ -49,12 +49,16 @@ func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.Executio
 	}
 	lifetime, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	facts, _, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
+	facts, env, e := a.facts(caller, c.Scope, original, finalized, source.AttemptID, source.ReplayID)
 	if e != nil {
 		return receipt, e
 	}
 	if facts.OriginalDigest != source.OriginalDigest || facts.FinalizedDigest != source.FinalizedDigest || facts.OriginalCaller != source.OriginalCaller {
 		return receipt, invalid("Native intent original or final admission bytes differ")
+	}
+	prepared, e := a.store.PrepareInvocationTarget(ctx, source.Target, source.TargetRevision, env.Payload)
+	if e != nil {
+		return receipt, e
 	}
 	bindingDigest, e := digest(b)
 	if e != nil || bindingDigest != source.BindingDigest {
@@ -69,6 +73,9 @@ func (a *Authority) FenceNativeIntent(ctx context.Context, owner fabric.Executio
 				return e
 			}
 			if e := a.originalAdmission(tx, source); e != nil {
+				return e
+			}
+			if e := verifySelectedSource(tx, source, env, prepared); e != nil {
 				return e
 			}
 			got, e := appendDurableIntent(lifetime)

@@ -23,12 +23,13 @@ import (
 // private paths, control keys nor executable profiles are application arguments.
 // The resolver owns the shared IPC connection; streams never close it.
 type WorkerHandle struct {
-	Current    identity.Controller
-	Binding    identity.Binding
-	Ownership  nativeauthority.Scope
-	Directory  string
-	ControlKey []byte                     `json:"-"`
-	Client     *sessionworker.LocalClient `json:"-"`
+	InputBindingProfile string
+	Current             identity.Controller
+	Binding             identity.Binding
+	Ownership           nativeauthority.Scope
+	Directory           string
+	ControlKey          []byte                     `json:"-"`
+	Client              *sessionworker.LocalClient `json:"-"`
 }
 type WorkerResolver interface {
 	Resolve(context.Context, fabric.ExecutionContext, fabric.EndpointDescriptor) (WorkerHandle, error)
@@ -146,7 +147,7 @@ func (a *Adapter) Invoke(ctx context.Context, caller fabric.ExecutionContext, en
 		return nil, e
 	}
 	var env fabric.Envelope
-	if fabric.DecodeJSON(finalized, &env) != nil || env.Validate() != nil || env.Operation != fabric.OperationInvoke || env.Target == nil || *env.Target != request.Target || env.Target.IsOffer() || endpoint.Ref != *env.Target || endpoint.Revision != env.ExpectedRevision || request.ExpectedRevision != env.ExpectedRevision || request.InvocationID != env.ID || request.IdempotencyKey != env.Context.IdempotencyKey || !bytes.Equal(request.Input, env.Payload) || !equalNativeValue(request.Deadline, env.Context.Deadline) {
+	if fabric.DecodeJSON(finalized, &env) != nil || env.Validate() != nil || env.Operation != fabric.OperationInvoke || env.Target == nil || *env.Target != request.Target || endpoint.Ref != env.Target.Endpoint() || !env.Target.IsOffer() && endpoint.Revision != env.ExpectedRevision || request.ExpectedRevision != env.ExpectedRevision || request.InvocationID != env.ID || request.IdempotencyKey != env.Context.IdempotencyKey || !bytes.Equal(request.Input, env.Payload) || !equalNativeValue(request.Deadline, env.Context.Deadline) {
 		return nil, adapterError(fabric.CodeInvalidInput, "Native request differs from finalized dispatch")
 	}
 	checkpoint, restored, e := a.config.Checkpoints.Load(ctx, caller.PrincipalView(), env.ID)
@@ -179,7 +180,11 @@ func (a *Adapter) Invoke(ctx context.Context, caller fabric.ExecutionContext, en
 	if _, e = a.config.Checkpoints.Save(ctx, checkpoint); e != nil {
 		return nil, e
 	}
-	controller, e := nativeauthority.NewLocalControllerForOwnership(a.config.Authority, a.config.Owner, h.Ownership, h.Binding, nativeauthority.JSONPromptBinder{ProfileDigest: h.Binding.Worker.ProfileDigest})
+	binder, e := nativeauthority.NewInputBinder(h.InputBindingProfile, h.Binding.Worker.ProfileDigest)
+	if e != nil {
+		return nil, e
+	}
+	controller, e := nativeauthority.NewLocalControllerForOwnership(a.config.Authority, a.config.Owner, h.Ownership, h.Binding, binder)
 	if e != nil {
 		return nil, e
 	}
@@ -513,7 +518,11 @@ func (s *nativeStream) Close() (result error) {
 			return err
 		})
 	}
-	controller, e := nativeauthority.NewLocalControllerForOwnership(s.adapter.config.Authority, s.adapter.config.Owner, h.Ownership, h.Binding, nativeauthority.JSONPromptBinder{ProfileDigest: s.checkpoint.OriginalBinding.Worker.ProfileDigest})
+	binder, e := nativeauthority.NewInputBinder(h.InputBindingProfile, s.checkpoint.OriginalBinding.Worker.ProfileDigest)
+	if e != nil {
+		return e
+	}
+	controller, e := nativeauthority.NewLocalControllerForOwnership(s.adapter.config.Authority, s.adapter.config.Owner, h.Ownership, h.Binding, binder)
 	if e != nil {
 		return e
 	}

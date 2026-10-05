@@ -46,7 +46,7 @@ func (a *Authority) RegisterHistoricalOrigin(ctx context.Context, owner fabric.E
 	if e != nil || e2 != nil || x != y || y != source.BindingDigest {
 		return result, invalid("Original native binding fields differ")
 	}
-	facts, _, e := a.facts(caller, source.Scope, original, finalized, source.AttemptID, source.ReplayID)
+	facts, env, e := a.facts(caller, source.Scope, original, finalized, source.AttemptID, source.ReplayID)
 	if e != nil {
 		return result, e
 	}
@@ -57,6 +57,7 @@ func (a *Authority) RegisterHistoricalOrigin(ctx context.Context, owner fabric.E
 	if e != nil {
 		return result, e
 	}
+	prepared, preparationErr := a.store.PrepareInvocationTarget(ctx, source.Target, source.TargetRevision, env.Payload)
 	base := Origin{ID: id, Scope: source.Scope, AdmissionID: source.ID, AdmissionDigest: sourceDigest, OriginalControllerEpoch: source.OriginalControllerEpoch, RegisteredControllerEpoch: current.Epoch(), Worker: originalBinding.Worker, NativeGeneration: generation}
 	commitment, e := originRequestDigest(base)
 	if e != nil {
@@ -96,6 +97,14 @@ func (a *Authority) RegisterHistoricalOrigin(ctx context.Context, owner fabric.E
 			}
 			if e := a.originalAdmission(tx, source); e != nil {
 				return e
+			}
+			if source.Target.IsOffer() {
+				if preparationErr != nil {
+					return preparationErr
+				}
+				if e := verifySelectedSource(tx, source, env, prepared); e != nil {
+					return e
+				}
 			}
 			if _, e := tx.Get(retirementKey(source.Scope, id)); e == nil {
 				return conflict("Original native generation permanently retired")

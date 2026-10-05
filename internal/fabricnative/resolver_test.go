@@ -508,3 +508,19 @@ func TestOnceCurrentPolicyPreservesFailureAndRejectsRepeatedSuccessfulCallback(t
 		})
 	}
 }
+
+func TestOnceCurrentPolicyEscapedCallbackDeniedAfterPolicyPanic(t *testing.T) {
+	var escaped func(context.Context) error
+	var steps atomic.Int64
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("fixture policy did not panic")
+			}
+		}()
+		_ = onceCurrentPolicy(t.Context(), func(next func(context.Context) error) error { escaped = next; panic("fixture policy panic") }, func(context.Context) error { steps.Add(1); return nil })
+	}()
+	if escaped == nil || escaped(t.Context()) == nil || steps.Load() != 0 {
+		t.Fatal("panic unwound live callback gate")
+	}
+}

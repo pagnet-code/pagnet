@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/pagnet-code/pagnet/internal/nativeauthority"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 )
 
@@ -39,6 +40,7 @@ func validCredentialSlot(key string) bool {
 }
 func LocalNativeProfileFingerprint(spec NativeSpec) string {
 	copy := spec
+	copy.InputBindingProfile = nativeauthority.EffectiveInputBindingProfile(spec.InputBindingProfile)
 	copy.CredentialEnvKeys = append([]string(nil), spec.CredentialEnvKeys...)
 	sort.Strings(copy.CredentialEnvKeys)
 	copy.Env = nil
@@ -57,6 +59,9 @@ func LocalNativeProfileFingerprint(spec NativeSpec) string {
 	return hex.EncodeToString(digest[:])
 }
 func validateLocalEnvironment(spec NativeSpec, persisted bool) error {
+	if _, err := nativeauthority.NewInputBinder(spec.InputBindingProfile, [32]byte{}); err != nil {
+		return err
+	}
 	if !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) || agentruntime.ValidateExtraEnv(spec.Env) != nil {
 		return errors.New("local native executable/profile environment invalid")
 	}

@@ -322,7 +322,7 @@ func (a *AuthorityTx) SignCallerProof(c fabric.ExecutionContext, original []byte
 
 // SignDispatchAdmission verifies the finalized view and exact current registered
 // target/binding. Caller identity/system fields remain bound to original bytes.
-func (a *AuthorityTx) SignDispatchAdmission(c fabric.ExecutionContext, original, finalized []byte, f fabric.DispatchAdmissionFrame) ([]byte, error) {
+func (a *AuthorityTx) SignDispatchAdmission(c fabric.ExecutionContext, original, finalized []byte, f fabric.DispatchAdmissionFrame, prepared ...*PreparedInvocationTarget) ([]byte, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if e := a.guard(); e != nil {
@@ -339,8 +339,11 @@ func (a *AuthorityTx) SignDispatchAdmission(c fabric.ExecutionContext, original,
 	if e = fabric.DecodeJSON(finalized, &after); e != nil || after.Validate() != nil {
 		return nil, invalid("Finalized invocation malformed")
 	}
-	if after.Target == nil || *after.Target != a.scope.Endpoint || after.ExpectedRevision != a.scope.ExpectedRevision || after.Operation != fabric.OperationInvoke {
+	if after.Target == nil || after.Operation != fabric.OperationInvoke {
 		return nil, invalid("Finalized target outside registered scope")
+	}
+	if _, e = a.verifyInvocationTarget(*after.Target, after.ExpectedRevision, after.Payload, prepared...); e != nil {
+		return nil, e
 	}
 	x, y := before, after
 	x.Payload = nil
