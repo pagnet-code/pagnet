@@ -79,6 +79,13 @@ type Config struct {
 	// store and fed as incremental search.Batch deltas. Nil = the daemon
 	// imports nothing (no implicit root, no silent pin).
 	HostedCatalogImporter *HostedCatalogImporter
+	// HostedAdvertise is the per-connect advertisement gate. It is called on
+	// the connect context before each (re)connect, and the connect query carries
+	// the fabric-hosted-native capability ONLY when it returns true. It is a
+	// composition-supplied gate (the fused installed product supplies
+	// bindings.Ready); nil = the daemon never advertises (no implicit
+	// enabling, no enabling by the mere presence of a SID or a fixture).
+	HostedAdvertise func(context.Context) bool
 	// FabricMCP is trusted local-node composition; nil refuses the explicit
 	// fabric.mcp protocol instead of falling back to the cloud tool relay.
 	FabricMCP    *ManagedFabricMCP
@@ -983,7 +990,7 @@ func isAuthReject(err error) bool {
 	return strings.Contains(s, "http 401") || strings.Contains(s, "http 403")
 }
 
-func (d *Daemon) wsURL() string {
+func (d *Daemon) wsURL(ctx context.Context) string {
 	base := strings.TrimSuffix(d.ServerURL, "/")
 	u, err := url.Parse(base)
 	if err != nil {
@@ -1010,6 +1017,13 @@ func (d *Daemon) wsURL() string {
 		q.Set("native_owned_deletion", transport.NativeOwnedDeletionProtocol)
 		q.Set("native_resource_interruption", transport.NativeResourceInterruptionProtocol)
 	}
+	// The fabric-hosted-native capability is advertised per (re)connect, only
+	// when the composition-supplied gate passes on this connect context: the
+	// fused product gates on bindings.Ready, so a half-composed or not-yet-
+	// authenticated state advertises nothing (no enabling by fixture or SID).
+	if d.HostedAdvertise != nil && d.HostedAdvertise(ctx) {
+		q.Set("fabric_hosted_native", transport.FabricHostedProtocol)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -1024,7 +1038,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(), hdr)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(ctx), hdr)
 	if err != nil {
 		if resp != nil {
 			return fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)

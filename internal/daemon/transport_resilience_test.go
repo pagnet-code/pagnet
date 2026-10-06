@@ -72,7 +72,7 @@ func TestWriteFailureInvalidatesAndReconnects(t *testing.T) {
 
 	// --- Phase 1: a write failure on curConn invalidates it ---
 	// Dial a connection to the fake server; this becomes the current conn.
-	connA, _, err := websocket.DefaultDialer.Dial(d.wsURL(), nil)
+	connA, _, err := websocket.DefaultDialer.Dial(d.wsURL(context.Background()), nil)
 	if err != nil {
 		t.Fatalf("dial connA: %v", err)
 	}

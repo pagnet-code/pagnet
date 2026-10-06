@@ -16,6 +16,7 @@ import (
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
 	"github.com/pagnet-code/pagnet/fabric/telemetry"
+	"github.com/pagnet-code/pagnet/internal/daemon"
 	"github.com/pagnet-code/pagnet/internal/fabricadmin"
 	"github.com/pagnet-code/pagnet/internal/fabrichost"
 	"github.com/pagnet-code/pagnet/internal/fabricmcp"
@@ -45,6 +46,13 @@ type InstalledConfig struct {
 	ExtensionPaging *ExtensionPagerOptions
 	// ObserveIndexPublication is trusted bounded observation, never authorization.
 	ObserveIndexPublication func(bool, error)
+	// Hosted is the explicit installed hosted product. Nil = the product is
+	// unavailable (explicit, never implicit). When set, OpenInstalled composes
+	// the actual owner guard, runtime bindings, invocation guard, sideports,
+	// catalog and admin over the loaded installation. A non-nil Hosted on a
+	// platform without the daemon's native worker lane is a startup error, not
+	// a silent skip.
+	Hosted *InstalledHostedConfig
 }
 
 // InstalledNode is the actual local socket/product composition. The installation
@@ -57,6 +65,7 @@ type InstalledNode struct {
 	Events         *EventRuntime
 	Extensions     *ExtensionRuntime
 	Publisher      *IndexPublisher
+	Hosted         *InstalledHosted
 	Host           *fabrichost.Host
 	server         *fabricmcp.Server
 	admin          *fabricadmin.Server
@@ -137,15 +146,50 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			return nil, nil
 		}
 	}
-	result.Node, err = ComposeRetained(ctx, installation.Store, func(ctx context.Context, store *registry.Store, _ *search.Backend) (Ports, error) {
-		result.Runtime, err = NewLocalRuntime(ctx, store, LocalRuntimeConfig{Operator: installation, Native: NativeRuntimeConfig{
+	// The installed hosted product is explicit, never implicit. The owner guard
+	// is composed before the native runtime because the runtime's authenticator
+	// uses it as the owner validator (chaining the original-worker roots over
+	// the local managed-owner gate). Its `next` is fail-closed until the native
+	// runtime exists and is wired to the local owner validator below. The
+	// bindings, publisher and daemon references are wired post-daemon.
+	var (
+		hostedDeferred   *hostedDeferred
+		hostedOwnerGuard *daemon.HostedOwnerGuard
+		hostedSearch     *search.Backend
+	)
+	if c.Hosted != nil {
+		if !HostedNativeLaneAvailable() {
+			return nil, fabric.NewError(fabric.CodeUnsupported, "Installed hosted product requires the daemon native worker lane")
+		}
+		hostedDeferred = newHostedDeferred()
+		if hostedOwnerGuard, err = daemon.NewHostedOwnerGuard(hostedDeferred.ownerValidator()); err != nil {
+			return nil, err
+		}
+	}
+	result.Node, err = ComposeRetained(ctx, installation.Store, func(ctx context.Context, store *registry.Store, index *search.Backend) (Ports, error) {
+		if c.Hosted != nil {
+			hostedSearch = index
+		}
+		nativeCfg := NativeRuntimeConfig{
 			Owner: owner, Protector: installation.Keys, Credentials: credentials, CleanupCaller: installation.Operator,
 			Binary: c.Binary, AuthorityDirectory: c.Directory, SocketPath: settings.SocketPath,
 			ControllerBootID: hex.EncodeToString(boot), MaxWorkers: settings.MaxWorkers,
 			MaxStartupMetadataBytes: settings.MaxStartupMetadataBytes, StartupTimeout: time.Duration(settings.StartupTimeoutMillis) * time.Millisecond,
-		}})
+		}
+		if c.Hosted != nil {
+			nativeCfg.OwnerValidator = hostedOwnerGuard.Validate
+			nativeCfg.HostedValidator = hostedDeferred.hostedValidator()
+			nativeCfg.HostedFacts = hostedDeferred.hostedFacts()
+		}
+		result.Runtime, err = NewLocalRuntime(ctx, store, LocalRuntimeConfig{Operator: installation, Native: nativeCfg})
 		if err != nil {
 			return Ports{}, err
+		}
+		if c.Hosted != nil {
+			// The native runtime now exists: the owner guard's `next` is the
+			// local node's owner validator (the installed node's local
+			// owner/managed gate).
+			hostedDeferred.setNext(result.Runtime.Peers.ValidateOwner)
 		}
 		ports := result.Runtime.Ports()
 		resources = &installedRuntimes{native: result.Runtime}
@@ -212,6 +256,15 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 	resources.mu.Lock()
 	resources.publisher = result.Publisher
 	resources.mu.Unlock()
+	// The installed hosted product over the loaded installation and composed
+	// native runtime. A composition failure with an explicit Hosted config is a
+	// startup failure (the retained-cleanup path above handles the join).
+	if c.Hosted != nil {
+		result.Hosted, err = newInstalledHosted(ctx, result, *c.Hosted, hostedDeferred, hostedOwnerGuard, hostedSearch)
+		if err != nil {
+			return nil, err
+		}
+	}
 	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
 	if err != nil {
 		return nil, err
@@ -242,11 +295,25 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			handlers[operation] = handler
 		}
 	}
+	if result.Hosted != nil {
+		for operation, handler := range result.Hosted.Administration() {
+			if handlers[operation] != nil {
+				return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
+			}
+			handlers[operation] = handler
+		}
+	}
 	result.admin, err = fabricadmin.New(fabricadmin.Config{Handlers: handlers})
 	if err != nil {
 		return nil, err
 	}
-	result.Host, err = fabrichost.Start(ctx, fabrichost.Config{Protocols: map[string]fabrichost.VerifiedSessionServer{fabrichost.AdminProtocol: result.admin}, SocketPath: settings.SocketPath, Authority: result.Runtime.Authenticator, Server: result.server, ResolveManaged: result.Runtime.ManagedResolver()})
+	hostCfg := fabrichost.Config{Protocols: map[string]fabrichost.VerifiedSessionServer{fabrichost.AdminProtocol: result.admin}, SocketPath: settings.SocketPath, Authority: result.Runtime.Authenticator, Server: result.server, ResolveManaged: result.Runtime.ManagedResolver()}
+	if result.Hosted != nil {
+		// The node's private listener authenticates hosted peers: the resolver
+		// is fail-closed until the runtime bindings are wired post-daemon.
+		hostCfg.ResolveHosted = result.Hosted.ResolveHosted()
+	}
+	result.Host, err = fabrichost.Start(ctx, hostCfg)
 	if err != nil {
 		return nil, err
 	}

@@ -32,6 +32,18 @@ type NativeRuntimeConfig struct {
 	Binary, AuthorityDirectory, SocketPath, ControllerBootID string
 	MaxWorkers, MaxStartupMetadataBytes                      int
 	StartupTimeout, MaxInvocationDuration, CleanupTimeout    time.Duration
+	// OwnerValidator overrides the authenticator's owner guard. Nil = the
+	// local managed peers' owner validator (the default). The installed hosted
+	// product supplies the chained original-worker guard here.
+	OwnerValidator fabricauth.OwnerValidator
+	// HostedValidator / HostedFacts enable hosted-socket authentication on the
+	// node's private listener. Both must be set together (the fabricauth
+	// contract); nil = no hosted capability (the default). The installed
+	// hosted product supplies fail-closed closures over the deferred runtime
+	// bindings, so SupportsHosted holds at fabrichost.Start while the socket
+	// denies until the bindings are wired.
+	HostedValidator fabricauth.HostedValidator
+	HostedFacts     fabricauth.HostedFactsProvider
 }
 
 // NativeRuntime uses the one Store supplied to Open.Compose. It neither owns
@@ -125,12 +137,19 @@ func NewNativeRuntime(ctx context.Context, store *registry.Store, c NativeRuntim
 	if err != nil {
 		return nil, err
 	}
+	ownerValidator := r.Peers.ValidateOwner
+	if c.OwnerValidator != nil {
+		ownerValidator = c.OwnerValidator
+	}
+	if (c.HostedValidator == nil) != (c.HostedFacts == nil) {
+		return nil, fabric.NewError(fabric.CodeInvalidInput, "Hosted validator and facts must be composed together")
+	}
 	r.Authenticator, err = fabricauth.New(fabricauth.Config{Root: root, RootOwner: root.Owner, Audience: root.Namespace, SocketPath: c.SocketPath, CurrentRoot: func(ctx context.Context) (registry.AuthorityIdentity, error) {
 		if r.closing.Load() {
 			return registry.AuthorityIdentity{}, fabric.NewError(fabric.CodeTargetUnavailable, "Native runtime is closing")
 		}
 		return store.CurrentAuthorityIdentity(ctx)
-	}, OwnerValidator: r.Peers.ValidateOwner, ManagedValidator: r.Peers.ValidateManaged, ManagedFacts: r.Peers.CurrentCallerFacts})
+	}, OwnerValidator: ownerValidator, ManagedValidator: r.Peers.ValidateManaged, ManagedFacts: r.Peers.CurrentCallerFacts, HostedValidator: c.HostedValidator, HostedFacts: c.HostedFacts})
 	if err != nil {
 		return nil, err
 	}

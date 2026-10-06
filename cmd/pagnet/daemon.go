@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,8 +33,11 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/pagnet-code/pagnet/fabric/registry"
+	"github.com/pagnet-code/pagnet/fabric/search"
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/daemon"
+	"github.com/pagnet-code/pagnet/internal/fabricnode"
 )
 
 // The daemon flag values. The same flag set is registered on the ROOT
@@ -179,7 +183,33 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		os.Setenv("PAGNET_STATE_DIR", cfg.StateDir)
 	}
 
-	d, err := daemon.New(daemon.Config{
+	// Fused installed hosted product (Phase A step 6): pagnet serve is the
+	// cloud daemon AND, when the operator has a local Fabric installation, the
+	// actual installed hosted product over it. An ABSENT installation is
+	// daemon-only (one honest log line, never a silent fixture); a PRESENT but
+	// corrupt installation is a startup failure (no silent skip). The
+	// daemon-side components and the per-connect advertisement gate are wired
+	// here; the runtime bindings, catalog publisher and importer are wired
+	// post-daemon (they need the daemon, which does not exist yet).
+	installDir, _, err := localFabricPaths("", "")
+	if err != nil {
+		return err
+	}
+	node, err := openFusedInstallation(cmd.Context(), installDir)
+	if err != nil {
+		var retained *fabricnode.InstalledOpenError
+		if errors.As(err, &retained) {
+			cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			err = errors.Join(err, retained.CloseContext(cleanup))
+		}
+		return err
+	}
+	if node == nil {
+		log.Info("pagnet serve: no local Fabric installation; serving daemon-only (hosted product unavailable)", "dir", installDir)
+	}
+
+	daemonCfg := daemon.Config{
 		ServerURL:    server,
 		Credential:   cfg.Credential,
 		HostID:       cfg.HostID,
@@ -198,11 +228,76 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
 		// non-loopback control plane / release URL).
 		InsecureRemoteHTTP: insecureRemoteHTTP,
-	}, log)
+	}
+	// advertiseGate is assigned post-daemon (the runtime bindings need the
+	// daemon); the closure is fail-closed (never advertises) until then, and
+	// it is called on the connect context once per (re)connect.
+	var advertiseGate func(context.Context) bool
+	if node != nil {
+		h := node.Hosted
+		daemonCfg.HostedOwnerGuard = h.OwnerGuard
+		daemonCfg.HostedInvocationGuard = h.InvocationGuard
+		daemonCfg.HostedFabricSideports = h.Sideports
+		daemonCfg.HostedAdvertise = func(ctx context.Context) bool {
+			return advertiseGate != nil && advertiseGate(ctx)
+		}
+	}
+	d, err := daemon.New(daemonCfg, log)
 	if err != nil {
+		if node != nil {
+			_ = node.Close()
+		}
 		return fmt.Errorf("init daemon: %w", err)
 	}
+	// Close order: the daemon FIRST (its hosted catalog importer feeds the
+	// node's search backend and must stop before the node releases its Store),
+	// then the node (which closes the installation last). Defers run LIFO, so
+	// the node close is registered before the daemon close.
+	defer func() {
+		if node != nil {
+			_ = node.Close()
+		}
+	}()
 	defer d.Close()
+
+	// Post-daemon wiring of the fused hosted product. It needs the daemon,
+	// which does not exist when the node is composed, and it all completes
+	// BEFORE the first host connection (d.Run). A failure here is a startup
+	// failure (the defers close the daemon, then the node).
+	if node != nil {
+		h := node.Hosted
+		wireCtx := cmd.Context()
+		bindings, bErr := fabricnode.NewHostedRuntimeBindings(wireCtx, node.Installation.Store, h.Profiles, d, h.OwnerGuard)
+		if bErr != nil {
+			return bErr
+		}
+		advertiseGate = func(ctx context.Context) bool { return bindings.Ready(ctx) == nil }
+		owner, oErr := node.Installation.Operator(wireCtx)
+		if oErr != nil {
+			return oErr
+		}
+		publisher, pErr := fabricnode.NewHostedCatalogPublisher(wireCtx, bindings, owner)
+		if pErr != nil {
+			return pErr
+		}
+		h.SetBindings(bindings)
+		h.SetPublisher(publisher)
+		h.SetDaemon(d)
+		h.SetProbe(d.ProbeHostedProfile)
+		if networks := h.Networks(); len(networks) > 0 {
+			importer, iErr := daemon.NewHostedCatalogImporter(d, daemon.HostedCatalogImporterConfig{
+				TrustedRoots: []registry.GenesisRecord{node.Installation.Store.Genesis()},
+				Networks:     networks,
+				Feed: func(ctx context.Context, _ string, batch search.Batch) error {
+					return h.SearchBackend.Apply(ctx, batch)
+				},
+			})
+			if iErr != nil {
+				return iErr
+			}
+			d.HostedCatalogImporter = importer
+		}
+	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -213,6 +308,28 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	return nil
+}
+
+// openFusedInstallation loads the operator's local Fabric installation for the
+// fused pagnet serve. An ABSENT installation dir is honest daemon-only (nil,
+// nil); a PRESENT dir that fails to load (corrupt/invalid) is a genuine
+// startup error (no silent skip). A present, valid installation composes the
+// actual installed hosted product (explicit Hosted config, never implicit).
+func openFusedInstallation(ctx context.Context, installDir string) (*fabricnode.InstalledNode, error) {
+	if _, statErr := os.Stat(installDir); os.IsNotExist(statErr) {
+		return nil, nil
+	} else if statErr != nil {
+		return nil, fmt.Errorf("inspect local installation: %w", statErr)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve executable for local installation: %w", err)
+	}
+	return fabricnode.OpenInstalled(ctx, fabricnode.InstalledConfig{
+		Directory: installDir,
+		Binary:    binary,
+		Hosted:    &fabricnode.InstalledHostedConfig{},
+	})
 }
 
 // --- first-run console handoff (BINDING 2026-09-22) ---------------------------
