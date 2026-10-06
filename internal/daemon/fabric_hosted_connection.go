@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -24,55 +25,121 @@ func (c *NativeObservationConnection) hostedFabricDisposition(p transport.Fabric
 	}
 }
 
+func (c *NativeObservationConnection) hostedFabricCatalogPageDisposition(p transport.FabricHostedCatalogPage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
+	if ch := c.pendingHostedFabric[p.RequestID]; ch != nil {
+		select {
+		case ch <- p:
+		default:
+		}
+	}
+}
+
 // Exact connection ownership and finite capacity apply to these new operations
 // as to existing native admission. Disconnect never selects a new connection.
-func (c *NativeObservationConnection) hostedFabricExchange(ctx context.Context, id, typ string, payload any) (transport.FabricHostedResult, error) {
+// The shared core returns the raw correlated reply; each typed exchange
+// asserts the reply's type (a mixed-up correlation is a conflict, never a
+// silent misparse).
+func (c *NativeObservationConnection) hostedFabricExchangeCore(ctx context.Context, id, typ string, payload any) (any, error) {
 	ctx, cancel := nativeDeliveryContext(ctx)
 	defer cancel()
-	ch := make(chan transport.FabricHostedResult, 1)
+	ch := make(chan any, 1)
 	c.mu.Lock()
 	if err := c.deliveryReadyLocked(false); err != nil {
 		c.mu.Unlock()
-		return transport.FabricHostedResult{}, err
+		return nil, err
 	}
 	if !slices.Contains(c.session.ProtocolFeatures, transport.FabricHostedProtocol) {
 		c.mu.Unlock()
-		return transport.FabricHostedResult{}, fabric.NewError(fabric.CodeUnsupported, "Hosted Fabric protocol is not configured")
+		return nil, fabric.NewError(fabric.CodeUnsupported, "Hosted Fabric protocol is not configured")
 	}
 	if c.pendingCountLocked() >= 64 {
 		c.mu.Unlock()
-		return transport.FabricHostedResult{}, ErrNativeObservationCapacity
+		return nil, ErrNativeObservationCapacity
 	}
 	if c.pendingHostedFabric == nil {
-		c.pendingHostedFabric = map[string]chan transport.FabricHostedResult{}
+		c.pendingHostedFabric = map[string]chan any{}
 	}
 	if c.pendingHostedFabric[id] != nil {
 		c.mu.Unlock()
-		return transport.FabricHostedResult{}, ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	c.pendingHostedFabric[id] = ch
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pendingHostedFabric, id); c.mu.Unlock() }()
 	if err := c.send(ctx, typ, payload); err != nil {
-		return transport.FabricHostedResult{}, err
+		return nil, err
 	}
 	select {
 	case <-ctx.Done():
-		return transport.FabricHostedResult{}, ctx.Err()
+		return nil, ctx.Err()
 	case <-c.closed:
-		return transport.FabricHostedResult{}, ErrNativeOriginAdmissionDeferred
-	case result := <-ch:
+		return nil, ErrNativeOriginAdmissionDeferred
+	case reply := <-ch:
 		if _, err := c.AuthenticatedNativeHostSession(); err != nil {
-			return transport.FabricHostedResult{}, err
+			return nil, err
 		}
 		if err := ctx.Err(); err != nil {
-			return transport.FabricHostedResult{}, err
+			return nil, err
 		}
-		if result.Error != nil {
-			return transport.FabricHostedResult{}, result.Error
-		}
-		return result, nil
+		return reply, nil
 	}
+}
+
+func (c *NativeObservationConnection) hostedFabricExchange(ctx context.Context, id, typ string, payload any) (transport.FabricHostedResult, error) {
+	reply, err := c.hostedFabricExchangeCore(ctx, id, typ, payload)
+	if err != nil {
+		return transport.FabricHostedResult{}, err
+	}
+	result, ok := reply.(transport.FabricHostedResult)
+	if !ok {
+		return transport.FabricHostedResult{}, ErrNativeObservationConflict
+	}
+	if result.Error != nil {
+		return transport.FabricHostedResult{}, result.Error
+	}
+	return result, nil
+}
+
+// RequestHostedFabricCatalog is the daemon's bounded hosted-catalog import
+// request over this exact authenticated connection: one page of the
+// server-side hosted catalog, correlated by RequestID and re-checked against
+// the request (network identity, the DECLARED byte/record bounds — an
+// over-bound served page is a protocol violation, not data).
+func (c *NativeObservationConnection) RequestHostedFabricCatalog(ctx context.Context, req transport.FabricHostedCatalogRequest) (transport.FabricHostedCatalogPage, error) {
+	if err := req.Validate(); err != nil {
+		return transport.FabricHostedCatalogPage{}, err
+	}
+	reply, err := c.hostedFabricExchangeCore(ctx, req.RequestID, transport.MsgFabricHostedCatalogRequest, req)
+	if err != nil {
+		return transport.FabricHostedCatalogPage{}, err
+	}
+	page, ok := reply.(transport.FabricHostedCatalogPage)
+	if !ok {
+		return transport.FabricHostedCatalogPage{}, ErrNativeObservationConflict
+	}
+	if err := page.Validate(); err != nil {
+		return transport.FabricHostedCatalogPage{}, err
+	}
+	if page.RequestID != req.RequestID || page.NetworkID != req.NetworkID {
+		return transport.FabricHostedCatalogPage{}, ErrNativeObservationConflict
+	}
+	if len(page.Records) > req.MaxRecords {
+		return transport.FabricHostedCatalogPage{}, ErrNativeObservationConflict
+	}
+	if raw, err := json.Marshal(page.Records); err != nil || len(raw) > req.MaxBytes {
+		return transport.FabricHostedCatalogPage{}, ErrNativeObservationConflict
+	}
+	if page.Error != nil {
+		return transport.FabricHostedCatalogPage{}, page.Error
+	}
+	return page, nil
 }
 
 func (c *NativeObservationConnection) PublishHostedFabric(ctx context.Context, p transport.FabricHostedPublication) error {

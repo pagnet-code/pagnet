@@ -112,6 +112,10 @@ func OpenState(path string) (*State, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate hosted source finals: %w", err)
 	}
+	if err := state.initHostedCatalogProjection(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate hosted catalog projection: %w", err)
+	}
 	return state, nil
 }
 

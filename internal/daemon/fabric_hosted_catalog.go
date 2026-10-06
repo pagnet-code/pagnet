@@ -37,7 +37,7 @@ func (d *Daemon) PrepareHostedCatalog(ctx context.Context, profile fabricagent.H
 	if fabric.DecodeJSON(genesis.Body, &root) != nil || string(root.PublicKey) != string(publication.DomainPublicKey) {
 		return transport.FabricHostedPublication{}, ErrNativeObservationConflict
 	}
-	body, err := json.Marshal(HostedCatalogBody{"pagnet.hosted.catalog.v1", genesis, record})
+	body, err := json.Marshal(HostedCatalogBody{hostedCatalogProtocol, genesis, record})
 	if err != nil || len(body) > 128<<10 {
 		return transport.FabricHostedPublication{}, fabric.NewError(fabric.CodeInvalidInput, "Hosted catalog proof exceeds its bounded descriptor budget")
 	}

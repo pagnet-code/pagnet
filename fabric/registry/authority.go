@@ -284,6 +284,13 @@ func installPrivate(dir, path string, b []byte) error {
 
 func invalid(message string) error  { return fabric.NewError(fabric.CodeInvalidInput, message) }
 func conflict(message string) error { return fabric.NewError(fabric.CodeStaleReference, message) }
+
+// ValidateGenesis authenticates an explicitly configured trusted root. It is
+// the composition-time gate for an external trust set (the daemon's hosted
+// catalog import): pure verification over the self-certifying genesis — it
+// reads no store and establishes no pin.
+func ValidateGenesis(g GenesisRecord) (GenesisBody, error) { return decodeGenesis(g) }
+
 func decodeGenesis(g GenesisRecord) (GenesisBody, error) {
 	var body GenesisBody
 	if len(g.Body) > 32768 || len(g.Signature) != ed25519.SignatureSize {

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,6 +109,11 @@ type hostedGuardFixture struct {
 	// workerEnv is applied to the daemon before the native worker is
 	// launched (the fake runtime's deterministic output knobs).
 	workerEnv []string
+	// catalogServer is the test-side server half of the hosted catalog
+	// import pair (step 5); nil = the fixture serves no catalog pages.
+	// Atomic: the responder reads it from the importer's goroutine while
+	// the test goroutine (re)queues a generation.
+	catalogServer atomic.Pointer[hostedCatalogTestServer]
 }
 
 type hostedGuardFixtureOption func(*hostedGuardFixture)
@@ -164,7 +170,7 @@ func newHostedGuardFixture(t *testing.T, opts ...hostedGuardFixtureOption) *host
 	// The observation lane: a direct test responder committing activation
 	// origin, session renewal and ownership registration, exactly like the
 	// control plane would.
-	admission := transport.HostSessionPayload{TenantID: tenantID, AccountID: tenantID, OwnershipScope: "personal", HostID: d.HostID, BootID: d.bootID, NativeAdmissionID: domain.NewID().String(), RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol}}
+	admission := transport.HostSessionPayload{TenantID: tenantID, AccountID: tenantID, OwnershipScope: "personal", HostID: d.HostID, BootID: d.bootID, NativeAdmissionID: domain.NewID().String(), RunnerID: domain.NewID().String(), RunnerEpoch: time.Now().UTC(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol, transport.FabricHostedProtocol}}
 	ownershipID := domain.NewID().String()
 	var ownerConn *NativeObservationConnection
 	ownerConn = NewNativeObservationConnection(d.ServerURL, d.HostID, d.bootID, func(_ context.Context, typ string, payload any) error {
@@ -182,6 +188,10 @@ func newHostedGuardFixture(t *testing.T, opts ...hostedGuardFixtureOption) *host
 			p := payload.(transport.NativeOwnershipRegisterPayload)
 			o := transport.NativeWorkerOwnership{ID: ownershipID, InstanceID: p.InstanceID, OwnershipGeneration: p.OwnershipGeneration, Runtime: p.Runtime, Profile: p.Profile, ProfileFingerprint: p.ProfileFingerprint, OriginalAdmissionID: p.NativeAdmissionID, State: "active"}
 			ownerConn.OwnershipDisposition(transport.NativeOwnershipRegisteredPayload{RequestID: p.RequestID, Ownership: &o})
+		case transport.MsgFabricHostedCatalogRequest:
+			if cs := f.catalogServer.Load(); cs != nil {
+				cs.serveRequest(payload.(transport.FabricHostedCatalogRequest))
+			}
 		default:
 			t.Errorf("unexpected observation message %s", typ)
 		}

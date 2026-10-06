@@ -71,6 +71,14 @@ type Config struct {
 	// authenticated bridge handshake (auth_ok) and nowhere else;
 	// unconfigured daemons advertise no sideport (fail-closed).
 	HostedFabricSideports *HostedFabricSideports
+	// HostedCatalogImporter is the explicit trusted composition of the
+	// hosted catalog's IMPORT side (signed selective catalog sync): bounded
+	// relay deltas over the authenticated host connection, each record
+	// verified against an EXPLICITLY trusted domain root before it is
+	// projected into the daemon's separate verified non-authoritative
+	// store and fed as incremental search.Batch deltas. Nil = the daemon
+	// imports nothing (no implicit root, no silent pin).
+	HostedCatalogImporter *HostedCatalogImporter
 	// FabricMCP is trusted local-node composition; nil refuses the explicit
 	// fabric.mcp protocol instead of falling back to the cloud tool relay.
 	FabricMCP    *ManagedFabricMCP
@@ -1079,6 +1087,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	// like the heartbeat, so no stale PINGs outlive the conn.
 	ping := time.NewTicker(d.pingEvery)
 	defer ping.Stop()
+	// Hosted catalog import refresh (signed selective catalog sync): a
+	// bounded, backoff-gated pass per configured network. The trigger only
+	// launches a non-blocking goroutine fenced to THIS connection — it
+	// never stalls the heartbeat, the command flow or the read loop.
+	catalog := time.NewTicker(hostedCatalogRefreshEvery)
+	defer catalog.Stop()
 	// Exits when THIS connection ends (not only on daemon shutdown) — a
 	// goroutine that only watches ctx would survive every reconnect as a
 	// dormant leak capturing the dead conn.
@@ -1097,9 +1111,14 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				d.maintainState()
 			case <-ping.C:
 				d.pingConn(conn)
+			case <-catalog.C:
+				d.triggerHostedCatalogSync(ctx)
 			}
 		}
 	}()
+	// Import sync at host-connection establishment (the first pass after a
+	// (re)connect; the ticker above is the bounded periodic refresh).
+	d.triggerHostedCatalogSync(ctx)
 
 	// Unblock the read loop on shutdown: closing the connection makes a
 	// pending ReadMessage return an error so the daemon can exit cleanly.

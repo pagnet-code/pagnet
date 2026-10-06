@@ -36,6 +36,11 @@ func (c *NativeObservationConnection) HandleEnvelope(env transport.Envelope) (ha
 		if err = env.DecodePayload(&p); err == nil {
 			c.hostedFabricDisposition(p)
 		}
+	case transport.MsgFabricHostedCatalogPage:
+		var p transport.FabricHostedCatalogPage
+		if err = env.DecodePayload(&p); err == nil {
+			c.hostedFabricCatalogPageDisposition(p)
+		}
 	case transport.MsgHostSession:
 		var p transport.HostSessionPayload
 		if err = env.DecodePayload(&p); err == nil {
