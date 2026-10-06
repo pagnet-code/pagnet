@@ -114,6 +114,10 @@ type hostedGuardFixture struct {
 	// Atomic: the responder reads it from the importer's goroutine while
 	// the test goroutine (re)queues a generation.
 	catalogServer atomic.Pointer[hostedCatalogTestServer]
+	// invokeServer is the test-side server half of the step-6b admit
+	// exchange (a fake host answering MsgFabricHostedInvoke); nil = the
+	// fixture serves no admits. Atomic for the same reason as catalogServer.
+	invokeServer atomic.Pointer[hostedInvokeTestServer]
 }
 
 type hostedGuardFixtureOption func(*hostedGuardFixture)
@@ -191,6 +195,10 @@ func newHostedGuardFixture(t *testing.T, opts ...hostedGuardFixtureOption) *host
 		case transport.MsgFabricHostedCatalogRequest:
 			if cs := f.catalogServer.Load(); cs != nil {
 				cs.serveRequest(payload.(transport.FabricHostedCatalogRequest))
+			}
+		case transport.MsgFabricHostedInvoke:
+			if is := f.invokeServer.Load(); is != nil {
+				is.serveRequest(payload.(transport.FabricHostedInvocation))
 			}
 		default:
 			t.Errorf("unexpected observation message %s", typ)

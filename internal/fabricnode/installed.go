@@ -156,12 +156,16 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		hostedDeferred   *hostedDeferred
 		hostedOwnerGuard *daemon.HostedOwnerGuard
 		hostedSearch     *search.Backend
+		hostedProvider   *hostedNativeProvider
 	)
 	if c.Hosted != nil {
 		if !HostedNativeLaneAvailable() {
 			return nil, fabric.NewError(fabric.CodeUnsupported, "Installed hosted product requires the daemon native worker lane")
 		}
 		hostedDeferred = newHostedDeferred()
+		// The router provider is fail-closed until the product (post
+		// newInstalledHosted) and the daemon (post-daemon wiring) exist.
+		hostedProvider = newHostedNativeProvider(result, hostedDeferred)
 		if hostedOwnerGuard, err = daemon.NewHostedOwnerGuard(hostedDeferred.ownerValidator()); err != nil {
 			return nil, err
 		}
@@ -192,6 +196,19 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			hostedDeferred.setNext(result.Runtime.Peers.ValidateOwner)
 		}
 		ports := result.Runtime.Ports()
+		if c.Hosted != nil {
+			// The native fallback router (local.native only) must also serve
+			// the installed hosted actor's binding; without it the canonical
+			// invoke chain cannot resolve the hosted endpoint at all.
+			hostedRouter, e := NewRouter(map[BindingProtocol]BindingProvider{
+				{Protocol: "local.native", Version: "1"}:              result.Runtime.BindingProvider,
+				{Protocol: HostedNativeBindingProtocol, Version: "1"}: hostedProvider,
+			})
+			if e != nil {
+				return Ports{}, e
+			}
+			ports.Bindings = hostedRouter
+		}
 		resources = &installedRuntimes{native: result.Runtime}
 		ports.Close = resources
 		if serviceConfig != nil {
@@ -209,6 +226,9 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			}
 			providers := result.Services.Bindings()
 			providers[BindingProtocol{Protocol: "local.native", Version: "1"}] = result.Runtime.BindingProvider
+			if c.Hosted != nil {
+				providers[BindingProtocol{Protocol: HostedNativeBindingProtocol, Version: "1"}] = hostedProvider
+			}
 			router, e := NewRouter(providers)
 			if e != nil {
 				return Ports{}, e
@@ -264,6 +284,7 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		if err != nil {
 			return nil, err
 		}
+		hostedProvider.setProduct(result.Hosted)
 	}
 	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
 	if err != nil {
