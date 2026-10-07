@@ -242,6 +242,11 @@ func TestDaemonHostedInvocationPrepareSealPinned(t *testing.T) {
 	if _, err := rand.Read(raw); err != nil {
 		t.Fatal(err)
 	}
+	// Force the version nibble to 4 (variant to 10): a raw random ID is
+	// v7-shaped with probability 1/16, in which case it would carry an
+	// embedded timestamp.
+	raw[6] = raw[6]&0x0f | 0x40
+	raw[8] = raw[8]&0x3f | 0x80
 	nonV7 := hex.EncodeToString(raw)
 
 	cipher, aad, err := f.d.PrepareHostedInvocation(ctx, f.profile, nonV7, promptBytes)
