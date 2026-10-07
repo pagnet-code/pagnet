@@ -89,6 +89,7 @@ func runMain(args []string, build string) error {
 	defer cancel()
 	ctx, cancelWorker := workerSignals(ctx)
 	defer cancelWorker()
+	stateDirWatchdog(ctx, *dir, cancelWorker)
 	journal, err := OpenJournal(*dir, bootstrap.Scope)
 	if err != nil {
 		return err

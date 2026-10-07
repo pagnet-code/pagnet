@@ -114,6 +114,7 @@ func runLocalMain(raw []byte, dir string, envFD int, build string) error {
 	defer cancel()
 	ctx, cancelWorker := workerSignals(ctx)
 	defer cancelWorker()
+	stateDirWatchdog(ctx, dir, cancelWorker)
 	j, e := OpenAuthorityJournal(dir, b.Authority)
 	if e != nil {
 		return e
