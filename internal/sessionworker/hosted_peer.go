@@ -36,7 +36,10 @@ func (o *SessionOwner) verifyHostedPeer(ctx context.Context, lease int64, r Host
 	o.mu.Lock()
 	nonce, generation := o.nonce, o.generation
 	o.mu.Unlock()
-	if nonce == "" || generation != r.NativeGeneration || subtle.ConstantTimeCompare([]byte(nonce), []byte(r.Nonce)) != 1 {
+	// The generation is the STABLE sideport identity: the signed scope
+	// generation the association pinned (immutable per bootstrap). Only the
+	// nonce is the per-activation fence.
+	if nonce == "" || o.journal.scope.Generation != r.NativeGeneration || subtle.ConstantTimeCompare([]byte(nonce), []byte(r.Nonce)) != 1 {
 		return nil, ErrFenced
 	}
 	snapshot := o.physicalSnapshot()
@@ -68,5 +71,5 @@ func (o *SessionOwner) verifyHostedPeer(ctx context.Context, lease int64, r Host
 	if _, e := o.relay.authorizeNativeEffect(lease); e != nil {
 		return nil, e
 	}
-	return &HostedPeerVerificationResult{r.Peer, o.journal.scope, generation, snapshot.NativeSessionID, snapshot.PID, snapshot.NativeStartIdentity}, nil
+	return &HostedPeerVerificationResult{r.Peer, o.journal.scope, o.journal.scope.Generation, snapshot.NativeSessionID, snapshot.PID, snapshot.NativeStartIdentity}, nil
 }

@@ -87,9 +87,12 @@ func TestActualNativeInvocationParserOutputOriginalEncryption(t *testing.T) {
 		if readErr != nil {
 			t.Fatal("actual original process", readErr)
 		}
-		request := HostedPeerVerificationRequest{Peer: peer, Nonce: owner.nonce, NativeGeneration: owner.generation, NativeSessionID: sid}
+		// The sideport presents the STABLE scope generation (the association
+		// pins it to the signed profile); the per-activation value is the
+		// nonce, which the owner hands the bridge in its launch env.
+		request := HostedPeerVerificationRequest{Peer: peer, Nonce: owner.nonce, NativeGeneration: scope.Generation, NativeSessionID: sid}
 		proof, verifyErr := owner.verifyHostedPeer(ctx, current, request)
-		if verifyErr != nil || proof.Scope != scope || proof.NativeSessionID != sid || proof.Peer != peer || proof.RootPID != snapshot.PID {
+		if verifyErr != nil || proof.Scope != scope || proof.NativeSessionID != sid || proof.Peer != peer || proof.RootPID != snapshot.PID || proof.NativeGeneration != scope.Generation {
 			t.Fatal("original physical caller proof", proof, verifyErr)
 		}
 		for _, change := range []func(*HostedPeerVerificationRequest){
@@ -108,6 +111,26 @@ func TestActualNativeInvocationParserOutputOriginalEncryption(t *testing.T) {
 		if _, verifyErr = owner.verifyHostedPeer(ctx, current+1, request); verifyErr == nil {
 			t.Fatal("foreign controller lease accepted")
 		}
+		// Regression (hosted-native e2e, 2026-10-07): a generation replacement
+		// rotates the owner's nonce but NOT the sideport generation. A frozen
+		// pre-rotation bridge env (old nonce, same scope generation) must be
+		// fenced; a fresh post-rotation env (new nonce, same scope generation)
+		// must be admitted with the stable scope generation in the proof.
+		owner.mu.Lock()
+		rotated := request
+		rotated.Nonce = "rotated-nonce"
+		oldGeneration, oldNonce := owner.generation, owner.nonce
+		owner.generation, owner.nonce = "rotated-generation", "rotated-nonce"
+		owner.mu.Unlock()
+		if _, verifyErr = owner.verifyHostedPeer(ctx, current, request); verifyErr == nil {
+			t.Fatal("stale pre-rotation nonce accepted after generation replacement")
+		}
+		if rotatedProof, verifyErr := owner.verifyHostedPeer(ctx, current, rotated); verifyErr != nil || rotatedProof.NativeGeneration != scope.Generation {
+			t.Fatal("fresh post-rotation env fenced: ", rotatedProof, verifyErr)
+		}
+		owner.mu.Lock()
+		owner.generation, owner.nonce = oldGeneration, oldNonce
+		owner.mu.Unlock()
 		encoded, _ := json.Marshal(proof)
 		if bytes.Contains(encoded, []byte(owner.nonce)) {
 			t.Fatal("original nonce exposed in proof")
