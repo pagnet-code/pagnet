@@ -49,17 +49,32 @@ func pagnetWorkerBinary(t *testing.T) string {
 	bin := filepath.Join(dir, "pagnet-worker-bin")
 	needBuild := true
 	if fi, err := os.Stat(bin); err == nil {
-		srcFiles, gerr := filepath.Glob(filepath.Join("..", "..", "cmd", "pagnet", "*.go"))
-		if gerr == nil {
-			var newest time.Time
-			for _, f := range srcFiles {
-				if s, serr := os.Stat(f); serr == nil && s.ModTime().After(newest) {
+		// The worker binary links the WHOLE module (cmd/pagnet is only the
+		// entry point), so track the newest .go file anywhere in the module:
+		// a cmd/pagnet-only check silently serves a stale worker binary after
+		// any internal/* edit (the same trap p0FakeBinary documents for its
+		// own package). Unreadable dirs fall back to a rebuild.
+		var newest time.Time
+		werr := filepath.WalkDir(filepath.Join("..", ".."), func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", ".qwen", "bin":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasSuffix(p, ".go") {
+				if s, serr := d.Info(); serr == nil && s.ModTime().After(newest) {
 					newest = s.ModTime()
 				}
 			}
-			if !newest.IsZero() && fi.ModTime().After(newest) {
-				needBuild = false
-			}
+			return nil
+		})
+		if werr == nil && !newest.IsZero() && fi.ModTime().After(newest) {
+			needBuild = false
 		}
 	}
 	if needBuild {
