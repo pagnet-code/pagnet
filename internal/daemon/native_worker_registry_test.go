@@ -129,7 +129,7 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := EnsureNativeWorker(ctx, registry, record, os.Getenv("PAGNET_REGISTRY_CHILD_BINARY"), []string{"TEST_SECRET=never-persist"}); err != nil {
+		if err := EnsureNativeWorker(ctx, registry, record, os.Getenv("PAGNET_REGISTRY_CHILD_BINARY"), []string{"TEST_SECRET=never-persist"}, ""); err != nil {
 			os.Exit(12)
 		}
 		os.Exit(0) // original launching controller exits; worker must survive
@@ -225,7 +225,7 @@ func TestNativeWorkerDetachedLaunchAndAuthenticatedAdoption(t *testing.T) {
 	if err != nil || recovered.LaunchState != "launched" {
 		t.Fatal("launch state not durable", err)
 	}
-	if err := EnsureNativeWorker(fresh, reopened, recovered, binary, spec.Env); err != nil {
+	if err := EnsureNativeWorker(fresh, reopened, recovered, binary, spec.Env, ""); err != nil {
 		t.Fatal(err)
 	}
 	replacement, err := sessionworker.DialOwnerController(fresh, recovered.Dir, s, key, "controller-B")
@@ -273,7 +273,7 @@ func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) 
 	// the writer genuinely blocked when cancellation clears private memory.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	err = EnsureNativeWorker(ctx, r, record, binary, []string{"PRIVATE_FIXTURE=" + strings.Repeat("s", 120<<10)})
+	err = EnsureNativeWorker(ctx, r, record, binary, []string{"PRIVATE_FIXTURE=" + strings.Repeat("s", 120<<10)}, "")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("stalled private pipe did not cancel safely", err)
 	}
@@ -283,6 +283,58 @@ func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) 
 	}
 	// The synthetic child exits naturally; the helper never kills uncertain PIDs.
 	time.Sleep(320 * time.Millisecond)
+}
+
+// TestNativeWorkerFabricSideportInPrivatePipe pins the sideport pair's
+// placement in the env-fd pipe payload (bootstrap.Native.Env source): it
+// reaches the detached worker exactly when the daemon has the fused
+// node's sideport socket configured. The pair is a pagnet-internal
+// injection appended AFTER the ChildEnv filter — it never travels through
+// the operator runtime-env pairs (ValidateExtraEnv rejects the PAGNET_*
+// key except this one documented exception), so the daemon config, not the
+// runtime env, decides its presence.
+func TestNativeWorkerFabricSideportInPrivatePipe(t *testing.T) {
+	const sideport = "/h/.pagnet/run/fabric/local.sock"
+	for _, tc := range []struct {
+		name   string
+		socket string
+	}{
+		{"sideport set", sideport},
+		{"sideport unset", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, s, spec := nativeRegistryFixture(t)
+			marker := filepath.Join(t.TempDir(), "pipe-payload")
+			binary := filepath.Join(t.TempDir(), "sideport-probe")
+			// The probe dumps the private env-fd payload and exits. It never
+			// creates the readiness socket, so EnsureNativeWorker is expected
+			// to time out AFTER the payload has crossed the pipe.
+			if err := os.WriteFile(binary, []byte("#!/bin/sh\ncat < /dev/fd/3 > "+marker+"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			record, err := r.Reserve(s, spec, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			if err := EnsureNativeWorker(ctx, r, record, binary, spec.Env, tc.socket); err == nil {
+				t.Fatal("readiness wait succeeded although the probe never creates a socket")
+			}
+			data, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal("probe did not capture the pipe payload", err)
+			}
+			present := bytes.Contains(data, []byte("PAGNET_FABRIC_SIDEPORT="+sideport))
+			if tc.socket == "" {
+				if present {
+					t.Fatal("sideport pair rendered into the pipe payload without a configured socket")
+				}
+			} else if !present {
+				t.Fatalf("pipe payload lacks the sideport pair: %s", data)
+			}
+		})
+	}
 }
 
 func TestNativeWorkerRegistryAcceptsSafeParentWithoutChangingPermissions(t *testing.T) {

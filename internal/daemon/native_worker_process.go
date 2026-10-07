@@ -22,7 +22,7 @@ import (
 // readiness is not authentication: callers MUST next use AttachNativeWorker.
 // Cancellation, TCP disconnect and daemon Close never kill this process. An
 // unavailable previously launched owner requires explicit recovery, not restart.
-func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record NativeWorkerRecord, binary string, runtimeEnv []string) error {
+func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record NativeWorkerRecord, binary string, runtimeEnv []string, sideportSocket string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -36,7 +36,23 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 	// Capture the daemon's allowlisted execution environment in this private
 	// memory-only pipe before crossing that boundary, including PATH for CLI
 	// interpreters and provider authentication. Explicit runtime pairs still win.
-	envRaw, err := json.Marshal(agentruntime.ChildEnv(runtimeEnv))
+	pairs := agentruntime.ChildEnv(runtimeEnv)
+	if sideportSocket != "" {
+		// Pagnet-internal explicit injection appended AFTER the ChildEnv
+		// filter: the sandboxed runtime bridge (spawned by the worker's
+		// runtime endpoint) must open the sideport's parent directory, and
+		// the grant is fixed at endpoint spawn — which happens BEFORE the
+		// per-binding sideport association. The socket path itself is the
+		// node's static host socket (Config.HostedFabricSideportSocket),
+		// known at registration, so it belongs to the worker-level launch
+		// env (spec.Env via this pipe), not to the association. Only the
+		// daemon's operator can supply the value (invoker/agent surfaces
+		// never reach spec.Env); the worker re-validates this payload at
+		// owner creation, which documents PAGNET_FABRIC_SIDEPORT as the
+		// sanctioned PAGNET_ exception alongside PAGNET_FAKE_*.
+		pairs = append(pairs, "PAGNET_FABRIC_SIDEPORT="+sideportSocket)
+	}
+	envRaw, err := json.Marshal(pairs)
 	if err != nil || len(envRaw) > 128<<10 {
 		return errors.New("native worker environment exceeds bound")
 	}

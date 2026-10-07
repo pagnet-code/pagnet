@@ -252,7 +252,7 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		}
 		env = append(env, profile.config.Environment()...)
 	}
-	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env); err != nil {
+	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.HostedFabricSideportSocket); err != nil {
 		return err
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)

@@ -39,7 +39,7 @@ func (*NativeWorkerRegistry) Reserve(sessionworker.Scope, sessionworker.NativeSp
 func (*NativeWorkerRegistry) BindOwnership(NativeWorkerRecord, transport.NativeWorkerOwnership) error {
 	return errNativeWorkerPlatform
 }
-func EnsureNativeWorker(context.Context, *NativeWorkerRegistry, NativeWorkerRecord, string, []string) error {
+func EnsureNativeWorker(context.Context, *NativeWorkerRegistry, NativeWorkerRecord, string, []string, string) error {
 	return errNativeWorkerPlatform
 }
 

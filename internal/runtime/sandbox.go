@@ -123,15 +123,25 @@ type driverSandboxOpts struct {
 // PAGNET_MCP_CONFIG in the launch env: the socket (its `--socket`
 // argument) and the bridge worker's binary dir (its `command`) — the
 // sandboxed runtime must be able to EXEC its own MCP server, or it loses
-// its network tools at first use.
+// its network tools at first use. The hosted Fabric sideport (when the
+// daemon renders PAGNET_FABRIC_SIDEPORT) is recovered the same way: the
+// runtime's bridge dials it, and the sandboxed bridge must be able to
+// OPEN its parent directory (Landlock gates the open, not the connect).
 func driverSandbox(o driverSandboxOpts) *sandbox.Spec {
 	mcp := pagnetMCPConfig(o.env)
 	// Explicit finalized runtime profile HOME wins over the controller process
 	// environment, exactly as ChildEnv does when constructing the launched child.
-	var home string
+	var home, sideport string
 	for _, pair := range o.env {
-		if key, value, ok := strings.Cut(pair, "="); ok && key == "HOME" {
+		switch key, value, ok := strings.Cut(pair, "="); {
+		case ok && key == "HOME":
 			home = value
+		case ok && key == "PAGNET_FABRIC_SIDEPORT":
+			// The daemon-rendered hosted Fabric sideport socket: the runtime's
+			// MCP bridge dials it, and the sandboxed bridge must be able to
+			// OPEN the sideport's parent directory (directory opens are
+			// gated by Landlock; pathname socket connects are not).
+			sideport = value
 		}
 	}
 	return sandbox.NewSpec(sandbox.Options{
@@ -141,10 +151,25 @@ func driverSandbox(o driverSandboxOpts) *sandbox.Spec {
 		Binary:     o.binary,
 		Home:       home,
 		Socket:     sandbox.SocketFromMCPConfig(mcp),
+		Sockets:    socketsOrNil(sideport),
 		BridgeDir:  sandbox.BridgeDirFromMCPConfig(mcp),
 		ExtraRW:    o.extraRW,
 		Denied:     o.denied,
 	})
+}
+
+// socketsOrNil is the driver-level shape helper for Options.Sockets:
+// the recovered daemon-rendered socket pairs (nil when the pair is
+// absent or empty — an empty path would fail the spec's absolute-path
+// check at launch, so absence must stay a non-grant, not a grant).
+func socketsOrNil(values ...string) []string {
+	var out []string
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // fakeBridgeResultDir returns the directory of the

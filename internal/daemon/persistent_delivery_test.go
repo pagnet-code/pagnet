@@ -606,6 +606,61 @@ func TestDaemon_PersistentEndpointEnvInjection(t *testing.T) {
 	t.Logf("endpoint child (pid %d) carries the daemon's spec env", *pid)
 }
 
+// Acceptance 4b: the PAGNET_FABRIC_SIDEPORT launch env pair reaches the
+// endpoint child EXACTLY when the daemon carries the fused node's sideport
+// socket (Config.HostedFabricSideportSocket): the runtime's MCP bridge
+// dials the sideport and the sandbox must open its parent. An unconfigured
+// daemon never renders the pair (no socket, no grant, no pair).
+func TestDaemon_PersistentEndpointFabricSideportEnv(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("proc environ check is Linux-only (GOOS=%s)", runtime.GOOS)
+	}
+	for _, tc := range []struct {
+		name   string
+		socket string
+	}{
+		{"sideport unset", ""},
+		{"sideport set", ""}, // filled below (needs a real parent dir)
+	} {
+		if tc.name == "sideport set" {
+			tc.socket = filepath.Join(t.TempDir(), "local.sock") // parent exists
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			d := newPersistentTestDaemon(t)
+			if tc.name == "sideport set" {
+				d.HostedFabricSideportSocket = tc.socket
+			}
+			client, server := newMemWS(t)
+			d.connMu.Lock()
+			d.curConn = client
+			d.connMu.Unlock()
+
+			instanceID := domain.NewID().String()
+			driveLaunch(t, d, server, transport.LaunchAgentPayload{
+				CommandID: "cmd-sideport-launch", InstanceID: instanceID,
+				Runtime: string(domain.RuntimeFakePersistent), Kind: "representative",
+				AgentName: "sideport-agent",
+			})
+			driveDeliver(t, d, server, transport.NetworkEventPayload{
+				CommandID: "cmd-sideport-deliver", InstanceID: instanceID,
+				Kind: "task", Body: "first",
+			})
+			pid := d.sup.EndpointPID(instanceID)
+			if pid == nil {
+				t.Fatal("no live endpoint after the turn")
+			}
+			env := readDaemonProcEnviron(t, *pid)
+			if got, ok := env["PAGNET_FABRIC_SIDEPORT"]; tc.socket == "" {
+				if ok {
+					t.Fatalf("PAGNET_FABRIC_SIDEPORT = %q rendered without a configured sideport", got)
+				}
+			} else if got := env["PAGNET_FABRIC_SIDEPORT"]; got != tc.socket {
+				t.Fatalf("PAGNET_FABRIC_SIDEPORT = %q, want %q", got, tc.socket)
+			}
+		})
+	}
+}
+
 // Acceptance 5: the submit's logical turn id appears on the host-protocol
 // turn events the daemon emits (turn.started and turn.completed share it,
 // and it is non-empty) — the end-to-end logical turn identity.

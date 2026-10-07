@@ -444,6 +444,11 @@ type Options struct {
 	Home string
 	// Socket: the daemon bridge socket path (IPC authorization is separate).
 	Socket string
+	// Sockets: additional unix socket paths the launched process must be
+	// able to reach (same grant as Socket: READ_DIR on each parent —
+	// directory entry names, never file contents). E.g. the node's hosted
+	// Fabric sideport socket for managed runtimes whose bridge dials it.
+	Sockets []string
 	// BridgeDir: the directory containing the daemon bridge worker binary
 	// (the pagnet MCP server the runtime spawns as its child). RO grant
 	// (read+execute) — the sandboxed runtime must be able to EXEC its MCP
@@ -495,6 +500,7 @@ func NewSpec(o Options) *Spec {
 	if o.Socket != "" {
 		s.Sockets = append(s.Sockets, o.Socket)
 	}
+	s.Sockets = append(s.Sockets, o.Sockets...)
 	s.Denied = append(s.Denied, o.Denied...)
 	return s
 }

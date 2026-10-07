@@ -71,6 +71,17 @@ type Config struct {
 	// authenticated bridge handshake (auth_ok) and nowhere else;
 	// unconfigured daemons advertise no sideport (fail-closed).
 	HostedFabricSideports *HostedFabricSideports
+	// HostedFabricSideportSocket is the fused node's Fabric host socket
+	// ("" when this daemon has no local installation). It is granted to
+	// every runtime through the PAGNET_FABRIC_SIDEPORT launch env pair —
+	// rendered by turnSpecFor for managed runtimes and carried in the
+	// native worker's bootstrap pipe (worker-level spec.Env) for native
+	// workers, because the sandbox grant is fixed at endpoint spawn and
+	// the socket path is static: the runtime's MCP bridge must be able to
+	// OPEN the sideport's parent directory under the Landlock boundary
+	// (directory opens are gated; pathname socket connects are not), or
+	// the hosted sideport dial fails at the client-side preconnect check.
+	HostedFabricSideportSocket string
 	// HostedCatalogImporter is the explicit trusted composition of the
 	// hosted catalog's IMPORT side (signed selective catalog sync): bounded
 	// relay deltas over the authenticated host connection, each record
@@ -3254,6 +3265,21 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 			contractPathForSpec = cp
 		}
 	}
+	// The sideport pair is a pagnet-internal explicit injection (it does
+	// NOT go through runtimeEnv, whose validation rejects all PAGNET_*):
+	// the managed runtime's MCP bridge dials the fused node's hosted
+	// Fabric sideport and must be able to open its parent directory
+	// under the Landlock boundary (see Config.HostedFabricSideportSocket).
+	env := []string{
+		"PAGNET_INSTANCE_ID=" + row.InstanceID,
+		"PAGNET_AGENT_NAME=" + row.AgentName,
+		"PAGNET_NETWORK_ID=" + row.NetworkID,
+		"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
+		"PAGNET_COORDINATION_CONTRACT=" + contractPathForSpec,
+	}
+	if d.HostedFabricSideportSocket != "" {
+		env = append(env, "PAGNET_FABRIC_SIDEPORT="+d.HostedFabricSideportSocket)
+	}
 	return agentruntime.TurnSpec{
 		TurnID:               domain.NewID().String(),
 		InstanceID:           row.InstanceID,
@@ -3267,13 +3293,7 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 		AgentMDPath:          agentMDPath,
 		StandingInstructions: standingText,
 		Metadata:             map[string]any{"profile": row.Profile},
-		Env: []string{
-			"PAGNET_INSTANCE_ID=" + row.InstanceID,
-			"PAGNET_AGENT_NAME=" + row.AgentName,
-			"PAGNET_NETWORK_ID=" + row.NetworkID,
-			"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
-			"PAGNET_COORDINATION_CONTRACT=" + contractPathForSpec,
-		},
+		Env:                  env,
 		// F-CFG-1: the daemon's OWN state dir is the containment set — a
 		// spec whose RW grants cover it (e.g. a workspace of $HOME or of
 		// the state dir's parent) is refused at the launch's wrap, before

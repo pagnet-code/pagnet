@@ -63,7 +63,7 @@ func TestDetachedNativeWorkerPreservesFilteredExecutionEnvironment(t *testing.T)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	if err = EnsureNativeWorker(ctx, r, record, worker, spec.Env); err != nil {
+	if err = EnsureNativeWorker(ctx, r, record, worker, spec.Env, ""); err != nil {
 		t.Fatal(err)
 	}
 	_, key, err := sessionworker.LoadControllerBootstrap(record.Dir, scope)

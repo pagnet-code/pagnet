@@ -153,6 +153,36 @@ func TestComputeRules_NoAmbientAncestorListing(t *testing.T) {
 	}
 }
 
+// TestComputeRules_SideportSocketParent pins that a spec carrying BOTH the
+// daemon bridge socket and the node's hosted Fabric sideport grants each
+// socket's PARENT directory exactly directoryNamesAccess (READ_DIR: entry
+// names, never file contents) — the sandboxed bridge needs to OPEN the
+// sideport's parent (gated); connecting to the socket path itself is not.
+func TestComputeRules_SideportSocketParent(t *testing.T) {
+	spec := &Spec{Sockets: []string{"/state/pagnetd.sock", "/home/u/.pagnet/run/fabric/local.sock"}}
+	for _, version := range []int{3, 4, 5, 6, 9} {
+		t.Run(fmt.Sprintf("ABI%d", version), func(t *testing.T) {
+			rules, _, _, err := computeRules(spec, landlockABI{version: version, fsMask: landlockFSMask(version)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rules["/state"] != directoryNamesAccess {
+				t.Errorf("bridge parent grant = %#x, want directory names only", rules["/state"])
+			}
+			if rules["/home/u/.pagnet/run/fabric"] != directoryNamesAccess {
+				t.Errorf("sideport parent grant = %#x, want directory names only", rules["/home/u/.pagnet/run/fabric"])
+			}
+			// The sideport tree itself (and its daemon-state ancestors) is
+			// never granted beyond the parent's entry names.
+			for _, ancestor := range []string{"/home/u", "/home/u/.pagnet", "/"} {
+				if _, ok := rules[ancestor]; ok {
+					t.Errorf("unexpected listing grant %q (only the socket parent may be granted)", ancestor)
+				}
+			}
+		})
+	}
+}
+
 // TestComputeRules_MakeBitsGated pins the F-S2-2 rule shape: the RW grant
 // carries all seven MAKE_* bits on every supported ABI, including ABI1:
 // creation is granted inside the subtree and denied outside.

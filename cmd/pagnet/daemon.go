@@ -238,6 +238,10 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		daemonCfg.HostedOwnerGuard = h.OwnerGuard
 		daemonCfg.HostedInvocationGuard = h.InvocationGuard
 		daemonCfg.HostedFabricSideports = h.Sideports
+		// The managed runtimes' MCP bridges dial this socket (the Landlock
+		// sandbox must open its parent directory) — grant it through the
+		// PAGNET_FABRIC_SIDEPORT launch env pair (see the daemon Config).
+		daemonCfg.HostedFabricSideportSocket = node.Installation.Configuration().Settings.SocketPath
 		daemonCfg.HostedAdvertise = func(ctx context.Context) bool {
 			return advertiseGate != nil && advertiseGate(ctx)
 		}

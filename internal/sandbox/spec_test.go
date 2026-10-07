@@ -221,6 +221,25 @@ func TestNormalize_DeniedContainment(t *testing.T) {
 	}
 }
 
+// TestNewSpec_AdditionalSockets pins that Options.Sockets reaches
+// Spec.Sockets alongside Options.Socket (bridge first, additional sockets
+// after) and that Normalize de-duplicates a socket listed twice: the
+// production shape is the daemon bridge socket plus the node's hosted
+// Fabric sideport the runtime's bridge dials.
+func TestNewSpec_AdditionalSockets(t *testing.T) {
+	s := NewSpec(Options{
+		Socket:  "/state/pagnetd.sock",
+		Sockets: []string{"/home/u/.pagnet/run/fabric/local.sock", "/state/pagnetd.sock"},
+	})
+	if err := s.Normalize(); err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	want := []string{"/state/pagnetd.sock", "/home/u/.pagnet/run/fabric/local.sock"}
+	if !reflect.DeepEqual(s.Sockets, want) {
+		t.Errorf("Sockets = %v, want %v (bridge first, sideport second, de-duplicated)", s.Sockets, want)
+	}
+}
+
 // TestNewSpec_DeniedPassThrough pins that NewSpec carries Options.Denied
 // into the spec (so the single construction point feeds the containment
 // check), and that the driver-shape options still assemble when a denied

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -89,6 +90,42 @@ func TestDriverSandbox_DeniedEveryDriver(t *testing.T) {
 	}
 	if err := driverSpec.Normalize(); err == nil {
 		t.Fatal("persistent-driver shape: workspace = the denied state dir: spec valid, want a refusal")
+	}
+}
+
+// TestDriverSandbox_FabricSideportSocket pins that the daemon-rendered
+// PAGNET_FABRIC_SIDEPORT launch env pair is recovered into the spec's
+// socket grants: the sandboxed MCP bridge dials the sideport and must be
+// able to OPEN its parent directory (directory opens are gated; pathname
+// connects are not). Without the pair only the bridge socket is granted.
+func TestDriverSandbox_FabricSideportSocket(t *testing.T) {
+	mcp := `{"mcpServers":{"pagnet":{"command":"/usr/local/bin/pagnet","args":["mcp","worker","--socket","/s/pagnetd.sock"]}}}`
+	base := driverSandboxOpts{workspace: "/ws/inst1", stateDir: "/state/inst1", binary: "/usr/local/bin/qwen"}
+
+	withSideport := driverSandbox(driverSandboxOpts{
+		workspace: base.workspace, stateDir: base.stateDir, binary: base.binary,
+		env: []string{"PAGNET_MCP_CONFIG=" + mcp, "PAGNET_FABRIC_SIDEPORT=/h/.pagnet/run/fabric/local.sock"},
+	})
+	if !reflect.DeepEqual(withSideport.Sockets, []string{"/s/pagnetd.sock", "/h/.pagnet/run/fabric/local.sock"}) {
+		t.Errorf("Sockets = %v, want bridge socket first then the sideport", withSideport.Sockets)
+	}
+
+	without := driverSandbox(driverSandboxOpts{
+		workspace: base.workspace, stateDir: base.stateDir, binary: base.binary,
+		env: []string{"PAGNET_MCP_CONFIG=" + mcp},
+	})
+	if !reflect.DeepEqual(without.Sockets, []string{"/s/pagnetd.sock"}) {
+		t.Errorf("Sockets = %v, want only the bridge socket when the pair is absent", without.Sockets)
+	}
+
+	// An empty value is absent, not a grant (a "" socket would fail the
+	// spec's absolute-path check at launch).
+	empty := driverSandbox(driverSandboxOpts{
+		workspace: base.workspace, stateDir: base.stateDir, binary: base.binary,
+		env: []string{"PAGNET_MCP_CONFIG=" + mcp, "PAGNET_FABRIC_SIDEPORT="},
+	})
+	if !reflect.DeepEqual(empty.Sockets, []string{"/s/pagnetd.sock"}) {
+		t.Errorf("empty sideport value: Sockets = %v, want only the bridge socket", empty.Sockets)
 	}
 }
 

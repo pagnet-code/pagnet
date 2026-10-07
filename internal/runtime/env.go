@@ -150,10 +150,16 @@ func isControlPlaneEnvKey(key string) bool {
 // operator-supplied runtime env pairs (PAGNET_RUNTIME_ENV / config
 // runtime_env) (SEC-410): these pairs are appended AFTER the ChildEnv
 // filter, so without this check they could re-inject exactly the keys the
-// filter removes (PAGNET_* credentials, DATABASE_URL, POSTGRES_*). The
-// documented PAGNET_FAKE_* fake-runtime simulation namespace is the only
-// PAGNET_ exception. A violation is a hard error (fail closed — the daemon
-// refuses to start) rather than a silent drop.
+// filter removes (PAGNET_* credentials, DATABASE_URL, POSTGRES_*). Two
+// documented PAGNET_ exceptions: the PAGNET_FAKE_* fake-runtime simulation
+// namespace, and the single pagnet-internal key PAGNET_FABRIC_SIDEPORT —
+// the fused node's static host socket, which the daemon renders into the
+// native worker's bootstrap pipe so the sandboxed runtime bridge can open
+// the sideport's parent directory (Landlock gates the open, not the
+// connect). The value carries no credential or authority and grants
+// exactly one READ_DIR parent in the sandbox spec. A violation is a hard
+// error (fail closed — the daemon refuses to start) rather than a silent
+// drop.
 func ValidateExtraEnv(pairs []string) error {
 	var blocked []string
 	for _, kv := range pairs {
@@ -162,7 +168,7 @@ func ValidateExtraEnv(pairs []string) error {
 			blocked = append(blocked, kv)
 			continue
 		}
-		if strings.HasPrefix(key, "PAGNET_FAKE_") {
+		if strings.HasPrefix(key, "PAGNET_FAKE_") || key == "PAGNET_FABRIC_SIDEPORT" {
 			continue
 		}
 		if isControlPlaneEnvKey(key) {
