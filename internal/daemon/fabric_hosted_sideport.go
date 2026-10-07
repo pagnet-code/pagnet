@@ -4,9 +4,10 @@ import (
 	"context"
 	"sync"
 
+	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/fabricagent"
-	"github.com/pagnet-code/pagnet/fabric/registry"
+	"github.com/pagnet-code/pagnet/internal/sessionworker"
 )
 
 // HostedFabricSideports is the owner-administration association between one
@@ -62,6 +63,18 @@ func (d *Daemon) AssociateHostedFabricSideport(ctx context.Context, instanceID s
 	if err := sp.Validate(); err != nil {
 		return err
 	}
+	// The strict advertisement contract (Phase A step 6d) requires a live
+	// worker to push to: a sideport exists only to be advertised on the
+	// worker's own bridge. Without a live link there is nothing to
+	// advertise to — refuse before anything is stored. (After the re-probe
+	// below the link cannot be absent — the probe itself requires it — but
+	// the guard keeps the contract honest at the cheap end.)
+	d.nativeWorkersMu.Lock()
+	link := d.nativeWorkers[instanceID]
+	d.nativeWorkersMu.Unlock()
+	if link == nil {
+		return ErrNativeObservationConflict
+	}
 	scope, profile, err := d.HostedFabricSideports.resolve(ctx, instanceID)
 	if err != nil {
 		return err
@@ -76,6 +89,51 @@ func (d *Daemon) AssociateHostedFabricSideport(ctx context.Context, instanceID s
 		return err
 	}
 	d.HostedFabricSideports.Store(instanceID, sp)
+	// The owner administration succeeds iff the association is stored AND
+	// advertised on the live worker. A stored-but-unadvertised association
+	// is an unobservable dead state: roll back the just-stored value on
+	// push failure and surface the error.
+	if err := d.pushHostedSideportToWorker(ctx, instanceID, &sp); err != nil {
+		d.HostedFabricSideports.Invalidate(instanceID)
+		return err
+	}
+	return nil
+}
+
+// pushHostedSideportToWorker advertises (sp non-nil) or clears (sp nil) the
+// instance's associated sideport on the live worker over the daemon's
+// authenticated controller connection. On success it records the value in
+// the link's tracked last-pushed state, which the pump's reconciliation
+// compares against the registry (a wire frame is re-sent only on mismatch).
+// No live link is an honest error: there is nothing to push to, and the
+// caller decides whether that is transient (reconciled later) or final
+// (the strict association refuses).
+func (d *Daemon) pushHostedSideportToWorker(ctx context.Context, instanceID string, sp *agentbridge.HostedFabricSideport) error {
+	if d == nil || instanceID == "" {
+		return ErrNativeObservationConflict
+	}
+	d.nativeWorkersMu.Lock()
+	link := d.nativeWorkers[instanceID]
+	d.nativeWorkersMu.Unlock()
+	if link == nil {
+		return ErrNativeObservationConflict
+	}
+	req := sessionworker.Request{Type: "hosted_sideport_clear"}
+	if sp != nil {
+		req = sessionworker.Request{Type: "hosted_sideport_set", HostedSideport: sp}
+	}
+	if _, err := link.proxy.call(ctx, req); err != nil {
+		return err
+	}
+	link.mu.Lock()
+	if sp == nil {
+		link.sideportPushed = agentbridge.HostedFabricSideport{}
+		link.sideportPushedPresent = false
+	} else {
+		link.sideportPushed = *sp
+		link.sideportPushedPresent = true
+	}
+	link.mu.Unlock()
 	return nil
 }
 
@@ -125,10 +183,22 @@ func (d *Daemon) hostedFabricSideportFor(instanceID string) (agentbridge.HostedF
 }
 
 // invalidateHostedSideport mirrors invalidateBridgeNonce at the instance's
-// process-death boundaries.
+// process-death boundaries. It drops the registry association and pushes the
+// clear to the live worker's advertisement (best-effort: a dead link has
+// nothing to clear — a fresh worker attaches clean and the pump's
+// reconciliation has nothing to restore). Every existing call site
+// (stop, forget, restart, native removal) gets both effects from this one
+// helper.
 func (d *Daemon) invalidateHostedSideport(instanceID string) {
 	if d == nil || d.HostedFabricSideports == nil {
 		return
 	}
 	d.HostedFabricSideports.Invalidate(instanceID)
+	// Bounded: the controller call carries its own deadline; a dead worker
+	// fails fast. The lifecycle paths this runs on are not latency-critical.
+	if err := d.pushHostedSideportToWorker(d.turnCtx, instanceID, nil); err != nil {
+		if d.Log != nil {
+			d.Log.Warn("hosted sideport clear push failed at process-death boundary", "instance", instanceID, "err", err.Error())
+		}
+	}
 }

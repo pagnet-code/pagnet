@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -55,6 +56,7 @@ type Request struct {
 	ObservationID    string                                        `json:"observationId,omitempty"`
 	SourceDigest     string                                        `json:"sourceDigest,omitempty"`
 	Admission        *Admission                                    `json:"admission,omitempty"`
+	HostedSideport   *agentbridge.HostedFabricSideport             `json:"hostedSideport,omitempty"`
 	Relay            *BridgeResult                                 `json:"relay,omitempty"`
 	Cursor           int64                                         `json:"cursor,omitempty"`
 	Limit            int                                           `json:"limit,omitempty"`
@@ -594,6 +596,25 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		} else {
 			err = o.relay.admit(lease, *req.Admission)
 		}
+	case "hosted_sideport_set":
+		// The daemon's owner-administration push of the instance's associated
+		// hosted Fabric sideport (Phase A step 6d). The worker is a pure
+		// advertisement carrier: it fail-closed validates the shape and
+		// stores the value; it never re-derives the profile. The node's
+		// dial-time verification (kernel ancestry + generation + the node's
+		// own activation state) is the security boundary. A second set
+		// replaces the stored value (idempotent owner-act semantics).
+		if req.HostedSideport == nil {
+			err = ErrConflict
+		} else if verr := req.HostedSideport.Validate(); verr != nil {
+			err = verr
+		} else {
+			o.storeHostedSideport(req.HostedSideport)
+		}
+	case "hosted_sideport_clear":
+		// Process-death boundary clear pushed by the daemon. Idempotent:
+		// clearing an absent value is a success no-op.
+		o.clearHostedSideport()
 	case "bridge_poll":
 		response.Bridge, err = o.relay.poll(lease)
 	case "bridge_result":

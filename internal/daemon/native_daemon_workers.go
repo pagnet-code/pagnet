@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -23,6 +24,13 @@ type nativeWorkerLink struct {
 	conn      *websocket.Conn
 	mu        sync.Mutex
 	ownership transport.NativeWorkerOwnership
+	// sideportPushed/sideportPushedPresent track the last sideport value
+	// this link was successfully pushed (guarded by mu). The pump compares
+	// the daemon registry against this per-link state every tick and
+	// re-pushes only on mismatch, so a transient push failure self-heals
+	// within one tick.
+	sideportPushed        agentbridge.HostedFabricSideport
+	sideportPushedPresent bool
 }
 
 func (d *Daemon) nativeOwned(instanceID string) bool {
@@ -277,6 +285,20 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		_ = old.proxy.Close()
 	}
 	d.Log.Info("native session worker connected", "instance", record.Scope.InstanceID, "runtime", record.Spec.Runtime)
+	// Attach-time restore (Phase A step 6d): the daemon's association
+	// registry survives worker restart, the worker's in-memory advertisement
+	// does not. Push any pre-existing association to the freshly attached
+	// worker. Best-effort: a transient failure is self-healed by the pump's
+	// reconciliation within one tick. (The registry does NOT survive a
+	// DAEMON restart — the association is a live authorization, and the
+	// owner re-associates after one.)
+	if sp, ok := d.hostedFabricSideportFor(record.Scope.InstanceID); ok {
+		if err := d.pushHostedSideportToWorker(d.turnCtx, record.Scope.InstanceID, &sp); err != nil {
+			if d.Log != nil {
+				d.Log.Warn("hosted sideport attach restore deferred to reconciliation", "instance", record.Scope.InstanceID, "err", err.Error())
+			}
+		}
+	}
 	go d.pumpNativeWorker(link)
 	return nil
 }
@@ -305,6 +327,7 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 		// disconnect stops forwarding; the independently owned session survives.
 		_ = link.proxy.Reconcile(ctx)
 		_ = link.proxy.DrainSources(ctx)
+		d.reconcileHostedSideport(ctx, link)
 
 		link.mu.Lock()
 		ownership := link.ownership
@@ -318,6 +341,31 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 			link.ownership = *updated
 			link.mu.Unlock()
 		}
+	}
+}
+
+// reconcileHostedSideport is the pump's per-tick sideport reconciliation
+// (Phase A step 6d): one compare of the daemon registry against the link's
+// tracked last-pushed state, and a wire frame only on mismatch. It closes
+// both residual drift paths the event pushes cannot — a stale advertisement
+// after a failed clear, and a missed attach-time restore. With no sideport
+// composition the daemon has no association, so no push ever happens
+// (fail-closed, like the rest of the composition).
+func (d *Daemon) reconcileHostedSideport(ctx context.Context, link *nativeWorkerLink) {
+	if d == nil || link == nil || d.HostedFabricSideports == nil {
+		return
+	}
+	instanceID := link.proxy.scope.InstanceID
+	sp, present := d.hostedFabricSideportFor(instanceID)
+	link.mu.Lock()
+	needSet := present && (!link.sideportPushedPresent || link.sideportPushed != sp)
+	needClear := !present && link.sideportPushedPresent
+	link.mu.Unlock()
+	switch {
+	case needSet:
+		_ = d.pushHostedSideportToWorker(ctx, instanceID, &sp)
+	case needClear:
+		_ = d.pushHostedSideportToWorker(ctx, instanceID, nil)
 	}
 }
 

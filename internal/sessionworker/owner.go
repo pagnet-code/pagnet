@@ -18,6 +18,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	fabricidentity "github.com/pagnet-code/pagnet/fabric/identity"
+	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
@@ -116,14 +117,23 @@ type SessionOwner struct {
 	candidateTurnSource      NativeTurnSource
 	bridgeSourceMu           sync.Mutex
 	taskContentPins          map[string]nativeTaskContentPin
-	outputMu                 sync.Mutex
-	terminal                 *os.File
-	pending                  map[string]*nativeApproval
-	fatal                    error
-	nativeSink               bool
-	observationBlocked       error
-	observationWaiters       map[string]bool
-	relay                    *relayBroker
+	// sideportMu guards hostedSideport. A dedicated mutex (rather than o.mu,
+	// the hot fence around nonce/generation) because the value is written
+	// only by the authenticated control channel and read once per native
+	// bridge authentication; folding it into the hot lock would extend a
+	// critical section held across native liveness checks for no atomicity
+	// gain (the node's dial-time verification is the boundary, not the
+	// pairing of nonce and sideport).
+	sideportMu         sync.Mutex
+	hostedSideport     *agentbridge.HostedFabricSideport
+	outputMu           sync.Mutex
+	terminal           *os.File
+	pending            map[string]*nativeApproval
+	fatal              error
+	nativeSink         bool
+	observationBlocked error
+	observationWaiters map[string]bool
+	relay              *relayBroker
 }
 
 func NewSessionOwner(ctx context.Context, j *Journal, spec NativeSpec, controlKey []byte) (*SessionOwner, error) {
@@ -757,6 +767,36 @@ func (o *SessionOwner) Close() {
 	case <-time.After(5 * time.Second):
 		o.failPersistence(errors.New("native source observer shutdown did not quiesce"))
 	}
+}
+
+// storeHostedSideport stores (replacing) the sideport the daemon's
+// owner-administration associated with this instance. Only the authenticated
+// control channel calls it; the value is read at native bridge
+// authentication only.
+func (o *SessionOwner) storeHostedSideport(sp *agentbridge.HostedFabricSideport) {
+	if sp == nil {
+		o.clearHostedSideport()
+		return
+	}
+	o.sideportMu.Lock()
+	o.hostedSideport = sp
+	o.sideportMu.Unlock()
+}
+
+// clearHostedSideport drops the advertised sideport at the daemon's
+// process-death boundaries. Idempotent.
+func (o *SessionOwner) clearHostedSideport() {
+	o.sideportMu.Lock()
+	o.hostedSideport = nil
+	o.sideportMu.Unlock()
+}
+
+// currentHostedSideport returns the stored sideport, or nil when the daemon
+// has not associated one (or cleared it).
+func (o *SessionOwner) currentHostedSideport() *agentbridge.HostedFabricSideport {
+	o.sideportMu.Lock()
+	defer o.sideportMu.Unlock()
+	return o.hostedSideport
 }
 
 // ownedDriver intercepts every actual activation, including the Manager's

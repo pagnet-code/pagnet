@@ -303,7 +303,20 @@ func (o *SessionOwner) nativeBridgeConnection(ctx context.Context, c *net.UnixCo
 		_ = bridgeWrite(c, map[string]any{"type": "error", "error": "native process ownership rejected"})
 		return
 	}
-	if bridgeWrite(c, map[string]any{"type": "auth_ok", "instanceId": o.journal.scope.InstanceID}) != nil {
+	// The hosted Fabric sideport (Phase A step 6d) is advertised ONLY here —
+	// inside the REAL authenticated handshake, after every identity check
+	// above (instance scope, per-activation nonce, kernel process ancestry)
+	// has passed. Its JSON shape (socket/endpoint/generation) is
+	// byte-identical to the managed bridge ack and to what the shipped
+	// bridge client parses. Refresh semantics: a bridge connection
+	// authenticated BEFORE the association keeps its original tools for its
+	// lifetime — the sideport is read at auth time only; a NEW bridge
+	// session (agent restart / MCP reconnect) picks it up.
+	authOK := map[string]any{"type": "auth_ok", "instanceId": o.journal.scope.InstanceID}
+	if sp := o.currentHostedSideport(); sp != nil {
+		authOK["sideport"] = sp
+	}
+	if bridgeWrite(c, authOK) != nil {
 		return
 	}
 	_ = c.SetReadDeadline(time.Time{})
