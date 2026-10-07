@@ -208,6 +208,11 @@ type InstalledHostedConfig struct {
 	// InvocationLimits bound the signed initial-effect journal. Zero = the
 	// finite product default; explicit override; never unlimited.
 	InvocationLimits fabricagent.HostedInvocationLimits
+	// IndexNotice is the retained index publisher's nonblocking coalesced
+	// notice, fired after each committed hosted catalog mutation (Register /
+	// Retire). The local search index never polls: an unnotified binding
+	// stays undiscoverable.
+	IndexNotice func()
 }
 
 // DefaultHostedInvocationLimits is the finite product default for the signed
@@ -233,8 +238,12 @@ type InstalledHosted struct {
 	// SearchBackend is the node's real search backend (the step-5 import feed
 	// target).
 	SearchBackend *search.Backend
-	node          *InstalledNode
-	deferred      *hostedDeferred
+	// IndexNotice is the retained index publisher's coalesced notice (the
+	// step-7 hosted-binding discovery path). Nil = not wired, and the
+	// mutating admin acts refuse fail-closed.
+	IndexNotice func()
+	node        *InstalledNode
+	deferred    *hostedDeferred
 }
 
 // SetProbe wires the profile probe (post-daemon).
@@ -458,6 +467,7 @@ func newInstalledHosted(ctx context.Context, n *InstalledNode, cfg InstalledHost
 		Sideports:       sideports,
 		Resolve:         resolve,
 		SearchBackend:   searchBackend,
+		IndexNotice:     cfg.IndexNotice,
 		node:            n,
 		deferred:        deferred,
 	}, nil

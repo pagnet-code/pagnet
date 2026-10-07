@@ -96,6 +96,11 @@ func (h *InstalledHosted) hostedBindingCreate(ctx context.Context, access *fabri
 	if publisher == nil {
 		return nil, hostedNotWired("catalog publisher")
 	}
+	// Same for the local index notice: an unnotified binding would silently
+	// stay undiscoverable, so an unwired notice refuses before commit.
+	if h.IndexNotice == nil {
+		return nil, hostedNotWired("index publisher")
+	}
 	var output json.RawMessage
 	err = h.node.Installation.WithCurrentOperator(ctx, owner, func(current context.Context) error {
 		if e := access.VerifyCurrent(current); e != nil {
@@ -127,6 +132,9 @@ func (h *InstalledHosted) hostedBindingCreate(ctx context.Context, access *fabri
 		if e = publisher.Publish(current, access, ref, revision, bindingID, ""); e != nil {
 			return e
 		}
+		// The retained search index never polls: this notice after the
+		// committed Register is what makes the new binding discoverable.
+		h.IndexNotice()
 		out, e := json.Marshal(map[string]string{"endpoint": ref.String(), "revision": string(revision), "binding": bindingID})
 		if e != nil {
 			return e
@@ -137,8 +145,12 @@ func (h *InstalledHosted) hostedBindingCreate(ctx context.Context, access *fabri
 	return output, err
 }
 
-// hostedBindingList is the truthful list of the node's hosted bindings,
-// including retired state. It never fabricates a binding.
+// hostedBindingList is the truthful list of the node's LIVE hosted bindings:
+// endpoints currently registered with a hosted-native binding. A revoked
+// binding's head is a tombstone (no bindings remain), so it is no longer a
+// hosted binding view; its revocation remains in the registry's signed
+// ledger, and the retained invocation journal is untouched. It never
+// fabricates a binding.
 func (h *InstalledHosted) hostedBindingList(ctx context.Context, access *fabricauth.OwnerAdministration, request fabricadmin.Request) (json.RawMessage, error) {
 	if h == nil || h.node == nil || access == nil || request.Operation != "hosted.binding.list" || access.VerifyCurrent(ctx) != nil {
 		return nil, localDenied()
@@ -155,7 +167,6 @@ func (h *InstalledHosted) hostedBindingList(ctx context.Context, access *fabrica
 		Endpoint  string `json:"endpoint"`
 		Revision  string `json:"revision"`
 		Binding   string `json:"binding"`
-		Retired   bool   `json:"retired"`
 		Instance  string `json:"instance,omitempty"`
 		NetworkID string `json:"networkId,omitempty"`
 	}
@@ -167,6 +178,9 @@ func (h *InstalledHosted) hostedBindingList(ctx context.Context, access *fabrica
 			return nil, err
 		}
 		for _, head := range page.Heads {
+			// A retired head carries only a tombstone (no bindings), so a
+			// revoked binding is no longer a hosted binding view; its
+			// revocation remains in the registry's signed ledger.
 			descriptor, err := store.GetEndpoint(ctx, head.Ref, head.Revision)
 			if err != nil {
 				continue
@@ -184,13 +198,11 @@ func (h *InstalledHosted) hostedBindingList(ctx context.Context, access *fabrica
 			if binding == "" {
 				continue
 			}
-			view := hostedBindingView{Endpoint: head.Ref.String(), Revision: string(head.Revision), Binding: binding, Retired: head.Retired}
-			if !head.Retired {
-				scope := registry.DescriptorBatchScope{Endpoint: head.Ref, ExpectedEndpointRevision: descriptor.Revision, BindingID: binding}
-				if profile, _, err := h.Profiles.Get(ctx, scope); err == nil {
-					view.Instance = profile.Scope.InstanceID
-					view.NetworkID = profile.NetworkID
-				}
+			view := hostedBindingView{Endpoint: head.Ref.String(), Revision: string(head.Revision), Binding: binding}
+			scope := registry.DescriptorBatchScope{Endpoint: head.Ref, ExpectedEndpointRevision: descriptor.Revision, BindingID: binding}
+			if profile, _, err := h.Profiles.Get(ctx, scope); err == nil {
+				view.Instance = profile.Scope.InstanceID
+				view.NetworkID = profile.NetworkID
 			}
 			out = append(out, view)
 		}
@@ -233,6 +245,11 @@ func (h *InstalledHosted) hostedBindingRevoke(ctx context.Context, access *fabri
 	if access.PrincipalView() != owner.PrincipalView() {
 		return nil, localDenied()
 	}
+	// An unnotified retire would leave the retired endpoint disclosable in
+	// the retained index, so an unwired notice refuses before commit.
+	if h.IndexNotice == nil {
+		return nil, hostedNotWired("index publisher")
+	}
 	var output json.RawMessage
 	err = h.node.Installation.WithCurrentOperator(ctx, owner, func(current context.Context) error {
 		if e := access.VerifyCurrent(current); e != nil {
@@ -248,6 +265,9 @@ func (h *InstalledHosted) hostedBindingRevoke(ctx context.Context, access *fabri
 		if e != nil {
 			return e
 		}
+		// The retained search index never polls: this notice after the
+		// committed Retire is what stops the retired endpoint being disclosed.
+		h.IndexNotice()
 		out, e := json.Marshal(map[string]string{"endpoint": ref.String(), "status": "revoked"})
 		if e != nil {
 			return e

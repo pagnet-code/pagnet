@@ -280,7 +280,13 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 	// native runtime. A composition failure with an explicit Hosted config is a
 	// startup failure (the retained-cleanup path above handles the join).
 	if c.Hosted != nil {
-		result.Hosted, err = newInstalledHosted(ctx, result, *c.Hosted, hostedDeferred, hostedOwnerGuard, hostedSearch)
+		hostedCfg := *c.Hosted
+		// The retained search index learns about committed mutations only
+		// through the publisher's coalesced notices: the hosted binding
+		// Register/Retire acts must drive it or the bindings stay
+		// undiscoverable.
+		hostedCfg.IndexNotice = result.Publisher.Notify
+		result.Hosted, err = newInstalledHosted(ctx, result, hostedCfg, hostedDeferred, hostedOwnerGuard, hostedSearch)
 		if err != nil {
 			return nil, err
 		}

@@ -129,6 +129,13 @@ func ComposeRetained(ctx context.Context, store *registry.Store, compose func(co
 	if ports.Authenticator == nil {
 		return nil, fabric.NewError(fabric.CodeUnauthenticated, "Missing actual node authenticator")
 	}
+	// The node contract supports read interception only with current
+	// disclosure validation; production composition supplies the retained
+	// registry as the current authority so an intercepted read can never
+	// disclose data the registry no longer holds.
+	if ports.Interceptors != nil && ports.ValidateReadResult == nil {
+		ports.ValidateReadResult = currentStateReadValidator(store)
+	}
 	bindings := ports.Bindings
 	if ports.Tracing != nil && bindings != nil {
 		bindings = observedBindings{bindings, ports.Tracing}
