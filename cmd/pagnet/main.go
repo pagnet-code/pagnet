@@ -198,6 +198,9 @@ func newRootCmd() *cobra.Command {
 		// spec §55 command surface
 		agentsCmd(),
 		agentCmd(),
+		// local fabric extension/continuation administration (private admin socket)
+		localExtensionCmd(),
+		localContinuationCmd(),
 		hostsCmd(),
 		hostCmd(),
 		networksCmd(),
