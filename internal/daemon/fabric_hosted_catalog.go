@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/registry"
@@ -50,6 +51,10 @@ func (d *Daemon) PrepareHostedCatalog(ctx context.Context, profile fabricagent.H
 	if err != nil {
 		return transport.FabricHostedPublication{}, err
 	}
+	// The flag is derived from the signed record the daemon just bound to
+	// this publication — the single source of truth; the retained packet is
+	// a value, so retries are byte-identical.
+	publication.Tombstone = strings.HasSuffix(record.Frame.ActionKind, ".retire")
 	if err = publication.Validate(); err != nil {
 		return transport.FabricHostedPublication{}, err
 	}

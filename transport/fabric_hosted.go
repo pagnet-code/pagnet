@@ -24,6 +24,11 @@ type FabricHostedPublication struct {
 	Revision            fabric.Revision         `json:"revision"`
 	ExpectedRevision    fabric.Revision         `json:"expectedRevision,omitempty"`
 	DomainPublicKey     []byte                  `json:"domainPublicKey"`
+	// Tombstone is routing metadata for the sealed record this publication
+	// carries: true when that signed record's action kind ends in ".retire".
+	// The publisher derives it from the signed record; the importer re-checks
+	// it against the signed body — it is never a trust input.
+	Tombstone           bool                    `json:"tombstone"`
 	NetworkID           string                  `json:"networkId"`
 	InstanceID          string                  `json:"instanceId"`
 	OwnershipID         string                  `json:"ownershipId"`

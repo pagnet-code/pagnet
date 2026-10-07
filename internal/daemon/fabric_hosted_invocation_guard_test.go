@@ -114,6 +114,13 @@ type hostedGuardFixture struct {
 	// Atomic: the responder reads it from the importer's goroutine while
 	// the test goroutine (re)queues a generation.
 	catalogServer atomic.Pointer[hostedCatalogTestServer]
+	// publishStore is the last publication the fake host accepted on
+	// MsgFabricHostedPublish (step 6c): the fake stores exactly what the
+	// publish message carried and the echo READ server serves it back —
+	// the same sealed envelope, routing and stored flag the real server
+	// will. Atomic: stored by the publish responder, read by the importer's
+	// goroutine and the test goroutine.
+	publishStore atomic.Pointer[transport.FabricHostedPublication]
 	// invokeServer is the test-side server half of the step-6b admit
 	// exchange (a fake host answering MsgFabricHostedInvoke); nil = the
 	// fixture serves no admits. Atomic for the same reason as catalogServer.
@@ -196,6 +203,10 @@ func newHostedGuardFixture(t *testing.T, opts ...hostedGuardFixtureOption) *host
 			if cs := f.catalogServer.Load(); cs != nil {
 				cs.serveRequest(payload.(transport.FabricHostedCatalogRequest))
 			}
+		case transport.MsgFabricHostedPublish:
+			pub := payload.(transport.FabricHostedPublication)
+			f.publishStore.Store(&pub)
+			ownerConn.hostedFabricDisposition(transport.FabricHostedResult{RequestID: pub.RequestID, Ref: pub.Ref, Revision: pub.Revision})
 		case transport.MsgFabricHostedInvoke:
 			if is := f.invokeServer.Load(); is != nil {
 				is.serveRequest(payload.(transport.FabricHostedInvocation))

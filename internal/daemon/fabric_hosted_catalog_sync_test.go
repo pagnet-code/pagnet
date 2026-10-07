@@ -101,10 +101,41 @@ type hostedCatalogTestServer struct {
 	// served counts served pages; the request goroutine increments it and
 	// the test goroutine polls it.
 	served int64
+	// echoPublish, when set, makes the server ECHO the stored publish:
+	// every request is answered with a single-record terminal page built
+	// from the publication the fake host last accepted on
+	// MsgFabricHostedPublish — the same sealed envelope, routing and
+	// stored tombstone flag the real server will serve (Phase C). It
+	// ignores the queued pages entirely.
+	echoPublish func() (transport.FabricHostedPublication, bool)
 }
 
 func (s *hostedCatalogTestServer) serveRequest(req transport.FabricHostedCatalogRequest) {
 	s.t.Helper()
+	if s.echoPublish != nil {
+		atomic.AddInt64(&s.served, 1)
+		pub, ok := s.echoPublish()
+		if !ok {
+			// Nothing stored yet: an empty terminal page.
+			s.conn.hostedFabricCatalogPageDisposition(transport.FabricHostedCatalogPage{RequestID: req.RequestID, NetworkID: req.NetworkID, Terminal: true})
+			return
+		}
+		page := transport.FabricHostedCatalogPage{
+			RequestID: req.RequestID,
+			NetworkID: req.NetworkID,
+			Records: []transport.FabricHostedCatalogRecord{{
+				Ref:             pub.Ref,
+				Revision:        pub.Revision,
+				DomainPublicKey: pub.DomainPublicKey,
+				Tombstone:       pub.Tombstone,
+				Envelope:        pub.Envelope,
+				AAD:             pub.AAD,
+			}},
+			Terminal: true,
+		}
+		s.conn.hostedFabricCatalogPageDisposition(page)
+		return
+	}
 	offset := 0
 	if req.Cursor != "" {
 		n, err := strconv.Atoi(req.Cursor)
@@ -180,6 +211,25 @@ func (f *hostedGuardFixture) queueRecordPages(t *testing.T, records ...transport
 		})
 	}
 	f.queuePagesFor(t, pages...)
+}
+
+// queueEchoPublishPages queues an echo-mode test server (step 6c): every
+// READ request is answered from the publication the fake host last stored
+// from a publish message — the stored flag rides the page, no queued pages.
+func (f *hostedGuardFixture) queueEchoPublishPages(t *testing.T) {
+	t.Helper()
+	server := &hostedCatalogTestServer{
+		t:    t,
+		conn: f.ownerConn,
+		echoPublish: func() (transport.FabricHostedPublication, bool) {
+			pub := f.publishStore.Load()
+			if pub == nil {
+				return transport.FabricHostedPublication{}, false
+			}
+			return *pub, true
+		},
+	}
+	f.catalogServer.Store(server)
 }
 
 func (f *hostedGuardFixture) newCatalogImporter(t *testing.T, trustedRoots []registry.GenesisRecord, feed HostedCatalogFeedFunc, maxRows, maxBytes int, backoffBase, backoffMax time.Duration) *HostedCatalogImporter {
