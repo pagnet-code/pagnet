@@ -38,6 +38,50 @@ type extensionRuntimeBundle struct {
 	recorder   *continuations.Recorder
 	handlers   []*extension.HTTPHandler
 	references int
+	// executing maps a node-verified extension credential principal ref to
+	// the owning extension ID, from the retained signed installation
+	// (Binding.CredentialPrincipalRef). A ref claimed by more than one
+	// extension has no verified association and is absent.
+	executing map[string]string
+}
+
+// executingExtensions returns the node-verified extension ID of the caller
+// when the caller's authenticated principal is the declared credential
+// principal of exactly one installed extension binding. No verified
+// association yields no evidence: with no node-minted chain every matching
+// interceptor still executes.
+func (b *extensionRuntimeBundle) executingExtensions(caller fabric.ExecutionContext) []string {
+	if b == nil || b.executing == nil {
+		return nil
+	}
+	id, ok := b.executing[caller.PrincipalView().Ref]
+	if !ok || id == "" {
+		return nil
+	}
+	return []string{id}
+}
+
+// extensionExecutingAssociation resolves the node-verified executing-extension
+// association: a credential principal ref maps to its owning extension ID
+// only when exactly one installed extension claims it. Claim order never
+// matters; an ambiguous ref is dropped, so the node mints no evidence for it.
+func extensionExecutingAssociation(claims map[string]map[string]struct{}) map[string]string {
+	if len(claims) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(claims))
+	for ref, owners := range claims {
+		if len(owners) != 1 {
+			continue
+		}
+		for id := range owners {
+			result[ref] = id
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 // ExtensionRuntime owns only configured providers and original stream lifetimes.
@@ -182,6 +226,7 @@ func (r *ExtensionRuntime) reload(ctx context.Context) error {
 		}
 	}
 	seen := map[string]extregistry.Binding{}
+	claims := map[string]map[string]struct{}{}
 	for cursor := ""; ; {
 		page, e := r.infrastructure.Registry.List(ctx, owner, cursor, 64)
 		if e != nil {
@@ -195,6 +240,12 @@ func (r *ExtensionRuntime) reload(ctx context.Context) error {
 				return e
 			}
 			for _, binding := range installation.Bindings {
+				if ref := binding.CredentialPrincipalRef; ref != "" {
+					if claims[ref] == nil {
+						claims[ref] = map[string]struct{}{}
+					}
+					claims[ref][installation.Manifest.ID] = struct{}{}
+				}
 				if prior, exists := seen[binding.ID]; exists {
 					if prior != binding {
 						closeHandlers()
@@ -277,7 +328,7 @@ func (r *ExtensionRuntime) reload(ctx context.Context) error {
 		closeHandlers()
 		return e
 	}
-	newBundle := &extensionRuntimeBundle{selected: selected, engine: engine, recorder: recorder, handlers: handlers}
+	newBundle := &extensionRuntimeBundle{selected: selected, engine: engine, recorder: recorder, handlers: handlers, executing: extensionExecutingAssociation(claims)}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closing {
@@ -295,8 +346,26 @@ func (r *ExtensionRuntime) current(ctx context.Context, caller fabric.ExecutionC
 		return r.config.CurrentCaller(c, caller, checked)
 	}, next)
 }
+
+// executingForward mints the node-verified executing-extension context value
+// exactly once per extension invocation, on the node's forward-composition
+// boundary. The value is the caller's extension ID from the bundle's retained
+// signed association; match() re-reads it for every chain (re)selection,
+// including redirect passes. A caller without a verified association has no
+// value minted, so every matching interceptor still executes.
+func (r *ExtensionRuntime) executingForward(ctx context.Context, bundle *extensionRuntimeBundle, caller fabric.ExecutionContext) context.Context {
+	executing := bundle.executingExtensions(caller)
+	if len(executing) == 0 {
+		return ctx
+	}
+	return extension.WithExecutingExtensions(ctx, executing)
+}
 func (r *ExtensionRuntime) match(ctx context.Context, caller fabric.ExecutionContext, envelope fabric.Envelope, stage string, placement extension.Placement) (extension.MatchContext, error) {
-	result := extension.MatchContext{Operation: envelope.Operation, Stage: stage, Placement: placement, SourceKind: caller.PrincipalView().Kind, Domain: r.boundary.root.Namespace}
+	// ExecutingInterceptors comes from the node-minted executing-extension
+	// capability on the invocation context. The caller's transport provenance
+	// is signed lineage, never local execution authority, and cannot
+	// populate it.
+	result := extension.MatchContext{Operation: envelope.Operation, Stage: stage, Placement: placement, SourceKind: caller.PrincipalView().Kind, Domain: r.boundary.root.Namespace, ExecutingInterceptors: extension.ExecutingExtensionsFrom(ctx)}
 	e := r.current(ctx, caller, func(current context.Context) error {
 		if envelope.Target == nil {
 			return nil
@@ -399,6 +468,7 @@ func (r *ExtensionRuntime) ExecuteStage(ctx context.Context, caller fabric.Execu
 		return extension.Outcome{}, e
 	}
 	owned = r.phaseActor(owned, caller, original)
+	owned = r.executingForward(owned, bundle, caller)
 	out, e := bundle.engine.ExecuteStage(owned, caller, original, audience, stage, placement, downstream)
 	if e != nil || out.Stream == nil {
 		release()
@@ -425,6 +495,7 @@ func (r *ExtensionRuntime) ExecuteReadProjection(ctx context.Context, caller fab
 	}
 	defer release()
 	owned = r.phaseActor(owned, caller, original)
+	owned = r.executingForward(owned, bundle, caller)
 	out, e := bundle.engine.ExecuteReadProjection(owned, caller, original, audience, stage, placement, payload, downstream)
 	if out.Stream != nil {
 		out.Stream.Close()

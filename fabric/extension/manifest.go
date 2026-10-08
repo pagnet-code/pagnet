@@ -88,14 +88,20 @@ type Match struct {
 // MatchContext is derived by the node from verified identity and the selected
 // descriptor/binding. Caller-provided tags do not become routing authority.
 type MatchContext struct {
-	Operation             fabric.Operation
-	Stage                 string
-	Placement             Placement
-	SourceKind            string
-	TargetKind            string
-	TargetProtocol        string
-	Domain                string
-	Tags                  []string
+	Operation  fabric.Operation
+	Stage      string
+	Placement  Placement
+	SourceKind string
+	TargetKind string
+	// TargetProtocol is the selected binding protocol.
+	TargetProtocol string
+	Domain         string
+	Tags           []string
+	// ExecutingInterceptors is current local execution evidence from the
+	// trusted node composition: exact interceptor IDs and/or the owning
+	// extension IDs of the invocation's genuinely executing extensions. It
+	// is minted by the node from node-verified association, never from the
+	// caller's transport provenance.
 	ExecutingInterceptors []string
 }
 type CompiledRegistration struct {
@@ -280,7 +286,12 @@ func (p *Plan) Select(ctx MatchContext) []CompiledRegistration {
 	for _, candidate := range candidates {
 		r := candidate.Registration
 		m := r.Match
-		if !r.AllowSelfRecursion && contains(ctx.ExecutingInterceptors, r.ID) {
+		// Current node-minted execution evidence suppresses self-recursion by
+		// exact interceptor ID or by the owning extension ID (an extension
+		// that is executing cannot re-trigger any of its own interceptors).
+		// Foreign interceptors and explicit AllowSelfRecursion registrations
+		// still execute; without verified local evidence nothing is skipped.
+		if !r.AllowSelfRecursion && (contains(ctx.ExecutingInterceptors, r.ID) || contains(ctx.ExecutingInterceptors, candidate.ExtensionID)) {
 			continue
 		}
 		if !accept(m.SourceKinds, ctx.SourceKind) || !accept(m.TargetKinds, ctx.TargetKind) || !accept(m.TargetProtocols, ctx.TargetProtocol) || !accept(m.Domains, ctx.Domain) {
