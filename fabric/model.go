@@ -221,6 +221,10 @@ type DescribeSelection struct {
 	ExpectedRevision Revision    `json:"expectedRevision,omitempty"`
 	OffersCursor     string      `json:"offersCursor,omitempty"`
 	OffersLimit      int         `json:"offersLimit,omitempty"`
+	// IncludeReferenceHandle explicitly requests the private-root friendly
+	// handle plus its truthful persisted label for an endpoint selection.
+	// It is never inferred, and nothing is disclosed without this exact flag.
+	IncludeReferenceHandle bool `json:"includeReferenceHandle,omitempty"`
 }
 
 type DescribeRequest struct {
@@ -233,7 +237,12 @@ type Description struct {
 	Offer            *OfferDescriptor    `json:"offer,omitempty"`
 	Offers           []OfferSummary      `json:"offers,omitempty"`
 	NextOffersCursor string              `json:"nextOffersCursor,omitempty"`
-	Error            *Error              `json:"error,omitempty"`
+	// ReferenceHandle is present only when the selection explicitly requested
+	// it and a handle is actually allocated for the endpoint. The descriptor
+	// remains DESCRIBE-only: the handle is a disclosure, never a target that
+	// replaces the canonical reference.
+	ReferenceHandle *ReferenceHandleView `json:"referenceHandle,omitempty"`
+	Error           *Error               `json:"error,omitempty"`
 }
 
 type DescribeResult struct {

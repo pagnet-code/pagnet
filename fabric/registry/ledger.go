@@ -409,6 +409,9 @@ func (s *Store) mutateTx(ctx context.Context, tx *sql.Tx, ref fabric.EndpointRef
 	if e = s.insertRecord(ctx, tx, r, o, true); e != nil {
 		return "", e
 	}
+	if e = s.syncReferenceHandle(ctx, tx, ref, action, rev, exists); e != nil {
+		return "", e
+	}
 	return rev, nil
 }
 

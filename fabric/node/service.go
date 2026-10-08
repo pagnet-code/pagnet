@@ -326,11 +326,46 @@ func (s *Service) describe(ctx context.Context, envelope fabric.Envelope) (Resul
 						}
 					}
 				}
+				if item.Endpoint != nil {
+					handle, err := s.describeReferenceHandle(ctx, selection)
+					if err != nil {
+						item.Endpoint = nil
+						item.Offers = nil
+						item.NextOffersCursor = ""
+						item.Error = publicError(err)
+					} else {
+						item.ReferenceHandle = handle
+					}
+				}
 			}
 		}
 		result.Descriptions = append(result.Descriptions, item)
 	}
 	return Result{Describe: &result}, nil
+}
+
+// describeReferenceHandle discloses the friendly handle plus its truthful
+// persisted label for an explicitly requested endpoint selection. A store
+// without the optional capability, or without an allocated handle, discloses
+// nothing: the descriptor remains the source of truth and nothing is
+// fabricated. A real resolver failure is returned so the selection errors.
+func (s *Service) describeReferenceHandle(ctx context.Context, selection fabric.DescribeSelection) (*fabric.ReferenceHandleView, error) {
+	if !selection.IncludeReferenceHandle {
+		return nil, nil
+	}
+	resolver, ok := s.config.Descriptors.(fabric.ReferenceHandleResolver)
+	if !ok {
+		return nil, nil
+	}
+	view, err := resolver.ReferenceHandleForRef(ctx, selection.Ref)
+	if err != nil {
+		var typed *fabric.Error
+		if errors.As(err, &typed) && typed.Code == fabric.CodeNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &view, nil
 }
 
 func (s *Service) invoke(ctx context.Context, trusted fabric.ExecutionContext, envelope fabric.Envelope) (Result, error) {

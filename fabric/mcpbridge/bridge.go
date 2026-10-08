@@ -479,10 +479,10 @@ func (b *Bridge) expiryLoop() {
 	}
 }
 
-var descriptions = map[string]string{"discover": "Find relevant agents and tools. Discovery does not run them.", "describe": "Read an exact remembered endpoint or offer before invoking it.", "invoke": "Invoke one exact offer, or consume/cancel an already admitted stream using its opaque handle."}
+var descriptions = map[string]string{"discover": "Find relevant agents and tools. Discovery does not run them.", "describe": "Read an exact remembered endpoint or offer before invoking it. Setting includeReferenceHandle on an endpoint selection also returns its persisted friendly handle and label.", "invoke": "Invoke one exact offer, or consume/cancel an already admitted stream using its opaque handle."}
 var schemas = map[string]string{
 	"discover": `{"type":"object","properties":{"query":{"type":"string"},"scope":{"type":"object"},"filters":{"type":"object"},"limit":{"type":"integer","minimum":1,"maximum":100},"cursor":{"type":"string"}},"required":["query","scope","limit"],"additionalProperties":false}`,
-	"describe": `{"type":"object","properties":{"selections":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"ref":{"type":"string"},"expectedRevision":{"type":"string"},"offersCursor":{"type":"string"},"offersLimit":{"type":"integer","minimum":1,"maximum":100}},"required":["ref"],"additionalProperties":false}}},"required":["selections"],"additionalProperties":false}`,
+	"describe": `{"type":"object","properties":{"selections":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"ref":{"type":"string"},"expectedRevision":{"type":"string"},"offersCursor":{"type":"string"},"offersLimit":{"type":"integer","minimum":1,"maximum":100},"includeReferenceHandle":{"type":"boolean"}},"required":["ref"],"additionalProperties":false}}},"required":["selections"],"additionalProperties":false}`,
 	"invoke":   `{"type":"object","oneOf":[{"properties":{"target":{"type":"string"},"input":{},"revision":{"type":"string"},"deadline":{"type":"string"},"idempotencyKey":{"type":"string"}},"required":["target","input"],"additionalProperties":false},{"properties":{"stream":{"type":"object","properties":{"handle":{"type":"string"},"afterSequence":{"type":"string","pattern":"^[0-9]+$"},"cancel":{"type":"boolean"}},"required":["handle","afterSequence"],"additionalProperties":false}},"required":["stream"],"additionalProperties":false}]}`,
 }
 

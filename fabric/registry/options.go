@@ -11,19 +11,25 @@ import (
 // Limits are local finite storage admissions, not permanent protocol capacities.
 // Reopening with smaller limits rejects retained state instead of purging identity.
 type Limits struct {
-	MaxRecords       uint64
-	MaxLedgerBytes   int64
-	MaxPayloadBytes  int
-	MaxDatabaseBytes int64
+	MaxRecords          uint64
+	MaxLedgerBytes      int64
+	MaxPayloadBytes     int
+	MaxDatabaseBytes    int64
+	MaxReferenceHandles int
 }
 type Options struct{ Limits Limits }
 
+const (
+	defaultMaxReferenceHandles = 1024
+	maxReferenceHandlesLimit   = 1_000_000
+)
+
 func DefaultOptions() Options {
-	return Options{Limits: Limits{MaxRecords: maxRecords, MaxLedgerBytes: maxLedgerBytes, MaxPayloadBytes: maxPayload, MaxDatabaseBytes: 256 << 20}}
+	return Options{Limits: Limits{MaxRecords: maxRecords, MaxLedgerBytes: maxLedgerBytes, MaxPayloadBytes: maxPayload, MaxDatabaseBytes: 256 << 20, MaxReferenceHandles: defaultMaxReferenceHandles}}
 }
 func (o Options) validate() error {
 	l := o.Limits
-	if l.MaxRecords == 0 || l.MaxRecords > math.MaxInt64 || l.MaxLedgerBytes < 1 || l.MaxPayloadBytes < 1 || l.MaxPayloadBytes > (math.MaxInt-65536)/2 || l.MaxDatabaseBytes < 65536 {
+	if l.MaxRecords == 0 || l.MaxRecords > math.MaxInt64 || l.MaxLedgerBytes < 1 || l.MaxPayloadBytes < 1 || l.MaxPayloadBytes > (math.MaxInt-65536)/2 || l.MaxDatabaseBytes < 65536 || l.MaxReferenceHandles < 1 || l.MaxReferenceHandles > maxReferenceHandlesLimit {
 		return invalid("registry storage limits must be positive finite representable bounds")
 	}
 	return nil

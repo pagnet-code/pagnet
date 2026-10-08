@@ -49,15 +49,16 @@ type Record struct {
 // Store owns the sole authoritative writer lock until Close. Private root keys
 // never appear in descriptors, search documents, prompts or wire envelopes.
 type Store struct {
-	mu       sync.Mutex
-	db       *sql.DB
-	lock     io.Closer
-	key      ed25519.PrivateKey
-	genesis  GenesisRecord
-	identity GenesisBody
-	closed   bool
-	dir      string
-	options  Options
+	mu                  sync.Mutex
+	db                  *sql.DB
+	lock                io.Closer
+	key                 ed25519.PrivateKey
+	genesis             GenesisRecord
+	identity            GenesisBody
+	closed              bool
+	dir                 string
+	options             Options
+	hasReferenceHandles bool
 }
 
 const schema = `
@@ -316,7 +317,7 @@ func decodeGenesis(g GenesisRecord) (GenesisBody, error) {
 }
 func (s *Store) readback(ctx context.Context) error {
 	var version int
-	if e := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); e != nil || (version != 1 && version != 2) {
+	if e := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); e != nil || (version != 1 && version != 2 && version != 3) {
 		return invalid("unsupported or missing registry format")
 	}
 	if version == 1 {
@@ -361,12 +362,21 @@ func (s *Store) readback(ctx context.Context) error {
 	if e = s.verifyIndex(ctx); e != nil {
 		return e
 	}
-	if version == 2 {
+	// A root at version 2 or 3 always carries the native authority schema:
+	// every adoption path applies it before the version can reach 3.
+	if version >= 2 {
 		if e = s.verifyNativeAuthority(ctx); e != nil {
 			return e
 		}
 	}
-	return s.verifyDescriptorProjections(ctx)
+	if e = s.verifyDescriptorProjections(ctx); e != nil {
+		return e
+	}
+	s.hasReferenceHandles = version >= 3
+	if s.hasReferenceHandles {
+		return s.verifyReferenceHandles(ctx)
+	}
+	return nil
 }
 
 func (s *Store) authorize(c fabric.ExecutionContext) error {

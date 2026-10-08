@@ -447,6 +447,9 @@ func (s *Store) WithNativeAuthority(ctx context.Context, owner fabric.ExecutionC
 	} else if scope.ExpectedRevision != "" || scope.BindingID != "" {
 		return invalid("Global controller scope contains endpoint assertions")
 	}
+	// Version 3 roots already carry the native authority schema: reference
+	// handle adoption always applies it first (1 -> 2 -> 3), so a v3 root
+	// never needs a re-migration here.
 	var version int
 	if e = tx.QueryRowContext(lifetime, "PRAGMA user_version").Scan(&version); e != nil {
 		return e
@@ -455,7 +458,7 @@ func (s *Store) WithNativeAuthority(ctx context.Context, owner fabric.ExecutionC
 		if _, e = tx.ExecContext(lifetime, nativeAuthoritySchema); e != nil {
 			return e
 		}
-	} else if version != 2 {
+	} else if version != 2 && version != 3 {
 		return invalid("Unsupported native authority format")
 	}
 	a := &AuthorityTx{tx: tx, store: s, ctx: lifetime, scope: scope, active: true, maxOperations: scope.MaxOperations}

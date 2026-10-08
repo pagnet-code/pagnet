@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/fabric/extension"
@@ -162,13 +164,13 @@ func decodeReadOutcome(envelope fabric.Envelope, outcome extension.Outcome) (Res
 				return bad()
 			}
 			if description.Error != nil {
-				if description.Endpoint != nil || description.Offer != nil || len(description.Offers) != 0 || description.NextOffersCursor != "" {
+				if description.Endpoint != nil || description.Offer != nil || len(description.Offers) != 0 || description.NextOffersCursor != "" || description.ReferenceHandle != nil {
 					return bad()
 				}
 				continue
 			}
 			if selected.Ref.IsOffer() {
-				if description.Offer == nil || description.Endpoint != nil || description.Offer.Ref != selected.Ref || selected.ExpectedRevision != "" && description.Offer.Revision != selected.ExpectedRevision || len(description.Offers) != 0 || description.NextOffersCursor != "" {
+				if description.Offer == nil || description.Endpoint != nil || description.Offer.Ref != selected.Ref || selected.ExpectedRevision != "" && description.Offer.Revision != selected.ExpectedRevision || len(description.Offers) != 0 || description.NextOffersCursor != "" || description.ReferenceHandle != nil {
 					return bad()
 				}
 			} else {
@@ -188,6 +190,21 @@ func decodeReadOutcome(envelope fabric.Envelope, outcome extension.Outcome) (Res
 						return bad()
 					}
 					seen[offer.Ref] = true
+				}
+				if description.ReferenceHandle != nil {
+					// Handles are disclosed only on explicit request, for the
+					// exact selected endpoint at its exact current revision.
+					// An extension cannot substitute, relocate or backdate one.
+					if !selected.IncludeReferenceHandle || description.ReferenceHandle.Ref != selected.Ref || description.ReferenceHandle.Revision != description.Endpoint.Revision {
+						return bad()
+					}
+					slot, revision, e := fabric.ParseReferenceHandle(description.ReferenceHandle.Handle)
+					if e != nil || description.ReferenceHandle.Handle != fabric.FormatReferenceHandle(slot, revision) {
+						return bad()
+					}
+					if description.ReferenceHandle.Label == "" || len(description.ReferenceHandle.Label) > 256 || !utf8.ValidString(description.ReferenceHandle.Label) || strings.ContainsAny(description.ReferenceHandle.Label, "\x00\n\r") {
+						return bad()
+					}
 				}
 			}
 		}
