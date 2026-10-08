@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/fabric"
+	"github.com/pagnet-code/pagnet/fabric/events/actions"
 	"github.com/pagnet-code/pagnet/fabric/events/httpbinding"
 	"github.com/pagnet-code/pagnet/fabric/extension"
 	"github.com/pagnet-code/pagnet/fabric/localinstallation"
@@ -59,7 +60,28 @@ type InstalledConfig struct {
 	// (federation.exposure.put/get) over the loaded installation. A missing
 	// exposure record is not a startup error: the first declaration creates it.
 	Federation *InstalledFederationConfig
+	// Actions is the explicit installed actions admission surface. Nil = the
+	// surface is unavailable (explicit, never implicit). When set, OpenInstalled
+	// composes the retained signed actions configuration over the loaded
+	// installation and the node's real dispatch. A missing actions record is not
+	// a startup error: an explicit setup creates it.
+	Actions *InstalledActionsConfig
+	// ActionBindings optionally extends the actions dispatch with additional
+	// private binding providers (the node's own bindings remain primary). It is
+	// an explicit composition input, never discovery; nil uses the node's own
+	// bindings only.
+	ActionBindings map[BindingProtocol]BindingProvider
+	// ActionSourceAuthorityWrapper optionally wraps the retained actions source
+	// authority (the wrapped authority remains the inner verifier). It is an
+	// explicit composition input for trusted test/observability boundaries; nil
+	// uses the retained authority unchanged.
+	ActionSourceAuthorityWrapper func(actions.SourceAuthority) actions.SourceAuthority
 }
+
+// InstalledActionsConfig selects the installed actions admission surface. It
+// carries no credentials or targets; the retained signed configuration is the
+// source of truth.
+type InstalledActionsConfig struct{}
 
 // InstalledNode is the actual local socket/product composition. The installation
 // owns the only writer and key; transport joins before runtime, key and Store.
@@ -69,6 +91,7 @@ type InstalledNode struct {
 	Runtime        *LocalRuntime
 	Services       *ServiceRuntime
 	Events         *EventRuntime
+	Actions        *ActionsRuntime
 	Extensions     *ExtensionRuntime
 	Publisher      *IndexPublisher
 	Hosted         *InstalledHosted
@@ -270,6 +293,33 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			resources.events = result.Events
 			ports.Events = result.Events
 		}
+		if c.Actions != nil {
+			settings, cfgErr := OpenInstalledActionsConfig(ctx, installation)
+			if cfgErr != nil {
+				return Ports{}, fmt.Errorf("loading retained actions configuration: %w", cfgErr)
+			}
+			if !settings.empty() {
+				actionsBindings := ports.Bindings
+				if len(c.ActionBindings) > 0 {
+					extra, e := NewRouter(c.ActionBindings)
+					if e != nil {
+						return Ports{}, e
+					}
+					actionsBindings = &actionsBindingResolver{primary: ports.Bindings, extra: extra}
+				}
+				result.Actions, err = OpenActionsRuntime(ctx, installation, settings, actionsBindings, c.ActionSourceAuthorityWrapper)
+				if err != nil {
+					var held *ActionsRuntimeOpenError
+					if errors.As(err, &held) {
+						resources.actions = held.retained
+					}
+					return Ports{}, fmt.Errorf("opening configured actions admission: %w", err)
+				}
+				if result.Actions != nil {
+					resources.actions = result.Actions
+				}
+			}
+		}
 		ports.Tracing = c.Tracing
 		return ports, nil
 	})
@@ -459,6 +509,11 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 				return err
 			}
 		}
+		if n.Actions != nil {
+			if err := n.Actions.CloseContext(ctx); err != nil {
+				return err
+			}
+		}
 		if n.Runtime != nil {
 			if err := n.Runtime.CloseContext(ctx); err != nil {
 				return err
@@ -483,6 +538,7 @@ type installedRuntimes struct {
 	publisher      *IndexPublisher
 	services       *ServiceRuntime
 	events         *EventRuntime
+	actions        *ActionsRuntime
 	extensions     *ExtensionRuntime
 	extensionAdmin *InstalledExtensionAdministration
 	mu             sync.Mutex
@@ -511,6 +567,11 @@ func (r *installedRuntimes) CloseContext(ctx context.Context) error {
 	}
 	if r.events != nil {
 		if e := r.events.CloseContext(ctx); e != nil {
+			return e
+		}
+	}
+	if r.actions != nil {
+		if e := r.actions.CloseContext(ctx); e != nil {
 			return e
 		}
 	}

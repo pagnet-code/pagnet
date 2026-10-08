@@ -235,10 +235,31 @@ func (s *Store) deliver(ctx context.Context, e event.Event) error {
 	}
 	return nil
 }
+// ClaimDelivery claims one pending delivery from the actions dispatch queue.
+// It is the worker's genuine claim: the caller owns the lease and must Ack or
+// let it expire. It exposes no authority; delivery still verifies through the
+// store's current source/definition authority and the durable Admitter.
+func (s *Store) ClaimDelivery(ctx context.Context, worker string, now time.Time) (durable.Delivery, bool, error) {
+	if s == nil || ctx == nil || worker == "" {
+		return durable.Delivery{}, false, invalid()
+	}
+	return s.queue.Claim(ctx, "actions.dispatch", worker, now)
+}
+
+// AckDelivery acknowledges a claimed delivery after its actions were durably
+// admitted. It never re-admits; an unacked lease is redelivered and the
+// Admitter recovers the same retained receipt.
+func (s *Store) AckDelivery(ctx context.Context, claim durable.Claim, now time.Time) error {
+	if s == nil || ctx == nil || claim.Token == "" {
+		return invalid()
+	}
+	return s.queue.Ack(ctx, claim, now)
+}
+
 func (s *Store) StartWorkers(ctx context.Context) (*durable.Workers, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.worker != nil {
+	if s.closed || s.worker != nil || s.config.Admitter == nil {
 		return nil, unavailable()
 	}
 	worker, err := durable.StartWorkers(ctx, s.queue, durable.WorkerConfig{Handlers: map[string]durable.Handler{"actions.dispatch": s.deliver}, Timeout: 30 * time.Second, PollInterval: 100 * time.Millisecond})

@@ -59,7 +59,10 @@ func Bootstrap(ctx context.Context, dir string, c Config) (*Store, error) {
 }
 func Open(ctx context.Context, dir string, c Config) (*Store, error) { return open(ctx, dir, c, false) }
 func open(ctx context.Context, dir string, c Config, create bool) (*Store, error) {
-	if ctx == nil || ctx.Err() != nil || c.Scope.Audience == "" || c.Scope.Domain == "" || c.Protector == nil || c.SourceAuthority == nil || c.DefinitionAuthority == nil || c.Authorizer == nil || c.Admitter == nil || c.MaxDefinitions < 1 || c.MaxDefinitions > 1024 || len(c.Definitions) > c.MaxDefinitions || c.MaxFanout < 1 || c.MaxFanout > 128 || c.MaxProofBytes < 1 || c.MaxProofBytes > 65536 || c.MaxEnvelopeBytes < 1024 || c.MaxEnvelopeBytes > 65536 {
+	// The Admitter is a delivery-time dependency (consumed by the worker
+	// handler), not an open-time one: an explicit setup/open that only verifies
+	// the retained queue/registrations may legitimately carry no Admitter.
+	if ctx == nil || ctx.Err() != nil || c.Scope.Audience == "" || c.Scope.Domain == "" || c.Protector == nil || c.SourceAuthority == nil || c.DefinitionAuthority == nil || c.Authorizer == nil || c.MaxDefinitions < 1 || c.MaxDefinitions > 1024 || len(c.Definitions) > c.MaxDefinitions || c.MaxFanout < 1 || c.MaxFanout > 128 || c.MaxProofBytes < 1 || c.MaxProofBytes > 65536 || c.MaxEnvelopeBytes < 1024 || c.MaxEnvelopeBytes > 65536 {
 		return nil, invalid()
 	}
 	if len(c.Queue.Subscriptions) != 1 || c.Queue.Subscriptions[0].ID != "actions.dispatch" || len(c.Queue.Subscriptions[0].Types) != 1 || c.Queue.Subscriptions[0].Types[0] != "dev.pagnet.actions.queued" {
