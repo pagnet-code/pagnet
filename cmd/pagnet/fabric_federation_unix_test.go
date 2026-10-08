@@ -276,3 +276,104 @@ func TestFederationExposureAdminCLIInstalledNode(t *testing.T) {
 		t.Fatalf("human get after retry = %q", out)
 	}
 }
+
+// TestFederationPeerLinkAdminCLIInstalledNode starts a genuine installed node
+// with Federation enabled and drives the peer certify + link put/get CLI
+// end-to-end against its private admin socket: the certify receipt carries the
+// exchange key, and the link put/get round-trips the declared channel.
+func TestFederationPeerLinkAdminCLIInstalledNode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 240*time.Second)
+	defer cancel()
+	private := t.TempDir()
+	if err := os.Chmod(private, 0700); err != nil {
+		t.Fatal(err)
+	}
+	socketDir := filepath.Join(private, "run")
+	if err := os.Mkdir(socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, socket := filepath.Join(private, "domain"), filepath.Join(socketDir, "node.sock")
+	initial, err := localinstallation.Bootstrap(ctx, dir, localinstallation.Options{Settings: localinstallation.DefaultSettings(socket)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := initial.Store.AuthorityIdentity()
+	if err = initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(private, "pagnet")
+	// The test binary's cwd is this package's source dir (cmd/pagnet); the
+	// module root (go.mod) is two levels up.
+	source, _ := filepath.Abs("../..")
+	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/pagnet")
+	build.Dir = source
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatal("actual CLI build", err, string(output))
+	}
+
+	product, err := fabricnode.OpenInstalled(ctx, fabricnode.InstalledConfig{Directory: dir, Binary: binary, Federation: &fabricnode.InstalledFederationConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = product.CloseContext(context.WithoutCancel(ctx)) }()
+	if product.Federation == nil {
+		t.Fatal("the federation surface was not composed")
+	}
+
+	// 1) certify (CLI) -> the receipt carries the exchange key + certificate.
+	var certify struct {
+		PublicKey   [32]byte `json:"publicKey"`
+		KeyRevision string   `json:"keyRevision"`
+	}
+	if err := json.Unmarshal(runCLISubcommandJSON(t, localFederationCmd, "peer", "certify", "--socket", socket), &certify); err != nil {
+		t.Fatal("certify", err)
+	}
+	if certify.KeyRevision != "1" || certify.PublicKey == ([32]byte{}) {
+		t.Fatalf("certify receipt = %+v; want a non-zero exchange key at revision 1", certify)
+	}
+
+	// 2) link put (CLI) -> the per-channel link at revision 1.
+	remoteKey := make([]byte, 32)
+	remoteKey[0] = 0x22
+	remoteRef, err := fabric.NewEndpointRef(remoteKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remoteRef.Domain() == root.Namespace {
+		t.Fatal("fixture foreign domain collided with the local domain")
+	}
+	remoteNamespace := remoteRef.Domain()
+	remoteStoreID := strings.Repeat("0", 64)
+	channelID := strings.Repeat("1", 64)
+	sourceRoute := strings.Repeat("2", 64)
+	destinationRoute := strings.Repeat("3", 64)
+	var put struct {
+		Revision string `json:"revision"`
+	}
+	if err := json.Unmarshal(runCLISubcommandJSON(t, localFederationCmd, "link", "put",
+		"--socket", socket,
+		"--remote-namespace", remoteNamespace, "--remote-store-id", remoteStoreID,
+		"--channel-id", channelID, "--source-route", sourceRoute, "--destination-route", destinationRoute,
+		"--source-role"), &put); err != nil {
+		t.Fatal("link put", err)
+	}
+	if put.Revision != "1" {
+		t.Fatalf("link put receipt = %+v; want revision 1", put)
+	}
+
+	// 3) link get (CLI) -> mirrors the declaration.
+	var get struct {
+		Revision string `json:"revision"`
+		Link     struct {
+			RemoteNamespace string `json:"remoteNamespace"`
+			RemoteStoreID   string `json:"remoteStoreId"`
+			SourceRole      bool   `json:"sourceRole"`
+		} `json:"link"`
+	}
+	if err := json.Unmarshal(runCLISubcommandJSON(t, localFederationCmd, "link", "get", "--socket", socket, "--channel-id", channelID), &get); err != nil {
+		t.Fatal("link get", err)
+	}
+	if get.Revision != "1" || get.Link.RemoteNamespace != remoteNamespace || get.Link.RemoteStoreID != remoteStoreID || !get.Link.SourceRole {
+		t.Fatalf("link get = %+v; want the declared link at revision 1", get)
+	}
+}
