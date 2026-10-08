@@ -20,8 +20,8 @@ import (
 	sdka2a "github.com/a2aproject/a2a-go/v2/a2a"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/pagnet-code/pagnet/fabric"
-	"github.com/pagnet-code/pagnet/fabric/federation"
 	"github.com/pagnet-code/pagnet/fabric/extension"
+	"github.com/pagnet-code/pagnet/fabric/federation"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
 	"github.com/pagnet-code/pagnet/internal/fabricfederation"
@@ -37,11 +37,13 @@ import (
 //	max bytes        — 128 MiB (duplex)
 //	conn lifetime    — 5 minutes
 //	max active       — 8 (per-link concurrent execution pipelines)
+//	max controls     — 100_000 (per-store control replay capacity)
 //	final outputs    — the existing DefaultFinalOutputLimits (64, 64 MiB, 4096)
 const (
 	federationServingConnLifetime = 5 * time.Minute
 	federationServingMaxActive    = 8
 	federationServingMaxBytes     = uint64(128 << 20)
+	federationServingMaxControls  = uint64(100000)
 	federationServingMaxRecords   = uint64(4096)
 )
 
@@ -70,6 +72,10 @@ type linkServing struct {
 	connections *fabricservices.Connections
 	a2a         *fabricservices.A2AConnections
 	runtime     *FederationRuntime
+
+	admissions *federation.AdmissionLedger
+	outputs    *FinalOutputs
+	controls   *federation.ControlLedger
 }
 
 // current reports whether this composition still matches the link and both
@@ -269,6 +275,29 @@ func (n *InstalledNode) composeFederationLink(ctx context.Context, relay *federa
 		}
 	}
 
+	// 8. Federation control ledger: per-store singleton, same pattern. The
+	// production verifiers recompute retained final-output/admission evidence
+	// inside the ledger's own transactions; the boundary is the control
+	// authenticator (fresh live control callers only).
+	controlConfig := federation.ControlConfig{
+		Ledger:        admissions,
+		Authenticator: boundary,
+		MaxControls:   federationServingMaxControls,
+		Cursors:       &federationCursorVerifier{outputs: final},
+		Results:       &federationControlResultVerifier{admissions: admissions, outputs: final},
+	}
+	controls, e := federation.OpenControlLedger(ctx, controlConfig)
+	if e != nil {
+		var missing *fabric.Error
+		if !errors.As(e, &missing) || missing.Code != fabric.CodeNotFound {
+			return nil, errors.Join(e, node.CloseContext(ctx), (&linkServing{connections: connections, a2a: a2a}).Close(ctx))
+		}
+		controls, e = federation.BootstrapControlLedger(ctx, controlConfig)
+		if e != nil {
+			return nil, errors.Join(e, node.CloseContext(ctx), (&linkServing{connections: connections, a2a: a2a}).Close(ctx))
+		}
+	}
+
 	runtime, e := NewFederationRuntime(FederationRuntimeConfig{
 		Boundary:   boundary,
 		Node:       node,
@@ -292,6 +321,9 @@ func (n *InstalledNode) composeFederationLink(ctx context.Context, relay *federa
 		connections:    connections,
 		a2a:            a2a,
 		runtime:        runtime,
+		admissions:     admissions,
+		outputs:        final,
+		controls:       controls,
 	}, nil
 }
 
@@ -338,9 +370,9 @@ func (r *federationRelay) connectExposedServices(ctx context.Context, n *Install
 			return fabric.NewError(fabric.CodeInvalidInput, "exposure binding is not published on the endpoint")
 		}
 		scope := registry.DescriptorBatchScope{
-			Endpoint:               endpointRef,
+			Endpoint:                 endpointRef,
 			ExpectedEndpointRevision: descriptor.Revision,
-			BindingID:              exposure.BindingID,
+			BindingID:                exposure.BindingID,
 		}
 		switch binding.Protocol {
 		case "mcp.tools":

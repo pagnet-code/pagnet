@@ -48,7 +48,7 @@ func (c *ForwardChannel) SendControl(ctx context.Context, request ControlRequest
 func (c *ForwardChannel) ReceiveControl(ctx context.Context) (ControlRequest, error) {
 	c.receiveMu.Lock()
 	defer c.receiveMu.Unlock()
-	raw, e := c.transport.Receive(ctx)
+	raw, e := c.takePending(ctx)
 	if e != nil {
 		return ControlRequest{}, e
 	}
@@ -118,7 +118,11 @@ func (c *ForwardChannel) ReceiveControlReply(ctx context.Context, request Contro
 	}
 	defer clear(raw)
 	var reply ControlReply
-	if len(raw) < 2 || raw[0] != controlReplyRecord || fabric.DecodeJSONWithLimits(raw[1:], &reply, fabric.WireLimits{MaxBytes: 4096, MaxDepth: 8, MaxMembers: 128}) != nil || reply.RequestDigest != digest || reply.ReceiptDigest != r.Proof.Frame.ReceiptDigest || reply.ReplayID != r.Proof.Frame.ReplayID || !cursorValid(&reply.Status.Cursor) || reply.Result != nil && !validControlResult(r, *reply.Result) {
+	// The closed reply shape carries up to five [32]byte digests (receipt,
+	// request, status cursor frame digest, result response digest and result
+	// cursor frame digest), each marshaled as a 32-element JSON array: 13
+	// object members plus 160 array elements, so the member bound is 256.
+	if len(raw) < 2 || raw[0] != controlReplyRecord || fabric.DecodeJSONWithLimits(raw[1:], &reply, fabric.WireLimits{MaxBytes: 4096, MaxDepth: 8, MaxMembers: 256}) != nil || reply.RequestDigest != digest || reply.ReceiptDigest != r.Proof.Frame.ReceiptDigest || reply.ReplayID != r.Proof.Frame.ReplayID || !cursorValid(&reply.Status.Cursor) || reply.Result != nil && !validControlResult(r, *reply.Result) {
 		c.Close()
 		return ControlReply{}, protocolError()
 	}

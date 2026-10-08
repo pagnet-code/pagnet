@@ -103,11 +103,13 @@ func TestActualRetainedNativeSourceDeliveryDetachReopenExactACKWithoutResend(t *
 		if e != nil || again.Frame == nil || sourceSHA(*again.Frame) != sourceSHA(*frame) || again.CipherDigest != page.CipherDigest {
 			t.Fatal("unacknowledged original frame changed", e)
 		}
-		if e = reopened.Ack(r.ctx, r.owner, page.Cursor, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); e == nil {
+		if _, e = reopened.Ack(r.ctx, r.owner, page.Cursor, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); e == nil {
 			t.Fatal("substituted ciphertext ACK accepted")
 		}
-		if e = reopened.Ack(r.ctx, r.owner, page.Cursor, page.CipherDigest); e != nil {
+		if acked, e := reopened.Ack(r.ctx, r.owner, page.Cursor, page.CipherDigest); e != nil {
 			t.Fatal(e)
+		} else if acked != page.CipherDigest {
+			t.Fatal("journal-verified ACK digest differs from the retained cipher digest")
 		}
 		cursor = page.Cursor
 		if frame.Kind == fabric.FrameChunk {

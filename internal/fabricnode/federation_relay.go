@@ -1,16 +1,18 @@
 package fabricnode
 
 // The installed federation product's blind-relay destination serving listener
-// (E1 slice-2b) — the platform-independent composition state.
+// (E1 slice-2b/2c) — the platform-independent composition state.
 //
 // The relay identifies a link ONLY from the plaintext Packet.Channel of the
 // first encrypted record; it never inspects decrypted content. Per connection
-// it re-establishes the HPKE transport from that first packet, receives one
-// bounded bundle, and hands it to the per-link serving runtime. The relay
-// sends no response: bundle-forward is one-way, and the honest observation of
-// the outcome is the relay's own retained start result. The actual socket
-// transport is unix-only (federation_relay_serve_unix.go); other platforms
-// fail the relay startup explicitly, never silently.
+// it re-establishes the HPKE transport from that first packet and serves one
+// bounded unit: a bundle-forward (records 1..3, one-way — the honest
+// observation of the outcome is the relay's own retained start result) or a
+// committed control unit (record 4, reply record 5, pull frames record 6 —
+// the wire reply is the primary observation; the retained control result
+// records outcomes the source could not receive). The actual socket transport
+// is unix-only (federation_relay_serve_unix.go); other platforms fail the
+// relay startup explicitly, never silently.
 
 import (
 	"context"
@@ -34,12 +36,14 @@ type federationRelay struct {
 	cancel     context.CancelFunc
 	acceptDone chan struct{}
 
-	mu         sync.Mutex
-	closed     bool
-	serving    map[[32]byte]*linkServing
-	profiles   *fabricservices.ProfileStore
-	results    map[[32]byte]federationServingResult
-	generation uint64
+	mu                sync.Mutex
+	closed            bool
+	serving           map[[32]byte]*linkServing
+	profiles          *fabricservices.ProfileStore
+	results           map[[32]byte]federationServingResult
+	generation        uint64
+	controlResults    map[[32]byte]federationServingControlResult
+	controlGeneration uint64
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -51,6 +55,18 @@ type federationServingResult struct {
 	Channel    [32]byte
 	Generation uint64
 	Start      FederationStart
+}
+
+// federationServingControlResult is the relay's retained latest control
+// outcome for a channel (private observability): the wire reply is the
+// primary observation, this records committed states and outcomes the source
+// could not receive.
+type federationServingControlResult struct {
+	Channel    [32]byte
+	Generation uint64
+	Action     string
+	State      federation.ControlState
+	Error      error
 }
 
 // newFederationRelay composes the relay over the installed node. The default
@@ -70,13 +86,14 @@ func newFederationRelay(ctx context.Context, n *InstalledNode, cfg *InstalledFed
 	}
 	lifetime, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &federationRelay{
-		node:       n,
-		path:       path,
-		lifetime:   lifetime,
-		cancel:     cancel,
-		acceptDone: make(chan struct{}),
-		serving:    map[[32]byte]*linkServing{},
-		results:    map[[32]byte]federationServingResult{},
+		node:           n,
+		path:           path,
+		lifetime:       lifetime,
+		cancel:         cancel,
+		acceptDone:     make(chan struct{}),
+		serving:        map[[32]byte]*linkServing{},
+		results:        map[[32]byte]federationServingResult{},
+		controlResults: map[[32]byte]federationServingControlResult{},
 	}, nil
 }
 
@@ -164,6 +181,34 @@ func (r *federationRelay) latestResult(channel [32]byte) (FederationStart, uint6
 	return value.Start, value.Generation, ok
 }
 
+// servingForChannel returns the retained per-link serving stack for a channel
+// (private observability for the in-package acceptance test, which
+// independently recomputes committed head-state digests).
+func (r *federationRelay) servingForChannel(channel [32]byte) *linkServing {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.serving[channel]
+}
+
+// recordControl retains the latest control outcome for a channel (private
+// observability; the wire reply is the primary observation).
+func (r *federationRelay) recordControl(channel [32]byte, action string, state federation.ControlState, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.controlGeneration++
+	r.controlResults[channel] = federationServingControlResult{Channel: channel, Generation: r.controlGeneration, Action: action, State: state, Error: err}
+}
+
+// latestControlResult reports the retained latest control outcome for a
+// channel and the control-generation counter. Private observability for the
+// in-package acceptance test.
+func (r *federationRelay) latestControlResult(channel [32]byte) (federationServingControlResult, uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, ok := r.controlResults[channel]
+	return value, r.controlGeneration, ok
+}
+
 // CloseContext stops the relay: cancel the lifetime, close the listener, join
 // the accept loop, then join in-flight serving connections. An incomplete
 // join returns the caller's context error and is retryable (idempotent).
@@ -215,5 +260,7 @@ func (s *prependStream) Read(ctx context.Context) (federation.Packet, error) {
 	}
 	return s.inner.Read(ctx)
 }
-func (s *prependStream) Write(ctx context.Context, p federation.Packet) error { return s.inner.Write(ctx, p) }
-func (s *prependStream) Close() error                                         { return s.inner.Close() }
+func (s *prependStream) Write(ctx context.Context, p federation.Packet) error {
+	return s.inner.Write(ctx, p)
+}
+func (s *prependStream) Close() error { return s.inner.Close() }

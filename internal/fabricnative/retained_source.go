@@ -222,44 +222,71 @@ func (s *RetainedSource) Wait(ctx context.Context, caller fabric.ExecutionContex
 	_, err = h.Client.WaitReady(ctx, h.ControlKey, token)
 	return err
 }
-func (s *RetainedSource) Ack(ctx context.Context, caller fabric.ExecutionContext, cursor int64, digest string) error {
+
+// Ack FULL-checkpoints the consumer's exact cursor against the retained
+// original journal. The digest must be the journal's own cipher digest for
+// the ACKed frame (from Page); the journal verifies it against its retained
+// frame chain (a re-ACK of the current floor against its floor digest is
+// idempotent). On success it returns that journal-verified digest as the
+// actuation evidence — never an unverified wire-claimed value.
+func (s *RetainedSource) Ack(ctx context.Context, caller fabric.ExecutionContext, cursor int64, digest string) (string, error) {
 	if cursor < 0 || cursor == math.MaxInt64 || len(digest) != 64 {
-		return adapterError(fabric.CodeInvalidInput, "Invalid original native frame ACK")
+		return "", adapterError(fabric.CodeInvalidInput, "Invalid original native frame ACK")
 	}
 	h, err := s.handle(ctx, caller)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return s.adapter.read(ctx, caller, h, s.checkpoint, s.reservation, identity.NativeSourceAck, func(current context.Context) error {
+	err = s.adapter.read(ctx, caller, h, s.checkpoint, s.reservation, identity.NativeSourceAck, func(current context.Context) error {
 		_, e := h.Client.Call(current, sessionworker.LocalRequest{Type: "stream_ack", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: s.reservation.Sequence, Cursor: cursor, Digest: digest})
 		return e
 	})
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
 }
 
-// RequestCancellation returns only genuine worker FULL cancellation-intent ACK.
-// It does not assert process reaping, business completion or a terminal frame.
-func (s *RetainedSource) RequestCancellation(ctx context.Context, caller fabric.ExecutionContext) error {
+// RequestCancellation commits only a genuine worker FULL cancellation-intent
+// ACK. It does not assert process reaping, business completion or a terminal
+// frame. On success it returns the digest of the exact verified
+// cancellation-intent wire artifact the worker committed — retained evidence
+// for the stop, never a self-attested value.
+func (s *RetainedSource) RequestCancellation(ctx context.Context, caller fabric.ExecutionContext) ([32]byte, error) {
 	h, err := s.handle(ctx, caller)
 	if err != nil {
-		return err
+		return [32]byte{}, err
 	}
 	binder, err := nativeauthority.NewInputBinder(h.InputBindingProfile, s.checkpoint.OriginalBinding.Worker.ProfileDigest)
 	if err != nil {
-		return err
+		return [32]byte{}, err
 	}
 	controller, err := nativeauthority.NewLocalControllerForOwnership(s.adapter.config.Authority, s.adapter.config.Owner, h.Ownership, h.Binding, binder)
 	if err != nil {
-		return err
+		return [32]byte{}, err
 	}
 	intent, err := controller.CancellationIntent(h.Current, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation, s.checkpoint.Finalized)
 	if err != nil {
-		return err
+		return [32]byte{}, err
 	}
-	return s.adapter.config.Authority.FenceNativeCancellation(ctx, s.adapter.config.Owner, caller, h.Current, h.Binding, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation, func(current context.Context) error {
+	var committed [32]byte
+	err = s.adapter.config.Authority.FenceNativeCancellation(ctx, s.adapter.config.Owner, caller, h.Current, h.Binding, s.checkpoint.OriginalBinding, s.checkpoint.Admission, s.reservation, func(current context.Context) error {
 		request := intent.Request()
-		_, e := h.Client.Call(current, sessionworker.LocalRequest{Type: "cancel", Intent: &request})
-		return e
+		if _, e := h.Client.Call(current, sessionworker.LocalRequest{Type: "cancel", Intent: &request}); e != nil {
+			return e
+		}
+		raw, e := json.Marshal(request)
+		if e != nil {
+			return adapterError(fabric.CodeProtocolError, "Original native cancellation intent encoding failed")
+		}
+		defer clear(raw)
+		committed = sha256.Sum256(raw)
+		return nil
 	})
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return committed, nil
 }
 
 // PrepareReferenceVerifier performs current caller/kernel checks before SQL.

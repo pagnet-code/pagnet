@@ -60,6 +60,19 @@ func (l *AdmissionLedger) change(ctx context.Context, c Config, a Admission, cal
 	}
 	return committed, nil
 }
+
+// AttemptID derives the deterministic original-attempt identifier committed by
+// MarkAttempt for the exact admission on the given store root. The source
+// composes it into pull/ack control frames without a round-trip; it is a
+// derived identifier, not a credential.
+func AttemptID(root registry.AuthorityIdentity, principal fabric.Principal, invocation string, bundleDigest [32]byte) string {
+	raw, _ := json.Marshal(struct {
+		Purpose, Domain, Store, Key string
+		Digest                      [32]byte
+	}{"pagnet.fabric.federation-attempt.v1", root.Namespace, root.StoreID, invocationKey(principal, invocation), bundleDigest})
+	sum := sha256.Sum256(raw)
+	return "attempt:" + hex.EncodeToString(sum[:])
+}
 func (l *AdmissionLedger) MarkAttempt(ctx context.Context, c Config, a Admission, caller fabric.ExecutionContext) (AttemptPermit, bool, error) {
 	fresh := false
 	m, e := l.change(ctx, c, a, caller, ActionAttempt, func(ctx context.Context, tx *registry.AuthorityTx, m *admissionManifest) error {
@@ -79,12 +92,7 @@ func (l *AdmissionLedger) MarkAttempt(ctx context.Context, c Config, a Admission
 				return fabric.NewError(fabric.CodeDeadlineExceeded, "Original invocation deadline expired")
 			}
 		}
-		raw, _ := json.Marshal(struct {
-			Purpose, Domain, Store, Key string
-			Digest                      [32]byte
-		}{"pagnet.fabric.federation-attempt.v1", l.root.Namespace, l.root.StoreID, a.key, a.digest})
-		sum := sha256.Sum256(raw)
-		m.AttemptID = "attempt:" + hex.EncodeToString(sum[:])
+		m.AttemptID = AttemptID(l.root, m.Facts.Principal, m.Facts.InvocationID, a.digest)
 		fresh = true
 		return nil
 	})
@@ -133,6 +141,25 @@ func (l *AdmissionLedger) Status(ctx context.Context, c Config, a Admission, cal
 		return AdmissionStatus{}, e
 	}
 	return AdmissionStatus{Attempted: m.AttemptID != "", CancelRequested: m.CancelRequested, Association: m.Association, Cursor: m.Cursor}, nil
+}
+
+// StatusTx reads the exact retained admission head inside the caller's
+// already-open transaction. It performs the same bounded local retained-state
+// check as Status without a caller: the current caller's admission
+// authorization is the caller's own concern, committed in the same
+// transaction by the surrounding policy. It never opens another registry
+// transaction or performs provider IO.
+func (l *AdmissionLedger) StatusTx(ctx context.Context, tx *registry.AuthorityTx, principal fabric.Principal, invocation string) (AdmissionStatus, error) {
+	if l == nil || tx == nil || ctx == nil || ctx.Err() != nil {
+		return AdmissionStatus{}, authError()
+	}
+	_, m, e := l.manifest(tx, invocationKey(principal, invocation))
+	if e != nil {
+		return AdmissionStatus{}, e
+	}
+	status := statusFrom(m)
+	status.Association = m.Association
+	return status, nil
 }
 
 // RequestCancellation FULL-commits stop intent only. The caller must then invoke

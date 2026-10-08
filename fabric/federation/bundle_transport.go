@@ -11,6 +11,17 @@ const bundleStart = byte(1)
 const bundleChunk = byte(2)
 const bundleEnd = byte(3)
 
+// UnitKind identifies the first plaintext record of one relay connection. The
+// blind relay dispatches on it before any unit-specific handling: UnitBundle
+// leads to ReceiveBundle (records 1..3), UnitControl to ReceiveControl
+// (record 4, reply record 5, pull frames record 6).
+type UnitKind int
+
+const (
+	UnitBundle  UnitKind = 1 // bundleStart: one bounded forward bundle
+	UnitControl UnitKind = 4 // controlRequestRecord: one committed control unit
+)
+
 // ForwardChannel owns its Duplex and serializes complete bounded request
 // documents. It never buffers an invocation response: subsequent result/event
 // frames require the actual node protocol's one-record pull boundary.
@@ -19,6 +30,7 @@ const bundleEnd = byte(3)
 type ForwardChannel struct {
 	transport         *Duplex
 	sendMu, receiveMu sync.Mutex
+	pending           []byte
 }
 
 func NewForwardChannel(transport *Duplex) (*ForwardChannel, error) {
@@ -28,6 +40,48 @@ func NewForwardChannel(transport *Duplex) (*ForwardChannel, error) {
 	return &ForwardChannel{transport: transport}, nil
 }
 func (c *ForwardChannel) Close() error { return c.transport.Close() }
+
+// DispatchFirst reads the first plaintext record and retains it for the
+// subsequent typed receive. Any other first record is a protocol error that
+// closes the channel. The caller must follow with the matching typed receive
+// (ReceiveBundle or ReceiveControl), which consumes and clears the retained
+// record.
+func (c *ForwardChannel) DispatchFirst(ctx context.Context) (UnitKind, error) {
+	c.receiveMu.Lock()
+	defer c.receiveMu.Unlock()
+	if c.pending != nil {
+		return 0, protocolError()
+	}
+	raw, e := c.transport.Receive(ctx)
+	if e != nil {
+		return 0, e
+	}
+	var kind UnitKind
+	switch {
+	case len(raw) == 37 && raw[0] == bundleStart:
+		kind = UnitBundle
+	case len(raw) >= 2 && raw[0] == controlRequestRecord:
+		kind = UnitControl
+	default:
+		clear(raw)
+		_ = c.transport.Close()
+		return 0, protocolError()
+	}
+	c.pending = raw
+	return kind, nil
+}
+
+// takePending returns the first record retained by DispatchFirst when one was
+// retained, otherwise reads the next record. Callers hold receiveMu and clear
+// the returned slice.
+func (c *ForwardChannel) takePending(ctx context.Context) ([]byte, error) {
+	if c.pending != nil {
+		p := c.pending
+		c.pending = nil
+		return p, nil
+	}
+	return c.transport.Receive(ctx)
+}
 func (c *ForwardChannel) SendBundle(ctx context.Context, b ForwardBundle) error {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
@@ -65,7 +119,7 @@ func (c *ForwardChannel) ReceiveBundle(ctx context.Context) (ForwardBundle, erro
 	c.receiveMu.Lock()
 	defer c.receiveMu.Unlock()
 	fail := func(e error) (ForwardBundle, error) { _ = c.Close(); return ForwardBundle{}, e }
-	header, e := c.transport.Receive(ctx)
+	header, e := c.takePending(ctx)
 	if e != nil {
 		return fail(e)
 	}

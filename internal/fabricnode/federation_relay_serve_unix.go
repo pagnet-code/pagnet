@@ -62,7 +62,9 @@ func (r *federationRelay) acceptLoop() {
 }
 
 // handle serves one connection: first-packet link lookup, per-link runtime,
-// one bounded bundle, execution through the runtime. Every failure closes the
+// one bounded unit. The first plaintext record selects the unit type:
+// record 1 (bundle start) runs the one-way bundle-forward; record 4 (control
+// request) runs the destination control path. Every failure closes the
 // connection without a response; the retained result records the outcome.
 func (r *federationRelay) handle(conn net.Conn) {
 	defer r.wg.Done()
@@ -110,6 +112,20 @@ func (r *federationRelay) handle(conn net.Conn) {
 		_ = duplex.Close()
 		return
 	}
+	kind, e := channel.DispatchFirst(ctx)
+	if e != nil {
+		_ = channel.Close()
+		return
+	}
+	switch kind {
+	case federation.UnitControl:
+		r.handleControl(ctx, serving, channel)
+		return
+	case federation.UnitBundle:
+	default:
+		_ = channel.Close()
+		return
+	}
 	bundle, e := channel.ReceiveBundle(ctx)
 	if e != nil {
 		_ = channel.Close()
@@ -124,4 +140,46 @@ func (r *federationRelay) handle(conn net.Conn) {
 	}
 	r.recordResult(first.Channel, started)
 	_ = channel.Close()
+}
+
+// handleControl serves one committed control unit on its own connection (D3):
+// receive the signed request (record 4), serve the action through the
+// per-link ControlLedger and the genuine source actuation, reply with the
+// committed state (record 5) and, for a pull, the retained frames (record 6).
+// Every failure closes the connection without a reply; the retained control
+// result records the outcome.
+func (r *federationRelay) handleControl(ctx context.Context, serving *linkServing, channel *federation.ForwardChannel) {
+	fail := func(action string, state federation.ControlState, e error) {
+		_ = channel.Close()
+		r.recordControl(serving.channel, action, state, e)
+	}
+	request, e := channel.ReceiveControl(ctx)
+	if e != nil {
+		fail("", federation.ControlState{}, e)
+		return
+	}
+	state, frames, e := serving.serveControl(ctx, request)
+	if e != nil {
+		fail(request.Proof.Frame.Action, federation.ControlState{}, e)
+		return
+	}
+	if e := channel.SendControlReply(ctx, request, state); e != nil {
+		fail(request.Proof.Frame.Action, federation.ControlState{}, e)
+		return
+	}
+	if len(frames) > 0 {
+		page, e := federation.NewPullPage(channel, request)
+		if e != nil {
+			fail(request.Proof.Frame.Action, state, e)
+			return
+		}
+		for _, frame := range frames {
+			if e := page.Send(ctx, frame); e != nil {
+				fail(request.Proof.Frame.Action, state, e)
+				return
+			}
+		}
+	}
+	_ = channel.Close()
+	r.recordControl(serving.channel, request.Proof.Frame.Action, state, nil)
 }

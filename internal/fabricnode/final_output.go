@@ -643,6 +643,73 @@ func (f *FinalOutputs) Frame(ctx context.Context, caller fabric.ExecutionContext
 	return frame, e
 }
 
+// VerifyFrameTx re-derives the exact retained final frame at ordinal inside
+// the caller's transaction and returns its committed digest. It performs the
+// integrity-only retained-state checks: reference validity, head match,
+// immutable commitment, current plan and the frame parts' own digest. It
+// authorizes no caller: the current caller's binding/peer/exposure
+// authorization for the exact admission is committed by the surrounding
+// control admission policy in this same transaction. It never opens another
+// Store transaction and never opens a source or provider.
+func (f *FinalOutputs) VerifyFrameTx(ctx context.Context, tx *registry.AuthorityTx, ref FinalOutputReference, ordinal uint64) ([32]byte, error) {
+	if f == nil || tx == nil || ctx == nil || ctx.Err() != nil || ref.Version != 1 || ref.Principal.Ref == "" || ref.Principal.Issuer == "" || ref.InvocationID == "" || len(ref.InvocationID) > 256 || ref.Commitment == ([32]byte{}) {
+		return [32]byte{}, localDenied()
+	}
+	id := finalOutputID(ref.Principal, ref.InvocationID)
+	if ref.SourceKey != id {
+		return [32]byte{}, localDenied()
+	}
+	var h finalOutputHead
+	if _, e := f.read(tx, id, &h); e != nil {
+		return [32]byte{}, e
+	}
+	if h.Principal != ref.Principal || h.InvocationID != ref.InvocationID || (h.Source == nil && h.NativeSource == nil) || finalOutputCommitment(h) != ref.Commitment {
+		return [32]byte{}, localDenied()
+	}
+	if e := f.currentPlanTx(tx, h); e != nil {
+		return [32]byte{}, e
+	}
+	if ordinal >= h.Frames {
+		if h.Attempted || h.Incomplete {
+			return [32]byte{}, &fabric.Error{Code: "federation.FINALIZATION_UNKNOWN", Message: "Original output finalization is incomplete; it cannot be rerun", Effect: fabric.EffectUnknown}
+		}
+		if h.Terminal {
+			return [32]byte{}, io.EOF
+		}
+		return [32]byte{}, fabric.NewError(fabric.CodeTargetUnavailable, "Original final output is not ready")
+	}
+	prefix := id + "/frame/" + hex.EncodeToString([]byte(fmtUint(ordinal)))
+	var meta finalOutputFrame
+	if _, e := f.read(tx, prefix, &meta); e != nil {
+		return [32]byte{}, e
+	}
+	if meta.Parts < 1 || meta.Parts > 6 || meta.Digest == ([32]byte{}) {
+		return [32]byte{}, localDenied()
+	}
+	var raw []byte
+	defer func() { clear(raw) }()
+	for n := uint32(0); n < meta.Parts; n++ {
+		var part []byte
+		if _, e := f.read(tx, prefix+"/"+fmtUint(uint64(n)), &part); e != nil {
+			return [32]byte{}, e
+		}
+		if len(part) == 0 || len(part) > 22<<10 || len(raw)+len(part) > 128<<10 {
+			clear(part)
+			return [32]byte{}, localDenied()
+		}
+		raw = append(raw, part...)
+		clear(part)
+	}
+	if sha256.Sum256(raw) != meta.Digest {
+		return [32]byte{}, localDenied()
+	}
+	var frame fabric.InvocationFrame
+	if fabric.DecodeJSONWithLimits(raw, &frame, fabric.WireLimits{MaxBytes: 128 << 10, MaxDepth: 16, MaxMembers: 512}) != nil || frame.InvocationID != h.InvocationID || frame.Sequence != ordinal || len(frame.Data) > fabric.MaxFrameBytes {
+		return [32]byte{}, localDenied()
+	}
+	return meta.Digest, nil
+}
+
 func (f *FinalOutputs) captureNative(ctx context.Context, owner *fabricnative.OriginalCaptureOwnership) error {
 	checkpoint, err := owner.Checkpoint()
 	if err != nil {

@@ -26,6 +26,19 @@ type FederationRuntime struct {
 	closed     bool
 	done       chan struct{}
 	wg         sync.WaitGroup
+
+	// Per-invocation execution contexts for the in-flight stop port: an
+	// invocation's pipeline runs under its own cancel scope so a committed
+	// stop intent can genuinely stop it (a completed invocation has no live
+	// effect to stop).
+	stopMu sync.Mutex
+	stops  map[string]*federationExecStop
+}
+
+// federationExecStop is one invocation's execution stop scope; pointer
+// identity distinguishes which Start registered a given entry.
+type federationExecStop struct {
+	cancel context.CancelFunc
 }
 type FederationRuntimeConfig struct {
 	Boundary   *RemoteBoundary
@@ -45,7 +58,7 @@ func NewFederationRuntime(c FederationRuntimeConfig) (*FederationRuntime, error)
 		return nil, localDenied()
 	}
 	ctx, cancel := context.WithCancel(c.Lifetime)
-	return &FederationRuntime{boundary: c.Boundary, node: c.Node, admissions: c.Admissions, outputs: c.Outputs, ctx: ctx, cancel: cancel, max: c.MaxActive, done: make(chan struct{})}, nil
+	return &FederationRuntime{boundary: c.Boundary, node: c.Node, admissions: c.Admissions, outputs: c.Outputs, ctx: ctx, cancel: cancel, max: c.MaxActive, done: make(chan struct{}), stops: map[string]*federationExecStop{}}, nil
 }
 
 // Start accepts only an actual decrypted source-root bundle. Network context
@@ -72,14 +85,34 @@ func (r *FederationRuntime) Start(delivery context.Context, bundle federation.Fo
 	r.active++
 	r.wg.Add(1)
 	r.mu.Unlock()
+	invocationID := owned.Proof.Frame.InvocationID
+	execCtx, execCancel := context.WithCancel(r.ctx)
+	execStop := &federationExecStop{cancel: execCancel}
+	registered := false
+	r.stopMu.Lock()
+	if _, exists := r.stops[invocationID]; !exists {
+		r.stops[invocationID] = execStop
+		registered = true
+	}
+	r.stopMu.Unlock()
 	ready := make(chan FederationStart, 1)
 	go func() {
 		defer r.wg.Done()
 		defer func() { r.mu.Lock(); r.active--; r.mu.Unlock() }()
+		defer func() {
+			execCancel()
+			if registered {
+				r.stopMu.Lock()
+				if r.stops[invocationID] == execStop {
+					delete(r.stops, invocationID)
+				}
+				r.stopMu.Unlock()
+			}
+		}()
 		var once sync.Once
 		report := func(v FederationStart) { once.Do(func() { ready <- v }) }
 		phase := "authenticate source"
-		err := r.boundary.WithForwardRequest(r.ctx, owned, func(ctx context.Context, caller fabric.ExecutionContext, evidence any) error {
+		err := r.boundary.WithForwardRequest(execCtx, owned, func(ctx context.Context, caller fabric.ExecutionContext, evidence any) error {
 			phase = "retain admission"
 			admitted, _, e := r.admissions.Admit(ctx, r.boundary.config, owned, caller)
 			if e != nil {
@@ -161,4 +194,24 @@ func (r *FederationRuntime) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// StopInvocation stops the in-flight execution pipeline for one retained
+// invocation, when one is still running in this runtime. It returns whether a
+// live pipeline was stopped; a completed invocation has nothing to stop. It
+// never reports business completion or the stop intent's outcome — the
+// committed head state carries the stop intent, the pipeline settles its own
+// honest result.
+func (r *FederationRuntime) StopInvocation(invocationID string) bool {
+	if r == nil || invocationID == "" {
+		return false
+	}
+	r.stopMu.Lock()
+	defer r.stopMu.Unlock()
+	stop, ok := r.stops[invocationID]
+	if !ok {
+		return false
+	}
+	stop.cancel()
+	return true
 }
