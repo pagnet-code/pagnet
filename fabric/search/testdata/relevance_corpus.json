@@ -1,0 +1,550 @@
+{
+  "description": "Pignet lexical search relevance corpus (VNEXT E4.3). Expert-graded CI fixture: each case has one grade-2 (most relevant) document, grade-1 (partially relevant) and grade-0 (irrelevant) documents. Grades reflect endpoint role for the query, not token overlap: same-term-different-domain documents are grade 0. Query types span single-term, multi-term, AND-operator and filtered cases; document types span agents, services and tools; scale cases carry 40-96 documents.",
+  "cases": [
+    {"id": "st01-invoice", "query": "invoice", "limit": 3, "documents": [
+      {"name": "Invoice Processor", "shortDescription": "Invoice processing automation for accounts payable", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Receipt Printer", "shortDescription": "Thermal receipt and invoice printing hardware", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Filing Cabinet", "shortDescription": "Steel filing cabinet with four drawers and casters", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Paper Shredder", "shortDescription": "Paper shredder for confidential documents", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "st02-ledger", "query": "ledger", "limit": 3, "documents": [
+      {"name": "Ledger Service", "shortDescription": "Double entry ledger for accounting records", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Ledger Lamp", "shortDescription": "Dimmable ledger lamp with paper warm color light", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Storage Bucket", "shortDescription": "Object storage bucket service with versioning", "kind": "service.typed", "provider": "initech", "tags": ["storage"], "grade": 0},
+      {"name": "Standing Desk", "shortDescription": "Ergonomic standing desk with dual motors", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "st03-receipt", "query": "receipt", "limit": 3, "documents": [
+      {"name": "Receipt Generator", "shortDescription": "Customer receipt generation and email delivery", "kind": "service.typed", "provider": "acme", "tags": ["retail"], "grade": 2},
+      {"name": "Receipt Roll Printer", "shortDescription": "Paper receipt roll printer with cutter", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Aging Report", "shortDescription": "Receivable aging report tool for credit teams", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Pallet Jack", "shortDescription": "Warehouse pallet jack with digital scale", "kind": "tool.binary", "provider": "globex", "tags": ["warehouse"], "grade": 0}
+    ]},
+    {"id": "st04-thermostat", "query": "thermostat", "limit": 3, "documents": [
+      {"name": "Smart Thermostat", "shortDescription": "Smart thermostat with schedule and room sensor", "kind": "service.typed", "provider": "acme", "tags": ["building"], "grade": 2},
+      {"name": "Mounting Bracket", "shortDescription": "Thermostat mounting bracket kit for walls", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Heat Press", "shortDescription": "Heat press for clothing and banner printing", "kind": "tool.binary", "provider": "initech", "tags": ["printing"], "grade": 0},
+      {"name": "Brew Controller", "shortDescription": "Brewing temperature controller for coffee", "kind": "tool.binary", "provider": "globex", "tags": ["kitchen"], "grade": 0}
+    ]},
+    {"id": "st05-sprint", "query": "sprint", "limit": 3, "documents": [
+      {"name": "Sprint Board", "shortDescription": "Sprint planning board for agile teams", "kind": "service.typed", "provider": "acme", "tags": ["dev"], "grade": 2},
+      {"name": "Goal Tracker", "shortDescription": "Sprint goal tracker for agile teams", "kind": "service.typed", "provider": "initech", "tags": ["dev"], "grade": 1},
+      {"name": "Interval Timer", "shortDescription": "Sprint interval timer for track athletes", "kind": "tool.binary", "provider": "globex", "tags": ["sports"], "grade": 0},
+      {"name": "Retro Notes", "shortDescription": "Agile retro note sync for team reviews", "kind": "service.typed", "provider": "initech", "tags": ["dev"], "grade": 0},
+      {"name": "Car Rental", "shortDescription": "Sprint car rental listing for events during weekends", "kind": "service.typed", "provider": "globex", "tags": ["events"], "grade": 0}
+    ]},
+    {"id": "st06-backup", "query": "backup", "limit": 3, "documents": [
+      {"name": "Backup Service", "shortDescription": "Nightly database backup verification", "kind": "service.typed", "provider": "acme", "tags": ["data"], "grade": 2},
+      {"name": "Backup Camera", "shortDescription": "Car backup camera wiring kit", "kind": "tool.binary", "provider": "globex", "tags": ["automotive"], "grade": 1},
+      {"name": "Fuel Filter", "shortDescription": "Backup generator fuel filter kit", "kind": "tool.binary", "provider": "initech", "tags": ["energy"], "grade": 1},
+      {"name": "Surge Protector", "shortDescription": "Power surge protector strip with eight outlets", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Sync Client", "shortDescription": "Cloud sync desktop client for files", "kind": "service.typed", "provider": "initech", "tags": ["storage"], "grade": 0}
+    ]},
+    {"id": "st07-router", "query": "router", "limit": 3, "documents": [
+      {"name": "Network Router", "shortDescription": "Network router with firewall and VLAN support", "kind": "service.typed", "provider": "acme", "tags": ["network"], "grade": 2},
+      {"name": "Router Bit Set", "shortDescription": "Furniture router bit set for edge profiles", "kind": "tool.binary", "provider": "globex", "tags": ["woodshop"], "grade": 0},
+      {"name": "Route Planner", "shortDescription": "Route planning map service for deliveries", "kind": "service.typed", "provider": "initech", "tags": ["logistics"], "grade": 0},
+      {"name": "Access Point", "shortDescription": "Wireless access point for office floors", "kind": "service.typed", "provider": "acme", "tags": ["network"], "grade": 0}
+    ]},
+    {"id": "st08-payroll", "query": "payroll", "limit": 3, "documents": [
+      {"name": "Payroll Service", "shortDescription": "Payroll run with tax withholding and deposits", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Spreadsheet Template", "shortDescription": "Payroll posting spreadsheet template", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 1},
+      {"name": "Survey Report", "shortDescription": "Salary survey benchmark report for HR", "kind": "service.typed", "provider": "initech", "tags": ["hr"], "grade": 0},
+      {"name": "Badge Printer", "shortDescription": "Employee badge printer with photo slot", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "st09-migration", "query": "migration", "limit": 3, "documents": [
+      {"name": "Migration Tooling", "shortDescription": "Database migration tooling with rollback support", "kind": "service.typed", "provider": "acme", "tags": ["data"], "grade": 2},
+      {"name": "Relocation Calendar", "shortDescription": "Office relocation and migration calendar", "kind": "actor.agent", "provider": "globex", "tags": ["ops"], "grade": 1},
+      {"name": "Visa Checklist", "shortDescription": "Immigration visa document checklist service", "kind": "actor.agent", "provider": "initech", "tags": ["hr"], "grade": 0},
+      {"name": "Schema Review Bot", "shortDescription": "Schema diff review bot for pull requests", "kind": "actor.agent", "provider": "acme", "tags": ["dev"], "grade": 0}
+    ]},
+    {"id": "st10-monitoring", "query": "monitoring", "limit": 3, "documents": [
+      {"name": "Monitoring Service", "shortDescription": "Network monitoring with alerting and status page", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 2},
+      {"name": "Garden Camera", "shortDescription": "Wall mounted monitoring camera for gardens", "kind": "tool.binary", "provider": "globex", "tags": ["security"], "grade": 1},
+      {"name": "Monitor Arm", "shortDescription": "Monitor arm for two displays with clamp", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "SLA Report", "shortDescription": "Uptime SLA report generator for vendors", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 0}
+    ]},
+    {"id": "t01-email-digest", "query": "email digest", "limit": 3, "documents": [
+      {"name": "Digest Summarizer", "shortDescription": "Email digest summarization for inboxes", "kind": "service.typed", "provider": "acme", "tags": ["mail"], "grade": 2},
+      {"name": "Newsletter Template", "shortDescription": "Weekly newsletter digest template library", "kind": "tool.binary", "provider": "globex", "tags": ["marketing"], "grade": 1},
+      {"name": "Inbox Course", "shortDescription": "Inbox zero productivity course with exercises", "kind": "actor.agent", "provider": "initech", "tags": ["learning"], "grade": 0},
+      {"name": "Focus Planner", "shortDescription": "Productivity course on focused work blocks", "kind": "actor.agent", "provider": "globex", "tags": ["learning"], "grade": 0}
+    ]},
+    {"id": "t02-invoice-accounting", "query": "invoice accounting", "limit": 3, "documents": [
+      {"name": "Invoice Matcher", "shortDescription": "Invoice matching for accounting ledgers", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Tax Preparer", "shortDescription": "Accounting tax preparation agent for filings", "kind": "actor.agent", "provider": "globex", "tags": ["finance"], "grade": 1},
+      {"name": "Font Package", "shortDescription": "Decorative invoice font package for print", "kind": "tool.binary", "provider": "initech", "tags": ["design"], "grade": 0},
+      {"name": "Calculator Tape", "shortDescription": "Desk calculator with paper tape printer", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "t03-warehouse-inventory", "query": "warehouse inventory", "limit": 3, "documents": [
+      {"name": "Inventory Tracker", "shortDescription": "Warehouse inventory tracking with cycle counts", "kind": "service.typed", "provider": "acme", "tags": ["warehouse"], "grade": 2},
+      {"name": "Picking Optimizer", "shortDescription": "Warehouse picking path optimizer for crews", "kind": "service.typed", "provider": "globex", "tags": ["warehouse"], "grade": 1},
+      {"name": "Bookstore Stock", "shortDescription": "Inventory management for small bookstores", "kind": "service.typed", "provider": "initech", "tags": ["retail"], "grade": 0},
+      {"name": "Label Printer", "shortDescription": "Shipping label printer with tear bar", "kind": "tool.binary", "provider": "globex", "tags": ["logistics"], "grade": 0}
+    ]},
+    {"id": "t04-meeting-notes", "query": "meeting notes", "limit": 3, "documents": [
+      {"name": "Notes Agent", "shortDescription": "Meeting notes transcription and action items", "kind": "service.typed", "provider": "acme", "tags": ["productivity"], "grade": 2},
+      {"name": "Room Booking", "shortDescription": "Meeting room booking calendar with video link", "kind": "service.typed", "provider": "globex", "tags": ["productivity"], "grade": 1},
+      {"name": "Leather Cover", "shortDescription": "Notebook leather cover with elastic band", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Slide Template", "shortDescription": "Presentation slide template for quarterly updates", "kind": "tool.binary", "provider": "globex", "tags": ["design"], "grade": 0}
+    ]},
+    {"id": "t05-travel-booking", "query": "travel booking", "limit": 3, "documents": [
+      {"name": "Booking Service", "shortDescription": "Travel booking with fare alerts and receipts", "kind": "service.typed", "provider": "acme", "tags": ["travel"], "grade": 2},
+      {"name": "Policy Advisor", "shortDescription": "Business travel policy advisor for approvers", "kind": "actor.agent", "provider": "globex", "tags": ["travel"], "grade": 1},
+      {"name": "Packing Cubes", "shortDescription": "Packing cube organizer set for carry on bags", "kind": "tool.binary", "provider": "initech", "tags": ["travel"], "grade": 0},
+      {"name": "Delay Calculator", "shortDescription": "Flight delay compensation calculator for claims", "kind": "service.typed", "provider": "globex", "tags": ["travel"], "grade": 0}
+    ]},
+    {"id": "t06-network-monitoring", "query": "network monitoring", "limit": 3, "documents": [
+      {"name": "Latency Watch", "shortDescription": "Network monitoring with latency and packet loss", "kind": "service.typed", "provider": "acme", "tags": ["network"], "grade": 2},
+      {"name": "Cable Crimper", "shortDescription": "Network cable crimping tool with testers", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Monitor Stand", "shortDescription": "Monitor stand for dual displays with cable tray", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Status Host", "shortDescription": "Uptime status page hoster for SaaS products", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 0}
+    ]},
+    {"id": "t07-customer-support", "query": "customer support", "limit": 3, "documents": [
+      {"name": "Ticketing Service", "shortDescription": "Customer support ticketing with SLA tracking", "kind": "service.typed", "provider": "acme", "tags": ["support"], "grade": 2},
+      {"name": "Headset", "shortDescription": "Support desk phone headset with noise cancel", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Loyalty Ledger", "shortDescription": "Customer loyalty points ledger for retailers", "kind": "service.typed", "provider": "initech", "tags": ["retail"], "grade": 0},
+      {"name": "Gate Controller", "shortDescription": "Ticket scanner gate controller for venues", "kind": "service.typed", "provider": "globex", "tags": ["events"], "grade": 0}
+    ]},
+    {"id": "t08-shipment-tracking", "query": "shipment tracking", "limit": 3, "documents": [
+      {"name": "Shipment Events", "shortDescription": "Shipment tracking with carrier events and ETAs", "kind": "service.typed", "provider": "acme", "tags": ["logistics"], "grade": 2},
+      {"name": "Freight Estimator", "shortDescription": "Freight shipment cost estimator for quotes", "kind": "service.typed", "provider": "globex", "tags": ["logistics"], "grade": 1},
+      {"name": "Tape Dispenser", "shortDescription": "Package tape dispenser with cutting edge", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Delivery Map", "shortDescription": "Delivery route map for local couriers", "kind": "service.typed", "provider": "globex", "tags": ["logistics"], "grade": 0}
+    ]},
+    {"id": "t09-code-review", "query": "code review", "limit": 3, "documents": [
+      {"name": "Review Bot", "shortDescription": "Code review automation with diff summaries", "kind": "service.typed", "provider": "acme", "tags": ["dev"], "grade": 2},
+      {"name": "Checklist Template", "shortDescription": "Code review checklist template for teams", "kind": "tool.binary", "provider": "globex", "tags": ["dev"], "grade": 1},
+      {"name": "Approval Workflow", "shortDescription": "Review board approval workflow for releases", "kind": "service.typed", "provider": "initech", "tags": ["dev"], "grade": 0},
+      {"name": "Image Diff", "shortDescription": "Diff viewer for rendered image comparisons", "kind": "tool.binary", "provider": "globex", "tags": ["dev"], "grade": 0}
+    ]},
+    {"id": "t10-energy-audit", "query": "energy audit", "limit": 3, "documents": [
+      {"name": "Audit Service", "shortDescription": "Building energy audit with load profile", "kind": "service.typed", "provider": "acme", "tags": ["building"], "grade": 2},
+      {"name": "Energy Retrofit", "shortDescription": "Efficient LED retrofit kit for offices", "kind": "tool.binary", "provider": "globex", "tags": ["building"], "grade": 1},
+      {"name": "Log Viewer", "shortDescription": "Audit log viewer for API services", "kind": "service.typed", "provider": "initech", "tags": ["ops"], "grade": 0},
+      {"name": "Panel Cleaner", "shortDescription": "Solar panel cleaning schedule and route", "kind": "service.typed", "provider": "globex", "tags": ["solar"], "grade": 0}
+    ]},
+    {"id": "t11-access-control", "query": "access control", "limit": 3, "documents": [
+      {"name": "Badge System", "shortDescription": "Access control with badge and door events", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 2},
+      {"name": "Badge Reader", "shortDescription": "Badge reader access point for lobbies", "kind": "tool.binary", "provider": "globex", "tags": ["security"], "grade": 1},
+      {"name": "Relay Module", "shortDescription": "Door control relay module for locks", "kind": "tool.binary", "provider": "initech", "tags": ["security"], "grade": 1},
+      {"name": "ACL Editor", "shortDescription": "Command line access control list editor for router security policies", "kind": "tool.binary", "provider": "globex", "tags": ["network"], "grade": 0}
+    ]},
+    {"id": "t12-resume-screening", "query": "resume screening", "limit": 3, "documents": [
+      {"name": "Screening Agent", "shortDescription": "Resume screening with skill extraction", "kind": "actor.agent", "provider": "acme", "tags": ["hiring"], "grade": 2},
+      {"name": "Template Library", "shortDescription": "Resume template library for job seekers", "kind": "tool.binary", "provider": "globex", "tags": ["hiring"], "grade": 1},
+      {"name": "Lighting Kit", "shortDescription": "Screening room lighting kit for labs", "kind": "tool.binary", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Interview Scheduler", "shortDescription": "Candidate interview scheduler with timezones", "kind": "service.typed", "provider": "acme", "tags": ["hiring"], "grade": 0}
+    ]},
+    {"id": "t13-inventory-count", "query": "inventory count", "limit": 3, "documents": [
+      {"name": "Count Sheets", "shortDescription": "Inventory count with blind count sheets", "kind": "service.typed", "provider": "acme", "tags": ["warehouse"], "grade": 2},
+      {"name": "Shrinkage Report", "shortDescription": "Inventory shrinkage report template for auditors", "kind": "tool.binary", "provider": "globex", "tags": ["warehouse"], "grade": 1},
+      {"name": "Display Case", "shortDescription": "Countertop display case for retail counters", "kind": "tool.binary", "provider": "initech", "tags": ["retail"], "grade": 0},
+      {"name": "Transfer Approval", "shortDescription": "Stock transfer approval flow between sites", "kind": "service.typed", "provider": "acme", "tags": ["warehouse"], "grade": 0}
+    ]},
+    {"id": "t14-data-backup", "query": "data backup", "limit": 3, "documents": [
+      {"name": "Dedup Backup", "shortDescription": "Data backup with deduplication and retention", "kind": "service.typed", "provider": "acme", "tags": ["data"], "grade": 2},
+      {"name": "Fuel Gauge", "shortDescription": "Backup generator fuel gauge with sensor", "kind": "tool.binary", "provider": "globex", "tags": ["energy"], "grade": 1},
+      {"name": "Chart Builder", "shortDescription": "Data visualization chart builder for teams", "kind": "tool.binary", "provider": "initech", "tags": ["analytics"], "grade": 0},
+      {"name": "Mirror Mount", "shortDescription": "Backup camera mirror mount for vans", "kind": "tool.binary", "provider": "globex", "tags": ["automotive"], "grade": 0}
+    ]},
+    {"id": "t301-inbox-summary", "query": "email inbox summary", "limit": 3, "documents": [
+      {"name": "Inbox Summarizer", "shortDescription": "Email inbox summary with priority grouping", "kind": "service.typed", "provider": "acme", "tags": ["mail"], "grade": 2},
+      {"name": "Label Rules", "shortDescription": "Inbox label automation rules for mail", "kind": "service.typed", "provider": "globex", "tags": ["mail"], "grade": 1},
+      {"name": "Archive Policy", "shortDescription": "Email archive retention for mailboxes", "kind": "service.typed", "provider": "initech", "tags": ["mail"], "grade": 1},
+      {"name": "Mail Sorter", "shortDescription": "Postal mail sorting service for offices", "kind": "service.typed", "provider": "globex", "tags": ["mail"], "grade": 0},
+      {"name": "Podcast Player", "shortDescription": "News summary podcast player with transcripts", "kind": "tool.binary", "provider": "initech", "tags": ["media"], "grade": 0}
+    ]},
+    {"id": "t302-gateway-failure", "query": "payment gateway failure", "limit": 3, "documents": [
+      {"name": "Diagnostics", "shortDescription": "Payment gateway failure diagnostics and retries", "kind": "service.typed", "provider": "acme", "tags": ["payments"], "grade": 2},
+      {"name": "Terminal Kit", "shortDescription": "Payment terminal maintenance kit for stores", "kind": "tool.binary", "provider": "globex", "tags": ["payments"], "grade": 1},
+      {"name": "Log Rotator", "shortDescription": "Gateway log rotator for edge nodes", "kind": "service.typed", "provider": "initech", "tags": ["ops"], "grade": 0},
+      {"name": "Memory Analyzer", "shortDescription": "Failure analyzer for memory dumps", "kind": "tool.binary", "provider": "globex", "tags": ["dev"], "grade": 0}
+    ]},
+    {"id": "t303-oncall-escalation", "query": "on call escalation", "limit": 3, "documents": [
+      {"name": "Escalation Service", "shortDescription": "On call escalation with paging rotation", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 2},
+      {"name": "Policy Template", "shortDescription": "Escalation policy template for on call teams", "kind": "tool.binary", "provider": "globex", "tags": ["ops"], "grade": 1},
+      {"name": "Headcount Planner", "shortDescription": "Call center headcount planner for shifts", "kind": "service.typed", "provider": "initech", "tags": ["support"], "grade": 0},
+      {"name": "Pager Battery", "shortDescription": "Pager battery replacement kit with charger", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 0}
+    ]},
+    {"id": "t304-incident-postmortem", "query": "incident postmortem", "limit": 3, "documents": [
+      {"name": "Postmortem Service", "shortDescription": "Incident postmortem with timeline and actions", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 2},
+      {"name": "Garden Guide", "shortDescription": "Postmortem garden planning guide for plots", "kind": "actor.agent", "provider": "globex", "tags": ["garden"], "grade": 0},
+      {"name": "Command Radio", "shortDescription": "Incident command radio for field crews", "kind": "tool.binary", "provider": "initech", "tags": ["safety"], "grade": 1},
+      {"name": "Retro Sync", "shortDescription": "Retrospective note sync for team reviews", "kind": "service.typed", "provider": "acme", "tags": ["dev"], "grade": 0}
+    ]},
+    {"id": "t305-api-rate-limiting", "query": "api rate limiting", "limit": 3, "documents": [
+      {"name": "Rate Limiter", "shortDescription": "API rate limiting with token buckets", "kind": "service.typed", "provider": "acme", "tags": ["api"], "grade": 2},
+      {"name": "Gateway LB", "shortDescription": "API gateway load balancer with caching", "kind": "service.typed", "provider": "globex", "tags": ["api"], "grade": 1},
+      {"name": "Conveyor Limiter", "shortDescription": "Rate limiter for factory conveyor belts", "kind": "tool.binary", "provider": "initech", "tags": ["industrial"], "grade": 0},
+      {"name": "Travel App", "shortDescription": "Bucket list travel app with map pins", "kind": "tool.binary", "provider": "globex", "tags": ["travel"], "grade": 0}
+    ]},
+    {"id": "t306-onboarding-flow", "query": "user onboarding flow", "limit": 3, "documents": [
+      {"name": "Onboarding Flow", "shortDescription": "User onboarding flow with progress checklist", "kind": "service.typed", "provider": "acme", "tags": ["product"], "grade": 2},
+      {"name": "Welcome Sequence", "shortDescription": "Onboarding welcome email sequence for signups", "kind": "service.typed", "provider": "globex", "tags": ["product"], "grade": 1},
+      {"name": "Whiteboard", "shortDescription": "Flow chart whiteboard for workshops", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Photo Editor", "shortDescription": "User profile photo editor with frames", "kind": "tool.binary", "provider": "globex", "tags": ["product"], "grade": 0}
+    ]},
+    {"id": "t307-git-branch-policy", "query": "git branch policy", "limit": 3, "documents": [
+      {"name": "Branch Enforcer", "shortDescription": "Git branch policy enforcement in CI", "kind": "service.typed", "provider": "acme", "tags": ["dev"], "grade": 2},
+      {"name": "Coverage Report", "shortDescription": "Branch coverage report generator for tests", "kind": "tool.binary", "provider": "globex", "tags": ["dev"], "grade": 1},
+      {"name": "Repo Mirror", "shortDescription": "Git repo mirror service for regions", "kind": "service.typed", "provider": "initech", "tags": ["dev"], "grade": 0},
+      {"name": "Retail Manager", "shortDescription": "Branch manager for retail store networks", "kind": "actor.agent", "provider": "globex", "tags": ["retail"], "grade": 0}
+    ]},
+    {"id": "t308-retention-policy", "query": "data retention policy", "limit": 3, "documents": [
+      {"name": "Retention Policy", "shortDescription": "Data retention policy with deletion schedule", "kind": "service.typed", "provider": "acme", "tags": ["compliance"], "grade": 2},
+      {"name": "Period Calculator", "shortDescription": "Retention period calculator for records", "kind": "tool.binary", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Policy Viewer", "shortDescription": "Policy diff viewer for policy documents", "kind": "tool.binary", "provider": "initech", "tags": ["compliance"], "grade": 1},
+      {"name": "Prevention Scanner", "shortDescription": "Data loss prevention scanner for emails", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 0}
+    ]},
+    {"id": "t309-uptime-report", "query": "machine uptime report", "limit": 3, "documents": [
+      {"name": "Uptime Report", "shortDescription": "Machine uptime report with MTBF figures", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 2},
+      {"name": "SLA Dashboard", "shortDescription": "Uptime SLA dashboard for service owners", "kind": "service.typed", "provider": "globex", "tags": ["ops"], "grade": 1},
+      {"name": "Card Printer", "shortDescription": "Report card printer for classrooms", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Notebook Host", "shortDescription": "Machine learning notebook host with GPU", "kind": "service.typed", "provider": "acme", "tags": ["ml"], "grade": 0}
+    ]},
+    {"id": "t401-financial-approval", "query": "quarterly financial report approval", "limit": 3, "documents": [
+      {"name": "Approval Workflow", "shortDescription": "Quarterly financial report approval workflow", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "PDF Generator", "shortDescription": "Financial report PDF generator with branding", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 1},
+      {"name": "OKR Template", "shortDescription": "Quarterly OKR review template for teams", "kind": "tool.binary", "provider": "initech", "tags": ["product"], "grade": 1},
+      {"name": "Stamp and Ink", "shortDescription": "Approval stamp and ink pads for paper", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Filing Cabinet", "shortDescription": "Report filing cabinet with fire rating", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "t402-evacuation-drill", "query": "emergency evacuation drill", "limit": 3, "documents": [
+      {"name": "Drill Scheduler", "shortDescription": "Emergency evacuation drill scheduler for floors", "kind": "service.typed", "provider": "acme", "tags": ["safety"], "grade": 2},
+      {"name": "Map Printer", "shortDescription": "Evacuation map poster printer for lobbies", "kind": "tool.binary", "provider": "globex", "tags": ["safety"], "grade": 1},
+      {"name": "Bit Set", "shortDescription": "Drill bit set for masonry and steel", "kind": "tool.binary", "provider": "initech", "tags": ["woodshop"], "grade": 0},
+      {"name": "Contact App", "shortDescription": "Emergency contact list app for families", "kind": "tool.binary", "provider": "globex", "tags": ["safety"], "grade": 0}
+    ]},
+    {"id": "t403-maintenance-schedule", "query": "vehicle maintenance schedule", "limit": 3, "documents": [
+      {"name": "Maintenance Reminders", "shortDescription": "Vehicle maintenance schedule with reminders", "kind": "service.typed", "provider": "acme", "tags": ["fleet"], "grade": 2},
+      {"name": "Contract Advisor", "shortDescription": "Maintenance contract advisor for fleet buyers", "kind": "actor.agent", "provider": "globex", "tags": ["fleet"], "grade": 1},
+      {"name": "Lift Guide", "shortDescription": "Vehicle lift installation guide for garages", "kind": "tool.binary", "provider": "initech", "tags": ["fleet"], "grade": 0},
+      {"name": "Shift Optimizer", "shortDescription": "Schedule optimization for warehouse shifts", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 0}
+    ]},
+    {"id": "t404-appointment-reminder", "query": "patient appointment reminder", "limit": 3, "documents": [
+      {"name": "Reminder Service", "shortDescription": "Patient appointment reminder with reschedule links", "kind": "service.typed", "provider": "acme", "tags": ["health"], "grade": 2},
+      {"name": "Leather Book", "shortDescription": "Appointment book leather cover with clasp", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 1},
+      {"name": "Monitor Stand", "shortDescription": "Patient monitor stand for clinic rooms", "kind": "tool.binary", "provider": "initech", "tags": ["health"], "grade": 0},
+      {"name": "Sticky Pads", "shortDescription": "Reminder sticky note pads for desks", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "t405-vulnerability-patch", "query": "security vulnerability patch", "limit": 3, "documents": [
+      {"name": "Patch Pipeline", "shortDescription": "Security vulnerability patch pipeline with staging", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 2},
+      {"name": "License Manager", "shortDescription": "Vulnerability scanner license manager for teams", "kind": "tool.binary", "provider": "globex", "tags": ["security"], "grade": 1},
+      {"name": "Cable Rack", "shortDescription": "Patch cable management rack for closets", "kind": "tool.binary", "provider": "initech", "tags": ["network"], "grade": 0},
+      {"name": "Lanyard", "shortDescription": "Security badge lanyard with quick release", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "and01-invoice-accounting", "query": "invoice accounting", "operator": "and", "limit": 3, "documents": [
+      {"name": "Reconciliation Service", "shortDescription": "Invoice accounting reconciliation service", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Close Checklist", "shortDescription": "Accounting close checklist for month ends", "kind": "tool.binary", "provider": "globex", "tags": ["finance"], "grade": 1},
+      {"name": "Batch Scanner", "shortDescription": "Invoice batch scanner with OCR queue", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 1},
+      {"name": "Tape Calculator", "shortDescription": "Desk calculator with paper tape roll", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "and02-email-digest", "query": "email digest", "operator": "and", "limit": 3, "documents": [
+      {"name": "Digest Builder", "shortDescription": "Email digest builder with unsubscribe links", "kind": "service.typed", "provider": "acme", "tags": ["mail"], "grade": 2},
+      {"name": "Newsletter Tool", "shortDescription": "Weekly digest newsletter tool for publishers", "kind": "service.typed", "provider": "globex", "tags": ["mail"], "grade": 1},
+      {"name": "Label Organizer", "shortDescription": "Email label organizer for shared mailboxes", "kind": "service.typed", "provider": "initech", "tags": ["mail"], "grade": 1},
+      {"name": "Shelf Organizer", "shortDescription": "Inbox shelf organizer for paper letters", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "and03-network-latency", "query": "network latency", "operator": "and", "limit": 3, "documents": [
+      {"name": "Latency Profiler", "shortDescription": "Network latency profiler with regional maps", "kind": "service.typed", "provider": "acme", "tags": ["network"], "grade": 2},
+      {"name": "Cable Tester", "shortDescription": "Network cable tester with length meter", "kind": "tool.binary", "provider": "globex", "tags": ["network"], "grade": 1},
+      {"name": "Racing Wheel", "shortDescription": "Latency sim racing wheel with pedals", "kind": "tool.binary", "provider": "initech", "tags": ["gaming"], "grade": 1},
+      {"name": "Dining Table", "shortDescription": "Map table for dining room planning", "kind": "tool.binary", "provider": "globex", "tags": ["furniture"], "grade": 0}
+    ]},
+    {"id": "and04-payroll-compliance", "query": "payroll compliance", "operator": "and", "limit": 3, "documents": [
+      {"name": "Audit Tracker", "shortDescription": "Payroll compliance audit tracker for HR", "kind": "service.typed", "provider": "acme", "tags": ["compliance"], "grade": 2},
+      {"name": "Calendar Service", "shortDescription": "Compliance calendar service for deadlines", "kind": "service.typed", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Template Tool", "shortDescription": "Payroll spreadsheet template for small teams", "kind": "tool.binary", "provider": "initech", "tags": ["finance"], "grade": 1},
+      {"name": "Wall Art", "shortDescription": "Calendar wall art for open offices", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "and05-storage-encryption", "query": "storage encryption", "operator": "and", "limit": 3, "documents": [
+      {"name": "Encryption Service", "shortDescription": "Storage encryption with key rotation", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 2},
+      {"name": "Dog Puzzle", "shortDescription": "Encryption dog toy puzzle for pets", "kind": "tool.binary", "provider": "globex", "tags": ["pets"], "grade": 1},
+      {"name": "Shelf Rack", "shortDescription": "Storage shelf rack with adjustable tiers", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 1},
+      {"name": "Key Ring", "shortDescription": "Key ring organizer for front desk", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "and06-customer-churn", "query": "customer churn", "operator": "and", "limit": 3, "documents": [
+      {"name": "Churn Prediction", "shortDescription": "Customer churn prediction with cohorts", "kind": "service.typed", "provider": "acme", "tags": ["analytics"], "grade": 2},
+      {"name": "Survey Tool", "shortDescription": "Churn prevention survey tool for support", "kind": "service.typed", "provider": "globex", "tags": ["support"], "grade": 1},
+      {"name": "Feedback Wall", "shortDescription": "Customer feedback wall for lobbies", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 1},
+      {"name": "Analysis Course", "shortDescription": "Cohort analysis course for analysts", "kind": "actor.agent", "provider": "globex", "tags": ["learning"], "grade": 0}
+    ]},
+    {"id": "and07-deploy-pipeline", "query": "deploy pipeline", "operator": "and", "limit": 3, "documents": [
+      {"name": "Canary Pipeline", "shortDescription": "Deploy pipeline with canary stages", "kind": "service.typed", "provider": "acme", "tags": ["dev"], "grade": 2},
+      {"name": "Leak Detector", "shortDescription": "Pipeline leak detector for plumbing runs", "kind": "tool.binary", "provider": "globex", "tags": ["home"], "grade": 1},
+      {"name": "Travel Bag", "shortDescription": "Deploy bag for conference travel", "kind": "tool.binary", "provider": "initech", "tags": ["travel"], "grade": 1},
+      {"name": "Fish Feeder", "shortDescription": "Canary fish feeder with timer", "kind": "tool.binary", "provider": "globex", "tags": ["pets"], "grade": 0}
+    ]},
+    {"id": "and08-access-audit", "query": "access audit", "operator": "and", "limit": 3, "documents": [
+      {"name": "Audit Trail", "shortDescription": "Access audit trail with export", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 2},
+      {"name": "Log Viewer", "shortDescription": "Audit log viewer for compliance reviews", "kind": "service.typed", "provider": "globex", "tags": ["security"], "grade": 1},
+      {"name": "Card Holder", "shortDescription": "Access card holder for desk drawers", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 1},
+      {"name": "Hiking Map", "shortDescription": "Trail map for hiking groups", "kind": "tool.binary", "provider": "globex", "tags": ["outdoors"], "grade": 0}
+    ]},
+    {"id": "f01-kind-filter", "query": "payment processing", "limit": 3, "filters": {"kinds": ["service.typed"]}, "documents": [
+      {"name": "Gateway Service", "shortDescription": "Payment processing gateway with refunds", "kind": "service.typed", "provider": "acme", "tags": ["payments"], "grade": 2},
+      {"name": "Approval Agent", "shortDescription": "Payment processing agent for approvals", "kind": "actor.agent", "provider": "globex", "tags": ["payments"], "grade": 1},
+      {"name": "Card Reader", "shortDescription": "Payment terminal card reader for counters", "kind": "tool.binary", "provider": "initech", "tags": ["payments"], "grade": 0},
+      {"name": "Oven Scheduler", "shortDescription": "Processing schedule for bakery ovens", "kind": "service.typed", "provider": "globex", "tags": ["food"], "grade": 0}
+    ]},
+    {"id": "f02-tag-filter", "query": "backup restore", "limit": 3, "filters": {"tags": ["nightly"]}, "documents": [
+      {"name": "Nightly Restore", "shortDescription": "Nightly backup restore with verification", "kind": "service.typed", "provider": "acme", "tags": ["nightly", "data"], "grade": 2},
+      {"name": "Tape Drive", "shortDescription": "Backup tape drive hardware with media", "kind": "tool.binary", "provider": "globex", "tags": ["hardware"], "grade": 1},
+      {"name": "Snapshotter", "shortDescription": "Restore point snapshotter for volumes", "kind": "service.typed", "provider": "initech", "tags": ["snapshot"], "grade": 1},
+      {"name": "Records Shelf", "shortDescription": "Backup shelf for archived records", "kind": "tool.binary", "provider": "globex", "tags": ["nightly"], "grade": 0}
+    ]},
+    {"id": "f03-provider-filter", "query": "analytics dashboard", "limit": 3, "filters": {"providers": ["acme"]}, "documents": [
+      {"name": "Cohort Dashboard", "shortDescription": "Analytics dashboard with cohort views", "kind": "service.typed", "provider": "acme", "tags": ["analytics"], "grade": 2},
+      {"name": "API Connector", "shortDescription": "Analytics API connector for warehouses", "kind": "service.typed", "provider": "globex", "tags": ["analytics"], "grade": 1},
+      {"name": "Widget Library", "shortDescription": "Dashboard widget library for embeds", "kind": "service.typed", "provider": "acme", "tags": ["analytics"], "grade": 1},
+      {"name": "Sticker Sheet", "shortDescription": "Brand sticker sheet for devices", "kind": "tool.binary", "provider": "acme", "tags": ["design"], "grade": 0}
+    ]},
+    {"id": "f04-kind-provider", "query": "report generation", "limit": 3, "filters": {"kinds": ["service.typed"], "providers": ["acme"]}, "documents": [
+      {"name": "Report Service", "shortDescription": "Quarterly report generation service", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Macro Suite", "shortDescription": "Report generation macro suite for spreadsheets", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 1},
+      {"name": "Aggregator", "shortDescription": "Service report aggregator for vendors", "kind": "service.typed", "provider": "globex", "tags": ["ops"], "grade": 1},
+      {"name": "Binding Machine", "shortDescription": "Report binding machine with spiral coil", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "f05-tag-kind", "query": "monitoring alerts", "limit": 3, "filters": {"tags": ["network"], "kinds": ["service.typed"]}, "documents": [
+      {"name": "Monitoring Alerts", "shortDescription": "Network monitoring alerts with paging", "kind": "service.typed", "provider": "acme", "tags": ["network", "ops"], "grade": 2},
+      {"name": "Radio Router", "shortDescription": "Alert router for two way radios", "kind": "tool.binary", "provider": "globex", "tags": ["network"], "grade": 1},
+      {"name": "Camera Alerts", "shortDescription": "Monitoring camera alerts for perimeters", "kind": "service.typed", "provider": "initech", "tags": ["camera"], "grade": 1},
+      {"name": "Lamp Alerts", "shortDescription": "Monitoring lamp alerts for server rooms", "kind": "service.typed", "provider": "globex", "tags": ["network"], "grade": 0}
+    ]},
+    {"id": "f06-provider-invoice", "query": "invoice", "limit": 3, "filters": {"providers": ["acme"]}, "documents": [
+      {"name": "Processing Automation", "shortDescription": "Invoice processing automation for payables", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Paper Catalog", "shortDescription": "Invoice paper stock catalog with samples", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 1},
+      {"name": "Font Book", "shortDescription": "Invoice font sample book for print", "kind": "tool.binary", "provider": "acme", "tags": ["design"], "grade": 1},
+      {"name": "Globe Stand", "shortDescription": "Globe stand with world map", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "f07-kind-router", "query": "router", "limit": 3, "filters": {"kinds": ["service.typed"]}, "documents": [
+      {"name": "Firewall Router", "shortDescription": "Network router with firewall and VLANs", "kind": "service.typed", "provider": "acme", "tags": ["network"], "grade": 2},
+      {"name": "Bit Set", "shortDescription": "Furniture router bit set for edges", "kind": "tool.binary", "provider": "globex", "tags": ["woodshop"], "grade": 1},
+      {"name": "Planner Service", "shortDescription": "Route planner service for field teams", "kind": "service.typed", "provider": "initech", "tags": ["logistics"], "grade": 0},
+      {"name": "Cable Organizer", "shortDescription": "Cable router desk organizer with trays", "kind": "service.typed", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "f08-tag-meeting", "query": "meeting notes", "limit": 3, "filters": {"tags": ["sales"]}, "documents": [
+      {"name": "Follow Up Notes", "shortDescription": "Sales meeting notes with follow up items", "kind": "service.typed", "provider": "acme", "tags": ["sales"], "grade": 2},
+      {"name": "Room Scheduler", "shortDescription": "Meeting room scheduler with calendars", "kind": "service.typed", "provider": "globex", "tags": ["ops"], "grade": 1},
+      {"name": "CRM Notes", "shortDescription": "Sales notes sync for CRM records", "kind": "service.typed", "provider": "initech", "tags": ["sales"], "grade": 1},
+      {"name": "Pin Set", "shortDescription": "Corkboard pin set for offices", "kind": "tool.binary", "provider": "globex", "tags": ["sales"], "grade": 0}
+    ]},
+    {"id": "f09-tag-shipment", "query": "shipment", "limit": 3, "filters": {"tags": ["express"]}, "documents": [
+      {"name": "Express Tracking", "shortDescription": "Express shipment tracking with events", "kind": "service.typed", "provider": "acme", "tags": ["express", "logistics"], "grade": 2},
+      {"name": "Cost Estimator", "shortDescription": "Shipment cost estimator for quotes", "kind": "service.typed", "provider": "globex", "tags": ["logistics"], "grade": 1},
+      {"name": "Label Printer", "shortDescription": "Express label printer with roll stock", "kind": "tool.binary", "provider": "initech", "tags": ["express"], "grade": 1},
+      {"name": "Freight Calculator", "shortDescription": "Express freight calculator for pallets", "kind": "service.typed", "provider": "globex", "tags": ["express"], "grade": 1}
+    ]},
+    {"id": "sc01-container-orchestration", "query": "container orchestration", "limit": 3, "documents": [
+      {"name": "Orchestration Platform", "shortDescription": "Container orchestration platform for Kubernetes workloads", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 2},
+      {"name": "K8s Scheduler", "shortDescription": "Kubernetes container scheduler extension", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 1},
+      {"name": "Registry Mirror", "shortDescription": "Docker container registry mirror", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 1},
+      {"name": "Image Scanner", "shortDescription": "Container image scanning tool", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 1},
+      {"name": "Workflow Engine", "shortDescription": "Workflow orchestration engine for jobs", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 1},
+      {"name": "Autoscaler", "shortDescription": "Cluster autoscaling controller for nodes", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 1},
+      {"name": "Quota Manager", "shortDescription": "Pod resource quota manager for teams", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 1},
+      {"name": "Load Balancer", "shortDescription": "Load balancer configuration tool", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "DNS Service", "shortDescription": "DNS resolution service for zones", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Cert Rotation", "shortDescription": "Certificate rotation service for edges", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Log Pipeline", "shortDescription": "Log aggregation pipeline for clusters", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Metrics Alerts", "shortDescription": "Metrics alerting service for SLOs", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Mesh Gateway", "shortDescription": "Service mesh gateway for mTLS", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Ingress Controller", "shortDescription": "Ingress routing controller for hosts", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Snapshot Scheduler", "shortDescription": "Storage snapshot scheduler for volumes", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Policy Auditor", "shortDescription": "Network policy auditor for namespaces", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Secrets Vault", "shortDescription": "Secrets management vault for apps", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Firewall Compiler", "shortDescription": "Firewall rule compiler for edges", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Bastion Manager", "shortDescription": "Bastion host manager for fleets", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Object Sync", "shortDescription": "Object storage sync client for regions", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Disk Reporter", "shortDescription": "Disk usage reporter for fleets", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Pcap Analyzer", "shortDescription": "Packet capture analyzer for incidents", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Websocket Tester", "shortDescription": "Websocket load tester for gateways", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Schema Diff", "shortDescription": "API schema diff tool for contracts", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Dependency Scan", "shortDescription": "Dependency scan dashboard for services", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "License Checker", "shortDescription": "License compliance checker for images", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Chaos Runner", "shortDescription": "Chaos experiment runner for resilience", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Trace Profiler", "shortDescription": "Trace sampling profiler for spans", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Event Bus", "shortDescription": "Event bus broker for topics", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Store Compactor", "shortDescription": "State store compactor for key ranges", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Plan Advisor", "shortDescription": "Query plan advisor for slow selects", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Lag Monitor", "shortDescription": "Replication lag monitor for shards", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Registry Service", "shortDescription": "Schema registry service for topics", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Flag Service", "shortDescription": "Feature flag service for rollouts", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Experiment Analyzer", "shortDescription": "A/B test analyzer for metrics", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Affinity Router", "shortDescription": "Session affinity router for web tiers", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Limit Editor", "shortDescription": "Rate limit policy editor for APIs", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Cron Backfill", "shortDescription": "Cron job backfill tool for queues", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Queue Viewer", "shortDescription": "Dead letter queue viewer for events", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Key Store", "shortDescription": "Idempotency key store for APIs", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Breaker Config", "shortDescription": "Circuit breaker config for clients", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Retry Dashboard", "shortDescription": "Retry budget dashboard for APIs", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Drain Controller", "shortDescription": "Graceful drain controller for nodes", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Probe Generator", "shortDescription": "Health probe generator for services", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Graph Visualizer", "shortDescription": "Dependency graph visualizer for services", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0},
+      {"name": "Flag Auditor", "shortDescription": "Runtime flag auditor for drift", "kind": "service.typed", "provider": "acme", "tags": ["infra"], "grade": 0},
+      {"name": "Cache Warmer", "shortDescription": "Build cache warmer for CI runners", "kind": "service.typed", "provider": "globex", "tags": ["infra"], "grade": 0},
+      {"name": "Binary Diff", "shortDescription": "Binary diff service for releases", "kind": "service.typed", "provider": "initech", "tags": ["infra"], "grade": 0}
+    ]},
+    {"id": "sc02-invoice-reconciliation", "query": "invoice reconciliation", "limit": 3, "filters": {"providers": ["acme"]}, "documents": [
+      {"name": "Vendor Matching", "shortDescription": "Invoice reconciliation with vendor matching", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 2},
+      {"name": "Scanner Queue", "shortDescription": "Invoice scanner batch queue", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 1},
+      {"name": "Rule Editor", "shortDescription": "Reconciliation rule editor for AP teams", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 1},
+      {"name": "Statement Importer", "shortDescription": "Vendor statement importer for ledgers", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 1},
+      {"name": "Aging Report", "shortDescription": "Accounts payable aging report service", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 1},
+      {"name": "Tax Calendar", "shortDescription": "Tax filing calendar service", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Category Rules", "shortDescription": "Expense category rules editor", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "OCR Engine", "shortDescription": "Receipt OCR engine for paper forms", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Forecast Tool", "shortDescription": "Budget forecast tool for quarters", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Accounts Editor", "shortDescription": "Chart of accounts editor for ledgers", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Depreciation Calc", "shortDescription": "Depreciation schedule calculator", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Bank Connector", "shortDescription": "Bank feed connector for cash", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Memo Generator", "shortDescription": "Credit memo generator for returns", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Note Formatter", "shortDescription": "Debit note formatter for suppliers", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Payment Reminders", "shortDescription": "Payment reminder service for payables", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Ladder Editor", "shortDescription": "Discount ladder editor for volume", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Price Versioning", "shortDescription": "Price book versioning for catalogs", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Center Mapping", "shortDescription": "Cost center mapping tool for GL", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Accrual Tracker", "shortDescription": "Project accrual tracker for billing", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Grant Ledger", "shortDescription": "Grant compliance ledger for awards", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Rate Table", "shortDescription": "Tax rate table service for regions", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Clock Calibration", "shortDescription": "Audit clock calibration for systems", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 0},
+      {"name": "Fiscal Calendar", "shortDescription": "Fiscal year calendar for reporting", "kind": "service.typed", "provider": "acme", "tags": ["finance"], "grade": 0},
+      {"name": "Risk Scoring", "shortDescription": "Vendor risk scoring model", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Approval Bot", "shortDescription": "AP approval workflow bot", "kind": "actor.agent", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Font Embedder", "shortDescription": "Invoice font embedding tool for print", "kind": "tool.binary", "provider": "initech", "tags": ["design"], "grade": 0},
+      {"name": "Clock Sync", "shortDescription": "Reconciliation clock sync service", "kind": "service.typed", "provider": "globex", "tags": ["ops"], "grade": 0},
+      {"name": "Stapler", "shortDescription": "Expense receipt stapler for paper", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Journal Entry", "shortDescription": "Payroll journal entry tool for ledgers", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Sales Tax", "shortDescription": "Sales tax calculator for jurisdictions", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Mapping Template", "shortDescription": "Account mapping template for M&A", "kind": "tool.binary", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Trail Exporter", "shortDescription": "Audit trail exporter for reviews", "kind": "service.typed", "provider": "initech", "tags": ["compliance"], "grade": 0},
+      {"name": "Close Checklist", "shortDescription": "Financial close checklist for teams", "kind": "tool.binary", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Review Queue", "shortDescription": "Journal entry review queue for controllers", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Fiscal Service", "shortDescription": "Fiscal calendar service for entities", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Recognition Rule", "shortDescription": "Revenue recognition rule editor", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Reversal Job", "shortDescription": "Accrual reversal job for month ends", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Consolidation", "shortDescription": "Subsidiary consolidation tool for groups", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Pricing Workbench", "shortDescription": "Transfer pricing workbench for interco", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Cash Flow", "shortDescription": "Cash flow forecast sheet for treasury", "kind": "tool.binary", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Rate Dashboard", "shortDescription": "Treasury rate dashboard for desks", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Capex Tracker", "shortDescription": "Capital expenditure tracker for projects", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Working Capital", "shortDescription": "Working capital report for AP", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Covenants Monitor", "shortDescription": "Debt covenants monitor for lenders", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Equity Rollup", "shortDescription": "Equity rollup service for owners", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Intercompany Match", "shortDescription": "Intercompany match tool for eliminations", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Hedge Book", "shortDescription": "FX exposure hedge book for treasurers", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Royalty Parser", "shortDescription": "Royalty statement parser for publishers", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Franchise Fee", "shortDescription": "Franchise fee schedule for units", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Proration Tool", "shortDescription": "License revenue proration for deals", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Reserve Calc", "shortDescription": "Warranty reserve calculator for products", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Lease Amortization", "shortDescription": "Lease asset amortization for portfolios", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Balance Sync", "shortDescription": "Depository balance sync for banks", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "ACH Validation", "shortDescription": "ACH batch validation for payouts", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Statement Parser", "shortDescription": "Card scheme statement parser", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Wire Checker", "shortDescription": "Wire instruction checker for treasury", "kind": "service.typed", "provider": "initech", "tags": ["finance"], "grade": 0},
+      {"name": "Liquidity Board", "shortDescription": "Liquidity position board for groups", "kind": "service.typed", "provider": "globex", "tags": ["finance"], "grade": 0},
+      {"name": "Mail Merge", "shortDescription": "Statement mail merge tool for letters", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Stamp Ink", "shortDescription": "Reconciliation stamp ink for paper", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Ledger Binding", "shortDescription": "Ledger binding machine for journals", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Voucher Printer", "shortDescription": "Voucher printing service for accounts", "kind": "service.typed", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Cash Count", "shortDescription": "Petty cash count sheet for front desk", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0}
+    ]},
+    {"id": "sc03-retention-policy", "query": "data retention policy", "limit": 3, "documents": [
+      {"name": "Deletion Schedule", "shortDescription": "Data retention policy with deletion schedule", "kind": "service.typed", "provider": "acme", "tags": ["compliance"], "grade": 2},
+      {"name": "Period Calculator", "shortDescription": "Retention period calculator for records", "kind": "tool.binary", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Policy Viewer", "shortDescription": "Policy diff viewer for policy documents", "kind": "tool.binary", "provider": "initech", "tags": ["compliance"], "grade": 1},
+      {"name": "Prevention Scanner", "shortDescription": "Data loss prevention scanner for mail", "kind": "service.typed", "provider": "acme", "tags": ["security"], "grade": 1},
+      {"name": "Rule Linter", "shortDescription": "Retention rule linter for config", "kind": "service.typed", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Template Library", "shortDescription": "Policy template library for teams", "kind": "service.typed", "provider": "initech", "tags": ["compliance"], "grade": 1},
+      {"name": "Map Catalog", "shortDescription": "Data map catalog service for assets", "kind": "service.typed", "provider": "acme", "tags": ["analytics"], "grade": 1},
+      {"name": "Deadline Notifier", "shortDescription": "Retention deadline notifier for owners", "kind": "service.typed", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Vacuum Job", "shortDescription": "Data warehouse vacuum job for tables", "kind": "service.typed", "provider": "initech", "tags": ["data"], "grade": 1},
+      {"name": "Compliance Exporter", "shortDescription": "Policy compliance exporter for auditors", "kind": "service.typed", "provider": "acme", "tags": ["compliance"], "grade": 1},
+      {"name": "Clock Monitor", "shortDescription": "Retention clock monitor for stores", "kind": "service.typed", "provider": "globex", "tags": ["compliance"], "grade": 1},
+      {"name": "Room Booking", "shortDescription": "Meeting room booking flow for floors", "kind": "service.typed", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Badge Printing", "shortDescription": "Employee badge printing service for HR", "kind": "service.typed", "provider": "acme", "tags": ["hr"], "grade": 0},
+      {"name": "Menu Planner", "shortDescription": "Cafeteria menu planner for facilities", "kind": "tool.binary", "provider": "globex", "tags": ["facilities"], "grade": 0},
+      {"name": "Lot Sensors", "shortDescription": "Parking lot sensor network for garages", "kind": "service.typed", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Vending Restock", "shortDescription": "Vending machine restock tool for floors", "kind": "service.typed", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Fuel Cards", "shortDescription": "Fleet fuel card service for vans", "kind": "service.typed", "provider": "globex", "tags": ["fleet"], "grade": 0},
+      {"name": "Plant Watering", "shortDescription": "Office plant watering schedule for lobbies", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Radio Playlist", "shortDescription": "Break room radio playlist for teams", "kind": "tool.binary", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Welcome Kit", "shortDescription": "New hire welcome kit for onboarding", "kind": "actor.agent", "provider": "globex", "tags": ["hr"], "grade": 0},
+      {"name": "Exit Interviews", "shortDescription": "Exit interview scheduler for HR", "kind": "actor.agent", "provider": "initech", "tags": ["hr"], "grade": 0},
+      {"name": "Review Cycle", "shortDescription": "Performance review cycle tool for managers", "kind": "service.typed", "provider": "acme", "tags": ["hr"], "grade": 0},
+      {"name": "Learning Paths", "shortDescription": "Learning path builder for engineers", "kind": "service.typed", "provider": "globex", "tags": ["learning"], "grade": 0},
+      {"name": "Cert Tracker", "shortDescription": "Certification expiry tracker for staff", "kind": "service.typed", "provider": "initech", "tags": ["compliance"], "grade": 0},
+      {"name": "Vendor Checklist", "shortDescription": "Vendor onboarding checklist for procurement", "kind": "actor.agent", "provider": "acme", "tags": ["procurement"], "grade": 0},
+      {"name": "Renewal Reminder", "shortDescription": "Contract renewal reminder for legal", "kind": "service.typed", "provider": "globex", "tags": ["legal"], "grade": 0},
+      {"name": "Asset Library", "shortDescription": "Brand asset library for marketing", "kind": "service.typed", "provider": "initech", "tags": ["marketing"], "grade": 0},
+      {"name": "Release Approval", "shortDescription": "Press release approval flow for comms", "kind": "service.typed", "provider": "acme", "tags": ["marketing"], "grade": 0},
+      {"name": "Survey Designer", "shortDescription": "Customer survey designer for research", "kind": "tool.binary", "provider": "globex", "tags": ["research"], "grade": 0},
+      {"name": "NPS Dashboard", "shortDescription": "NPS score dashboard for products", "kind": "service.typed", "provider": "initech", "tags": ["analytics"], "grade": 0},
+      {"name": "Follow Up Queue", "shortDescription": "Churn call follow up queue for CS", "kind": "service.typed", "provider": "acme", "tags": ["support"], "grade": 0},
+      {"name": "Macro Editor", "shortDescription": "Support macro editor for agents", "kind": "tool.binary", "provider": "globex", "tags": ["support"], "grade": 0},
+      {"name": "Article Merger", "shortDescription": "Knowledge base article merger for docs", "kind": "service.typed", "provider": "initech", "tags": ["docs"], "grade": 0},
+      {"name": "Transcript Tagger", "shortDescription": "Chat transcript tagger for QA", "kind": "service.typed", "provider": "acme", "tags": ["support"], "grade": 0},
+      {"name": "Template Personalizer", "shortDescription": "Email template personalizer for comms", "kind": "tool.binary", "provider": "globex", "tags": ["marketing"], "grade": 0},
+      {"name": "Banner Editor", "shortDescription": "Announcement banner editor for portals", "kind": "tool.binary", "provider": "initech", "tags": ["design"], "grade": 0},
+      {"name": "Widget Kit", "shortDescription": "Status page widget kit for vendors", "kind": "tool.binary", "provider": "acme", "tags": ["ops"], "grade": 0},
+      {"name": "Badge Printer", "shortDescription": "Incident badge printer for control rooms", "kind": "tool.binary", "provider": "globex", "tags": ["ops"], "grade": 0},
+      {"name": "Video Bridge", "shortDescription": "War room video bridge for bridges", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Rotation Editor", "shortDescription": "On call rotation editor for teams", "kind": "service.typed", "provider": "acme", "tags": ["ops"], "grade": 0},
+      {"name": "Commute Alerts", "shortDescription": "Severe weather commute alert service", "kind": "service.typed", "provider": "globex", "tags": ["facilities"], "grade": 0},
+      {"name": "Shuttle Planner", "shortDescription": "Shuttle route planner for campuses", "kind": "service.typed", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Coffee Repair", "shortDescription": "Coffee machine repair service for floors", "kind": "service.typed", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Lamp Dimmer", "shortDescription": "Desk lamp dimmer controller for rooms", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Marker Cart", "shortDescription": "Whiteboard marker refill cart for teams", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Heater Thermostat", "shortDescription": "Room heater thermostat for labs", "kind": "tool.binary", "provider": "acme", "tags": ["building"], "grade": 0},
+      {"name": "Air Sensors", "shortDescription": "Air quality sensor grid for floors", "kind": "service.typed", "provider": "globex", "tags": ["building"], "grade": 0},
+      {"name": "Elevator Log", "shortDescription": "Elevator maintenance log for towers", "kind": "service.typed", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Alarm Scheduler", "shortDescription": "Fire alarm test scheduler for buildings", "kind": "service.typed", "provider": "acme", "tags": ["safety"], "grade": 0},
+      {"name": "Supply Tracker", "shortDescription": "Janitorial supply tracker for facilities", "kind": "tool.binary", "provider": "globex", "tags": ["facilities"], "grade": 0},
+      {"name": "Voucher Printer", "shortDescription": "Laundry voucher printer for staff", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Bike Rack", "shortDescription": "Bike rack reservation app for gates", "kind": "service.typed", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Charging Monitor", "shortDescription": "EV charging spot monitor for garages", "kind": "service.typed", "provider": "globex", "tags": ["fleet"], "grade": 0},
+      {"name": "Storage Locker", "shortDescription": "Luggage storage locker for travelers", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Dry Cleaning", "shortDescription": "Dry cleaning pickup reminder for staff", "kind": "tool.binary", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Catering Portal", "shortDescription": "Catering order portal for events", "kind": "service.typed", "provider": "globex", "tags": ["events"], "grade": 0},
+      {"name": "Flower Delivery", "shortDescription": "Office flower delivery service for lobbies", "kind": "service.typed", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Crew Booker", "shortDescription": "Moving day crew booker for offices", "kind": "actor.agent", "provider": "acme", "tags": ["facilities"], "grade": 0},
+      {"name": "Cabinet Trail", "shortDescription": "Key cabinet audit trail for facilities", "kind": "service.typed", "provider": "globex", "tags": ["safety"], "grade": 0},
+      {"name": "Kiosk", "shortDescription": "Visitor badge kiosk for lobbies", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Dial In", "shortDescription": "Conference call dial in for rooms", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 0},
+      {"name": "License Pool", "shortDescription": "Screen share license pool for teams", "kind": "service.typed", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Scanner Batch", "shortDescription": "Document scanner batch tool for mail", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Toner Sensor", "shortDescription": "Ink toner level sensor for printers", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 0},
+      {"name": "Cover Editor", "shortDescription": "Fax cover sheet editor for letters", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Sticker Printer", "shortDescription": "Sticker label printer for assets", "kind": "tool.binary", "provider": "initech", "tags": ["office"], "grade": 0},
+      {"name": "Sealing Machine", "shortDescription": "Envelope sealing machine for mail", "kind": "tool.binary", "provider": "acme", "tags": ["office"], "grade": 0},
+      {"name": "Sorting Belt", "shortDescription": "Mailroom sorting belt for volume", "kind": "tool.binary", "provider": "globex", "tags": ["office"], "grade": 0},
+      {"name": "Pickup Locker", "shortDescription": "Package pickup locker for lobbies", "kind": "tool.binary", "provider": "initech", "tags": ["facilities"], "grade": 0},
+      {"name": "Return Labels", "shortDescription": "Return label generator for returns", "kind": "service.typed", "provider": "acme", "tags": ["logistics"], "grade": 0},
+      {"name": "Dispatch Board", "shortDescription": "Courier dispatch board for couriers", "kind": "service.typed", "provider": "globex", "tags": ["logistics"], "grade": 0},
+      {"name": "Temp Logger", "shortDescription": "Cold chain temp logger for labs", "kind": "tool.binary", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Waste Manifest", "shortDescription": "Hazardous waste manifest tool for labs", "kind": "service.typed", "provider": "acme", "tags": ["safety"], "grade": 0},
+      {"name": "Storage Checklist", "shortDescription": "Chemical storage checklist for labs", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Coat Survey", "shortDescription": "Lab coat sizing survey for staff", "kind": "tool.binary", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Scope Calibration", "shortDescription": "Microscope calibration log for lenses", "kind": "tool.binary", "provider": "acme", "tags": ["lab"], "grade": 0},
+      {"name": "Centrifuge Kit", "shortDescription": "Centrifuge maintenance kit for labs", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Fridge Alerts", "shortDescription": "Specimen fridge alert service for labs", "kind": "service.typed", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Hood Test", "shortDescription": "Fume hood airflow test for labs", "kind": "service.typed", "provider": "acme", "tags": ["safety"], "grade": 0},
+      {"name": "Cycle Timer", "shortDescription": "Autoclave cycle timer for labs", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Freezer Map", "shortDescription": "Tissue sample freezer map for biobanks", "kind": "service.typed", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Label Printer", "shortDescription": "Reagent expiry label printer for stock", "kind": "tool.binary", "provider": "acme", "tags": ["lab"], "grade": 0},
+      {"name": "Calibration Station", "shortDescription": "Pipette calibration station for labs", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Imager Light", "shortDescription": "Gel imager light kit for benches", "kind": "tool.binary", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Culture Tracker", "shortDescription": "Cell culture supply tracker for core", "kind": "service.typed", "provider": "acme", "tags": ["lab"], "grade": 0},
+      {"name": "Door Sensor", "shortDescription": "Incubator door sensor for rooms", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Dewar Log", "shortDescription": "Cryo storage dewar log for biobanks", "kind": "service.typed", "provider": "initech", "tags": ["lab"], "grade": 0},
+      {"name": "Notebook Indexer", "shortDescription": "Lab notebook page indexer for records", "kind": "service.typed", "provider": "acme", "tags": ["lab"], "grade": 0},
+      {"name": "Version Comparator", "shortDescription": "Protocol version comparator for SOPs", "kind": "tool.binary", "provider": "globex", "tags": ["lab"], "grade": 0},
+      {"name": "Form Helper", "shortDescription": "Ethical review form helper for studies", "kind": "actor.agent", "provider": "initech", "tags": ["research"], "grade": 0},
+      {"name": "Submission Checklist", "shortDescription": "IRB submission checklist for protocols", "kind": "actor.agent", "provider": "acme", "tags": ["research"], "grade": 0},
+      {"name": "Consent Scanner", "shortDescription": "Participant consent scanner for studies", "kind": "service.typed", "provider": "globex", "tags": ["research"], "grade": 0},
+      {"name": "Group Booker", "shortDescription": "Focus group room booker for research", "kind": "tool.binary", "provider": "initech", "tags": ["research"], "grade": 0},
+      {"name": "Recording Kit", "shortDescription": "Interview recording consent kit for teams", "kind": "tool.binary", "provider": "acme", "tags": ["research"], "grade": 0},
+      {"name": "Response Cleaner", "shortDescription": "Survey response de identifier for studies", "kind": "service.typed", "provider": "globex", "tags": ["research"], "grade": 0}
+    ]}
+  ]
+}
