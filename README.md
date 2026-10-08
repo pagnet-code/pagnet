@@ -56,6 +56,26 @@ published by the installer; replace manually rather than using `update`.
 Windows amd64 and arm64 builds are checked from Linux; Windows runtime
 behavior has not been verified on a Windows runner.
 
+## Platform support
+
+| Capability | Linux | macOS | Windows |
+|---|---|---|---|
+| Remote CLI (client) | yes | yes | yes — cross-compiled from Linux; runtime unverified on a Windows runner |
+| Go SDK | yes | yes | yes |
+| External MCP bridge | yes | yes | yes |
+| Host daemon (`serve`, `-d`, local workers) | yes | yes | no — run the daemon in WSL2 |
+| Peer authentication | yes (`SO_PEERCRED`) | yes (`LOCAL_PEERCRED`) | no — fails closed, no nonce-only fallback |
+| Private runtime profiles | yes | yes | no — ACL privacy unverified |
+| Owner-context storage | yes | yes | no |
+| Kernel-hosted native launch | yes | yes | no |
+
+Windows is a first-class *remote client*: the CLI, Go SDK, and external MCP
+bridge compile and run there against a host daemon on Linux or macOS (or in
+WSL2). Native Windows host execution is the one unsupported path — it needs Job
+Object process containment and ConPTY integration, which are not implemented.
+Peer authentication never weakens on an unsupported platform; it refuses the
+local socket rather than falling back to a weaker boundary.
+
 ## Quick start: a custom Service
 
 The Go SDK connects a custom Agent or Service principal to a control plane and
