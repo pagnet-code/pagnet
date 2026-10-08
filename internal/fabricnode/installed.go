@@ -78,6 +78,7 @@ type InstalledNode struct {
 	admin          *fabricadmin.Server
 	extensionAdmin *InstalledExtensionAdministration
 	incomplete     *CompositionError
+	relay          *federationRelay
 	mu             sync.Mutex
 }
 
@@ -308,6 +309,21 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 			return nil, err
 		}
 	}
+	// The federation relay listener serves bundle-forward bundles on the
+	// private relay socket. Explicit, never implicit: a nil Federation means
+	// no relay listener. A startup failure with an explicit Federation config
+	// is a startup failure (the retained-cleanup path above handles the join).
+	if result.Federation != nil {
+		result.relay, err = newFederationRelay(ctx, result, c.Federation)
+		if err != nil {
+			return nil, err
+		}
+		if err = result.relay.start(ctx); err != nil {
+			_ = result.relay.CloseContext(ctx)
+			result.relay = nil
+			return nil, err
+		}
+	}
 	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
 	if err != nil {
 		return nil, err
@@ -398,6 +414,14 @@ func (n *InstalledNode) CloseContext(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+	// The relay joins before the composed runtimes and the installation: its
+	// in-flight executions hold references to the node's store and keys.
+	if n.relay != nil {
+		if err := n.relay.CloseContext(ctx); err != nil {
+			return err
+		}
+		n.relay = nil
 	}
 	if n.incomplete != nil {
 		if err := n.incomplete.CloseContext(ctx); err != nil {

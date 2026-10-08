@@ -29,8 +29,12 @@ import (
 
 // InstalledFederationConfig is the explicit installed federation surface. A
 // nil InstalledConfig.Federation means the surface is unavailable (explicit,
-// never implicit). The relay socket is a subsequent serving slice.
-type InstalledFederationConfig struct{}
+// never implicit).
+type InstalledFederationConfig struct {
+	// RelaySocket optionally overrides the blind-relay serving socket path.
+	// The default is <dir(settings.SocketPath)>/federation.sock (0600).
+	RelaySocket string
+}
 
 // InstalledFederation is the composed installed federation surface over the
 // loaded installation: the retained signed exposure record, the sealed exchange
