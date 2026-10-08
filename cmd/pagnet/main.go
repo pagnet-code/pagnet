@@ -201,6 +201,7 @@ func newRootCmd() *cobra.Command {
 		// local fabric extension/continuation administration (private admin socket)
 		localExtensionCmd(),
 		localContinuationCmd(),
+		localFederationCmd(),
 		hostsCmd(),
 		hostCmd(),
 		networksCmd(),

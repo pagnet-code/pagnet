@@ -53,6 +53,12 @@ type InstalledConfig struct {
 	// platform without the daemon's native worker lane is a startup error, not
 	// a silent skip.
 	Hosted *InstalledHostedConfig
+	// Federation is the explicit installed federation exposure surface. Nil =
+	// the surface is unavailable (explicit, never implicit). When set,
+	// OpenInstalled composes the retained signed exposure configuration
+	// (federation.exposure.put/get) over the loaded installation. A missing
+	// exposure record is not a startup error: the first declaration creates it.
+	Federation *InstalledFederationConfig
 }
 
 // InstalledNode is the actual local socket/product composition. The installation
@@ -66,6 +72,7 @@ type InstalledNode struct {
 	Extensions     *ExtensionRuntime
 	Publisher      *IndexPublisher
 	Hosted         *InstalledHosted
+	Federation     *InstalledFederation
 	Host           *fabrichost.Host
 	server         *fabricmcp.Server
 	admin          *fabricadmin.Server
@@ -292,6 +299,15 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 		}
 		hostedProvider.setProduct(result.Hosted)
 	}
+	// The installed federation exposure surface is explicit, never implicit.
+	// A composition failure with an explicit Federation config is a startup
+	// failure (the retained-cleanup path above handles the join).
+	if c.Federation != nil {
+		result.Federation, err = newInstalledFederation(ctx, result)
+		if err != nil {
+			return nil, err
+		}
+	}
 	result.server, err = fabricmcp.New(fabricmcp.Config{Executor: result.Node.Service})
 	if err != nil {
 		return nil, err
@@ -324,6 +340,14 @@ func OpenInstalled(ctx context.Context, c InstalledConfig) (_ *InstalledNode, er
 	}
 	if result.Hosted != nil {
 		for operation, handler := range result.Hosted.Administration() {
+			if handlers[operation] != nil {
+				return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
+			}
+			handlers[operation] = handler
+		}
+	}
+	if result.Federation != nil {
+		for operation, handler := range result.Federation.Administration() {
 			if handlers[operation] != nil {
 				return nil, fabric.NewError(fabric.CodeInvalidInput, "Duplicate local administration operation")
 			}

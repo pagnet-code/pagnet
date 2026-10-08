@@ -333,6 +333,12 @@ func openFusedInstallation(ctx context.Context, installDir string) (*fabricnode.
 		Directory: installDir,
 		Binary:    binary,
 		Hosted:    &fabricnode.InstalledHostedConfig{},
+		// The installed federation exposure surface (slice-1 config surface)
+		// is explicit, like Hosted. The declared signed record is consumed by
+		// the serving slice; declaring it before then is config-first, not a
+		// non-functional surface (no daemon lane or other capability is
+		// required to compose it).
+		Federation: &fabricnode.InstalledFederationConfig{},
 	})
 }
 

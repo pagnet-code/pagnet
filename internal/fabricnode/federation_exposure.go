@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"sync/atomic"
 
 	"github.com/pagnet-code/pagnet/fabric"
@@ -219,13 +220,14 @@ func (v *FederationExposures) CheckTx(tx *registry.AuthorityTx, remote string, t
 	return fabric.NewError(fabric.CodeUnauthenticated, "Selected target is not published to this federation link")
 }
 
-// Reload compiles indexed immutable exposure membership only on explicit
-// configuration change/restart. Missing/corrupt retained configuration denies;
-// it never bootstraps or substitutes a newly generated configuration.
-func (v *FederationExposures) Reload(ctx context.Context) error {
+// loadCurrent is the single owner-guarded read + snapshot re-publish of the
+// retained exposure record, shared by Reload and Current. It never
+// bootstraps or substitutes a newly generated configuration: a missing record
+// is a CodeNotFound error, corrupt retained configuration denies.
+func (v *FederationExposures) loadCurrent(ctx context.Context) (FederationExposureConfiguration, registry.AuthorityRecord, error) {
 	owner, e := v.owner(ctx)
 	if e != nil {
-		return e
+		return FederationExposureConfiguration{}, registry.AuthorityRecord{}, e
 	}
 	var c FederationExposureConfiguration
 	var record registry.AuthorityRecord
@@ -243,7 +245,31 @@ func (v *FederationExposures) Reload(ctx context.Context) error {
 	if e == nil {
 		v.publishSnapshot(c, record)
 	}
+	return c, record, e
+}
+
+// Reload compiles indexed immutable exposure membership only on explicit
+// configuration change/restart. Missing/corrupt retained configuration denies;
+// it never bootstraps or substitutes a newly generated configuration.
+func (v *FederationExposures) Reload(ctx context.Context) error {
+	_, _, e := v.loadCurrent(ctx)
 	return e
+}
+
+// Current returns the declared exposure configuration and its retained
+// revision. A missing record is the not-configured state: an empty
+// configuration at revision 0, NOT an error. Any other read failure (corrupt
+// retained record, owner fence, authority change) still denies.
+func (v *FederationExposures) Current(ctx context.Context) (FederationExposureConfiguration, uint64, error) {
+	c, record, e := v.loadCurrent(ctx)
+	if e != nil {
+		var missing *fabric.Error
+		if errors.As(e, &missing) && missing.Code == fabric.CodeNotFound {
+			return FederationExposureConfiguration{}, 0, nil
+		}
+		return FederationExposureConfiguration{}, 0, e
+	}
+	return c, record.Revision, nil
 }
 func (v *FederationExposures) publishSnapshot(c FederationExposureConfiguration, row registry.AuthorityRecord) {
 	entries := make(map[FederationExposure]struct{}, len(c.Exposures))

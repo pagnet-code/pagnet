@@ -27,7 +27,7 @@ func runLocalFabricDaemon(cmd *cobra.Command, directory string) (err error) {
 	}
 	ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	n, err := fabricnode.OpenInstalled(ctx, fabricnode.InstalledConfig{Directory: dir, Binary: binary})
+	n, err := fabricnode.OpenInstalled(ctx, fabricnode.InstalledConfig{Directory: dir, Binary: binary, Federation: &fabricnode.InstalledFederationConfig{}})
 	if err != nil {
 		var retained *fabricnode.InstalledOpenError
 		if errors.As(err, &retained) {
