@@ -412,94 +412,100 @@ func eventWatchCmd() *cobra.Command {
 		Short: "Live-tail the network's events (SSE stream, filtered)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := newCLI("")
-			if err != nil {
-				return err
-			}
-			netID := ""
-			if network != "" {
-				netID, _, err = c.resolveNetwork(network)
-				if err != nil {
-					return err
-				}
-			}
-			// The existing control-plane SSE stream (ticket-authenticated):
-			// POST a one-shot ticket, then open the stream. The mint route is
-			// /api/v1/stream/ticket (server.go registers p.Post("/stream/ticket",
-			// handleStreamTicket)) — NOT /events/stream/ticket, which is only
-			// the SSE GET path (/api/v1/events/stream) and never existed as a
-			// mint endpoint. The ticket is minted for the caller's TENANT
-			// ("stream:<tenantID>"), so the user bearer that mints it is the
-			// right auth for a tenant-scoped stream.
-			var ticket struct {
-				Ticket string `json:"ticket"`
-			}
-			if err := c.post("/api/v1/stream/ticket", map[string]any{}, &ticket); err != nil {
-				return err
-			}
-			if ticket.Ticket == "" {
-				return fmt.Errorf("no stream ticket returned")
-			}
-
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-				c.base+"/api/v1/events/stream?ticket="+ticket.Ticket, nil)
-			if err != nil {
-				return err
-			}
-			req.Header.Set("Accept", "text/event-stream")
-			if c.token != "" {
-				req.Header.Set("Authorization", "Bearer "+c.token)
-			}
-			resp, err := netpolicy.NewHTTPClient(0, insecureRemoteHTTP).Do(req)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("http %d opening the event stream", resp.StatusCode)
-			}
-			if !silent {
-				fmt.Fprintln(os.Stderr, "watching events (Ctrl+C to stop)")
-			}
-
-			r := bufio.NewReader(resp.Body)
-			var dataLine, idLine string
-			for {
-				line, err := r.ReadString('\n')
-				if err != nil {
-					if ctx.Err() != nil {
-						return nil // stopped by the user
-					}
-					return fmt.Errorf("event stream closed: %v", err)
-				}
-				line = strings.TrimRight(line, "\r\n")
-				switch {
-				case strings.HasPrefix(line, "data:"):
-					dataLine = strings.TrimPrefix(line, "data:")
-					dataLine = strings.TrimPrefix(dataLine, " ")
-				case strings.HasPrefix(line, "id:"):
-					idLine = strings.TrimPrefix(line, "id:")
-					idLine = strings.TrimPrefix(idLine, " ")
-				case line == "":
-					if dataLine == "" {
-						continue
-					}
-					if !handleStreamLine(cmd, json.RawMessage(dataLine), idLine, netID, eventType) {
-						return nil
-					}
-					dataLine, idLine = "", ""
-				default:
-					// Comment (": connected") / unknown — skip.
-				}
-			}
+			return runEventWatch(cmd, network, eventType)
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "only events of this network (default: all)")
 	cmd.Flags().StringVar(&eventType, "type", "", "only events matching this type pattern (* wildcards)")
 	return cmd
+}
+
+// runEventWatch is the shared event-watching body: `pagnet event watch`
+// and `pagnet events watch` are the same live SSE tail.
+func runEventWatch(cmd *cobra.Command, network, eventType string) error {
+	c, err := newCLI("")
+	if err != nil {
+		return err
+	}
+	netID := ""
+	if network != "" {
+		netID, _, err = c.resolveNetwork(network)
+		if err != nil {
+			return err
+		}
+	}
+	// The existing control-plane SSE stream (ticket-authenticated):
+	// POST a one-shot ticket, then open the stream. The mint route is
+	// /api/v1/stream/ticket (server.go registers p.Post("/stream/ticket",
+	// handleStreamTicket)) — NOT /events/stream/ticket, which is only
+	// the SSE GET path (/api/v1/events/stream) and never existed as a
+	// mint endpoint. The ticket is minted for the caller's TENANT
+	// ("stream:<tenantID>"), so the user bearer that mints it is the
+	// right auth for a tenant-scoped stream.
+	var ticket struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := c.post("/api/v1/stream/ticket", map[string]any{}, &ticket); err != nil {
+		return err
+	}
+	if ticket.Ticket == "" {
+		return fmt.Errorf("no stream ticket returned")
+	}
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.base+"/api/v1/events/stream?ticket="+ticket.Ticket, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := netpolicy.NewHTTPClient(0, insecureRemoteHTTP).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d opening the event stream", resp.StatusCode)
+	}
+	if !silent {
+		fmt.Fprintln(os.Stderr, "watching events (Ctrl+C to stop)")
+	}
+
+	r := bufio.NewReader(resp.Body)
+	var dataLine, idLine string
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil // stopped by the user
+			}
+			return fmt.Errorf("event stream closed: %v", err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		switch {
+		case strings.HasPrefix(line, "data:"):
+			dataLine = strings.TrimPrefix(line, "data:")
+			dataLine = strings.TrimPrefix(dataLine, " ")
+		case strings.HasPrefix(line, "id:"):
+			idLine = strings.TrimPrefix(line, "id:")
+			idLine = strings.TrimPrefix(idLine, " ")
+		case line == "":
+			if dataLine == "" {
+				continue
+			}
+			if !handleStreamLine(cmd, json.RawMessage(dataLine), idLine, netID, eventType) {
+				return nil
+			}
+			dataLine, idLine = "", ""
+		default:
+			// Comment (": connected") / unknown — skip.
+		}
+	}
 }
 
 // handleStreamLine renders one SSE event after the filters. It returns

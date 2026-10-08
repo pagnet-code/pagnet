@@ -221,6 +221,8 @@ func newRootCmd() *cobra.Command {
 		discoverCmd(),
 		describeCmd(),
 		eventCmd(),
+		eventsCmd(),
+		traceCmd(),
 		subscribeCmd(),
 		subscriptionsCmd(),
 		unsubscribeCmd(),

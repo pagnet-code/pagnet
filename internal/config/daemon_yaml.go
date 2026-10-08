@@ -2,8 +2,10 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +35,22 @@ type daemonFileConfig struct {
 	// disables it (absent = default ON — unlike the bool fields above,
 	// where false is the zero value and indistinguishable from absent).
 	AutoUpdate *bool `yaml:"autoUpdate"`
+	// Telemetry is the observability subset (E4.4). A pointer: absent =
+	// the zero-value (no-export) default.
+	Telemetry *telemetryFileConfig `yaml:"telemetry"`
+}
+
+// telemetryFileConfig mirrors the persistent subset of Telemetry stored
+// under the state file's `telemetry:` mapping. Zero values are "not set"
+// (env wins).
+type telemetryFileConfig struct {
+	ExporterEndpoint string            `yaml:"exporterEndpoint"`
+	ExporterProtocol string            `yaml:"exporterProtocol"`
+	Headers          map[string]string `yaml:"headers"`
+	AcceptRemoteParent bool            `yaml:"acceptRemoteParent"`
+	// TraceRetention is a Go duration string (e.g. "720h").
+	TraceRetention string `yaml:"traceRetention"`
+	MaxTraces      int    `yaml:"maxTraces"`
 }
 
 func loadDaemonYAML(path string, cfg *Daemon) error {
@@ -75,6 +93,33 @@ func loadDaemonYAML(path string, cfg *Daemon) error {
 	// `autoUpdate: true` and an absent key both keep it enabled.
 	if fc.AutoUpdate != nil && !*fc.AutoUpdate {
 		cfg.AutoUpdate = false
+	}
+	// Observability (E4.4): the env values (already loaded) win; the state
+	// file fills only what is absent. An unparseable duration is a corrupt
+	// state file and is refused (never silently degraded).
+	if fc.Telemetry != nil {
+		if cfg.Telemetry.ExporterEndpoint == "" {
+			cfg.Telemetry.ExporterEndpoint = fc.Telemetry.ExporterEndpoint
+		}
+		if cfg.Telemetry.ExporterProtocol == "" {
+			cfg.Telemetry.ExporterProtocol = fc.Telemetry.ExporterProtocol
+		}
+		if len(cfg.Telemetry.Headers) == 0 {
+			cfg.Telemetry.Headers = fc.Telemetry.Headers
+		}
+		if !cfg.Telemetry.AcceptRemoteParent {
+			cfg.Telemetry.AcceptRemoteParent = fc.Telemetry.AcceptRemoteParent
+		}
+		if cfg.Telemetry.TraceRetention == 0 && fc.Telemetry.TraceRetention != "" {
+			d, err := time.ParseDuration(fc.Telemetry.TraceRetention)
+			if err != nil {
+				return fmt.Errorf("telemetry.traceRetention is not a Go duration (e.g. 720h)")
+			}
+			cfg.Telemetry.TraceRetention = d
+		}
+		if cfg.Telemetry.MaxTraces == 0 {
+			cfg.Telemetry.MaxTraces = fc.Telemetry.MaxTraces
+		}
 	}
 	return nil
 }

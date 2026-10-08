@@ -35,9 +35,11 @@ import (
 
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/fabric/search"
+	"github.com/pagnet-code/pagnet/fabric/telemetry"
 	"github.com/pagnet-code/pagnet/internal/config"
 	"github.com/pagnet-code/pagnet/internal/daemon"
 	"github.com/pagnet-code/pagnet/internal/fabricnode"
+	otel "github.com/pagnet-code/pagnet/internal/telemetry"
 )
 
 // The daemon flag values. The same flag set is registered on the ROOT
@@ -195,7 +197,28 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
-	node, err := openFusedInstallation(cmd.Context(), installDir)
+	// Observability stack (E4.4): the configured OTLP exporter (or the
+	// no-op default) + the bounded durable metadata-only trace store in
+	// the machine state dir. It is composed BEFORE the installation so
+	// the installed node's InstalledConfig.Tracing carries the real
+	// provider. A misconfigured exporter is a startup failure (explicit
+	// operator configuration fails closed); the empty-endpoint default
+	// is exactly the previous no-op behavior.
+	tel, err := otel.Compose(cmd.Context(), telemetryStackConfig(cfg, filepath.Join(cfg.StateDir, "telemetry")))
+	if err != nil {
+		return fmt.Errorf("compose observability: %w", err)
+	}
+	// Defer order (LIFO): the node close registers NEXT, so it runs
+	// BEFORE the stack shutdown — the node's final spans flush into the
+	// store/exporter before the exporter drains and the store closes.
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := tel.Shutdown(cleanup); err != nil {
+			log.Warn("observability shutdown", "error", err)
+		}
+	}()
+	node, err := openFusedInstallation(cmd.Context(), installDir, tel.Provider)
 	if err != nil {
 		var retained *fabricnode.InstalledOpenError
 		if errors.As(err, &retained) {
@@ -319,7 +342,9 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 // nil); a PRESENT dir that fails to load (corrupt/invalid) is a genuine
 // startup error (no silent skip). A present, valid installation composes the
 // actual installed hosted product (explicit Hosted config, never implicit).
-func openFusedInstallation(ctx context.Context, installDir string) (*fabricnode.InstalledNode, error) {
+// tracing is the composed observability provider (E4.4); nil is the
+// node's no-op default.
+func openFusedInstallation(ctx context.Context, installDir string, tracing telemetry.Provider) (*fabricnode.InstalledNode, error) {
 	if _, statErr := os.Stat(installDir); os.IsNotExist(statErr) {
 		return nil, nil
 	} else if statErr != nil {
@@ -339,7 +364,27 @@ func openFusedInstallation(ctx context.Context, installDir string) (*fabricnode.
 		// non-functional surface (no daemon lane or other capability is
 		// required to compose it).
 		Federation: &fabricnode.InstalledFederationConfig{},
+		// The configured observability provider (the OTLP exporter + the
+		// bounded durable trace store behind it); nil = the node's no-op
+		// default.
+		Tracing: tracing,
 	})
+}
+
+// telemetryStackConfig maps the daemon config's Telemetry surface onto the
+// observability stack composition, with the durable trace store rooted at
+// traceDir. The metadata-only privacy invariants live in fabric/telemetry;
+// this mapping only selects the transport and the retention bounds.
+func telemetryStackConfig(cfg config.Daemon, traceDir string) otel.Config {
+	return otel.Config{
+		ExporterEndpoint:   cfg.Telemetry.ExporterEndpoint,
+		ExporterProtocol:   cfg.Telemetry.ExporterProtocol,
+		Headers:            cfg.Telemetry.Headers,
+		AcceptRemoteParent: cfg.Telemetry.AcceptRemoteParent,
+		TraceDir:           traceDir,
+		Retention:          cfg.Telemetry.TraceRetention,
+		MaxTraces:          cfg.Telemetry.MaxTraces,
+	}
 }
 
 // --- first-run console handoff (BINDING 2026-09-22) ---------------------------

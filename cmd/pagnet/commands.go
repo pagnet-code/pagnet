@@ -148,50 +148,9 @@ func runList(c *cliCtx, target, network string) error {
 			}
 			printTable(participantHeaders, rows)
 		case "events":
-			var out []struct {
-				ID           string  `json:"id"`
-				IDLegacy     string  `json:"ID"`
-				Type         string  `json:"type"`
-				TypeLegacy   string  `json:"Type"`
-				Target       *string `json:"targetPrincipalId"`
-				TargetLegacy *string `json:"TargetAgentName"`
-				Time         *string `json:"createdAt"`
-				TimeLegacy   *string `json:"Timestamp"`
-			}
-			if err := c.get("/api/v1/networks/"+netID+"/events?limit=100", &out); err != nil {
-				return err
-			}
-			if jsonOut {
-				return printJSON(out)
-			}
-			if len(out) == 0 {
-				fmt.Println("no events in this network yet")
-				return nil
-			}
-			rows := make([][]string, 0, len(out))
-			for _, e := range out {
-				id := e.ID
-				if id == "" {
-					id = e.IDLegacy
-				}
-				typ := e.Type
-				if typ == "" {
-					typ = e.TypeLegacy
-				}
-				var target, ts string
-				if e.Target != nil {
-					target = *e.Target
-				} else if e.TargetLegacy != nil {
-					target = *e.TargetLegacy
-				}
-				if e.Time != nil {
-					ts = *e.Time
-				} else if e.TimeLegacy != nil {
-					ts = *e.TimeLegacy
-				}
-				rows = append(rows, []string{id, typ, orDash(target), orDash(ts)})
-			}
-			printTable([]string{"ID", "TYPE", "TARGET", "TIME"}, rows)
+			// The shared network-events listing (`pagnet events list` is
+			// the same body — E4.4).
+			return runEventsListing(c, netID)
 		}
 	case "subscriptions":
 		// Subscriptions are the subscriber's own surface: the control plane

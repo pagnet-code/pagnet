@@ -23,7 +23,7 @@ func TestOpenFusedInstallation(t *testing.T) {
 	defer cancel()
 
 	absent := filepath.Join(t.TempDir(), "missing")
-	if n, err := openFusedInstallation(ctx, absent); err != nil || n != nil {
+	if n, err := openFusedInstallation(ctx, absent, nil); err != nil || n != nil {
 		t.Fatalf("absent installation: got (node=%v, err=%v), want (nil, nil)", n != nil, err)
 	}
 
@@ -31,7 +31,7 @@ func TestOpenFusedInstallation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(corrupt, "garbage.txt"), []byte("not a pagnet installation"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := openFusedInstallation(ctx, corrupt); err == nil {
+	if n, err := openFusedInstallation(ctx, corrupt, nil); err == nil {
 		if n != nil {
 			_ = n.Close()
 		}
@@ -52,7 +52,7 @@ func TestOpenFusedInstallation(t *testing.T) {
 	if err := installed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	n, err := openFusedInstallation(ctx, dir)
+	n, err := openFusedInstallation(ctx, dir, nil)
 	if err != nil {
 		t.Fatalf("present installation: %v", err)
 	}
