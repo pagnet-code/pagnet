@@ -270,7 +270,7 @@ func TestRunBridgeSideportAttachesNodeToolsAndClosesWithBridge(t *testing.T) {
 					ListChanged *bool `json:"listChanged"`
 				} `json:"tools"`
 			} `json:"capabilities"`
-			ServerInfo   struct {
+			ServerInfo struct {
 				Name string `json:"name"`
 			} `json:"serverInfo"`
 			Instructions string `json:"instructions"`

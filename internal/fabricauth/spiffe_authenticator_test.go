@@ -40,7 +40,7 @@ func faRoot(t *testing.T) (cert *x509.Certificate, key *ecdsa.PrivateKey, der []
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "fa root"},
 		NotBefore: faNow.Add(-2 * time.Hour), NotAfter: faNow.Add(24 * time.Hour),
-		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true, IsCA: true, SubjectKeyId: []byte{1},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)

@@ -18,14 +18,14 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
-	mu                   sync.Mutex
-	hostID, bootID       string
-	serverURL            string
-	session              *transport.HostSessionPayload
-	pending              map[string]chan transport.NativeOriginRegisteredPayload
-	pendingSessions      map[string]chan transport.NativeOriginSessionConfirmedPayload
-	pendingContent       map[string]chan transport.NativeContentStagedPayload
-	pendingObservations  map[string]chan transport.NativeObservationReceiptPayload
+	mu                  sync.Mutex
+	hostID, bootID      string
+	serverURL           string
+	session             *transport.HostSessionPayload
+	pending             map[string]chan transport.NativeOriginRegisteredPayload
+	pendingSessions     map[string]chan transport.NativeOriginSessionConfirmedPayload
+	pendingContent      map[string]chan transport.NativeContentStagedPayload
+	pendingObservations map[string]chan transport.NativeObservationReceiptPayload
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
 	// their raw reply channel: both the publish/invoke result and the
 	// catalog page reply correlate on the same lane (the typed exchanges

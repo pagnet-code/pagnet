@@ -21,14 +21,14 @@ type SourceIssuer interface {
 // CronConfig selects one explicit, generic internal schedule. The schedule is
 // configuration, never a core type switch.
 type CronConfig struct {
-	ID        string
-	Store     *Store
-	Mode      string // "trigger" or "emit"
-	Target    fabric.EndpointRef
-	Revision  fabric.Revision
-	Issuer    SourceIssuer
-	Interval  time.Duration
-	Timeout   time.Duration
+	ID       string
+	Store    *Store
+	Mode     string // "trigger" or "emit"
+	Target   fabric.EndpointRef
+	Revision fabric.Revision
+	Issuer   SourceIssuer
+	Interval time.Duration
+	Timeout  time.Duration
 }
 
 // Cron is a generic internal schedule provider. Each tick mints one signed

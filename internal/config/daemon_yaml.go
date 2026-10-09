@@ -44,10 +44,10 @@ type daemonFileConfig struct {
 // under the state file's `telemetry:` mapping. Zero values are "not set"
 // (env wins).
 type telemetryFileConfig struct {
-	ExporterEndpoint string            `yaml:"exporterEndpoint"`
-	ExporterProtocol string            `yaml:"exporterProtocol"`
-	Headers          map[string]string `yaml:"headers"`
-	AcceptRemoteParent bool            `yaml:"acceptRemoteParent"`
+	ExporterEndpoint   string            `yaml:"exporterEndpoint"`
+	ExporterProtocol   string            `yaml:"exporterProtocol"`
+	Headers            map[string]string `yaml:"headers"`
+	AcceptRemoteParent bool              `yaml:"acceptRemoteParent"`
 	// TraceRetention is a Go duration string (e.g. "720h").
 	TraceRetention string `yaml:"traceRetention"`
 	MaxTraces      int    `yaml:"maxTraces"`

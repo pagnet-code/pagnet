@@ -315,7 +315,7 @@ func localFederationPeerPinCmd() *cobra.Command {
 			}
 			return localExtensionPrint(cmd, result, func(out io.Writer, raw []byte) error {
 				var view struct {
-					Authority   struct {
+					Authority struct {
 						Namespace string `json:"namespace"`
 						StoreID   string `json:"storeId"`
 					} `json:"authority"`

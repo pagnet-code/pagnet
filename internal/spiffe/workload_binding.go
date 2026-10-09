@@ -26,8 +26,12 @@ type WorkloadBinding struct {
 	principal   fabric.Principal
 }
 
-func (WorkloadBinding) MarshalJSON() ([]byte, error) { return nil, errors.New("spiffe: workload binding is not a wire value") }
-func (*WorkloadBinding) UnmarshalJSON([]byte) error  { return errors.New("spiffe: wire data cannot create a workload binding") }
+func (WorkloadBinding) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("spiffe: workload binding is not a wire value")
+}
+func (*WorkloadBinding) UnmarshalJSON([]byte) error {
+	return errors.New("spiffe: wire data cannot create a workload binding")
+}
 
 // BindWorkload maps the verified SVID subject to the asserted fabric principal.
 // It denies the binding when the asserted Principal.Ref does not exactly equal
@@ -57,9 +61,12 @@ func BindWorkload(svid *SVID, asserted fabric.Principal) (WorkloadBinding, error
 
 // Principal returns the bound, verified fabric principal.
 func (b WorkloadBinding) Principal() fabric.Principal { return b.principal }
+
 // SPIFFEID returns the verified SPIFFE subject of the bound SVID.
 func (b WorkloadBinding) SPIFFEID() string { return b.spiffeID }
+
 // Serial returns the bound SVID serial (the revocation identity).
 func (b WorkloadBinding) Serial() *big.Int { return b.serial }
+
 // Fingerprint returns the SHA-256 of the bound SVID leaf DER.
 func (b WorkloadBinding) Fingerprint() [32]byte { return b.fingerprint }

@@ -19,11 +19,11 @@ const (
 )
 
 type FabricHostedPublication struct {
-	RequestID           string                  `json:"requestId"`
-	Ref                 fabric.EndpointRef      `json:"ref"`
-	Revision            fabric.Revision         `json:"revision"`
-	ExpectedRevision    fabric.Revision         `json:"expectedRevision,omitempty"`
-	DomainPublicKey     []byte                  `json:"domainPublicKey"`
+	RequestID        string             `json:"requestId"`
+	Ref              fabric.EndpointRef `json:"ref"`
+	Revision         fabric.Revision    `json:"revision"`
+	ExpectedRevision fabric.Revision    `json:"expectedRevision,omitempty"`
+	DomainPublicKey  []byte             `json:"domainPublicKey"`
 	// Tombstone is routing metadata for the sealed record this publication
 	// carries: true when that signed record's action kind ends in ".retire".
 	// The publisher derives it from the signed record; the importer re-checks

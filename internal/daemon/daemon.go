@@ -2775,7 +2775,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	if !d.sup.WaitForStop(instanceID, 10*time.Second) {
 		d.Log.Warn("stop: turn not fully reaped within the wait window", "instance", instanceID)
 	}
-	d.invalidateBridgeNonce(instanceID) // S1: the activation's bridge credential dies with the process
+	d.invalidateBridgeNonce(instanceID)    // S1: the activation's bridge credential dies with the process
 	d.invalidateHostedSideport(instanceID) // the dead activation advertises no sideport
 	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err

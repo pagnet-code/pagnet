@@ -40,8 +40,10 @@ type SVID struct {
 	trustDomain   string
 }
 
-func (SVID) MarshalJSON() ([]byte, error)       { return nil, errors.New("spiffe: SVID is not a wire value") }
-func (*SVID) UnmarshalJSON([]byte) error        { return errors.New("spiffe: wire data cannot create an SVID") }
+func (SVID) MarshalJSON() ([]byte, error) { return nil, errors.New("spiffe: SVID is not a wire value") }
+func (*SVID) UnmarshalJSON([]byte) error {
+	return errors.New("spiffe: wire data cannot create an SVID")
+}
 
 // NewSVID parses a DER-encoded leaf X.509 certificate as a SPIFFE SVID,
 // validating its structure per the SPIFFE X.509-SVID specification, plus any
@@ -76,18 +78,25 @@ func NewSVID(leafDER []byte, intermediateDERs ...[]byte) (*SVID, error) {
 
 // Certificate returns the parsed leaf SVID certificate.
 func (s *SVID) Certificate() *x509.Certificate { return s.leaf }
+
 // Intermediates returns the presented intermediate CAs in order, if any.
 func (s *SVID) Intermediates() []*x509.Certificate { return s.intermediates }
+
 // SPIFFEID returns the exact spiffe:// identity carried in the URI SAN.
 func (s *SVID) SPIFFEID() string { return s.spiffeID }
+
 // TrustDomain returns the authority component of the SPIFFE ID.
 func (s *SVID) TrustDomain() string { return s.trustDomain }
+
 // SerialNumber returns the SVID serial; it is the revocation identity.
 func (s *SVID) SerialNumber() *big.Int { return s.leaf.SerialNumber }
+
 // NotBefore returns the SVID validity start.
 func (s *SVID) NotBefore() time.Time { return s.leaf.NotBefore }
+
 // NotAfter returns the SVID validity end.
 func (s *SVID) NotAfter() time.Time { return s.leaf.NotAfter }
+
 // Fingerprint returns the SHA-256 of the leaf DER, for exact pinning.
 func (s *SVID) Fingerprint() [32]byte { return sha256.Sum256(s.leaf.Raw) }
 

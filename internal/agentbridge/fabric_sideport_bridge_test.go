@@ -50,8 +50,8 @@ func sideportTestServer(t *testing.T, wantNonce, sideportRaw string) string {
 				r := bufio.NewReader(c)
 				line, readErr := readLine(r)
 				var auth struct {
-					Type string `json:"type"`
-					Kind string `json:"kind"`
+					Type  string `json:"type"`
+					Kind  string `json:"kind"`
 					Nonce string `json:"nonce"`
 				}
 				if readErr != nil || json.Unmarshal(line, &auth) != nil || auth.Type != "auth" || auth.Kind != "worker" || auth.Nonce != wantNonce {

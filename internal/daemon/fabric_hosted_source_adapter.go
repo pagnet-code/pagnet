@@ -518,7 +518,7 @@ func (d *Daemon) consumeHostedInvocation(ctx context.Context, profile fabricagen
 			switch rng.Terminal.Event.Type {
 			case session.EventTurnCompleted:
 			case session.EventTurnFailed, session.EventSessionStopped:
-				state, reason = "failed", "terminal_" + rng.Terminal.Event.Type
+				state, reason = "failed", "terminal_"+rng.Terminal.Event.Type
 			default:
 				return d.finalizeHostedSourceUnavailable(ctx, instanceID, commandID, "terminal_conflict")
 			}

@@ -115,6 +115,7 @@ func (h *hostedDeferred) probe() fabricagent.OriginalHostedProbe {
 		return pfn(ctx, p)
 	}
 }
+
 // ownerValidator is the fail-closed owner-guard `next` (wired to the local
 // node's owner validator once the native runtime is composed).
 func (h *hostedDeferred) ownerValidator() fabricauth.OwnerValidator {
@@ -131,6 +132,7 @@ func (h *hostedDeferred) ownerValidator() fabricauth.OwnerValidator {
 		return v(ctx, peer)
 	}
 }
+
 // hostedValidator is the fail-closed hosted-socket validator (wired to the
 // composed runtime bindings).
 func (h *hostedDeferred) hostedValidator() fabricauth.HostedValidator {
@@ -147,6 +149,7 @@ func (h *hostedDeferred) hostedValidator() fabricauth.HostedValidator {
 		return b.ValidateHosted(ctx, peer)
 	}
 }
+
 // hostedFacts is the fail-closed hosted-socket facts provider.
 func (h *hostedDeferred) hostedFacts() fabricauth.HostedFactsProvider {
 	return func(ctx context.Context, peer fabricauth.HostedPeer) (*fabricauth.HostedCallerAuthority, error) {
@@ -162,6 +165,7 @@ func (h *hostedDeferred) hostedFacts() fabricauth.HostedFactsProvider {
 		return b.HostedFacts(ctx, peer)
 	}
 }
+
 // resolveHosted is the fail-closed hosted-socket resolver.
 func (h *hostedDeferred) resolveHosted() fabrichost.HostedResolver {
 	return func(ctx context.Context, sel fabrichost.HostedSelector) (fabricauth.HostedActivation, error) {
@@ -177,6 +181,7 @@ func (h *hostedDeferred) resolveHosted() fabrichost.HostedResolver {
 		return b.ResolveHosted(ctx, sel)
 	}
 }
+
 // publisher is the (possibly nil) catalog publisher for admin handlers; nil is
 // an honest refusal, never a silent no-op.
 func (h *hostedDeferred) publisher() *HostedCatalogPublisher {
@@ -187,6 +192,7 @@ func (h *hostedDeferred) publisher() *HostedCatalogPublisher {
 	defer h.mu.RUnlock()
 	return h.publisherRef
 }
+
 // daemon is the (possibly nil) daemon for admin acts; nil is an honest refusal.
 func (h *hostedDeferred) daemon() *daemon.Daemon {
 	if h == nil {
@@ -252,6 +258,7 @@ func (h *InstalledHosted) SetProbe(p fabricagent.OriginalHostedProbe) {
 		h.deferred.setProbe(p)
 	}
 }
+
 // SetOwnerValidator wires the owner-guard next (once the native runtime is
 // composed).
 func (h *InstalledHosted) SetOwnerValidator(v fabricauth.OwnerValidator) {
@@ -259,18 +266,21 @@ func (h *InstalledHosted) SetOwnerValidator(v fabricauth.OwnerValidator) {
 		h.deferred.setNext(v)
 	}
 }
+
 // SetBindings wires the composed runtime bindings (post-daemon).
 func (h *InstalledHosted) SetBindings(b *HostedRuntimeBindings) {
 	if h != nil && h.deferred != nil {
 		h.deferred.setBindings(b)
 	}
 }
+
 // SetPublisher wires the catalog publisher (post-daemon).
 func (h *InstalledHosted) SetPublisher(p *HostedCatalogPublisher) {
 	if h != nil && h.deferred != nil {
 		h.deferred.setPublisher(p)
 	}
 }
+
 // SetDaemon wires the daemon reference (post-daemon).
 func (h *InstalledHosted) SetDaemon(d *daemon.Daemon) {
 	if h != nil && h.deferred != nil {

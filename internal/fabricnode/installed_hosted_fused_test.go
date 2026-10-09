@@ -54,9 +54,9 @@ func newFusedDaemon(t *testing.T, h *InstalledHosted, cell *gateCell) *daemon.Da
 		t.Fatal(err)
 	}
 	d, err := daemon.New(daemon.Config{
-		HostID:    domain.NewID().String(),
-		StateDir:  stateDir,
-		NoScan:    true,
+		HostID:                domain.NewID().String(),
+		StateDir:              stateDir,
+		NoScan:                true,
 		HostedOwnerGuard:      h.OwnerGuard,
 		HostedInvocationGuard: h.InvocationGuard,
 		HostedFabricSideports: h.Sideports,

@@ -71,12 +71,12 @@ type FabricHostedCatalogRecord struct {
 }
 
 type FabricHostedCatalogPage struct {
-	RequestID  string                     `json:"requestId"`
-	NetworkID  string                     `json:"networkId"`
+	RequestID  string                      `json:"requestId"`
+	NetworkID  string                      `json:"networkId"`
 	Records    []FabricHostedCatalogRecord `json:"records"`
-	NextCursor string                     `json:"nextCursor"`
-	Terminal   bool                       `json:"terminal"`
-	Error      *fabric.Error              `json:"error,omitempty"`
+	NextCursor string                      `json:"nextCursor"`
+	Terminal   bool                        `json:"terminal"`
+	Error      *fabric.Error               `json:"error,omitempty"`
 }
 
 func (p FabricHostedCatalogPage) Validate() error {

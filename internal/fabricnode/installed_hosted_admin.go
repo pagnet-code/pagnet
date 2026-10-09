@@ -55,10 +55,10 @@ func (h *InstalledHosted) Administration() map[string]fabricadmin.Handler {
 		return nil
 	}
 	return map[string]fabricadmin.Handler{
-		"hosted.binding.create":       h.hostedBindingCreate,
-		"hosted.binding.list":         h.hostedBindingList,
-		"hosted.binding.revoke":       h.hostedBindingRevoke,
-		"hosted.sideport.associate":   h.hostedSideportAssociate,
+		"hosted.binding.create":     h.hostedBindingCreate,
+		"hosted.binding.list":       h.hostedBindingList,
+		"hosted.binding.revoke":     h.hostedBindingRevoke,
+		"hosted.sideport.associate": h.hostedSideportAssociate,
 	}
 }
 

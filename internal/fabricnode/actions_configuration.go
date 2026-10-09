@@ -63,16 +63,16 @@ type ActionsCronSettings struct {
 // installed actions runtime: the producer/definition keys, the trigger
 // definitions, the durable queue, and the optional webhook/cron registrations.
 type ActionsSettings struct {
-	Producers           []ActionsProducerSettings  `json:"producers"`
-	DefinitionPublicKey ed25519.PublicKey          `json:"definitionPublicKey"`
+	Producers           []ActionsProducerSettings   `json:"producers"`
+	DefinitionPublicKey ed25519.PublicKey           `json:"definitionPublicKey"`
 	Definitions         []actions.TriggerDefinition `json:"definitions"`
-	Queue               durable.Config             `json:"queue"`
-	MaxDefinitions      int                        `json:"maxDefinitions"`
-	MaxFanout           int                        `json:"maxFanout"`
-	MaxProofBytes       int                        `json:"maxProofBytes"`
-	MaxEnvelopeBytes    int                        `json:"maxEnvelopeBytes"`
-	Webhook             *ActionsWebhookSettings    `json:"webhook,omitempty"`
-	Cron                *ActionsCronSettings       `json:"cron,omitempty"`
+	Queue               durable.Config              `json:"queue"`
+	MaxDefinitions      int                         `json:"maxDefinitions"`
+	MaxFanout           int                         `json:"maxFanout"`
+	MaxProofBytes       int                         `json:"maxProofBytes"`
+	MaxEnvelopeBytes    int                         `json:"maxEnvelopeBytes"`
+	Webhook             *ActionsWebhookSettings     `json:"webhook,omitempty"`
+	Cron                *ActionsCronSettings        `json:"cron,omitempty"`
 }
 
 // empty reports whether the retained configuration is all-missing (disabled).

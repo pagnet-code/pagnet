@@ -91,9 +91,9 @@ func exportCurrentRecord(t *testing.T, ctx context.Context, inst *localinstallat
 // server frames them with cursor semantics; every record inside is a
 // genuine signed export sealed under the network epoch).
 type hostedCatalogTestServer struct {
-	t      *testing.T
-	conn   *NativeObservationConnection
-	pages  []transport.FabricHostedCatalogPage
+	t     *testing.T
+	conn  *NativeObservationConnection
+	pages []transport.FabricHostedCatalogPage
 	// base is the persisted import cursor when the pages were queued, so
 	// each re-queue is served from its own head (the importer keeps its
 	// global watermark across queue generations).

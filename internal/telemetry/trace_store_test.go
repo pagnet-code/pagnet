@@ -14,7 +14,7 @@ import (
 // chronologically ordered).
 func testSpanRecord(inv string, i, n int) SpanRecord {
 	now := time.Now().UTC().UnixNano()
-	start := now - int64(n-i) * int64(time.Second)
+	start := now - int64(n-i)*int64(time.Second)
 	return SpanRecord{
 		InvocationID: inv,
 		TraceID:      "4bf92f3577b34da6a3ce929d0e0e4736",
@@ -185,7 +185,7 @@ func TestTraceStoreRejectsInvalidRecords(t *testing.T) {
 		"bad phase":               func(r *SpanRecord) { r.Phase = "rogue" },
 		"bad disposition":         func(r *SpanRecord) { r.Disposition = "rogue" },
 		"end before start":        func(r *SpanRecord) { r.End = r.Start - 1 },
-		"duration beyond bound":   func(r *SpanRecord) { r.End = r.Start + int64(MaxSpanDuration + time.Hour) },
+		"duration beyond bound":   func(r *SpanRecord) { r.End = r.Start + int64(MaxSpanDuration+time.Hour) },
 		"malformed attributes":    func(r *SpanRecord) { r.Attributes = `{not-json` },
 	}
 

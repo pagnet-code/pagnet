@@ -320,10 +320,16 @@ func TestDaemonHostedSourceAdapterRefusesInvalidProofs(t *testing.T) {
 		{"negative dispatch sequence", func(p *transport.NativeDispatchProof) { p.DispatchSequence = -1 }},
 		{"missing source command", func(p *transport.NativeDispatchProof) { p.SourceCommandID = "" }},
 		{"missing source admission", func(p *transport.NativeDispatchProof) { p.SourceAdmissionID = "" }},
-		{"task source set", func(p *transport.NativeDispatchProof) { p.TaskSource = &transport.NativeTaskSource{TaskID: domain.NewID().String()} }},
+		{"task source set", func(p *transport.NativeDispatchProof) {
+			p.TaskSource = &transport.NativeTaskSource{TaskID: domain.NewID().String()}
+		}},
 		{"invalid invocation source", func(p *transport.NativeDispatchProof) { p.InvocationSource.InvocationID = "mismatch" }},
-		{"aad network mismatch", func(p *transport.NativeDispatchProof) { p.InvocationSource.InputAAD.NetworkID = domain.NewID().String() }},
-		{"aad recipient mismatch", func(p *transport.NativeDispatchProof) { p.InvocationSource.InputAAD.Recipient = domain.NewID().String() }},
+		{"aad network mismatch", func(p *transport.NativeDispatchProof) {
+			p.InvocationSource.InputAAD.NetworkID = domain.NewID().String()
+		}},
+		{"aad recipient mismatch", func(p *transport.NativeDispatchProof) {
+			p.InvocationSource.InputAAD.Recipient = domain.NewID().String()
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

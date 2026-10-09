@@ -235,6 +235,7 @@ func (s *Store) deliver(ctx context.Context, e event.Event) error {
 	}
 	return nil
 }
+
 // ClaimDelivery claims one pending delivery from the actions dispatch queue.
 // It is the worker's genuine claim: the caller owns the lease and must Ack or
 // let it expire. It exposes no authority; delivery still verifies through the

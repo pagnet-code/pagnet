@@ -45,7 +45,7 @@ type wiringCollector struct {
 }
 
 type wiringSpan struct {
-	name string
+	name  string
 	attrs map[string]string
 }
 

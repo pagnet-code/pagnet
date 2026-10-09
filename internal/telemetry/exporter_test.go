@@ -290,9 +290,9 @@ func TestComposeSecretScrubbingEndToEnd(t *testing.T) {
 	collector, endpoint := startGRPCCollector(t)
 	dir := t.TempDir()
 	stack, err := Compose(context.Background(), Config{
-		ExporterEndpoint:   endpoint,
-		ExporterProtocol:   "grpc",
-		TraceDir:           dir,
+		ExporterEndpoint: endpoint,
+		ExporterProtocol: "grpc",
+		TraceDir:         dir,
 		// The WIDEST remote-trust setting: the incoming headers are
 		// honored, so this is the highest-leak-risk configuration.
 		AcceptRemoteParent: true,

@@ -56,10 +56,10 @@ func NewNamedProvider(name ProviderName, a Authenticator) (NamedProvider, error)
 // providers. It performs no discovery: only providers registered by trusted
 // composition are selectable. It is safe for concurrent use.
 type ProviderSet struct {
-	mu            sync.RWMutex
-	defaultName   ProviderName
-	providers     map[ProviderName]AuthenticatorProvider
-	defaultSet    bool
+	mu          sync.RWMutex
+	defaultName ProviderName
+	providers   map[ProviderName]AuthenticatorProvider
+	defaultSet  bool
 }
 
 // NewProviderSet builds a set whose default (empty-name) selection is the given

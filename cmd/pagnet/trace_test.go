@@ -54,17 +54,17 @@ func TestTraceCommandPrintsRecordedSpansMetadataOnly(t *testing.T) {
 			End:          now + int64(1200*time.Millisecond),
 		},
 		otel.SpanRecord{
-			InvocationID: "inv-cli",
-			TraceID:      "4bf92f3577b34da6a3ce929d0e0e4736",
-			SpanID:       "b2b2b2b2b2b2b2b2",
-			ParentSpanID: "a1a1a1a1a1a1a1a1",
-			Name:         "pagnet.adapter",
-			Disposition:  "failed",
-			StatusCode:   2,
+			InvocationID:      "inv-cli",
+			TraceID:           "4bf92f3577b34da6a3ce929d0e0e4736",
+			SpanID:            "b2b2b2b2b2b2b2b2",
+			ParentSpanID:      "a1a1a1a1a1a1a1a1",
+			Name:              "pagnet.adapter",
+			Disposition:       "failed",
+			StatusCode:        2,
 			StatusDescription: "operation failed",
-			Attributes:    `{"pagnet.invocation.id":"inv-cli","pagnet.operation.disposition":"failed"}`,
-			Start:         now + int64(100*time.Millisecond),
-			End:           now + int64(1300*time.Millisecond),
+			Attributes:        `{"pagnet.invocation.id":"inv-cli","pagnet.operation.disposition":"failed"}`,
+			Start:             now + int64(100*time.Millisecond),
+			End:               now + int64(1300*time.Millisecond),
 		},
 	)
 
@@ -124,15 +124,15 @@ func TestTraceCommandJSON(t *testing.T) {
 		t.Fatalf("trace --json: %v", err)
 	}
 	var rows []struct {
-		InvocationID  string `json:"invocationId"`
-		TraceID       string `json:"traceId"`
-		SpanID        string `json:"spanId"`
-		Name          string `json:"name"`
-		Disposition   string `json:"disposition"`
-		StatusCode    int    `json:"statusCode"`
-		Start         int64  `json:"startNano"`
-		End           int64  `json:"endNano"`
-		RetainUntil   int64  `json:"retainUntilNano"`
+		InvocationID string `json:"invocationId"`
+		TraceID      string `json:"traceId"`
+		SpanID       string `json:"spanId"`
+		Name         string `json:"name"`
+		Disposition  string `json:"disposition"`
+		StatusCode   int    `json:"statusCode"`
+		Start        int64  `json:"startNano"`
+		End          int64  `json:"endNano"`
+		RetainUntil  int64  `json:"retainUntilNano"`
 	}
 	if err := json.Unmarshal([]byte(out), &rows); err != nil {
 		t.Fatalf("trace --json output is not JSON: %v\n%s", err, out)
@@ -177,7 +177,7 @@ func TestTraceCommandNoStoreYet(t *testing.T) {
 // E2EE payload is never fetched or rendered).
 func TestEventsListCommandJSON(t *testing.T) {
 	ts := newStubV2Server(t, map[string]string{
-		"/api/v1/networks":          `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+		"/api/v1/networks":              `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
 		"/api/v1/networks/net-1/events": `[{"id":"ev-1","type":"build.completed","targetPrincipalId":"agent-atlas","createdAt":"2026-10-08T10:00:00Z"},{"id":"ev-2","type":"deploy.started"}]`,
 	})
 	cliEnv(t, ts.ts)
@@ -224,7 +224,7 @@ func TestEventsListCommandJSON(t *testing.T) {
 func TestEventsListCommandHuman(t *testing.T) {
 	t.Run("rows", func(t *testing.T) {
 		ts := newStubV2Server(t, map[string]string{
-			"/api/v1/networks":            `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+			"/api/v1/networks":              `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
 			"/api/v1/networks/net-1/events": `[{"id":"ev-1","type":"build.completed","createdAt":"2026-10-08T10:00:00Z"}]`,
 		})
 		cliEnv(t, ts.ts)
@@ -245,7 +245,7 @@ func TestEventsListCommandHuman(t *testing.T) {
 	})
 	t.Run("empty", func(t *testing.T) {
 		ts := newStubV2Server(t, map[string]string{
-			"/api/v1/networks":            `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
+			"/api/v1/networks":              `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
 			"/api/v1/networks/net-1/events": `[]`,
 		})
 		cliEnv(t, ts.ts)

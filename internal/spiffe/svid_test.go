@@ -39,14 +39,14 @@ func genRoot(t *testing.T, subject string, keyID []byte) ca {
 	t.Helper()
 	key := genKey(t)
 	tmpl := &x509.Certificate{
-		SerialNumber:            big.NewInt(1),
-		Subject:                 pkix.Name{CommonName: subject},
-		NotBefore:               now.Add(-2 * time.Hour),
-		NotAfter:                now.Add(24 * time.Hour),
-		KeyUsage:                x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid:   true,
-		IsCA:                    true,
-		SubjectKeyId:            keyID,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: subject},
+		NotBefore:             now.Add(-2 * time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		SubjectKeyId:          keyID,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -137,8 +137,10 @@ func genCRL(t *testing.T, signer ca, serials []int64, thisUpdate, nextUpdate, re
 	return der
 }
 
-func pemCert(der []byte) []byte { return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}) }
-func pemCRL(der []byte) []byte  { return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}) }
+func pemCert(der []byte) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+func pemCRL(der []byte) []byte { return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}) }
 
 func bundleFrom(t *testing.T, root ca, crlDER []byte, audience string) *TrustBundle {
 	t.Helper()

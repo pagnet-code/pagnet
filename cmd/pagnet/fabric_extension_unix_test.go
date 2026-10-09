@@ -408,9 +408,9 @@ func TestExtensionAdminCLIInstalledNode(t *testing.T) {
 	var effects atomic.Int32
 	official := sdk.NewServer(&sdk.Implementation{Name: "cli extension source", Version: "1"}, nil)
 	official.AddTool(&sdk.Tool{
-		Name:         "echo",
-		Description:  "Exact approved source",
-		InputSchema:  json.RawMessage(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`),
+		Name:        "echo",
+		Description: "Exact approved source",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`),
 	}, func(_ context.Context, _ *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 		effects.Add(1)
 		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: strings.Repeat("approved output\n", 2000)}}}, nil
@@ -481,7 +481,7 @@ func TestExtensionAdminCLIInstalledNode(t *testing.T) {
 	// 2) extension install (CLI) -> server-side signed reference receipt.
 	installation := extregistry.Installation{
 		Manifest: extension.ExtensionManifest{ManifestVersion: "1.0", ID: "cli.guard", Version: "1", MinProtocol: "1.0", MaxProtocol: "1.0", Interceptors: []extension.Registration{{
-			ID: "cli.guard.invoke",
+			ID:        "cli.guard.invoke",
 			Match:     extension.Match{Operation: fabric.OperationInvoke, Stage: "invoke.dispatch"},
 			Placement: extension.PlacementSource, NeedsPlaintext: true,
 			Phases:        []extension.Phase{extension.PhaseRequest, extension.PhaseChunk, extension.PhaseResponse, extension.PhaseCompletion},

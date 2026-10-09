@@ -93,9 +93,9 @@ func federationServeSetupServices(t *testing.T, ctx context.Context, dir, binary
 		t.Fatal(e)
 	}
 	revision, e := setup.Installation.Store.Register(ctx, owner, fabric.RegistryUpdate{Descriptor: fabric.EndpointDescriptor{
-		Ref:    ref,
-		Kind:   "service.mcp",
-		Name:   "Served effect",
+		Ref:      ref,
+		Kind:     "service.mcp",
+		Name:     "Served effect",
 		Bindings: []fabric.BindingSummary{{ID: "mcp", Protocol: "mcp.tools", Version: "2025-11-25", Cancellation: true}},
 	}})
 	if e != nil {

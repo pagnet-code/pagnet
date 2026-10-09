@@ -363,13 +363,13 @@ func (f *InstalledFederation) federationPeerUnpin(ctx context.Context, access *f
 }
 
 type federationLinkPutInput struct {
-	ExpectedRevision uint64   `json:"expectedRevision"`
-	RemoteNamespace  string   `json:"remoteNamespace"`
-	RemoteStoreID    string   `json:"remoteStoreId"`
-	ChannelID        []byte   `json:"channelId"`
-	SourceRoute      []byte   `json:"sourceRoute"`
-	DestinationRoute []byte   `json:"destinationRoute"`
-	SourceRole       bool     `json:"sourceRole"`
+	ExpectedRevision uint64 `json:"expectedRevision"`
+	RemoteNamespace  string `json:"remoteNamespace"`
+	RemoteStoreID    string `json:"remoteStoreId"`
+	ChannelID        []byte `json:"channelId"`
+	SourceRoute      []byte `json:"sourceRoute"`
+	DestinationRoute []byte `json:"destinationRoute"`
+	SourceRole       bool   `json:"sourceRole"`
 }
 
 func (f *InstalledFederation) federationLinkPut(ctx context.Context, access *fabricauth.OwnerAdministration, request fabricadmin.Request) (json.RawMessage, error) {
