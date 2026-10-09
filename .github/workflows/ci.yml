@@ -9,6 +9,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # This runner shares a 28-core host (vLLM + other org runners + owner
+  # work). Unbounded suites (GOMAXPROCS=28 x 28 parallel test packages)
+  # oversubscribed the host ~28x and starved goroutines in the transpiled
+  # sqlite parser for 19m+ (durable package timeouts on 2026-10-09).
+  # Bounded to 8 procs/binary, 2 packages in parallel = max 16 cores.
+  GOMAXPROCS: "8"
+
 jobs:
   go:
     # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
@@ -43,7 +51,7 @@ jobs:
       # locked from -race measurements (see fabric/search/perf_test.go); they
       # run in their own non-race step below, where the measurement the
       # budgets describe actually happens.
-      - run: go test -timeout=20m -count=1 -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
+      - run: go test -timeout=20m -count=1 -p 2 -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
       # -race: pagnet pushes BEFORE the monorepo pointer bump, so a
       # regression only the race detector catches must fail here, not
       # first in the monorepo (the 2026-09-29 stderr-drain race). The P0
@@ -51,7 +59,7 @@ jobs:
       # is opt-in via PAGNET_PROC_STRESS, unset in CI), so the detector's
       # overhead is safe on the runner. The search timing gates are skipped
       # here for the same reason as the non-race step.
-      - run: go test -timeout=20m -count=1 -race -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
+      - run: go test -timeout=20m -count=1 -race -p 2 -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
       # Search-quality gates (VNEXT E4.3): the swappability conformance gate
       # against the fabric.SearchBackend contract, the committed relevance
       # corpus (>= 50 expert-graded cases), the locked 10k/100k/1M p99
