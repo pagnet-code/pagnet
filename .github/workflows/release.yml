@@ -8,12 +8,22 @@ on:
   push:
     tags: ['v*']
     branches: [main]
+  # Re-runs the tag lane from this branch's workflow: after a fix here, a
+  # tag whose release run failed can be rebuilt and published without
+  # moving the tag (moving it would change the module version that
+  # downstream go.sum pins already resolve).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to release, e.g. v0.10.0'
+        required: true
+        type: string
 
 # The rolling dev publish is a delete+create pair: a second dev run (or a
 # tag run) interleaving with it could leave the dev release deleted or
 # clobbered. Serialize each lane; tag and dev lanes may run in parallel.
 concurrency:
-  group: release-${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'dev' }}
+  group: release-${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'dev' }}
   cancel-in-progress: false
 
 # Creating/deleting releases needs write on the contents scope.
@@ -22,7 +32,7 @@ permissions:
 
 jobs:
   release:
-    name: build + publish (${{ startsWith(github.ref, 'refs/tags/v') && 'tagged' || 'dev' }})
+    name: build + publish (${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'dev' }})
     # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
     # runner billing is broken, so CI runs on the org's own infrastructure.
     runs-on: [self-hosted, self-hosted-linux, owl-deploy]
@@ -32,6 +42,9 @@ jobs:
           # Full history so `git describe --tags` (the release VERSION) can
           # resolve the tag instead of falling back to a bare commit hash.
           fetch-depth: 0
+          # A dispatch re-run checks out the tag it is releasing; push runs
+          # check out the pushed ref as usual.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -41,10 +54,16 @@ jobs:
           cache: false
 
       - name: Resolve one SemVer build version
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ -n "${DISPATCH_TAG:-}" ]]; then
+            RELEASE_VERSION="$(sh scripts/version.sh --stable "$DISPATCH_TAG")"
+            echo "RELEASE_TAG=$DISPATCH_TAG" >> "$GITHUB_ENV"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
             RELEASE_VERSION="$(sh scripts/version.sh --stable "$GITHUB_REF_NAME")"
+            echo "RELEASE_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
           else
             RELEASE_VERSION="$(sh scripts/version.sh)"
           fi
@@ -54,10 +73,18 @@ jobs:
 
       # Release runs independently of CI, including tag pushes. Never sign
       # or publish a build whose own revision fails the correctness gates.
+      # The wall-clock search gates (performance targets, adversarial worst
+      # case) lock p99 budgets measured in a clean single-package run (see
+      # fabric/search/perf_test.go), so — exactly as in CI — the parallel
+      # suite skips them and each runs in its own dedicated step.
       - name: Verify release revision
         run: |
           go vet ./...
-          go test -timeout=20m -count=1 -race ./...
+          go test -timeout=20m -count=1 -race -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
+          go test -count=1 -run TestSearchBackendConformance -v ./fabric/search/...
+          go test -count=1 -run TestRelevanceCorpus -v ./fabric/search/...
+          go test -count=1 -run TestSearchPerformanceTargets -v ./fabric/search/...
+          go test -count=1 -run TestSearchAdversarialWorstCase -v ./fabric/search/...
 
       # Cross-compiles the unified pagnet binary for
       # linux/{amd64,arm64} and darwin/{amd64,arm64} into dist/
@@ -116,25 +143,28 @@ jobs:
       # lane when the runner container was recreated (2026-09-18).
 
       - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           api() { curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"; }
           base="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # A dispatch re-run (RELEASE_TAG) builds the checked-out tag, so the
+          # release pins that commit — not the branch HEAD the run came from.
+          sha=$(git rev-parse HEAD)
           # Resume an incomplete draft after a failed upload. Published stable
           # releases are immutable: deleting their assets on a rerun would
           # interrupt installs and replace already trusted signed artifacts.
-          rel=$(api "${base}/releases/tags/${GITHUB_REF_NAME}" 2>/dev/null || true)
+          rel=$(api "${base}/releases/tags/${RELEASE_TAG}" 2>/dev/null || true)
           rel_id=$(echo "${rel}" | jq -r '.id // empty' 2>/dev/null || true)
           shopt -s nullglob
           if [ -n "${rel_id}" ]; then
             if [ "$(echo "${rel}" | jq -r '.draft')" != "true" ]; then
-              echo "::error::${GITHUB_REF_NAME} is already published and immutable. Publish a new version instead."
+              echo "::error::${RELEASE_TAG} is already published and immutable. Publish a new version instead."
               exit 1
             fi
-            echo "resuming draft release ${rel_id} for ${GITHUB_REF_NAME}"
+            echo "resuming draft release ${rel_id} for ${RELEASE_TAG}"
             for f in dist/pagnet-*.tar.gz dist/pagnet-release-manifest-*.json; do
               aid=$(api "${base}/releases/${rel_id}/assets" | jq -r --arg n "$(basename "$f")" '.[] | select(.name == $n) | .id' | head -1)
               if [ -n "${aid}" ]; then api -X DELETE "${base}/releases/assets/${aid}" >/dev/null; fi
@@ -146,7 +176,7 @@ jobs:
           # composed in the shell and passed with --arg.
           rel=$(api -X POST "${base}/releases" \
             -H "Content-Type: application/json" \
-            -d "$(jq -cn --arg tag "${GITHUB_REF_NAME}" --arg sha "${GITHUB_SHA}" --arg body "pagnet ${GITHUB_REF_NAME}" \
+            -d "$(jq -cn --arg tag "${RELEASE_TAG}" --arg sha "${sha}" --arg body "pagnet ${RELEASE_TAG}" \
                  '{tag_name: $tag, name: $tag, target_commitish: $sha, draft: true, prerelease: false, body: $body}')")
           rel_id=$(echo "$rel" | jq -r .id)
           fi
@@ -166,10 +196,10 @@ jobs:
           api -X PATCH "${base}/releases/${rel_id}" \
             -H "Content-Type: application/json" \
             -d '{"draft":false,"prerelease":false,"make_latest":"true"}' -o /dev/null
-          echo "published ${GITHUB_REF_NAME}"
+          echo "published ${RELEASE_TAG}"
 
       - name: Publish rolling dev release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && inputs.tag == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
