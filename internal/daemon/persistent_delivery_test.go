@@ -628,7 +628,7 @@ func TestDaemon_PersistentEndpointFabricSideportEnv(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := newPersistentTestDaemon(t)
 			if tc.name == "sideport set" {
-				d.HostedFabricSideportSocket = tc.socket
+				d.SetHostedFabricSideportSocket(tc.socket)
 			}
 			client, server := newMemWS(t)
 			d.connMu.Lock()

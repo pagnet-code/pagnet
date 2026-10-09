@@ -252,7 +252,7 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		}
 		env = append(env, profile.config.Environment()...)
 	}
-	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.HostedFabricSideportSocket); err != nil {
+	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.composedSideportSocket()); err != nil {
 		return err
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)
@@ -352,7 +352,7 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 // composition the daemon has no association, so no push ever happens
 // (fail-closed, like the rest of the composition).
 func (d *Daemon) reconcileHostedSideport(ctx context.Context, link *nativeWorkerLink) {
-	if d == nil || link == nil || d.HostedFabricSideports == nil {
+	if d == nil || link == nil || d.composedSideports() == nil {
 		return
 	}
 	instanceID := link.proxy.scope.InstanceID

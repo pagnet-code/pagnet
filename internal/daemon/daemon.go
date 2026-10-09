@@ -185,9 +185,15 @@ type Daemon struct {
 	nativeWorkersMu    sync.Mutex
 	nativeConnectLocks [16]sync.Mutex
 	nativeWorkers      map[string]*nativeWorkerLink
-	state              *State
-	adapters           map[domain.RuntimeName]agentruntime.Adapter
-	runtimeProfiles    map[string]*loadedRuntimeProfile
+
+	// compositionMu guards Config.HostedFabricSideports and
+	// Config.HostedFabricSideportSocket: composition may happen before OR
+	// after the native worker pumps start, and the 100ms pump tick plus env
+	// rendering read both fields on every cycle.
+	compositionMu   sync.RWMutex
+	state           *State
+	adapters        map[domain.RuntimeName]agentruntime.Adapter
+	runtimeProfiles map[string]*loadedRuntimeProfile
 
 	// selfExe is this process's canonicalized own executable path,
 	// resolved ONCE at construction (New). The agent runtimes spawn the
@@ -3277,8 +3283,8 @@ func (d *Daemon) turnSpecFor(row *InstanceRow, resume bool, input, kind string) 
 		"PAGNET_MCP_CONFIG=" + d.mcpConfig(row),
 		"PAGNET_COORDINATION_CONTRACT=" + contractPathForSpec,
 	}
-	if d.HostedFabricSideportSocket != "" {
-		env = append(env, "PAGNET_FABRIC_SIDEPORT="+d.HostedFabricSideportSocket)
+	if socket := d.composedSideportSocket(); socket != "" {
+		env = append(env, "PAGNET_FABRIC_SIDEPORT="+socket)
 	}
 	return agentruntime.TurnSpec{
 		TurnID:               domain.NewID().String(),

@@ -385,12 +385,12 @@ func newSideportMiniFixture(t *testing.T, accepts bool) *sideportMiniFixture {
 	}
 	// The resolve port models the node's selected-binding wiring for this
 	// mini instance: the exact profile, the endpoint the test selects.
-	d.HostedFabricSideports = NewHostedFabricSideports(func(_ context.Context, instanceID string) (registry.DescriptorBatchScope, fabricagent.HostedProfile, error) {
+	d.SetHostedFabricSideports(NewHostedFabricSideports(func(_ context.Context, instanceID string) (registry.DescriptorBatchScope, fabricagent.HostedProfile, error) {
 		if instanceID != scope.InstanceID {
 			return registry.DescriptorBatchScope{}, fabricagent.HostedProfile{}, errors.New("instance not bound to the selected binding")
 		}
 		return registry.DescriptorBatchScope{Endpoint: ref, BindingID: "original"}, profile, nil
-	})
+	}))
 	return &sideportMiniFixture{t: t, d: d, fw: fw, proxy: proxy, link: link, scope: scope, ownership: ownership, profile: profile, resolveRef: ref, client: client}
 }
 
@@ -473,7 +473,7 @@ func TestHostedSideportAssociatePushesToLiveWorker(t *testing.T) {
 	resultFile := filepath.Join(t.TempDir(), "sideport-g2-result.json")
 	f := newHostedGuardFixture(t, withWorkerEnv("PAGNET_FAKE_BRIDGE_CONTROL=1", "PAGNET_FAKE_BRIDGE_RESULT_FILE="+resultFile))
 	d := f.d
-	d.HostedFabricSideports = NewHostedFabricSideports(f.hostedNativeResolvePort)
+	d.SetHostedFabricSideports(NewHostedFabricSideports(f.hostedNativeResolvePort))
 	cc, instanceID := sideportBridgeControl(t, f, resultFile)
 
 	// Baseline: no association yet — the pre-6d two-key handshake.
@@ -487,7 +487,7 @@ func TestHostedSideportAssociatePushesToLiveWorker(t *testing.T) {
 	if err := d.AssociateHostedFabricSideport(t.Context(), instanceID, sp); err != nil {
 		t.Fatalf("genuine owner administration refused: %v", err)
 	}
-	if got, ok := d.HostedFabricSideports.For(instanceID); !ok || got != sp {
+	if got, ok := d.composedSideports().For(instanceID); !ok || got != sp {
 		t.Fatalf("association = %+v ok=%v, want the exact stored triple", got, ok)
 	}
 	// The G2 assertion: the live worker's NEXT bridge session carries the
@@ -509,7 +509,7 @@ func TestHostedSideportStrictAssociateRollsBackOnPushFailure(t *testing.T) {
 	if err := f.d.AssociateHostedFabricSideport(ctx, f.scope.InstanceID, sp); err == nil {
 		t.Fatal("associate succeeded against a worker that refused the push")
 	}
-	if _, ok := f.d.HostedFabricSideports.For(f.scope.InstanceID); ok {
+	if _, ok := f.d.composedSideports().For(f.scope.InstanceID); ok {
 		t.Fatal("push failure did not roll back the stored association")
 	}
 	sets, clears, types := f.fw.counts()
@@ -528,7 +528,7 @@ func TestHostedSideportStrictAssociateRollsBackOnPushFailure(t *testing.T) {
 	if err := stub.AssociateHostedFabricSideport(ctx, f.scope.InstanceID, f.validSideport(t)); !errors.Is(err, ErrNativeObservationConflict) {
 		t.Fatalf("no-link associate err = %v, want conflict", err)
 	}
-	if _, ok := stub.HostedFabricSideports.For(f.scope.InstanceID); ok {
+	if _, ok := stub.composedSideports().For(f.scope.InstanceID); ok {
 		t.Fatal("no-link associate stored an association")
 	}
 
@@ -555,7 +555,7 @@ func TestHostedSideportAttachRestore(t *testing.T) {
 	resultFile := filepath.Join(t.TempDir(), "sideport-attach-result.json")
 	f := newHostedGuardFixture(t, withWorkerEnv("PAGNET_FAKE_BRIDGE_CONTROL=1", "PAGNET_FAKE_BRIDGE_RESULT_FILE="+resultFile))
 	d := f.d
-	d.HostedFabricSideports = NewHostedFabricSideports(f.hostedNativeResolvePort)
+	d.SetHostedFabricSideports(NewHostedFabricSideports(f.hostedNativeResolvePort))
 	cc, instanceID := sideportBridgeControl(t, f, resultFile)
 
 	// The worker attached at fixture construction, before any association
@@ -569,7 +569,7 @@ func TestHostedSideportAttachRestore(t *testing.T) {
 	}
 	// A pre-existing association in the daemon registry whose advertisement
 	// the (restarted) worker no longer holds.
-	d.HostedFabricSideports.Store(instanceID, sp)
+	d.composedSideports().Store(instanceID, sp)
 
 	d.nativeWorkersMu.Lock()
 	old := d.nativeWorkers[instanceID]
@@ -598,7 +598,7 @@ func TestHostedSideportInvalidateClearsLiveWorker(t *testing.T) {
 	resultFile := filepath.Join(t.TempDir(), "sideport-invalidate-result.json")
 	f := newHostedGuardFixture(t, withWorkerEnv("PAGNET_FAKE_BRIDGE_CONTROL=1", "PAGNET_FAKE_BRIDGE_RESULT_FILE="+resultFile))
 	d := f.d
-	d.HostedFabricSideports = NewHostedFabricSideports(f.hostedNativeResolvePort)
+	d.SetHostedFabricSideports(NewHostedFabricSideports(f.hostedNativeResolvePort))
 	cc, instanceID := sideportBridgeControl(t, f, resultFile)
 
 	assertAuthOKSideport(t, cc, instanceID, f.networkID, nil)
@@ -613,7 +613,7 @@ func TestHostedSideportInvalidateClearsLiveWorker(t *testing.T) {
 	assertAuthOKSideport(t, cc, instanceID, f.networkID, &sp)
 
 	d.invalidateHostedSideport(instanceID)
-	if _, ok := d.HostedFabricSideports.For(instanceID); ok {
+	if _, ok := d.composedSideports().For(instanceID); ok {
 		t.Fatal("invalidation did not drop the association")
 	}
 	// The worker is alive: the clear push landed, new sessions see nothing.
@@ -630,7 +630,7 @@ func TestHostedSideportPumpReconciliationConverges(t *testing.T) {
 	ctx := t.Context()
 	f := newSideportMiniFixture(t, true)
 	sp := f.validSideport(t)
-	f.d.HostedFabricSideports.Store(f.scope.InstanceID, sp)
+	f.d.composedSideports().Store(f.scope.InstanceID, sp)
 
 	// Drift: the registry has the association, the link tracked nothing.
 	f.link.mu.Lock()
@@ -660,7 +660,7 @@ func TestHostedSideportPumpReconciliationConverges(t *testing.T) {
 	// link tracks the old one → one set (never a clear + set pair).
 	sp2 := f.validSideport(t)
 	sp2.Generation = "second-generation"
-	f.d.HostedFabricSideports.Store(f.scope.InstanceID, sp2)
+	f.d.composedSideports().Store(f.scope.InstanceID, sp2)
 	f.d.reconcileHostedSideport(ctx, f.link)
 	sets, clears, _ = f.fw.counts()
 	if sets != 2 || clears != 0 {
@@ -674,7 +674,7 @@ func TestHostedSideportPumpReconciliationConverges(t *testing.T) {
 	}
 
 	// Invalidation while tracked present: exactly one clear.
-	f.d.HostedFabricSideports.Invalidate(f.scope.InstanceID)
+	f.d.composedSideports().Invalidate(f.scope.InstanceID)
 	f.d.reconcileHostedSideport(ctx, f.link)
 	sets, clears, _ = f.fw.counts()
 	if sets != 2 || clears != 1 {
@@ -688,7 +688,7 @@ func TestHostedSideportPumpReconciliationConverges(t *testing.T) {
 	}
 
 	// No composition: no push ever happens, tracked state untouched.
-	f.d.HostedFabricSideports = nil
+	f.d.SetHostedFabricSideports(nil)
 	f.link.mu.Lock()
 	f.link.sideportPushed = sp2
 	f.link.sideportPushedPresent = true

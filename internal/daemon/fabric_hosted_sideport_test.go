@@ -92,8 +92,8 @@ func TestAssociateHostedFabricSideport_GenuineOwnerAdministration(t *testing.T) 
 	f := newHostedGuardFixture(t)
 	ctx := t.Context()
 	d := f.d
-	d.HostedFabricSideports = NewHostedFabricSideports(f.hostedNativeResolvePort)
-	if d.HostedFabricSideports == nil {
+	d.SetHostedFabricSideports(NewHostedFabricSideports(f.hostedNativeResolvePort))
+	if d.composedSideports() == nil {
 		t.Fatal("resolve port present: composition must exist")
 	}
 	if got := NewHostedFabricSideports(nil); got != nil {
@@ -116,7 +116,7 @@ func TestAssociateHostedFabricSideport_GenuineOwnerAdministration(t *testing.T) 
 	if err := d.AssociateHostedFabricSideport(ctx, f.profile.Scope.InstanceID, sp); err != nil {
 		t.Fatalf("genuine owner administration refused: %v", err)
 	}
-	if got, ok := d.HostedFabricSideports.For(f.profile.Scope.InstanceID); !ok || got != sp {
+	if got, ok := d.composedSideports().For(f.profile.Scope.InstanceID); !ok || got != sp {
 		t.Fatalf("association = %+v ok=%v, want the exact stored triple", got, ok)
 	}
 
@@ -156,7 +156,7 @@ func TestAssociateHostedFabricSideport_GenuineOwnerAdministration(t *testing.T) 
 	}
 	// Process-death boundary: the dead activation advertises nothing.
 	d.invalidateHostedSideport(f.profile.Scope.InstanceID)
-	if _, ok := d.HostedFabricSideports.For(f.profile.Scope.InstanceID); ok {
+	if _, ok := d.composedSideports().For(f.profile.Scope.InstanceID); ok {
 		t.Fatal("invalidation did not drop the association")
 	}
 }
@@ -344,7 +344,7 @@ func TestBridgeSideportAdvertisedHookedTransitionPreserved(t *testing.T) {
 	// (The genuine Associate path is pinned in the companion test; the
 	// daemon-managed instance has no native journal entry to resolve, so
 	// the seed exercises the advertisement + hook chain directly.)
-	d.HostedFabricSideports = NewHostedFabricSideports(f.hostedNativeResolvePort)
+	d.SetHostedFabricSideports(NewHostedFabricSideports(f.hostedNativeResolvePort))
 	sp := agentbridge.HostedFabricSideport{
 		Socket:     nodeSocket,
 		Endpoint:   f.ref,
@@ -378,7 +378,7 @@ func TestBridgeSideportAdvertisedHookedTransitionPreserved(t *testing.T) {
 		"PAGNET_FAKE_BRIDGE_RESULT_FILE=" + hostileFile,
 	}
 	hostileID := domain.NewID().String()
-	d.HostedFabricSideports.Store(hostileID, sp)
+	d.composedSideports().Store(hostileID, sp)
 	launchSideportInstance(t, hostileID)
 	hostileLines := readBridgeResult(t, hostileFile)
 	assertAuthOK(t, hostileLines, hostileID)
@@ -412,7 +412,7 @@ func TestBridgeSideportAdvertisedHookedTransitionPreserved(t *testing.T) {
 		"PAGNET_FAKE_BRIDGE_LIST_TOOLS=1",
 	}
 	spawnID := domain.NewID().String()
-	d.HostedFabricSideports.Store(spawnID, sp)
+	d.composedSideports().Store(spawnID, sp)
 	launchSideportInstance(t, spawnID)
 	lines := readBridgeResult(t, resultFile)
 	if len(lines) < 4 {

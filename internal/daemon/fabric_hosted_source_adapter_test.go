@@ -519,8 +519,26 @@ func TestDaemonHostedSourceAdapterEnforcesCapacityBeforeAcceptance(t *testing.T)
 	if out.State != "unavailable" || len(out.Output) > 0 || out.Terminal != nil {
 		t.Fatalf("read port exposed a truncated final output: %+v", out)
 	}
-	if turns, _ := f.fakeTurns(); turns != 1 {
-		t.Fatalf("capacity refusal changed the turn count: %d", turns)
+	// The fake runtime increments and persists its turn count only after
+	// streaming the full 1 MiB, which the consumer has already refused
+	// mid-stream; the turn completes shortly after the unavailable settle,
+	// so bound the read instead of sampling once.
+	ctx := t.Context()
+	var turns int
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		turns, _ = f.fakeTurns()
+		if turns == 1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("capacity refusal left the turn incomplete (turns=%d): %v", turns, ctx.Err())
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if turns != 1 {
+		t.Fatalf("capacity refusal changed the turn count: got %d, want 1 (unavailable reason %q)", turns, row.Reason)
 	}
 }
 

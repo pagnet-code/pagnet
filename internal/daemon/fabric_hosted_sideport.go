@@ -57,7 +57,8 @@ func NewHostedFabricSideports(resolve func(ctx context.Context, instanceID strin
 // stored, and a prior exact association for the instance is replaced only by
 // another owner-administration act.
 func (d *Daemon) AssociateHostedFabricSideport(ctx context.Context, instanceID string, sp agentbridge.HostedFabricSideport) error {
-	if d == nil || ctx == nil || ctx.Err() != nil || d.HostedFabricSideports == nil {
+	reg := d.composedSideports()
+	if d == nil || ctx == nil || ctx.Err() != nil || reg == nil {
 		return ErrNativeObservationConflict
 	}
 	if err := sp.Validate(); err != nil {
@@ -75,7 +76,7 @@ func (d *Daemon) AssociateHostedFabricSideport(ctx context.Context, instanceID s
 	if link == nil {
 		return ErrNativeObservationConflict
 	}
-	scope, profile, err := d.HostedFabricSideports.resolve(ctx, instanceID)
+	scope, profile, err := reg.resolve(ctx, instanceID)
 	if err != nil {
 		return err
 	}
@@ -88,13 +89,13 @@ func (d *Daemon) AssociateHostedFabricSideport(ctx context.Context, instanceID s
 	if err := d.ProbeHostedProfile(ctx, profile); err != nil {
 		return err
 	}
-	d.HostedFabricSideports.Store(instanceID, sp)
+	reg.Store(instanceID, sp)
 	// The owner administration succeeds iff the association is stored AND
 	// advertised on the live worker. A stored-but-unadvertised association
 	// is an unobservable dead state: roll back the just-stored value on
 	// push failure and surface the error.
 	if err := d.pushHostedSideportToWorker(ctx, instanceID, &sp); err != nil {
-		d.HostedFabricSideports.Invalidate(instanceID)
+		reg.Invalidate(instanceID)
 		return err
 	}
 	return nil
@@ -173,13 +174,54 @@ func (s *HostedFabricSideports) Invalidate(instanceID string) {
 	s.mu.Unlock()
 }
 
+// composedSideports is the pump-safe snapshot of the sideport composition.
+// The composition may be set (or cleared) before or after the native worker
+// pumps start, so every pump-side read goes through this snapshot.
+func (d *Daemon) composedSideports() *HostedFabricSideports {
+	if d == nil {
+		return nil
+	}
+	d.compositionMu.RLock()
+	defer d.compositionMu.RUnlock()
+	return d.HostedFabricSideports
+}
+
+// composedSideportSocket is the pump-safe snapshot of the fused node's
+// Fabric host socket path ("" = no local installation).
+func (d *Daemon) composedSideportSocket() string {
+	if d == nil {
+		return ""
+	}
+	d.compositionMu.RLock()
+	defer d.compositionMu.RUnlock()
+	return d.HostedFabricSideportSocket
+}
+
+// SetHostedFabricSideports composes (nil clears) the sideport association.
+// Safe before or after the native worker pumps start; a cleared daemon
+// advertises no sideport (fail-closed).
+func (d *Daemon) SetHostedFabricSideports(s *HostedFabricSideports) {
+	d.compositionMu.Lock()
+	defer d.compositionMu.Unlock()
+	d.HostedFabricSideports = s
+}
+
+// SetHostedFabricSideportSocket composes ("" clears) the fused node's
+// Fabric host socket launch env. Safe before or after worker start.
+func (d *Daemon) SetHostedFabricSideportSocket(path string) {
+	d.compositionMu.Lock()
+	defer d.compositionMu.Unlock()
+	d.HostedFabricSideportSocket = path
+}
+
 // hostedFabricSideportFor is the nil-safe advertisement lookup used by the
 // bridge auth ack.
 func (d *Daemon) hostedFabricSideportFor(instanceID string) (agentbridge.HostedFabricSideport, bool) {
-	if d == nil || d.HostedFabricSideports == nil {
+	sp := d.composedSideports()
+	if sp == nil {
 		return agentbridge.HostedFabricSideport{}, false
 	}
-	return d.HostedFabricSideports.For(instanceID)
+	return sp.For(instanceID)
 }
 
 // invalidateHostedSideport mirrors invalidateBridgeNonce at the instance's
@@ -190,10 +232,11 @@ func (d *Daemon) hostedFabricSideportFor(instanceID string) (agentbridge.HostedF
 // (stop, forget, restart, native removal) gets both effects from this one
 // helper.
 func (d *Daemon) invalidateHostedSideport(instanceID string) {
-	if d == nil || d.HostedFabricSideports == nil {
+	sp := d.composedSideports()
+	if sp == nil {
 		return
 	}
-	d.HostedFabricSideports.Invalidate(instanceID)
+	sp.Invalidate(instanceID)
 	// Bounded: the controller call carries its own deadline; a dead worker
 	// fails fast. The lifecycle paths this runs on are not latency-critical.
 	if err := d.pushHostedSideportToWorker(d.turnCtx, instanceID, nil); err != nil {
