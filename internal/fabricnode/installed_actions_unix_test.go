@@ -258,16 +258,21 @@ func (f *installedActionsFixture) openNode(t *testing.T, wrapper func(actions.So
 }
 
 type claimedAction struct {
-	delivery durable.Delivery
-	action   actions.Action
-	source   actions.SourceInput
+	delivery  durable.Delivery
+	claimedAt time.Time
+	action    actions.Action
+	source    actions.SourceInput
 }
 
 // claim leases one pending delivery from the real actions queue and decodes its
 // single action. The caller owns the lease and decides whether to ack.
 func (f *installedActionsFixture) claim(t *testing.T, store *actions.Store) claimedAction {
 	t.Helper()
-	d, ok, err := store.ClaimDelivery(t.Context(), "installed.worker", time.Now())
+	// One logical instant shared with the Ack: the delivery work between Claim
+	// and Ack must not race the 100ms lease on a loaded runner (real-time
+	// lease expiry is exercised by the restart tests' sleeps).
+	claimedAt := time.Now()
+	d, ok, err := store.ClaimDelivery(t.Context(), "installed.worker", claimedAt)
 	if err != nil || !ok {
 		t.Fatal("no genuine queue claim: ", err)
 	}
@@ -278,12 +283,12 @@ func (f *installedActionsFixture) claim(t *testing.T, store *actions.Store) clai
 	if err := fabric.DecodeJSON(d.Event.Data(), &set); err != nil || len(set.Actions) != 1 {
 		t.Fatal("expected a single-action delivery: ", err)
 	}
-	return claimedAction{delivery: d, action: set.Actions[0], source: set.Source}
+	return claimedAction{delivery: d, claimedAt: claimedAt, action: set.Actions[0], source: set.Source}
 }
 
 func (c claimedAction) ack(t *testing.T, store *actions.Store) {
 	t.Helper()
-	if err := store.AckDelivery(t.Context(), c.delivery.Claim, time.Now()); err != nil {
+	if err := store.AckDelivery(t.Context(), c.delivery.Claim, c.claimedAt); err != nil {
 		t.Fatal("ack delivery: ", err)
 	}
 }

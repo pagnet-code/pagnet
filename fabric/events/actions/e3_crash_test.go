@@ -299,14 +299,18 @@ func TestCrashDuplicatesNeverDoubleDispatch(t *testing.T) {
 	if err != nil || !dup.Duplicate {
 		t.Fatalf("exact original retry was not a duplicate: %v %+v", err, dup)
 	}
-	d := claimDelivery(t, s, time.Now())
+	// The Ack is evaluated at the claim's own instant: the delivery work
+	// between Claim and Ack must not race the 100ms lease on a loaded runner
+	// (real-time lease expiry is covered by the restart tests below).
+	ackNow := time.Now()
+	d := claimDelivery(t, s, ackNow)
 	if err := s.deliver(t.Context(), d.Event); err != nil {
 		t.Fatal(err)
 	}
 	if f.endpoint.invocations.Load() != 1 {
 		t.Fatalf("duplicate source dispatched %d times", f.endpoint.invocations.Load())
 	}
-	if err := s.queue.Ack(t.Context(), d.Claim, time.Now()); err != nil {
+	if err := s.queue.Ack(t.Context(), d.Claim, ackNow); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -428,18 +432,20 @@ func TestCrashRestartAfterAdmissionRecoversReceipt(t *testing.T) {
 	}
 	defer s2.Close()
 	f.auth.store = s2
-	// Let the unacked lease expire so the delivery is redelivered, then claim at
-	// the real clock (kept consistent with the Ack below). The retained receipt
-	// is recovered with no second endpoint effect.
+	// Let the unacked lease expire at the real clock so the delivery is
+	// redelivered; the post-restart claim and Ack share one instant so the
+	// delivery work cannot race the 100ms lease on a loaded runner. The
+	// retained receipt is recovered with no second endpoint effect.
 	time.Sleep(f.config.Queue.LeaseTTL + 200*time.Millisecond)
-	d2 := claimDelivery(t, s2, time.Now())
+	ackNow := time.Now()
+	d2 := claimDelivery(t, s2, ackNow)
 	if err := s2.deliver(t.Context(), d2.Event); err != nil {
 		t.Fatal(err)
 	}
 	if f.endpoint.invocations.Load() != 1 {
 		t.Fatalf("redelivery after restart repeated the paid effect: %d", f.endpoint.invocations.Load())
 	}
-	if err := s2.queue.Ack(t.Context(), d2.Claim, time.Now()); err != nil {
+	if err := s2.queue.Ack(t.Context(), d2.Claim, ackNow); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -477,16 +483,19 @@ func TestCrashRestartBeforeAdmissionDeliversOnce(t *testing.T) {
 	}
 	defer s2.Close()
 	f.auth.store = s2
-	// Let the unacked lease expire, then redeliver and admit fresh.
+	// Let the unacked lease expire at the real clock, then redeliver and admit
+	// fresh; the new claim and its Ack share one instant so the delivery work
+	// cannot race the 100ms lease on a loaded runner.
 	time.Sleep(f.config.Queue.LeaseTTL + 200*time.Millisecond)
-	d2 := claimDelivery(t, s2, time.Now())
+	ackNow := time.Now()
+	d2 := claimDelivery(t, s2, ackNow)
 	if err := s2.deliver(t.Context(), d2.Event); err != nil {
 		t.Fatal(err)
 	}
 	if f.endpoint.invocations.Load() != 1 {
 		t.Fatalf("restart-before-admission admitted %d times", f.endpoint.invocations.Load())
 	}
-	if err := s2.queue.Ack(t.Context(), d2.Claim, time.Now()); err != nil {
+	if err := s2.queue.Ack(t.Context(), d2.Claim, ackNow); err != nil {
 		t.Fatal(err)
 	}
 }
