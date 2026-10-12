@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/pagnet-code/pagnet/domain"
@@ -61,6 +62,29 @@ func Path(state, name string) (string, error) {
 	}
 	return filepath.Join(state, "external-profiles", name+".json"), nil
 }
+
+// List returns the saved profile names (sorted). A missing profile
+// directory is an empty list, not an error; non-profile files (state
+// dirs, stray files) are ignored.
+func List(state string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(state, "external-profiles"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []string{}, nil
+		}
+		return nil, errors.New("cannot list external profiles")
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(entry.Name(), ".json"))
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 func Load(path string) (Profile, error) {
 	var p Profile
 	before, err := os.Lstat(path)

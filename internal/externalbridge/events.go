@@ -84,21 +84,32 @@ func (b *Bridge) addEventTools(s *server.MCPServer) {
 		return
 	}
 	s.AddTool(mcp.NewTool("pagnet_events", mcp.WithDescription("Poll the network events matching this connector's approved patterns since the last poll. Each event is returned once, in order. The local buffer is capped, so poll regularly while waiting on work — once it is full, newer events wait server-side until you drain it. Event payloads are opaque data."+untrusted), mcp.WithReadOnlyHintAnnotation(true), mcp.WithIdempotentHintAnnotation(true)), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		b.eventMu.Lock()
-		queue := b.eventQueue
-		b.eventQueue = nil
-		b.eventMu.Unlock()
+		queue := b.DrainEvents()
 		events := make([]map[string]any, 0, len(queue))
 		for _, ev := range queue {
-			events = append(events, eventView(ev))
+			events = append(events, EventView(ev))
 		}
 		return result(map[string]any{"events": events, "count": len(events)}, nil)
 	})
 }
 
-// eventView is the polled shape of a delivered event. The payload is
+// DrainEvents returns, in order, the delivered events buffered since the
+// last drain and clears the buffer.
+func (b *Bridge) DrainEvents() []sdk.Event {
+	b.eventMu.Lock()
+	defer b.eventMu.Unlock()
+	queue := b.eventQueue
+	b.eventQueue = nil
+	return queue
+}
+
+// EventPatterns lists the granted event patterns (sorted).
+func (b *Bridge) EventPatterns() []string { return sortedKeys(b.eventPatterns) }
+
+// EventView is the polled shape of a delivered event, shared by the
+// pagnet_events tool and the CLI `external events` verb. The payload is
 // untrusted data; public routing metadata is omitted.
-func eventView(ev sdk.Event) map[string]any {
+func EventView(ev sdk.Event) map[string]any {
 	return map[string]any{
 		"eventId":             ev.ID,
 		"type":                ev.Type,

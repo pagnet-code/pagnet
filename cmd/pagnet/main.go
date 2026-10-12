@@ -227,6 +227,8 @@ func newRootCmd() *cobra.Command {
 		subscriptionsCmd(),
 		unsubscribeCmd(),
 		recipeCmd(),
+		// independent-principal CLI surface (1:1 with the mcp external bridge)
+		externalCmd(),
 		// internal (hidden): daemon-spawned MCP bridge entrypoints
 		mcpCmd(),
 	)
