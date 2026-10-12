@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -27,11 +29,13 @@ type Client interface {
 }
 
 // Grants are exact principal/capability pairs. Empty grants means discovery only.
+// Events are granted event patterns (exact type or single-level wildcard).
 // Network is pinned at startup and cannot be overridden by MCP input.
 type Config struct {
 	Network          string
 	Grants           []string
 	MessagingTargets []string
+	Events           []string
 }
 
 type Bridge struct {
@@ -39,13 +43,18 @@ type Bridge struct {
 	network          string
 	grants           map[string]bool
 	messagingTargets map[string]bool
+	eventPatterns    map[string]bool
+
+	eventMu      sync.Mutex
+	eventQueue   []sdk.Event
+	eventStarted bool
 }
 
 func New(client Client, cfg Config) (*Bridge, error) {
 	if _, err := uuid.Parse(cfg.Network); err != nil {
 		return nil, errors.New("external MCP: --network must be a network UUID")
 	}
-	b := &Bridge{client: client, network: cfg.Network, grants: map[string]bool{}, messagingTargets: map[string]bool{}}
+	b := &Bridge{client: client, network: cfg.Network, grants: map[string]bool{}, messagingTargets: map[string]bool{}, eventPatterns: map[string]bool{}}
 	for _, grant := range cfg.Grants {
 		parts := strings.Split(grant, "/")
 		if len(parts) != 2 || parts[1] == "" || strings.ContainsAny(parts[1], "* \t\r\n") {
@@ -61,6 +70,12 @@ func New(client Client, cfg Config) (*Bridge, error) {
 			return nil, errors.New("messaging targets must be unique agent UUIDs")
 		}
 		b.messagingTargets[target] = true
+	}
+	for _, pattern := range cfg.Events {
+		if !domain.ValidEventPattern(pattern) {
+			return nil, fmt.Errorf("external MCP: invalid event pattern %q; use an exact event type or a single-level wildcard like task.*", pattern)
+		}
+		b.eventPatterns[pattern] = true
 	}
 	return b, nil
 }
@@ -93,7 +108,12 @@ func (b *Bridge) Server() *server.MCPServer {
 			targets = append(targets, target)
 		}
 		sort.Strings(targets)
-		return result(map[string]any{"principalId": id.PrincipalID, "name": id.Name, "kind": id.Kind, "networkId": b.network, "invokeGrants": grants, "messagingTargets": targets}, nil)
+		patterns := make([]string, 0, len(b.eventPatterns))
+		for pattern := range b.eventPatterns {
+			patterns = append(patterns, pattern)
+		}
+		sort.Strings(patterns)
+		return result(map[string]any{"principalId": id.PrincipalID, "name": id.Name, "kind": id.Kind, "networkId": b.network, "invokeGrants": grants, "messagingTargets": targets, "eventPatterns": patterns}, nil)
 	})
 	s.AddTool(mcp.NewTool("pagnet_search", mcp.WithDescription("Discover participants in the configured Pagnet network. Search does not grant permission to invoke them."+untrusted), mcp.WithReadOnlyHintAnnotation(true), mcp.WithString("query"), mcp.WithString("capabilityId"), mcp.WithString("cursor")), func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		hits, cursor, err := b.client.Search(ctx, b.network, sdk.Query{Text: r.GetString("query", ""), Capability: r.GetString("capabilityId", ""), Cursor: r.GetString("cursor", ""), Limit: 20})
@@ -117,6 +137,7 @@ func (b *Bridge) Server() *server.MCPServer {
 		})
 	}
 	b.addMessagingTools(s)
+	b.addEventTools(s)
 	return s
 }
 

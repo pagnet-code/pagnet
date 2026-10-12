@@ -64,7 +64,7 @@ func mcpConnectCmd() *cobra.Command {
 			}
 			saved.Server = serverURL
 			saved.Activation = setup
-			if _, err := externalbridge.New(nil, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets}); err != nil {
+			if _, err := externalbridge.New(nil, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets, Events: saved.Policy.Events}); err != nil {
 				return err
 			}
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -107,9 +107,14 @@ func mcpConnectCmd() *cobra.Command {
 			return err
 		}
 		defer client.Close()
-		bridge, err := externalbridge.New(client, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets})
+		bridge, err := externalbridge.New(client, externalbridge.Config{Network: saved.Policy.NetworkID, Grants: saved.Policy.Grants, MessagingTargets: saved.Policy.MessagingTargets, Events: saved.Policy.Events})
 		if err != nil {
 			return err
+		}
+		if len(saved.Policy.Events) > 0 {
+			if err := bridge.StartEvents(cmd.Context(), externalbridge.AgentEvents(client, saved.Policy.NetworkID)); err != nil {
+				return err
+			}
 		}
 		fmt.Fprintln(cmd.ErrOrStderr(), "Browser connector running. Keep this process running; restart with: pagnet mcp connect --connector "+connector)
 		delay := time.Second

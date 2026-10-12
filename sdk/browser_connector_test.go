@@ -12,7 +12,7 @@ import (
 )
 
 func TestBrowserBridgePinsPolicyKeepsEndpointSecretAndServicesHeartbeatDuringTool(t *testing.T) {
-	policy := BrowserBridgePolicy{ConnectorID: "01900000-0000-7000-8000-000000000001", NetworkID: "01900000-0000-7000-8000-000000000002", Grants: []string{}, PolicyRevision: 1}
+	policy := BrowserBridgePolicy{ConnectorID: "01900000-0000-7000-8000-000000000001", NetworkID: "01900000-0000-7000-8000-000000000002", Grants: []string{}, Events: []string{"task.*"}, PolicyRevision: 1}
 	var observed atomic.Bool
 	heartbeat := make(chan struct{})
 	response := make(chan struct{})
@@ -31,7 +31,7 @@ func TestBrowserBridgePinsPolicyKeepsEndpointSecretAndServicesHeartbeatDuringToo
 			return
 		}
 		defer conn.Close()
-		_ = conn.WriteJSON(map[string]any{"type": "ready", "connectorId": policy.ConnectorID, "networkId": policy.NetworkID, "grants": policy.Grants, "policyRevision": int64(1)})
+		_ = conn.WriteJSON(map[string]any{"type": "ready", "connectorId": policy.ConnectorID, "networkId": policy.NetworkID, "grants": policy.Grants, "events": policy.Events, "policyRevision": int64(1)})
 		_ = conn.WriteJSON(map[string]any{"type": "request", "id": "request-1", "body": json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)})
 		_ = conn.WriteJSON(map[string]any{"type": "ping"})
 		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -91,5 +91,25 @@ func TestBrowserBridgeRejectsServerPolicyReplacementBeforeCallingHandler(t *test
 		return nil, nil
 	}); err == nil {
 		t.Fatal("changed policy accepted")
+	}
+}
+func TestBrowserBridgeRejectsEventPolicyMismatchBeforeCallingHandler(t *testing.T) {
+	policy := BrowserBridgePolicy{ConnectorID: "01900000-0000-7000-8000-000000000001", NetworkID: "01900000-0000-7000-8000-000000000002", Events: []string{"task.*"}, PolicyRevision: 1}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteJSON(map[string]any{"type": "ready", "connectorId": policy.ConnectorID, "networkId": policy.NetworkID, "events": []string{"task.created"}, "policyRevision": 1})
+	}))
+	defer ts.Close()
+	c := &Client{cfg: Config{Server: ts.URL}}
+	c.credential.Store("pgn_epd_v1_private-endpoint")
+	if err := c.ServeBrowserBridge(context.Background(), policy, func(context.Context, json.RawMessage) (json.RawMessage, error) {
+		t.Error("handler reached despite changed event policy")
+		return nil, nil
+	}); err == nil {
+		t.Fatal("changed event policy accepted")
 	}
 }

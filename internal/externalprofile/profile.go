@@ -24,6 +24,7 @@ type Profile struct {
 	Credential       string   `json:"credential"`
 	Grants           []string `json:"grants,omitempty"`
 	MessagingTargets []string `json:"messagingTargets,omitempty"`
+	Events           []string `json:"events,omitempty"`
 }
 
 func (p Profile) Validate() error {
@@ -39,7 +40,7 @@ func (p Profile) Validate() error {
 	if strings.ContainsAny(p.Credential, "\r\n\x00 \t") {
 		return errors.New("invalid external principal credential encoding")
 	}
-	if len(p.Credential) > 4096 || len(p.Grants) > 64 || len(p.MessagingTargets) > 64 {
+	if len(p.Credential) > 4096 || len(p.Grants) > 64 || len(p.MessagingTargets) > 64 || len(p.Events) > 64 {
 		return errors.New("external bridge profile exceeds bounds")
 	}
 	u, err := url.Parse(p.Server)
@@ -49,8 +50,8 @@ func (p Profile) Validate() error {
 	if err := (sdk.Config{Server: p.Server, Credential: p.Credential}).Validate(); err != nil {
 		return errors.New("invalid external bridge server configuration")
 	}
-	if _, err := externalbridge.New(nil, externalbridge.Config{Network: p.Network, Grants: p.Grants, MessagingTargets: p.MessagingTargets}); err != nil {
-		return errors.New("invalid external bridge network or grants")
+	if _, err := externalbridge.New(nil, externalbridge.Config{Network: p.Network, Grants: p.Grants, MessagingTargets: p.MessagingTargets, Events: p.Events}); err != nil {
+		return errors.New("invalid external bridge network, grants or event patterns")
 	}
 	return nil
 }

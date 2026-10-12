@@ -19,8 +19,12 @@ type BrowserBridgePolicy struct {
 	ConnectorID      string   `json:"connectorId"`
 	NetworkID        string   `json:"networkId"`
 	MessagingTargets []string `json:"messagingTargets"`
-	Grants           []string `json:"grants"`
-	PolicyRevision   int64    `json:"policyRevision"`
+	// Events are the approved event patterns for this bridge (exact type or
+	// single-level wildcard). Nil or empty means the bridge receives no
+	// network events.
+	Events         []string `json:"events"`
+	Grants         []string `json:"grants"`
+	PolicyRevision int64    `json:"policyRevision"`
 }
 
 // ServeBrowserBridge opens an outbound connection to the configured Pagnet
@@ -70,7 +74,7 @@ func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePol
 	if conn.ReadJSON(&ready) != nil {
 		return errors.New("browser bridge handshake failed")
 	}
-	if ready.Type != "ready" || ready.ConnectorID != policy.ConnectorID || ready.NetworkID != policy.NetworkID || ready.PolicyRevision != policy.PolicyRevision || !sameBrowserGrants(ready.Grants, policy.Grants) || !sameBrowserGrants(ready.MessagingTargets, policy.MessagingTargets) {
+	if ready.Type != "ready" || ready.ConnectorID != policy.ConnectorID || ready.NetworkID != policy.NetworkID || ready.PolicyRevision != policy.PolicyRevision || !sameBrowserPolicyList(ready.Grants, policy.Grants) || !sameBrowserPolicyList(ready.MessagingTargets, policy.MessagingTargets) || !sameBrowserPolicyList(ready.Events, policy.Events) {
 		return errors.New("browser bridge policy mismatch; reconnect requires explicit setup approval")
 	}
 	jobs := make(chan struct {
@@ -136,7 +140,7 @@ func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePol
 		}
 	}
 }
-func sameBrowserGrants(a, b []string) bool {
+func sameBrowserPolicyList(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}

@@ -32,6 +32,8 @@ func (b *Bridge) HandleHosted(ctx context.Context, body json.RawMessage) (json.R
 			allowed = len(b.messagingTargets) > 0
 		case "pagnet_invoke", "pagnet_invocation_get":
 			allowed = len(b.grants) > 0
+		case "pagnet_events":
+			allowed = len(b.eventPatterns) > 0
 		}
 	}
 	if !allowed {

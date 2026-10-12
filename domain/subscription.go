@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // EventDeliveryMode selects how a subscribed event reaches the subscriber.
 type EventDeliveryMode string
@@ -84,4 +87,46 @@ type EventDelivery struct {
 	AcknowledgedAt *time.Time
 	// LastError is the last dispatch failure (public-safe detail).
 	LastError string
+}
+
+// ValidEventPattern reports whether p is a valid event subscription pattern:
+// an exact event type ("task.created") or a single-level suffix wildcard
+// ("task.*" matches "task.created" but not "task.sub.created"). Every
+// dot-separated segment is non-empty and contains only [a-zA-Z0-9_-];
+// patterns are at most 128 characters.
+func ValidEventPattern(p string) bool {
+	if p == "" || len(p) > 128 {
+		return false
+	}
+	if strings.HasSuffix(p, ".*") {
+		p = p[:len(p)-2]
+	} else if strings.Contains(p, "*") {
+		return false
+	}
+	if p == "" {
+		return false
+	}
+	for _, segment := range strings.Split(p, ".") {
+		if !isPatternSegment(segment) {
+			return false
+		}
+	}
+	return true
+}
+
+func isPatternSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for _, r := range segment {
+		switch {
+		case r == '-' || r == '_':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
