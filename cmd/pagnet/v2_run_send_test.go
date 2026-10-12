@@ -247,7 +247,7 @@ func runTestEnv(t *testing.T, runtimesJSON string, extraRoutes map[string]string
 		"GET /api/v1/networks":                                     `[{"ID":"net-1","Name":"default","Slug":"default"}]`,
 		"GET /api/v1/hosts/host-1":                                 hostDetail,
 		"GET /api/v1/networks/net-1/agents":                        `[]`,
-		"POST /api/v1/networks/net-1/agents":                       `{"ID":"def-1"}`,
+		"POST /api/v1/networks/net-1/agents":                       `{"agent":{"ID":"def-1"}}`,
 		"POST /api/v1/networks/net-1/agents/def-1/launch":          `{"ID":"inst-1","Status":"starting"}`,
 		"GET /api/v1/networks/net-1/agents/def-1/instances/inst-1": `{"instance":{"Status":"idle"}}`,
 	}

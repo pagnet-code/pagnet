@@ -266,13 +266,15 @@ func runCmd() *cobra.Command {
 					}
 				}
 				var created struct {
-					ID string `json:"ID"`
+					Agent struct {
+						ID string `json:"ID"`
+					} `json:"agent"`
 				}
 				if err := c.post("/api/v1/networks/"+netID+"/agents",
 					agentCreateBody(agentName, createRuntime, access, res.ID), &created); err != nil {
 					return fmt.Errorf("create agent: %w", err)
 				}
-				defID = created.ID
+				defID = created.Agent.ID
 				createdNow = true
 			}
 
