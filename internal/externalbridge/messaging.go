@@ -29,7 +29,7 @@ func (b *Bridge) addMessagingTools(s *server.MCPServer) {
 	s.AddTool(mcp.NewTool("pagnet_ask", mcp.WithDescription("Ask an explicitly allowed Pagnet agent a question. Agent descriptions are discoverable via pagnet_search; no business capability schema is required. Choose a short requestId such as travel-plan-1 for new work, and reuse the SAME requestId, agent and text for retries. The bridge creates durable identifiers; you do not need UUIDs. Results are durable; poll pagnet_ask_get, never resubmit under a new request key after timeout."+untrusted), mcp.WithReadOnlyHintAnnotation(false), mcp.WithIdempotentHintAnnotation(true), mcp.WithString("targetPrincipalId", mcp.Required()), mcp.WithString("requestId"), mcp.WithString("messageId", mcp.Description("Advanced compatibility: UUID instead of requestId")), mcp.WithString("text", mcp.Required())), func(ctx context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		out, err := b.Ask(ctx, r.GetString("targetPrincipalId", ""), r.GetString("requestId", ""), r.GetString("messageId", ""), r.GetString("text", ""))
 		if err != nil && out != nil {
-			return result(map[string]any{"requestId": r.GetString("requestId", ""), "targetPrincipalId": out.TargetPrincipalID, "messageId": out.MessageID, "threadId": out.ThreadID, "notice": AskUncertainNotice}, nil)
+			return result(map[string]any{"requestId": r.GetString("requestId", ""), "targetPrincipalId": out.TargetPrincipalID, "messageId": out.MessageID, "threadId": out.ThreadID, "notice": AskUncertainNotice, "reason": err.Error()}, nil)
 		}
 		return result(out, err)
 	})

@@ -336,10 +336,10 @@ after a timeout. Poll ask-get for the reply.`,
 			out, err := s.bridge.Ask(cmd.Context(), args[0], askKey, askMessageID, text)
 			if err != nil && out != nil {
 				if jsonOut {
-					return printJSON(map[string]any{"requestId": askKey, "targetPrincipalId": out.TargetPrincipalID, "messageId": out.MessageID, "threadId": out.ThreadID, "notice": externalbridge.AskUncertainNotice})
+					return printJSON(map[string]any{"requestId": askKey, "targetPrincipalId": out.TargetPrincipalID, "messageId": out.MessageID, "threadId": out.ThreadID, "notice": externalbridge.AskUncertainNotice, "reason": err.Error()})
 				}
 				fmt.Printf("ask: %s  agent: %s  request: %s\n", out.MessageID, args[0], orDash(askKey))
-				fmt.Fprintln(os.Stderr, "notice: "+externalbridge.AskUncertainNotice)
+				fmt.Fprintln(os.Stderr, "notice: "+externalbridge.AskUncertainNotice+" "+err.Error())
 				return nil
 			}
 			if err != nil {
@@ -422,18 +422,24 @@ waits briefly for pending deliveries, drains, prints, and exits.`,
 			emit := func(evs []sdk.Event) {
 				for _, ev := range evs {
 					raw, _ := json.Marshal(externalbridge.EventView(ev))
-					fmt.Fprintln(cmd.OutOrStdout(), raw)
+					fmt.Fprintln(cmd.OutOrStdout(), string(raw))
 				}
 			}
 			if once {
+				// DrainEvents returns and clears the queue — keep the first
+				// non-empty batch and print it; polling it in the loop
+				// condition would consume and discard the very events we
+				// are waiting for.
 				deadline := time.Now().Add(2 * time.Second)
-				for len(s.bridge.DrainEvents()) == 0 {
+				evs := s.bridge.DrainEvents()
+				for len(evs) == 0 {
 					if time.Now().After(deadline) || cmd.Context().Err() != nil {
 						break
 					}
 					time.Sleep(50 * time.Millisecond)
+					evs = s.bridge.DrainEvents()
 				}
-				emit(s.bridge.DrainEvents())
+				emit(evs)
 				return nil
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
