@@ -48,3 +48,26 @@ type nativeWorkerGC struct{ Phase string }
 func (*NativeWorkerRegistry) lookupGC(string) (nativeWorkerGC, error) {
 	return nativeWorkerGC{}, errNativeWorkerPlatform
 }
+
+// NativeWorkerRecovery mirrors durable recovery identity on supported platforms.
+type NativeWorkerRecovery struct {
+	RecoveryID          string
+	InstanceID          string
+	OriginalGeneration  string
+	PrepareBootIdentity string
+	Phase               string
+}
+
+func (*NativeWorkerRegistry) LookupRecovery(string) (NativeWorkerRecovery, error) {
+	return NativeWorkerRecovery{}, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) RecoveryTombstoned(string, string) (bool, error) {
+	return true, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) checkRecoveryFence(string, string) error { return errNativeWorkerPlatform }
+func (*NativeWorkerRegistry) PrepareRecovery(NativeWorkerRecovery) (NativeWorkerRecovery, error) {
+	return NativeWorkerRecovery{}, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) AdvanceRecoveryPhase(string, string, string) error {
+	return errNativeWorkerPlatform
+}

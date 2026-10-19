@@ -1025,6 +1025,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	// daemon process as a runner under the host, keyed by (host_id, boot_id).
 	q := u.Query()
 	q.Set("boot_id", d.bootID)
+	setHostBootIdentity(q, proc.ReadBootIdentity)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	if d.nativeRegistry != nil {
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)

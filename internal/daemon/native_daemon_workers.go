@@ -44,6 +44,11 @@ func (d *Daemon) nativeWorkerFor(conn *websocket.Conn, instanceID string) (*Nati
 	if link == nil || link.conn != conn {
 		return nil, ErrNativeOriginAdmissionDeferred
 	}
+	if d.nativeRegistry != nil {
+		if err := d.nativeRegistry.checkRecoveryFence(instanceID, link.proxy.scope.Generation); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := link.proxy.connection.AuthenticatedNativeHostSession(); err != nil {
 		return nil, err
 	}
@@ -229,6 +234,9 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 }
 
 func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObservationConnection, record NativeWorkerRecord) error {
+	if err := d.nativeRegistry.checkRecoveryFence(record.Scope.InstanceID, record.Scope.Generation); err != nil {
+		return err
+	}
 	if gc, gcErr := d.nativeRegistry.lookupGC(record.Scope.InstanceID); !errors.Is(gcErr, sql.ErrNoRows) && (gcErr != nil || gc.Phase != "waiting") {
 		return ErrNativeOriginAdmissionDeferred
 	}
