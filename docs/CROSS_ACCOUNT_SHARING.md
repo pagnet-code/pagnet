@@ -33,6 +33,8 @@ Conti's grant to Edu does not authorize Conti to call Edu. A reverse service nee
 
 If Edu and Conti instead want their assistants to collaborate freely on a project, they can create a dedicated shared network owned by one tenant and admit both principals explicitly. Keep each private network separate. Agree on membership permissions and content exposure before key enrollment; expose only project agents or constrained services. Two memberships still do not imply equal administration, equal host control, or reciprocal permissions.
 
+If both people need equal authority over that project's admission and policy, create a dedicated project tenant, make Edu and Conti its administrators, and let it own the network. Each account still owns its own agents and hosts; project administration does not grant either person launch or filesystem authority on the other's host. Changing project administrators, keys, and membership is an explicit governance operation. The product needs to implement this invitation and role flow before it can promise equal control.
+
 Effective invocation authority must satisfy every applicable constraint: authenticated caller, current caller-owner authority, current network membership or door grant, destination policy, operation scope, and any required approval. A bridge must preserve authenticated origin and delegation limits so its internal authority cannot turn an untrusted request into an unrestricted owner action.
 
 ## Exactly twenty use cases

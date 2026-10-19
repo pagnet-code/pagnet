@@ -57,6 +57,16 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		return errors.New("native worker environment exceeds bound")
 	}
 	defer clear(envRaw)
+	r.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			r.mu.Unlock()
+		}
+	}()
+	if err := r.checkRecoveryFence(record.Scope.InstanceID, record.Scope.Generation); err != nil {
+		return err
+	}
 	current, err := r.Lookup(record.Scope.InstanceID)
 	if err != nil {
 		return err
@@ -65,14 +75,11 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		return errors.New("native worker launch identity conflict")
 	}
 	if current.LaunchState == "reserved" {
-		r.mu.Lock()
 		err = r.prepare(current)
 		if err != nil {
-			r.mu.Unlock()
 			return err
 		}
 		result, claimErr := r.db.Exec(`UPDATE native_workers SET launch_state='launching' WHERE instance_id=? AND launch_state='reserved'`, current.Scope.InstanceID)
-		r.mu.Unlock()
 		if claimErr != nil {
 			return claimErr
 		}
@@ -102,6 +109,8 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			}
 			_ = input.Close()
 			_, markErr := r.db.Exec(`UPDATE native_workers SET launch_state='launched' WHERE instance_id=? AND launch_state='launching'`, current.Scope.InstanceID)
+			r.mu.Unlock()
+			locked = false
 			// Reap when this controller remains alive; the child is independent when it
 			// exits. Never use CommandContext or cancel/kill the original process.
 			go func() { _ = cmd.Wait() }()
@@ -126,6 +135,10 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 				return markErr
 			}
 		}
+	}
+	if locked {
+		r.mu.Unlock()
+		locked = false
 	}
 	path, err := sessionworker.SocketPath(current.Dir)
 	if err != nil {

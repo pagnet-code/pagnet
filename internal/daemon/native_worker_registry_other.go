@@ -48,3 +48,25 @@ type nativeWorkerGC struct{ Phase string }
 func (*NativeWorkerRegistry) lookupGC(string) (nativeWorkerGC, error) {
 	return nativeWorkerGC{}, errNativeWorkerPlatform
 }
+
+func (*NativeWorkerRegistry) LookupRecovery(string) (NativeWorkerRecovery, error) {
+	return NativeWorkerRecovery{}, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) RecoveryTombstoned(string, string) (bool, error) {
+	return true, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) checkRecoveryFence(string, string) error { return errNativeWorkerPlatform }
+func (*NativeWorkerRegistry) PrepareRecovery(NativeWorkerRecovery) (NativeWorkerRecovery, error) {
+	return NativeWorkerRecovery{}, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) AdvanceRecoveryPhase(string, string, string) error {
+	return errNativeWorkerPlatform
+}
+
+func (*NativeWorkerRegistry) pendingCollectedRecoveries() ([]NativeWorkerRecovery, error) {
+	return nil, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) confirmRecoveryCleaned(string) error { return errNativeWorkerPlatform }
+func (*NativeWorkerRegistry) collectRecovery(NativeWorkerRecovery) error {
+	return errNativeWorkerPlatform
+}

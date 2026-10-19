@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -104,11 +105,43 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{`PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `CREATE TABLE IF NOT EXISTS native_workers(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL,launch_state TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_gc(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL)`} {
+	for _, q := range []string{`PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `CREATE TABLE IF NOT EXISTS native_workers(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL,launch_state TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_gc(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_recoveries(recovery_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,original_generation TEXT NOT NULL,prepare_boot_identity TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('prepared','committed','collected')),UNIQUE(instance_id,original_generation))`} {
 		if _, err = db.Exec(q); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
+	}
+	// Older tombstones remain launch fences, but lack the immutable evidence
+	// needed to authorize phase advancement. Never infer or backfill that evidence.
+	rows, err := db.Query(`PRAGMA table_info(native_worker_recoveries)`)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	hasPayload, hasCleaned := false, false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			break
+		}
+		hasPayload = hasPayload || name == "payload"
+		hasCleaned = hasCleaned || name == "server_cleaned"
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err == nil && !hasPayload {
+		_, err = db.Exec(`ALTER TABLE native_worker_recoveries ADD COLUMN payload BLOB NOT NULL DEFAULT ''`)
+	}
+	if err == nil && !hasCleaned {
+		_, err = db.Exec(`ALTER TABLE native_worker_recoveries ADD COLUMN server_cleaned INTEGER NOT NULL DEFAULT 0 CHECK(server_cleaned IN(0,1))`)
+	}
+	if err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return &NativeWorkerRegistry{db: db, root: root}, nil
 }
@@ -136,7 +169,7 @@ func (r *NativeWorkerRegistry) Lookup(instanceID string) (NativeWorkerRecord, er
 }
 func (r *NativeWorkerRegistry) Owns(instanceID string) bool {
 	var n int
-	err := r.db.QueryRow(`SELECT COUNT(*) FROM native_workers WHERE instance_id=?`, instanceID).Scan(&n)
+	err := r.db.QueryRow(`SELECT (SELECT COUNT(*) FROM native_workers WHERE instance_id=?)+(SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=?)`, instanceID, instanceID).Scan(&n)
 	return err != nil || n > 0
 } // fail closed on registry errors
 func (r *NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
@@ -178,6 +211,9 @@ func (r *NativeWorkerRegistry) Reserve(scope sessionworker.Scope, spec sessionwo
 	record.Spec.Env = nil
 	if scope.ServerURL == "" || scope.TenantID == "" || scope.AccountID == "" || scope.HostID == "" || scope.InstanceID == "" || scope.Generation == "" || spec.TenantID != scope.TenantID || !filepath.IsAbs(spec.Workspace) || !filepath.IsAbs(spec.Binary) || !filepath.IsAbs(spec.MCPExecutable) {
 		return NativeWorkerRecord{}, errors.New("incomplete original native worker authority")
+	}
+	if err := r.checkRecoveryFence(scope.InstanceID, scope.Generation); err != nil {
+		return NativeWorkerRecord{}, err
 	}
 	existing, err := r.Lookup(scope.InstanceID)
 	if err == nil {
@@ -300,4 +336,172 @@ func (r *NativeWorkerRegistry) prepare(record NativeWorkerRecord) error {
 	}
 	defer clear(key)
 	return sessionworker.PrepareBootstrap(record.Dir, sessionworker.Bootstrap{Protocol: sessionworker.Protocol, Scope: record.Scope, Native: record.Spec}, key)
+}
+
+func validNativeRecovery(record NativeWorkerRecovery) bool {
+	for _, value := range []string{record.RecoveryID, record.InstanceID} {
+		if !validNativeRecoveryToken(value, false) {
+			return false
+		}
+	}
+	if !validNativeRecoveryToken(record.OriginalGeneration, true) || !validNativeRecoveryToken(record.LocalGeneration, true) {
+		return false
+	}
+	if record.OriginalGeneration != "" && record.LocalGeneration != "" && record.OriginalGeneration != record.LocalGeneration {
+		return false
+	}
+	if record.Action != "replace" && record.Action != "delete" {
+		return false
+	}
+	if !record.PrepareBoot.Valid() || !record.FenceBoot.Valid() {
+		return false
+	}
+	if record.OriginalBoot != (transport.KernelBootEvidence{}) && !record.OriginalBoot.Valid() {
+		return false
+	}
+	return record.Phase == "prepared" || record.Phase == "committed" || record.Phase == "collected"
+}
+
+func validNativeRecoveryToken(value string, optional bool) bool {
+	return (optional || value != "") && len(value) <= 128 && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
+}
+
+func (r *NativeWorkerRegistry) LookupRecovery(recoveryID string) (NativeWorkerRecovery, error) {
+	var record NativeWorkerRecovery
+	var raw []byte
+	var instanceID, generation, bootIdentity, phase string
+	var cleaned bool
+	err := r.db.QueryRow(`SELECT instance_id,original_generation,prepare_boot_identity,phase,payload,server_cleaned FROM native_worker_recoveries WHERE recovery_id=?`, recoveryID).Scan(&instanceID, &generation, &bootIdentity, &phase, &raw, &cleaned)
+	if err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	if len(raw) > 8192 || json.Unmarshal(raw, &record) != nil || !validNativeRecovery(record) || record.RecoveryID != recoveryID || record.InstanceID != instanceID || record.OriginalGeneration != generation || record.PrepareBoot.Identity != bootIdentity || record.Phase != "prepared" {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery identity corrupt or missing boot evidence")
+	}
+	// The immutable payload always retains the preparation; the adjacent CAS
+	// transition is represented only by the phase column.
+	record.Phase = phase
+	record.ServerCleaned = cleaned
+	if !validNativeRecovery(record) {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery phase corrupt")
+	}
+	return record, nil
+}
+
+// RecoveryTombstoned fails closed on registry errors. Every recorded phase is
+// a fence; collected records remain fences after server cleanup confirmation.
+func (r *NativeWorkerRegistry) RecoveryTombstoned(instanceID, generation string) (bool, error) {
+	var count int
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation='')`, instanceID, generation).Scan(&count)
+	return err != nil || count > 0, err
+}
+func (r *NativeWorkerRegistry) checkRecoveryFence(instanceID, generation string) error {
+	fenced, err := r.RecoveryTombstoned(instanceID, generation)
+	if err != nil {
+		return err
+	}
+	if fenced {
+		return errors.New("native worker generation is fenced by recovery")
+	}
+	return nil
+}
+
+// PrepareRecovery durably commits the fence before the caller may perform any
+// recovery action. SQLite synchronous=FULL fsyncs the commit. Only exact identity
+// replay is accepted, returning the already persisted phase without regression.
+func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (NativeWorkerRecovery, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !validNativeRecovery(record) || record.Phase != "prepared" || record.ServerCleaned {
+		return NativeWorkerRecovery{}, errors.New("invalid native worker recovery preparation")
+	}
+	existing, err := r.LookupRecovery(record.RecoveryID)
+	if err == nil {
+		identity := existing
+		identity.Phase = "prepared"
+		identity.ServerCleaned = false
+		if identity != record {
+			return NativeWorkerRecovery{}, errors.New("native worker recovery identity conflict")
+		}
+		return existing, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return NativeWorkerRecovery{}, err
+	}
+	worker, err := r.Lookup(record.InstanceID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return NativeWorkerRecovery{}, err
+	}
+	if err == nil && record.OriginalGeneration != "" && worker.Scope.Generation != record.OriginalGeneration {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery original generation conflict")
+	}
+	localGeneration := ""
+	if err == nil {
+		localGeneration = worker.Scope.Generation
+	}
+	if record.LocalGeneration != localGeneration {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery local generation conflict")
+	}
+	tx, err := r.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	defer tx.Rollback()
+	var count int
+	// Completed tombstones are permanent generation fences. Counting them
+	// against the in-flight limit would eventually prevent every future
+	// recovery on a long-lived host.
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries WHERE server_cleaned=0`).Scan(&count); err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	if count >= maxNativeWorkerRecords {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery registry full")
+	}
+	var overlap int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation='' OR ?='')`, record.InstanceID, record.OriginalGeneration, record.OriginalGeneration).Scan(&overlap); err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	if overlap != 0 {
+		return NativeWorkerRecovery{}, errors.New("native worker recovery fence conflict")
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	if _, err = tx.Exec(`INSERT INTO native_worker_recoveries(recovery_id,instance_id,original_generation,prepare_boot_identity,phase,payload) VALUES(?,?,?,?,?,?)`, record.RecoveryID, record.InstanceID, record.OriginalGeneration, record.PrepareBoot.Identity, record.Phase, raw); err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return NativeWorkerRecovery{}, err
+	}
+	return record, nil
+}
+
+// AdvanceRecoveryPhase applies only the two adjacent state transitions. Exact
+// replay of a completed transition is idempotent; older phases never overwrite it.
+func (r *NativeWorkerRegistry) AdvanceRecoveryPhase(recoveryID, from, to string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !((from == "prepared" && to == "committed") || (from == "committed" && to == "collected")) {
+		return errors.New("invalid native worker recovery phase transition")
+	}
+	record, err := r.LookupRecovery(recoveryID)
+	if err != nil {
+		return err
+	}
+	if record.Phase == to {
+		return nil
+	}
+	result, err := r.db.Exec(`UPDATE native_worker_recoveries SET phase=? WHERE recovery_id=? AND phase=?`, to, recoveryID, from)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errors.New("native worker recovery phase conflict")
+	}
+	return nil
 }
