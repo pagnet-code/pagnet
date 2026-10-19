@@ -118,7 +118,7 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	hasPayload := false
+	hasPayload, hasCleaned := false, false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -127,6 +127,7 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 			break
 		}
 		hasPayload = hasPayload || name == "payload"
+		hasCleaned = hasCleaned || name == "server_cleaned"
 	}
 	if err == nil {
 		err = rows.Err()
@@ -134,6 +135,9 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 	rows.Close()
 	if err == nil && !hasPayload {
 		_, err = db.Exec(`ALTER TABLE native_worker_recoveries ADD COLUMN payload BLOB NOT NULL DEFAULT ''`)
+	}
+	if err == nil && !hasCleaned {
+		_, err = db.Exec(`ALTER TABLE native_worker_recoveries ADD COLUMN server_cleaned INTEGER NOT NULL DEFAULT 0 CHECK(server_cleaned IN(0,1))`)
 	}
 	if err != nil {
 		_ = db.Close()
@@ -165,7 +169,7 @@ func (r *NativeWorkerRegistry) Lookup(instanceID string) (NativeWorkerRecord, er
 }
 func (r *NativeWorkerRegistry) Owns(instanceID string) bool {
 	var n int
-	err := r.db.QueryRow(`SELECT COUNT(*) FROM native_workers WHERE instance_id=?`, instanceID).Scan(&n)
+	err := r.db.QueryRow(`SELECT (SELECT COUNT(*) FROM native_workers WHERE instance_id=?)+(SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=?)`, instanceID, instanceID).Scan(&n)
 	return err != nil || n > 0
 } // fail closed on registry errors
 func (r *NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
@@ -366,7 +370,8 @@ func (r *NativeWorkerRegistry) LookupRecovery(recoveryID string) (NativeWorkerRe
 	var record NativeWorkerRecovery
 	var raw []byte
 	var instanceID, generation, bootIdentity, phase string
-	err := r.db.QueryRow(`SELECT instance_id,original_generation,prepare_boot_identity,phase,payload FROM native_worker_recoveries WHERE recovery_id=?`, recoveryID).Scan(&instanceID, &generation, &bootIdentity, &phase, &raw)
+	var cleaned bool
+	err := r.db.QueryRow(`SELECT instance_id,original_generation,prepare_boot_identity,phase,payload,server_cleaned FROM native_worker_recoveries WHERE recovery_id=?`, recoveryID).Scan(&instanceID, &generation, &bootIdentity, &phase, &raw, &cleaned)
 	if err != nil {
 		return NativeWorkerRecovery{}, err
 	}
@@ -376,6 +381,7 @@ func (r *NativeWorkerRegistry) LookupRecovery(recoveryID string) (NativeWorkerRe
 	// The immutable payload always retains the preparation; the adjacent CAS
 	// transition is represented only by the phase column.
 	record.Phase = phase
+	record.ServerCleaned = cleaned
 	if !validNativeRecovery(record) {
 		return NativeWorkerRecovery{}, errors.New("native worker recovery phase corrupt")
 	}
@@ -406,13 +412,14 @@ func (r *NativeWorkerRegistry) checkRecoveryFence(instanceID, generation string)
 func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (NativeWorkerRecovery, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !validNativeRecovery(record) || record.Phase != "prepared" {
+	if !validNativeRecovery(record) || record.Phase != "prepared" || record.ServerCleaned {
 		return NativeWorkerRecovery{}, errors.New("invalid native worker recovery preparation")
 	}
 	existing, err := r.LookupRecovery(record.RecoveryID)
 	if err == nil {
 		identity := existing
 		identity.Phase = "prepared"
+		identity.ServerCleaned = false
 		if identity != record {
 			return NativeWorkerRecovery{}, errors.New("native worker recovery identity conflict")
 		}

@@ -6,15 +6,23 @@ import "github.com/pagnet-code/pagnet/transport"
 // fences the whole legacy instance; LocalGeneration records only the generation
 // actually found locally, for later cleanup. Collection never removes the fence.
 type NativeWorkerRecovery struct {
-	RecoveryID         string
-	InstanceID         string
-	OriginalGeneration string
-	Action             string
-	OriginalBoot       transport.KernelBootEvidence
-	PrepareBoot        transport.KernelBootEvidence
-	FenceBoot          transport.KernelBootEvidence
-	LocalGeneration    string
-	Phase              string
+	RecoveryID           string
+	DefinitionID         string
+	HostID               string
+	TenantID             string
+	AccountID            string
+	OwnershipID          string
+	LastDispatchSequence int64
+	RetiredFloor         int64
+	ServerCleaned        bool
+	InstanceID           string
+	OriginalGeneration   string
+	Action               string
+	OriginalBoot         transport.KernelBootEvidence
+	PrepareBoot          transport.KernelBootEvidence
+	FenceBoot            transport.KernelBootEvidence
+	LocalGeneration      string
+	Phase                string
 }
 
 // ProvesNewBoot requires a real UUID boot after both the server preparation and

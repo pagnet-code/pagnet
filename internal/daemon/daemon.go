@@ -1025,9 +1025,11 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	// daemon process as a runner under the host, keyed by (host_id, boot_id).
 	q := u.Query()
 	q.Set("boot_id", d.bootID)
-	setHostBootIdentity(q, proc.ReadBootIdentity)
+	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
+		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
@@ -1236,6 +1238,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			}
 			if env.Type == transport.MsgHostSession {
 				go d.recoverNativeWorkers(conn, nativeConn)
+				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
 			continue
 		}
@@ -1513,6 +1516,16 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case transport.MsgNativeWorkerRecoveryState:
+		var p transport.NativeWorkerRecoveryState
+		if len(env.Payload) > 8192 || env.DecodePayload(&p) != nil {
+			return
+		}
+		d.enqueueInstance(p.InstanceID, func() {
+			if err := d.handleNativeWorkerRecoveryState(conn, p, CollectKernelBootEvidence); err != nil && d.Log != nil {
+				d.Log.Warn("native worker loss recovery deferred", "instance", p.InstanceID)
+			}
+		})
 	case transport.MsgNativeOwnershipPrepare:
 		var p transport.NativeOwnershipPreparePayload
 		if env.DecodePayload(&p) != nil {

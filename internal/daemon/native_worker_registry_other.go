@@ -62,3 +62,11 @@ func (*NativeWorkerRegistry) PrepareRecovery(NativeWorkerRecovery) (NativeWorker
 func (*NativeWorkerRegistry) AdvanceRecoveryPhase(string, string, string) error {
 	return errNativeWorkerPlatform
 }
+
+func (*NativeWorkerRegistry) pendingCollectedRecoveries() ([]NativeWorkerRecovery, error) {
+	return nil, errNativeWorkerPlatform
+}
+func (*NativeWorkerRegistry) confirmRecoveryCleaned(string) error { return errNativeWorkerPlatform }
+func (*NativeWorkerRegistry) collectRecovery(NativeWorkerRecovery) error {
+	return errNativeWorkerPlatform
+}
