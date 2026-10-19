@@ -448,7 +448,10 @@ func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (Nat
 	}
 	defer tx.Rollback()
 	var count int
-	if err = tx.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries`).Scan(&count); err != nil {
+	// Completed tombstones are permanent generation fences. Counting them
+	// against the in-flight limit would eventually prevent every future
+	// recovery on a long-lived host.
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries WHERE server_cleaned=0`).Scan(&count); err != nil {
 		return NativeWorkerRecovery{}, err
 	}
 	if count >= maxNativeWorkerRecords {
