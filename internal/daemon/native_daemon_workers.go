@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -411,6 +412,42 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 	if d.nativeRegistry == nil {
 		return
 	}
+	// Recovery retries every two seconds across multiple workers. Keep the
+	// last failure per instance so a reserved worker's failure stays visible
+	// without filling the daemon log on every retry.
+	type recoveryFailure struct {
+		fingerprint [sha256.Size]byte
+		loggedAt    time.Time
+	}
+	var failuresMu sync.Mutex
+	failures := make(map[string]recoveryFailure)
+	reportFailure := func(instanceID string, err error) {
+		failuresMu.Lock()
+		defer failuresMu.Unlock()
+		if err == nil {
+			delete(failures, instanceID)
+			return
+		}
+		fingerprint := sha256.Sum256([]byte(err.Error()))
+		now := time.Now()
+		previous, exists := failures[instanceID]
+		if exists && previous.fingerprint == fingerprint && now.Sub(previous.loggedAt) < time.Minute {
+			return
+		}
+		failures[instanceID] = recoveryFailure{fingerprint: fingerprint, loggedAt: now}
+		if d.Log != nil {
+			// Arbitrary errors can contain worker paths or configuration. Only
+			// emit known sentinel messages, falling back to the error's type.
+			category := fmt.Sprintf("%T", err)
+			for _, known := range []error{ErrNativeOriginAdmissionDeferred, ErrNativeOriginAdmissionRejected, ErrNativeObservationConflict, ErrNativeSourceUnsupported, context.Canceled, context.DeadlineExceeded, sql.ErrNoRows} {
+				if errors.Is(err, known) {
+					category = known.Error()
+					break
+				}
+			}
+			d.Log.Warn("native session worker recovery failed", "instance", instanceID, "error_category", category)
+		}
+	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -433,7 +470,9 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 					default:
 					}
 					if _, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err != nil {
-						_ = d.connectNativeWorker(conn, connection, record)
+						reportFailure(record.Scope.InstanceID, d.connectNativeWorker(conn, connection, record))
+					} else {
+						reportFailure(record.Scope.InstanceID, nil)
 					}
 				}
 			}()
@@ -441,6 +480,7 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 		stopped := false
 		for _, record := range records {
 			if _, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err == nil {
+				reportFailure(record.Scope.InstanceID, nil)
 				continue
 			}
 			select {
