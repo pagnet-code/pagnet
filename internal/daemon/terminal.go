@@ -717,15 +717,18 @@ func (tm *terminalManager) launchPTY(s *ptySession, instanceID string, resume bo
 	return nil
 }
 
-// readLoop streams PTY output: ring append + one ordered terminal_output
-// frame per chunk. The frame carries the post-chunk seq; frames are sent
-// from this single goroutine, so per-session order is socket order.
+// readLoop always drains the PTY into its bounded ring. Only viewers bound
+// to this generation receive live output. Registration and recipient capture
+// share tm.mu so every chunk is either in the attach snapshot or delivered
+// live (possibly both; LastSeq handles that overlap). Socket sends hold no
+// terminal, buffer, or attach locks.
 func (tm *terminalManager) readLoop(s *ptySession) {
 	buf := make([]byte, terminalChunk)
 	for {
 		n, err := s.f.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
+			tm.mu.Lock()
 			s.bufMu.Lock()
 			s.seq += uint64(n)
 			seq := s.seq
@@ -734,11 +737,22 @@ func (tm *terminalManager) readLoop(s *ptySession) {
 				s.ring = s.ring[int64(len(s.ring))-terminalRingCap:]
 			}
 			s.bufMu.Unlock()
-			tm.d.send(nil, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
-				InstanceID: s.instanceID,
-				Data:       base64.StdEncoding.EncodeToString(chunk),
-				Seq:        seq,
-			})
+			var viewers []string
+			if tm.sessions[s.instanceID] == s && !s.killed && s.exitSettled == nil {
+				viewers = tm.viewersLocked(s)
+			}
+			tm.mu.Unlock()
+			if len(viewers) > 0 {
+				data := base64.StdEncoding.EncodeToString(chunk)
+				for _, sessionID := range viewers {
+					_ = tm.d.send(nil, transport.MsgTerminalOutput, transport.TerminalOutputPayload{
+						InstanceID: s.instanceID,
+						SessionID:  sessionID,
+						Data:       data,
+						Seq:        seq,
+					})
+				}
+			}
 		}
 		if err != nil {
 			// View: master EOF means the endpoint died. Signal the view's
@@ -750,6 +764,19 @@ func (tm *terminalManager) readLoop(s *ptySession) {
 			return
 		}
 	}
+}
+
+// viewersLocked captures this generation's recipients. Caller holds tm.mu.
+func (tm *terminalManager) viewersLocked(s *ptySession) []string {
+	tm.d.attachMu.Lock()
+	defer tm.d.attachMu.Unlock()
+	var viewers []string
+	for sessionID, bound := range tm.d.attachPTY[s.instanceID] {
+		if bound == s {
+			viewers = append(viewers, sessionID)
+		}
+	}
+	return viewers
 }
 
 // snapshot returns the bounded ring + current seq atomically (attach
@@ -779,11 +806,7 @@ func (tm *terminalManager) exitLoop(s *ptySession) {
 		if tm.sessions[s.instanceID] == s {
 			// Record only viewers of this capture before releasing its slot.
 			// A replacement capture's late EOF must not close the new view.
-			tm.d.attachMu.Lock()
-			for sessionID := range tm.d.attaches[s.instanceID] {
-				ended = append(ended, sessionID)
-			}
-			tm.d.attachMu.Unlock()
+			ended = tm.viewersLocked(s)
 			tm.stopInputLocked(s)
 			delete(tm.sessions, s.instanceID)
 			delete(tm.lastSize, s.instanceID)
@@ -818,11 +841,7 @@ func (tm *terminalManager) finishExitedPTY(s *ptySession, waitErr error) {
 	if owned && !killed {
 		s.exitSettled = make(chan struct{})
 		tm.stopInputLocked(s)
-		tm.d.attachMu.Lock()
-		for sessionID := range tm.d.attaches[s.instanceID] {
-			ended = append(ended, sessionID)
-		}
-		tm.d.attachMu.Unlock()
+		ended = tm.viewersLocked(s)
 	}
 	tm.mu.Unlock()
 	if !owned || killed {

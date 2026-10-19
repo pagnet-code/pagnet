@@ -720,6 +720,12 @@ func (s *Supervisor) Launch(ctx context.Context, req LaunchRequest) (*Handle, er
 		return fail(err)
 	}
 
+	// PTY children render in the attached terminal even when the daemon
+	// itself has no terminal environment (for example, a system service).
+	if req.Class == ClassPTY || (req.Class == ClassEndpoint && req.PTYSize != nil) {
+		defaultPTYEnv(req.Cmd)
+	}
+
 	// Filesystem sandbox (S2) — the single policy point: every class
 	// (turn, endpoint, PTY) is wrapped here, before the Start. On Linux
 	// the launch FAILS CLOSED if the sandbox cannot be applied (H3):

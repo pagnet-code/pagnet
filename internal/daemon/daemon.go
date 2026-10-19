@@ -285,8 +285,9 @@ type Daemon struct {
 	// the tracking, which is safe — worst case the instance hibernates
 	// and the next attach re-wakes it.
 	attachMu       sync.Mutex
-	attaches       map[string]map[string]time.Time // instanceID -> attachSessionID
-	attachRevision uint64                          // detach mutations; optimistic registration fence, guarded by attachMu
+	attaches       map[string]map[string]time.Time   // instanceID -> attachSessionID
+	attachPTY      map[string]map[string]*ptySession // attachMu: viewer -> concrete PTY generation
+	attachRevision uint64                            // detach mutations; optimistic registration fence, guarded by attachMu
 
 	// settleMu guards settleGens: a per-instance monotonically increasing
 	// settle generation, bumped by activateSessionIdle after the idle
@@ -4384,6 +4385,10 @@ func (d *Daemon) removeAttach(instanceID, sessionID string) bool {
 
 // removeAttachLocked requires attachMu.
 func (d *Daemon) removeAttachLocked(instanceID, sessionID string) bool {
+	delete(d.attachPTY[instanceID], sessionID)
+	if len(d.attachPTY[instanceID]) == 0 {
+		delete(d.attachPTY, instanceID)
+	}
 	sess := d.attaches[instanceID]
 	if _, ok := sess[sessionID]; !ok {
 		return false
@@ -4422,6 +4427,13 @@ func (d *Daemon) registerTerminalAttach(s *ptySession, p transport.TerminalAttac
 	current := d.terminal.sessions[p.InstanceID] == s && !s.killed && s.exitSettled == nil && d.attachRevision == revision
 	if current {
 		d.addAttachLocked(p.InstanceID, p.SessionID)
+		if d.attachPTY == nil {
+			d.attachPTY = map[string]map[string]*ptySession{}
+		}
+		if d.attachPTY[p.InstanceID] == nil {
+			d.attachPTY[p.InstanceID] = map[string]*ptySession{}
+		}
+		d.attachPTY[p.InstanceID][p.SessionID] = s
 	}
 	d.attachMu.Unlock()
 	d.terminal.mu.Unlock()
@@ -4611,15 +4623,13 @@ func (d *Daemon) doTerminalSnapshot(conn *websocket.Conn, p transport.TerminalSn
 	// An on-demand snapshot can follow a deferred attach while activation
 	// is still in flight. It must not turn an unsettled capture into the
 	// client's ready signal; the successful attach sends that snapshot.
+	d.terminal.mu.Lock()
+	s := d.terminal.sessions[p.InstanceID]
 	d.attachMu.Lock()
-	_, attached := d.attaches[p.InstanceID][p.SessionID]
+	attached := s != nil && d.attachPTY[p.InstanceID][p.SessionID] == s
 	d.attachMu.Unlock()
+	d.terminal.mu.Unlock()
 	if !attached || d.sessionActivating(p.InstanceID) {
-		return nil
-	}
-
-	s := d.terminal.get(p.InstanceID)
-	if s == nil {
 		return nil
 	}
 	data, lastSeq := d.terminal.snapshot(s)
