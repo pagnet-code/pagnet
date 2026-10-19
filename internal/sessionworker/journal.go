@@ -87,6 +87,20 @@ func OpenJournal(dir string, scope Scope) (*Journal, error) {
 // channel. Local owners still require independently pinned bootstrap, current
 // signed control/source admission and kernel ownership verification before work.
 func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error) {
+	return openAuthorityJournal(dir, authority, false)
+}
+
+// OpenExistingJournal acquires the original lifetime lock and opens SQLite in
+// non-creation mode. Missing or empty history cannot become a fresh lifetime.
+func OpenExistingJournal(dir string, scope Scope) (*Journal, error) {
+	authority, err := nativeauthority.NewCloudScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	return openAuthorityJournal(dir, authority, true)
+}
+
+func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (*Journal, error) {
 	if e := authority.Validate(); e != nil {
 		return nil, e
 	}
@@ -116,7 +130,20 @@ func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error
 		}
 	}()
 	path := filepath.Join(dir, "intents.sqlite")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if existing {
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			return nil, statErr
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+			return nil, errors.New("worker journal is not a private regular file")
+		}
+	}
+	flags := os.O_RDWR | os.O_CREATE | os.O_EXCL
+	if existing {
+		flags = os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flags, 0600)
 	if err == nil {
 		err = f.Close()
 	} else if os.IsExist(err) {
@@ -132,7 +159,11 @@ func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: path}).String())
+	uri := &url.URL{Scheme: "file", Path: path}
+	if existing {
+		uri.RawQuery = "mode=rw"
+	}
+	db, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +174,15 @@ func OpenAuthorityJournal(dir string, authority AuthorityScope) (*Journal, error
 		j.cloudReadiness, err = newLocalReadiness()
 		if err != nil {
 			return fail(err)
+		}
+	}
+	if existing {
+		var storedProtocol, stored string
+		if err = db.QueryRow(`SELECT protocol,scope FROM worker_meta WHERE singleton=1`).Scan(&storedProtocol, &stored); err != nil {
+			return fail(err)
+		}
+		if storedProtocol != protocol || stored != string(encoded) {
+			return fail(errors.New("worker journal scope or protocol mismatch"))
 		}
 	}
 	for _, q := range []string{

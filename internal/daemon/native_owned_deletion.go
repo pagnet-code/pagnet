@@ -45,52 +45,67 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 	ctx, cancel := context.WithTimeout(d.turnCtx, 2*time.Second)
 	defer cancel()
 	if gc.Phase == "waiting" {
+		stage = "worker_link"
 		proxy, err := d.nativeWorkerFor(conn, p.InstanceID)
 		if err != nil {
-			return errors.Join(ErrDeferred, err)
-		}
-		stage = "source_drain"
-		if err = proxy.DrainDeletionSources(ctx, p.DeleteRequestID); err != nil {
-			return errors.Join(ErrDeferred, err)
-		}
-		d.nativeWorkersMu.Lock()
-		link := d.nativeWorkers[p.InstanceID]
-		d.nativeWorkersMu.Unlock()
-		if link == nil || link.proxy != proxy {
-			return ErrDeferred
-		}
-		link.mu.Lock()
-		owned := link.ownership
-		link.mu.Unlock()
-		stage = "deletion_proof"
-		if p.DeletionProof != nil {
-			if p.DeletionProof.DeleteRequestID != p.DeleteRequestID || p.DeletionProof.StopProof.OwnershipID != owned.ID || p.DeletionProof.StopProof.OwnershipGeneration != record.Scope.Generation {
-				return ErrNativeObservationConflict
-			}
-			if _, err = proxy.call(ctx, sessionworker.Request{Type: "deletion_quarantines", DeletionProof: p.DeletionProof}); err != nil {
+			gc, err = d.recoverNativeDeletion(ctx, connection, record, gc, p)
+			if err != nil {
 				return errors.Join(ErrDeferred, err)
 			}
+		} else {
+			stage = "source_drain"
+			if err = proxy.DrainDeletionSources(ctx, p.DeleteRequestID); err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+			d.nativeWorkersMu.Lock()
+			link := d.nativeWorkers[p.InstanceID]
+			d.nativeWorkersMu.Unlock()
+			if link == nil || link.proxy != proxy {
+				return ErrDeferred
+			}
+			link.mu.Lock()
+			owned := link.ownership
+			link.mu.Unlock()
+			stage = "deletion_proof"
+			if p.DeletionProof != nil {
+				if p.DeletionProof.DeleteRequestID != p.DeleteRequestID || p.DeletionProof.StopProof.OwnershipID != owned.ID || p.DeletionProof.StopProof.OwnershipGeneration != record.Scope.Generation {
+					return ErrNativeObservationConflict
+				}
+				if _, err = proxy.call(ctx, sessionworker.Request{Type: "deletion_quarantines", DeletionProof: p.DeletionProof}); err != nil {
+					return errors.Join(ErrDeferred, err)
+				}
+			}
+			stage = "dispatch_settlement"
+			settled, err := proxy.SettleDispatches(ctx, owned)
+			if err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+			if settled.LastDispatchSequence != settled.RetiredFloor {
+				return ErrDeferred
+			}
+			stage = "native_snapshot"
+			snapshot, err := proxy.Snapshot(ctx)
+			if err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+			if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
+				return ErrDeferred
+			}
+			stage = "retirement_preparation"
+			gc, err = d.nativeRegistry.advanceGC(p.InstanceID, gc, "retiring", settled, p.DeletionProof)
+			if err != nil {
+				return err
+			}
 		}
-		stage = "dispatch_settlement"
-		settled, err := proxy.SettleDispatches(ctx, owned)
-		if err != nil {
-			return errors.Join(ErrDeferred, err)
-		}
-		if settled.LastDispatchSequence != settled.RetiredFloor {
-			return ErrDeferred
-		}
-		stage = "native_snapshot"
-		snapshot, err := proxy.Snapshot(ctx)
-		if err != nil {
-			return errors.Join(ErrDeferred, err)
-		}
-		if snapshot.IdentityPending || snapshot.PID != 0 || snapshot.HasTerminal || len(snapshot.Pending) != 0 {
-			return ErrDeferred
-		}
+	}
+	if gc.Phase == "retiring" {
 		stage = "backend_retirement"
-		retired, err := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, *settled, settled.RetiredFloor, nil, true, nil)
-		if err != nil {
-			return errors.Join(ErrDeferred, err)
+		retired := p.NativeOwnership
+		if retired.State != "retired" {
+			retired, err = connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, gc.Ownership, gc.Ownership.RetiredFloor, nil, true, nil)
+			if err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
 		}
 		gc, err = d.nativeRegistry.advanceGC(p.InstanceID, gc, "backend_retired", retired)
 		if err != nil {
@@ -116,9 +131,15 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 				return errors.Join(ErrDeferred, callErr)
 			}
 		}
+		if err != nil {
+			gc, err = d.recoverNativeDeletion(ctx, connection, record, gc, p)
+			if err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+		}
 		// Even a lost retirement reply is recoverable only from its durable private
 		// receipt under the exclusive lifetime lock, never from socket absence.
-		if err == nil {
+		if err == nil && gc.Phase == "backend_retired" {
 			gc, err = d.nativeRegistry.advanceGC(p.InstanceID, gc, "worker_retired", nil)
 			if err != nil {
 				return err
@@ -189,4 +210,88 @@ func (d *Daemon) confirmNativeForgotten(conn *websocket.Conn, p transport.Native
 		return err
 	}
 	return d.nativeRegistry.confirmGC(d.turnCtx, p)
+}
+
+// recoverNativeDeletion never launches or attaches a runtime. Only an original
+// launched registry tuple and an exclusively locked existing journal enter it.
+func (d *Daemon) recoverNativeDeletion(ctx context.Context, connection *NativeObservationConnection, record NativeWorkerRecord, gc nativeWorkerGC, p transport.ForgetInstancePayload) (nativeWorkerGC, error) {
+	if record.LaunchState != "launched" || record.Ownership == nil {
+		return gc, ErrNativeObservationConflict
+	}
+	bootstrap, key, err := sessionworker.LoadControllerBootstrap(record.Dir, record.Scope)
+	clear(key)
+	if err != nil {
+		return gc, err
+	}
+	if sessionworker.NativeProfileFingerprint(bootstrap.Native) != record.ProfileFingerprint {
+		return gc, ErrNativeObservationConflict
+	}
+	recovery, err := sessionworker.OpenDeletionRecovery(ctx, record.Dir, record.Scope)
+	if err != nil {
+		return gc, err
+	}
+	defer recovery.Close()
+	if gc.Phase == "waiting" {
+		if p.DeletionProof != nil && p.DeletionProof.DeleteRequestID != gc.DeleteRequestID {
+			return gc, ErrNativeObservationConflict
+		}
+		for cursor := int64(0); ; {
+			if err = ctx.Err(); err != nil {
+				return gc, err
+			}
+			cursor, err = connection.DrainDeletionSourcesPage(ctx, recovery.SourceCall, cursor, gc.DeleteRequestID)
+			if err != nil {
+				return gc, err
+			}
+			if cursor == 0 {
+				break
+			}
+		}
+		floor, unstarted, prepareErr := recovery.Prepare(ctx, gc.Ownership, p.DeletionProof)
+		if prepareErr != nil {
+			return gc, prepareErr
+		}
+		ownership := gc.Ownership
+		if floor > ownership.LastDispatchSequence {
+			ownership.LastDispatchSequence = floor
+		}
+		settled, settleErr := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, ownership, floor, nil, false, unstarted)
+		if settleErr != nil {
+			return gc, settleErr
+		}
+		if settled.LastDispatchSequence != floor || settled.RetiredFloor != floor {
+			return gc, ErrNativeObservationConflict
+		}
+		// Retain the prepared remote floor before pruning its original local
+		// mapping, so a crash cannot strand a waiting marker behind that floor.
+		gc, err = d.nativeRegistry.advanceGC(p.InstanceID, gc, "retiring", settled, p.DeletionProof)
+		if err != nil {
+			return gc, err
+		}
+		if err = recovery.RetireDispatches(ctx, floor); err != nil {
+			return gc, err
+		}
+	}
+	if gc.Phase == "retiring" {
+		retired, retireErr := connection.RetireNativeWorkerOwnership(ctx, record.Scope, record.Spec, record.Profile, gc.Ownership, gc.Ownership.RetiredFloor, nil, true, nil)
+		if retireErr != nil {
+			return gc, retireErr
+		}
+		gc, err = d.nativeRegistry.advanceGC(p.InstanceID, gc, "backend_retired", retired)
+		if err != nil {
+			return gc, err
+		}
+	}
+	if gc.Phase != "backend_retired" {
+		return gc, ErrNativeObservationConflict
+	}
+	// A crash may leave the prepared remote floor with its original local
+	// mapping intact. Existing readiness checks remain mandatory on replay.
+	if err = recovery.RetireDispatches(ctx, gc.Ownership.RetiredFloor); err != nil {
+		return gc, err
+	}
+	if err = recovery.CommitRetirement(ctx, gc.Ownership); err != nil {
+		return gc, err
+	}
+	return d.nativeRegistry.advanceGC(p.InstanceID, gc, "worker_retired", nil)
 }

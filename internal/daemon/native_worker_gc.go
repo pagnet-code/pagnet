@@ -17,6 +17,7 @@ type nativeWorkerGC struct {
 	DeleteRequestID string
 	Ownership       transport.NativeWorkerOwnership
 	Phase           string
+	DeletionProof   *transport.NativeOwnershipDeletionProof `json:",omitempty"`
 }
 
 // The bounded registry retains only outstanding deletions; a remote COMMIT
@@ -47,9 +48,11 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 		case "retired":
 			// A refreshed backend delivery can carry the retirement committed
 			// by this same job. It cannot create a new collection authority.
-			proposedRaw, _ := json.Marshal(p.NativeOwnership)
-			committedRaw, _ := json.Marshal(existing.Ownership)
-			if existing.Phase == "waiting" || string(proposedRaw) != string(committedRaw) {
+			if existing.Phase == "retiring" {
+				if !existing.matchesRetirement(p.NativeOwnership) {
+					return existing, ErrNativeObservationConflict
+				}
+			} else if existing.Phase == "waiting" || !transport.SameNativeWorkerOwnership(*p.NativeOwnership, existing.Ownership) {
 				return existing, ErrNativeObservationConflict
 			}
 		default:
@@ -92,26 +95,22 @@ func (r *NativeWorkerRegistry) lookupGC(id string) (nativeWorkerGC, error) {
 	}
 	return gc, nil
 }
-func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase string, proof *transport.NativeWorkerOwnership) (nativeWorkerGC, error) {
-	allowed := (gc.Phase == "waiting" && phase == "backend_retired") || (gc.Phase == "backend_retired" && (phase == "worker_retired" || phase == "collecting")) || (gc.Phase == "worker_retired" && phase == "collecting") || (gc.Phase == "collecting" && phase == "collected")
-	if !allowed {
+func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase string, proof *transport.NativeWorkerOwnership, deletionProof ...*transport.NativeOwnershipDeletionProof) (nativeWorkerGC, error) {
+	allowed := (gc.Phase == "waiting" && phase == "retiring") || (gc.Phase == "retiring" && phase == "backend_retired") || (gc.Phase == "backend_retired" && (phase == "worker_retired" || phase == "collecting")) || (gc.Phase == "worker_retired" && phase == "collecting") || (gc.Phase == "collecting" && phase == "collected")
+	if !allowed || len(deletionProof) > 1 || (len(deletionProof) != 0 && phase != "retiring") {
 		return gc, ErrNativeObservationConflict
 	}
-	if phase == "backend_retired" {
-		if proof == nil || proof.State != "retired" || proof.LastDispatchSequence != proof.RetiredFloor {
-			return gc, ErrNativeObservationConflict
-		}
-		if proof.DeletionProof != nil && (proof.DeletionProof.DeleteRequestID != gc.DeleteRequestID || proof.DeletionProof.StopProof.OwnershipID != gc.Ownership.ID || proof.DeletionProof.StopProof.OwnershipGeneration != gc.Ownership.OwnershipGeneration) {
+	if phase == "retiring" {
+		if proof == nil || proof.State != "active" || proof.LastDispatchSequence != proof.RetiredFloor || proof.RetiredFloor < gc.Ownership.RetiredFloor || proof.LastDispatchSequence < gc.Ownership.LastDispatchSequence || proof.DeletionProof != nil {
 			return gc, ErrNativeObservationConflict
 		}
 		expected, actual := gc.Ownership, *proof
-		expected.DeletionProof, actual.DeletionProof = nil, nil
-		expected.State = "retired"
-		expected.LastDispatchSequence = 0
-		expected.RetiredFloor = 0
-		actual.LastDispatchSequence = 0
-		actual.RetiredFloor = 0
+		expected.LastDispatchSequence, expected.RetiredFloor = actual.LastDispatchSequence, actual.RetiredFloor
 		if !reflect.DeepEqual(expected, actual) {
+			return gc, ErrNativeObservationConflict
+		}
+	} else if phase == "backend_retired" {
+		if !gc.matchesRetirement(proof) {
 			return gc, ErrNativeObservationConflict
 		}
 	} else if proof != nil {
@@ -120,6 +119,9 @@ func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase str
 	previous, _ := json.Marshal(gc)
 	next := gc
 	next.Phase = phase
+	if len(deletionProof) == 1 {
+		next.DeletionProof = deletionProof[0]
+	}
 	if proof != nil {
 		next.Ownership = *proof
 	}
@@ -137,6 +139,25 @@ func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase str
 	}
 	return next, nil
 }
+
+// matchesRetirement binds authoritative retirement to the durably prepared
+// dispatch floor and deletion authority before collection can proceed.
+func (gc nativeWorkerGC) matchesRetirement(proof *transport.NativeWorkerOwnership) bool {
+	if proof == nil || proof.State != "retired" || proof.LastDispatchSequence != gc.Ownership.LastDispatchSequence || proof.RetiredFloor != gc.Ownership.RetiredFloor {
+		return false
+	}
+	if gc.DeletionProof != nil && (proof.DeletionProof == nil || !transport.SameNativeOwnershipDeletionProof(*gc.DeletionProof, *proof.DeletionProof)) {
+		return false
+	}
+	if p := proof.DeletionProof; p != nil && (p.DeleteRequestID != gc.DeleteRequestID || p.StopProof.OwnershipID != gc.Ownership.ID || p.StopProof.OwnershipGeneration != gc.Ownership.OwnershipGeneration || p.StopProof.DispatchSequence <= 0 || p.StopProof.DispatchSequence > proof.RetiredFloor) {
+		return false
+	}
+	expected, actual := gc.Ownership, *proof
+	expected.State = "retired"
+	expected.DeletionProof, actual.DeletionProof = nil, nil
+	return reflect.DeepEqual(expected, actual)
+}
+
 func (r *NativeWorkerRegistry) confirmGC(ctx context.Context, p transport.NativeInstanceForgottenPayload) error {
 	gc, err := r.lookupGC(p.InstanceID)
 	if errors.Is(err, sql.ErrNoRows) {
