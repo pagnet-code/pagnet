@@ -109,6 +109,10 @@ var strictProviderErrorPatterns = []string{
 	"prompt is too long",
 }
 
+// Bare status numbers can be ordinary output, such as source line citations.
+// On the success path, require an HTTP/status label or an error reason.
+var reProviderErrorStatus = regexp.MustCompile(`\b(?:http(?:/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|429)\b|\b401\s+unauthorized\b`)
+
 // LooksLikeProviderError reports whether any of the texts carries a
 // strong provider-error signature. Runtimes can report a 429/quota
 // failure inside a "successful" turn (is_error=false), so the success
@@ -119,8 +123,7 @@ func LooksLikeProviderError(texts ...string) bool {
 	if strings.TrimSpace(joined) == "" {
 		return false
 	}
-	return reStatusCode429.MatchString(joined) ||
-		reStatusCode401.MatchString(joined) ||
+	return reProviderErrorStatus.MatchString(joined) ||
 		matchAny(joined, strictProviderErrorPatterns)
 }
 

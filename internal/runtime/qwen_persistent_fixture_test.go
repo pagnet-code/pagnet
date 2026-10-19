@@ -20,6 +20,7 @@ package runtime
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -626,6 +627,31 @@ func TestQwenDO_OrdinaryFinalTextIsNotMisclassified(t *testing.T) {
 	}
 	if evs[0].OutputTokens == nil || *evs[0].OutputTokens != 20 {
 		t.Fatalf("output tokens = %v, want 20", evs[0].OutputTokens)
+	}
+}
+
+func TestQwenDO_FinalTextLineCitationCompletes(t *testing.T) {
+	for _, stopBeforeFinalize := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stopBeforeFinalize=%t", stopBeforeFinalize), func(t *testing.T) {
+			s, _ := newFixtureState(false, "")
+			feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+			s.beginMachineTurn("turn-1", "explain the transition")
+			feedLines(t, s, userTextLine(t, fixtureSID, "explain the transition"))
+			feedLines(t, s, messageStartLine(t, fixtureSID))
+			if stopBeforeFinalize {
+				feedLines(t, s, messageStopLine(t, fixtureSID))
+			}
+			const answer = "The transition is implemented in `internal/daemon/state.go:401-402`."
+			evs := feedLines(t, s, assistantTextLine(t, fixtureSID, "test-model", answer, 10, 20, 5))
+			if !stopBeforeFinalize {
+				assertEventTypes(t, evs)
+				evs = feedLines(t, s, messageStopLine(t, fixtureSID))
+			}
+			assertEventTypes(t, evs, session.EventTurnCompleted)
+			if evs[0].TurnID != "turn-1" {
+				t.Fatalf("turn id = %q, want turn-1", evs[0].TurnID)
+			}
+		})
 	}
 }
 
