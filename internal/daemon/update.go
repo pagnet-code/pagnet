@@ -10,7 +10,8 @@ package daemon
 // Safety:
 //   - IDLE GATE: the update runs only when the daemon has no active work
 //     (no working/starting/waking instance, no in-flight turn, no live
-//     PTY) — a re-exec would otherwise orphan running runtime processes.
+//     PTY, no native worker ownership) — a re-exec would otherwise orphan
+//     running runtime processes or leave native workers on an older binary.
 //   - BACKOFF: after any failed attempt the daemon does not retry the
 //     download for an hour (a bad release must not hammer /download/).
 //   - NEVER CRASH: every failure is logged and swallowed; the daemon
@@ -228,7 +229,7 @@ func (d *Daemon) performAutoUpdate(latest string) {
 	// daemon's view. Defer to the next heartbeat — no backoff, nothing
 	// was downloaded.
 	if n := d.activeWorkCount(); n > 0 {
-		d.Log.Info("deferring auto-update to "+latest+": worker not idle", "active", n)
+		d.Log.Info("deferring auto-update to "+latest+": active work, native ownership, or unknown state", "active", n)
 		return
 	}
 	d.updMu.Lock()
@@ -279,14 +280,16 @@ func (d *Daemon) performAutoUpdate(latest string) {
 			d.Log.Error("auto-update failed: exec: "+err.Error()+"; backing off 1h", "latest", latest)
 		}
 	}) {
-		d.Log.Info("deferring auto-update to " + latest + ": worker not idle or admission busy")
+		d.Log.Info("deferring auto-update to " + latest + ": active work, native ownership, unknown state, or admission busy")
 	}
 }
 
 // activeWorkCount is the idle-gate metric: the number of active work
 // units — in-flight turns, live PTY sessions, LIVE session-driven
-// endpoints, and instances in a working/starting/waking state. Zero = the
-// daemon is idle enough to re-exec without orphaning a runtime process.
+// endpoints, native worker ownership records, and instances in a
+// working/starting/waking state. Unknown state counts as busy. Zero = the
+// daemon is idle enough to re-exec without orphaning a runtime process or
+// leaving a persistent native worker on an older binary.
 //
 // Phase 3 (A7): the live endpoints count (sup.EndpointCount) is added
 // because a re-exec orphans them — they are long-lived processes the
@@ -299,6 +302,16 @@ func (d *Daemon) activeWorkCount() int {
 	d.turnMu.Unlock()
 	n += d.terminal.activeCount()
 	n += d.sup.EndpointCount()
+	// Native workers survive daemon replacement, including while detached and
+	// idle. Until updates can migrate owners, even reserved/launching records
+	// must block a daemon-only re-exec; registry errors fail closed too.
+	if d.nativeRegistry != nil {
+		records, err := d.nativeRegistry.List()
+		if err != nil {
+			return n + 1
+		}
+		n += len(records)
+	}
 	insts, err := d.state.ListInstances()
 	if err != nil {
 		return n + 1 // Unknown state must never authorize replacing a live daemon.
