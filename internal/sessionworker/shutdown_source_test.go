@@ -58,31 +58,49 @@ func TestActualNativeShutdownWithFullOrdinaryOutboxRetainsOriginalEOFOnReopen(t 
 		t.Fatal("actual reader never registered original append capability")
 	}
 	// Row pressure is synthetic; the native reader/process and final EOF are real.
-	// NORMAL avoids thousands of irrelevant fsyncs; restore FULL before shutdown.
-	if _, err = j.db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
+	// Build pressure in one FULL transaction, leaving the final ordinary slot
+	// for production-path acceptance and quota rejection below.
+	tx, err := j.db.BeginTx(ctx, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
+	var count, total int
+	if err = tx.QueryRow(`SELECT COUNT(*),COALESCE(SUM(size),0)+(SELECT COALESCE(SUM(size),0) FROM worker_source_captures) FROM worker_observations`).Scan(&count, &total); err != nil {
+		t.Fatal(err)
+	}
+	total += count*sourceDispositionReserveBytes + sourceStopReserveBytes
 	ordinary := 0
-	for {
+	for ordinary < maxPendingObservations {
 		observed := NativeObservation{ID: uuid.NewString(), NativeGeneration: producer.generation, NativeSessionID: originalSID, Origin: producer.origin, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventPlanUpdated, SessionID: originalSID}}
 		observed.SourceDigest, _ = observationDigest(observed)
-		err = j.journalCapturedObservation(context.Background(), producer, observed, nil)
-		if errors.Is(err, ErrFull) {
+		raw, _ := json.Marshal(observed)
+		if count+2 >= maxPendingObservations || total+len(raw)+sourceDispositionReserveBytes > maxPendingObservationBytes {
 			break
 		}
-		if err != nil {
+		if _, err = tx.Exec(`INSERT INTO worker_observations(id,digest,payload,size) VALUES(?,?,?,?)`, observed.ID, observed.SourceDigest, raw, len(raw)); err != nil {
 			t.Fatal(err)
 		}
+		count++
+		total += len(raw) + sourceDispositionReserveBytes
 		ordinary++
-		if ordinary > maxPendingObservations {
-			t.Fatal("ordinary quota unbounded")
-		}
 	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	observed := NativeObservation{ID: uuid.NewString(), NativeGeneration: producer.generation, NativeSessionID: originalSID, Origin: producer.origin, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventPlanUpdated, SessionID: originalSID}}
+	observed.SourceDigest, _ = observationDigest(observed)
+	if err = j.journalCapturedObservation(context.Background(), producer, observed, nil); err != nil {
+		t.Fatal("final ordinary row was not accepted", err)
+	}
+	ordinary++
 	if ordinary != maxPendingObservations-2 {
 		t.Fatalf("unexpected reserved ordinary rows %d", ordinary)
 	}
-	if _, err = j.db.Exec(`PRAGMA synchronous=FULL`); err != nil {
-		t.Fatal(err)
+	observed.ID = uuid.NewString()
+	observed.SourceDigest, _ = observationDigest(observed)
+	if err = j.journalCapturedObservation(context.Background(), producer, observed, nil); !errors.Is(err, ErrFull) {
+		t.Fatal("ordinary setup did not exercise full quota", err)
 	}
 	started := time.Now()
 	done := make(chan struct{})
