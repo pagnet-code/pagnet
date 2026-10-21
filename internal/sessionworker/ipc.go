@@ -23,6 +23,9 @@ import (
 const maxFrame = 1 << 20
 const handshakeTimeout = 5 * time.Second
 
+// ErrControllerCallNotStarted means cancellation prevented any RPC I/O.
+var ErrControllerCallNotStarted = errors.New("controller call not started")
+
 type handshake struct {
 	NativeGeneration string `json:"nativeGeneration,omitempty"`
 	Error            string `json:"error,omitempty"`
@@ -438,6 +441,10 @@ func (c *Controller) Close() error { return c.conn.Close() }
 func (c *Controller) Call(ctx context.Context, req Request) (Response, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// An expired queued call must not write or close a healthy connection.
+	if err := ctx.Err(); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
 	deadline := time.Now().Add(handshakeTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d

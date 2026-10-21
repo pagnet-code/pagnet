@@ -268,6 +268,10 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 	if err != nil {
 		return err
 	}
+	// Consult the durable marker on every ordinary drain, including reconnects.
+	proxy.ordinarySourceAdmission = func() error {
+		return d.nativeRegistry.ordinarySourceDrainAdmission(record.Scope.InstanceID)
+	}
 	if err = proxy.BindOwnership(d.turnCtx, *ownership); err != nil {
 		_ = proxy.Close()
 		return err

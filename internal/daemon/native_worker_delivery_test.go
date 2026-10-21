@@ -403,7 +403,7 @@ func TestNativeWorkerExpiredContentRequestsReceiptWithoutStaging(t *testing.T) {
 }
 
 func TestNativeWorkerExplicitDeleteMetadataOnlyRetainsCiphertext(t *testing.T) {
-	for _, mode := range []string{"supported", "unsupported", "invalid_job", "wrong_digest", "disconnect"} {
+	for _, mode := range []string{"supported", "unsupported", "invalid_job", "wrong_digest", "missing_receipt", "disconnect"} {
 		t.Run(mode, func(t *testing.T) {
 			var c *NativeObservationConnection
 			job := domain.NewID().String()
@@ -424,6 +424,9 @@ func TestNativeWorkerExplicitDeleteMetadataOnlyRetainsCiphertext(t *testing.T) {
 				writes++
 				if mode == "disconnect" {
 					c.Close()
+					return nil
+				}
+				if mode == "missing_receipt" {
 					return nil
 				}
 				digest := p.Digest
@@ -466,7 +469,9 @@ func TestNativeWorkerExplicitDeleteMetadataOnlyRetainsCiphertext(t *testing.T) {
 					return sessionworker.Response{}, nil
 				}
 			}
-			_, err = c.DrainDeletionSourcesPage(t.Context(), call, 0, job)
+			ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			defer cancel()
+			_, err = c.DrainDeletionSourcesPage(ctx, call, 0, job)
 			if mode == "supported" {
 				if err != nil || writes != 1 || marks != 1 {
 					t.Fatal(err, writes, marks)
