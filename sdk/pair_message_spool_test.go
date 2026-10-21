@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-
 )
+
 func storeSpool(t *testing.T, k *keyring, b pairMessageBinding, raw []byte) pairMessageState {
 	t.Helper()
 	if _, exists, err := k.reservePairMessage(b); err != nil || exists {
