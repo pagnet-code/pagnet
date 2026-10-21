@@ -8,14 +8,14 @@ import (
 )
 
 // This file exposes the FIXED HPKE parameter set used for browser key-session
-// key transfer (plan §13, p10): HPKE base mode (RFC 9180) over
+// key transfer (plan §13, p10): HPKE base and authenticated modes (RFC 9180) over
 // X25519 / HKDF-SHA256 / AES-256-GCM — the audited
 // github.com/cloudflare/circl implementation, the SAME suite the p8 key
 // package uses (internal/crypto).
 //
 // The API is deliberately NOT generic-configurable: there is exactly one
-// suite (the constants below) and two operations (Wrap = sender, Unwrap =
-// receiver). A future stronger client (plan §13.5) implements the same
+// suite (the constants below), with Wrap = sender and Unwrap = receiver.
+// A future stronger client (plan §13.5) implements the same
 // BrowserCryptoProvider contract over its own primitives; it does not get a
 // configurable crypto API here.
 //
@@ -88,6 +88,57 @@ func HPKEUnwrap(recipientPriv, enc, info, aad, ct []byte) ([]byte, error) {
 	opener, err := receiver.Setup(enc)
 	if err != nil {
 		return nil, fmt.Errorf("e2ee: hpke open setup: %w", err)
+	}
+	return opener.Open(ct, aad)
+}
+
+// HPKEWrapAuth seals plaintext to the recipient's X25519 public key using
+// HPKE authenticated mode with the fixed suite and the sender's X25519
+// private key. A fresh sender ephemeral is drawn per call. The receiver
+// must pin the sender's public key and use matching info and aad.
+func HPKEWrapAuth(recipientPub, senderPriv, info, aad, plaintext []byte) (enc, ct []byte, err error) {
+	pkR, err := hpke.KEM_X25519_HKDF_SHA256.Scheme().UnmarshalBinaryPublicKey(recipientPub)
+	if err != nil {
+		return nil, nil, fmt.Errorf("e2ee: hpke auth recipient public key: %w", err)
+	}
+	skS, err := hpke.KEM_X25519_HKDF_SHA256.Scheme().UnmarshalBinaryPrivateKey(senderPriv)
+	if err != nil {
+		return nil, nil, fmt.Errorf("e2ee: hpke auth sender private key: %w", err)
+	}
+	sender, err := hpkeSuite.NewSender(pkR, info)
+	if err != nil {
+		return nil, nil, fmt.Errorf("e2ee: hpke auth sender: %w", err)
+	}
+	enc, sealer, err := sender.SetupAuth(rand.Reader, skS)
+	if err != nil {
+		return nil, nil, fmt.Errorf("e2ee: hpke auth setup: %w", err)
+	}
+	ct, err = sealer.Seal(plaintext, aad)
+	if err != nil {
+		return nil, nil, fmt.Errorf("e2ee: hpke auth seal: %w", err)
+	}
+	return enc, ct, nil
+}
+
+// HPKEUnwrapAuth opens an HPKE authenticated-mode sealed value with the
+// recipient's X25519 private key and the pinned sender's X25519 public key.
+// The sender public key, info, and aad must match HPKEWrapAuth's inputs.
+func HPKEUnwrapAuth(recipientPriv, senderPub, enc, info, aad, ct []byte) ([]byte, error) {
+	skR, err := hpke.KEM_X25519_HKDF_SHA256.Scheme().UnmarshalBinaryPrivateKey(recipientPriv)
+	if err != nil {
+		return nil, fmt.Errorf("e2ee: hpke auth recipient private key: %w", err)
+	}
+	pkS, err := hpke.KEM_X25519_HKDF_SHA256.Scheme().UnmarshalBinaryPublicKey(senderPub)
+	if err != nil {
+		return nil, fmt.Errorf("e2ee: hpke auth sender public key: %w", err)
+	}
+	receiver, err := hpkeSuite.NewReceiver(skR, info)
+	if err != nil {
+		return nil, fmt.Errorf("e2ee: hpke auth receiver: %w", err)
+	}
+	opener, err := receiver.SetupAuth(enc, pkS)
+	if err != nil {
+		return nil, fmt.Errorf("e2ee: hpke auth open setup: %w", err)
 	}
 	return opener.Open(ct, aad)
 }
