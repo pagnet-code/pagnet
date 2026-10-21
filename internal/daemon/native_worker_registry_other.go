@@ -48,6 +48,9 @@ type nativeWorkerGC struct{ Phase string }
 func (*NativeWorkerRegistry) lookupGC(string) (nativeWorkerGC, error) {
 	return nativeWorkerGC{}, errNativeWorkerPlatform
 }
+func (*NativeWorkerRegistry) ordinarySourceDrainAdmission(string) error {
+	return errNativeWorkerPlatform
+}
 
 func (*NativeWorkerRegistry) LookupRecovery(string) (NativeWorkerRecovery, error) {
 	return NativeWorkerRecovery{}, errNativeWorkerPlatform

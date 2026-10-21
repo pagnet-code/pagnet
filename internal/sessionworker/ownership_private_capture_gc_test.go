@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestRetirementCollectsOnlyQuiescedPrivateUnboundCapture(t *testing.T) {
+func TestRetirementKeepsNativeCapturesWithoutStoppedProof(t *testing.T) {
 	for _, variant := range []string{"private", "live-reader", "supported", "accepted-turn"} {
 		t.Run(variant, func(t *testing.T) {
 			j, _ := testJournal(t)
@@ -55,20 +55,11 @@ func TestRetirementCollectsOnlyQuiescedPrivateUnboundCapture(t *testing.T) {
 			}
 			owned.State = "retired"
 			err = j.CommitOwnershipRetirement(t.Context(), l, owned)
-			if variant == "private" {
-				if err != nil {
-					t.Fatal("closed private native capture blocks retirement", err)
-				}
-				if n := sourceCount(t, j, "worker_observations"); n != 0 {
-					t.Fatal("private capture leaks", n)
-				}
-			} else {
-				if !errors.Is(err, ErrConflict) {
-					t.Fatal("unproven live/supported/accepted evidence erased", err)
-				}
-				if n := sourceCount(t, j, "worker_observations"); n != 1 {
-					t.Fatal("failed retirement deleted evidence", n)
-				}
+			if !errors.Is(err, ErrConflict) {
+				t.Fatal("native capture retired without stopped proof", err)
+			}
+			if n := sourceCount(t, j, "worker_observations"); n != 1 {
+				t.Fatal("failed retirement deleted evidence", n)
 			}
 		})
 	}

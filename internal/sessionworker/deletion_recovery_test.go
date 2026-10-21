@@ -192,6 +192,31 @@ func TestDeletionRecoveryMaterializedRequiresExactStoppedReceipt(t *testing.T) {
 	if err != nil || floor != 2 || unstarted != nil {
 		t.Fatal("settled materialized deletion blocked", floor, err)
 	}
+	if err = recovery.RetireDispatches(t.Context(), floor); err != nil {
+		t.Fatal(err)
+	}
+	if sourceCount(t, recovery.journal, "worker_stopped_receipts") != 1 {
+		t.Fatal("dispatch floor lost latest stop witness")
+	}
+	// Crash after backend floor/pruning and before local ownership retirement.
+	if err = recovery.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err = OpenDeletionRecovery(t.Context(), f.dir, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovery.Close()
+	if _, _, err = recovery.Prepare(t.Context(), owned, proof); err != nil {
+		t.Fatal("reopened stop proof lost", err)
+	}
+	owned.State, owned.LastDispatchSequence, owned.RetiredFloor, owned.DeletionProof = "retired", floor, floor, proof
+	if err = recovery.CommitRetirement(t.Context(), owned); err != nil {
+		t.Fatal(err)
+	}
+	if sourceCount(t, recovery.journal, "worker_stopped_receipts") != 0 || sourceCount(t, recovery.journal, "worker_source_registration") != 0 {
+		t.Fatal("ownership retirement retained stop witness")
+	}
 }
 
 func TestExistingJournalRejectsEmptyHistory(t *testing.T) {

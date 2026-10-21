@@ -16,6 +16,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/crypto"
+	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -122,6 +123,9 @@ func (d *Daemon) nativeConfiguration(row *InstanceRow, scope sessionworker.Scope
 	}
 	if !filepath.IsAbs(binary) {
 		return sessionworker.NativeSpec{}, fmt.Errorf("runtime executable unavailable")
+	}
+	if err := agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv, env), row.Workspace); err != nil {
+		return sessionworker.NativeSpec{}, err
 	}
 	_, standing, err := d.writeStandingDocument(row)
 	if err != nil {
@@ -249,10 +253,6 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 	if existing, err := d.nativeWorkerFor(conn, record.Scope.InstanceID); err == nil && existing.scope == record.Scope {
 		return nil
 	}
-	ownership, err := connection.RegisterNativeWorkerOwnership(d.turnCtx, record.Scope, record.Spec, record.Profile, record.OriginalOwnershipID)
-	if err != nil {
-		return err
-	}
 	env := append([]string(nil), d.RuntimeEnv...)
 	if record.Profile != "" {
 		profile := d.runtimeProfiles[record.Profile]
@@ -261,12 +261,29 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		}
 		env = append(env, profile.config.Environment()...)
 	}
+	current, err := d.nativeRegistry.Lookup(record.Scope.InstanceID)
+	if err != nil {
+		return err
+	}
+	if current.LaunchState == "reserved" {
+		if err := agentruntime.PreflightExecutable(current.Spec.Binary, agentruntime.ChildEnv(env), current.Spec.Workspace); err != nil {
+			return err
+		}
+	}
+	ownership, err := connection.RegisterNativeWorkerOwnership(d.turnCtx, record.Scope, record.Spec, record.Profile, record.OriginalOwnershipID)
+	if err != nil {
+		return err
+	}
 	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.composedSideportSocket()); err != nil {
 		return err
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)
 	if err != nil {
 		return err
+	}
+	// Consult the durable marker on every ordinary drain, including reconnects.
+	proxy.ordinarySourceAdmission = func() error {
+		return d.nativeRegistry.ordinarySourceDrainAdmission(record.Scope.InstanceID)
 	}
 	if err = proxy.BindOwnership(d.turnCtx, *ownership); err != nil {
 		_ = proxy.Close()

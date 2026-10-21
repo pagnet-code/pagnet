@@ -112,3 +112,31 @@ func TestNativeProfileDriverKeysAndStateContainment(t *testing.T) {
 		t.Fatal("profile granted daemon state")
 	}
 }
+
+func TestRuntimeProfileAvailabilityUsesEffectivePathAndRescans(t *testing.T) {
+	d := newTestDaemon(t)
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "wrapper")
+	if err := os.WriteFile(binary, []byte("#!/usr/bin/env node\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	d.RuntimeEnv = []string{"PATH=" + t.TempDir()}
+	profile := runtimeprofile.Profile{Name: "custom", Runtime: domain.RuntimeQwenCode, Executable: binary, Env: map[string]string{"PATH": dir}}
+	if err := runtimeprofile.Save(filepath.Join(d.StateDir, runtimeprofile.Filename), runtimeprofile.File{Version: 1, Profiles: []runtimeprofile.Profile{profile}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.loadRuntimeProfiles(); err != nil {
+		t.Fatal(err)
+	}
+	loaded := d.runtimeProfiles[profile.Name]
+	driver := loaded.driver
+	if d.profileAvailable(loaded) || d.detectRuntimeProfiles()[0].Available {
+		t.Fatal("profile with missing interpreter advertised available")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "node"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if !d.profileAvailable(loaded) || !d.detectRuntimeProfiles()[0].Available || loaded.driver != driver {
+		t.Fatal("profile PATH repair did not restore original driver availability")
+	}
+}

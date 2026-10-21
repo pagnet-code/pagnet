@@ -40,7 +40,8 @@ func TestDetectRuntimes_UsesAdapterBinaryResolution(t *testing.T) {
 	// the assertion environment-dependent.
 	d.sessions = session.NewManager()
 	out := d.detectRuntimes()
-	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != "stub" {
+	wantPath, _ := (stubAdapter{}).BinaryPath()
+	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != wantPath {
 		t.Fatalf("detectRuntimes = %+v, want one qwen-code entry with the adapter-resolved path", out)
 	}
 }
@@ -136,10 +137,13 @@ func (stubAdapter) Name() domain.RuntimeName { return domain.RuntimeFake }
 func (stubAdapter) StartTurn(context.Context, agentruntime.TurnSpec, chan agentruntime.TurnEvent) error {
 	return nil
 }
-func (stubAdapter) Stop(string) error          { return nil }
-func (stubAdapter) Available() bool            { return true }
-func (stubAdapter) BinaryPath() (string, bool) { return "stub", true }
-func (stubAdapter) PID(string) *int            { return nil }
+func (stubAdapter) Stop(string) error { return nil }
+func (stubAdapter) Available() bool   { return true }
+func (stubAdapter) BinaryPath() (string, bool) {
+	path, err := os.Executable()
+	return path, err == nil
+}
+func (stubAdapter) PID(string) *int { return nil }
 func (stubAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
 }

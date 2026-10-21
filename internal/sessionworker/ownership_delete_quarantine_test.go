@@ -34,7 +34,7 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 				t.Fatal(err)
 			}
 			// This is an older activation of the same original worker lifetime.
-			origin := transport.NativeObservationOrigin{ID: domain.NewID().String(), HostID: j.scope.HostID, InstanceID: j.scope.InstanceID, Runtime: owned.Runtime, NativeGeneration: "old-activation"}
+			origin := transport.NativeObservationOrigin{ID: domain.NewID().String(), TenantID: j.scope.TenantID, HostID: j.scope.HostID, InstanceID: j.scope.InstanceID, Runtime: owned.Runtime, NativeGeneration: "old-activation"}
 			raw, _ := json.Marshal(origin)
 			producer, err := j.registerNativeSource(t.Context(), origin.NativeGeneration, raw)
 			if err != nil {
@@ -43,6 +43,7 @@ func TestExplicitDeletionCollectsOnlyAuthenticQuiescedQuarantine(t *testing.T) {
 			observation := NativeObservation{ID: domain.NewID().String(), Origin: raw, NativeGeneration: origin.NativeGeneration, NativeSessionID: "original-session", ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventBusy}}
 			if variant == "original-stopped" {
 				observation.Event.Type = session.EventSessionStopped
+				observation.Event.SessionID = observation.NativeSessionID
 			}
 			observation.SourceDigest, _ = observationDigest(observation)
 			if err = j.journalCapturedObservation(t.Context(), producer, observation, nil); err != nil {

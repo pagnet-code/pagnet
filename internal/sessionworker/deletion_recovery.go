@@ -164,13 +164,21 @@ func (r *DeletionRecovery) CommitRetirement(ctx context.Context, proof transport
 }
 
 func (r *DeletionRecovery) validateStoppedProof(ctx context.Context, proof *transport.NativeOwnershipDeletionProof) error {
+	return r.journal.validateStoppedProofQuery(ctx, r.journal.db, proof)
+}
+
+type stoppedProofQuery interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (j *Journal) validateStoppedProofQuery(ctx context.Context, query stoppedProofQuery, proof *transport.NativeOwnershipDeletionProof) error {
 	var raw []byte
-	err := r.journal.db.QueryRowContext(ctx, `SELECT payload FROM worker_stopped_receipts WHERE observation_id=?`, proof.StoppedObservationID).Scan(&raw)
+	err := query.QueryRowContext(ctx, `SELECT payload FROM worker_stopped_receipts WHERE observation_id=?`, proof.StoppedObservationID).Scan(&raw)
 	var e stoppedReceipt
 	if errors.Is(err, sql.ErrNoRows) {
 		var payload, receipt []byte
 		var sequence int64
-		err = r.journal.db.QueryRowContext(ctx, `SELECT o.payload,d.receipt,s.source_sequence FROM worker_observations o JOIN worker_source_dispositions d ON d.observation_id=o.id JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.id=?`, proof.StoppedObservationID).Scan(&payload, &receipt, &sequence)
+		err = query.QueryRowContext(ctx, `SELECT o.payload,d.receipt,s.source_sequence FROM worker_observations o JOIN worker_source_dispositions d ON d.observation_id=o.id JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.id=?`, proof.StoppedObservationID).Scan(&payload, &receipt, &sequence)
 		if err != nil {
 			return err
 		}
@@ -183,7 +191,7 @@ func (r *DeletionRecovery) validateStoppedProof(ctx context.Context, proof *tran
 	} else if json.Unmarshal(raw, &e) != nil {
 		return ErrConflict
 	}
-	if validateStoppedReceipt(r.journal.scope, e) != nil {
+	if validateStoppedReceipt(j.scope, e) != nil || e.Observation.ID != proof.StoppedObservationID {
 		return ErrConflict
 	}
 	wire, err := NativeBackendObservation(e.Observation)

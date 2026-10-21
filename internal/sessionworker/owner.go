@@ -808,6 +808,21 @@ type ownedDriver struct {
 
 func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
 	o := d.owner
+	var prepared *nativeSourceProducer
+	defer func() {
+		if prepared == nil {
+			return
+		}
+		o.mu.Lock()
+		registered := o.generation == prepared.generation && o.nativeObserverRegistered
+		o.mu.Unlock()
+		// Once attached, the reader's EOF callback owns quiescence.
+		if !registered {
+			if err := o.journal.retireNativeSource(context.Background(), prepared); err != nil {
+				o.failPersistence(err)
+			}
+		}
+	}()
 	activationCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	o.mu.Lock()
@@ -857,6 +872,12 @@ func (d *ownedDriver) Activate(ctx context.Context, sess *session.RuntimeSession
 		}
 		if err != nil {
 			return nil, err
+		}
+		if !o.journal.isLocal() {
+			prepared, err = o.journal.registerNativeSourceActivation(ctx, generation, origin, true)
+			if err != nil {
+				return nil, err
+			}
 		}
 		o.mu.Lock()
 		o.generation = generation

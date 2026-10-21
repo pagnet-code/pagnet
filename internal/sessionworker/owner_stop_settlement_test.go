@@ -149,8 +149,45 @@ func TestOwnerStoppedDeleteProofLostReplyReopenAndQuarantine(t *testing.T) {
 			if err = j.RetireDispatches(t.Context(), f.lease, 2); err != nil {
 				t.Fatal(err)
 			}
-			if sourceCount(t, j, "worker_owner_stop_settlements") != 0 || sourceCount(t, j, "worker_stopped_receipts") != 0 {
-				t.Fatal("settled deletion retained lifetime evidence")
+			if sourceCount(t, j, "worker_owner_stop_settlements") != 0 || sourceCount(t, j, "worker_stopped_receipts") != 1 || sourceCount(t, j, "worker_source_registration") != 1 {
+				t.Fatal("dispatch retirement lost original stop witness")
+			}
+			var ownershipRaw string
+			if err = j.db.QueryRow(`SELECT ownership FROM worker_dispatch_meta`).Scan(&ownershipRaw); err != nil {
+				t.Fatal(err)
+			}
+			var retired transport.NativeWorkerOwnership
+			if err = json.Unmarshal([]byte(ownershipRaw), &retired); err != nil {
+				t.Fatal(err)
+			}
+			retired.State, retired.LastDispatchSequence, retired.RetiredFloor, retired.DeletionProof = "retired", 2, 2, p
+			bad := retired
+			badProof := *p
+			badProof.StoppedDigest = "foreign"
+			bad.DeletionProof = &badProof
+			if err = j.CommitOwnershipRetirement(t.Context(), f.lease, bad); err == nil {
+				t.Fatal("foreign stopped proof retired original worker")
+			}
+			if _, err = j.db.Exec(`CREATE TRIGGER fail_retirement BEFORE INSERT ON worker_ownership_retirement BEGIN SELECT RAISE(ABORT,'rollback retirement'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err = j.CommitOwnershipRetirement(t.Context(), f.lease, retired); err == nil {
+				t.Fatal("failed retirement acknowledged")
+			}
+			if sourceCount(t, j, "worker_stopped_receipts") != 1 || sourceCount(t, j, "worker_source_registration") != 1 {
+				t.Fatal("failed retirement lost witness")
+			}
+			if _, err = j.db.Exec(`DROP TRIGGER fail_retirement`); err != nil {
+				t.Fatal(err)
+			}
+			if err = j.CommitOwnershipRetirement(t.Context(), f.lease, retired); err != nil {
+				t.Fatal(err)
+			}
+			if err = j.CommitOwnershipRetirement(t.Context(), f.lease, retired); err != nil {
+				t.Fatal("retirement receipt replay failed", err)
+			}
+			if sourceCount(t, j, "worker_stopped_receipts") != 0 || sourceCount(t, j, "worker_source_registration") != 0 || sourceCount(t, j, "worker_source_stream") != 0 {
+				t.Fatal("retired worker retained source evidence")
 			}
 		})
 	}

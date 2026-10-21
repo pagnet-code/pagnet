@@ -27,7 +27,9 @@ type NativeWorkerProxy struct {
 	confirmedMu                         sync.Mutex
 	confirmedGeneration, confirmedStart string
 	confirmedAt                         time.Time
-	sourceMu                            sync.Mutex
+	sourceOnce                          sync.Once
+	sourceGate                          chan struct{}
+	ordinarySourceAdmission             func() error
 	sourceCursor                        int64
 	cancellationCursor                  int64
 	deletionSourceCursor                int64
@@ -93,7 +95,10 @@ func (p *NativeWorkerProxy) call(ctx context.Context, request sessionworker.Requ
 	}
 	response, err := p.controller.Call(ctx, request)
 	if err != nil {
-		_ = p.Close()
+		// A call canceled before serialization has not touched the connection.
+		if !errors.Is(err, sessionworker.ErrControllerCallNotStarted) {
+			_ = p.Close()
+		}
 		return sessionworker.Response{}, err
 	}
 	if response.Error != "" {
@@ -110,12 +115,52 @@ func (p *NativeWorkerProxy) call(ctx context.Context, request sessionworker.Requ
 	return response, nil
 }
 
+// acquireSourceLane waits without consuming the deletion execution budget.
+func (p *NativeWorkerProxy) acquireSourceLane(ctx context.Context) error {
+	p.sourceOnce.Do(func() { p.sourceGate = make(chan struct{}, 1) })
+	select {
+	case p.sourceGate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			p.releaseSourceLane()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.done:
+		return ErrNativeOriginAdmissionDeferred
+	}
+}
+
+func (p *NativeWorkerProxy) releaseSourceLane() { <-p.sourceGate }
+
+func (p *NativeWorkerProxy) beginDeletion(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	if err := p.acquireSourceLane(ctx); err != nil {
+		return nil, nil, err
+	}
+	execution, cancel := context.WithTimeout(ctx, 2*time.Second)
+	var once sync.Once
+	return execution, func() {
+		once.Do(func() {
+			cancel()
+			p.releaseSourceLane()
+		})
+	}, nil
+}
+
 // DrainSources keeps the authenticated journal scan cursor for this proxy's
 // lifetime. An error retains the returned cursor, so a later page never makes
 // an unsupported prefix starve valid evidence behind it.
 func (p *NativeWorkerProxy) DrainSources(ctx context.Context) error {
-	p.sourceMu.Lock()
-	defer p.sourceMu.Unlock()
+	if err := p.acquireSourceLane(ctx); err != nil {
+		return err
+	}
+	defer p.releaseSourceLane()
+	if p.ordinarySourceAdmission != nil {
+		if err := p.ordinarySourceAdmission(); err != nil {
+			return err
+		}
+	}
 	next, err := p.connection.DrainNativeWorkerSourcesPage(ctx, p.SourceCall, p.sourceCursor)
 	p.sourceCursor = next
 	return err
@@ -124,8 +169,14 @@ func (p *NativeWorkerProxy) DrainSources(ctx context.Context) error {
 // DrainDeletionSources is available only to an authenticated typed Forget job.
 // Its independent cursor cannot alter ordinary source publication authority.
 func (p *NativeWorkerProxy) DrainDeletionSources(ctx context.Context, jobID string) error {
-	p.sourceMu.Lock()
-	defer p.sourceMu.Unlock()
+	if err := p.acquireSourceLane(ctx); err != nil {
+		return err
+	}
+	defer p.releaseSourceLane()
+	return p.drainDeletionSources(ctx, jobID)
+}
+
+func (p *NativeWorkerProxy) drainDeletionSources(ctx context.Context, jobID string) error {
 	if p.deletionSourceJob != jobID {
 		p.deletionSourceCursor = 0
 		p.deletionSourceJob = jobID

@@ -201,3 +201,78 @@ func TestAuthenticatedControllerReplacementReleasesConnectionSlots(t *testing.T)
 		t.Fatal(err)
 	}
 }
+
+func TestControllerQueuedCancellationPreservesConnection(t *testing.T) {
+	for _, mode := range []string{"canceled", "expired"} {
+		t.Run(mode, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			defer server.Close()
+			controller := &Controller{conn: client}
+			controller.mu.Lock()
+			ctx, cancel := context.WithCancel(t.Context())
+			if mode == "expired" {
+				cancel()
+				ctx, cancel = context.WithTimeout(t.Context(), time.Millisecond)
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, err := controller.Call(ctx, Request{Type: "canceled"})
+				result <- err
+			}()
+			if mode == "expired" {
+				<-ctx.Done()
+			} else {
+				cancel()
+			}
+			defer cancel()
+			controller.mu.Unlock()
+			if err := <-result; !errors.Is(err, ErrControllerCallNotStarted) || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+				t.Fatal(err)
+			}
+			serverResult := make(chan error, 1)
+			go func() {
+				var req Request
+				if err := readFrame(server, &req); err != nil {
+					serverResult <- err
+					return
+				}
+				if req.Type != "snapshot" {
+					serverResult <- errors.New("canceled request reached wire")
+					return
+				}
+				serverResult <- writeFrame(server, Response{})
+			}()
+			valid, stop := context.WithTimeout(t.Context(), time.Second)
+			defer stop()
+			if _, err := controller.Call(valid, Request{Type: "snapshot"}); err != nil {
+				t.Fatal("later valid call failed", err)
+			}
+			if err := <-serverResult; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestControllerPartialRPCTimeoutClosesConnection(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	controller := &Controller{conn: client}
+	read := make(chan error, 1)
+	go func() {
+		var req Request
+		read <- readFrame(server, &req)
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := controller.Call(ctx, Request{Type: "snapshot"}); err == nil || errors.Is(err, ErrControllerCallNotStarted) {
+		t.Fatal("partial RPC returned an unsent result", err)
+	}
+	if err := <-read; err != nil {
+		t.Fatal("request was not sent", err)
+	}
+	if _, err := server.Write([]byte{0}); err == nil {
+		t.Fatal("partial RPC left connection open")
+	}
+}

@@ -47,11 +47,11 @@ func RuntimeInventory(ctx context.Context, profilePath string) ([]RuntimeChoice,
 	rows := make([]RuntimeChoice, 0, len(drivers)+len(configured.Profiles))
 	for _, d := range drivers {
 		path, available := d.driver.BinaryPath()
-		rows = append(rows, RuntimeChoice{Runtime: d.runtime, Available: available, Executable: path})
+		rows = append(rows, RuntimeChoice{Runtime: d.runtime, Available: available && agentruntime.PreflightExecutable(path, agentruntime.ChildEnv(), "") == nil, Executable: path})
 	}
 	for _, p := range configured.Profiles {
 		path, available := p.ResolvedExecutable()
-		rows = append(rows, RuntimeChoice{Name: p.Name, Runtime: p.Runtime, Available: available, Executable: path, Profile: p})
+		rows = append(rows, RuntimeChoice{Name: p.Name, Runtime: p.Runtime, Available: available && agentruntime.PreflightExecutable(path, agentruntime.ChildEnv(p.Environment()), "") == nil, Executable: path, Profile: p})
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Runtime != rows[j].Runtime {

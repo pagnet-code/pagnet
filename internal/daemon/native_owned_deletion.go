@@ -42,19 +42,36 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(d.turnCtx, 2*time.Second)
+	// Queue behind any in-flight ordinary drain before starting the bounded
+	// deletion execution. The durable marker fences subsequent ordinary drains.
+	var proxy *NativeWorkerProxy
+	var proxyErr error
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if gc.Phase == "waiting" {
+		stage = "worker_link"
+		proxy, proxyErr = d.nativeWorkerFor(conn, p.InstanceID)
+		if proxyErr == nil {
+			stage = "source_lane"
+			if ctx, cancel, err = proxy.beginDeletion(d.turnCtx); err != nil {
+				return errors.Join(ErrDeferred, err)
+			}
+		}
+	}
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(d.turnCtx, 2*time.Second)
+	}
 	defer cancel()
 	if gc.Phase == "waiting" {
 		stage = "worker_link"
-		proxy, err := d.nativeWorkerFor(conn, p.InstanceID)
-		if err != nil {
+		if proxyErr != nil {
 			gc, err = d.recoverNativeDeletion(ctx, connection, record, gc, p)
 			if err != nil {
 				return errors.Join(ErrDeferred, err)
 			}
 		} else {
 			stage = "source_drain"
-			if err = proxy.DrainDeletionSources(ctx, p.DeleteRequestID); err != nil {
+			if err = proxy.drainDeletionSources(ctx, p.DeleteRequestID); err != nil {
 				return errors.Join(ErrDeferred, err)
 			}
 			d.nativeWorkersMu.Lock()

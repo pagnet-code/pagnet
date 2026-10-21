@@ -75,6 +75,9 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		return errors.New("native worker launch identity conflict")
 	}
 	if current.LaunchState == "reserved" {
+		if err := agentruntime.PreflightExecutable(current.Spec.Binary, pairs, current.Spec.Workspace); err != nil {
+			return err
+		}
 		err = r.prepare(current)
 		if err != nil {
 			return err

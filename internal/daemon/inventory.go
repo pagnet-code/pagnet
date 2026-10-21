@@ -114,7 +114,7 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 	reported := make(map[domain.RuntimeName]bool, len(d.adapters))
 	out := make([]transport.RuntimeInstallation, 0, len(d.adapters))
 	for name, a := range d.adapters {
-		if p, ok := a.BinaryPath(); ok {
+		if p, ok := a.BinaryPath(); ok && agentruntime.PreflightExecutable(p, agentruntime.ChildEnv(d.RuntimeEnv), "") == nil {
 			reported[name] = true
 			ri := transport.RuntimeInstallation{
 				Runtime: string(name),
@@ -160,7 +160,7 @@ func (d *Daemon) detectRuntimes() []transport.RuntimeInstallation {
 				continue
 			}
 			p, ok := bp.BinaryPath()
-			if !ok {
+			if !ok || agentruntime.PreflightExecutable(p, agentruntime.ChildEnv(d.RuntimeEnv), "") != nil {
 				continue
 			}
 			ri := transport.RuntimeInstallation{

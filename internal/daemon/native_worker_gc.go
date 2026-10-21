@@ -83,6 +83,19 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 	}
 	return existing, nil
 }
+
+// A persisted deletion fences ordinary publication through every proxy lease.
+func (r *NativeWorkerRegistry) ordinarySourceDrainAdmission(id string) error {
+	_, err := r.lookupGC(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return ErrNativeOriginAdmissionDeferred
+}
+
 func (r *NativeWorkerRegistry) lookupGC(id string) (nativeWorkerGC, error) {
 	var raw []byte
 	var gc nativeWorkerGC
