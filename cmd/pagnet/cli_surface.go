@@ -513,9 +513,10 @@ func doctorCmd() *cobra.Command {
 				return errors.New("no control plane URL")
 			}
 
-			// 1. Server reachable?
+			// 1. Server reachable? Use the public API route available through
+			// hosted ingress as well as on self-hosted control planes.
 			client := netpolicy.NewHTTPClient(5*time.Second, insecureRemoteHTTP)
-			resp, err := client.Get(server + "/healthz")
+			resp, err := client.Get(server + "/api/v1/auth/setup/status")
 			if err != nil {
 				check("server reachable", false, fmt.Sprintf("%s: %v", server, err))
 				fmt.Println("\ndiagnosis failed: the control plane is unreachable")
