@@ -1,6 +1,8 @@
 # Cross-account sharing and usage budgets
 
-Status: design proposal. This document defines intended product behavior and coordinated release gates. Cross-account invitations, isolated direct shares, restricted external execution and durable usage enforcement are proposed work, not integrated product guarantees today.
+Status: v1 is implemented in coordinated client, server and web changes, pending compatible release and activation. V1 supports a dedicated pair of SDK service principals with bilateral human owner consent, isolated encrypted direct `ASK`/`REPLY`, six aggregate limits and an owner-visible usage snapshot. Explicit SDK enrollment and durable message reservations are implemented; automatic event-driven enrollment and delivery recovery remain pending release work and must not be assumed available.
+
+The broader design below remains future work: sharing managed agents, approved actions/capabilities, multiparty shared networks and owner-enforced host execution profiles. Implementation status is not a claim that these changes are deployed. The v1 setup below describes the implemented contract; later requirements describe the target behavior unless explicitly identified as v1.
 
 ## Model and existing evidence
 
@@ -15,9 +17,42 @@ The repository already supplies the following foundations:
 - [Private owner contexts](OWNER_CONTENT_CONTEXTS.md) protect personal representative permission details independently of network membership. [Bridge process binding](BRIDGE_PROCESS_BINDING.md) documents kernel process authentication and the separate filesystem boundary.
 - [Federation transport](../fabric/federation/README.md) provides tested cryptographic components and explicitly identifies missing product integration. It is not evidence of a deployed entry-door service.
 
-The current API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP create limiter of 120 requests per minute. That limiter is process-local; it is not durable multi-replica admission or a per-principal, per-grant or per-network usage policy. Neither control supplies the sharing budgets proposed below.
+The general API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP create limiter of 120 requests per minute. That limiter is process-local; it is not durable multi-replica admission or a per-principal, per-grant or per-network usage policy. Neither general control supplies sharing budgets. V1 additionally enforces its six accepted pair limits through aggregate durable admission; the broader directional, owner/project and runtime budgets below remain future requirements.
 
-## Two sharing actions and tenant membership
+## Edu–Conti v1 setup (coordinated release pending)
+
+1. Each owner creates or selects their own SDK **service** principal and runs its SDK endpoint with its own credential and durable state directory (`sdk.Connect(ctx, sdk.ConfigFromEnv())`). Do not use a managed representative or reuse a private multiparty network. Conti gives Edu the service address `pagnet-share:v1:<Conti tenant UUID>:<Conti service UUID>` through a trusted channel; verify the peer and, before enrollment, compare identity fingerprints through that channel if required. Directory pins alone trust the server on first contact.
+2. As the issuing account administrator, Edu opens **Settings → Sharing** (`/settings/sharing`), selects Edu's owned service, enters Conti's address and chooses expiry and all six limits. The UI calls `POST /api/v1/sharing-proposals`, atomically creating a dedicated network and invitation. The equivalent request body is below; keep the same `requestId` and body for retries. These example limits match the current UI defaults, not a measured safe workload preset.
+
+   ```json
+   {
+     "requestId": "<new UUID>",
+     "issuerPrincipalId": "<Edu service UUID>",
+     "recipientTenantId": "<Conti tenant UUID>",
+     "recipientPrincipalId": "<Conti service UUID>",
+     "slug": "edu-conti",
+     "name": "Edu–Conti SDK chat",
+     "description": "Dedicated direct SDK conversation",
+     "permissions": ["communicate"],
+     "limits": {
+       "maxMessageWireBytes": 16384,
+       "maxMessagesPerMinute": 6,
+       "maxMessagesPerDay": 100,
+       "maxWireBytesPerDay": 1048576,
+       "maxInFlight": 1,
+       "maxTurnsPerThread": 8
+     }
+   }
+   ```
+
+3. Conti reviews the incoming invitation in Settings → Sharing and chooses **Accept consent only**. The API is `POST /api/v1/sharing-invitations/{invitationId}/accept` with `{"expectedVersion":1}`, authenticated as the recipient human owner (or the required organization administrator). Edu's proposal records issuer consent; Conti's acceptance records recipient consent. Neither operation alone delivers keys or enables messaging. The current UI deliberately says **Sharing is not yet active**.
+4. On each connected SDK endpoint, call `client.ListSharingPairs(ctx, cursor)` (follow its returned cursor) to find the grant, then `client.EnrollSharingPair(ctx, grantID)`. Inspect the returned fingerprints and `Pending` status. Both endpoints must complete their key/proof steps before the pair is active. At this committed documentation baseline, a pending result requires a later explicit call; reconnecting or accepting in the UI must not be described as automatically enrolling or delivering messages. Event-driven reconciliation is pending coordinated release and verification.
+5. The coordinated SDK messaging phase provides `PrepareSharingMessage(ctx, SharingMessageRequest{GrantID: grantID, Parts: parts})`, then `SendPreparedSharingMessage(ctx, prepared)` for an encrypted ASK. The peer uses `ReceiveSharingMessages(ctx, grantID, handler)`; a response is prepared with the received message as `ReplyTo`, preserving correlation and consuming the same aggregate limits. Reuse the durable prepared message after an ambiguous send; use `GetSharingMessageReceipt` and `UnresolvedSharingMessages` for recovery. These APIs and automatic recovery require the matching client/server release and verification before use; the generic network `Send` or capability invocation is not a substitute for pair admission.
+6. Either owner can inspect `GET /api/v1/sharing-invitations/{invitationId}/usage` in the usage view: accepted limits, minute/day reset times, counts/bytes, in-flight reservations and lifetime totals. End participation with the invitation's revoke control (`POST /api/v1/sharing-invitations/{invitationId}/revoke`, `{"expectedVersion":1}`), subject to that owner's authorization. Revocation stops future admission; it cannot erase previously received plaintext or keys.
+
+The server pair message contract is `POST /api/v1/sharing-pairs/{grantId}/messages`, with authenticated inbox, acknowledgement and receipt endpoints under the same grant. It accepts encrypted `ASK`/`REPLY` only, not actions, capability invocations or arbitrary host execution. A pair marked active establishes key readiness; it is not evidence that the coordinated messaging/recovery release is deployed.
+
+## Future sharing actions and tenant membership
 
 **Share an agent** invites a named, verified recipient principal and its owner to chat with an agent, use selected approved actions, or both. Both principal owners must accept the recipient, scope, expiry and limits before activation. Messages require chat permission, not a capability. Actions additionally require the selected capability revisions, validated inputs, destination policy and any owner approval. Public discovery is not an anonymous grant.
 
@@ -27,7 +62,7 @@ A direct share that promises isolation needs a separate cryptographic and conten
 
 **Tenant membership** is appropriate when a person should participate in organization administration and resources under its roles. It is broader than sharing an agent and is not required for independently owned agents to collaborate.
 
-## Edu–Conti example and bilateral rights
+## Future Edu–Conti example and bilateral rights
 
 Edu and Conti own separate accounts, tenants, private networks, representatives and hosts. Conti selects **Share an agent**, verifies Edu's recipient identity and chooses chat, `review_proposal`, or both, with an expiry and usage limits. Edu accepts for Edu's named principal. An isolated direct share uses its own content scope; it grants no access to Conti's private network epoch keys, participant inventory, hosts or filesystem. Conti's agent may release only information and results permitted by Conti's external execution profile.
 
@@ -38,6 +73,8 @@ Each grant records issuer and accepting owners, verified peer principals and ten
 For joint project work, Edu and Conti can instead create a dedicated shared network owned by one tenant, explicitly admit project agents and agree on permissions, key exposure and history before enrollment. Memberships need not have equal administration or reciprocal actions. If both people need equal control over admission and policy, a dedicated project tenant can own the network with both as administrators. Each account still owns its agents and hosts; this governance flow also needs implementation before it can be promised.
 
 ## Exactly twenty use cases
+
+These cases retain the broader product design. Cases 01–03, 05, 07–13 and 16–19 are **future-only as described**: v1 does not execute review/calendar/submission actions, connect managed representatives or create multiparty project networks. Case 06 can use v1 only as direct SDK chat; submission actions remain future. Case 20 covers v1 direct-share revocation, with multiparty membership/history behavior still future. Cases 04, 14 and 15 describe existing relationship types, not new v1 sharing features.
 
 | ID | Situation | Appropriate relationship |
 | --- | --- | --- |
@@ -64,7 +101,7 @@ For joint project work, Edu and Conti can instead create a dedicated shared netw
 
 ## Ten representative decisions
 
-“Tenant” below means adding the foreign person to the owning tenant, not changing principal ownership. Recommendations assume the circumstances in the use-case table.
+“Tenant” below means adding the foreign person to the owning tenant, not changing principal ownership. Recommendations assume the circumstances in the use-case table and carry the same future-only labels; this is a design comparison, not a list of v1 controls.
 
 | Case | Tenant membership | Shared network | Share an agent | Recommendation |
 | --- | --- | --- | --- | --- |
@@ -89,7 +126,7 @@ Seeing a public principal, discovering a filtered catalog, or holding `discover`
 
 For this sharing design, foreign membership and agent sharing never confer host enrollment, launch, attach, stop, workspace browsing, path selection, or arbitrary filesystem access. Only the resource owner or an explicitly authorized existing administrative path can authorize host actions; personal representative launch retains the same-owner personal-host requirement evidenced by [its regression test](../../pagnet-server/internal/controlplane/representative_personal_host_test.go). This is not a claim that all current host APIs are owner-only: [host access code](../../pagnet-server/internal/controlplane/api_hosts.go) also has tenant administrator rules.
 
-Every external conversation or action must run under an owner-enforced restricted execution profile. The owner provisions its worker and approved workspace in advance and explicitly bounds tools, readable data, writable paths, memory retrieval and persistence, outbound destinations, model/runtime access and approved effects. Chat alone can trigger model tool use or memory disclosure, so a chat permission is not sufficient execution containment. A request may select a validated business resource ID, not an arbitrary host path or shell command. Server authorization must bind the selected principal, host, workspace and operation to the owner's policy; the daemon must independently enforce the local workspace allowlist, canonical path and symlink containment, and runtime sandbox before effects. Missing enforcement must fail closed. Network `operate` cannot bypass these resource checks.
+Future managed-agent conversations and actions must run under an owner-enforced restricted execution profile. V1 hostless SDK chat admits encrypted messages between two service endpoints and grants no managed runtime, host tool or workspace authority; activation of that mode does not require a daemon/runtime sandbox. An SDK application remains responsible for any processing it chooses to perform. A future mode that offers managed execution must enforce the following profile before activation. The owner provisions its worker and approved workspace in advance and explicitly bounds tools, readable data, writable paths, memory retrieval and persistence, outbound destinations, model/runtime access and approved effects. Chat alone can trigger model tool use or memory disclosure, so a chat permission is not sufficient execution containment. A request may select a validated business resource ID, not an arbitrary host path or shell command. Server authorization must bind the selected principal, host, workspace and operation to the owner's policy; the daemon must independently enforce the local workspace allowlist, canonical path and symlink containment, and runtime sandbox before effects. Missing enforcement must fail closed. Network `operate` cannot bypass these resource checks.
 
 Bridge process binding proves which local process called; it does not prove that a requested file is allowed. Current Linux Landlock requirements and the documented lack of equivalent macOS filesystem isolation must remain visible. The current macOS `allow_all` profile cannot enforce this restricted external execution profile today and must not host externally triggered execution under this proposal. Unsupported platforms or runtimes must reject activation or execution until equivalent containment is verified. Do not claim portable filesystem containment or approve an untrusted sharing workload on the strength of a nonce, process ancestry, or server path validation alone.
 
@@ -109,7 +146,11 @@ Proposed share revocation must stop new admission, invalidate cached grants and 
 
 Network revocation must deny future authorized traffic and enrollment, close applicable sessions, and rotate epochs when excluding a key holder from future content. It cannot revoke retained keys, plaintext or downloaded ciphertext. New membership must not automatically grant historical epoch keys; historical access needs an explicit owner decision and supported enrollment policy. Leaving and rejoining must not silently restore earlier grants or history access. Preserve audit metadata about issuer, caller, scope, revisions, admission, result and revocation without logging protected payloads. Lost old keys can make old content unreadable; rotation is not recovery.
 
-## Sharing and usage controls are one plan
+## V1 usage contract and future usage controls
+
+V1 accepts exactly six limits: `maxMessageWireBytes`, `maxMessagesPerMinute`, `maxMessagesPerDay`, `maxWireBytesPerDay`, `maxInFlight` and `maxTurnsPerThread`. These apply to aggregate pair traffic, including admitted replies; they are not six independent allowances per sender. The usage endpoint provides the current counters, in-flight reservations and reset times for that invitation. Wire bytes are the canonical serialized pair request, including its encrypted envelope and bound metadata, not plaintext, model tokens or provider spend. V1 is not a hard monetary cap, a general owner/project budget or a promise of separate uploaded/delivered fan-out quotas.
+
+The remaining controls in this section are the broader target requirements; do not infer that v1 implements every rate/burst, queue, directional byte, execution-time or runtime policy described here.
 
 ### Measurement and policy
 
@@ -135,20 +176,20 @@ Owners may add provider token/spend limits where the runtime or provider supplie
 
 Usage UI and audit records reveal metadata: peer and owner identifiers, scope/grant IDs, timestamps, directions, envelope sizes, counts, delivery state, policy revisions and blocked reasons. Keep this disclosure alongside encryption claims, with retention and access rules. Store no plaintext, prompts, tool inputs, memory or protected results in quota logs. Aggregated views and denials must not reveal another participant's private activity or remaining budgets to an unauthorized peer.
 
-## Frontend requirements
+## Future frontend requirements
 
 The primary flow is one **Share an agent** dialog: verified named recipient and owning account, chat initiation choice, approved actions, expiry and a finite usage preset. Show the agent's restricted execution profile and expose detailed directional byte/count/rate/burst/concurrency/turn/runtime limits under advanced controls. The acceptance view must show the same effective policy and distinguish chat replies, mutual chat initiation and reciprocal action rights. Editing or increasing authority requires the affected owners' acceptance; no unchecked default may silently grant `operate` or all permissions.
 
 **Create shared network** must disclose its single accountable owner, participants, common epoch key/content boundary, selected permissions, history access, membership expiry and aggregate budgets before either owner accepts enrollment. Explain that a direct isolated conversation needs a separate scope; do not promise pairwise privacy inside this common epoch. Equal project administration needs the separate tenant governance flow.
 
-Owners need usage and remaining-budget views with units, windows, pending reservations and freshness; pause/revoke controls; invitation and policy status; and concrete blocked reasons such as expired grant, unsupported execution profile, byte cap, rate limit or exhausted runtime allowance. Peers receive only reasons they are authorized to see. Clients must handle retries, reconnects and ambiguous admission through the durable operation status API. Until enforcement passes the release gates, frontend descriptions must label this functionality **proposed**. No sharing control, preset, invitation acceptance or budget promise may ship before the matching server and host enforcement is enabled and verified.
+Owners need usage and remaining-budget views with units, windows, pending reservations and freshness; pause/revoke controls; invitation and policy status; and concrete blocked reasons such as expired grant, unsupported execution profile, byte cap, rate limit or exhausted runtime allowance. Peers receive only reasons they are authorized to see. Clients must handle retries, reconnects and ambiguous admission through the durable operation status API. Future controls must remain labeled **proposed** until their corresponding release gates pass. V1 may expose its SDK-pair invitation, acceptance and usage controls against the matching server and SDK contract. Host enforcement is a release dependency for managed-agent/action execution, not for hostless SDK chat.
 
 ## Coordinated delivery and release gates
 
-All gates are required for each offered sharing mode. Deployment may stage components with activation disabled; a frontend feature flag alone is not an authorization boundary.
+Apply these gates to the authority each offered mode provides. V1 hostless SDK chat requires compatible server, SDK and web contracts, consent, isolated key enrollment, aggregate admission and recovery verification. It does not require host runtime containment, action capability contracts or multiparty enrollment. Those are additional gates for future managed-agent/action/shared-network modes. Deployment may stage components with activation disabled; a frontend feature flag alone is not an authorization boundary.
 
 1. **Backend contracts and migration.** Version consent/grant, scope/key enrollment, execution-profile and usage schemas; define exact accounting units, aggregation identities, limits, retry retention and lifecycle/status contracts. Ship durable atomic admission, dedupe, queue fencing, reservations, counters, policy invalidation, expiry and revocation first. Migrate existing memberships by preserving their recorded authority and marking them for explicit review; do not reinterpret all-eight defaults as accepted external shares or silently enroll foreign principals into isolated scopes. Backfill ownership, scope and audit references, reconcile counters/reservations with durable admitted work, and quarantine ambiguous records until owners reconfirm. Existing shared epoch data cannot become pairwise private by migration. Test rollback compatibility; never roll back to admission that ignores active grants or budget reservations.
-2. **Client and host enforcement.** Release compatible daemon/runtime support for authenticated origin, causal roots, scoped keys, exact envelope accounting, durable retry IDs, status recovery and independently enforced restricted profiles. Test real platform tool/data/memory/destination isolation, child execution, concurrency, turn/time termination, revoked queued work and effects. The current macOS `allow_all` path fails this gate. Backend negotiation must reject unsupported client/runtime versions and profiles rather than downgrade enforcement. Install and reconcile runtime policy before a share becomes executable; reconnecting older clients cannot bypass it.
-3. **Web and acceptance flow.** Release the Share dialog, shared-network disclosure, both-owner acceptance, usage/status views and pause/revoke only against the versioned backend contract and a compatible enforced host profile. Verify that displayed presets equal effective server/runtime limits and that changed scope/limits cannot race acceptance. A pending invitation sends no traffic or keys. Web, CLI and API calls must face the same checks; hiding a button does not secure an endpoint.
-4. **Cross-component proof before activation.** Pass end-to-end tests across backend, client/daemon/runtime and web for Edu–Conti chat without capabilities, bounded one-way replies, mutual chat with no reciprocal action grant, independently accepted reverse actions, isolated two-principal scope, shared-network epoch disclosure, independent ownership, denied host control and Telegram account binding. Also test concurrent aggregate exhaustion, oversized ciphertext, fan-out and both byte directions, rate/burst, response reserve exhaustion, loop/runtime stops, duplicate retries, conflicting digests, crash/restart reconciliation, expiry/revocation before effects, historical-key policy and stale/unsupported clients. Confirm logs and blocked reasons contain only permitted metadata. Activation requires all three repositories' compatible releases and these tests; federation fixtures alone do not satisfy it.
+2. **Client and host enforcement.** For v1, verify SDK identity/key enrollment, encrypted ASK/REPLY admission, durable retry IDs and recovery. For future managed execution, release compatible daemon/runtime support for authenticated origin, causal roots, scoped keys, exact envelope accounting, durable retry IDs, status recovery and independently enforced restricted profiles. Test real platform tool/data/memory/destination isolation, child execution, concurrency, turn/time termination, revoked queued work and effects. The current macOS `allow_all` path fails this gate. Backend negotiation must reject unsupported client/runtime versions and profiles rather than downgrade enforcement. Install and reconcile runtime policy before a share becomes executable; reconnecting older clients cannot bypass it.
+3. **Web and acceptance flow.** Release the Share dialog, shared-network disclosure, both-owner acceptance, usage/status views and pause/revoke only against the versioned backend contract; managed-agent/action controls additionally require a compatible enforced host profile. Verify that displayed presets equal effective server/runtime limits and that changed scope/limits cannot race acceptance. A pending invitation sends no traffic or keys. Web, CLI and API calls must face the same checks; hiding a button does not secure an endpoint.
+4. **Cross-component proof before activation.** For v1, prove bilateral owner consent, isolated two-service-principal enrollment, encrypted ASK/REPLY, all six aggregate limits, usage, retries, expiry/revocation and compatible SDK recovery across backend, SDK and web. Automatic event-driven recovery remains pending release work. For the future modes, additionally pass end-to-end tests across backend, client/daemon/runtime and web for Edu–Conti chat without capabilities, bounded one-way replies, mutual chat with no reciprocal action grant, independently accepted reverse actions, isolated two-principal scope, shared-network epoch disclosure, independent ownership, denied host control and Telegram account binding. Also test concurrent aggregate exhaustion, oversized ciphertext, fan-out and both byte directions, rate/burst, response reserve exhaustion, loop/runtime stops, duplicate retries, conflicting digests, crash/restart reconciliation, expiry/revocation before effects, historical-key policy and stale/unsupported clients. Confirm logs and blocked reasons contain only permitted metadata. Activation requires all three repositories' compatible releases and the tests applicable to the offered mode; federation fixtures alone do not satisfy it.
 5. **Controlled activation and continuing reconciliation.** Enable only verified platform/runtime/mode combinations after schema migration, accounting reconciliation and owner acceptance. Record deployed backend/client/web contract versions, monitor admission-versus-usage drift, and automatically stop affected admissions on inconsistent counters or policy. Exercise pause/revoke, epoch rotation and crash recovery operationally. Expand actions, discovery and platforms only after their corresponding gates pass. Independently owner-verified enrollment remains separate cryptographic trust work.
