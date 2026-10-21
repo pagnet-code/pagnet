@@ -13,12 +13,27 @@ import (
 // ErrExecutableUnavailable deliberately omits executable paths and environment.
 var ErrExecutableUnavailable = errors.New("runtime executable or interpreter unavailable")
 
+// ErrExecutableWorkspaceRequired means interpreter resolution depends on the
+// eventual launch working directory. Admission must defer to the exact check.
+var ErrExecutableWorkspaceRequired = errors.New("runtime interpreter requires launch workspace")
+
 // PreflightExecutable checks a resolved executable and its shebang interpreters
 // without executing code. env must be the effective runtime launch environment.
 // workdir is the launch working directory; empty uses the controller working
 // directory, as inventory and doctor do before a workspace has been selected.
 // Inspection is bounded, including interpreter chains and the first line read.
 func PreflightExecutable(binary string, env []string, workdir string) error {
+	return preflightExecutableEnvironment(binary, env, workdir, true)
+}
+
+// PreflightExecutableBeforeWorkspace checks workspace-independent requirements.
+// A relative interpreter lookup returns ErrExecutableWorkspaceRequired rather
+// than treating the controller working directory as the launch workspace.
+func PreflightExecutableBeforeWorkspace(binary string, env []string) error {
+	return preflightExecutableEnvironment(binary, env, "", false)
+}
+
+func preflightExecutableEnvironment(binary string, env []string, workdir string, workspaceKnown bool) error {
 	workdir, err := filepath.Abs(workdir)
 	if err != nil {
 		return ErrExecutableUnavailable
@@ -33,10 +48,10 @@ func PreflightExecutable(binary string, env []string, workdir string) error {
 			break
 		}
 	}
-	return preflightExecutable(binary, searchPath, workdir, 0)
+	return preflightExecutable(binary, searchPath, workdir, 0, workspaceKnown)
 }
 
-func preflightExecutable(binary, searchPath, workdir string, depth int) error {
+func preflightExecutable(binary, searchPath, workdir string, depth int, workspaceKnown bool) error {
 	if depth >= 4 {
 		return ErrExecutableUnavailable
 	}
@@ -64,7 +79,7 @@ func preflightExecutable(binary, searchPath, workdir string, depth int) error {
 	if len(fields) == 0 || !filepath.IsAbs(fields[0]) {
 		return ErrExecutableUnavailable
 	}
-	if err := preflightExecutable(fields[0], searchPath, workdir, depth+1); err != nil {
+	if err := preflightExecutable(fields[0], searchPath, workdir, depth+1, workspaceKnown); err != nil {
 		return err
 	}
 	if filepath.Base(fields[0]) != "env" {
@@ -89,9 +104,12 @@ func preflightExecutable(binary, searchPath, workdir string, depth int) error {
 	interpreter := args[0]
 	if strings.ContainsRune(interpreter, os.PathSeparator) {
 		if !filepath.IsAbs(interpreter) {
+			if !workspaceKnown {
+				return ErrExecutableWorkspaceRequired
+			}
 			interpreter = filepath.Join(workdir, interpreter)
 		}
-		return preflightExecutable(interpreter, searchPath, workdir, depth+1)
+		return preflightExecutable(interpreter, searchPath, workdir, depth+1, workspaceKnown)
 	}
 	dirs := filepath.SplitList(searchPath)
 	if searchPath == "" {
@@ -99,12 +117,15 @@ func preflightExecutable(binary, searchPath, workdir string, depth int) error {
 	}
 	for _, dir := range dirs {
 		if !filepath.IsAbs(dir) {
+			if !workspaceKnown {
+				return ErrExecutableWorkspaceRequired
+			}
 			dir = filepath.Join(workdir, dir)
 		}
 		candidate := filepath.Join(dir, interpreter)
 		info, err := os.Stat(candidate)
 		if err == nil && info.Mode().IsRegular() && (goruntime.GOOS == "windows" || info.Mode().Perm()&0111 != 0) {
-			return preflightExecutable(candidate, searchPath, workdir, depth+1)
+			return preflightExecutable(candidate, searchPath, workdir, depth+1, workspaceKnown)
 		}
 	}
 	return ErrExecutableUnavailable

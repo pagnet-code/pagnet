@@ -116,11 +116,15 @@ func (d *Daemon) loadRuntimeProfiles() error {
 	return nil
 }
 func (d *Daemon) profileAvailable(p *loadedRuntimeProfile) bool {
+	return d.profileAvailableAt(p, "", false)
+}
+
+func (d *Daemon) profileAvailableAt(p *loadedRuntimeProfile, workdir string, beforeWorkspace bool) bool {
 	if p == nil {
 		return false
 	}
 	binary, available := p.config.ResolvedExecutable()
-	if !available || agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv, p.config.Environment()), "") != nil {
+	if !available || !executableAvailableAt(binary, agentruntime.ChildEnv(d.RuntimeEnv, p.config.Environment()), workdir, beforeWorkspace) {
 		return false
 	}
 	if p.adapter != nil {
@@ -162,6 +166,14 @@ func (d *Daemon) sessionRuntimeFor(row *InstanceRow) domain.RuntimeName {
 	return domain.RuntimeName(row.Runtime)
 }
 func (d *Daemon) checkRuntimeProfile(row *InstanceRow, pin bool) error {
+	return d.validateRuntimeProfile(row, pin, true)
+}
+
+func (d *Daemon) checkRuntimeProfileBeforeWorkspace(row *InstanceRow) error {
+	return d.validateRuntimeProfile(row, true, false)
+}
+
+func (d *Daemon) validateRuntimeProfile(row *InstanceRow, allowUnpinned, writePin bool) error {
 	if row.Profile == "" {
 		return nil
 	}
@@ -169,7 +181,7 @@ func (d *Daemon) checkRuntimeProfile(row *InstanceRow, pin bool) error {
 	if p == nil || string(p.config.Runtime) != row.Runtime {
 		return fmt.Errorf("runtime profile %q is not configured for this runtime", row.Profile)
 	}
-	if !d.profileAvailable(p) {
+	if !d.profileAvailableAt(p, row.Workspace, row.Workspace == "") {
 		return fmt.Errorf("runtime profile %q executable or interpreter unavailable on this host", row.Profile)
 	}
 	digest := p.config.Digest()
@@ -178,10 +190,12 @@ func (d *Daemon) checkRuntimeProfile(row *InstanceRow, pin bool) error {
 		return fmt.Errorf("runtime profile %q changed; start a fresh instance instead of resuming with another configuration", row.Profile)
 	}
 	if !found {
-		if !pin || row.SessionID != "" {
+		if !allowUnpinned || row.SessionID != "" {
 			return fmt.Errorf("runtime profile %q has no verified session configuration; start a fresh instance", row.Profile)
 		}
-		return d.state.KVSet("runtime-profile:"+row.InstanceID, digest)
+		if writePin {
+			return d.state.KVSet("runtime-profile:"+row.InstanceID, digest)
+		}
 	}
 	return nil
 }

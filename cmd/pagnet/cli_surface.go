@@ -600,7 +600,7 @@ func doctorCmd() *cobra.Command {
 				check("git installed", true, "found")
 			}
 			for _, tool := range []string{"qwen", "claude", "docker"} {
-				info(tool+" installed", doctorToolStatus(tool))
+				info(tool+" installed (local configured environment)", doctorToolStatus(tool, cfg.RuntimeEnv))
 			}
 
 			// 7. Allowed roots resolvable?
@@ -623,12 +623,12 @@ func doctorCmd() *cobra.Command {
 }
 
 // doctorToolStatus shares the launch preflight without invoking the tool.
-func doctorToolStatus(tool string) string {
+func doctorToolStatus(tool string, runtimeEnv []string) string {
 	path, err := exec.LookPath(tool)
 	if err != nil {
 		return "not found (only needed for that runtime)"
 	}
-	if err := agentruntime.PreflightExecutable(path, agentruntime.ChildEnv(), ""); err != nil {
+	if err := agentruntime.PreflightExecutable(path, agentruntime.ChildEnv(runtimeEnv), ""); err != nil {
 		return err.Error()
 	}
 	return "found"

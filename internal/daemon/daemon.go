@@ -2472,7 +2472,7 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 			return nil, "", false, fmt.Errorf("runtime profile %q belongs to a different runtime", p.Profile)
 		}
 		rn = profile.config.Runtime
-		if err := d.checkRuntimeProfile(&InstanceRow{InstanceID: p.InstanceID, Runtime: string(rn), Profile: p.Profile}, true); err != nil {
+		if err := d.checkRuntimeProfileBeforeWorkspace(&InstanceRow{InstanceID: p.InstanceID, Runtime: string(rn), Profile: p.Profile}); err != nil {
 			return nil, "", false, err
 		}
 	}
@@ -2488,7 +2488,7 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 			domain.RuntimeQwenCode, domain.RuntimeClaudeCode, domain.RuntimeOpenCode,
 			domain.RuntimeCodex, domain.RuntimeGrok,
 		} {
-			if d.runtimeAvailable(name) {
+			if d.runtimeAvailableAt(name, "", true) {
 				rn = name
 				break
 			}
@@ -2508,7 +2508,7 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 	if !d.runtimeSupported(rn) {
 		return nil, "", false, fmt.Errorf("runtime %q not supported on this host", p.Runtime)
 	}
-	if p.Profile == "" && !d.runtimeAvailable(rn) {
+	if p.Profile == "" && !d.runtimeAvailableAt(rn, "", true) {
 		// Fail the launch now, not at the first turn: a host without the
 		// runtime CLI must not ack a clean launch and idle until work
 		// arrives.
@@ -2519,9 +2519,10 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 		access = domain.AccessReadWrite
 	}
 	var (
-		wsPath   string
-		lock     *sync.Mutex
-		worktree bool
+		wsPath          string
+		lock            *sync.Mutex
+		worktree        bool
+		createdWorktree string
 	)
 	if p.WorkspacePath == "" {
 		// Representative (§37/§72): no git workspace; an pagnet-managed
@@ -2545,6 +2546,18 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 		// §29: a second read/write agent on the same repository is
 		// isolated into an automatic git worktree (fail clearly if that
 		// is unsafe).
+		// Under the repository lock, record absence of this instance's exact
+		// managed path. Only that proof permits cleanup after failed preflight;
+		// a replay may reuse a worktree containing existing work.
+		absentManagedWorktree := ""
+		if access == domain.AccessReadWrite {
+			if common, err := d.repoCommonDir(p.WorkspacePath); err == nil && filepath.Base(common) == ".git" {
+				candidate := filepath.Join(filepath.Dir(common), ".pagnet", "worktrees", p.InstanceID)
+				if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+					absentManagedWorktree = candidate
+				}
+			}
+		}
 		var err error
 		wsPath, err = d.resolveWorkspace(p, access)
 		if err != nil {
@@ -2552,6 +2565,9 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 			return nil, "", false, err
 		}
 		worktree = wsPath != p.WorkspacePath
+		if worktree && wsPath == absentManagedWorktree {
+			createdWorktree = wsPath
+		}
 		// CWD override: run the agent in a subdirectory of the workspace
 		// (it sees only from there forward). The subdir is applied relative
 		// to the resolved checkout, so it stays correct when the checkout
@@ -2584,6 +2600,25 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 		Model:            p.Model,
 		Instruction:      p.AgentMD,
 		AgentPrincipalID: p.AgentPrincipalID,
+	}
+	// Interpreter lookup now has the exact runtime working directory. Admit
+	// workspace-dependent PATH entries before writing standing state or pinning
+	// a profile, and fail without registering an unusable instance.
+	var preflightErr error
+	if row.Profile != "" {
+		preflightErr = d.checkRuntimeProfile(&row, true)
+	} else if !d.runtimeAvailableAt(rn, wsPath, false) {
+		preflightErr = agentruntime.ErrExecutableUnavailable
+	}
+	if preflightErr != nil {
+		if createdWorktree != "" {
+			// git worktree remove refuses dirty state; never force cleanup.
+			d.removeWorktree(&InstanceRow{Workspace: createdWorktree})
+		}
+		if lock != nil {
+			lock.Unlock()
+		}
+		return nil, "", false, preflightErr
 	}
 	// The ONE managed standing document (the pagnet overlay + the
 	// operator's standing instruction when set): materialized in the
@@ -2748,19 +2783,22 @@ func (d *Daemon) runtimeSupported(rn domain.RuntimeName) bool {
 // process-per-turn runtime via its adapter's availability check, a
 // session-driven runtime (qwen-code, fake-persistent) via its driver. A
 // session driver without an availability check is assumed available.
-// Relative PATH entries are evaluated in the daemon working directory here;
-// early launch admission is conservative until nativeConfiguration and the
-// reserved-worker launch check evaluate the exact runtime workspace.
+// Inventory evaluates relative PATH entries in the daemon working directory.
+// Launch admission defers workspace-dependent resolution until wsPath is known.
 func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
+	return d.runtimeAvailableAt(rn, "", false)
+}
+
+func (d *Daemon) runtimeAvailableAt(rn domain.RuntimeName, workdir string, beforeWorkspace bool) bool {
 	if ad, ok := d.adapters[rn]; ok {
 		binary, available := ad.BinaryPath()
-		return available && agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv), "") == nil
+		return available && executableAvailableAt(binary, agentruntime.ChildEnv(d.RuntimeEnv), workdir, beforeWorkspace)
 	}
 	if d.sessions != nil {
 		if drv := d.sessions.DriverFor(rn); drv != nil {
 			if bp, ok := drv.(interface{ BinaryPath() (string, bool) }); ok {
 				binary, available := bp.BinaryPath()
-				return available && agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv), "") == nil
+				return available && executableAvailableAt(binary, agentruntime.ChildEnv(d.RuntimeEnv), workdir, beforeWorkspace)
 			}
 			if available, ok := drv.(interface{ Available() bool }); ok {
 				return available.Available()
@@ -2769,6 +2807,14 @@ func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 		}
 	}
 	return false
+}
+
+func executableAvailableAt(binary string, env []string, workdir string, beforeWorkspace bool) bool {
+	if beforeWorkspace {
+		err := agentruntime.PreflightExecutableBeforeWorkspace(binary, env)
+		return err == nil || errors.Is(err, agentruntime.ErrExecutableWorkspaceRequired)
+	}
+	return agentruntime.PreflightExecutable(binary, env, workdir) == nil
 }
 
 func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {

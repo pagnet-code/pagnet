@@ -105,3 +105,24 @@ func TestExecutablePreflightEnvSplitStringSupportsOnlySimpleWords(t *testing.T) 
 		}
 	}
 }
+
+func TestExecutablePreflightBeforeWorkspaceDefersOnlyRelativeLookup(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "wrapper")
+	for _, searchPath := range []string{"bin", "", "missing:"} {
+		if err := os.WriteFile(binary, []byte("#!/usr/bin/env node\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := PreflightExecutableBeforeWorkspace(binary, []string{"PATH=" + searchPath}); err != ErrExecutableWorkspaceRequired {
+			t.Fatalf("relative PATH %q should defer: %v", searchPath, err)
+		}
+		for _, shebang := range []string{"#!" + filepath.Join(dir, "missing"), "#!/usr/bin/env " + filepath.Join(dir, "missing")} {
+			if err := os.WriteFile(binary, []byte(shebang+"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := PreflightExecutableBeforeWorkspace(binary, []string{"PATH=" + searchPath}); err != ErrExecutableUnavailable {
+				t.Fatalf("absolute missing interpreter deferred: %v", err)
+			}
+		}
+	}
+}
