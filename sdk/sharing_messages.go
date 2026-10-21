@@ -145,6 +145,8 @@ func sharingMessageError(err error, headers http.Header) error {
 	return err
 }
 
+var errSharingConnectionProofRequired = errors.New("sdk: sharing pair requires proof on the current connection")
+
 type sharingMessageSession struct {
 	status              SharingPairStatus
 	principal, endpoint string
@@ -214,7 +216,7 @@ func (c *Client) sharingMessageSession(ctx context.Context, grant string) (shari
 	ready := c.sharingReady[status.NetworkID] > 0 && c.sharingReady[status.NetworkID] == s.connection
 	c.cryptoMu.Unlock()
 	if !ready || !s.current(c) {
-		return s, errors.New("sdk: sharing pair requires proof on the current connection")
+		return s, errSharingConnectionProofRequired
 	}
 	p, err := c.kr.loadPendingPairEpoch(grant, uint64(status.Generation))
 	if err != nil {

@@ -119,6 +119,10 @@ type Client struct {
 	sharingReady      map[string]int64
 	pendingChallenges map[string]EndpointCryptoChallengePayload
 
+	// Opt-in pair reconciliation has one worker across connections.
+	sharingMu          sync.Mutex
+	sharingCoordinator *sharingCoordinator
+
 	// cached identity (tenant id for AADs, memberships for agents)
 	identityMu sync.Mutex
 	identity   *Identity
@@ -273,6 +277,7 @@ func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	c.stopSharingCoordinator()
 	close(c.closeCh)
 	c.finish(nil)
 	c.connMu.Lock()
@@ -323,6 +328,7 @@ func (c *Client) finish(err error) {
 		c.terminalErr = err
 		c.terminalMu.Unlock()
 		close(c.terminalCh)
+		c.stopSharingCoordinator()
 	})
 }
 
@@ -889,6 +895,7 @@ func (c *Client) connectOnce() error {
 	// Wait for the session to end.
 	<-pc.dead
 	c.connected.Store(false)
+	c.sharingPairDisconnected(c.connGeneration.Load())
 	c.connMu.Lock()
 	if c.cur == pc {
 		c.cur = nil
@@ -998,6 +1005,7 @@ func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 // subscriptions (server is the source of truth) and re-send invocation
 // results whose send failed on the dead session.
 func (c *Client) onLive() {
+	c.sharingPairLive()
 	c.flushPendingResults()
 	c.participantMu.Lock()
 	services := make([]*Service, len(c.services))
