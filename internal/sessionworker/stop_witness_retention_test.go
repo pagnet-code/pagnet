@@ -5,9 +5,11 @@ package sessionworker
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -231,5 +233,122 @@ func TestOwnedActivationBindsDispatchBeforeDriverExecution(t *testing.T) {
 	}
 	if sourceCount(t, j, "worker_source_registration") != 1 {
 		t.Fatal("rejected retirement lost failed activation evidence")
+	}
+}
+
+func TestReopenRejectsActivationProofFromOlderGenerationBeforeReceiptGC(t *testing.T) {
+	for _, corruption := range []string{"older-proof", "sequence-only"} {
+		t.Run(corruption, func(t *testing.T) {
+			j, dir := testJournal(t)
+			l := lease(t, j)
+			owned := dispatchOwnership(t, j, l)
+			var oldProof []byte
+			var latest NativeObservation
+			for n := int64(1); n <= 3; n++ {
+				proof := dispatchProof(owned, n)
+				admission := &Admission{Scope: j.scope, NativeAdmissionID: proof.SourceAdmissionID, RunnerID: proof.SourceRunnerID, RunnerEpoch: proof.SourceRunnerEpoch, BootID: proof.SourceBootID}
+				out, _, err := j.admitDispatch(t.Context(), l, 0, proof.SourceCommandID, "activate", json.RawMessage(`{}`), func() (*Admission, error) { return admission, nil }, &proof)
+				if err != nil {
+					t.Fatal(err)
+				}
+				generation := fmt.Sprintf("original-generation-%d", n)
+				origin := transport.NativeObservationOrigin{ID: domain.NewID().String(), TenantID: j.scope.TenantID, HostID: j.scope.HostID, InstanceID: j.scope.InstanceID, Runtime: owned.Runtime, NativeGeneration: generation, CommandID: proof.SourceCommandID, NativeAdmissionID: proof.SourceAdmissionID, RunnerID: proof.SourceRunnerID, RunnerEpoch: proof.SourceRunnerEpoch, BootID: proof.SourceBootID, CreatedAt: time.Now().UTC()}
+				raw, _ := json.Marshal(origin)
+				producer, err := j.registerNativeSourceActivation(t.Context(), generation, raw, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				observation := NativeObservation{ID: domain.NewID().String(), NativeGeneration: generation, NativeSessionID: "session-" + generation, Origin: raw, ObservedAt: time.Now().UTC(), Event: session.SessionEvent{Type: session.EventSessionStopped, SessionID: "session-" + generation}}
+				observation.SourceDigest, _ = observationDigest(observation)
+				if err = j.journalCapturedObservation(t.Context(), producer, observation, nil); err != nil {
+					t.Fatal(err)
+				}
+				if err = j.Settle(t.Context(), out.Sequence, "completed", nil); err != nil {
+					t.Fatal(err)
+				}
+				if err = j.Acknowledge(t.Context(), l, out.Sequence); err != nil {
+					t.Fatal(err)
+				}
+				if err = j.retireNativeSource(t.Context(), producer); err != nil {
+					t.Fatal(err)
+				}
+				if n == 1 {
+					oldProof, _ = json.Marshal(proof)
+				}
+				if n == 3 {
+					pending, err := j.PendingObservations(t.Context(), 32)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, candidate := range pending {
+						if candidate.ID == observation.ID {
+							latest = candidate
+						}
+					}
+					wire, err := NativeBackendObservation(latest)
+					if err != nil {
+						t.Fatal(err)
+					}
+					receipt := transport.NativeObservationReceiptPayload{ObservationID: latest.ID, OriginID: wire.OriginID, Digest: wire.Digest, Disposition: "committed"}
+					if err = j.acknowledgeObservation(t.Context(), l, latest.ID, latest.SourceDigest, &receipt, nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := j.RetireDispatches(t.Context(), l, 3); err != nil {
+				t.Fatal(err)
+			}
+			if sourceCount(t, j, "worker_dispatches") != 0 || sourceCount(t, j, "worker_intent_admission") != 0 {
+				t.Fatal("fixture retained original dispatch/admission")
+			}
+			if err := j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Original origin bytes keep valid bindings verifiable after dispatch pruning.
+			var err error
+			j, err = OpenJournal(dir, testScope())
+			if err != nil {
+				t.Fatal("valid pruned activation bindings rejected", err)
+			}
+			replacement := oldProof
+			if corruption == "sequence-only" {
+				var raw []byte
+				if err = j.db.QueryRow(`SELECT activation_proof FROM worker_source_registration WHERE native_generation=?`, latest.NativeGeneration).Scan(&raw); err != nil {
+					t.Fatal(err)
+				}
+				var proof transport.NativeDispatchProof
+				if err = json.Unmarshal(raw, &proof); err != nil {
+					t.Fatal(err)
+				}
+				proof.DispatchSequence = 1
+				replacement, err = json.Marshal(proof)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err = j.db.Exec(`UPDATE worker_source_registration SET activation_proof=? WHERE native_generation=?`, replacement, latest.NativeGeneration); err != nil {
+				t.Fatal(err)
+			}
+			if err = j.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenJournal(dir, testScope())
+			if err == nil {
+				reopened.Close()
+				t.Fatal("older generation proof authorized latest receipt reclamation")
+			}
+			db, err := sql.Open("sqlite", filepath.Join(dir, "intents.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var retained int
+			if err = db.QueryRow(`SELECT count(*) FROM worker_stopped_receipts WHERE observation_id=?`, latest.ID).Scan(&retained); err != nil {
+				t.Fatal(err)
+			}
+			if retained != 1 {
+				t.Fatal("rejected activation proof deleted latest stopped receipt")
+			}
+		})
 	}
 }

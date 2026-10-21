@@ -3,6 +3,7 @@ package sessionworker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -41,7 +42,7 @@ func (j *Journal) initializeSourceRetirement() error {
 	if err != nil {
 		return err
 	}
-	hasProof := false
+	hasProof, hasOrigin, hasDigest := false, false, false
 	for columns.Next() {
 		var cid, notNull, pk int
 		var name, typ string
@@ -51,6 +52,8 @@ func (j *Journal) initializeSourceRetirement() error {
 			return err
 		}
 		hasProof = hasProof || name == "activation_proof"
+		hasOrigin = hasOrigin || name == "activation_origin"
+		hasDigest = hasDigest || name == "activation_digest"
 	}
 	err = columns.Err()
 	columns.Close()
@@ -59,6 +62,16 @@ func (j *Journal) initializeSourceRetirement() error {
 	}
 	if !hasProof {
 		if _, err = j.db.Exec(`ALTER TABLE worker_source_registration ADD COLUMN activation_proof BLOB`); err != nil {
+			return err
+		}
+	}
+	if !hasOrigin {
+		if _, err = j.db.Exec(`ALTER TABLE worker_source_registration ADD COLUMN activation_origin BLOB`); err != nil {
+			return err
+		}
+	}
+	if !hasDigest {
+		if _, err = j.db.Exec(`ALTER TABLE worker_source_registration ADD COLUMN activation_digest BLOB`); err != nil {
 			return err
 		}
 	}
@@ -185,9 +198,13 @@ func (j *Journal) registerNativeSourceActivation(ctx context.Context, generation
 			return nil, err
 		}
 	}
+	var bindingDigest []byte
+	if activation != nil {
+		bindingDigest = activationBindingDigest(activation, origin)
+	}
 	// Existing quiesced registrations cannot be revived. A fresh launch uses
 	// ownedDriver's fresh generation and authenticated new original origin.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_registration(origin_id,native_generation,quiesced,activation_proof) VALUES(?,?,0,?)`, p.originID, generation, activation); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_registration(origin_id,native_generation,quiesced,activation_proof,activation_origin,activation_digest) VALUES(?,?,0,?,?,?)`, p.originID, generation, activation, []byte(origin), bindingDigest); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO worker_source_registration_protocol VALUES(1)`); err != nil {
@@ -237,6 +254,9 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 
 func (j *Journal) reclaimSourceStreamsTx(ctx context.Context, tx *sql.Tx, retiring bool) error {
 	var err error
+	if err = j.validateActivationBindingsTx(ctx, tx); err != nil {
+		return err
+	}
 	limit := 32
 	if retiring {
 		limit = maxPendingObservations
@@ -430,4 +450,139 @@ func (j *Journal) activationDispatchProofTx(ctx context.Context, tx *sql.Tx, gen
 		return nil, ErrConflict
 	}
 	return proofRaw, nil
+}
+
+// Reclamation may use dispatch ordering only after checking the proof against
+// the original pre-exec origin, retained dispatch/admission, and source evidence.
+func (j *Journal) validateActivationBindingsTx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT origin_id,native_generation,activation_proof,activation_origin,activation_digest FROM worker_source_registration WHERE activation_proof IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	type binding struct {
+		id, generation        string
+		proof, origin, digest []byte
+	}
+	var bindings []binding
+	for rows.Next() {
+		var b binding
+		if err = rows.Scan(&b.id, &b.generation, &b.proof, &b.origin, &b.digest); err != nil {
+			rows.Close()
+			return err
+		}
+		bindings = append(bindings, b)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || len(bindings) == 0 {
+		return err
+	}
+	var ownership string
+	var last, floor int64
+	if err = tx.QueryRowContext(ctx, `SELECT ownership,last_sequence,retired FROM worker_dispatch_meta WHERE singleton=1`).Scan(&ownership, &last, &floor); err != nil {
+		return err
+	}
+	var owned transport.NativeWorkerOwnership
+	if json.Unmarshal([]byte(ownership), &owned) != nil {
+		return ErrConflict
+	}
+	for _, b := range bindings {
+		if !bytes.Equal(b.digest, activationBindingDigest(b.proof, b.origin)) {
+			return ErrConflict
+		}
+		var proof transport.NativeDispatchProof
+		var origin transport.NativeObservationOrigin
+		if json.Unmarshal(b.proof, &proof) != nil || json.Unmarshal(b.origin, &origin) != nil || origin.ID != b.id || origin.NativeGeneration != b.generation || origin.HostID != j.scope.HostID || origin.InstanceID != j.scope.InstanceID || origin.Runtime != owned.Runtime || origin.CreatedAt.IsZero() || proof.OwnershipID != owned.ID || proof.OwnershipGeneration != j.scope.Generation || proof.DispatchSequence <= 0 || proof.DispatchSequence > last || proof.SourceCommandID != origin.CommandID || proof.SourceAdmissionID != origin.NativeAdmissionID || proof.SourceRunnerID != origin.RunnerID || !proof.SourceRunnerEpoch.Equal(origin.RunnerEpoch) || proof.SourceBootID != origin.BootID {
+			return ErrConflict
+		}
+		var dispatch []byte
+		var command string
+		var operation int64
+		err = tx.QueryRowContext(ctx, `SELECT proof,command_id,operation_sequence FROM worker_dispatches WHERE dispatch_sequence=?`, proof.DispatchSequence).Scan(&dispatch, &command, &operation)
+		if errors.Is(err, sql.ErrNoRows) {
+			if proof.DispatchSequence > floor {
+				return ErrConflict
+			}
+		} else if err != nil {
+			return err
+		} else {
+			var original transport.NativeDispatchProof
+			if json.Unmarshal(dispatch, &original) != nil || !transport.SameNativeDispatchProof(original, proof) || command != origin.CommandID {
+				return ErrConflict
+			}
+			var raw []byte
+			err = tx.QueryRowContext(ctx, `SELECT admission FROM worker_intent_admission WHERE sequence=?`, operation).Scan(&raw)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				var retained bool
+				if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_intent WHERE sequence=?)`, operation).Scan(&retained); err != nil {
+					return err
+				}
+				if retained {
+					return ErrConflict
+				}
+			} else {
+				var admission Admission
+				if json.Unmarshal(raw, &admission) != nil || admission.Scope != j.scope || admission.NativeAdmissionID != proof.SourceAdmissionID || admission.RunnerID != proof.SourceRunnerID || !admission.RunnerEpoch.Equal(proof.SourceRunnerEpoch) || admission.BootID != proof.SourceBootID {
+					return ErrConflict
+				}
+			}
+		}
+		evidence, err := tx.QueryContext(ctx, `SELECT payload,0 FROM worker_observations WHERE json_extract(payload,'$.origin.id')=? OR json_extract(payload,'$.nativeGeneration')=? UNION ALL SELECT payload,1 FROM worker_stopped_receipts WHERE json_extract(payload,'$.observation.origin.id')=? OR native_generation=?`, b.id, b.generation, b.id, b.generation)
+		if err != nil {
+			return err
+		}
+		for evidence.Next() {
+			var raw []byte
+			var receipt bool
+			var observation NativeObservation
+			if err = evidence.Scan(&raw, &receipt); err != nil {
+				evidence.Close()
+				return err
+			}
+			if receipt {
+				var stopped stoppedReceipt
+				if json.Unmarshal(raw, &stopped) != nil || validateStoppedReceipt(j.scope, stopped) != nil {
+					evidence.Close()
+					return ErrConflict
+				}
+				observation = stopped.Observation
+			} else if json.Unmarshal(raw, &observation) != nil {
+				evidence.Close()
+				return ErrConflict
+			}
+			var captured transport.NativeObservationOrigin
+			if observation.NativeGeneration != b.generation || json.Unmarshal(observation.Origin, &captured) != nil || !sameActivationOrigin(origin, captured) {
+				evidence.Close()
+				return ErrConflict
+			}
+		}
+		err = evidence.Err()
+		evidence.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sameActivationOrigin(a, b transport.NativeObservationOrigin) bool {
+	if !a.RunnerEpoch.Equal(b.RunnerEpoch) || !a.CreatedAt.Equal(b.CreatedAt) {
+		return false
+	}
+	a.RunnerEpoch = b.RunnerEpoch
+	a.CreatedAt = b.CreatedAt
+	return a == b
+}
+
+// This independent persisted witness also detects a proof sequence alteration
+// after its original dispatch and admission have legitimately been pruned.
+func activationBindingDigest(proof, origin []byte) []byte {
+	h := sha256.New()
+	h.Write(proof)
+	h.Write([]byte{0})
+	h.Write(origin)
+	return h.Sum(nil)
 }
