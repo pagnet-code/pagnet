@@ -461,17 +461,8 @@ func (c *Client) Unsubscribe(ctx context.Context, networkID, subID string) error
 }
 
 // Send sends a durable message in a network. The parts are encrypted
-// client-side (object type message). Direct ASK/REPLY requests are persisted before
-// sending. On a send error their ID is returned; retry with SendPrepared to reuse
-// the exact request, including after restarting the client.
+// client-side (object type message). Returns the message id.
 func (c *Client) Send(ctx context.Context, m OutgoingMessage) (string, error) {
-	if m.RecipientGroupID == "" && (m.Kind == "" || m.Kind == string(domain.MessageKindAsk) || m.Kind == string(domain.MessageKindReply)) {
-		prepared, err := c.PrepareMessage(ctx, m)
-		if err != nil {
-			return "", err
-		}
-		return c.SendPrepared(ctx, prepared.NetworkID, prepared.ID)
-	}
 	if err := c.checkOpen(); err != nil {
 		return "", err
 	}
