@@ -40,7 +40,8 @@ func TestDetectRuntimes_UsesAdapterBinaryResolution(t *testing.T) {
 	// the assertion environment-dependent.
 	d.sessions = session.NewManager()
 	out := d.detectRuntimes()
-	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != "stub" {
+	wantPath, _ := (stubAdapter{}).BinaryPath()
+	if len(out) != 1 || out[0].Runtime != "qwen-code" || out[0].Path != wantPath {
 		t.Fatalf("detectRuntimes = %+v, want one qwen-code entry with the adapter-resolved path", out)
 	}
 }
