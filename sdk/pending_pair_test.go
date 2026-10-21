@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -128,7 +130,11 @@ func TestPendingPairCorruptOrMissingFailsClosed(t *testing.T) {
 				} else {
 					f.Record.DescriptorHash[0]++
 					payload, _ := json.Marshal(f.Record)
-					f.Checksum = sha256.Sum256(payload)
+					key, keyErr := readPrivatePairFile(filepath.Join(k.root, "pending-pairs", "auth.key"))
+					if keyErr != nil {
+						t.Fatal(keyErr)
+					}
+					f.MAC = pendingPairMAC(key, "record", payload)
 				}
 				b, _ = json.Marshal(f)
 				if err := os.WriteFile(path, b, 0600); err != nil {
@@ -237,5 +243,185 @@ func TestPendingPairActivationKeyConflict(t *testing.T) {
 	got, err := k.EpochKey(p.NetworkID, p.EpochID)
 	if err != nil || got != existing {
 		t.Fatal("existing key changed")
+	}
+}
+
+func TestPendingPairRetrySyncsRenamedRecord(t *testing.T) {
+	k := newTestKeyring(t)
+	p := testPendingPair()
+	bindingDir := k.pendingPairDir(p.GrantID, p.Generation)
+	fault := errors.New("injected directory fsync failure")
+	k.pendingPairSyncDir = func(path string) error {
+		if path == bindingDir {
+			return fault
+		}
+		return syncPairDir(path)
+	}
+	// The file is fsynced and renamed, but its directory sync fails (the same
+	// observable state as a predecessor dying immediately after the rename).
+	if _, err := k.storePendingPairEpoch(p); !errors.Is(err, fault) {
+		t.Fatalf("writer fault: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bindingDir, "record.json")); err != nil {
+		t.Fatal("fault did not occur after rename:", err)
+	}
+	if _, err := k.storePendingPairEpoch(p); !errors.Is(err, fault) {
+		t.Fatalf("retry returned before syncing renamed record: %v", err)
+	}
+	if _, err := k.loadPendingPairEpoch(p.GrantID, p.Generation); !errors.Is(err, fault) {
+		t.Fatalf("load returned before syncing renamed record: %v", err)
+	}
+	k.pendingPairSyncDir = nil
+	if _, err := k.loadPendingPairEpoch(p.GrantID, p.Generation); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPendingPairMissingDirectoryFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	k, _ := newKeyring(dir)
+	p := testPendingPair()
+	if _, err := k.storePendingPairEpoch(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(k.pendingPairDir(p.GrantID, p.Generation)); err != nil {
+		t.Fatal(err)
+	}
+	k, _ = newKeyring(dir)
+	if _, err := k.storePendingPairEpoch(p); err == nil {
+		t.Fatal("regenerated deleted binding directory")
+	}
+	if _, err := k.loadPendingPairEpoch(p.GrantID, p.Generation); err == nil {
+		t.Fatal("loaded deleted binding directory")
+	}
+}
+
+func TestPendingPairMetadataFailsClosed(t *testing.T) {
+	for _, kind := range []string{"missing_key", "missing_index", "rewritten_key", "rewritten_index", "rewritten_record"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			k, _ := newKeyring(dir)
+			p := testPendingPair()
+			if _, err := k.storePendingPairEpoch(p); err != nil {
+				t.Fatal(err)
+			}
+			storeDir := filepath.Join(k.root, "pending-pairs")
+			switch kind {
+			case "missing_key":
+				if err := os.Remove(filepath.Join(storeDir, "auth.key")); err != nil {
+					t.Fatal(err)
+				}
+			case "missing_index":
+				if err := os.Remove(filepath.Join(storeDir, "index.json")); err != nil {
+					t.Fatal(err)
+				}
+			case "rewritten_key":
+				if err := os.WriteFile(filepath.Join(storeDir, "auth.key"), bytes.Repeat([]byte{5}, 32), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "rewritten_index":
+				path := filepath.Join(storeDir, "index.json")
+				b, _ := os.ReadFile(path)
+				var index pendingPairIndex
+				if err := json.Unmarshal(b, &index); err != nil {
+					t.Fatal(err)
+				}
+				index.Bindings = map[string]bool{}
+				b, _ = json.Marshal(index)
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "rewritten_record":
+				path := filepath.Join(k.pendingPairDir(p.GrantID, p.Generation), "record.json")
+				b, _ := os.ReadFile(path)
+				var record pendingPairFile
+				if err := json.Unmarshal(b, &record); err != nil {
+					t.Fatal(err)
+				}
+				record.Record.Descriptor = []byte("rewritten immutable descriptor")
+				record.Record.DescriptorHash = sha256.Sum256(record.Record.Descriptor)
+				// An editor may recompute public hashes, but cannot repair the MAC
+				// without the retained store authentication key.
+				b, _ = json.Marshal(record)
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			k, _ = newKeyring(dir)
+			if _, err := k.storePendingPairEpoch(p); err == nil {
+				t.Fatal("accepted damaged metadata")
+			}
+			if _, err := k.loadPendingPairEpoch(p.GrantID, p.Generation); err == nil {
+				t.Fatal("loaded damaged metadata")
+			}
+			if err := k.activatePendingPairEpoch(p.GrantID, p.Generation, p.NetworkID, p.EpochID, p.DescriptorHash); err == nil {
+				t.Fatal("activated damaged metadata")
+			}
+		})
+	}
+}
+
+func TestPendingPairRejectsPathIdentifiers(t *testing.T) {
+	for _, id := range []string{"", ".", "..", "../other", "a/b", `a\b`, "/tmp", "bad\x00id", "a b", "a\n", "c:other"} {
+		for _, field := range []string{"network", "epoch"} {
+			t.Run(field+"/"+strconv.Quote(id), func(t *testing.T) {
+				k := newTestKeyring(t)
+				p := testPendingPair()
+				if field == "network" {
+					p.NetworkID = id
+				} else {
+					p.EpochID = id
+				}
+				if _, err := k.storePendingPairEpoch(p); err == nil {
+					t.Fatal("accepted invalid path identifier")
+				}
+				if err := k.activatePendingPairEpoch(p.GrantID, p.Generation, p.NetworkID, p.EpochID, p.DescriptorHash); err == nil {
+					t.Fatal("activation accepted invalid path identifier")
+				}
+				if _, err := os.Stat(filepath.Join(k.root, "networks")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid activation created network path: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestPendingPairReservationRenameFaultFailsClosed(t *testing.T) {
+	k := newTestKeyring(t)
+	p := testPendingPair()
+	// Initialize the store before injecting a fault in the reservation update.
+	if _, err := k.loadPendingPairEpoch("unknown", 1); err == nil {
+		t.Fatal("unexpected record")
+	}
+	storeDir := filepath.Join(k.root, "pending-pairs")
+	bindingDir := k.pendingPairDir(p.GrantID, p.Generation)
+	fault := errors.New("injected reservation fsync failure")
+	k.pendingPairSyncDir = func(path string) error {
+		if path == storeDir {
+			b, err := os.ReadFile(filepath.Join(storeDir, "index.json"))
+			if err != nil {
+				return err
+			}
+			var index pendingPairIndex
+			if err := json.Unmarshal(b, &index); err != nil {
+				return err
+			}
+			if index.Bindings[filepath.Base(bindingDir)] {
+				return fault
+			}
+		}
+		return syncPairDir(path)
+	}
+	if _, err := k.storePendingPairEpoch(p); !errors.Is(err, fault) {
+		t.Fatalf("reservation fault: %v", err)
+	}
+	if _, err := os.Stat(bindingDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created child before durable reservation: %v", err)
+	}
+	k.pendingPairSyncDir = nil
+	// A restart can make the renamed reservation durable, but must fail closed
+	// because there is no original key/package to resume.
+	if _, err := k.storePendingPairEpoch(p); err == nil {
+		t.Fatal("regenerated key after interrupted reservation")
 	}
 }

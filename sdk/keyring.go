@@ -45,6 +45,8 @@ const (
 type keyring struct {
 	root string // <StateDir>/principals
 
+	pendingPairSyncDir func(string) error // optional fault injection for pending-store durability tests
+
 	epochMu    sync.Mutex
 	epochLRU   map[string]map[string][32]byte // networkID → (epochID → key)
 	epochOrder []string                       // networkID, front = most recent

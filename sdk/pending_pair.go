@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,15 +29,29 @@ type pendingPairEpoch struct {
 }
 
 type pendingPairFile struct {
-	Record   pendingPairEpoch `json:"record"`
-	Checksum [32]byte         `json:"checksum"`
+	Record pendingPairEpoch `json:"record"`
+	MAC    []byte           `json:"mac"`
 }
 
 func (p pendingPairEpoch) validate() error {
-	if p.GrantID == "" || p.Generation == 0 || p.NetworkID == "" || p.EpochID == "" || filepath.Base(p.NetworkID) != p.NetworkID || p.NetworkID == "." || filepath.Base(p.EpochID) != p.EpochID || p.EpochID == "." || len(p.Descriptor) == 0 || len(p.Descriptor) > 4096 || len(p.EpochKey) != 32 || sha256.Sum256(p.Descriptor) != p.DescriptorHash || p.IssuerFingerprint == ([32]byte{}) || p.RecipientFingerprint == ([32]byte{}) {
+	if p.GrantID == "" || p.Generation == 0 || !validPairPathID(p.NetworkID) || !validPairPathID(p.EpochID) || len(p.Descriptor) == 0 || len(p.Descriptor) > 4096 || len(p.EpochKey) != 32 || sha256.Sum256(p.Descriptor) != p.DescriptorHash || p.IssuerFingerprint == ([32]byte{}) || p.RecipientFingerprint == ([32]byte{}) {
 		return errors.New("sdk: invalid pending pair epoch")
 	}
 	return nil
+}
+
+// These identifiers become path components. Restrict to canonical ASCII tokens;
+// the wire descriptor layer may impose a narrower UUID format.
+func validPairPathID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 func (k *keyring) pendingPairDir(grantID string, generation uint64) string {
@@ -59,8 +74,12 @@ func (k *keyring) storePendingPairEpoch(p pendingPairEpoch) (pendingPairEpoch, e
 	}
 	defer unlock()
 	dir := k.pendingPairDir(p.GrantID, p.Generation)
-	err = os.Mkdir(dir, 0700)
-	if errors.Is(err, os.ErrExist) {
+	index, key, err := k.readPendingPairIndex()
+	if err != nil {
+		return pendingPairEpoch{}, err
+	}
+	binding := filepath.Base(dir)
+	if index[binding] {
 		old, err := k.readPendingPairEpoch(p.GrantID, p.Generation)
 		if err != nil {
 			return pendingPairEpoch{}, err
@@ -70,20 +89,30 @@ func (k *keyring) storePendingPairEpoch(p pendingPairEpoch) (pendingPairEpoch, e
 		}
 		return old, nil
 	}
+	// Reserve the binding durably before creating its child. Missing children
+	// remain failures even when their entire directory has disappeared.
+	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+		return pendingPairEpoch{}, errors.New("sdk: unreserved pending pair directory")
+	}
+	index[binding] = true
+	if err := k.writePendingPairIndex(index, key); err != nil {
+		return pendingPairEpoch{}, err
+	}
+	err = os.Mkdir(dir, 0700)
 	if err != nil {
 		return pendingPairEpoch{}, err
 	}
 	// Persist the directory reservation first; its survival forbids regeneration
 	// if a crash occurs before the complete record is committed.
-	if err := syncPairDir(filepath.Dir(dir)); err != nil {
+	if err := k.syncPendingPairDir(filepath.Dir(dir)); err != nil {
 		return pendingPairEpoch{}, err
 	}
 	payload, _ := json.Marshal(p)
-	encoded, err := json.Marshal(pendingPairFile{Record: p, Checksum: sha256.Sum256(payload)})
+	encoded, err := json.Marshal(pendingPairFile{Record: p, MAC: pendingPairMAC(key, "record", payload)})
 	if err != nil {
 		return pendingPairEpoch{}, err
 	}
-	if err := writePairFileDurable(filepath.Join(dir, "record.json"), encoded); err != nil {
+	if err := k.writePairFileDurable(filepath.Join(dir, "record.json"), encoded); err != nil {
 		return pendingPairEpoch{}, err
 	}
 	return k.readPendingPairEpoch(p.GrantID, p.Generation)
@@ -101,6 +130,13 @@ func (k *keyring) loadPendingPairEpoch(grantID string, generation uint64) (pendi
 
 func (k *keyring) readPendingPairEpoch(grantID string, generation uint64) (pendingPairEpoch, error) {
 	dir := k.pendingPairDir(grantID, generation)
+	index, key, err := k.readPendingPairIndex()
+	if err != nil {
+		return pendingPairEpoch{}, err
+	}
+	if !index[filepath.Base(dir)] {
+		return pendingPairEpoch{}, errors.New("sdk: pending pair binding is not reserved")
+	}
 	info, err := os.Lstat(dir)
 	if err != nil {
 		return pendingPairEpoch{}, err
@@ -125,10 +161,13 @@ func (k *keyring) readPendingPairEpoch(grantID string, generation uint64) (pendi
 		return pendingPairEpoch{}, fmt.Errorf("sdk: corrupt pending pair epoch: %w", err)
 	}
 	payload, _ := json.Marshal(f.Record)
-	if sha256.Sum256(payload) != f.Checksum || f.Record.GrantID != grantID || f.Record.Generation != generation {
+	if !hmac.Equal(pendingPairMAC(key, "record", payload), f.MAC) || f.Record.GrantID != grantID || f.Record.Generation != generation {
 		return pendingPairEpoch{}, errors.New("sdk: corrupt pending pair epoch")
 	}
 	if err := f.Record.validate(); err != nil {
+		return pendingPairEpoch{}, err
+	}
+	if err := k.syncPendingPairDir(dir); err != nil {
 		return pendingPairEpoch{}, err
 	}
 	return f.Record, nil
@@ -139,6 +178,9 @@ func (k *keyring) readPendingPairEpoch(grantID string, generation uint64) (pendi
 // publishing a package or receiving/proving a key MUST NOT call this method.
 // Keep the pending record for stable retries, including after a crash here.
 func (k *keyring) activatePendingPairEpoch(grantID string, generation uint64, networkID, epochID string, descriptorHash [32]byte) error {
+	if !validPairPathID(networkID) || !validPairPathID(epochID) {
+		return errors.New("sdk: invalid active pair identifiers")
+	}
 	unlock, err := k.lockPendingPairs()
 	if err != nil {
 		return err
@@ -155,10 +197,10 @@ func (k *keyring) activatePendingPairEpoch(grantID string, generation uint64, ne
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	if err := syncPairDir(k.root); err != nil {
+	if err := k.syncPendingPairDir(k.root); err != nil {
 		return err
 	}
-	if err := syncPairDir(filepath.Dir(dir)); err != nil {
+	if err := k.syncPendingPairDir(filepath.Dir(dir)); err != nil {
 		return err
 	}
 	path := filepath.Join(dir, "epoch-"+epochID+".key")
@@ -169,7 +211,7 @@ func (k *keyring) activatePendingPairEpoch(grantID string, generation uint64, ne
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if err := writePairFileDurable(path, p.EpochKey); err != nil {
+	if err := k.writePairFileDurable(path, p.EpochKey); err != nil {
 		return err
 	}
 	// Invalidate our lazy cache only after the enrollment is durable.
@@ -185,6 +227,13 @@ func (k *keyring) activatePendingPairEpoch(grantID string, generation uint64, ne
 	return nil
 }
 
+func (k *keyring) syncPendingPairDir(path string) error {
+	if k.pendingPairSyncDir != nil {
+		return k.pendingPairSyncDir(path)
+	}
+	return syncPairDir(path)
+}
+
 func syncPairDir(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -194,7 +243,7 @@ func syncPairDir(path string) error {
 	return f.Sync()
 }
 
-func writePairFileDurable(path string, b []byte) error {
+func (k *keyring) writePairFileDurable(path string, b []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".pending-*")
 	if err != nil {
 		return err
@@ -214,5 +263,5 @@ func writePairFileDurable(path string, b []byte) error {
 	if err := os.Rename(f.Name(), path); err != nil {
 		return err
 	}
-	return syncPairDir(filepath.Dir(path))
+	return k.syncPendingPairDir(filepath.Dir(path))
 }
