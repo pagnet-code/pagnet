@@ -3,11 +3,13 @@ package sessionworker
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"sync"
 
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // A producer is an unexported, worker-memory append capability. Native readers
@@ -35,6 +37,31 @@ func (j *Journal) initializeSourceRetirement() error {
 			return err
 		}
 	}
+	columns, err := j.db.Query(`PRAGMA table_info(worker_source_registration)`)
+	if err != nil {
+		return err
+	}
+	hasProof := false
+	for columns.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err = columns.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			columns.Close()
+			return err
+		}
+		hasProof = hasProof || name == "activation_proof"
+	}
+	err = columns.Err()
+	columns.Close()
+	if err != nil {
+		return err
+	}
+	if !hasProof {
+		if _, err = j.db.Exec(`ALTER TABLE worker_source_registration ADD COLUMN activation_proof BLOB`); err != nil {
+			return err
+		}
+	}
 	var registered int
 	if err := j.db.QueryRow(`SELECT COUNT(*) FROM worker_source_registration_protocol`).Scan(&registered); err != nil {
 		return err
@@ -47,15 +74,23 @@ func (j *Journal) initializeSourceRetirement() error {
 	if count > maxPendingObservations || (count > 0 && registered == 0) {
 		return errors.New("original source registration protocol is corrupt")
 	}
-	rows, err := j.db.Query(`SELECT origin_id,native_generation FROM worker_source_registration`)
+	rows, err := j.db.Query(`SELECT origin_id,native_generation,activation_proof FROM worker_source_registration`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var id, generation string
-		if err = rows.Scan(&id, &generation); err != nil {
+		var activation []byte
+		if err = rows.Scan(&id, &generation, &activation); err != nil {
 			rows.Close()
 			return err
+		}
+		if activation != nil {
+			var proof transport.NativeDispatchProof
+			if json.Unmarshal(activation, &proof) != nil || proof.DispatchSequence <= 0 || proof.OwnershipGeneration != j.scope.Generation || proof.OwnershipID == "" || proof.SourceCommandID == "" || proof.SourceAdmissionID == "" || proof.SourceRunnerID == "" || proof.SourceBootID == "" || proof.SourceRunnerEpoch.IsZero() {
+				rows.Close()
+				return ErrConflict
+			}
 		}
 		if id == "" || len(id) > 256 || generation == "" || len(generation) > 256 {
 			rows.Close()
@@ -73,6 +108,12 @@ func (j *Journal) initializeSourceRetirement() error {
 	if count > 0 {
 		return errors.New("original source registration binding is corrupt")
 	}
+	if err = j.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.activation_proof IS NOT NULL AND NOT EXISTS(SELECT 1 FROM worker_dispatch_meta d WHERE json_extract(d.ownership,'$.id')=json_extract(r.activation_proof,'$.ownershipId')))`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return errors.New("original activation ownership binding is corrupt")
+	}
 
 	// OpenJournal owns the exclusive worker lifetime lock. No prior callback or
 	// in-memory append capability survives that worker's death. New owners can
@@ -83,6 +124,10 @@ func (j *Journal) initializeSourceRetirement() error {
 	return j.reclaimSourceStreamsLocked(context.Background())
 }
 func (j *Journal) registerNativeSource(ctx context.Context, generation string, origin json.RawMessage) (*nativeSourceProducer, error) {
+	return j.registerNativeSourceActivation(ctx, generation, origin, false)
+}
+
+func (j *Journal) registerNativeSourceActivation(ctx context.Context, generation string, origin json.RawMessage, bind bool) (*nativeSourceProducer, error) {
 	var descriptor struct {
 		ID               string `json:"id"`
 		NativeGeneration string `json:"nativeGeneration"`
@@ -133,9 +178,16 @@ func (j *Journal) registerNativeSource(ctx context.Context, generation string, o
 	if existing > 0 {
 		return nil, ErrConflict
 	}
+	var activation []byte
+	if bind {
+		activation, err = j.activationDispatchProofTx(ctx, tx, generation, origin)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Existing quiesced registrations cannot be revived. A fresh launch uses
 	// ownedDriver's fresh generation and authenticated new original origin.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_registration(origin_id,native_generation,quiesced) VALUES(?,?,0)`, p.originID, generation); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO worker_source_registration(origin_id,native_generation,quiesced,activation_proof) VALUES(?,?,0,?)`, p.originID, generation, activation); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO worker_source_registration_protocol VALUES(1)`); err != nil {
@@ -177,10 +229,25 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err = j.reclaimSourceStreamsTx(ctx, tx, false); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (j *Journal) reclaimSourceStreamsTx(ctx context.Context, tx *sql.Tx, retiring bool) error {
+	var err error
+	limit := 32
+	if retiring {
+		limit = maxPendingObservations
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_turn_sources AS t WHERE NOT EXISTS(SELECT 1 FROM worker_invocation_streams s WHERE s.sequence=t.sequence AND s.closed=0) AND completed=1 AND NOT EXISTS(SELECT 1 FROM worker_terminal_reservations q WHERE q.sequence=t.sequence) AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions q WHERE q.sequence=t.sequence) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=t.sequence) AND sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND EXISTS(SELECT 1 FROM worker_source_registration r WHERE r.quiesced=1 AND r.native_generation=t.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=t.native_generation AND i.logical_turn=t.logical_turn) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.nativeGeneration')=t.native_generation AND json_extract(o.payload,'$.turnSource.logicalTurnId')=t.logical_turn)`+j.localStreamRetentionPredicate()); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT r.origin_id FROM worker_source_registration r WHERE r.quiesced=1 AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions q WHERE q.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.origin.id')=r.origin_id OR json_extract(o.payload,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_intent w WHERE json_valid(w.result) AND json_extract(w.result,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observation_sequence s WHERE s.origin_id=r.origin_id) AND NOT EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_source_captures c LEFT JOIN worker_observations o ON o.id=c.id WHERE o.id IS NULL) AND NOT EXISTS(SELECT 1 FROM worker_content_fragments f LEFT JOIN worker_observations o ON o.id=f.observation_id WHERE o.id IS NULL) ORDER BY r.origin_id LIMIT 32`)
+	// The server can keep referring to the latest activation after all its
+	// output drains. Preserve that generation (including dispatch ties) and
+	// unbound legacy sources until authenticated ownership retirement commits.
+	rows, err := tx.QueryContext(ctx, `SELECT r.origin_id FROM worker_source_registration r WHERE r.quiesced=1 AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions q WHERE q.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.origin.id')=r.origin_id OR json_extract(o.payload,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_intent w WHERE json_valid(w.result) AND json_extract(w.result,'$.nativeGeneration')=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_observation_sequence s WHERE s.origin_id=r.origin_id) AND NOT EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_interaction_sources i WHERE i.native_generation=r.native_generation) AND NOT EXISTS(SELECT 1 FROM worker_source_captures c LEFT JOIN worker_observations o ON o.id=c.id WHERE o.id IS NULL) AND NOT EXISTS(SELECT 1 FROM worker_content_fragments f LEFT JOIN worker_observations o ON o.id=f.observation_id WHERE o.id IS NULL) AND (? OR NOT EXISTS(SELECT 1 FROM worker_dispatch_meta) OR (r.activation_proof IS NOT NULL AND json_extract(r.activation_proof,'$.dispatchSequence') < (SELECT MAX(json_extract(newer.activation_proof,'$.dispatchSequence')) FROM worker_source_registration newer))) ORDER BY r.origin_id LIMIT ?`, retiring, limit)
 	if err != nil {
 		return err
 	}
@@ -219,7 +286,7 @@ func (j *Journal) reclaimSourceStreamsLocked(ctx context.Context) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (o *SessionOwner) nativeEventRegistration(instanceID string) session.NativeEventObserverRegistration {
@@ -233,7 +300,19 @@ func (o *SessionOwner) nativeEventRegistration(instanceID string) session.Native
 	generation := o.generation
 	origin := append(json.RawMessage(nil), o.origin...)
 	o.mu.Unlock()
-	producer, err := o.journal.registerNativeSource(o.ctx, generation, origin)
+	o.journal.mu.Lock()
+	var producer *nativeSourceProducer
+	for candidate := range o.journal.sourceProducers {
+		if !candidate.closed && candidate.generation == generation && candidate.owns(origin) {
+			producer = candidate
+			break
+		}
+	}
+	o.journal.mu.Unlock()
+	var err error
+	if producer == nil {
+		producer, err = o.journal.registerNativeSource(o.ctx, generation, origin)
+	}
 	if err != nil {
 		o.nativeObserverWG.Done()
 		o.failPersistence(err)
@@ -321,4 +400,34 @@ func (j *Journal) requireNativeReadersQuiesced(ctx context.Context) error {
 		return session.ErrBusy
 	}
 	return nil
+}
+
+// Bind only the original accepted dispatch and admission, before native exec.
+// A missing ownership record denotes the older standalone/local protocol.
+func (j *Journal) activationDispatchProofTx(ctx context.Context, tx *sql.Tx, generation string, raw json.RawMessage) ([]byte, error) {
+	var ownership string
+	err := tx.QueryRowContext(ctx, `SELECT ownership FROM worker_dispatch_meta WHERE singleton=1`).Scan(&ownership)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var owned transport.NativeWorkerOwnership
+	var origin transport.NativeObservationOrigin
+	if json.Unmarshal([]byte(ownership), &owned) != nil || json.Unmarshal(raw, &origin) != nil || origin.ID == "" || origin.NativeGeneration != generation || origin.HostID != j.scope.HostID || origin.InstanceID != j.scope.InstanceID || origin.Runtime != owned.Runtime || origin.CreatedAt.IsZero() {
+		return nil, ErrConflict
+	}
+	var proofRaw, admissionRaw []byte
+	var sequence int64
+	err = tx.QueryRowContext(ctx, `SELECT d.proof,a.admission,d.dispatch_sequence FROM worker_dispatches d JOIN worker_intent_admission a ON a.sequence=d.operation_sequence WHERE d.command_id=?`, origin.CommandID).Scan(&proofRaw, &admissionRaw, &sequence)
+	if err != nil {
+		return nil, err
+	}
+	var proof transport.NativeDispatchProof
+	var admission Admission
+	if json.Unmarshal(proofRaw, &proof) != nil || json.Unmarshal(admissionRaw, &admission) != nil || proof.DispatchSequence != sequence || proof.OwnershipID != owned.ID || proof.OwnershipGeneration != j.scope.Generation || proof.SourceCommandID != origin.CommandID || proof.SourceAdmissionID != origin.NativeAdmissionID || proof.SourceRunnerID != origin.RunnerID || !proof.SourceRunnerEpoch.Equal(origin.RunnerEpoch) || proof.SourceBootID != origin.BootID || admission.Scope != j.scope || admission.NativeAdmissionID != proof.SourceAdmissionID || admission.RunnerID != proof.SourceRunnerID || !admission.RunnerEpoch.Equal(proof.SourceRunnerEpoch) || admission.BootID != proof.SourceBootID {
+		return nil, ErrConflict
+	}
+	return proofRaw, nil
 }

@@ -79,6 +79,7 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 		return err
 	}
 	var ids []string
+	var stopped *stoppedReceipt
 	for rows.Next() {
 		var id, privateDigest string
 		var payload, receipt []byte
@@ -106,6 +107,7 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 				rows.Close()
 				return ErrConflict
 			}
+			stopped = &stoppedReceipt{Observation: observation, Receipt: terminal}
 		}
 		ids = append(ids, id)
 	}
@@ -113,6 +115,11 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	rows.Close()
 	if err != nil {
 		return err
+	}
+	if stopped != nil {
+		if err = j.retainStoppedReceiptTx(ctx, tx, stopped.Observation, &stopped.Receipt); err != nil {
+			return err
+		}
 	}
 	for _, id := range ids {
 		for _, query := range []string{`DELETE FROM worker_source_dispositions WHERE observation_id=?`, `DELETE FROM worker_observation_sequence WHERE observation_id=?`, `DELETE FROM worker_content_fragments WHERE observation_id=?`, `DELETE FROM worker_source_captures WHERE id=?`, `DELETE FROM worker_observations WHERE id=?`} {

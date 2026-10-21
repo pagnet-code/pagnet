@@ -411,7 +411,7 @@ func TestInvocationStreamProtectedIdentityAndCurrentLease(t *testing.T) {
 	}
 }
 
-func TestInvocationStreamACKAndExpiryPermitOnlySettledOwnershipRetirement(t *testing.T) {
+func TestInvocationStreamACKAndExpiryStillRequireStoppedOwnershipProof(t *testing.T) {
 	for _, expired := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ack", true: "expiry"}[expired], func(t *testing.T) {
 			f := newInvocationStreamFixture(t)
@@ -461,8 +461,10 @@ func TestInvocationStreamACKAndExpiryPermitOnlySettledOwnershipRetirement(t *tes
 			if sourceCount(t, f.j, "worker_turn_sources") != 0 || sourceCount(t, f.j, "worker_invocation_streams") != 0 || sourceCount(t, f.j, "worker_invocation_stream_subscriptions") != 0 {
 				t.Fatal("settled delivery left original-source or ledger orphans")
 			}
-			if err = f.j.CommitOwnershipRetirement(ctx, f.lease, ownership); err != nil {
-				t.Fatal("fully proven settled owner cannot retire", err)
+			// Draining invocation delivery does not prove native reader stop. The
+			// legacy source binding remains pinned until an authenticated stop retires it.
+			if err = f.j.CommitOwnershipRetirement(ctx, f.lease, ownership); !errors.Is(err, ErrConflict) {
+				t.Fatal("settled invocation delivery bypassed stopped ownership proof", err)
 			}
 		})
 	}
