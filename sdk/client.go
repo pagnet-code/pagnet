@@ -116,6 +116,7 @@ type Client struct {
 	// crypto enrollment state (pendingMu is shared with pendingResults)
 	cryptoMu          sync.Mutex
 	cryptoReadySet    map[string]bool
+	sharingReady      map[string]int64
 	pendingChallenges map[string]EndpointCryptoChallengePayload
 
 	// cached identity (tenant id for AADs, memberships for agents)
