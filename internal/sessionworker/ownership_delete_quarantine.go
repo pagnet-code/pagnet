@@ -125,6 +125,10 @@ func (j *Journal) collectDeletionQuarantines(ctx context.Context, lease int64, p
 	if err = j.collectOwnerStoppedPrivateInspectionsTx(ctx, tx, proof); err != nil {
 		return err
 	}
+	stage = "private_turn_outputs"
+	if err = j.collectDeletedPrivateTurnOutputsTx(ctx, tx, captureKey, proof, owned); err != nil {
+		return err
+	}
 	stage = "source_reservations"
 	if err = j.collectStoppedNativeReservationsTx(ctx, tx, captureKey, proof.NativeGeneration, proof.NativeSessionID, proof.OriginID); err != nil {
 		return err
