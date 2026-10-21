@@ -33,6 +33,36 @@ const preparedMessageHistoryLimit = 10000
 
 var preparedMessageMu sync.Mutex
 
+// These operations are replaceable for durability fault and publication race tests.
+var preparedMessageLink = os.Link
+var preparedMessageSyncDir = syncPreparedMessageDir
+
+func syncPreparedMessageDir(name string) error {
+	d, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	closeErr := d.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+// A cache entry may have been published by a process that has not yet synced
+// its directories (or failed while doing so). Every observer must finish that
+// work before exposing the identity or sending its ciphertext.
+func (c *Client) syncPreparedMessage(path string) error {
+	dir := filepath.Dir(path)
+	for _, name := range []string{dir, filepath.Dir(dir), c.kr.root, filepath.Dir(c.kr.root)} {
+		if err := preparedMessageSyncDir(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type savedMessage struct {
 	PrincipalID string             `json:"principalId"`
 	NetworkID   string             `json:"networkId"`
@@ -156,6 +186,9 @@ func (c *Client) PrepareMessage(ctx context.Context, m OutgoingMessage) (Prepare
 		if p.Digest != digest {
 			return zero, errors.New("sdk: message UUID already bound to different input")
 		}
+		if err := c.syncPreparedMessage(path); err != nil {
+			return zero, err
+		}
 		return p.metadata(), nil
 	} else if !os.IsNotExist(err) {
 		return zero, err
@@ -203,7 +236,7 @@ func (c *Client) PrepareMessage(ctx context.Context, m OutgoingMessage) (Prepare
 	if closeErr != nil {
 		return zero, closeErr
 	}
-	if err = os.Link(f.Name(), path); err != nil {
+	if err = preparedMessageLink(f.Name(), path); err != nil {
 		if !os.IsExist(err) {
 			return zero, err
 		}
@@ -214,21 +247,13 @@ func (c *Client) PrepareMessage(ctx context.Context, m OutgoingMessage) (Prepare
 		if existing.Digest != digest {
 			return zero, errors.New("sdk: message UUID already bound to different input")
 		}
+		if err := c.syncPreparedMessage(path); err != nil {
+			return zero, err
+		}
 		return existing.metadata(), nil
 	}
-	for _, name := range []string{dir, filepath.Dir(dir)} {
-		d, err := os.Open(name)
-		if err != nil {
-			return zero, err
-		}
-		err = d.Sync()
-		closeErr := d.Close()
-		if err != nil {
-			return zero, err
-		}
-		if closeErr != nil {
-			return zero, closeErr
-		}
+	if err := c.syncPreparedMessage(path); err != nil {
+		return zero, err
 	}
 	return p.metadata(), nil
 }
@@ -246,6 +271,9 @@ func (c *Client) SendPrepared(ctx context.Context, networkID, messageID string) 
 	}
 	p, err := c.loadPreparedMessage(path, networkID, messageID)
 	if err != nil {
+		return "", err
+	}
+	if err := c.syncPreparedMessage(path); err != nil {
 		return "", err
 	}
 	id, err := c.rest.sendMessage(ctx, networkID, p.Request)
