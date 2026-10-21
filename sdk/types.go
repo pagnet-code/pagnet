@@ -222,11 +222,13 @@ func (m *Message) TextBody() string {
 // control plane (zero-knowledge: the server stores and relays ciphertext
 // only).
 type OutgoingMessage struct {
+	// ID optionally fixes the durable identity for PrepareMessage and direct ASK/REPLY Send retries.
+	ID string
 	// CorrelationID identifies the message this reply answers.
 	CorrelationID string
 	// NetworkID is the network (required).
 	NetworkID string
-	// ThreadID continues a thread ("" = new/no thread).
+	// ThreadID continues a thread (direct ASK defaults to its own ID).
 	ThreadID string
 	// RecipientPrincipalID is the addressed principal.
 	RecipientPrincipalID string
