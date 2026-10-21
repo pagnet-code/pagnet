@@ -1,6 +1,6 @@
 module github.com/pagnet-code/pagnet
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/99designs/keyring v1.2.2
