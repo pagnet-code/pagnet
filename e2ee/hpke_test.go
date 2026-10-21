@@ -52,6 +52,68 @@ func TestHPKERoundTrip(t *testing.T) {
 	}
 }
 
+func TestHPKEAuthRoundTrip(t *testing.T) {
+	recipientPub, recipientPriv := newTestX25519KeyPair(t)
+	senderPub, senderPriv := newTestX25519KeyPair(t)
+	info := []byte("pagnet/sharing/test/v1")
+	aad := []byte("recipient-and-object")
+	plaintext := []byte("secret-cek-bytes-0123456789abcdef")
+	enc, ct, err := HPKEWrapAuth(recipientPub, senderPriv, info, aad, plaintext)
+	if err != nil {
+		t.Fatalf("HPKEWrapAuth: %v", err)
+	}
+	got, err := HPKEUnwrapAuth(recipientPriv, senderPub, enc, info, aad, ct)
+	if err != nil {
+		t.Fatalf("HPKEUnwrapAuth: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatal("authenticated HPKE round-trip mismatch")
+	}
+
+	otherSenderPub, _ := newTestX25519KeyPair(t)
+	_, otherRecipientPriv := newTestX25519KeyPair(t)
+	for _, tc := range []struct {
+		name          string
+		recipientPriv []byte
+		senderPub     []byte
+		info          []byte
+		aad           []byte
+	}{
+		{"wrong pinned sender", recipientPriv, otherSenderPub, info, aad},
+		{"wrong recipient", otherRecipientPriv, senderPub, info, aad},
+		{"wrong info", recipientPriv, senderPub, []byte("other-info"), aad},
+		{"wrong aad", recipientPriv, senderPub, info, []byte("other-aad")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := HPKEUnwrapAuth(tc.recipientPriv, tc.senderPub, enc, tc.info, tc.aad, ct); err == nil {
+				t.Fatal("HPKEUnwrapAuth succeeded, want authentication failure")
+			}
+		})
+	}
+}
+
+func TestHPKEAuthRejectsBaseMode(t *testing.T) {
+	recipientPub, recipientPriv := newTestX25519KeyPair(t)
+	senderPub, senderPriv := newTestX25519KeyPair(t)
+	info := []byte("pagnet/sharing/test/v1")
+	aad := []byte("recipient-and-object")
+	plaintext := []byte("cek")
+	enc, ct, err := HPKEWrap(recipientPub, info, aad, plaintext)
+	if err != nil {
+		t.Fatalf("HPKEWrap: %v", err)
+	}
+	if _, err := HPKEUnwrapAuth(recipientPriv, senderPub, enc, info, aad, ct); err == nil {
+		t.Fatal("authenticated unwrap accepted base-mode ciphertext")
+	}
+	enc, ct, err = HPKEWrapAuth(recipientPub, senderPriv, info, aad, plaintext)
+	if err != nil {
+		t.Fatalf("HPKEWrapAuth: %v", err)
+	}
+	if _, err := HPKEUnwrap(recipientPriv, enc, info, aad, ct); err == nil {
+		t.Fatal("base-mode unwrap accepted authenticated ciphertext")
+	}
+}
+
 // TestHPKEWrongKeyFails verifies a different recipient private key cannot
 // open the seal.
 func TestHPKEWrongKeyFails(t *testing.T) {

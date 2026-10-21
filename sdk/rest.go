@@ -58,6 +58,10 @@ func (e *restError) Error() string {
 // do performs one REST call and decodes the JSON response into out (when
 // non-nil).
 func (r *restClient) do(ctx context.Context, method, path string, body, out any) error {
+	return r.doWithHeaders(ctx, method, path, body, out, nil)
+}
+
+func (r *restClient) doWithHeaders(ctx context.Context, method, path string, body, out any, headers *http.Header) error {
 	var reader io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -81,6 +85,9 @@ func (r *restClient) do(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("sdk: REST %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
+	if headers != nil {
+		*headers = resp.Header.Clone()
+	}
 	// Bound responses without silently truncating large network listings.
 	const maxResponseBytes = 16 << 20
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))

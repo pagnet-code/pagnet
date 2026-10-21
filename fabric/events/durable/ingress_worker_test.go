@@ -210,20 +210,43 @@ func TestWorkerRetrySameOriginalAndPanicFailureIsFinite(t *testing.T) {
 	}
 }
 func TestIgnoringHandlerOccupiesOnlyOwnWorkerAndCloseHasDeadline(t *testing.T) {
-	s, _, _, _ := fixtureStore(t, fixtureConfig())
+	c := fixtureConfig()
+	// Allow FULL claim IO to complete before the handler starts; this test
+	// exercises cancellation during Close, not lease expiry.
+	c.LeaseTTL = DefaultConfig(c.Subscriptions).LeaseTTL
+	s, _, _, _ := fixtureStore(t, c)
 	requirePublish(t, s, fixtureEvent(t, "slow"))
 	entered, release := make(chan struct{}), make(chan struct{})
-	w, err := StartWorkers(t.Context(), s, WorkerConfig{Handlers: map[string]Handler{"fixture.observer": func(context.Context, event.Event) error { close(entered); <-release; return nil }}, Timeout: time.Millisecond, PollInterval: time.Millisecond})
+	workerCtx, workerCancel := context.WithCancel(t.Context())
+	defer workerCancel()
+	w, err := StartWorkers(workerCtx, s, WorkerConfig{Handlers: map[string]Handler{"fixture.observer": func(context.Context, event.Event) error { close(entered); <-release; return nil }}, Timeout: c.LeaseTTL, PollInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-entered
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	defer func() {
+		workerCancel()
+		releaseHandler()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), c.LeaseTTL)
+		defer cleanupCancel()
+		if err := w.Close(cleanupCtx); err != nil {
+			t.Error("worker cleanup", err)
+		}
+	}()
+	entryCtx, entryCancel := context.WithTimeout(t.Context(), c.LeaseTTL)
+	defer entryCancel()
+	select {
+	case <-entered:
+	case <-entryCtx.Done():
+		t.Fatalf("handler delivery did not arrive: stats=%+v", w.Stats())
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
 	defer cancel()
 	if err := w.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("claimed arbitrary handler was forcibly closed", err)
 	}
-	close(release)
+	releaseHandler()
 	if err := w.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}

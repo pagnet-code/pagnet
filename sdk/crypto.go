@@ -253,7 +253,7 @@ func (c *Client) markCryptoReady(networkID string) {
 func (c *Client) cryptoReady(networkID string) bool {
 	c.cryptoMu.Lock()
 	defer c.cryptoMu.Unlock()
-	return c.cryptoReadySet[networkID] && c.authorizedNetworkTenant(networkID) != ""
+	return (c.cryptoReadySet[networkID] || (c.connected.Load() && c.sharingReady[networkID] > 0 && c.sharingReady[networkID] == c.connGeneration.Load())) && c.authorizedNetworkTenant(networkID) != ""
 }
 
 // Ownership comes only from authorized discovery or authenticated enrollment,
