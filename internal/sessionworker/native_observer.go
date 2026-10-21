@@ -37,6 +37,17 @@ func (o *SessionOwner) nativeSourceObserver(instanceID string, producer *nativeS
 // Recovery can project only an already FULL-captured encrypted tail. It does
 // not register a producer or authorize native callbacks for its old generation.
 func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer *nativeSourceProducer, generation string, origin json.RawMessage) (session.NativeEventObserver, nativeOutputProjectionObserver, session.NativeEventBatchObserver) {
+	liveOnlyAsk := func(source *NativeTurnSource, unavailable bool) bool {
+		return !o.journal.isLocal() && source != nil && !unavailable && source.InputKind == "ask" && source.SourceTask == nil && source.SourceInvocation == nil
+	}
+	recordLive := func(event session.SessionEvent) {
+		o.mu.Lock()
+		if o.generation == generation {
+			o.manager.ObserveNativeActivity(instanceID, event)
+		}
+		o.mu.Unlock()
+		o.recordLiveEvent(event, generation, origin)
+	}
 	observe := func(event session.SessionEvent, stream *NativeOutputStreamProof, projection *outputSpoolProjection) error {
 		observeCtx := o.ctx
 		if stream != nil || event.Type == session.EventSessionStopped || event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed {
@@ -283,21 +294,28 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 			}
 			return o.nativeOutputResourceLimit(producer, source, ErrNativeOutputLimit)
 		}
-		if event.Type == session.EventTurnOutput && event.NativeOutput {
+		if event.Type == session.EventTurnOutput && event.NativeOutput || event.Type == session.EventPlanUpdated {
 			captureCtx, captureCancel := context.WithTimeout(context.WithoutCancel(o.ctx), 3*time.Second)
 			defer captureCancel()
 			source, unavailable, err := o.journal.NativeEventSource(captureCtx, generation, event)
 			if err != nil {
 				return err
 			}
-			if source != nil && !unavailable && source.SourceCommandID != "" && source.SourceAdmissionID != "" {
+			// Ask has no accepted content descriptor for publishing output or plans.
+			// Keep its live replay without retaining an undeliverable capture.
+			if liveOnlyAsk(source, unavailable) {
+				recordLive(event)
+				return nil
+			}
+			if event.Type == session.EventTurnOutput && source != nil && !unavailable && source.SourceCommandID != "" && source.SourceAdmissionID != "" {
 				err := o.observeOutputDelta(producer, *source, event, observe)
 				if nativeSourceResourceLimit(err) {
 					return o.nativeOutputResourceLimit(producer, source, err)
 				}
 				return err
 			}
-		} else if durableNativeEvent(event) {
+		}
+		if durableNativeEvent(event) {
 			if err := o.flushNativeOutputGeneration(generation, observe); err != nil {
 				return err
 			}
@@ -345,6 +363,12 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		source, unavailable, err := o.journal.NativeEventSource(captureCtx, generation, first)
 		if err != nil {
 			return err
+		}
+		if liveOnlyAsk(source, unavailable) {
+			for _, event := range events {
+				recordLive(event)
+			}
+			return nil
 		}
 		if source == nil || unavailable || source.SourceCommandID == "" || source.SourceAdmissionID == "" {
 			for _, event := range events {
