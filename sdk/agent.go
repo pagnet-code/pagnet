@@ -99,9 +99,7 @@ func (a *Agent) Send(ctx context.Context, m OutgoingMessage) (string, error) {
 }
 
 // Reply sends a REPLY in the same thread, addressed to the message's
-// sender. Reply generates a new identity on each call and does not retain a
-// request for replay. For recovery after an ambiguous send error, use Send with
-// an explicit OutgoingMessage.ID and retry with Client.SendPrepared.
+// sender.
 func (a *Agent) Reply(ctx context.Context, m *Message, body string) error {
 	if m == nil {
 		return errors.New("sdk: Reply requires the message being replied to")

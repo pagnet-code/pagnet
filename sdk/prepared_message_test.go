@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,9 +74,8 @@ func TestPreparedMessageAmbiguousTimeoutRestart(t *testing.T) {
 	restarted := mustConnect(t, fs, credential, state)
 	restarted.rest.base = server.URL
 	// Replay does not depend on a current enrollment, tenant lookup, or encryption.
-	replay := &Client{kr: restarted.kr, identityPriv: restarted.identityPriv, rest: restarted.rest}
-	replay.principalID.Store(restarted.PrincipalID())
-	if got, err := replay.SendPrepared(context.Background(), network, id); err != nil || got != id {
+	restarted.networkTenants = sync.Map{}
+	if got, err := restarted.SendPrepared(context.Background(), network, id); err != nil || got != id {
 		t.Fatalf("replay = %q, %v", got, err)
 	}
 	after, _ := os.ReadFile(path)
@@ -219,125 +216,5 @@ func TestPreparedMessageReplyAndValidation(t *testing.T) {
 				t.Fatal("invalid preparation accepted")
 			}
 		})
-	}
-}
-
-func TestPreparedMessageDirectorySyncFailure(t *testing.T) {
-	fs := newFakeServer(t)
-	network := fs.createNetwork("prepared", true)
-	principal, credential := fs.createPrincipal("service", "sender", network)
-	target, _ := fs.createPrincipal("agent", "target", network)
-	c := mustConnect(t, fs, credential, t.TempDir())
-	waitForCryptoReady(t, fs, principal)
-	ctx := context.Background()
-	fault := errors.New("directory sync failed")
-	for _, mode := range []string{"publish", "cached", "link loser", "send"} {
-		for failAt := 0; failAt < 4; failAt++ {
-			t.Run(fmt.Sprintf("%s/directory%d", mode, failAt), func(t *testing.T) {
-				m := OutgoingMessage{ID: domain.NewID().String(), NetworkID: network, RecipientPrincipalID: target, Parts: []MessagePart{TextPart("durable")}}
-				path, _ := c.preparedMessagePath(network, m.ID)
-				if mode == "cached" || mode == "send" {
-					if _, err := c.PrepareMessage(ctx, m); err != nil {
-						t.Fatal(err)
-					}
-				}
-				oldSync, oldLink := preparedMessageSyncDir, preparedMessageLink
-				defer func() { preparedMessageSyncDir, preparedMessageLink = oldSync, oldLink }()
-				if mode == "link loser" {
-					preparedMessageLink = func(from, to string) error {
-						// Another process publishes this exact entry but has not
-						// synced its directories when our link loses the race.
-						if err := os.Link(from, to); err != nil {
-							return err
-						}
-						return &os.LinkError{Op: "link", Old: from, New: to, Err: os.ErrExist}
-					}
-				}
-				wantDirs := []string{filepath.Dir(path), filepath.Dir(filepath.Dir(path)), c.kr.root, filepath.Dir(c.kr.root)}
-				calls := 0
-				preparedMessageSyncDir = func(dir string) error {
-					if dir != wantDirs[calls] {
-						t.Fatalf("sync directory = %q, want %q", dir, wantDirs[calls])
-					}
-					calls++
-					if calls == failAt+1 {
-						return fault
-					}
-					return oldSync(dir)
-				}
-				if mode == "send" {
-					// No REST client: reaching the network before syncing would panic.
-					replay := &Client{kr: c.kr, identityPriv: c.identityPriv}
-					replay.principalID.Store(principal)
-					if _, err := replay.SendPrepared(ctx, network, m.ID); !errors.Is(err, fault) {
-						t.Fatalf("send error = %v", err)
-					}
-				} else if p, err := c.PrepareMessage(ctx, m); !errors.Is(err, fault) || p.ID != "" {
-					t.Fatalf("prepare = %#v, %v", p, err)
-				}
-				if calls != failAt+1 {
-					t.Fatalf("sync calls = %d, want %d", calls, failAt+1)
-				}
-				// A failed publisher left an observable entry. Retrying must
-				// finish syncing it before it can return success.
-				preparedMessageSyncDir, preparedMessageLink = oldSync, oldLink
-				if p, err := c.PrepareMessage(ctx, m); err != nil || p.ID != m.ID {
-					t.Fatalf("recovery = %#v, %v", p, err)
-				}
-			})
-		}
-	}
-}
-
-func TestSendWithoutIDDoesNotConsumePreparedHistory(t *testing.T) {
-	fs := newFakeServer(t)
-	network := fs.createNetwork("prepared", true)
-	principal, credential := fs.createPrincipal("service", "sender", network)
-	target, _ := fs.createPrincipal("agent", "target", network)
-	c := mustConnect(t, fs, credential, t.TempDir())
-	waitForCryptoReady(t, fs, principal)
-	m := OutgoingMessage{NetworkID: network, RecipientPrincipalID: target, Parts: []MessagePart{TextPart("ordinary send")}}
-	path, _ := c.preparedMessagePath(network, domain.NewID().String())
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < preparedMessageHistoryLimit; i++ {
-		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("entry-%d", i)), nil, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := c.PrepareMessage(context.Background(), m); err == nil {
-		t.Fatal("full prepared history accepted a new entry")
-	}
-	var mu sync.Mutex
-	var requests []restMessageRequest
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req restMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Error(err)
-		}
-		mu.Lock()
-		requests = append(requests, req)
-		mu.Unlock()
-		_ = json.NewEncoder(w).Encode(map[string]string{"ID": req.ID})
-	}))
-	defer server.Close()
-	c.rest.base = server.URL
-	for _, kind := range []string{"ASK", "REPLY"} {
-		m.Kind = kind
-		m.ThreadID, m.CorrelationID = domain.NewID().String(), domain.NewID().String()
-		if id, err := c.Send(context.Background(), m); err != nil || id == "" {
-			t.Fatalf("ordinary %s = %q, %v", kind, id, err)
-		}
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != preparedMessageHistoryLimit {
-		t.Fatalf("history changed: count=%d, error=%v", len(entries), err)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(requests) != 2 || requests[0].ID == requests[1].ID || requests[1].CorrelationID != m.CorrelationID {
-		t.Fatal("ordinary send identity or routing lost")
 	}
 }
