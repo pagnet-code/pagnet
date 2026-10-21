@@ -119,6 +119,10 @@ func (d *Daemon) profileAvailable(p *loadedRuntimeProfile) bool {
 	if p == nil {
 		return false
 	}
+	binary, available := p.config.ResolvedExecutable()
+	if !available || agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv, p.config.Environment()), "") != nil {
+		return false
+	}
 	if p.adapter != nil {
 		return p.adapter.Available()
 	}
@@ -166,7 +170,7 @@ func (d *Daemon) checkRuntimeProfile(row *InstanceRow, pin bool) error {
 		return fmt.Errorf("runtime profile %q is not configured for this runtime", row.Profile)
 	}
 	if !d.profileAvailable(p) {
-		return fmt.Errorf("runtime profile %q is unavailable; install its executable and reload the daemon configuration", row.Profile)
+		return fmt.Errorf("runtime profile %q executable or interpreter unavailable on this host", row.Profile)
 	}
 	digest := p.config.Digest()
 	old, found := d.state.KVGet("runtime-profile:" + row.InstanceID)

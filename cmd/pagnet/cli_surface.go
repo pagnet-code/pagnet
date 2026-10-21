@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
+	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"io"
 	"net/http"
 	"os"
@@ -599,11 +600,7 @@ func doctorCmd() *cobra.Command {
 				check("git installed", true, "found")
 			}
 			for _, tool := range []string{"qwen", "claude", "docker"} {
-				if _, err := exec.LookPath(tool); err == nil {
-					info(tool+" installed", "found")
-				} else {
-					info(tool+" installed", "not found (only needed for that runtime)")
-				}
+				info(tool+" installed", doctorToolStatus(tool))
 			}
 
 			// 7. Allowed roots resolvable?
@@ -623,4 +620,16 @@ func doctorCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir with the login (default ~/.pagnet)")
 	return cmd
+}
+
+// doctorToolStatus shares the launch preflight without invoking the tool.
+func doctorToolStatus(tool string) string {
+	path, err := exec.LookPath(tool)
+	if err != nil {
+		return "not found (only needed for that runtime)"
+	}
+	if err := agentruntime.PreflightExecutable(path, agentruntime.ChildEnv(), ""); err != nil {
+		return err.Error()
+	}
+	return "found"
 }

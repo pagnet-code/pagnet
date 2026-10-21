@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -32,10 +33,13 @@ func (a *turnCapturingAdapter) StartTurn(ctx context.Context, spec agentruntime.
 	close(events)
 	return nil
 }
-func (a *turnCapturingAdapter) Stop(string) error          { return nil }
-func (a *turnCapturingAdapter) Available() bool            { return true }
-func (a *turnCapturingAdapter) BinaryPath() (string, bool) { return "stub", true }
-func (a *turnCapturingAdapter) PID(string) *int            { return nil }
+func (a *turnCapturingAdapter) Stop(string) error { return nil }
+func (a *turnCapturingAdapter) Available() bool   { return true }
+func (a *turnCapturingAdapter) BinaryPath() (string, bool) {
+	path, err := os.Executable()
+	return path, err == nil
+}
+func (a *turnCapturingAdapter) PID(string) *int { return nil }
 func (a *turnCapturingAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
 }

@@ -2512,7 +2512,7 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 		// Fail the launch now, not at the first turn: a host without the
 		// runtime CLI must not ack a clean launch and idle until work
 		// arrives.
-		return nil, "", false, fmt.Errorf("runtime %q is not installed on this host", p.Runtime)
+		return nil, "", false, fmt.Errorf("runtime %q executable or interpreter unavailable on this host", p.Runtime)
 	}
 	access := p.Access
 	if access != domain.AccessReadOnly {
@@ -2748,12 +2748,20 @@ func (d *Daemon) runtimeSupported(rn domain.RuntimeName) bool {
 // process-per-turn runtime via its adapter's availability check, a
 // session-driven runtime (qwen-code, fake-persistent) via its driver. A
 // session driver without an availability check is assumed available.
+// Relative PATH entries are evaluated in the daemon working directory here;
+// early launch admission is conservative until nativeConfiguration and the
+// reserved-worker launch check evaluate the exact runtime workspace.
 func (d *Daemon) runtimeAvailable(rn domain.RuntimeName) bool {
 	if ad, ok := d.adapters[rn]; ok {
-		return ad.Available()
+		binary, available := ad.BinaryPath()
+		return available && agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv), "") == nil
 	}
 	if d.sessions != nil {
 		if drv := d.sessions.DriverFor(rn); drv != nil {
+			if bp, ok := drv.(interface{ BinaryPath() (string, bool) }); ok {
+				binary, available := bp.BinaryPath()
+				return available && agentruntime.PreflightExecutable(binary, agentruntime.ChildEnv(d.RuntimeEnv), "") == nil
+			}
 			if available, ok := drv.(interface{ Available() bool }); ok {
 				return available.Available()
 			}

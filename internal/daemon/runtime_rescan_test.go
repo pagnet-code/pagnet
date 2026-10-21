@@ -96,3 +96,44 @@ func TestRuntimeRescanDiscoversInstallAfterStartupWithoutReplacingDrivers(t *tes
 		}
 	}
 }
+
+func TestRuntimeRescanRepairsMissingInterpreter(t *testing.T) {
+	binDir := t.TempDir()
+	t.Setenv("PATH", binDir)
+	binary := filepath.Join(binDir, "qwen")
+	marker := filepath.Join(binDir, "executed")
+	if err := os.WriteFile(binary, []byte("#!/usr/bin/env node\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	d, err := newDaemon(Config{StateDir: privateDaemonStateDir(t), NoScan: true}, nil, func() (string, error) {
+		return filepath.Join(binDir, "missing-pagnet"), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if d.runtimeAvailable(domain.RuntimeQwenCode) || len(d.detectRuntimes()) != 0 {
+		t.Fatal("wrapper without node advertised available")
+	}
+	instance := domain.NewID().String()
+	if _, _, _, err := d.prepareLaunch(transport.LaunchAgentPayload{InstanceID: instance, Runtime: string(domain.RuntimeQwenCode), Kind: "representative"}); err == nil {
+		t.Fatal("missing interpreter admitted launch")
+	}
+	if _, err := os.Stat(filepath.Join(d.StateDir, "representatives", instance)); !os.IsNotExist(err) {
+		t.Fatal("failed runtime preflight created workspace")
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "node"), []byte("#!/bin/sh\nprintf executed > '"+marker+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if !d.runtimeAvailable(domain.RuntimeQwenCode) || len(d.detectRuntimes()) != 1 {
+		t.Fatal("rescan did not repair interpreter availability")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("availability check executed interpreter")
+	}
+	// Explicit launch PATH wins over the daemon's inherited PATH.
+	d.RuntimeEnv = []string{"PATH=" + t.TempDir()}
+	if d.runtimeAvailable(domain.RuntimeQwenCode) || len(d.detectRuntimes()) != 0 {
+		t.Fatal("availability ignored effective launch PATH")
+	}
+}

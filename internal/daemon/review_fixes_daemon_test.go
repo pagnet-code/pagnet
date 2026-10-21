@@ -136,10 +136,13 @@ func (stubAdapter) Name() domain.RuntimeName { return domain.RuntimeFake }
 func (stubAdapter) StartTurn(context.Context, agentruntime.TurnSpec, chan agentruntime.TurnEvent) error {
 	return nil
 }
-func (stubAdapter) Stop(string) error          { return nil }
-func (stubAdapter) Available() bool            { return true }
-func (stubAdapter) BinaryPath() (string, bool) { return "stub", true }
-func (stubAdapter) PID(string) *int            { return nil }
+func (stubAdapter) Stop(string) error { return nil }
+func (stubAdapter) Available() bool   { return true }
+func (stubAdapter) BinaryPath() (string, bool) {
+	path, err := os.Executable()
+	return path, err == nil
+}
+func (stubAdapter) PID(string) *int { return nil }
 func (stubAdapter) InteractiveCmd(agentruntime.TurnSpec) (*exec.Cmd, error) {
 	return nil, errors.New("stub adapter has no interactive process")
 }
