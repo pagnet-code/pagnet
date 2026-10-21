@@ -150,8 +150,8 @@ func (r *federationRelay) handle(conn net.Conn) {
 // result records the outcome.
 func (r *federationRelay) handleControl(ctx context.Context, serving *linkServing, channel *federation.ForwardChannel) {
 	fail := func(action string, state federation.ControlState, e error) {
-		_ = channel.Close()
 		r.recordControl(serving.channel, action, state, e)
+		_ = channel.Close()
 	}
 	request, e := channel.ReceiveControl(ctx)
 	if e != nil {
@@ -180,6 +180,6 @@ func (r *federationRelay) handleControl(ctx context.Context, serving *linkServin
 			}
 		}
 	}
-	_ = channel.Close()
 	r.recordControl(serving.channel, request.Proof.Frame.Action, state, nil)
+	_ = channel.Close()
 }
