@@ -36,6 +36,7 @@ type pairMessageState struct {
 	WireDigest [32]byte           `json:"wire_digest"`
 	WireBytes  int                `json:"wire_bytes"`
 	Retired    bool               `json:"retired"`
+	Rejected   bool               `json:"rejected,omitempty"`
 }
 
 type pairMessageIndex struct {
@@ -159,7 +160,7 @@ func (k *keyring) readPairMessageIndex(principal string) (map[string]pairMessage
 	}
 	count, total := 0, 0
 	for id, state := range index.Records {
-		if !state.Binding.valid() || state.Binding.PrincipalID != principal || state.Binding.MessageID != id || state.WireBytes < 0 || state.WireBytes > pairMessageSpoolBytes || (state.WireBytes == 0) != (state.WireDigest == ([32]byte{})) || state.Retired && state.WireBytes == 0 {
+		if !state.Binding.valid() || state.Binding.PrincipalID != principal || state.Binding.MessageID != id || state.WireBytes < 0 || state.WireBytes > pairMessageSpoolBytes || (state.WireBytes == 0) != (state.WireDigest == ([32]byte{})) || state.Retired && state.WireBytes == 0 && !state.Rejected || state.Rejected && !state.Retired {
 			return nil, nil, errors.New("sdk: corrupt message spool binding")
 		}
 		if !state.Retired {
@@ -247,6 +248,9 @@ func (k *keyring) storePairMessage(b pairMessageBinding, wire []byte, digest [32
 	old, ok := records[b.MessageID]
 	if !ok || old.Binding != b {
 		return zero, errors.New("sdk: message is not reserved")
+	}
+	if old.Rejected {
+		return zero, errors.New("sdk: message reservation was rejected")
 	}
 	if old.WireBytes > 0 {
 		if old.WireDigest != digest || old.WireBytes != len(wire) {
@@ -380,7 +384,7 @@ func (k *keyring) retirePairMessage(b pairMessageBinding, digest [32]byte, statu
 		return err
 	}
 	state, ok := records[b.MessageID]
-	if !ok || state.Binding != b || state.WireBytes == 0 || state.WireDigest != digest {
+	if !ok || state.Binding != b || state.Rejected || state.WireBytes == 0 || state.WireDigest != digest {
 		return errors.New("sdk: admission receipt binding mismatch")
 	}
 	if !state.Retired {
@@ -392,6 +396,44 @@ func (k *keyring) retirePairMessage(b pairMessageBinding, digest [32]byte, statu
 		if err := k.writePairMessageIndex(b.PrincipalID, records, key); err != nil {
 			return err
 		}
+	}
+	if err := os.Remove(k.pairMessagePath(b)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return k.syncPendingPairDir(k.pairMessageDir(b.PrincipalID))
+}
+
+// rejectPairMessage durably aborts a never-sent incomplete reservation, or a
+// finalized request after the caller established definite non-admission.
+// Only internal transport code may supply finalized=true.
+func (k *keyring) rejectPairMessage(b pairMessageBinding, finalized bool) error {
+	if !b.valid() {
+		return errors.New("sdk: invalid message abort binding")
+	}
+	unlock, err := k.lockPairMessages(b.PrincipalID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	records, key, err := k.readPairMessageIndex(b.PrincipalID)
+	if err != nil {
+		return err
+	}
+	state, ok := records[b.MessageID]
+	if !ok || state.Binding != b {
+		return errors.New("sdk: message abort binding mismatch")
+	}
+	if state.Retired && !state.Rejected {
+		return errors.New("sdk: admitted message cannot be rejected")
+	}
+	if state.WireBytes > 0 && !finalized && !state.Rejected {
+		return errors.New("sdk: finalized message requires admission resolution")
+	}
+	state.Retired = true
+	state.Rejected = true
+	records[b.MessageID] = state
+	if err := k.writePairMessageIndex(b.PrincipalID, records, key); err != nil {
+		return err
 	}
 	if err := os.Remove(k.pairMessagePath(b)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err

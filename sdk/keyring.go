@@ -353,14 +353,9 @@ func (k *keyring) StoreEpoch(networkID, epochID string, key [32]byte) error {
 	defer k.epochMu.Unlock()
 	epochs, ok := k.epochLRU[networkID]
 	if !ok {
-		epochs = map[string][32]byte{}
-		k.epochLRU[networkID] = epochs
-		k.epochOrder = append(k.epochOrder, networkID)
-		if len(k.epochOrder) > epochCacheCap {
-			old := k.epochOrder[0]
-			k.epochOrder = k.epochOrder[1:]
-			delete(k.epochLRU, old)
-		}
+		// A cold cache must remain cold: seeding only this epoch would hide
+		// earlier durable epochs from EpochKey and EpochKeys until eviction.
+		return nil
 	}
 	epochs[epochID] = key
 	return nil

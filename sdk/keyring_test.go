@@ -240,3 +240,30 @@ func TestKeyringNoEpochForUnknownNetwork(t *testing.T) {
 		t.Fatal("ActiveEpoch for a network with no epochs should error")
 	}
 }
+
+func TestStoreEpochColdCachePreservesExactDurableEpoch(t *testing.T) {
+	dir := t.TempDir()
+	k, err := newKeyring(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := [32]byte{1}
+	newer := [32]byte{2}
+	if err := k.StoreEpoch("net", "activation", activation); err != nil {
+		t.Fatal(err)
+	}
+	k, err = newKeyring(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.StoreEpoch("net", "zzzz-newer", newer); err != nil {
+		t.Fatal(err)
+	}
+	got, err := k.EpochKey("net", "activation")
+	if err != nil || got != activation {
+		t.Fatalf("exact durable activation hidden: %v", err)
+	}
+	if got, id, err := k.ActiveEpoch("net"); err != nil || id != "zzzz-newer" || got != newer {
+		t.Fatalf("generic active epoch: %s %v", id, err)
+	}
+}
