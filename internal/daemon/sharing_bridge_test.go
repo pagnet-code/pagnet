@@ -28,8 +28,10 @@ type bridgeTestEndpoint struct {
 	enabled atomic.Bool
 }
 
-func (e *bridgeTestEndpoint) PrincipalID() string   { return e.id }
-func (e *bridgeTestEndpoint) EnableSharingPairs()   { e.enabled.Store(true) }
+func (e *bridgeTestEndpoint) PrincipalID() string { return e.id }
+func (e *bridgeTestEndpoint) OnSharingMessage(func(context.Context, sdk.SharingMessage) error) {
+	e.enabled.Store(true)
+}
 func (e *bridgeTestEndpoint) Done() <-chan struct{} { return e.done }
 func (e *bridgeTestEndpoint) Close() error          { e.once.Do(func() { close(e.done) }); return nil }
 
@@ -82,7 +84,7 @@ func newBridgeFixture(t *testing.T) (*bridgeFixture, *sharingBridgeSupervisor) {
 		f.endpoints = append(f.endpoints, e)
 		return e, nil
 	}
-	s.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+	s.admit(transport.HostSessionPayload{TenantID: "tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
 	return f, s
 }
 func (f *bridgeFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -194,7 +196,7 @@ func TestSharingBridgeStartupRestartAndNoIdlePolling(t *testing.T) {
 	s2.retry = s.retry
 	s2.renew = s.renew
 	s2.connect = s.connect
-	s2.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+	s2.admit(transport.HostSessionPayload{TenantID: "tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
 	startBridgeTest(t, s2)
 	awaitBridge(t, func() bool {
 		f.mu.Lock()
@@ -261,7 +263,7 @@ func TestSharingBridgeDuplicateLocalRunner(t *testing.T) {
 	awaitBridge(t, f.ready)
 	s2 := newSharingBridgeSupervisor(s.daemon)
 	s2.connect = s.connect
-	s2.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+	s2.admit(transport.HostSessionPayload{TenantID: "tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
 	startBridgeTest(t, s2)
 	time.Sleep(40 * time.Millisecond)
 	f.mu.Lock()
@@ -284,7 +286,7 @@ func TestSharingBridgeReconnectRetainsEndpointAndStaleGenerationRecovers(t *test
 		t.Fatal("brief host disconnect closed healthy endpoint")
 	default:
 	}
-	s.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+	s.admit(transport.HostSessionPayload{TenantID: "tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
 	awaitBridge(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -398,7 +400,7 @@ func TestSharingBridgeUnsupportedRecoveryListStaysDormant(t *testing.T) {
 			}
 			if trigger == "reconnect" {
 				s.disconnect()
-				s.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+				s.admit(transport.HostSessionPayload{TenantID: "tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
 			} else if err := s.recordWake(f.installation.ID); err != nil {
 				t.Fatal(err)
 			}
@@ -429,4 +431,22 @@ func TestSharingBridgeRecoveryListRetriesTransientErrors(t *testing.T) {
 	if f.lists != 2 {
 		t.Fatalf("transient recovery list failure did not retry: calls = %d", f.lists)
 	}
+}
+
+func TestSharingBridgeChangedMailboxHostBindingStopsEndpoint(t *testing.T) {
+	f, s := newBridgeFixture(t)
+	startBridgeTest(t, s)
+	awaitBridge(t, f.ready)
+	f.mu.Lock()
+	endpoint := f.endpoints[0]
+	f.mu.Unlock()
+	s.admit(transport.HostSessionPayload{TenantID: "other-tenant", HostID: "host", RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+	awaitBridge(t, func() bool {
+		select {
+		case <-endpoint.Done():
+			return true
+		default:
+			return false
+		}
+	})
 }

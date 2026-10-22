@@ -43,7 +43,7 @@ type sharingBridgeController struct {
 }
 type sharingBridgeEndpoint interface {
 	PrincipalID() string
-	EnableSharingPairs()
+	OnSharingMessage(func(context.Context, sdk.SharingMessage) error)
 	Close() error
 	Done() <-chan struct{}
 }
@@ -355,11 +355,25 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return
 	}
+	if err := syncSharingMailboxDir(filepath.Dir(dir)); err != nil {
+		return
+	}
 	release, err := lockSharingBridge(dir)
 	if err != nil {
 		return
 	}
 	defer release()
+	s.mu.Lock()
+	var binding sharingMailboxBinding
+	if s.session != nil {
+		binding = sharingMailboxBinding{v.ID, v.ServiceID, s.session.TenantID, s.session.HostID}
+	}
+	s.mu.Unlock()
+	mailbox, err := openSharingMailbox(filepath.Join(dir, "mailbox"), binding)
+	if err != nil {
+		return
+	}
+	defer mailbox.db.Close()
 	sdkDir := filepath.Join(dir, "sdk")
 	generation := v.CredentialGeneration
 	saved := sharingBridgeState{}
@@ -406,6 +420,12 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		}
 	}
 	for ctx.Err() == nil {
+		s.mu.Lock()
+		bindingChanged := s.session != nil && (s.session.TenantID != binding.TenantID || s.session.HostID != binding.HostID)
+		s.mu.Unlock()
+		if bindingChanged {
+			return
+		}
 		if !lease.IsZero() && !time.Now().Before(lease) {
 			closeEndpoint()
 			lease = time.Time{}
@@ -529,7 +549,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 			endpoint = candidate
 			connectRetry = s.retry
 			needClaim = false
-			endpoint.EnableSharingPairs()
+			endpoint.OnSharingMessage(mailbox.receive)
 		}
 		// The independent deadline closes transport even while an HTTP operation
 		// is blocked. A failed renewal cannot keep an endpoint past its authority.
