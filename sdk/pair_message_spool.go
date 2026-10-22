@@ -337,6 +337,31 @@ func (k *keyring) loadPairMessage(b pairMessageBinding) ([]byte, error) {
 	return k.readPairMessageWire(state, key)
 }
 
+// lookupPairMessage authenticates one reservation, including retired tombstones.
+// Only nonretired prepared records require surviving authenticated wire bytes.
+func (k *keyring) lookupPairMessage(principal, messageID string) (pairMessageState, bool, error) {
+	var zero pairMessageState
+	if !validPairPathID(principal) || !validPairUUID(messageID) {
+		return zero, false, errors.New("sdk: invalid message lookup binding")
+	}
+	unlock, err := k.lockPairMessages(principal)
+	if err != nil {
+		return zero, false, err
+	}
+	defer unlock()
+	records, key, err := k.readPairMessageIndex(principal)
+	if err != nil {
+		return zero, false, err
+	}
+	state, found := records[messageID]
+	if found && !state.Retired && state.WireBytes > 0 {
+		if _, err := k.readPairMessageWire(state, key); err != nil {
+			return zero, false, err
+		}
+	}
+	return state, found, nil
+}
+
 // unresolvedPairMessages includes incomplete reservations and errors on corrupt
 // finalized records. No expiry, revocation, or HTTP response deletes a record.
 func (k *keyring) unresolvedPairMessages(principal string) ([]pairMessageState, error) {
