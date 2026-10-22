@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ type sharingOutboundRecord struct {
 	Phase     string
 	Receipt   *sdk.SharingMessageReceipt
 	Error     string
+	RetryAt   time.Time
 }
 type sharingOutboundEndpoint interface {
 	LookupSharingMessage(string) (sdk.SharingMessageLocalState, bool, error)
@@ -217,7 +219,13 @@ func (w *sharingOutboundWorker) retry(ctx context.Context, id string) (sharingOu
 	return record, err
 }
 func (w *sharingOutboundWorker) run(ctx context.Context) {
+	var timer *time.Timer
 	var retry <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -225,7 +233,17 @@ func (w *sharingOutboundWorker) run(ctx context.Context) {
 		case <-w.wake:
 		case <-retry:
 		}
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
 		retry = nil
+		var earliest time.Time
+		deferUntil := func(deadline time.Time) {
+			if !deadline.IsZero() && (earliest.IsZero() || deadline.Before(earliest)) {
+				earliest = deadline
+			}
+		}
 		w.mu.Lock()
 		ep := w.endpoint
 		if ep == nil {
@@ -242,24 +260,29 @@ func (w *sharingOutboundWorker) run(ctx context.Context) {
 				if actionCtx.Err() != nil {
 					break
 				}
+				if time.Now().Before(record.RetryAt) {
+					deferUntil(record.RetryAt)
+					continue
+				}
 				delay, err := w.advance(actionCtx, ep, record)
 				if err != nil && actionCtx.Err() == nil {
 					// Preserve the last durable phase while exposing only a
 					// fixed local diagnostic, never an SDK/server error body.
 					current, loadErr := w.mailbox.outboundStatus(actionCtx, record.Input.OperationID)
 					if loadErr == nil {
+						current.RetryAt = time.Time{}
 						current.Error = "action_unavailable"
 						if err.Error() == "sharing outbound integrity error" {
 							current.Error = "integrity_error"
 						}
 						if delay > 0 {
 							current.Error = "quota_deferred"
+							current.RetryAt = time.Now().Add(delay)
 						}
-						_ = w.mailbox.saveOutbound(actionCtx, current)
+						if saveErr := w.mailbox.saveOutbound(actionCtx, current); saveErr == nil && delay > 0 {
+							deferUntil(current.RetryAt)
+						}
 					}
-				}
-				if err != nil && delay > 0 {
-					retry = time.After(delay)
 				}
 			}
 		}
@@ -268,6 +291,10 @@ func (w *sharingOutboundWorker) run(ctx context.Context) {
 		w.actionCancel, w.actionDone = nil, nil
 		close(done)
 		w.mu.Unlock()
+		if !earliest.IsZero() {
+			timer = time.NewTimer(max(time.Until(earliest), 0))
+			retry = timer.C
+		}
 	}
 }
 func (w *sharingOutboundWorker) pending(ctx context.Context) ([]sharingOutboundRecord, error) {
@@ -295,6 +322,7 @@ func (w *sharingOutboundWorker) pending(ctx context.Context) ([]sharingOutboundR
 }
 func (w *sharingOutboundWorker) advance(ctx context.Context, ep sharingOutboundEndpoint, r sharingOutboundRecord) (time.Duration, error) {
 	r.Error = ""
+	r.RetryAt = time.Time{}
 	fail := func(code string) (time.Duration, error) {
 		r.Phase = "failed"
 		r.Error = code
@@ -465,11 +493,13 @@ func outboundRetryDelay(err error) (time.Duration, error) {
 		return 0, errors.New("sharing outbound action unavailable")
 	}
 	delay := time.Second
-	if seconds, e := strconv.Atoi(quota.RetryAfter); e == nil && seconds > 0 {
-		delay = time.Duration(min(seconds, 3600)) * time.Second
+	if seconds, e := strconv.ParseInt(quota.RetryAfter, 10, 64); e == nil && seconds > 0 {
+		delay = time.Duration(min(seconds, int64((1<<63-1)/time.Second))) * time.Second
+	} else if deadline, e := http.ParseTime(quota.RetryAfter); e == nil {
+		delay = max(delay, time.Until(deadline))
 	}
 	if quota.ResetAt != nil {
-		delay = max(delay, min(time.Until(*quota.ResetAt), time.Hour))
+		delay = max(delay, time.Until(*quota.ResetAt))
 	}
 	return delay, errors.New("sharing outbound quota deferred")
 }

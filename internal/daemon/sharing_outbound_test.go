@@ -252,6 +252,17 @@ func TestSharingOutboundWorkerIdleAndRetry(t *testing.T) {
 	<-done
 }
 func TestSharingOutboundQuotaBackoff(t *testing.T) {
+	if delay, _ := outboundRetryDelay(&sdk.SharingMessageQuotaError{StatusCode: 429, RetryAfter: "7200"}); delay != 2*time.Hour {
+		t.Fatal("long retry deadline shortened", delay)
+	}
+	reset := time.Now().Add(2 * time.Hour)
+	if delay, _ := outboundRetryDelay(&sdk.SharingMessageQuotaError{StatusCode: 429, ResetAt: &reset}); delay < 119*time.Minute {
+		t.Fatal("quota reset deadline shortened", delay)
+	}
+	retryDate := time.Now().Add(30 * time.Minute).UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+	if delay, _ := outboundRetryDelay(&sdk.SharingMessageQuotaError{StatusCode: 429, RetryAfter: retryDate}); delay < 29*time.Minute || delay > 30*time.Minute {
+		t.Fatal("retry date ignored", delay)
+	}
 	if delay, _ := outboundRetryDelay(&sdk.SharingMessageQuotaError{StatusCode: 429, RetryAfter: "2"}); delay != 2*time.Second {
 		t.Fatal(delay)
 	}
@@ -386,5 +397,146 @@ func TestSharingOutboundConcurrentChangedOperation(t *testing.T) {
 	}
 	if successes != 10 || conflicts != 10 {
 		t.Fatalf("successes=%d conflicts=%d", successes, conflicts)
+	}
+}
+
+type outboundQuotaAttempt struct {
+	messageID string
+	at        time.Time
+}
+type outboundQuotaFake struct {
+	*outboundFake
+	attempts chan outboundQuotaAttempt
+	readyMu  sync.Mutex
+	ready    func()
+}
+
+func (f *outboundQuotaFake) PrepareSharingMessage(_ context.Context, req sdk.SharingMessageRequest) (sdk.PreparedSharingMessage, error) {
+	f.attempts <- outboundQuotaAttempt{req.MessageID, time.Now()}
+	return sdk.PreparedSharingMessage{}, &sdk.SharingMessageQuotaError{StatusCode: 429, RetryAfter: "20"}
+}
+func (f *outboundQuotaFake) OnSharingPairReady(ready func()) {
+	f.readyMu.Lock()
+	f.ready = ready
+	f.readyMu.Unlock()
+}
+func (f *outboundQuotaFake) pairReady() {
+	f.readyMu.Lock()
+	ready := f.ready
+	f.readyMu.Unlock()
+	if ready != nil {
+		ready()
+	}
+}
+func waitOutboundDeferred(t *testing.T, m *sharingMailbox, id string) sharingOutboundRecord {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		r, err := m.outboundStatus(context.Background(), id)
+		if err == nil && r.Error == "quota_deferred" && r.RetryAt.After(time.Now()) {
+			return r
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("quota deadline was not committed")
+	return sharingOutboundRecord{}
+}
+func TestSharingOutboundQuotaDeadlineSurvivesUnrelatedWakes(t *testing.T) {
+	w, base, r := outboundFixture(t)
+	ep := &outboundQuotaFake{outboundFake: base, attempts: make(chan outboundQuotaAttempt, 20)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); w.run(ctx) }()
+	defer func() { cancel(); <-done }()
+	w.setEndpoint(ep)
+	deferred := waitOutboundDeferred(t, w.mailbox, r.Input.OperationID)
+	unrelated, err := w.submit(ctx, outboundInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitOutboundDeferred(t, w.mailbox, unrelated.Input.OperationID)
+	ep.pairReady()
+	w.setEndpoint(nil)
+	w.setEndpoint(ep)
+	if _, err = w.retry(ctx, r.Input.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	ep.pairReady()
+	time.Sleep(50 * time.Millisecond)
+	counts := map[string]int{}
+	for {
+		select {
+		case attempt := <-ep.attempts:
+			counts[attempt.messageID]++
+		default:
+			goto drained
+		}
+	}
+drained:
+	if counts[r.MessageID] != 1 || counts[unrelated.MessageID] != 1 {
+		t.Fatalf("wake bypassed quota deadline: %v", counts)
+	}
+	saved, err := w.mailbox.outboundStatus(ctx, r.Input.OperationID)
+	if err != nil || !saved.RetryAt.Equal(deferred.RetryAt) {
+		t.Fatal("wake changed durable quota deadline")
+	}
+}
+func TestSharingOutboundQuotaRestartSchedulesEarliestDeadline(t *testing.T) {
+	m, dir, binding, _ := mailboxFixture(t)
+	ctx := context.Background()
+	_, base, _ := outboundFixture(t)
+	// Insert the later deadline first so row order cannot choose the timer.
+	later, err := m.submitOutbound(ctx, outboundInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlier, err := m.submitOutbound(ctx, outboundInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	later.RetryAt = now.Add(650 * time.Millisecond)
+	later.Error = "quota_deferred"
+	earlier.RetryAt = now.Add(250 * time.Millisecond)
+	earlier.Error = "quota_deferred"
+	for _, r := range []sharingOutboundRecord{later, earlier} {
+		if err = m.saveOutbound(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.db.Close()
+	reopened, err := openSharingMailbox(dir, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.db.Close()
+	w := newSharingOutboundWorker(reopened)
+	ep := &outboundQuotaFake{outboundFake: base, attempts: make(chan outboundQuotaAttempt, 20)}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); w.run(runCtx) }()
+	defer func() { cancel(); <-done }()
+	w.setEndpoint(ep)
+	// Repeated event wakes preserve the earliest timer reconstructed from storage.
+	ep.pairReady()
+	ep.pairReady()
+	var first, second outboundQuotaAttempt
+	select {
+	case first = <-ep.attempts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("earliest deadline did not wake worker")
+	}
+	if first.messageID != earlier.MessageID || first.at.Before(earlier.RetryAt) || !first.at.Before(later.RetryAt) {
+		t.Fatalf("wrong earliest retry: %+v", first)
+	}
+	waitOutboundDeferred(t, reopened, earlier.Input.OperationID)
+	ep.pairReady()
+	select {
+	case second = <-ep.attempts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("later deadline did not wake worker")
+	}
+	if second.messageID != later.MessageID || second.at.Before(later.RetryAt) {
+		t.Fatalf("later retry ran before its deadline: %+v", second)
 	}
 }
