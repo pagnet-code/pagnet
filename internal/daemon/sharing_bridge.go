@@ -350,12 +350,24 @@ func (s *sharingBridgeSupervisor) recordWake(id string) error {
 	return nil
 }
 
-func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharingBridgeInstallation, r *sharingBridgeRuntime) {
-	dir := filepath.Join(s.daemon.StateDir, "sharing-bridges", v.ID)
+// prepareSharingBridgeDir syncs each newly introduced directory entry from
+// StateDir down before an endpoint can acknowledge any inbound message.
+func prepareSharingBridgeDir(stateDir, id string, syncDir func(string) error) (string, error) {
+	dir := filepath.Join(stateDir, "sharing-bridges", id)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return
+		return "", err
 	}
-	if err := syncSharingMailboxDir(filepath.Dir(dir)); err != nil {
+	for _, parent := range []string{stateDir, filepath.Dir(dir)} {
+		if err := syncDir(parent); err != nil {
+			return "", err
+		}
+	}
+	return dir, nil
+}
+
+func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharingBridgeInstallation, r *sharingBridgeRuntime) {
+	dir, err := prepareSharingBridgeDir(s.daemon.StateDir, v.ID, syncSharingMailboxDir)
+	if err != nil {
 		return
 	}
 	release, err := lockSharingBridge(dir)

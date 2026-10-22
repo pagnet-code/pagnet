@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -130,18 +131,62 @@ func openSharingMailbox(dir string, binding sharingMailboxBinding) (_ *sharingMa
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if statErr == nil {
+		m, err := openSharingMailboxDatabase(path, aead, binding, false)
+		if err != nil {
+			return nil, err
+		}
+		if err = syncSharingMailboxDir(dir); err != nil {
+			m.db.Close()
+			return nil, err
+		}
+		return m, nil
+	}
+	if err = publishSharingMailboxDatabase(dir, path, func(temporary string) error {
+		initial, err := openSharingMailboxDatabase(temporary, aead, binding, true)
+		if err != nil {
+			return err
+		}
+		return initial.db.Close()
+	}); err != nil {
+		return nil, err
+	}
+	return openSharingMailboxDatabase(path, aead, binding, false)
+}
+
+// The established path is published only after the complete authenticated
+// database has committed and closed. A crash before publication leaves an
+// unused temporary file; the next startup can initialize a fresh one.
+func publishSharingMailboxDatabase(dir, path string, initialize func(string) error) error {
+	f, err := os.CreateTemp(dir, ".inbound-*")
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err = f.Chmod(0600); err != nil {
-		f.Close()
-		return nil, err
-	}
+	temporary := f.Name()
+	defer os.Remove(temporary)
 	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = initialize(temporary); err != nil {
+		return err
+	}
+	// Link publishes atomically without replacing an established mailbox.
+	if err = os.Link(temporary, path); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return syncSharingMailboxDir(dir)
+}
+
+func openSharingMailboxDatabase(path string, aead cipher.AEAD, binding sharingMailboxBinding, initialize bool) (_ *sharingMailbox, err error) {
+	if err = os.Chmod(path, 0600); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path)
+	// Driver pragmas run for every physical connection, including replacements
+	// created by database/sql. EXTRA syncs the DELETE journal's unlink before
+	// commit returns: https://www.sqlite.org/pragma.html#pragma_synchronous.
+	query := url.Values{"mode": {"rw"}, "_pragma": {"page_size=4096", "max_page_count=20000", "journal_mode=DELETE", "synchronous=EXTRA", "busy_timeout=5000"}}
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}).String()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -152,23 +197,27 @@ func openSharingMailbox(dir string, binding sharingMailboxBinding) (_ *sharingMa
 			db.Close()
 		}
 	}()
-	for _, stmt := range []string{
-		"PRAGMA page_size=4096", "PRAGMA max_page_count=20000", "PRAGMA journal_mode=DELETE", "PRAGMA synchronous=FULL", "PRAGMA busy_timeout=5000",
-		"CREATE TABLE IF NOT EXISTS mailbox_binding (id INTEGER PRIMARY KEY CHECK(id=1), sealed BLOB NOT NULL)",
-		"CREATE TABLE IF NOT EXISTS inbound (grant_id TEXT NOT NULL, generation INTEGER NOT NULL, message_id TEXT NOT NULL, sealed BLOB NOT NULL, PRIMARY KEY(grant_id,generation,message_id))",
-	} {
-		if _, err = db.Exec(stmt); err != nil {
-			return nil, err
+	var synchronous int
+	if err = db.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return nil, err
+	}
+	if synchronous != 3 {
+		return nil, errors.New("sharing mailbox durability unavailable")
+	}
+	if initialize {
+		for _, stmt := range []string{
+			"CREATE TABLE mailbox_binding (id INTEGER PRIMARY KEY CHECK(id=1), sealed BLOB NOT NULL)",
+			"CREATE TABLE inbound (grant_id TEXT NOT NULL, generation INTEGER NOT NULL, message_id TEXT NOT NULL, sealed BLOB NOT NULL, PRIMARY KEY(grant_id,generation,message_id))",
+		} {
+			if _, err = db.Exec(stmt); err != nil {
+				return nil, err
+			}
 		}
 	}
 	aad, _ := json.Marshal(binding)
 	var sealed []byte
 	err = db.QueryRow("SELECT sealed FROM mailbox_binding WHERE id=1").Scan(&sealed)
-	if errors.Is(err, sql.ErrNoRows) {
-		// An existing database must already have an authenticated immutable binding.
-		if statErr == nil {
-			return nil, errors.New("sharing mailbox binding missing")
-		}
+	if errors.Is(err, sql.ErrNoRows) && initialize {
 		sealed, err = m.seal([]byte("sharing-mailbox-v1"), aad)
 		if err != nil {
 			return nil, err
@@ -184,11 +233,9 @@ func openSharingMailbox(dir string, binding sharingMailboxBinding) (_ *sharingMa
 	if err != nil {
 		return nil, err
 	}
-	if err = syncSharingMailboxDir(dir); err != nil {
-		return nil, err
-	}
 	return m, nil
 }
+
 func (m *sharingMailbox) seal(plain, aad []byte) ([]byte, error) {
 	nonce := make([]byte, m.aead.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
@@ -234,6 +281,13 @@ func (m *sharingMailbox) put(ctx context.Context, record sharingMailboxRecord) e
 		return err
 	}
 	defer tx.Rollback()
+	var synchronous int
+	if err = tx.QueryRowContext(ctx, "PRAGMA synchronous").Scan(&synchronous); err != nil {
+		return err
+	}
+	if synchronous != 3 {
+		return errors.New("sharing mailbox durability unavailable")
+	}
 	var previous []byte
 	err = tx.QueryRowContext(ctx, "SELECT sealed FROM inbound WHERE grant_id=? AND generation=? AND message_id=?", msg.GrantID, msg.Generation, msg.ID).Scan(&previous)
 	if err == nil {

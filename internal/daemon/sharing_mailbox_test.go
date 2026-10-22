@@ -3,8 +3,11 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/sdk"
@@ -214,5 +217,150 @@ func TestSharingMailboxRetirePreservesHistory(t *testing.T) {
 	defer restarted.db.Close()
 	if _, err := restarted.load(context.Background(), "grant", 1, "message"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSharingMailboxInterruptedInitialization(t *testing.T) {
+	for _, stage := range []string{"empty", "schema", "bound"} {
+		t.Run(stage, func(t *testing.T) {
+			dir := t.TempDir()
+			binding := sharingMailboxBinding{"installation", "service", "tenant", "host"}
+			key, err := sharingMailboxKey(dir, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Simulate a process dying before the initialized temporary database is
+			// published. No established path has existed, and no receipt was ACKed.
+			temporary := filepath.Join(dir, ".inbound-interrupted")
+			if err := os.WriteFile(temporary, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if stage == "schema" {
+				db, err := sql.Open("sqlite", temporary)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = db.Exec("CREATE TABLE mailbox_binding (id INTEGER PRIMARY KEY, sealed BLOB NOT NULL)")
+				db.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if stage == "bound" {
+				// Build a complete unpublished database using the real initializer.
+				if err := os.Remove(temporary); err != nil {
+					t.Fatal(err)
+				}
+				unpublished, err := openSharingMailbox(filepath.Join(dir, "unpublished"), binding)
+				if err != nil {
+					t.Fatal(err)
+				}
+				unpublished.db.Close()
+				if err := os.Rename(filepath.Join(dir, "unpublished", "inbound.sqlite"), temporary); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dir, "inbound.sqlite")); !os.IsNotExist(err) {
+				t.Fatal("established database appeared before publication")
+			}
+			recovered, err := openSharingMailbox(dir, binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recovered.db.Close()
+			retained, err := os.ReadFile(filepath.Join(dir, "key"))
+			if err != nil || !bytes.Equal(key, retained) {
+				t.Fatal("interrupted initialization replaced existing key")
+			}
+			restarted, err := openSharingMailbox(dir, binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted.db.Close()
+		})
+	}
+}
+func TestSharingMailboxInitializationFailureDoesNotPublish(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inbound.sqlite")
+	interrupted := errors.New("interrupted before binding commit")
+	err := publishSharingMailboxDatabase(dir, path, func(temporary string) error {
+		db, err := sql.Open("sqlite", temporary)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		if _, err = db.Exec("CREATE TABLE mailbox_binding (id INTEGER PRIMARY KEY, sealed BLOB NOT NULL)"); err != nil {
+			return err
+		}
+		if _, err = os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("unbound database published during initialization")
+		}
+		return interrupted
+	})
+	if !errors.Is(err, interrupted) {
+		t.Fatalf("initialization failure: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("failed initialization left established unbound database")
+	}
+	recovered, err := openSharingMailbox(dir, sharingMailboxBinding{"installation", "service", "tenant", "host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered.db.Close()
+}
+
+func TestSharingMailboxEstablishedMissingBindingFailsClosed(t *testing.T) {
+	m, dir, binding, _ := mailboxFixture(t)
+	if _, err := m.db.Exec("DELETE FROM mailbox_binding"); err != nil {
+		t.Fatal(err)
+	}
+	m.db.Close()
+	if reopened, err := openSharingMailbox(dir, binding); err == nil {
+		reopened.db.Close()
+		t.Fatal("established missing binding regenerated")
+	}
+}
+func TestSharingMailboxExtraSynchronousEveryConnection(t *testing.T) {
+	m, _, _, record := mailboxFixture(t)
+	// Force database/sql to replace the physical connection between operations.
+	m.db.SetMaxIdleConns(0)
+	for i := 0; i < 3; i++ {
+		var synchronous int
+		if err := m.db.QueryRow("PRAGMA synchronous").Scan(&synchronous); err != nil || synchronous != 3 {
+			t.Fatalf("synchronous=%d err=%v", synchronous, err)
+		}
+		if err := m.put(context.Background(), record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.db.SetMaxIdleConns(1)
+	if _, err := m.db.Exec("PRAGMA synchronous=FULL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.put(context.Background(), record); err == nil {
+		t.Fatal("weakened synchronous mode acknowledged duplicate")
+	}
+}
+func TestPrepareSharingBridgeDirDurability(t *testing.T) {
+	stateDir := t.TempDir()
+	var synced []string
+	dir, err := prepareSharingBridgeDir(stateDir, "installation", func(path string) error {
+		if _, err := os.Stat(filepath.Join(stateDir, "sharing-bridges", "installation")); err != nil {
+			return err
+		}
+		synced = append(synced, path)
+		return syncSharingMailboxDir(path)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != filepath.Join(stateDir, "sharing-bridges", "installation") || !reflect.DeepEqual(synced, []string{stateDir, filepath.Join(stateDir, "sharing-bridges")}) {
+		t.Fatalf("directory sync chain: %v", synced)
+	}
+	failure := errors.New("directory fsync failed")
+	if _, err := prepareSharingBridgeDir(stateDir, "other", func(string) error { return failure }); !errors.Is(err, failure) {
+		t.Fatal("directory sync failure ignored")
 	}
 }
