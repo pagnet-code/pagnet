@@ -87,6 +87,12 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 	if _, err := domain.ParseID(p.RunnerID); err != nil {
 		return ErrNativeObservationConflict
 	}
+	if p.HostCredentialID != "" {
+		id, err := domain.ParseID(p.HostCredentialID)
+		if err != nil || id.String() != p.HostCredentialID {
+			return ErrNativeObservationConflict
+		}
+	}
 	negotiated := false
 	for _, feature := range p.ProtocolFeatures {
 		if feature == transport.NativeObservationReceiptProtocol {
@@ -97,7 +103,7 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		return errors.New("native observation receipts unavailable")
 	}
 	if c.session != nil {
-		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
+		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.HostCredentialID != p.HostCredentialID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
 			return ErrNativeObservationConflict
 		}
 		return nil
@@ -308,6 +314,8 @@ func (c *NativeObservationConnection) SessionConfirmed(p transport.NativeOriginS
 // AuthenticatedNativeHostSession returns an immutable copy of the authority
 // supplied by this exact authenticated server connection. Local CLI account
 // labels and cached worker journals cannot supply host account identities.
+// HostCredentialID pins the server-authenticated credential; older servers leave
+// it empty, so consumers requiring that pin must reject an empty value.
 func (c *NativeObservationConnection) AuthenticatedNativeHostSession() (transport.HostSessionPayload, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
