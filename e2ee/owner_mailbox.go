@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -39,12 +40,37 @@ type OwnerMailboxDescriptor struct {
 	RunnerID             string    `json:"runnerId"`
 	RunnerEpoch          time.Time `json:"runnerEpoch"`
 	HostCredentialID     string    `json:"hostCredentialId"`
-	Generation           uint64    `json:"generation"`
+	Generation           uint64    `json:"generation,string"`
 	BrowserX25519Pub     []byte    `json:"browserX25519Pub"`
 	HostX25519Pub        []byte    `json:"hostX25519Pub"`
 	HostEd25519Pub       []byte    `json:"hostEd25519Pub"`
 	IssuedAtUnixSeconds  uint64    `json:"issuedAtUnixSeconds"`
 	ExpiresAtUnixSeconds uint64    `json:"expiresAtUnixSeconds"`
+}
+
+// UnmarshalJSON requires a canonical decimal string for generation so browser
+// JSON parsing preserves every integer bit through MaxInt64.
+func (d *OwnerMailboxDescriptor) UnmarshalJSON(data []byte) error {
+	type descriptor OwnerMailboxDescriptor
+	var decoded descriptor
+	wire := struct {
+		*descriptor
+		Generation json.RawMessage `json:"generation"`
+	}{descriptor: &decoded}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	var text string
+	if err := json.Unmarshal(wire.Generation, &text); err != nil {
+		return errors.New("e2ee: owner mailbox generation must be a decimal string")
+	}
+	generation, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || generation == 0 || generation > math.MaxInt64 || strconv.FormatUint(generation, 10) != text {
+		return errors.New("e2ee: invalid owner mailbox generation")
+	}
+	decoded.Generation = generation
+	*d = OwnerMailboxDescriptor(decoded)
+	return nil
 }
 
 func ownerMailboxField(dst, field []byte) []byte {
@@ -131,6 +157,7 @@ func CreateOwnerMailboxBootstrap(d OwnerMailboxDescriptor, signer ed25519.Privat
 		return bootstrap, keys, errors.New("e2ee: owner mailbox signer mismatch")
 	}
 	plaintext := make([]byte, 64)
+	defer clear(plaintext)
 	if _, err := rand.Read(plaintext); err != nil {
 		return bootstrap, keys, err
 	}
@@ -164,6 +191,7 @@ func VerifyOwnerMailboxBootstrap(d OwnerMailboxDescriptor, bootstrap OwnerMailbo
 	if err != nil {
 		return keys, fmt.Errorf("e2ee: owner mailbox unwrap: %w", err)
 	}
+	defer clear(plaintext)
 	if len(plaintext) != 64 {
 		return keys, errors.New("e2ee: invalid owner mailbox key material")
 	}

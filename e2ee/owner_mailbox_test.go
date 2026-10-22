@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func ownerMailboxTestDescriptor(t *testing.T) (OwnerMailboxDescriptor, []byte, e
 		InstallationID: "00000000-0000-4000-8000-000000000003", ServiceID: "00000000-0000-4000-8000-000000000004",
 		HostID: "00000000-0000-4000-8000-000000000005", SessionID: "00000000-0000-4000-8000-000000000006",
 		RunnerID: "00000000-0000-4000-8000-000000000007", HostCredentialID: "00000000-0000-4000-8000-000000000008",
-		RunnerEpoch: time.Date(2026, 10, 22, 12, 34, 56, 123456000, time.UTC), Generation: 42,
+		RunnerEpoch: time.Date(2026, 10, 22, 12, 34, 56, 123456000, time.UTC), Generation: 9007199254740993,
 		BrowserX25519Pub: browser.PublicKey().Bytes(), HostX25519Pub: host.PublicKey().Bytes(), HostEd25519Pub: signer.Public().(ed25519.PublicKey),
 		IssuedAtUnixSeconds: 1792672496, ExpiresAtUnixSeconds: 1792673396,
 	}, browserPrivate, signer
@@ -311,5 +312,44 @@ func TestOwnerMailboxFrames(t *testing.T) {
 	_, nonce, err := ownerMailboxFrameCipher(key, OwnerMailboxSequenceLimit-1)
 	if err != nil || hex.EncodeToString(nonce) != "0000000000000000000fffff" {
 		t.Fatal("nonce encoding", err)
+	}
+}
+
+func TestOwnerMailboxGenerationJSON(t *testing.T) {
+	d, _, _ := ownerMailboxTestDescriptor(t)
+	for _, generation := range []uint64{1, 9007199254740993, math.MaxInt64} {
+		d.Generation = generation
+		data, err := json.Marshal(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		canonical := strconv.FormatUint(generation, 10)
+		if !bytes.Contains(data, []byte(`"generation":"`+canonical+`"`)) {
+			t.Fatal("generation must be a decimal JSON string")
+		}
+		var decoded OwnerMailboxDescriptor
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		before, err := EncodeOwnerMailboxDescriptor(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		after, err := EncodeOwnerMailboxDescriptor(decoded)
+		if err != nil || decoded.Generation != generation || !bytes.Equal(before, after) {
+			t.Fatal("generation round trip changed descriptor", err)
+		}
+	}
+	for _, value := range []string{`1`, `9007199254740993`, `null`, `""`, `"0"`, `"01"`, `"+1"`, `"-1"`, `"1.0"`, `"1e1"`, `" 1"`, `"9223372036854775808"`, `"18446744073709551616"`} {
+		t.Run(value, func(t *testing.T) {
+			var decoded OwnerMailboxDescriptor
+			if err := json.Unmarshal([]byte(`{"generation":`+value+`}`), &decoded); err == nil {
+				t.Fatal("accepted noncanonical generation")
+			}
+		})
+	}
+	var decoded OwnerMailboxDescriptor
+	if err := json.Unmarshal([]byte(`{}`), &decoded); err == nil {
+		t.Fatal("accepted missing generation")
 	}
 }
