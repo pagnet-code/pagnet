@@ -181,6 +181,8 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
+	sharingBridges *sharingBridgeSupervisor
+
 	nativeRegistry     *NativeWorkerRegistry
 	nativeWorkersMu    sync.Mutex
 	nativeConnectLocks [16]sync.Mutex
@@ -939,6 +941,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	defer releaseLock()
+	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	d.sharingBridges = newSharingBridgeSupervisor(d)
+	bridgeDone := make(chan struct{})
+	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-bridgeDone }()
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
 	// fail cleanly (not hang) while the host connection is down.
@@ -1027,6 +1034,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("boot_id", d.bootID)
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
@@ -1069,6 +1077,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
 	defer nativeConn.Close()
+	if d.sharingBridges != nil {
+		defer d.sharingBridges.disconnect()
+	}
 	d.connMu.Lock()
 	d.curConn = conn
 	d.nativeConn = nativeConn
@@ -1237,6 +1248,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				return fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				if d.sharingBridges != nil {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						d.sharingBridges.admit(session)
+					}
+				}
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
@@ -1516,6 +1532,26 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case sharingBridgeCommand:
+		var p struct {
+			InstallationID string `json:"installationId"`
+			CommandID      string `json:"commandId"`
+		}
+		if len(env.Payload) > 8192 || env.DecodePayload(&p) != nil {
+			return
+		}
+		if _, err := domain.ParseID(p.InstallationID); err != nil {
+			return
+		}
+		if d.sharingBridges == nil {
+			return
+		}
+		if err := d.sharingBridges.recordWake(p.InstallationID); err != nil {
+			return
+		}
+		if p.CommandID != "" {
+			_ = d.sendAck(conn, p.CommandID, "")
+		}
 	case transport.MsgNativeWorkerRecoveryState:
 		var p transport.NativeWorkerRecoveryState
 		if len(env.Payload) > 8192 || env.DecodePayload(&p) != nil {

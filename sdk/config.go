@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 )
 
@@ -45,6 +46,11 @@ const (
 //     connection; the SDK stops reconnecting with a clear error (a dead
 //     credential cannot be fixed by retrying).
 type Config struct {
+	// ExpectedPrincipalID optionally binds this connection to a known principal.
+	// It reuses that principal's persisted crypto identity across credential
+	// rotations and rejects a different auth_ok identity before persistence.
+	ExpectedPrincipalID string
+
 	// Server is the control-plane base URL (https://app.pagnet.dev or a
 	// self-hosted origin). Required.
 	Server string
@@ -85,6 +91,12 @@ func ConfigFromEnv() Config {
 // same function (same error style, same PAGNET_INSECURE_REMOTE_HTTP opt-in;
 // the SDK has no CLI flag, so the flag half is false).
 func (c Config) Validate() error {
+	if c.ExpectedPrincipalID != "" {
+		if _, err := domain.ParseID(c.ExpectedPrincipalID); err != nil {
+			return fmt.Errorf("sdk: ExpectedPrincipalID must be a principal ID")
+		}
+	}
+
 	if strings.TrimSpace(c.Server) == "" {
 		return fmt.Errorf("sdk: Server is required (set Config.Server or %s)", EnvServer)
 	}
