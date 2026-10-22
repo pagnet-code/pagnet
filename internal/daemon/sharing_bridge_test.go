@@ -44,6 +44,9 @@ type bridgeFixture struct {
 	claims, lists, connects int
 	loseClaim, loseExchange bool
 	staleProof              bool
+	connectFailures         int
+	listStatus              int
+	listFailures            int
 	endpoints               []*bridgeTestEndpoint
 }
 
@@ -59,6 +62,10 @@ func newBridgeFixture(t *testing.T) (*bridgeFixture, *sharingBridgeSupervisor) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.connects++
+		if f.connectFailures > 0 {
+			f.connectFailures--
+			return nil, errors.New("temporary SDK connect failure")
+		}
 		if f.loseExchange {
 			f.loseExchange = false
 			return nil, errors.New("exchange response lost")
@@ -88,6 +95,15 @@ func (f *bridgeFixture) serve(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == http.MethodGet {
 		f.lists++
+		if f.listStatus != 0 {
+			http.Error(w, "", f.listStatus)
+			return
+		}
+		if f.listFailures > 0 {
+			f.listFailures--
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
 		all := []sharingBridgeInstallation{}
 		if f.present {
 			v := f.installation
@@ -348,4 +364,69 @@ func TestSharingBridgeStaleRunnerProofDoesNotRetireLiveInstallation(t *testing.T
 	f.staleProof = false
 	f.mu.Unlock()
 	s.signal()
+}
+
+func TestSharingBridgeRecoversAfterRepeatedConnectFailures(t *testing.T) {
+	f, s := newBridgeFixture(t)
+	f.connectFailures = 7
+	startBridgeTest(t, s)
+	awaitBridge(t, f.ready)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.connects != 8 {
+		t.Fatalf("connect attempts = %d, want 8", f.connects)
+	}
+	if f.lists != 1 {
+		t.Fatalf("recovery required an unrelated reconcile: list calls = %d", f.lists)
+	}
+}
+
+func TestSharingBridgeUnsupportedRecoveryListStaysDormant(t *testing.T) {
+	for _, trigger := range []string{"reconnect", "command"} {
+		t.Run(trigger, func(t *testing.T) {
+			f, s := newBridgeFixture(t)
+			f.present = false
+			f.listStatus = http.StatusNotFound
+			startBridgeTest(t, s)
+			awaitBridge(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.lists >= 1 })
+			time.Sleep(40 * time.Millisecond)
+			f.mu.Lock()
+			calls := f.lists
+			f.mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("unsupported recovery endpoint was polled %d times", calls)
+			}
+			if trigger == "reconnect" {
+				s.disconnect()
+				s.admit(transport.HostSessionPayload{RunnerID: domain.NewID().String(), RunnerEpoch: time.Now()})
+			} else if err := s.recordWake(f.installation.ID); err != nil {
+				t.Fatal(err)
+			}
+			awaitBridge(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.lists >= 2 })
+			time.Sleep(40 * time.Millisecond)
+			f.mu.Lock()
+			calls = f.lists
+			f.listStatus = 0
+			f.mu.Unlock()
+			if calls != 2 {
+				t.Fatalf("explicit wake resumed idle polling: calls = %d", calls)
+			}
+			if err := s.recordWake(f.installation.ID); err != nil {
+				t.Fatal(err)
+			}
+			awaitBridge(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.lists >= 3 })
+		})
+	}
+}
+
+func TestSharingBridgeRecoveryListRetriesTransientErrors(t *testing.T) {
+	f, s := newBridgeFixture(t)
+	f.listFailures = 1
+	startBridgeTest(t, s)
+	awaitBridge(t, f.ready)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lists != 2 {
+		t.Fatalf("transient recovery list failure did not retry: calls = %d", f.lists)
+	}
 }

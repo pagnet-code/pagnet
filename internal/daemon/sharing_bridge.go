@@ -115,7 +115,9 @@ func (s *sharingBridgeSupervisor) run(ctx context.Context) {
 			continue
 		}
 		if err := s.reconcile(ctx); err != nil {
-			if ctx.Err() == nil {
+			// An older server may not implement recovery listing. Stay dormant
+			// until the next host connection or explicit bridge command.
+			if ctx.Err() == nil && err != sharingBridgeHTTPError(http.StatusNotFound) {
 				retry = time.After(s.retry)
 			}
 		}
@@ -372,7 +374,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 	var lease time.Time
 	var endpoint sharingBridgeEndpoint
 	var leaseTimer *time.Timer
-	failures := 0
+	connectRetry := s.retry
 	wait := func(delay time.Duration) bool {
 		t := time.NewTimer(delay)
 		defer t.Stop()
@@ -509,13 +511,10 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 				// An exchange can commit without delivering auth_ok. A new claim will
 				// rotate that unreachable credential on the next attempt.
 				needClaim = true
-				failures++
-				if failures >= 5 {
+				if !wait(connectRetry) {
 					return
 				}
-				if !wait(s.retry) {
-					return
-				}
+				connectRetry = min(connectRetry*2, 30*time.Second)
 				continue
 			}
 			if candidate.PrincipalID() != v.ServiceID {
@@ -528,7 +527,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 			}
 			closeEndpoint()
 			endpoint = candidate
-			failures = 0
+			connectRetry = s.retry
 			needClaim = false
 			endpoint.EnableSharingPairs()
 		}
