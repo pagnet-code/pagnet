@@ -25,6 +25,7 @@ type sharingCoordinator struct {
 	blocked       map[string]bool
 	full          bool
 	handler       func(context.Context, SharingMessage) error
+	ready         func()
 	ctx           context.Context
 	cancel        context.CancelFunc
 	connection    int64
@@ -65,6 +66,28 @@ func (c *Client) EnableSharingPairs() {
 		return
 	}
 	c.kickSharingCoordinatorLocked(c.ensureSharingCoordinatorLocked())
+}
+
+// OnSharingPairReady registers a nonblocking local wake after pair authority is
+// ready, including reconnect reconciliation. It performs no idle polling.
+func (c *Client) OnSharingPairReady(handler func()) {
+	c.sharingMu.Lock()
+	defer c.sharingMu.Unlock()
+	if c.closed.Load() {
+		return
+	}
+	s := c.ensureSharingCoordinatorLocked()
+	s.ready = handler
+	c.kickSharingCoordinatorLocked(s)
+}
+func (c *Client) notifySharingPairReady(s *sharingCoordinator, job sharingReconcileJob) {
+	c.sharingMu.Lock()
+	ready := s.ready
+	current := s.ctx == job.ctx && s.connection == job.connection
+	c.sharingMu.Unlock()
+	if current && ready != nil && job.ctx.Err() == nil {
+		func() { defer func() { _ = recover() }(); ready() }()
+	}
 }
 
 func (c *Client) ensureSharingCoordinatorLocked() *sharingCoordinator {
@@ -351,6 +374,9 @@ func (c *Client) reconcileSharingGrant(s *sharingCoordinator, job sharingReconci
 			_, err = c.sharingMessageSession(job.ctx, grant)
 		}
 		if !errors.Is(err, errSharingConnectionProofRequired) || job.ctx.Err() != nil {
+			if err == nil {
+				c.notifySharingPairReady(s, job)
+			}
 			return err
 		}
 	}
@@ -361,6 +387,7 @@ func (c *Client) reconcileSharingGrant(s *sharingCoordinator, job sharingReconci
 	if result.Pending || job.ctx.Err() != nil {
 		return job.ctx.Err()
 	}
+	c.notifySharingPairReady(s, job)
 	c.sharingMu.Lock()
 	handler = s.handler
 	current = s.ctx == job.ctx && s.connection == job.connection

@@ -53,12 +53,13 @@ type sharingBridgeRuntime struct {
 	wake   chan struct{}
 }
 type sharingBridgeSupervisor struct {
-	daemon  *Daemon
-	http    *http.Client
-	connect func(context.Context, sdk.Config) (sharingBridgeEndpoint, error)
-	mu      sync.Mutex
-	session *transport.HostSessionPayload
-	wake    chan struct{}
+	daemon   *Daemon
+	http     *http.Client
+	connect  func(context.Context, sdk.Config) (sharingBridgeEndpoint, error)
+	mu       sync.Mutex
+	session  *transport.HostSessionPayload
+	outbound map[string]*sharingOutboundWorker
+	wake     chan struct{}
 	// owned by run only
 	running map[string]*sharingBridgeRuntime
 	retry   time.Duration
@@ -386,6 +387,23 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		return
 	}
 	defer mailbox.db.Close()
+	outbound := newSharingOutboundWorker(mailbox)
+	outboundCtx, stopOutbound := context.WithCancel(ctx)
+	outboundDone := make(chan struct{})
+	go func() { defer close(outboundDone); outbound.run(outboundCtx) }()
+	s.mu.Lock()
+	if s.outbound == nil {
+		s.outbound = map[string]*sharingOutboundWorker{}
+	}
+	s.outbound[v.ID] = outbound
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.outbound, v.ID)
+		s.mu.Unlock()
+		stopOutbound()
+		<-outboundDone
+	}()
 	sdkDir := filepath.Join(dir, "sdk")
 	generation := v.CredentialGeneration
 	saved := sharingBridgeState{}
@@ -422,6 +440,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		}
 	}()
 	closeEndpoint := func() {
+		outbound.setEndpoint(nil)
 		if leaseTimer != nil {
 			leaseTimer.Stop()
 			leaseTimer = nil
@@ -562,6 +581,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 			connectRetry = s.retry
 			needClaim = false
 			endpoint.OnSharingMessage(mailbox.receive)
+			outbound.setEndpoint(endpoint)
 		}
 		// The independent deadline closes transport even while an HTTP operation
 		// is blocked. A failed renewal cannot keep an endpoint past its authority.
@@ -578,6 +598,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 			return
 		case <-r.wake:
 			t.Stop()
+			outbound.signal()
 		case <-endpoint.Done():
 			t.Stop()
 			closeEndpoint()
@@ -585,4 +606,34 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		case <-t.C:
 		}
 	}
+}
+
+// Internal owner operations. A future caller must establish MANUAL ownership
+// before selecting an installation; no transport route is installed here.
+func (s *sharingBridgeSupervisor) submitOutbound(ctx context.Context, installation string, in sharingOutboundInput) (sharingOutboundRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	worker := s.outbound[installation]
+	if worker == nil {
+		return sharingOutboundRecord{}, errors.New("sharing outbound installation unavailable")
+	}
+	return worker.submit(ctx, in)
+}
+func (s *sharingBridgeSupervisor) outboundStatus(ctx context.Context, installation, operation string) (sharingOutboundRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	worker := s.outbound[installation]
+	if worker == nil {
+		return sharingOutboundRecord{}, errors.New("sharing outbound installation unavailable")
+	}
+	return worker.mailbox.outboundStatus(ctx, operation)
+}
+func (s *sharingBridgeSupervisor) retryOutbound(ctx context.Context, installation, operation string) (sharingOutboundRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	worker := s.outbound[installation]
+	if worker == nil {
+		return sharingOutboundRecord{}, errors.New("sharing outbound installation unavailable")
+	}
+	return worker.retry(ctx, operation)
 }

@@ -495,3 +495,31 @@ func TestSharingCoordinatorFailurePreservesNewerTrigger(t *testing.T) {
 		})
 	}
 }
+
+func TestSharingCoordinatorPairReadyCallback(t *testing.T) {
+	f, issuer, _ := coordinatorClients(t, true)
+	var ready atomic.Int32
+	issuer.OnSharingPairReady(func() { ready.Add(1) })
+	waitSharing(t, func() bool { return ready.Load() > 0 })
+	// A fresh connection must notify again after reestablishing pair authority.
+	before := ready.Load()
+	issuer.sharingPairLive()
+	waitSharing(t, func() bool { return ready.Load() > before })
+	f.mu.Lock()
+	calls := f.calls
+	f.mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	f.mu.Lock()
+	after := f.calls
+	f.mu.Unlock()
+	if calls != after {
+		t.Fatal("pair ready callback introduced idle polling")
+	}
+	// Callback failure cannot terminate the coordinator.
+	issuer.OnSharingPairReady(func() { panic("local callback") })
+	time.Sleep(30 * time.Millisecond)
+	issuer.OnSharingPairReady(func() { ready.Add(1) })
+	before = ready.Load()
+	issuer.EnableSharingPairs()
+	waitSharing(t, func() bool { return ready.Load() > before })
+}

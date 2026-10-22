@@ -233,6 +233,9 @@ func openSharingMailboxDatabase(path string, aead cipher.AEAD, binding sharingMa
 	if err != nil {
 		return nil, err
 	}
+	if _, err = db.Exec("CREATE TABLE IF NOT EXISTS outbound (operation_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, sealed BLOB NOT NULL)"); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
