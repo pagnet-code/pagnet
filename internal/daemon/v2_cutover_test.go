@@ -494,7 +494,10 @@ func TestDaemon_UpgradeRequiredStopsConnection(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := d.connectAndRun(ctx)
+		connectedAt, err := d.connectAndRun(ctx)
+		if connectedAt.IsZero() {
+			t.Fatal("successful WebSocket upgrade did not record connectedAt")
+		}
 		if !errors.Is(err, ErrOutdated) {
 			t.Fatalf("connectAndRun = %v, want ErrOutdated", err)
 		}

@@ -174,3 +174,69 @@ func TestNativeObservationSessionConfirmationRequiresLiveProofAndExactReceipt(t 
 		})
 	}
 }
+
+func TestNativeObservationConnectionPinsAuthenticatedHostCredential(t *testing.T) {
+	host, boot, runner := domain.NewID().String(), domain.NewID().String(), domain.NewID().String()
+	credential := "00000000-0000-4000-8000-00000000abcd"
+	admission := transport.HostSessionPayload{TenantID: host, AccountID: host, OwnershipScope: "personal", NativeAdmissionID: runner, HostID: host, HostCredentialID: credential, BootID: boot, RunnerID: runner, RunnerEpoch: time.Now().UTC(), ProtocolFeatures: []string{transport.NativeObservationReceiptProtocol}}
+	newConnection := func() *NativeObservationConnection {
+		return NewNativeObservationConnection("https://example.test", host, boot, nil)
+	}
+	for _, invalid := range []string{"invalid", "0000000000004000800000000000abcd", "00000000-0000-4000-8000-00000000ABCD", "urn:uuid:" + credential} {
+		wrong := admission
+		wrong.HostCredentialID = invalid
+		if err := newConnection().Admit(wrong); !errors.Is(err, ErrNativeObservationConflict) {
+			t.Fatal("noncanonical credential admitted", invalid, err)
+		}
+	}
+	conn := newConnection()
+	if err := conn.Admit(admission); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Admit(admission); err != nil {
+		t.Fatal("exact repeat rejected", err)
+	}
+	for _, mismatch := range []string{"", domain.NewID().String()} {
+		wrong := admission
+		wrong.HostCredentialID = mismatch
+		if err := conn.Admit(wrong); !errors.Is(err, ErrNativeObservationConflict) {
+			t.Fatal("credential pin changed on same connection", err)
+		}
+	}
+	retained, err := conn.AuthenticatedNativeHostSession()
+	if err != nil || retained.HostCredentialID != credential {
+		t.Fatal("authenticated credential not retained", err)
+	}
+	retained.HostCredentialID = domain.NewID().String()
+	retained.ProtocolFeatures[0] = "modified"
+	retained, err = conn.AuthenticatedNativeHostSession()
+	if err != nil || retained.HostCredentialID != credential || retained.ProtocolFeatures[0] != transport.NativeObservationReceiptProtocol {
+		t.Fatal("accessor mutated authenticated authority", err)
+	}
+	conn.Close()
+	if _, err := conn.AuthenticatedNativeHostSession(); !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+		t.Fatal("closed connection retained credential authority", err)
+	}
+	admission.HostCredentialID = domain.NewID().String()
+	reconnected := newConnection()
+	if err := reconnected.Admit(admission); err != nil {
+		t.Fatal("replacement credential rejected on new connection", err)
+	}
+	retained, err = reconnected.AuthenticatedNativeHostSession()
+	if err != nil || retained.HostCredentialID != admission.HostCredentialID {
+		t.Fatal("reconnect inherited previous credential", err)
+	}
+	admission.HostCredentialID = ""
+	legacy := newConnection()
+	if err := legacy.Admit(admission); err != nil {
+		t.Fatal("older server lost native admission", err)
+	}
+	retained, err = legacy.AuthenticatedNativeHostSession()
+	if err != nil || retained.HostCredentialID != "" {
+		t.Fatal("older server manufactured credential pin", err)
+	}
+	admission.HostCredentialID = credential
+	if err := legacy.Admit(admission); !errors.Is(err, ErrNativeObservationConflict) {
+		t.Fatal("legacy connection upgraded credential pin", err)
+	}
+}

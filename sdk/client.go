@@ -167,7 +167,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	priv, principalID, err := kr.loadOrCreateIdentity(cfg.Credential)
+	priv, principalID, err := kr.loadBoundIdentity(cfg.Credential, cfg.ExpectedPrincipalID)
 	if err != nil {
 		return nil, err
 	}
@@ -972,6 +972,9 @@ func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 	}
 	if _, err := domain.ParseID(p.PrincipalID); err != nil {
 		return fmt.Errorf("sdk: server returned a malformed principalId: %w", err)
+	}
+	if c.cfg.ExpectedPrincipalID != "" && p.PrincipalID != c.cfg.ExpectedPrincipalID {
+		return errors.New("sdk: authenticated principal does not match ExpectedPrincipalID")
 	}
 	c.principalID.Store(p.PrincipalID)
 	c.endpointID.Store(p.EndpointID)

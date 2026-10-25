@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
@@ -433,20 +434,18 @@ func (d *Daemon) pumpNativeBridge(ctx context.Context, link *nativeWorkerLink) {
 	}
 }
 
-func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeObservationConnection) {
-	if d.nativeRegistry == nil {
-		return
-	}
-	// Recovery retries every two seconds across multiple workers. Keep the
-	// last failure per instance so a reserved worker's failure stays visible
-	// without filling the daemon log on every retry.
+// nativeRecoveryFailureReporter tracks failures for one recovery connection.
+// Admission can briefly be deferred while a fresh runner epoch prepares.
+func nativeRecoveryFailureReporter(log *slog.Logger, now func() time.Time) func(string, error) {
 	type recoveryFailure struct {
 		fingerprint [sha256.Size]byte
+		firstSeen   time.Time
 		loggedAt    time.Time
+		level       slog.Level
 	}
 	var failuresMu sync.Mutex
 	failures := make(map[string]recoveryFailure)
-	reportFailure := func(instanceID string, err error) {
+	return func(instanceID string, err error) {
 		failuresMu.Lock()
 		defer failuresMu.Unlock()
 		if err == nil {
@@ -454,13 +453,21 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 			return
 		}
 		fingerprint := sha256.Sum256([]byte(err.Error()))
-		now := time.Now()
+		at := now()
 		previous, exists := failures[instanceID]
-		if exists && previous.fingerprint == fingerprint && now.Sub(previous.loggedAt) < time.Minute {
+		firstSeen := previous.firstSeen
+		if !exists {
+			firstSeen = at
+		}
+		level := slog.LevelWarn
+		if errors.Is(err, ErrNativeOriginAdmissionDeferred) && at.Sub(firstSeen) < 5*time.Second {
+			level = slog.LevelDebug
+		}
+		if exists && previous.fingerprint == fingerprint && previous.level == level && at.Sub(previous.loggedAt) < time.Minute {
 			return
 		}
-		failures[instanceID] = recoveryFailure{fingerprint: fingerprint, loggedAt: now}
-		if d.Log != nil {
+		failures[instanceID] = recoveryFailure{fingerprint: fingerprint, firstSeen: firstSeen, loggedAt: at, level: level}
+		if log != nil {
 			// Arbitrary errors can contain worker paths or configuration. Only
 			// emit known sentinel messages, falling back to the error's type.
 			category := fmt.Sprintf("%T", err)
@@ -470,9 +477,19 @@ func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeOb
 					break
 				}
 			}
-			d.Log.Warn("native session worker recovery failed", "instance", instanceID, "error_category", category)
+			log.Log(context.Background(), level, "native session worker recovery failed", "instance", instanceID, "error_category", category)
 		}
 	}
+}
+
+func (d *Daemon) recoverNativeWorkers(conn *websocket.Conn, connection *NativeObservationConnection) {
+	if d.nativeRegistry == nil {
+		return
+	}
+	// Recovery retries every two seconds across multiple workers. Keep the
+	// last failure per instance so a reserved worker's failure stays visible
+	// without filling the daemon log on every retry.
+	reportFailure := nativeRecoveryFailureReporter(d.Log, time.Now)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {

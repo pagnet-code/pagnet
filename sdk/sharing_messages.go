@@ -27,6 +27,9 @@ type SharingMessageRequest struct {
 	MessageID string
 	Parts     []MessagePart
 	ReplyTo   *SharingMessage
+	// ExpectedGeneration, when positive, must match current pair authority.
+	// Zero selects the current generation; negative values are invalid.
+	ExpectedGeneration int64
 }
 
 // PreparedSharingMessage is a durable retry handle; it contains no plaintext.
@@ -39,8 +42,54 @@ type PreparedSharingMessage struct {
 // GrantID identifies the pair whose durable reservation this handle represents.
 func (p PreparedSharingMessage) GrantID() string { return p.state.Binding.GrantID }
 
-// CanRetry is false for incomplete or rejected reservations.
-func (p PreparedSharingMessage) CanRetry() bool { return p.state.WireBytes > 0 && !p.state.Rejected }
+// Generation identifies the pair generation of the durable reservation.
+func (p PreparedSharingMessage) Generation() int64 { return int64(p.state.Binding.Generation) }
+
+// CanRetry is false for incomplete, admitted, or rejected reservations.
+func (p PreparedSharingMessage) CanRetry() bool { return p.state.WireBytes > 0 && !p.state.Retired }
+
+// SharingMessageDisposition is the durable local reservation's progress.
+type SharingMessageDisposition string
+
+const (
+	SharingMessageIncomplete SharingMessageDisposition = "incomplete"
+	SharingMessagePrepared   SharingMessageDisposition = "prepared"
+	SharingMessageAdmitted   SharingMessageDisposition = "admitted"
+	SharingMessageRejected   SharingMessageDisposition = "rejected"
+)
+
+// SharingMessageLocalState describes a principal's durable local reservation.
+// Prepared is identity metadata only for admitted and rejected tombstones.
+type SharingMessageLocalState struct {
+	Disposition SharingMessageDisposition
+	Prepared    PreparedSharingMessage
+}
+
+// LookupSharingMessage authenticates local state without network access or an
+// active pair. A returned handle grants no authority to send or fetch receipts.
+func (c *Client) LookupSharingMessage(messageID string) (SharingMessageLocalState, bool, error) {
+	var out SharingMessageLocalState
+	principal := c.principalID.Load()
+	state, found, err := c.kr.lookupPairMessage(principal, messageID)
+	if err != nil || !found {
+		return out, false, err
+	}
+	if c.principalID.Load() != principal {
+		return out, false, errors.New("sdk: message lookup principal changed")
+	}
+	out.Prepared = PreparedSharingMessage{messageID, state}
+	switch {
+	case state.Rejected:
+		out.Disposition = SharingMessageRejected
+	case state.Retired:
+		out.Disposition = SharingMessageAdmitted
+	case state.WireBytes > 0:
+		out.Disposition = SharingMessagePrepared
+	default:
+		out.Disposition = SharingMessageIncomplete
+	}
+	return out, true, nil
+}
 
 // AbortPreparedSharingMessage releases an incomplete reservation that could
 // never have been sent. Its tombstone continues to reject conflicting ID reuse.
@@ -66,6 +115,81 @@ type SharingMessage struct {
 	Message
 	CorrelationID *string
 	wire          *pairMessageWire
+}
+
+const maxSharingReplyMaterialBytes = 65536
+
+// ExportReplyMaterial returns opaque, encrypted material for persisting a received
+// message as a reply predecessor. Public field edits are not exported. Restore
+// with ImportReceivedSharingMessage, which rechecks the current pair authority.
+func (m SharingMessage) ExportReplyMaterial() ([]byte, error) {
+	if m.wire == nil {
+		return nil, errors.New("sdk: sharing reply material requires a received message")
+	}
+	raw, err := json.Marshal(m.wire)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxSharingReplyMaterialBytes {
+		return nil, errors.New("sdk: sharing reply material exceeds limit")
+	}
+	return raw, nil
+}
+
+// ImportReceivedSharingMessage authenticates persisted reply material against
+// the currently authorized pair and reconstructs its received message. It does
+// not receive or acknowledge a server inbox message.
+func (c *Client) ImportReceivedSharingMessage(ctx context.Context, grantID string, opaque []byte) (SharingMessage, error) {
+	var out SharingMessage
+	if len(opaque) == 0 || len(opaque) > maxSharingReplyMaterialBytes {
+		return out, errors.New("sdk: invalid sharing reply material size")
+	}
+	s, err := c.sharingMessageSession(ctx, grantID)
+	if err != nil {
+		return out, err
+	}
+	if len(opaque) > s.status.Limits.MaxMessageWireBytes {
+		return out, errors.New("sdk: sharing reply material exceeds pair limit")
+	}
+	var wire pairMessageWire
+	decoder := json.NewDecoder(bytes.NewReader(opaque))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return out, err
+	}
+	canonical, err := json.Marshal(wire)
+	if err != nil || !bytes.Equal(canonical, opaque) {
+		return out, errors.New("sdk: noncanonical sharing reply material")
+	}
+	out, err = receivedSharingMessage(wire, s)
+	if err != nil {
+		return SharingMessage{}, err
+	}
+	if !s.current(c) {
+		return SharingMessage{}, errors.New("sdk: sharing connection changed")
+	}
+	return out, nil
+}
+
+func receivedSharingMessage(wire pairMessageWire, s sharingMessageSession) (SharingMessage, error) {
+	if err := validateSharingWire(wire, s, true); err != nil {
+		return SharingMessage{}, err
+	}
+	plain, err := e2ee.Decrypt(wire.Envelope, s.key, wire.AAD)
+	if err != nil {
+		return SharingMessage{}, err
+	}
+	parts, err := decodeSharingContent(plain, wire)
+	if err != nil {
+		return SharingMessage{}, err
+	}
+	created, _ := time.Parse(time.RFC3339Nano, wire.AAD.CreatedAt)
+	var correlation *string
+	if wire.CorrelationID != nil {
+		value := *wire.CorrelationID
+		correlation = &value
+	}
+	return SharingMessage{GrantID: wire.GrantID, Generation: wire.Generation, Message: Message{ID: wire.ID, NetworkID: wire.NetworkID, ThreadID: wire.ThreadID, Kind: wire.Kind, SenderPrincipalID: wire.SenderPrincipalID, RecipientPrincipalID: wire.RecipientPrincipalID, Parts: parts, CreatedAt: created}, CorrelationID: correlation, wire: &wire}, nil
 }
 
 // Pair causality is inside the authenticated ciphertext: the outer canonical
@@ -239,9 +363,15 @@ func (c *Client) sharingMessageSession(ctx context.Context, grant string) (shari
 
 func (c *Client) PrepareSharingMessage(ctx context.Context, req SharingMessageRequest) (PreparedSharingMessage, error) {
 	var out PreparedSharingMessage
+	if req.ExpectedGeneration < 0 {
+		return out, errors.New("sdk: invalid expected sharing generation")
+	}
 	s, err := c.sharingMessageSession(ctx, req.GrantID)
 	if err != nil {
 		return out, err
+	}
+	if req.ExpectedGeneration > 0 && req.ExpectedGeneration != s.status.Generation {
+		return out, errors.New("sdk: expected sharing generation mismatch")
 	}
 	plain, err := domain.EncodeMessageContent(req.Parts)
 	if err != nil {
@@ -319,7 +449,7 @@ func validPairUUID(id string) bool {
 }
 func checkPrepared(s sharingMessageSession, p PreparedSharingMessage) error {
 	b := p.state.Binding
-	if p.MessageID != b.MessageID || !b.valid() || b.PrincipalID != s.principal || b.GrantID != s.status.GrantID || b.Generation != uint64(s.status.Generation) || b.NetworkID != s.status.NetworkID || p.state.WireBytes == 0 || p.state.Rejected {
+	if p.MessageID != b.MessageID || !b.valid() || b.PrincipalID != s.principal || b.GrantID != s.status.GrantID || b.Generation != uint64(s.status.Generation) || b.NetworkID != s.status.NetworkID || p.state.WireBytes == 0 || p.state.Retired {
 		return errors.New("sdk: prepared sharing message binding mismatch")
 	}
 	return nil
@@ -517,20 +647,10 @@ func (c *Client) ReceiveSharingMessages(ctx context.Context, grant string, handl
 				return errors.New("sdk: unordered sharing inbox")
 			}
 			previous = wire.ID
-			if err := validateSharingWire(wire, s, true); err != nil {
-				return err
-			}
-			plain, err := e2ee.Decrypt(wire.Envelope, s.key, wire.AAD)
+			m, err := receivedSharingMessage(wire, s)
 			if err != nil {
 				return err
 			}
-			parts, err := decodeSharingContent(plain, wire)
-			if err != nil {
-				return err
-			}
-			created, _ := time.Parse(time.RFC3339Nano, wire.AAD.CreatedAt)
-			copyWire := wire
-			m := SharingMessage{GrantID: grant, Generation: wire.Generation, Message: Message{ID: wire.ID, NetworkID: wire.NetworkID, ThreadID: wire.ThreadID, Kind: wire.Kind, SenderPrincipalID: wire.SenderPrincipalID, RecipientPrincipalID: wire.RecipientPrincipalID, Parts: parts, CreatedAt: created}, CorrelationID: wire.CorrelationID, wire: &copyWire}
 			if err := invokeSharingHandler(ctx, handler, m); err != nil {
 				return err
 			}

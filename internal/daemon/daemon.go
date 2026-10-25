@@ -181,6 +181,10 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
+	sharingBridges   *sharingBridgeSupervisor
+	ownerMailboxMu   sync.Mutex
+	ownerMailboxUsed map[string]time.Time
+
 	nativeRegistry     *NativeWorkerRegistry
 	nativeWorkersMu    sync.Mutex
 	nativeConnectLocks [16]sync.Mutex
@@ -939,6 +943,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	defer releaseLock()
+	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	d.sharingBridges = newSharingBridgeSupervisor(d)
+	bridgeDone := make(chan struct{})
+	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-bridgeDone }()
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
 	// fail cleanly (not hang) while the host connection is down.
@@ -947,7 +956,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	backoff := time.Second
 	for ctx.Err() == nil {
-		err := d.connectAndRun(ctx)
+		connectedAt, err := d.connectAndRun(ctx)
+		backoff = reconnectBackoff(backoff, connectedAt, time.Now())
 		if d.unenrolled {
 			// The control plane removed/revoked this host (live
 			// host.unenrolled, or an auth-rejected dial): the credential
@@ -997,6 +1007,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return nil
 }
 
+// reconnectBackoff clears failure history only after a stable upgraded connection.
+// A zero connectedAt means the attempt never established a WebSocket.
+func reconnectBackoff(backoff time.Duration, connectedAt, now time.Time) time.Duration {
+	if !connectedAt.IsZero() && now.Sub(connectedAt) >= time.Minute {
+		return time.Second
+	}
+	return backoff
+}
+
 // isAuthReject reports whether a dial error is an auth rejection (401/403)
 // from the control plane — the daemon's credential is dead, not a network
 // problem, so reconnecting cannot help.
@@ -1027,6 +1046,8 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("boot_id", d.bootID)
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
+	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
@@ -1049,26 +1070,41 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	return u.String()
 }
 
-func (d *Daemon) connectAndRun(ctx context.Context) error {
+func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err error) {
 	// Re-check the HTTPS policy on every (re)connect: New checked it at
 	// construction, but this is the actual dial — a defense-in-depth
 	// guard so no code path can ever open a plain-HTTP non-loopback
 	// control-plane connection.
 	if err := netpolicy.Check(d.ServerURL, d.InsecureRemoteHTTP); err != nil {
-		return err
+		return connectedAt, err
 	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(ctx), hdr)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)
+			return connectedAt, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)
 		}
-		return err
+		return connectedAt, err
 	}
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
 	defer nativeConn.Close()
+	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
+		env, err := transport.NewEnvelope(typ, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		return d.write(conn, raw)
+	})
+	defer ownerMailboxes.close()
+	if d.sharingBridges != nil {
+		defer d.sharingBridges.disconnect()
+	}
 	d.connMu.Lock()
 	d.curConn = conn
 	d.nativeConn = nativeConn
@@ -1079,6 +1115,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 		d.nativeConn = nil
 		d.connMu.Unlock()
 	}()
+	connectedAt = time.Now()
 	d.Log.Info("connected to control plane")
 
 	// Transport liveness (WAVE 2): the daemon sends a websocket PING every
@@ -1165,7 +1202,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return connectedAt, ctx.Err()
 		default:
 		}
 		// Transport liveness (WAVE 2): bound how long the read may wait for
@@ -1183,7 +1220,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				// reconnect loop in Run dials a fresh connection.
 				d.Log.Warn("host connection read timeout (no data from control plane); reconnecting",
 					"timeout", d.readTimeout)
-				return err
+				return connectedAt, err
 			}
 			var closeErr *websocket.CloseError
 			if errors.As(err, &closeErr) && closeErr.Code == transport.CloseCodeSuperseded {
@@ -1192,9 +1229,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				// (a second daemon was started). Stop: reconnecting
 				// would only fight the other daemon forever.
 				d.superseded = true
-				return ErrSuperseded
+				return connectedAt, ErrSuperseded
 			}
-			return err
+			return connectedAt, err
 		}
 		var env transport.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
@@ -1211,7 +1248,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			d.outdated = true
 			d.Log.Error("protocol upgrade required — stopping", "required", env.ProtocolVersion, "have", transport.ProtocolVersion)
 			fmt.Fprintln(os.Stderr, "pagnet: "+transport.UpgradeRequiredMessage)
-			return ErrOutdated
+			return connectedAt, ErrOutdated
 		}
 		if env.Type == transport.MsgUpgradeRequired {
 			// protocol.upgrade_required/v1: the server's explicit "your
@@ -1220,7 +1257,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			d.outdated = true
 			d.Log.Error("protocol upgrade required — stopping")
 			fmt.Fprintln(os.Stderr, "pagnet: "+transport.UpgradeRequiredMessage)
-			return ErrOutdated
+			return connectedAt, ErrOutdated
 		}
 		if env.Type == transport.MsgHostUnenrolled {
 			// The control plane removed this host (deleted or unenrolled).
@@ -1230,16 +1267,26 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 			d.Log.Error("host unenrolled — stopping", "err", ErrUnenrolled)
 			fmt.Fprintln(os.Stderr,
 				"pagnet: this host was unenrolled from the control plane — the daemon is stopping")
-			return ErrUnenrolled
+			return connectedAt, ErrUnenrolled
 		}
 		if handled, err := nativeConn.HandleEnvelope(env); handled {
 			if err != nil {
-				return fmt.Errorf("native host protocol: %w", err)
+				return connectedAt, fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				if d.sharingBridges != nil {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						d.sharingBridges.admit(session)
+					}
+				}
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
+			continue
+		}
+		if env.Type == transport.MsgOwnerMailboxOpen || env.Type == transport.MsgOwnerMailboxClose ||
+			env.Type == transport.MsgOwnerMailboxOperation || env.Type == transport.MsgOwnerMailboxResult || env.Type == transport.MsgOwnerMailboxReady {
+			ownerMailboxes.handle(env, len(raw))
 			continue
 		}
 		if env.Type == transport.MsgAgentResponse {
@@ -1516,6 +1563,26 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case sharingBridgeCommand:
+		var p struct {
+			InstallationID string `json:"installationId"`
+			CommandID      string `json:"commandId"`
+		}
+		if len(env.Payload) > 8192 || env.DecodePayload(&p) != nil {
+			return
+		}
+		if _, err := domain.ParseID(p.InstallationID); err != nil {
+			return
+		}
+		if d.sharingBridges == nil {
+			return
+		}
+		if err := d.sharingBridges.recordWake(p.InstallationID); err != nil {
+			return
+		}
+		if p.CommandID != "" {
+			_ = d.sendAck(conn, p.CommandID, "")
+		}
 	case transport.MsgNativeWorkerRecoveryState:
 		var p transport.NativeWorkerRecoveryState
 		if len(env.Payload) > 8192 || env.DecodePayload(&p) != nil {

@@ -21,6 +21,10 @@ The general API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP cr
 
 ## Edu–Conti v1 setup
 
+For the built-in manual inbox, each person enrolls their own personal host and chooses **Set up inbox** in Settings → Sharing. Conti copies the inbox's public sharing address to Edu. Edu pastes it into **Connect with someone**, reviews the six limits and requests the connection. Conti accepts the incoming invitation; the two bridges enroll and prove the pair automatically. Once the pair is active, either person opens their encrypted inbox to send, read and reply. The same inbox can serve several independent bilateral pairs. Neither account gains access to the other's host, private networks or other agents. Invitations and activation refresh on events, and the UI also has an explicit Refresh action.
+
+The following steps are the advanced SDK-controlled service flow. They use the same pair consent and limits but let an SDK application handle messages directly.
+
 1. Each owner creates or selects their own SDK **service** principal and runs its SDK endpoint with its own credential and durable state directory (`sdk.Connect(ctx, sdk.ConfigFromEnv())`). Do not use a managed representative or reuse a private multiparty network. Conti gives Edu the service address `pagnet-share:v1:<Conti tenant UUID>:<Conti service UUID>` through a trusted channel; verify the peer and, before enrollment, compare identity fingerprints through that channel if required. Directory pins alone trust the server on first contact.
 2. As the issuing account administrator, Edu opens **Settings → Sharing** (`/settings/sharing`), selects Edu's owned service, enters Conti's address and chooses expiry and all six limits. The UI calls `POST /api/v1/sharing-proposals`, atomically creating a dedicated network and invitation. The equivalent request body is below; keep the same `requestId` and body for retries. These example limits match the current UI defaults, not a measured safe workload preset.
 
@@ -115,6 +119,23 @@ These cases retain the broader product design. Cases 01–03, 05, 07–13 and 16
 | 09 Aggregate data | Unnecessary | A common epoch exposes its content to key holders | Approved query action and output limits in an isolated scope | Share an agent |
 | 10 Auditor | Broader than evidence access | Shared keys conflict with selective evidence disclosure | Releases approved evidence into its own scope | Share an agent |
 | 16 Telegram partner call | Channel binding grants no tenant role | Channel binding grants no membership | Own representative uses an accepted partner action grant | Telegram binding plus agent share |
+
+## Ten setup journeys
+
+These journeys are ordered from personal collaboration to organization workflows. The v1 inbox handles only the named bilateral service exchange; the proposed steps are not yet controls in Pagnet.
+
+| Case | Process in Pagnet | Status |
+| --- | --- | --- |
+| 01 Edu–Conti review | Each sets up an inbox, Edu requests a pair from Conti's public address, Conti accepts, then they exchange an encrypted proposal and reply. An approved review action on Conti's agent is the later automation step. | Manual exchange in v1; agent action proposed |
+| 03 Reverse calendar request | Conti can send a manual request back through the active pair. A future Edu-issued calendar action would return only approved availability. | Reverse manual message in v1; calendar action proposed |
+| 04 Employee | An owner adds the employee to the organization, assigns a role, then grants selected internal network access. | Separate existing membership flow |
+| 05 Contractor project | A project owner creates a dedicated network, invites only the contractor's project principal with narrow permissions and an expiry; each principal owner accepts. | Foreign-principal project enrollment proposed |
+| 06 Customer support | A named customer and vendor can use a v1 pair for direct SDK chat. A vendor support intake action would accept tickets without admitting customers to its network. | Bilateral chat in v1; support intake proposed |
+| 07 Joint incident room | One company owns a short-lived common network and admits selected responders from both companies; each keeps its own hosts and administration. | Multiparty shared network proposed |
+| 09 Aggregate data query | A supplier exposes one bounded query action; the buyer accepts the scope and limits, then invokes it without receiving supplier network keys. | Bounded action proposed |
+| 10 Auditor evidence | An organization exposes an evidence projection with an expiry; the auditor requests only approved records, never internal hosts or participant inventory. | Bounded action proposed |
+| 16 Telegram partner request | Telegram binds to Edu's account; Edu's representative uses a separately accepted Conti action grant. The Telegram identity never selects Conti's authority. | Account binding exists; partner agent action proposed |
+| 02 Joint project | A project network owner invites selected Edu and Conti principals to a shared key scope for tasks and events; both owners consent and keep private networks separate. | Shared project network proposed |
 
 ## Security and operation boundaries
 

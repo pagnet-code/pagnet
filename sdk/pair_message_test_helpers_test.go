@@ -19,3 +19,15 @@ func spoolInput(t *testing.T) (pairMessageBinding, []byte) {
 	raw, _ := json.Marshal(w)
 	return b, raw
 }
+
+func storeSpool(t *testing.T, k *keyring, b pairMessageBinding, raw []byte) pairMessageState {
+	t.Helper()
+	if _, exists, err := k.reservePairMessage(b); err != nil || exists {
+		t.Fatalf("reserve: exists=%v %v", exists, err)
+	}
+	s, err := k.storePairMessage(b, raw, sha256.Sum256(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}

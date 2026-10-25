@@ -26,6 +26,7 @@ type HostSessionPayload struct {
 	OwnershipScope    string    `json:"ownershipScope"`
 	NativeAdmissionID string    `json:"nativeAdmissionId"`
 	HostID            string    `json:"hostId"`
+	HostCredentialID  string    `json:"hostCredentialId,omitempty"`
 	RunnerID          string    `json:"runnerId"`
 	RunnerEpoch       time.Time `json:"runnerEpoch"`
 	BootID            string    `json:"bootId"`

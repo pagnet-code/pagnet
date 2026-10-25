@@ -152,6 +152,31 @@ func (k *keyring) loadOrCreateIdentity(cred string) (priv []byte, principalID st
 	return priv, "", err
 }
 
+// loadBoundIdentity keeps a known principal's identity stable when a fresh
+// activation has not yet been indexed. A credential indexed to another
+// principal cannot select or overwrite this principal's key material.
+func (k *keyring) loadBoundIdentity(cred, expected string) ([]byte, string, error) {
+	if expected == "" {
+		return k.loadOrCreateIdentity(cred)
+	}
+	indexed, err := k.principalForCredential(cred)
+	if err != nil {
+		return nil, "", err
+	}
+	if indexed != "" && indexed != expected {
+		return nil, "", errors.New("sdk: credential belongs to a different principal")
+	}
+	priv, err := k.identityKey(expected)
+	if err == nil {
+		return priv, expected, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, "", err
+	}
+	priv, err = newIdentityKey()
+	return priv, expected, err
+}
+
 // newIdentityKey generates a fresh X25519 keypair (the audited circl KEM
 // scheme — the same suite the host crypto identity uses).
 func newIdentityKey() ([]byte, error) {
