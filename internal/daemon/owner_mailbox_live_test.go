@@ -32,7 +32,8 @@ func TestOwnerMailboxLiveHost(t *testing.T) {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	// Cover server readiness, both browser phases, SDK enrollment and teardown.
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	d, err := New(cfg, slog.New(slog.DiscardHandler))
 	if err != nil {
