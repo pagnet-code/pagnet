@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"time"
 
@@ -33,6 +34,10 @@ func sameOwnerMailboxAuthority(a, b transport.HostSessionPayload) bool {
 func (s *sharingBridgeSupervisor) ownerMailboxReady(d e2ee.OwnerMailboxDescriptor, p transport.HostSessionPayload, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.ownerMailboxReadyLocked(d, p, now)
+}
+
+func (s *sharingBridgeSupervisor) ownerMailboxReadyLocked(d e2ee.OwnerMailboxDescriptor, p transport.HostSessionPayload, now time.Time) bool {
 	active, ok := s.active[d.InstallationID]
 	if !ok || s.session == nil || !sameOwnerMailboxAuthority(*s.session, p) ||
 		!sameOwnerMailboxAuthority(active.session, p) || active.binding.InstallationID != d.InstallationID ||
@@ -50,9 +55,15 @@ func (s *sharingBridgeSupervisor) ownerMailboxReady(d e2ee.OwnerMailboxDescripto
 }
 
 type ownerMailboxSession struct {
-	descriptor e2ee.OwnerMailboxDescriptor
-	keys       e2ee.OwnerMailboxKeys
-	timer      *time.Timer
+	descriptor     e2ee.OwnerMailboxDescriptor
+	keys           e2ee.OwnerMailboxKeys
+	timer          *time.Timer
+	authority      transport.HostSessionPayload
+	ctx            context.Context
+	cancel         context.CancelFunc
+	clientSequence uint64
+	hostSequence   uint64
+	busy           bool
 }
 
 // Each instance belongs to one socket. Timers only erase memory; there is no
@@ -75,6 +86,9 @@ func (c *ownerMailboxConnection) erase(id string) {
 	if session == nil {
 		return
 	}
+	if session.cancel != nil {
+		session.cancel()
+	}
 	if session.timer != nil {
 		session.timer.Stop()
 	}
@@ -94,19 +108,27 @@ func (c *ownerMailboxConnection) close() {
 }
 
 func (c *ownerMailboxConnection) handle(env transport.Envelope, wireBytes int) {
-	if wireBytes > transport.OwnerMailboxMaxWireBytes {
-		return
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if wireBytes > transport.OwnerMailboxMaxWireBytes {
+		for id := range c.sessions {
+			c.erase(id)
+		}
+		return
+	}
 	if c.closed {
 		return
 	}
 	p, err := c.native.AuthenticatedNativeHostSession()
 	if err != nil || p.OwnershipScope != "personal" || p.HostCredentialID == "" {
+		for id := range c.sessions {
+			c.erase(id)
+		}
 		return
 	}
 	switch env.Type {
+	case transport.MsgOwnerMailboxOperation:
+		c.operation(env, p)
 	case transport.MsgOwnerMailboxOpen:
 		var open transport.OwnerMailboxOpenPayload
 		if env.DecodePayload(&open) != nil || open.Protocol != transport.OwnerMailboxProtocolV1 {
@@ -177,11 +199,23 @@ func (c *ownerMailboxConnection) open(d e2ee.OwnerMailboxDescriptor, p transport
 	if err != nil {
 		return
 	}
-	session := &ownerMailboxSession{descriptor: d, keys: keys}
+	ctx, cancel := context.WithDeadline(context.Background(), expiry)
+	session := &ownerMailboxSession{descriptor: d, keys: keys, authority: p, ctx: ctx, cancel: cancel}
 	clear(keys.ClientToHost[:])
 	clear(keys.HostToClient[:])
 	c.sessions[d.SessionID] = session
 	session.timer = time.AfterFunc(time.Until(expiry), func() { c.mu.Lock(); defer c.mu.Unlock(); c.erase(d.SessionID) })
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-c.native.closed:
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.sessions[d.SessionID] == session {
+			c.erase(d.SessionID)
+		}
+	}()
 	if c.send(transport.MsgOwnerMailboxReady, transport.OwnerMailboxReadyPayload{Protocol: transport.OwnerMailboxProtocolV1, Descriptor: d, Bootstrap: bootstrap}) != nil {
 		c.erase(d.SessionID)
 	}
