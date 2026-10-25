@@ -181,7 +181,9 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	sharingBridges *sharingBridgeSupervisor
+	sharingBridges   *sharingBridgeSupervisor
+	ownerMailboxMu   sync.Mutex
+	ownerMailboxUsed map[string]time.Time
 
 	nativeRegistry     *NativeWorkerRegistry
 	nativeWorkersMu    sync.Mutex
@@ -1077,6 +1079,18 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
 	defer nativeConn.Close()
+	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
+		env, err := transport.NewEnvelope(typ, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		return d.write(conn, raw)
+	})
+	defer ownerMailboxes.close()
 	if d.sharingBridges != nil {
 		defer d.sharingBridges.disconnect()
 	}
@@ -1256,6 +1270,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) error {
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
+			continue
+		}
+		if env.Type == transport.MsgOwnerMailboxOpen || env.Type == transport.MsgOwnerMailboxClose ||
+			env.Type == transport.MsgOwnerMailboxOperation || env.Type == transport.MsgOwnerMailboxResult || env.Type == transport.MsgOwnerMailboxReady {
+			ownerMailboxes.handle(env, len(raw))
 			continue
 		}
 		if env.Type == transport.MsgAgentResponse {

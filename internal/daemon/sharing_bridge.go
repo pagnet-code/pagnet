@@ -59,6 +59,7 @@ type sharingBridgeSupervisor struct {
 	mu       sync.Mutex
 	session  *transport.HostSessionPayload
 	outbound map[string]*sharingOutboundWorker
+	active   map[string]sharingBridgeActiveBinding
 	wake     chan struct{}
 	// owned by run only
 	running map[string]*sharingBridgeRuntime
@@ -79,10 +80,16 @@ func (s *sharingBridgeSupervisor) admit(p transport.HostSessionPayload) {
 	s.mu.Lock()
 	copy := p
 	s.session = &copy
+	clear(s.active)
 	s.mu.Unlock()
 	s.signal()
 }
-func (s *sharingBridgeSupervisor) disconnect() { s.mu.Lock(); s.session = nil; s.mu.Unlock() }
+func (s *sharingBridgeSupervisor) disconnect() {
+	s.mu.Lock()
+	s.session = nil
+	clear(s.active)
+	s.mu.Unlock()
+}
 func (s *sharingBridgeSupervisor) controller(generation int64, status string) (sharingBridgeController, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -432,6 +439,9 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		}
 	}
 	defer func() {
+		s.mu.Lock()
+		delete(s.active, v.ID)
+		s.mu.Unlock()
 		if leaseTimer != nil {
 			leaseTimer.Stop()
 		}
@@ -440,6 +450,9 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		}
 	}()
 	closeEndpoint := func() {
+		s.mu.Lock()
+		delete(s.active, v.ID)
+		s.mu.Unlock()
 		outbound.setEndpoint(nil)
 		if leaseTimer != nil {
 			leaseTimer.Stop()
@@ -465,7 +478,14 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 		if needClaim {
 			status = "starting"
 		}
-		controller, ok := s.controller(generation, status)
+		s.mu.Lock()
+		var renewedSession transport.HostSessionPayload
+		ok := s.session != nil
+		if ok {
+			renewedSession = *s.session
+		}
+		s.mu.Unlock()
+		controller := sharingBridgeController{renewedSession.RunnerID, renewedSession.RunnerEpoch, generation, status}
 		if !ok {
 			delay := s.retry
 			if !lease.IsZero() && time.Until(lease) < delay {
@@ -498,6 +518,7 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 				if claim.Generation <= generation || claim.ActivationCredential == "" || !claim.LeaseExpiresAt.After(time.Now()) {
 					return
 				}
+				closeEndpoint()
 				generation = claim.Generation
 				if err = saveSharingBridgeState(dir, sharingBridgeState{Generation: generation}); err != nil {
 					return
@@ -583,6 +604,15 @@ func (s *sharingBridgeSupervisor) runInstallation(ctx context.Context, v sharing
 			endpoint.OnSharingMessage(mailbox.receive)
 			outbound.setEndpoint(endpoint)
 		}
+		// Publish only the authority that actually renewed this ready endpoint.
+		s.mu.Lock()
+		if s.session != nil && sameOwnerMailboxAuthority(*s.session, renewedSession) {
+			if s.active == nil {
+				s.active = map[string]sharingBridgeActiveBinding{}
+			}
+			s.active[v.ID] = sharingBridgeActiveBinding{binding, generation, *s.session, endpoint, lease}
+		}
+		s.mu.Unlock()
 		// The independent deadline closes transport even while an HTTP operation
 		// is blocked. A failed renewal cannot keep an endpoint past its authority.
 		if leaseTimer != nil {
