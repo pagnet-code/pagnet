@@ -112,7 +112,7 @@ func TestWriteFailureInvalidatesAndReconnects(t *testing.T) {
 		for ctx.Err() == nil {
 			// Dial + run the read loop; on any exit (connection lost) the
 			// loop dials again — that IS the reconnect.
-			_ = d.connectAndRun(ctx)
+			_, _ = d.connectAndRun(ctx)
 			select {
 			case <-ctx.Done():
 				return
