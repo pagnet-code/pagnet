@@ -43,9 +43,13 @@ type bridgeFixture struct {
 	generation              int64
 	owner                   sharingBridgeController
 	lease                   time.Time
+	leaseDuration           time.Duration
 	claims, lists, connects int
 	loseClaim, loseExchange bool
 	staleProof              bool
+	staleRenews             int
+	staleClaims             int
+	staleRecoveryLists      int
 	connectFailures         int
 	listStatus              int
 	listFailures            int
@@ -54,7 +58,7 @@ type bridgeFixture struct {
 
 func newBridgeFixture(t *testing.T) (*bridgeFixture, *sharingBridgeSupervisor) {
 	t.Helper()
-	f := &bridgeFixture{t: t, present: true, installation: sharingBridgeInstallation{ID: domain.NewID().String(), ServiceID: domain.NewID().String(), DesiredState: "running"}}
+	f := &bridgeFixture{t: t, present: true, leaseDuration: 30 * time.Second, installation: sharingBridgeInstallation{ID: domain.NewID().String(), ServiceID: domain.NewID().String(), DesiredState: "running"}}
 	server := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(server.Close)
 	s := newSharingBridgeSupervisor(&Daemon{Config: Config{ServerURL: server.URL, Credential: "host-test", StateDir: t.TempDir()}})
@@ -106,6 +110,9 @@ func (f *bridgeFixture) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "", http.StatusServiceUnavailable)
 			return
 		}
+		if f.staleProof && f.staleClaims > 0 {
+			f.staleRecoveryLists++
+		}
 		all := []sharingBridgeInstallation{}
 		if f.present {
 			v := f.installation
@@ -120,6 +127,11 @@ func (f *bridgeFixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if f.staleProof {
+		if strings.HasSuffix(r.URL.Path, "/renew") {
+			f.staleRenews++
+		} else if strings.HasSuffix(r.URL.Path, "/claim") {
+			f.staleClaims++
+		}
 		http.Error(w, "", 404)
 		return
 	}
@@ -147,7 +159,7 @@ func (f *bridgeFixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	f.lease = time.Now().Add(300 * time.Millisecond)
+	f.lease = time.Now().Add(f.leaseDuration)
 	out := sharingBridgeClaim{Generation: f.generation, LeaseExpiresAt: f.lease}
 	if strings.HasSuffix(r.URL.Path, "/claim") {
 		out.ActivationCredential = "pgn_act_v1_fixture"
@@ -171,7 +183,7 @@ func startBridgeTest(t *testing.T, s *sharingBridgeSupervisor) (context.CancelFu
 }
 func awaitBridge(t *testing.T, predicate func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if predicate() {
 			return
@@ -183,7 +195,16 @@ func awaitBridge(t *testing.T, predicate func() bool) {
 func (f *bridgeFixture) ready() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.endpoints) > 0 && f.endpoints[len(f.endpoints)-1].enabled.Load()
+	if len(f.endpoints) == 0 {
+		return false
+	}
+	endpoint := f.endpoints[len(f.endpoints)-1]
+	select {
+	case <-endpoint.Done():
+		return false
+	default:
+		return endpoint.enabled.Load()
+	}
 }
 
 func TestSharingBridgeStartupRestartAndNoIdlePolling(t *testing.T) {
@@ -306,6 +327,9 @@ func TestSharingBridgeRevocationAndLeaseExpiryStopEndpoint(t *testing.T) {
 	for _, mode := range []string{"revocation", "lease"} {
 		t.Run(mode, func(t *testing.T) {
 			f, s := newBridgeFixture(t)
+			if mode == "lease" {
+				f.leaseDuration = 300 * time.Millisecond
+			}
 			startBridgeTest(t, s)
 			awaitBridge(t, f.ready)
 			f.mu.Lock()
@@ -353,7 +377,13 @@ func TestSharingBridgeStaleRunnerProofDoesNotRetireLiveInstallation(t *testing.T
 	f.staleProof = true
 	f.mu.Unlock()
 	s.signal()
-	time.Sleep(40 * time.Millisecond)
+	// Observe both rejected requests and the successful authority check after
+	// the claim rejection before checking that a nonterminal 404 preserves state.
+	awaitBridge(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.staleRenews > 0 && f.staleClaims > 0 && f.staleRecoveryLists > 0
+	})
 	select {
 	case <-endpoint.Done():
 		t.Fatal("stale runner proof retired live bridge before lease expiry")
