@@ -15,18 +15,6 @@ import (
 	"testing"
 )
 
-func storeSpool(t *testing.T, k *keyring, b pairMessageBinding, raw []byte) pairMessageState {
-	t.Helper()
-	if _, exists, err := k.reservePairMessage(b); err != nil || exists {
-		t.Fatalf("reserve: exists=%v %v", exists, err)
-	}
-	s, err := k.storePairMessage(b, raw, sha256.Sum256(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
-}
-
 func TestPairMessageSpoolRestartAndRetirement(t *testing.T) {
 	dir := t.TempDir()
 	k, _ := newKeyring(dir)
