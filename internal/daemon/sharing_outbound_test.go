@@ -15,8 +15,10 @@ import (
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
+const sharingOutboundTestGrant = "11111111-1111-4111-8111-111111111111"
+
 func outboundInput() sharingOutboundInput {
-	return sharingOutboundInput{OperationID: uuid.NewString(), GrantID: "grant", ExpectedGeneration: 1, Text: "private outbound text"}
+	return sharingOutboundInput{OperationID: uuid.NewString(), GrantID: sharingOutboundTestGrant, ExpectedGeneration: 1, Text: "private outbound text"}
 }
 func TestSharingOutboundConcurrentDedupeRestart(t *testing.T) {
 	m, dir, binding, _ := mailboxFixture(t)
@@ -162,7 +164,7 @@ func (*outboundFake) OnSharingPairReady(func()) {}
 func outboundFixture(t *testing.T) (*sharingOutboundWorker, *outboundFake, sharingOutboundRecord) {
 	m, _, _, _ := mailboxFixture(t)
 	w := newSharingOutboundWorker(m)
-	f := &outboundFake{pair: sdk.SharingPairStatus{GrantID: "grant", Generation: 1, State: "active", IssuerPrincipalID: "service", RecipientPrincipalID: "peer", Limits: sdk.SharingPairLimits{MaxMessageWireBytes: 4096}}, prepareErr: errors.New("sensitive plaintext must not escape")}
+	f := &outboundFake{pair: sdk.SharingPairStatus{GrantID: sharingOutboundTestGrant, Generation: 1, State: "active", IssuerPrincipalID: "service", RecipientPrincipalID: "peer", Limits: sdk.SharingPairLimits{MaxMessageWireBytes: 4096}}, prepareErr: errors.New("sensitive plaintext must not escape")}
 	r, err := m.submitOutbound(context.Background(), outboundInput())
 	if err != nil {
 		t.Fatal(err)
@@ -204,11 +206,11 @@ func TestSharingOutboundRevocationAndReplyBinding(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				record := sharingMailboxRecord{Message: sdk.SharingMessage{GrantID: "grant", Generation: 1, Message: sdk.Message{ID: r.Input.ReplyToID, RecipientPrincipalID: "service"}}, ReplyMaterial: []byte("authenticated material")}
+				record := sharingMailboxRecord{Message: sdk.SharingMessage{GrantID: sharingOutboundTestGrant, Generation: 1, Message: sdk.Message{ID: r.Input.ReplyToID, RecipientPrincipalID: "service"}}, ReplyMaterial: []byte("authenticated material")}
 				if err := w.mailbox.put(context.Background(), record); err != nil {
 					t.Fatal(err)
 				}
-				f.importReply = sdk.SharingMessage{GrantID: "grant", Generation: 1, Message: sdk.Message{ID: r.Input.ReplyToID, SenderPrincipalID: "wrong peer", RecipientPrincipalID: "service"}}
+				f.importReply = sdk.SharingMessage{GrantID: sharingOutboundTestGrant, Generation: 1, Message: sdk.Message{ID: r.Input.ReplyToID, SenderPrincipalID: "wrong peer", RecipientPrincipalID: "service"}}
 			}
 			if _, err := w.advance(context.Background(), f, r); err != nil {
 				t.Fatal(err)
@@ -538,5 +540,20 @@ func TestSharingOutboundQuotaRestartSchedulesEarliestDeadline(t *testing.T) {
 	}
 	if second.messageID != later.MessageID || second.at.Before(later.RetryAt) {
 		t.Fatalf("later retry ran before its deadline: %+v", second)
+	}
+}
+
+func TestSharingOutboundRejectsNoncanonicalGrantBeforePersistence(t *testing.T) {
+	m, _, _, _ := mailboxFixture(t)
+	for _, grant := range []string{"", "grant", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa", string(make([]byte, 62<<10))} {
+		in := outboundInput()
+		in.GrantID = grant
+		if _, err := m.submitOutbound(context.Background(), in); err == nil {
+			t.Fatal("noncanonical grant accepted")
+		}
+	}
+	var count int
+	if err := m.db.QueryRow("SELECT count(*) FROM outbound").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("invalid grants reached journal: count=%d err=%v", count, err)
 	}
 }

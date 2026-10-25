@@ -244,6 +244,15 @@ type ownerOutboxItem struct {
 	RetryAt            time.Time `json:"retryAt"`
 	Preview            string    `json:"preview"`
 }
+
+// Older journals can contain metadata too large for an encrypted list frame.
+// Preserve operation discovery and cursor progress without returning that data.
+type ownerOutboxPlaceholder struct {
+	OperationID string `json:"operationId"`
+	MessageID   string `json:"messageId"`
+	Phase       string `json:"phase"`
+	Oversized   bool   `json:"oversized"`
+}
 type ownerMailboxPage struct {
 	Items      []any   `json:"items"`
 	NextCursor *string `json:"nextCursor"`
@@ -326,6 +335,14 @@ func (m *sharingMailbox) ownerList(ctx context.Context, cursor string, limit int
 		encoded, err := json.Marshal(item)
 		if err != nil {
 			return page, err
+		}
+		if outbound && len(encoded)+1 > ownerMailboxPageBytes {
+			record := item.(ownerOutboxItem)
+			item = ownerOutboxPlaceholder{record.OperationID, record.MessageID, record.Phase, true}
+			encoded, err = json.Marshal(item)
+			if err != nil {
+				return page, err
+			}
 		}
 		if len(page.Items) == limit || bytes+len(encoded)+1 > ownerMailboxPageBytes {
 			if len(page.Items) == 0 {

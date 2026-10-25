@@ -79,7 +79,7 @@ func (m *sharingMailbox) outboundStatus(ctx context.Context, operation string) (
 	return m.decodeOutbound(operation, message, sealed)
 }
 func (m *sharingMailbox) submitOutbound(ctx context.Context, in sharingOutboundInput) (sharingOutboundRecord, error) {
-	if !canonicalOutboundID(in.OperationID) || in.GrantID == "" || in.ExpectedGeneration <= 0 || !utf8.ValidString(in.Text) || len(in.Text) > sharingMailboxMaxRecord/2 || (in.ReplyToID != "" && !canonicalOutboundID(in.ReplyToID)) {
+	if !canonicalOutboundID(in.OperationID) || !canonicalOutboundID(in.GrantID) || in.ExpectedGeneration <= 0 || !utf8.ValidString(in.Text) || len(in.Text) > sharingMailboxMaxRecord/2 || (in.ReplyToID != "" && !canonicalOutboundID(in.ReplyToID)) {
 		return sharingOutboundRecord{}, errors.New("sharing outbound input invalid")
 	}
 	plainInput, _ := json.Marshal(in)

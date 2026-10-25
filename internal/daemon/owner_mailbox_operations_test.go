@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -420,7 +421,7 @@ func TestOwnerMailboxOutboxCursorSurvivesArrivalsAndRestart(t *testing.T) {
 				t.Fatal("cursor skipped or duplicated operation")
 			}
 			seen[item.OperationID] = true
-			if item.GrantID != "grant" || item.ExpectedGeneration != 1 || item.MessageID == "" || item.Phase != "queued" || len(item.Preview) > ownerMailboxPreviewBytes || !utf8.ValidString(item.Preview) {
+			if item.GrantID != sharingOutboundTestGrant || item.ExpectedGeneration != 1 || item.MessageID == "" || item.Phase != "queued" || len(item.Preview) > ownerMailboxPreviewBytes || !utf8.ValidString(item.Preview) {
 				t.Fatal("missing outbox metadata")
 			}
 		}
@@ -444,7 +445,6 @@ func TestOwnerMailboxListFrameBudgetAndAuthentication(t *testing.T) {
 			for i := range 25 {
 				if outbound {
 					in := outboundInput()
-					in.GrantID = record.Message.GrantID
 					in.Text = record.Text
 					if _, err := m.submitOutbound(ctx, in); err != nil {
 						t.Fatal(err)
@@ -510,5 +510,67 @@ func TestOwnerMailboxListFrameBudgetAndAuthentication(t *testing.T) {
 				t.Fatal("unauthenticated list metadata exposed")
 			}
 		})
+	}
+}
+
+func TestOwnerMailboxLegacyOversizedOutboxAdvancesAfterRestart(t *testing.T) {
+	m, dir, binding, _ := mailboxFixture(t)
+	ctx := context.Background()
+	old, err := m.submitOutbound(ctx, outboundInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a previously accepted journal entry while preserving authenticated
+	// storage and the input digest checked when reopening the record.
+	old.Input.GrantID = strings.Repeat("g", 62<<10)
+	old.Input.Text = "legacy sensitive text"
+	input, err := json.Marshal(old.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Digest = sha256.Sum256(input)
+	if err := m.saveOutbound(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := m.submitOutbound(ctx, outboundInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := openSharingMailbox(dir, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.db.Close()
+	page, err := restarted.ownerList(ctx, "", 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.NextCursor == nil {
+		t.Fatal("legacy entry blocked pagination")
+	}
+	item, ok := page.Items[0].(ownerOutboxPlaceholder)
+	if !ok || !item.Oversized || item.OperationID != old.Input.OperationID || item.MessageID != old.MessageID || item.Phase != old.Phase {
+		t.Fatal("missing bounded legacy placeholder")
+	}
+	raw, err := json.Marshal(ownerMailboxResponse{Version: 1, RequestID: "outbox", Code: "ok", Data: page})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > 1024 || bytes.Contains(raw, []byte("grantId")) || bytes.Contains(raw, []byte("legacy sensitive text")) || bytes.Contains(raw, []byte("preview")) {
+		t.Fatal("placeholder exposed oversized metadata")
+	}
+	page, err = restarted.ownerList(ctx, *page.NextCursor, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.NextCursor != nil {
+		t.Fatal("valid later row missing")
+	}
+	next, ok := page.Items[0].(ownerOutboxItem)
+	if !ok || next.OperationID != valid.Input.OperationID || next.GrantID != valid.Input.GrantID {
+		t.Fatal("placeholder hid valid later operation")
 	}
 }
