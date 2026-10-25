@@ -1037,6 +1037,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
+	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)

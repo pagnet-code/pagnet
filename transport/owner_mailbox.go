@@ -1,8 +1,17 @@
 package transport
 
-import "github.com/pagnet-code/pagnet/e2ee"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strconv"
+
+	"github.com/pagnet-code/pagnet/e2ee"
+)
 
 const (
+	// OwnerMailboxCapabilityV1 is the host WebSocket capability marker.
+	OwnerMailboxCapabilityV1 = "owner_mailbox_v1"
 	OwnerMailboxProtocolV1   = "pagnet/owner-mailbox/v1"
 	OwnerMailboxMaxWireBytes = 256 * 1024
 
@@ -49,7 +58,7 @@ type OwnerMailboxOperationPayload struct {
 	Protocol   string `json:"protocol"`
 	SessionID  string `json:"sessionId"`
 	RequestID  string `json:"requestId"`
-	Sequence   uint64 `json:"sequence"`
+	Sequence   uint64 `json:"sequence,string"`
 	Ciphertext []byte `json:"ciphertext"`
 }
 
@@ -60,8 +69,65 @@ type OwnerMailboxResultPayload struct {
 	Protocol   string `json:"protocol"`
 	SessionID  string `json:"sessionId"`
 	RequestID  string `json:"requestId"`
-	Sequence   uint64 `json:"sequence"`
+	Sequence   uint64 `json:"sequence,string"`
 	Ciphertext []byte `json:"ciphertext"`
+}
+
+// Decode sequences without coercing through JSON numbers, accepting only the
+// canonical decimal string shared with the browser. Keep strict field decoding
+// here because a custom unmarshaler otherwise bypasses DisallowUnknownFields.
+func ownerMailboxSequence(raw json.RawMessage) (uint64, error) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return 0, errors.New("transport: owner mailbox sequence must be a decimal string")
+	}
+	sequence, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || strconv.FormatUint(sequence, 10) != text {
+		return 0, errors.New("transport: invalid owner mailbox sequence")
+	}
+	return sequence, nil
+}
+
+func (p *OwnerMailboxOperationPayload) UnmarshalJSON(data []byte) error {
+	type operation OwnerMailboxOperationPayload
+	var decoded operation
+	wire := struct {
+		*operation
+		Sequence json.RawMessage `json:"sequence"`
+	}{operation: &decoded}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	sequence, err := ownerMailboxSequence(wire.Sequence)
+	if err != nil {
+		return err
+	}
+	decoded.Sequence = sequence
+	*p = OwnerMailboxOperationPayload(decoded)
+	return nil
+}
+
+func (p *OwnerMailboxResultPayload) UnmarshalJSON(data []byte) error {
+	type result OwnerMailboxResultPayload
+	var decoded result
+	wire := struct {
+		*result
+		Sequence json.RawMessage `json:"sequence"`
+	}{result: &decoded}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	sequence, err := ownerMailboxSequence(wire.Sequence)
+	if err != nil {
+		return err
+	}
+	decoded.Sequence = sequence
+	*p = OwnerMailboxResultPayload(decoded)
+	return nil
 }
 
 // OwnerMailboxCloseCode is a finite public reason, never diagnostic text.

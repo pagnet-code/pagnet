@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"errors"
+	"net/url"
 	"testing"
 	"time"
 
@@ -320,5 +321,16 @@ func TestOwnerMailboxReplayMemoryBound(t *testing.T) {
 	}
 	if !d.rememberOwnerMailbox(domain.NewID().String(), expiry.Add(time.Minute), expiry) {
 		t.Fatal("expired replay memory retained")
+	}
+}
+
+func TestOwnerMailboxCapabilityAdvertisement(t *testing.T) {
+	d := &Daemon{Config: Config{ServerURL: "http://127.0.0.1:18080?owner_mailbox=unsupported"}}
+	parsed, err := url.Parse(d.wsURL(t.Context()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := parsed.Query()["owner_mailbox"]; len(got) != 1 || got[0] != transport.OwnerMailboxCapabilityV1 {
+		t.Fatalf("owner mailbox capability = %v", got)
 	}
 }

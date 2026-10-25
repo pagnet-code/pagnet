@@ -163,3 +163,35 @@ func TestOwnerMailboxCloseCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnerMailboxSequenceCanonicalJSON(t *testing.T) {
+	for _, payload := range []any{
+		OwnerMailboxOperationPayload{Sequence: 7, Ciphertext: []byte{1}},
+		OwnerMailboxResultPayload{Sequence: 7, Ciphertext: []byte{1}},
+	} {
+		wire, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(wire, []byte(`"sequence":"7"`)) {
+			t.Fatal("sequence must be a decimal string")
+		}
+		decoded := reflect.New(reflect.TypeOf(payload)).Interface()
+		if err := json.Unmarshal(wire, decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(reflect.ValueOf(decoded).Elem().Interface(), payload) {
+			t.Fatal("sequence changed across round trip")
+		}
+		for _, invalid := range []string{`7`, `"07"`, `"+7"`, `"-1"`, `"7.0"`, `""`, `null`, `"18446744073709551616"`} {
+			bad := bytes.Replace(wire, []byte(`"sequence":"7"`), []byte(`"sequence":`+invalid), 1)
+			if err := json.Unmarshal(bad, decoded); err == nil {
+				t.Fatalf("accepted noncanonical sequence %s", invalid)
+			}
+		}
+		unknown := bytes.Replace(wire, []byte(`"sequence":"7"`), []byte(`"sequence":"7","unexpected":true`), 1)
+		if err := json.Unmarshal(unknown, decoded); err == nil {
+			t.Fatal("custom sequence decoder bypassed strict field validation")
+		}
+	}
+}
