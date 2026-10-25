@@ -175,8 +175,8 @@ func executeOwnerMailbox(ctx context.Context, w *sharingOutboundWorker, endpoint
 			Pairs  []pair `json:"pairs"`
 			Cursor string `json:"cursor"`
 		}{out, next}, nil
-	case "inbox":
-		return w.mailbox.ownerInbox(ctx, r.Cursor, r.Limit)
+	case "inbox", "outbox":
+		return w.mailbox.ownerList(ctx, r.Cursor, r.Limit, r.Action == "outbox")
 	case "read":
 		if r.Offset < 0 || r.ExpectedGeneration <= 0 {
 			return nil, errors.New("invalid")
@@ -222,54 +222,122 @@ func executeOwnerMailbox(ctx context.Context, w *sharingOutboundWorker, endpoint
 	return nil, errors.New("unsupported")
 }
 
+const ownerMailboxPageSize = 20
+const ownerMailboxPreviewBytes = 256
+const ownerMailboxPageBytes = 60 << 10
+
 type ownerInboxItem struct {
-	GrantID    string `json:"grantId"`
-	Generation int64  `json:"generation"`
-	MessageID  string `json:"messageId"`
+	GrantID           string    `json:"grantId"`
+	Generation        int64     `json:"generation"`
+	MessageID         string    `json:"messageId"`
+	Preview           string    `json:"preview"`
+	SenderPrincipalID string    `json:"senderPrincipalId"`
+	Kind              string    `json:"kind"`
+	CreatedAt         time.Time `json:"createdAt"`
+}
+type ownerOutboxItem struct {
+	OperationID        string    `json:"operationId"`
+	MessageID          string    `json:"messageId"`
+	GrantID            string    `json:"grantId"`
+	ExpectedGeneration int64     `json:"expectedGeneration"`
+	Phase              string    `json:"phase"`
+	RetryAt            time.Time `json:"retryAt"`
+	Preview            string    `json:"preview"`
+}
+type ownerMailboxPage struct {
+	Items      []any   `json:"items"`
+	NextCursor *string `json:"nextCursor"`
 }
 
-func (m *sharingMailbox) ownerInbox(ctx context.Context, cursor string, limit int) (any, error) {
+func ownerMailboxPreview(text string) string {
+	end := min(len(text), ownerMailboxPreviewBytes)
+	for end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
+}
+
+// SQLite rowids provide stable cursors while arrivals append to the journal.
+// Authenticate each sealed record before selecting any display fields. The
+// encoded item budget leaves room for the response wrapper and request ID.
+func (m *sharingMailbox) ownerList(ctx context.Context, cursor string, limit int, outbound bool) (ownerMailboxPage, error) {
+	page := ownerMailboxPage{Items: []any{}}
 	var after int64
 	if cursor != "" {
 		var err error
 		after, err = strconv.ParseInt(cursor, 10, 64)
 		if err != nil || after <= 0 || strconv.FormatInt(after, 10) != cursor {
-			return nil, errors.New("invalid")
+			return page, errors.New("invalid")
 		}
 	}
-	if limit < 0 || limit > 100 {
-		return nil, errors.New("invalid")
+	if limit < 0 || limit > ownerMailboxPageSize {
+		return page, errors.New("invalid")
 	}
 	if limit == 0 {
-		limit = 50
+		limit = ownerMailboxPageSize
 	}
-	rows, err := m.db.QueryContext(ctx, "SELECT rowid,grant_id,generation,message_id FROM inbound WHERE rowid>? ORDER BY rowid LIMIT ?", after, limit+1)
+	query := "SELECT rowid,grant_id,generation,message_id,sealed FROM inbound WHERE rowid>? ORDER BY rowid LIMIT ?"
+	if outbound {
+		query = "SELECT rowid,operation_id,message_id,sealed FROM outbound WHERE rowid>? ORDER BY rowid LIMIT ?"
+	}
+	rows, err := m.db.QueryContext(ctx, query, after, limit+1)
 	if err != nil {
-		return nil, err
+		return page, err
 	}
 	defer rows.Close()
-	items := []ownerInboxItem{}
-	ids := []int64{}
+	var last int64
+	bytes := 0
 	for rows.Next() {
-		var item ownerInboxItem
 		var id int64
-		if err := rows.Scan(&id, &item.GrantID, &item.Generation, &item.MessageID); err != nil {
-			return nil, err
+		var item any
+		if outbound {
+			var operation, message string
+			var sealed []byte
+			if err := rows.Scan(&id, &operation, &message, &sealed); err != nil {
+				return page, err
+			}
+			record, err := m.decodeOutbound(operation, message, sealed)
+			if err != nil {
+				return page, err
+			}
+			item = ownerOutboxItem{record.Input.OperationID, record.MessageID, record.Input.GrantID, record.Input.ExpectedGeneration, record.Phase, record.RetryAt, ownerMailboxPreview(record.Input.Text)}
+		} else {
+			var grant, message string
+			var generation int64
+			var sealed []byte
+			if err := rows.Scan(&id, &grant, &generation, &message, &sealed); err != nil {
+				return page, err
+			}
+			plain, err := m.unseal(sealed, m.aad(grant, generation, message))
+			if err != nil {
+				return page, err
+			}
+			var record sharingMailboxRecord
+			err = json.Unmarshal(plain, &record)
+			clear(plain)
+			if err != nil {
+				return page, err
+			}
+			if record.Message.GrantID != grant || record.Message.Generation != generation || record.Message.ID != message || record.Message.RecipientPrincipalID != m.binding.ServiceID {
+				return page, errors.New("invalid")
+			}
+			item = ownerInboxItem{grant, generation, message, ownerMailboxPreview(record.Text), record.Message.SenderPrincipalID, record.Message.Kind, record.Message.CreatedAt}
 		}
-		items = append(items, item)
-		ids = append(ids, id)
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return page, err
+		}
+		if len(page.Items) == limit || bytes+len(encoded)+1 > ownerMailboxPageBytes {
+			if len(page.Items) == 0 {
+				return page, errors.New("item too large")
+			}
+			value := strconv.FormatInt(last, 10)
+			page.NextCursor = &value
+			break
+		}
+		page.Items = append(page.Items, item)
+		bytes += len(encoded) + 1
+		last = id
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	var next *string
-	if len(items) > limit {
-		items = items[:limit]
-		value := strconv.FormatInt(ids[limit-1], 10)
-		next = &value
-	}
-	return struct {
-		Items      []ownerInboxItem `json:"items"`
-		NextCursor *string          `json:"nextCursor"`
-	}{items, next}, nil
+	return page, rows.Err()
 }

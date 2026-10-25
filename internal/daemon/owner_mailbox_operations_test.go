@@ -170,6 +170,17 @@ func TestOwnerMailboxDuplicateSequenceAndSendIdempotence(t *testing.T) {
 			t.Fatalf("%s changed journal status", action)
 		}
 	}
+	r.Action = "outbox"
+	r.RequestID = "outbox"
+	f.deliver(t, f.frame(t, 4, r))
+	outbox := f.response(t, 4)
+	if outbox.Code != "ok" {
+		t.Fatal(outbox.Code)
+	}
+	items := outbox.Data.(map[string]any)["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["operationId"] != in.OperationID || items[0].(map[string]any)["preview"] != in.Text {
+		t.Fatal("sent operation not discoverable")
+	}
 	var count int
 	if err := f.worker.mailbox.db.QueryRow("SELECT count(*) FROM outbound").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
@@ -182,6 +193,8 @@ func TestOwnerMailboxPaginatedReadAndInbox(t *testing.T) {
 	f := newOwnerOperationFixture(t)
 	_, _, _, record := mailboxFixture(t)
 	record.Message.RecipientPrincipalID = f.descriptor.ServiceID
+	record.Message.Kind = "ASK"
+	record.Message.CreatedAt = time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC)
 	record.Text = strings.Repeat("\x00\"界", 25000)
 	if err := f.worker.mailbox.put(context.Background(), record); err != nil {
 		t.Fatal(err)
@@ -224,6 +237,11 @@ func TestOwnerMailboxPaginatedReadAndInbox(t *testing.T) {
 		items := data["items"].([]any)
 		if len(items) != 1 {
 			t.Fatal("incorrect page size")
+		}
+		item := items[0].(map[string]any)
+		preview := item["preview"].(string)
+		if len(preview) > ownerMailboxPreviewBytes || !utf8.ValidString(preview) || !strings.HasPrefix(record.Text, preview) || item["senderPrincipalId"] != record.Message.SenderPrincipalID || item["kind"] != "ASK" || item["createdAt"] != record.Message.CreatedAt.Format(time.RFC3339) {
+			t.Fatal("missing authenticated inbox metadata")
 		}
 		id := items[0].(map[string]any)["messageId"].(string)
 		if seen[id] {
@@ -354,5 +372,143 @@ func TestOwnerMailboxSanitizedResultsAndSizeCap(t *testing.T) {
 	f.deliver(t, f.frame(t, 2, r))
 	if response = f.response(t, 2); response.Code != "operation_failed" {
 		t.Fatal("large valid frame was not processed")
+	}
+}
+
+func TestOwnerMailboxOutboxCursorSurvivesArrivalsAndRestart(t *testing.T) {
+	m, dir, binding, _ := mailboxFixture(t)
+	ctx := context.Background()
+	expected := map[string]bool{}
+	add := func() {
+		in := outboundInput()
+		in.Text = strings.Repeat("界", 1000)
+		if _, err := m.submitOutbound(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+		expected[in.OperationID] = true
+	}
+	for range 3 {
+		add()
+	}
+	page, err := m.ownerList(ctx, "", 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := page.Items[0].(ownerOutboxItem)
+	if page.NextCursor == nil {
+		t.Fatal("missing first cursor")
+	}
+	add()
+	if err := m.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := openSharingMailbox(dir, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.db.Close()
+	seen := map[string]bool{first.OperationID: true}
+	cursor := *page.NextCursor
+	for {
+		page, err = restarted.ownerList(ctx, cursor, 1, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, raw := range page.Items {
+			item := raw.(ownerOutboxItem)
+			if seen[item.OperationID] || !expected[item.OperationID] {
+				t.Fatal("cursor skipped or duplicated operation")
+			}
+			seen[item.OperationID] = true
+			if item.GrantID != "grant" || item.ExpectedGeneration != 1 || item.MessageID == "" || item.Phase != "queued" || len(item.Preview) > ownerMailboxPreviewBytes || !utf8.ValidString(item.Preview) {
+				t.Fatal("missing outbox metadata")
+			}
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		cursor = *page.NextCursor
+	}
+	if len(seen) != len(expected) {
+		t.Fatal("restart lost outbox operation discovery")
+	}
+}
+
+func TestOwnerMailboxListFrameBudgetAndAuthentication(t *testing.T) {
+	for _, outbound := range []bool{false, true} {
+		t.Run(map[bool]string{false: "inbox", true: "outbox"}[outbound], func(t *testing.T) {
+			m, _, _, record := mailboxFixture(t)
+			ctx := context.Background()
+			record.Text = strings.Repeat("\x00界", 3000)
+			record.Message.GrantID = strings.Repeat("<", 2000)
+			for i := range 25 {
+				if outbound {
+					in := outboundInput()
+					in.GrantID = record.Message.GrantID
+					in.Text = record.Text
+					if _, err := m.submitOutbound(ctx, in); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					record.Message.ID = string(rune('a' + i))
+					if err := m.put(ctx, record); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			count := 0
+			cursor := ""
+			for {
+				page, err := m.ownerList(ctx, cursor, ownerMailboxPageSize, outbound)
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err := json.Marshal(ownerMailboxResponse{Version: 1, RequestID: strings.Repeat("<", 128), Code: "ok", Data: page})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(raw) > e2ee.OwnerMailboxMaxPlaintext || len(page.Items) == 0 || len(page.Items) > ownerMailboxPageSize {
+					t.Fatal("list exceeded frame budget")
+				}
+				if bytes.Contains(raw, []byte("ReplyMaterial")) || bytes.Contains(raw, []byte("opaque reply material")) || bytes.Contains(raw, []byte("Digest")) {
+					t.Fatal("list exposed sealed record internals")
+				}
+				for _, raw := range page.Items {
+					var preview string
+					if outbound {
+						preview = raw.(ownerOutboxItem).Preview
+					} else {
+						preview = raw.(ownerInboxItem).Preview
+					}
+					if len(preview) > ownerMailboxPreviewBytes || !utf8.ValidString(preview) {
+						t.Fatal("unbounded preview")
+					}
+				}
+				count += len(page.Items)
+				if page.NextCursor == nil {
+					break
+				}
+				cursor = *page.NextCursor
+			}
+			if count != 25 {
+				t.Fatal("frame budget pagination lost records")
+			}
+			if _, err := m.ownerList(ctx, "", ownerMailboxPageSize+1, outbound); err == nil {
+				t.Fatal("oversize page accepted")
+			}
+			if _, err := m.ownerList(ctx, "-1", 1, outbound); err == nil {
+				t.Fatal("invalid cursor accepted")
+			}
+			query := "UPDATE inbound SET sealed=x'0000'"
+			if outbound {
+				query = "UPDATE outbound SET sealed=x'0000'"
+			}
+			if _, err := m.db.Exec(query); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.ownerList(ctx, "", 1, outbound); err == nil {
+				t.Fatal("unauthenticated list metadata exposed")
+			}
+		})
 	}
 }
