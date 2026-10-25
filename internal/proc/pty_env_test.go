@@ -88,7 +88,8 @@ func TestPTYEnvPreservesColorPreferences(t *testing.T) {
 		{"empty-values", nil, []string{"TERM=", "COLORTERM=", "NO_COLOR="}, map[string]string{"TERM": "", "COLORTERM": "", "NO_COLOR": ""}},
 		{"dumb", nil, []string{"TERM=dumb"}, map[string]string{"TERM": "dumb"}},
 		{"empty-term", nil, []string{"TERM="}, map[string]string{"TERM": ""}},
-		{"inherited-filtered", []string{"TERM=screen", "COLORTERM=24bit", "NO_COLOR=1"}, nil, map[string]string{"TERM": "screen", "COLORTERM": "24bit", "NO_COLOR": "1"}},
+		{"inherited-filtered", []string{"TERM=screen", "COLORTERM=24bit", "NO_COLOR=1"}, nil, map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor"}},
+		{"daemon-monochrome", []string{"TERM=dumb", "NO_COLOR=1"}, nil, map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor"}},
 		{"child-overrides-inherited", []string{"TERM=dumb", "COLORTERM=24bit", "NO_COLOR=1"}, []string{"TERM=xterm", "COLORTERM=", "NO_COLOR="}, map[string]string{"TERM": "xterm", "COLORTERM": "", "NO_COLOR": ""}},
 		{"no-color-with-capabilities", nil, []string{"NO_COLOR=1"}, map[string]string{"TERM": "xterm-256color", "COLORTERM": "truecolor", "NO_COLOR": "1"}},
 	} {
@@ -118,5 +119,32 @@ func TestPTYEnvPreservesColorPreferences(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPTYEnvImplicitInheritanceUsesViewerCapabilities(t *testing.T) {
+	unsetTerminalEnv(t)
+	t.Setenv("TERM", "dumb")
+	t.Setenv("COLORTERM", "daemon-color")
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("PAGNET_TEST_PTY_ENV", "preserved")
+	cmd := exec.Command("sh")
+	defaultPTYEnv(cmd)
+	got := map[string]string{}
+	for _, pair := range cmd.Env {
+		key, value, _ := strings.Cut(pair, "=")
+		got[key] = value
+	}
+	for key, want := range map[string]string{
+		"TERM":                "xterm-256color",
+		"COLORTERM":           "truecolor",
+		"PAGNET_TEST_PTY_ENV": "preserved",
+	} {
+		if got[key] != want {
+			t.Fatalf("%s=%q, want %q", key, got[key], want)
+		}
+	}
+	if _, present := got["NO_COLOR"]; present {
+		t.Fatal("daemon NO_COLOR inherited by PTY child")
 	}
 }

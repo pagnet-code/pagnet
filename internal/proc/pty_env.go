@@ -1,7 +1,6 @@
 package proc
 
 import (
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -10,21 +9,21 @@ import (
 // color. Explicit child values win, including empty values and NO_COLOR.
 func defaultPTYEnv(cmd *exec.Cmd) {
 	env := cmd.Environ()
+	if cmd.Env == nil {
+		// Implicit inheritance describes the daemon's terminal, not the viewer.
+		childEnv := env[:0]
+		for _, pair := range env {
+			key, _, _ := strings.Cut(pair, "=")
+			if key != "TERM" && key != "COLORTERM" && key != "NO_COLOR" {
+				childEnv = append(childEnv, pair)
+			}
+		}
+		env = childEnv
+	}
 	values := make(map[string]string, 3)
 	for _, pair := range env {
 		key, value, ok := strings.Cut(pair, "=")
 		if ok {
-			values[key] = value
-		}
-	}
-	// Runtime environment filtering may have removed these inherited settings.
-	// Restore only terminal capability/color preferences on PTY launches.
-	for _, key := range []string{"TERM", "COLORTERM", "NO_COLOR"} {
-		if _, present := values[key]; present {
-			continue
-		}
-		if value, present := os.LookupEnv(key); present {
-			env = append(env, key+"="+value)
 			values[key] = value
 		}
 	}
