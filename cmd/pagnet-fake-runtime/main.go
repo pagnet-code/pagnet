@@ -537,7 +537,7 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 	// the slave fds explicitly — exec would otherwise give it fresh
 	// pipes.
 	//
-	// The child IGNORES SIGHUP (trap "" HUP; exec …): when the session
+	// The child IGNORES SIGHUP (trap "" HUP): when the session
 	// leader (the runtime) dies, the kernel broadcasts SIGHUP to the PTY
 	// foreground process group. A helper with the default SIGHUP
 	// disposition would die from that broadcast and the leak would be
@@ -547,7 +547,8 @@ func runPTY(instanceID, sessionDir, resumeID string) {
 	// production shape: the direct child is killed, the slave-holding
 	// descendant is not.
 	if os.Getenv("PAGNET_FAKE_PTY_CHILD") == "1" {
-		c := exec.Command("sh", "-c", "trap \"\" HUP; printf '\\r\\npagnet-pty-child-ready %s\\r\\n' \"$$\"; exec sleep 3600")
+		// Keep the ready shell's identity stable for /proc inspection after readiness.
+		c := exec.Command("sh", "-c", "trap \"\" HUP; printf '\\r\\npagnet-pty-child-ready %s\\r\\n' \"$$\"; sleep 3600 & wait")
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := c.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "pty child fixture spawn: %v\r\n", err)
