@@ -185,18 +185,37 @@ func executeOwnerMailbox(ctx context.Context, w *sharingOutboundWorker, endpoint
 		if err != nil {
 			return nil, err
 		}
-		if r.Offset > len(record.Text) || (r.Offset < len(record.Text) && !utf8.RuneStart(record.Text[r.Offset])) {
+		return ownerMailboxChunk(record.Text, r.Offset)
+	case "read_outbox":
+		if !canonicalOutboundID(r.OperationID) || r.Offset < 0 {
 			return nil, errors.New("invalid")
 		}
-		end := min(len(record.Text), r.Offset+ownerMailboxReadBytes)
-		for end < len(record.Text) && !utf8.RuneStart(record.Text[end]) {
-			end--
+		record, err := w.mailbox.outboundStatus(ctx, r.OperationID)
+		if err != nil {
+			return nil, err
+		}
+		// Legacy malformed metadata can be listed as a placeholder, but must not
+		// inflate a text chunk or expose unbounded fields when reopening a message.
+		if !canonicalOutboundID(record.Input.GrantID) || !canonicalOutboundID(record.MessageID) || record.Input.ExpectedGeneration <= 0 {
+			return nil, errors.New("invalid")
+		}
+		switch record.Phase {
+		case "queued", "prepared", "admitted", "acknowledged", "failed":
+		default:
+			return nil, errors.New("invalid")
+		}
+		chunk, err := ownerMailboxChunk(record.Input.Text, r.Offset)
+		if err != nil {
+			return nil, err
 		}
 		return struct {
-			Text       string `json:"text"`
-			NextOffset int    `json:"nextOffset"`
-			TotalBytes int    `json:"totalBytes"`
-		}{record.Text[r.Offset:end], end, len(record.Text)}, nil
+			ownerMailboxReadChunk
+			GrantID            string `json:"grantId"`
+			ExpectedGeneration int64  `json:"expectedGeneration"`
+			MessageID          string `json:"messageId"`
+			Phase              string `json:"phase"`
+		}{chunk, record.Input.GrantID, record.Input.ExpectedGeneration, record.MessageID, record.Phase}, nil
+
 	case "send", "status", "retry":
 		var record sharingOutboundRecord
 		var err error
@@ -220,6 +239,23 @@ func executeOwnerMailbox(ctx context.Context, w *sharingOutboundWorker, endpoint
 		}{record.Input.OperationID, record.MessageID, record.Phase, record.RetryAt}, nil
 	}
 	return nil, errors.New("unsupported")
+}
+
+type ownerMailboxReadChunk struct {
+	Text       string `json:"text"`
+	NextOffset int    `json:"nextOffset"`
+	TotalBytes int    `json:"totalBytes"`
+}
+
+func ownerMailboxChunk(text string, offset int) (ownerMailboxReadChunk, error) {
+	if offset < 0 || offset > len(text) || (offset < len(text) && !utf8.RuneStart(text[offset])) {
+		return ownerMailboxReadChunk{}, errors.New("invalid")
+	}
+	end := min(len(text), offset+ownerMailboxReadBytes)
+	for end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return ownerMailboxReadChunk{text[offset:end], end, len(text)}, nil
 }
 
 const ownerMailboxPageSize = 20

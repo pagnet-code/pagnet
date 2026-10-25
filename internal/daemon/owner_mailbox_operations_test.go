@@ -18,15 +18,17 @@ import (
 
 type ownerOperationFixture struct {
 	*ownerMailboxFixture
-	keys    e2ee.OwnerMailboxKeys
-	results chan transport.OwnerMailboxResultPayload
-	worker  *sharingOutboundWorker
+	keys       e2ee.OwnerMailboxKeys
+	results    chan transport.OwnerMailboxResultPayload
+	worker     *sharingOutboundWorker
+	mailboxDir string
 }
 
 func newOwnerOperationFixture(t *testing.T) *ownerOperationFixture {
 	t.Helper()
 	f := &ownerOperationFixture{ownerMailboxFixture: newOwnerMailboxFixture(t), results: make(chan transport.OwnerMailboxResultPayload, 10)}
-	m, err := openSharingMailbox(t.TempDir()+"/mailbox", f.d.sharingBridges.active[f.descriptor.InstallationID].binding)
+	f.mailboxDir = t.TempDir() + "/mailbox"
+	m, err := openSharingMailbox(f.mailboxDir, f.d.sharingBridges.active[f.descriptor.InstallationID].binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,5 +574,99 @@ func TestOwnerMailboxLegacyOversizedOutboxAdvancesAfterRestart(t *testing.T) {
 	next, ok := page.Items[0].(ownerOutboxItem)
 	if !ok || next.OperationID != valid.Input.OperationID || next.GrantID != valid.Input.GrantID {
 		t.Fatal("placeholder hid valid later operation")
+	}
+}
+
+func TestOwnerMailboxReadOutboxRestartChunksAndLimits(t *testing.T) {
+	f := newOwnerOperationFixture(t)
+	ctx := context.Background()
+	in := outboundInput()
+	in.Text = strings.Repeat("\x00\"界", 25000)
+	record, err := f.worker.mailbox.submitOutbound(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Error = "private journal diagnostic"
+	if err := f.worker.mailbox.saveOutbound(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	binding := f.worker.mailbox.binding
+	if err := f.worker.mailbox.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := openSharingMailbox(f.mailboxDir, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.db.Close()
+	f.worker.mailbox = restarted
+	seq := uint64(0)
+	read := func(operation string, offset int) ownerMailboxResponse {
+		t.Helper()
+		r := ownerMailboxRequest{Version: 1, RequestID: "sent-text", Action: "read_outbox", OperationID: operation, Offset: offset}
+		f.deliver(t, f.frame(t, seq, r))
+		response := f.response(t, seq)
+		seq++
+		return response
+	}
+	var text strings.Builder
+	for offset := 0; offset < len(in.Text); {
+		response := read(in.OperationID, offset)
+		if response.Code != "ok" {
+			t.Fatal(response.Code)
+		}
+		data := response.Data.(map[string]any)
+		chunk := data["text"].(string)
+		if chunk == "" || len(chunk) > ownerMailboxReadBytes || !utf8.ValidString(chunk) {
+			t.Fatal("invalid sent text chunk")
+		}
+		if data["grantId"] != in.GrantID || int64(data["expectedGeneration"].(float64)) != in.ExpectedGeneration || data["messageId"] != record.MessageID || data["phase"] != "queued" || int(data["totalBytes"].(float64)) != len(in.Text) {
+			t.Fatal("missing sent message metadata")
+		}
+		raw, _ := json.Marshal(response)
+		for _, private := range []string{"private journal diagnostic", "Digest", "Receipt", "ReplyMaterial", "ReplyToID"} {
+			if bytes.Contains(raw, []byte(private)) {
+				t.Fatal("sent read exposed journal internals")
+			}
+		}
+		text.WriteString(chunk)
+		next := int(data["nextOffset"].(float64))
+		if next <= offset {
+			t.Fatal("sent read made no progress")
+		}
+		offset = next
+	}
+	if text.String() != in.Text {
+		t.Fatal("sent text changed after restart or chunking")
+	}
+	end := read(in.OperationID, len(in.Text))
+	if end.Code != "ok" || end.Data.(map[string]any)["text"] != "" {
+		t.Fatal("sent text end offset invalid")
+	}
+	for _, offset := range []int{-1, 3, len(in.Text) + 1, int(^uint(0) >> 1)} {
+		response := read(in.OperationID, offset)
+		if response.Code != "operation_failed" || response.Data != nil {
+			t.Fatal("invalid sent text offset accepted")
+		}
+	}
+	if response := read("invalid-operation", 0); response.Code != "operation_failed" {
+		t.Fatal("noncanonical operation accepted")
+	}
+	// Previously accepted oversized metadata remains a list placeholder; opening
+	// that row returns a finite error instead of trying to render its grant ID.
+	record.Input.GrantID = strings.Repeat("g", 62<<10)
+	input, _ := json.Marshal(record.Input)
+	record.Digest = sha256.Sum256(input)
+	if err := restarted.saveOutbound(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if response := read(in.OperationID, 0); response.Code != "operation_failed" || response.Data != nil {
+		t.Fatal("oversized legacy metadata returned")
+	}
+	if _, err := restarted.db.Exec("UPDATE outbound SET sealed=x'0000' WHERE operation_id=?", in.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if response := read(in.OperationID, 0); response.Code != "operation_failed" || response.Data != nil {
+		t.Fatal("tampered sent record returned")
 	}
 }
