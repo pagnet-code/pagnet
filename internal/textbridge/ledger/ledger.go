@@ -317,7 +317,7 @@ func openDatabase(path string, aead cipher.AEAD, b Binding, limits Limits, initi
 		if _, err = tx.Exec("INSERT INTO binding VALUES(1,?)", sealed); err != nil {
 			return nil, err
 		}
-		initial := budgetState{Limits: limits, Active: make(map[string]providerClaim)}
+		initial := budgetState{Limits: limits, Enabled: true, Active: make(map[string]providerClaim)}
 		budgetSealed, e := s.encodeBudget(1, initial)
 		if e != nil {
 			return nil, e

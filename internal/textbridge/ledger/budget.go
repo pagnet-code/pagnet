@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -19,6 +20,8 @@ type Limits struct {
 func (l Limits) valid() bool { return l.CallsPerDay > 0 && l.MaxConcurrent > 0 }
 
 var ErrLimit = errors.New("text bridge provider budget exhausted")
+
+var ErrDisabled = errors.New("text bridge provider dispatch disabled")
 
 // LimitError identifies the allowance that prevented a provider claim.
 type LimitError struct{ Limit string }
@@ -34,11 +37,67 @@ func (e *StaleError) Unwrap() error { return ErrStale }
 
 type providerClaim struct{ ProjectID, AskID string }
 type budgetState struct {
-	Limits Limits
-	Day    string
-	Calls  int64
-	Active map[string]providerClaim
+	Limits  Limits
+	Enabled bool
+	Day     string
+	Calls   int64
+	Active  map[string]providerClaim
 }
+
+// ProviderClaim identifies an unresolved reservation without exposing its token
+// or any ASK or provider content.
+type ProviderClaim struct{ ProjectID, AskID string }
+
+// BudgetStatus is the authenticated owner view of provider allowances and usage.
+type BudgetStatus struct {
+	Limits        Limits
+	Enabled       bool
+	CurrentUTCDay string
+	HighWaterDay  string
+	Used          int64
+	Active        []ProviderClaim
+}
+
+// BudgetSnapshot returns current UTC-day usage and unresolved reservations. It
+// does not roll the durable usage day forward or release any reservations. Used
+// is zero after HighWaterDay; on clock rollback it retains the durable charge.
+func (s *Store) BudgetSnapshot(ctx context.Context) (BudgetStatus, error) {
+	_, b, err := s.readBudget(ctx, s.db)
+	if err != nil {
+		return BudgetStatus{}, err
+	}
+	day := time.Now().UTC().Format("2006-01-02")
+	used := b.Calls
+	if day > b.Day {
+		used = 0
+	}
+	status := BudgetStatus{Limits: b.Limits, Enabled: b.Enabled, CurrentUTCDay: day, HighWaterDay: b.Day, Used: used, Active: []ProviderClaim{}}
+	for _, claim := range b.Active {
+		status.Active = append(status.Active, ProviderClaim{claim.ProjectID, claim.AskID})
+	}
+	sort.Slice(status.Active, func(i, j int) bool {
+		if status.Active[i].ProjectID == status.Active[j].ProjectID {
+			return status.Active[i].AskID < status.Active[j].AskID
+		}
+		return status.Active[i].ProjectID < status.Active[j].ProjectID
+	})
+	return status, nil
+}
+
+// SetEnabled serializes the owner's dispatch switch with provider claims. Once
+// disabling commits, a later claim cannot authorize dispatch until re-enabled.
+// It does not stop calls that were already claimed.
+func (s *Store) SetEnabled(ctx context.Context, enabled bool) error {
+	return s.immediate(ctx, func(c *sql.Conn) error {
+		revision, b, err := s.readBudget(ctx, c)
+		if err != nil {
+			return err
+		}
+		b.Enabled = enabled
+		return s.writeBudget(ctx, c, revision, b)
+	})
+}
+
 type budgetAAD struct {
 	Domain   string
 	Binding  Binding
@@ -145,6 +204,9 @@ func (s *Store) ClaimProvider(ctx context.Context, expected Job, now time.Time) 
 		if e != nil {
 			return e
 		}
+		if !b.Enabled {
+			return ErrDisabled
+		}
 		j, e := s.scan(c.QueryRowContext(ctx, "SELECT "+columns+" FROM jobs WHERE project_id=? AND ask_id=?", expected.ProjectID, expected.AskID))
 		if e != nil {
 			return e
@@ -197,6 +259,61 @@ func (s *Store) ClaimProvider(ctx context.Context, expected Job, now time.Time) 
 		return Job{}, "", e
 	}
 	return result, token, nil
+}
+
+// AbandonProviderClaim is an owner-only recovery operation for an unresolved
+// reservation. The caller must first disable dispatch and establish runner
+// quiescence using the OS runner lock/CLI: this API cannot prove that an external
+// provider call has stopped. It keeps the daily charge and ASK tombstone, makes
+// the ASK terminal Unknown, and permanently invalidates its completion token.
+func (s *Store) AbandonProviderClaim(ctx context.Context, projectID, askID string, expectedRevision int64) (Job, error) {
+	var result Job
+	err := s.immediate(ctx, func(c *sql.Conn) error {
+		revision, b, err := s.readBudget(ctx, c)
+		if err != nil {
+			return err
+		}
+		if b.Enabled {
+			return ErrInvalid
+		}
+		j, err := s.scan(c.QueryRowContext(ctx, "SELECT "+columns+" FROM jobs WHERE project_id=? AND ask_id=?", projectID, askID))
+		if err != nil {
+			return err
+		}
+		if j.Revision != expectedRevision {
+			return &StaleError{"job revision"}
+		}
+		if j.Phase != Unknown && j.Phase != ProviderStarted {
+			return ErrInvalid
+		}
+		var token string
+		for candidate, claim := range b.Active {
+			if claim.ProjectID == projectID && claim.AskID == askID {
+				token = candidate
+				break
+			}
+		}
+		if token == "" {
+			return &StaleError{"claim unavailable"}
+		}
+		delete(b.Active, token)
+		if j.Phase == ProviderStarted {
+			j.Revision++
+			j.Phase = Unknown
+			if err = s.writeProviderJob(ctx, c, j); err != nil {
+				return err
+			}
+		}
+		if err = s.writeBudget(ctx, c, revision, b); err != nil {
+			return err
+		}
+		result = j
+		return nil
+	})
+	if err != nil {
+		return Job{}, err
+	}
+	return result, nil
 }
 
 // FinishProvider commits successful validated output and releases its active
