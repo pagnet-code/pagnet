@@ -14,8 +14,9 @@
 // supervisor's root-PID tracking and the S1 bridge process-tree binding keep
 // working). Managed Linux runtimes require Landlock ABI3 or newer and fail
 // closed when the sandbox cannot be applied. On
-// platforms without Landlock (darwin) the launch is NOT sandboxed and the
-// platform is reported as non-isolated (owner-scoped dev machines).
+// Darwin, managed launches remain non-isolated (owner-scoped dev machines).
+// The explicit hidden sandbox-exec command uses Seatbelt on Darwin; supervisor
+// integration remains gated on production runtime probes.
 //
 // The allowlist is per-instance and built by the daemon/driver layer from
 // what it already knows (NewSpec). Coarse system read + tight per-instance
@@ -38,6 +39,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -270,6 +272,12 @@ func Home() string {
 // because runtimes and their shell commands must WRITE /dev/null — see
 // SystemDev.
 func SystemRO() []string {
+	if runtime.GOOS == "darwin" {
+		// dyld/frameworks live under /System. /private/var/select/sh is the
+		// system shell selector, normally a symlink to /bin/bash; granting
+		// this exact file avoids exposing the rest of /private/var.
+		return []string{"/usr", "/bin", "/sbin", "/etc", "/opt", "/System", "/private/var/select/sh"}
+	}
 	return []string{
 		"/usr", "/bin", "/lib", "/lib64", "/sbin", "/etc", "/opt",
 		"/proc/self",
@@ -293,7 +301,8 @@ func SystemDev() []string {
 // network call the runtime makes dies (observed: codex model requests
 // fail with "workspace routing discovery failed"). A regular
 // /etc/resolv.conf (non-systemd resolvers) is already covered by /etc:
-// no extra grant. Best-effort: an unreadable /etc/resolv.conf yields no
+// no extra grant. Darwin grants the exact resolved file, never /var/run.
+// Best-effort: an unreadable /etc/resolv.conf yields no
 // grant (the regular-file case is already covered; a machine whose
 // resolver config is unreadable by the user cannot do DNS at all).
 // Safe: the grant sits ON TOP of DAC — the resolved target dir
@@ -303,6 +312,11 @@ func ResolvRO() []string {
 	target, err := filepath.EvalSymlinks("/etc/resolv.conf")
 	if err != nil {
 		return nil
+	}
+	if runtime.GOOS == "darwin" {
+		// macOS links resolv.conf into /private/var/run. Only the exact
+		// configuration file is needed; its parent holds unrelated sockets.
+		return []string{target}
 	}
 	if strings.HasPrefix(target, "/etc/") {
 		return nil // the /etc grant already covers the resolved target
