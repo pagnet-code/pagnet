@@ -60,6 +60,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -693,4 +694,79 @@ func TestQwenPersistent_StartupBudgetIsOneBudgetPerActivation(t *testing.T) {
 	q.retireEndpoint(e)
 	waitReaped(t, sup, "inst-1", 30*time.Second)
 	assertTerminationRequested(t, sup, "one startup budget")
+}
+
+// Both startup timeout surfaces must retain the first liveness observation,
+// even when the other timeout path runs after endpoint termination and reap.
+func TestQwenPersistent_StartupTimeoutProcessSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		activationFirst bool
+		exitedFirst     bool
+	}{
+		{name: "readerFirst"},
+		{name: "activationFirst", activationFirst: true},
+		{name: "exitedReaderFirst", exitedFirst: true},
+		{name: "exitedActivationFirst", activationFirst: true, exitedFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sup, _, _, _ := newQwenLifecycleFixture(t)
+			h, err := sup.Launch(context.Background(), proc.LaunchRequest{
+				InstanceID: "timeout-snapshot",
+				Runtime:    "qwen-code",
+				Class:      proc.ClassEndpoint,
+				Cmd:        exec.Command("sleep", "60"),
+			})
+			if err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+			e := &qwenEndpoint{
+				h:               h,
+				eventsPath:      filepath.Join(t.TempDir(), "events.jsonl"),
+				startupBudget:   time.Second,
+				startupDeadline: time.Now().Add(-time.Second),
+			}
+			stop := func() {
+				t.Helper()
+				if err := h.Terminate("timeout snapshot test"); err != nil {
+					t.Fatalf("Terminate: %v", err)
+				}
+				if _, err := h.WaitDeadline(5 * time.Second); err != nil {
+					t.Fatalf("WaitDeadline: %v", err)
+				}
+			}
+			if e.processGone() {
+				t.Fatal("supervised child is not alive before the timeout")
+			}
+			want := "process=alive"
+			if tc.exitedFirst {
+				stop()
+				want = "process=exited"
+			}
+			fileWait := func() string {
+				t.Helper()
+				_, err := e.waitForEventsFile()
+				if err == nil {
+					t.Fatal("waitForEventsFile succeeded with an absent file and expired deadline")
+				}
+				return err.Error()
+			}
+			first, second := fileWait, e.startupDiag
+			if tc.activationFirst {
+				first, second = second, first
+			}
+			if got := first(); !strings.Contains(got, want) {
+				t.Fatalf("first timeout = %q, want %s", got, want)
+			}
+			if !tc.exitedFirst {
+				stop()
+			}
+			if !e.processGone() {
+				t.Fatal("processGone did not observe the reaped child")
+			}
+			if got := second(); !strings.Contains(got, want) {
+				t.Fatalf("second timeout after reap = %q, want %s", got, want)
+			}
+		})
+	}
 }
