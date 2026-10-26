@@ -71,6 +71,7 @@ type Store struct {
 	db      *sql.DB
 	aead    cipher.AEAD
 	binding Binding
+	limits  Limits
 }
 
 type aad struct {
@@ -197,9 +198,13 @@ func readKey(dir string, exists bool) ([]byte, error) {
 }
 
 // Open creates a private ledger or authenticates the complete existing ledger.
+// Limits must match the authenticated owner allowances on every reopen.
 // An existing database is never reinitialized, including after key loss. Missing
 // databases with initialization evidence also fail closed to retain deduplication.
-func Open(dir string, b Binding) (*Store, error) {
+func Open(dir string, b Binding, limits Limits) (*Store, error) {
+	if !limits.valid() {
+		return nil, ErrInvalid
+	}
 	b, err := normalizeBinding(b)
 	if err != nil {
 		return nil, err
@@ -251,7 +256,7 @@ func Open(dir string, b Binding) (*Store, error) {
 		if err = f.Close(); err != nil {
 			return nil, err
 		}
-		s, err := openDatabase(temporary, aead, b, true)
+		s, err := openDatabase(temporary, aead, b, limits, true)
 		if err != nil {
 			return nil, err
 		}
@@ -265,9 +270,9 @@ func Open(dir string, b Binding) (*Store, error) {
 	if err = syncDir(dir); err != nil {
 		return nil, err
 	}
-	return openDatabase(path, aead, b, false)
+	return openDatabase(path, aead, b, limits, false)
 }
-func openDatabase(path string, aead cipher.AEAD, b Binding, initialize bool) (_ *Store, err error) {
+func openDatabase(path string, aead cipher.AEAD, b Binding, limits Limits, initialize bool) (_ *Store, err error) {
 	if err = os.Chmod(path, 0600); err != nil {
 		return nil, err
 	}
@@ -277,7 +282,7 @@ func openDatabase(path string, aead cipher.AEAD, b Binding, initialize bool) (_ 
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db, aead: aead, binding: b}
+	s := &Store{db: db, aead: aead, binding: b, limits: limits}
 	defer func() {
 		if err != nil {
 			db.Close()
@@ -296,7 +301,7 @@ func openDatabase(path string, aead cipher.AEAD, b Binding, initialize bool) (_ 
 			return nil, e
 		}
 		defer tx.Rollback()
-		for _, stmt := range []string{"CREATE TABLE binding(id INTEGER PRIMARY KEY CHECK(id=1),sealed BLOB NOT NULL)", "CREATE TABLE jobs(project_id TEXT NOT NULL,ask_id TEXT NOT NULL,revision INTEGER NOT NULL,phase TEXT NOT NULL,revoked INTEGER NOT NULL CHECK(revoked IN (0,1)),sealed BLOB NOT NULL,PRIMARY KEY(project_id,ask_id))"} {
+		for _, stmt := range []string{"CREATE TABLE budget(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL,sealed BLOB NOT NULL)", "CREATE TABLE binding(id INTEGER PRIMARY KEY CHECK(id=1),sealed BLOB NOT NULL)", "CREATE TABLE jobs(project_id TEXT NOT NULL,ask_id TEXT NOT NULL,revision INTEGER NOT NULL,phase TEXT NOT NULL,revoked INTEGER NOT NULL CHECK(revoked IN (0,1)),sealed BLOB NOT NULL,PRIMARY KEY(project_id,ask_id))"} {
 			if _, err = tx.Exec(stmt); err != nil {
 				return nil, err
 			}
@@ -308,6 +313,14 @@ func openDatabase(path string, aead cipher.AEAD, b Binding, initialize bool) (_ 
 			return nil, err
 		}
 		if _, err = tx.Exec("INSERT INTO binding VALUES(1,?)", sealed); err != nil {
+			return nil, err
+		}
+		initial := budgetState{Limits: limits, Active: make(map[string]providerClaim)}
+		budgetSealed, e := s.encodeBudget(1, initial)
+		if e != nil {
+			return nil, e
+		}
+		if _, err = tx.Exec("INSERT INTO budget VALUES(1,1,?)", budgetSealed); err != nil {
 			return nil, err
 		}
 		if err = tx.Commit(); err != nil {
@@ -332,6 +345,9 @@ func openDatabase(path string, aead cipher.AEAD, b Binding, initialize bool) (_ 
 	expected, _ := json.Marshal(b)
 	if !bytes.Equal(plain, expected) {
 		return nil, errors.New("text bridge ledger binding mismatch")
+	}
+	if _, _, err = s.readBudget(context.Background(), db); err != nil {
+		return nil, err
 	}
 	if _, err = s.List(context.Background()); err != nil {
 		return nil, err
@@ -492,8 +508,12 @@ func allowed(from, to Phase) bool {
 
 // CompareAndSwap advances exactly the caller's observed revision. A revoked
 // job can only reconcile a previously prepared reply's validated receipt. The
-// immutable incoming ASK digest cannot change.
+// immutable incoming ASK digest cannot change. Provider entry and completion
+// require ClaimProvider and FinishProvider so budget updates cannot be bypassed.
 func (s *Store) CompareAndSwap(ctx context.Context, expected Job, next Phase, d Data) (Job, error) {
+	if next == ProviderStarted || expected.Phase == ProviderStarted {
+		return Job{}, ErrInvalid
+	}
 	if expected.Revoked && (expected.Phase != ReplyPrepared || next != Admitted || len(d.Receipt) == 0 || bytes.Equal(bytes.TrimSpace(d.Receipt), []byte("null"))) {
 		return Job{}, ErrInvalid
 	}

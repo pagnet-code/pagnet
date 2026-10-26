@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var ctx = context.Background()
@@ -21,7 +22,7 @@ func data() Data {
 func openTest(t *testing.T) (*Store, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "ledger")
-	s, e := Open(dir, binding())
+	s, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -50,7 +51,7 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 	}
 	normalized := binding()
 	normalized.ServiceOrigin = "https://example.com"
-	s, e := Open(dir, normalized)
+	s, e := Open(dir, normalized, Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -60,7 +61,7 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 		t.Fatalf("restart: %+v %v", got, e)
 	}
 	for _, b := range []Binding{{"https://other.example", "principal"}, {"https://example.com", "other"}} {
-		if other, e := Open(dir, b); e == nil {
+		if other, e := Open(dir, b, Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 			other.Close()
 			t.Fatal("binding mismatch accepted")
 		}
@@ -76,7 +77,7 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 func TestNestedPrivateDirectoryCreation(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "private", "nested", "ledger")
-	s, e := Open(dir, binding())
+	s, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -90,7 +91,7 @@ func TestNestedPrivateDirectoryCreation(t *testing.T) {
 			t.Fatalf("permissions %s: %v %v", path, info, e)
 		}
 	}
-	s, e = Open(dir, binding())
+	s, e = Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -135,7 +136,7 @@ func TestDirectorySyncRetryIncludesExistingAncestors(t *testing.T) {
 			}
 		}
 	}
-	s, err := Open(dir, binding())
+	s, err := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +158,7 @@ func TestRejectSymlinkDirectory(t *testing.T) {
 			if nested {
 				dir = filepath.Join(dir, "ledger")
 			}
-			if s, err := Open(dir, binding()); err == nil {
+			if s, err := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); err == nil {
 				s.Close()
 				t.Fatal("symlink ledger path accepted")
 			}
@@ -172,11 +173,7 @@ func TestMissingDatabaseAfterTerminalJobFailsClosed(t *testing.T) {
 	s, dir := openTest(t)
 	j := insert(t, s)
 	for _, phase := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared, Admitted} {
-		var e error
-		j, e = s.CompareAndSwap(ctx, j, phase, j.Data)
-		if e != nil {
-			t.Fatal(e)
-		}
+		j = advance(t, s, j, phase, j.Data)
 	}
 	if e := s.Close(); e != nil {
 		t.Fatal(e)
@@ -185,7 +182,7 @@ func TestMissingDatabaseAfterTerminalJobFailsClosed(t *testing.T) {
 	if e := os.Remove(path); e != nil {
 		t.Fatal(e)
 	}
-	if reopened, e := Open(dir, binding()); e == nil {
+	if reopened, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 		reopened.Close()
 		t.Fatal("lost terminal job history accepted; duplicate ASK could run again")
 	}
@@ -200,7 +197,7 @@ func TestInitializationEvidenceWithoutDatabaseFailsClosed(t *testing.T) {
 			if e := os.WriteFile(filepath.Join(dir, name), []byte("initialization evidence"), 0600); e != nil {
 				t.Fatal(e)
 			}
-			if s, e := Open(dir, binding()); e == nil {
+			if s, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 				s.Close()
 				t.Fatal("initialization evidence ignored")
 			}
@@ -224,10 +221,7 @@ func TestIdempotenceConflictAndTerminalRetention(t *testing.T) {
 		t.Fatal(e)
 	}
 	for _, phase := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared, Admitted} {
-		j, e = s.CompareAndSwap(ctx, j, phase, j.Data)
-		if e != nil {
-			t.Fatal(e)
-		}
+		j = advance(t, s, j, phase, j.Data)
 	}
 	again, e = s.Insert(ctx, j.ProjectID, j.AskID, data())
 	if e != nil || again.Phase != Admitted {
@@ -244,7 +238,7 @@ func TestIdempotenceConflictAndTerminalRetention(t *testing.T) {
 func TestCASAcrossStoresAndRevocation(t *testing.T) {
 	s, dir := openTest(t)
 	j := insert(t, s)
-	other, e := Open(dir, binding())
+	other, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -255,7 +249,7 @@ func TestCASAcrossStoresAndRevocation(t *testing.T) {
 		wg.Add(1)
 		go func(s *Store) {
 			defer wg.Done()
-			_, e := s.CompareAndSwap(ctx, j, ProviderStarted, j.Data)
+			_, _, e := s.ClaimProvider(ctx, j, time.Now())
 			results <- e
 		}(store)
 	}
@@ -301,14 +295,9 @@ func TestUncertaintyAndImmutableInput(t *testing.T) {
 	if _, e := s.CompareAndSwap(ctx, j, ProviderStarted, d); !errors.Is(e, ErrInvalid) {
 		t.Fatal(e)
 	}
-	j, e := s.CompareAndSwap(ctx, j, ProviderStarted, j.Data)
-	if e != nil {
-		t.Fatal(e)
-	}
-	j, e = s.CompareAndSwap(ctx, j, Unknown, j.Data)
-	if e != nil {
-		t.Fatal(e)
-	}
+	j = advance(t, s, j, ProviderStarted, j.Data)
+	var e error
+	j = advance(t, s, j, Unknown, j.Data)
 	if _, e = s.CompareAndSwap(ctx, j, Queued, j.Data); !errors.Is(e, ErrInvalid) {
 		t.Fatal(e)
 	}
@@ -329,11 +318,7 @@ func TestRejectionOnlyBeforeProviderStarted(t *testing.T) {
 					if j.Phase == phase {
 						break
 					}
-					var e error
-					j, e = s.CompareAndSwap(ctx, j, next, j.Data)
-					if e != nil {
-						t.Fatal(e)
-					}
+					j = advance(t, s, j, next, j.Data)
 				}
 			}
 			_, e := s.CompareAndSwap(ctx, j, Rejected, j.Data)
@@ -360,11 +345,7 @@ func TestRevokedPreparedReplyReceiptReconciliation(t *testing.T) {
 					d.ReplyID = "reply"
 					d.ReplyDigest = strings.Repeat("b", 64)
 				}
-				var e error
-				j, e = s.CompareAndSwap(ctx, j, next, d)
-				if e != nil {
-					t.Fatal(e)
-				}
+				j = advance(t, s, j, next, d)
 			}
 			j, e := s.Revoke(ctx, j)
 			if e != nil {
@@ -411,7 +392,7 @@ func TestRevokedPreparedReplyReceiptReconciliation(t *testing.T) {
 			if e = s.Close(); e != nil {
 				t.Fatal(e)
 			}
-			s, e = Open(dir, binding())
+			s, e = Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -427,11 +408,7 @@ func TestRevokedReconciliationRequiresStoredReplyID(t *testing.T) {
 	s, _ := openTest(t)
 	j := insert(t, s)
 	for _, next := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared} {
-		var e error
-		j, e = s.CompareAndSwap(ctx, j, next, j.Data)
-		if e != nil {
-			t.Fatal(e)
-		}
+		j = advance(t, s, j, next, j.Data)
 	}
 	j, e := s.Revoke(ctx, j)
 	if e != nil {
@@ -453,7 +430,7 @@ func TestTamperFailsClosed(t *testing.T) {
 				t.Fatal(e)
 			}
 			s.Close()
-			if reopened, e := Open(dir, binding()); e == nil {
+			if reopened, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 				reopened.Close()
 				t.Fatal("tampered database accepted")
 			}
@@ -478,7 +455,7 @@ func TestMissingKeyAndCorruption(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			if reopened, e := Open(dir, binding()); e == nil {
+			if reopened, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 				reopened.Close()
 				t.Fatal("corruption accepted")
 			}
