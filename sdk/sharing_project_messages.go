@@ -203,7 +203,23 @@ func validateProjectReply(w, previous sharingProjectMessageWire) error {
 // durably stores the exact canonical wire. An error can return a reserved ID;
 // a reservation without wire is unresolved and must never be reencrypted.
 func (c *Client) PrepareSharingProjectMessage(project, recipient, kind string, plaintext, predecessorWire []byte) (PreparedSharingProjectMessage, error) {
-	var result PreparedSharingProjectMessage
+	return c.prepareSharingProjectMessage(project, recipient, kind, "", plaintext, predecessorWire)
+}
+
+// PrepareSharingProjectMessageWithID prepares a message with the caller's strict,
+// canonical UUIDv7 ID. The ID follows kind and precedes the plaintext and
+// predecessor wire. It is returned on every error for reconciliation with
+// LoadPreparedSharingProjectMessage. An ID is durably reserved before encryption
+// and cannot be prepared again, even when its reservation has no wire.
+func (c *Client) PrepareSharingProjectMessageWithID(project, recipient, kind, id string, plaintext, predecessorWire []byte) (PreparedSharingProjectMessage, error) {
+	if !projectUUID(id, true) {
+		return PreparedSharingProjectMessage{ID: id}, errors.New("sdk: invalid project message ID")
+	}
+	return c.prepareSharingProjectMessage(project, recipient, kind, id, plaintext, predecessorWire)
+}
+
+func (c *Client) prepareSharingProjectMessage(project, recipient, kind, id string, plaintext, predecessorWire []byte) (PreparedSharingProjectMessage, error) {
+	result := PreparedSharingProjectMessage{ID: id}
 	d, hash, err := c.projectMessageDescriptor(project)
 	if err != nil {
 		return result, err
@@ -218,11 +234,13 @@ func (c *Client) PrepareSharingProjectMessage(project, recipient, kind string, p
 	if len(plaintext) > d.Limits.MaxMessageWireBytes {
 		return result, errors.New("sdk: project plaintext exceeds wire limit")
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return result, err
+	if result.ID == "" {
+		generated, err := uuid.NewV7()
+		if err != nil {
+			return result, err
+		}
+		result.ID = generated.String()
 	}
-	result.ID = id.String()
 	w := sharingProjectMessageWire{SharingProjectMessageHeader: SharingProjectMessageHeader{Version: 2, ProjectID: project, NetworkID: d.NetworkID, PolicyHash: d.PolicyHash, DescriptorHash: hex.EncodeToString(hash), ID: result.ID, ThreadID: result.ID, Kind: kind, SenderPrincipalID: c.principalID.Load(), RecipientPrincipalID: recipient, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}}
 	if kind == "REPLY" {
 		previous, err := c.projectMessagePredecessor(predecessorWire, d, hash)
