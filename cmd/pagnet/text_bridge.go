@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,9 +44,10 @@ type textBridgeConnection interface {
 }
 
 type textBridgeDependencies struct {
-	owner    func() (*cliCtx, error)
-	provider func(provider.Config) (textbridge.Provider, error)
-	connect  func(context.Context, sdk.Config) (textBridgeConnection, error)
+	owner         func() (*cliCtx, error)
+	provider      func(provider.Config) (textbridge.Provider, error)
+	connect       func(context.Context, sdk.Config) (textBridgeConnection, error)
+	senderConnect func(context.Context, sdk.Config) (textBridgeSenderConnection, error)
 }
 
 func textBridgeCmd() *cobra.Command {
@@ -62,6 +62,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 	cmd := &cobra.Command{Use: "text-bridge", Short: "Run a local, bounded text-only provider service", Args: cobra.NoArgs}
 	var stateDir string
 	cmd.PersistentFlags().StringVar(&stateDir, "state-dir", "", "private local state directory (default ~/.pagnet)")
+	cmd.AddCommand(textBridgeSenderCmd(&stateDir, textBridgeSenderDependencies{owner: deps.owner, connect: deps.senderConnect}))
 	var name, origin, model, keyFile string
 	var calls int64
 	enable := &cobra.Command{Use: "enable", Args: cobra.NoArgs, Short: "Create a service and save its private local responder profile", RunE: func(cmd *cobra.Command, _ []string) (retErr error) {
@@ -99,37 +100,15 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		var created struct {
-			ID         string `json:"id"`
-			Credential string `json:"activationCredential"`
-		}
-		// This creation request is deliberately sent exactly once, without the
-		// shared CLI's reauthentication retry or redirects. Never expose its body.
-		body, _ := json.Marshal(map[string]any{"name": name})
-		req, err := http.NewRequestWithContext(cmd.Context(), http.MethodPost, strings.TrimRight(owner.base, "/")+"/api/v1/service-recipes", bytes.NewReader(body))
+		created, err := textBridgeCreateService(cmd.Context(), owner, name)
 		if err != nil {
-			return errors.New("invalid service creation request")
+			return err
 		}
-		req.Header.Set("Authorization", "Bearer "+owner.token)
-		req.Header.Set("Content-Type", "application/json")
-		client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		resp, err := client.Do(req)
-		if err != nil {
-			return errors.New("service creation outcome uncertain; inspect Services before creating another service")
-		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 32769))
-		decodeErr := json.Unmarshal(raw, &created)
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 && textBridgeUUID(created.ID) {
-			defer func() {
-				if retErr != nil {
-					retErr = fmt.Errorf("service %s was created but local setup failed; inspect this service in Services before retrying: %w", created.ID, retErr)
-				}
-			}()
-		}
-		if err != nil || len(raw) > 32768 || resp.StatusCode < 200 || resp.StatusCode >= 300 || decodeErr != nil || !textBridgeUUID(created.ID) || created.Credential == "" {
-			return errors.New("service creation did not return a usable setup; inspect Services before creating another service")
-		}
+		defer func() {
+			if retErr != nil {
+				retErr = fmt.Errorf("service %s was created but local setup failed; inspect this service in Services before retrying: %w", created.ID, retErr)
+			}
+		}()
 		p := textBridgeProfile{Service: created.ID, Server: owner.base, Credential: created.Credential, ProviderOrigin: origin, Model: model, KeyFile: keyPath, Fingerprint: textBridgeFingerprint(config), Limits: ledger.Limits{CallsPerDay: calls, MaxConcurrent: 1}}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created service has invalid connection configuration; inspect Services")
@@ -307,13 +286,17 @@ func textBridgeLoadProfile(dir, service string) (textBridgeProfile, error) {
 }
 
 func textBridgeSaveProfile(dir string, p textBridgeProfile) error {
+	return textBridgeSaveJSON(dir, "profile.json", p)
+}
+
+func textBridgeSaveJSON(dir, name string, value any) error {
 	f, err := os.CreateTemp(dir, ".profile-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(f.Name())
 	if err = f.Chmod(0600); err == nil {
-		err = json.NewEncoder(f).Encode(p)
+		err = json.NewEncoder(f).Encode(value)
 	}
 	if err == nil {
 		err = f.Sync()
@@ -325,7 +308,7 @@ func textBridgeSaveProfile(dir string, p textBridgeProfile) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	if err = os.Rename(f.Name(), filepath.Join(dir, "profile.json")); err != nil {
+	if err = os.Rename(f.Name(), filepath.Join(dir, name)); err != nil {
 		return err
 	}
 	d, err := os.Open(dir)
