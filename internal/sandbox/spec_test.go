@@ -3,6 +3,7 @@ package sandbox
 import (
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -156,6 +157,12 @@ func TestResolvRO(t *testing.T) {
 		t.Skipf("/etc/resolv.conf not resolvable: %v", err)
 	}
 	got := ResolvRO()
+	if runtime.GOOS == "darwin" {
+		if !reflect.DeepEqual(got, []string{target}) {
+			t.Fatalf("ResolvRO = %v, want exact file %q", got, target)
+		}
+		return
+	}
 	if strings.HasPrefix(target, "/etc/") {
 		// The /etc grant already covers the resolved target: no extra grant.
 		if len(got) != 0 {
