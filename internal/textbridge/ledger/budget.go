@@ -135,7 +135,8 @@ func (s *Store) writeProviderJob(ctx context.Context, c *sql.Conn, j Job) error 
 // attempted. The opaque token must accompany completion. Time is observed in UTC;
 // a day earlier than the durable high-water day is rejected without resetting it.
 // Only a nil error authorizes dispatch. Any error, including an uncertain commit
-// response, returns no token and must be handled through job recovery.
+// response, returns no token. Recovery may inspect and surface an unresolved
+// ProviderStarted job; it must not replay the call or release its active claim.
 func (s *Store) ClaimProvider(ctx context.Context, expected Job, now time.Time) (Job, string, error) {
 	var result Job
 	var token string
