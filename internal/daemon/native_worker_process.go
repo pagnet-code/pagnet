@@ -156,7 +156,7 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		if err == nil {
 			stat, ok := info.Sys().(*syscall.Stat_t)
 			if !ok || stat.Uid != uint32(os.Getuid()) || info.Mode()&os.ModeSocket == 0 {
-				return errors.New("native worker readiness path is not a private socket")
+				return errors.Join(errNativeWorkerReadinessUnavailable, errors.New("native worker readiness path is not a private socket"))
 			}
 			// The worker makes the socket private after binding it. Poll through
 			// that interval, but never accept readiness before its chmod completes.
@@ -165,13 +165,13 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			}
 		}
 		if err != nil && !os.IsNotExist(err) {
-			return err
+			return errors.Join(errNativeWorkerReadinessUnavailable, err)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			return errors.New("original native worker unavailable; automatic replacement forbidden")
+			return errors.Join(errNativeWorkerReadinessUnavailable, errors.New("original native worker unavailable; automatic replacement forbidden"))
 		case <-tick.C:
 		}
 	}

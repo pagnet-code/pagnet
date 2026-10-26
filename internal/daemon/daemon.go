@@ -1050,6 +1050,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
+		q.Set("native_worker_availability", transport.NativeWorkerAvailabilityProtocol)
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
@@ -1279,6 +1280,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 						d.sharingBridges.admit(session)
 					}
 				}
+				nativeConn.availabilityOnce.Do(func() { go d.publishNativeWorkerAvailability(conn, nativeConn) })
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}

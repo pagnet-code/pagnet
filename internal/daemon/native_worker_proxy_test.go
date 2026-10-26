@@ -75,6 +75,9 @@ func TestNativeWorkerProxyReconnectsExistingWorkerWithoutBootstrapMutation(t *te
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Close() })
+	if a.availability(time.Now()) != "connected" {
+		t.Fatal("authenticated initial snapshot did not establish availability")
+	}
 	if err := a.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +122,9 @@ func TestNativeWorkerProxyReconnectsExistingWorkerWithoutBootstrapMutation(t *te
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = replacement.Close() })
+	if replacement.availability(time.Now()) != "connected" || a.availability(time.Now()) != "unavailable" {
+		t.Fatal("reconnect retained stale proxy availability")
+	}
 	if replacement.controller.Lease <= a.controller.Lease || replacement.controller.WorkerBuild != "original-worker" {
 		t.Fatal("replacement lost worker ownership/fence")
 	}

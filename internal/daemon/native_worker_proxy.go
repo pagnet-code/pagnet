@@ -24,6 +24,8 @@ type NativeWorkerProxy struct {
 	closeOnce                           sync.Once
 	reconcileOnce                       sync.Once
 	reconcileGate                       chan struct{}
+	snapshotMu                          sync.Mutex
+	snapshotAt                          time.Time
 	confirmedMu                         sync.Mutex
 	confirmedGeneration, confirmedStart string
 	confirmedAt                         time.Time
@@ -204,6 +206,9 @@ func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeS
 		_ = p.Close()
 		return sessionworker.NativeSnapshot{}, ErrNativeObservationConflict
 	}
+	p.snapshotMu.Lock()
+	p.snapshotAt = time.Now()
+	p.snapshotMu.Unlock()
 	return *response.Snapshot, nil
 }
 
