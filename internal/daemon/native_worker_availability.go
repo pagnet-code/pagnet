@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 
@@ -10,16 +11,33 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+var errNativeWorkerReadinessUnavailable = errors.New("native worker readiness unavailable")
+
 const nativeWorkerSnapshotFreshness = 10 * time.Second
 const nativeWorkerAvailabilityInterval = 15 * time.Second
 
-func (c *NativeObservationConnection) recordNativeWorkerAttachFailure(scope sessionworker.Scope) {
+func (c *NativeObservationConnection) recordNativeWorkerAttachFailure(scope sessionworker.Scope, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrNativeOriginAdmissionDeferred) || errors.Is(err, ErrNativeOriginAdmissionRejected) || errors.Is(err, sessionworker.ErrControllerCallNotStarted) {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.availabilityFailures == nil {
 		c.availabilityFailures = make(map[string]string)
 	}
 	c.availabilityFailures[scope.InstanceID] = scope.Generation
+}
+
+// Only a consumed launch claim and a definitive local readiness observation
+// establish unavailability. Admission and caller cancellation carry no evidence.
+func (d *Daemon) recordNativeWorkerReadinessFailure(c *NativeObservationConnection, record NativeWorkerRecord, err error) {
+	if !errors.Is(err, errNativeWorkerReadinessUnavailable) {
+		return
+	}
+	current, lookupErr := d.nativeRegistry.Lookup(record.Scope.InstanceID)
+	if lookupErr == nil && current.Scope == record.Scope && (current.LaunchState == "launched" || current.LaunchState == "launching") {
+		c.recordNativeWorkerAttachFailure(record.Scope, err)
+	}
 }
 
 func (p *NativeWorkerProxy) availability(now time.Time) string {
@@ -79,7 +97,7 @@ func (d *Daemon) sendNativeWorkerAvailability(ctx context.Context, conn *websock
 	if d.nativeRegistry == nil || !slices.Contains(session.ProtocolFeatures, transport.NativeWorkerAvailabilityProtocol) {
 		return nil
 	}
-	records, err := d.nativeRegistry.List()
+	records, err := d.nativeRegistry.list(true)
 	if err != nil {
 		return err
 	}
@@ -98,7 +116,7 @@ func (d *Daemon) sendNativeWorkerAvailability(ctx context.Context, conn *websock
 		c.mu.Unlock()
 		p := transport.NativeWorkerAvailabilityPayload{InstanceID: record.Scope.InstanceID, OwnershipGeneration: record.Scope.Generation, Sequence: sequence, State: state}
 		if err := p.Validate(); err != nil {
-			return err
+			continue
 		}
 		if err := c.send(ctx, transport.MsgNativeWorkerAvailability, p); err != nil {
 			return err

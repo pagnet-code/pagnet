@@ -4,9 +4,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +68,7 @@ func TestNativeWorkerAvailabilityStaleSocketNeverRelaunches(t *testing.T) {
 			_ = p.Close()
 			t.Fatal("stale socket authenticated")
 		}
-		c.recordNativeWorkerAttachFailure(scope)
+		c.recordNativeWorkerAttachFailure(scope, errors.New("attach failed"))
 		if err := d.sendNativeWorkerAvailability(t.Context(), nil, c); err != nil {
 			t.Fatal(err)
 		}
@@ -80,6 +82,47 @@ func TestNativeWorkerAvailabilityStaleSocketNeverRelaunches(t *testing.T) {
 	current, err := r.Lookup(scope.InstanceID)
 	if err != nil || current.LaunchState != "launched" {
 		t.Fatal("availability mutated launch claim", err)
+	}
+}
+
+func TestNativeWorkerAvailabilityMissingConsumedOwner(t *testing.T) {
+	r, scope, spec := nativeRegistryFixture(t)
+	record, err := r.Reserve(scope, spec, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.prepare(record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.db.Exec(`UPDATE native_workers SET launch_state='launched' WHERE instance_id=?`, scope.InstanceID); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{nativeRegistry: r}
+	c := NewNativeObservationConnection(scope.ServerURL, scope.HostID, "boot", nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = EnsureNativeWorker(ctx, r, record, "/bin/true", nil, "")
+	d.recordNativeWorkerReadinessFailure(c, record, err)
+	if got := d.nativeWorkerAvailability(nil, c, record, time.Now()); got != "unknown" {
+		t.Fatal("cancellation claimed unavailable", got)
+	}
+	for _, uncertain := range []error{context.Canceled, context.DeadlineExceeded, ErrNativeOriginAdmissionDeferred, ErrNativeOriginAdmissionRejected} {
+		c.recordNativeWorkerAttachFailure(scope, uncertain)
+		if got := d.nativeWorkerAvailability(nil, c, record, time.Now()); got != "unknown" {
+			t.Fatal("uncertain attach claimed unavailable", uncertain, got)
+		}
+	}
+	err = EnsureNativeWorker(t.Context(), r, record, "/bin/true", nil, "")
+	if !errors.Is(err, errNativeWorkerReadinessUnavailable) {
+		t.Fatal("missing owner did not yield readiness evidence", err)
+	}
+	d.recordNativeWorkerReadinessFailure(c, record, err)
+	if got := d.nativeWorkerAvailability(nil, c, record, time.Now()); got != "unavailable" {
+		t.Fatal("missing consumed owner unavailable evidence lost", got)
+	}
+	current, err := r.Lookup(scope.InstanceID)
+	if err != nil || current.LaunchState != "launched" {
+		t.Fatal("missing owner consumed launch changed", err)
 	}
 }
 
@@ -110,7 +153,7 @@ func TestNativeWorkerAvailabilityCurrentProxyOnly(t *testing.T) {
 	check("unknown", now)
 	// A late observation from the replaced proxy cannot refresh its successor.
 	old.snapshotAt = now.Add(time.Second)
-	c.recordNativeWorkerAttachFailure(scope)
+	c.recordNativeWorkerAttachFailure(scope, errors.New("attach failed"))
 	check("unknown", now)
 	replacement.snapshotAt = now
 	check("connected", now)
@@ -118,7 +161,7 @@ func TestNativeWorkerAvailabilityCurrentProxyOnly(t *testing.T) {
 	if got := d.nativeWorkerAvailability(conn, other, record, now); got != "unknown" {
 		t.Fatal("replayed previous connection observation", got)
 	}
-	other.recordNativeWorkerAttachFailure(scope)
+	other.recordNativeWorkerAttachFailure(scope, errors.New("attach failed"))
 	if got := d.nativeWorkerAvailability(conn, other, record, now); got != "unavailable" {
 		t.Fatal("attach failure lost", got)
 	}
@@ -158,7 +201,7 @@ func TestNativeWorkerAvailabilityNegotiationSequenceAndNoReplay(t *testing.T) {
 		t.Fatal("event sent to legacy server")
 	}
 	c := newConnection(true)
-	c.recordNativeWorkerAttachFailure(scope)
+	c.recordNativeWorkerAttachFailure(scope, errors.New("attach failed"))
 	for range 2 {
 		if err := d.sendNativeWorkerAvailability(t.Context(), conn, c); err != nil {
 			t.Fatal(err)
@@ -177,6 +220,49 @@ func TestNativeWorkerAvailabilityNegotiationSequenceAndNoReplay(t *testing.T) {
 	}
 	if len(sent) != 3 || sent[2].Sequence != 1 || sent[2].State != "unknown" {
 		t.Fatal("old connection state replayed", sent)
+	}
+	// A valid opaque generation, a bad transport row, and a corrupt registry
+	// row coexist. Neither bad row can suppress healthy instances or later ticks.
+	opaque := scope
+	opaque.InstanceID = domain.NewID().String()
+	opaque.Generation = "opaque-ownership-generation"
+	if _, err := r.Reserve(opaque, spec, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	bad := scope
+	bad.InstanceID = "00000000-0000-4000-8000-000000000001"
+	bad.Generation = strings.Repeat("g", 257)
+	if _, err := r.Reserve(bad, spec, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := scope
+	corrupt.InstanceID = "00000000-0000-4000-8000-000000000002"
+	if _, err := r.Reserve(corrupt, spec, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.db.Exec(`UPDATE native_workers SET payload='invalid' WHERE instance_id=?`, corrupt.InstanceID); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		before := len(sent)
+		if err := d.sendNativeWorkerAvailability(t.Context(), conn, next); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) != before+2 {
+			t.Fatal("bad row suppressed healthy instances", sent[before:])
+		}
+		foundOpaque := false
+		for _, p := range sent[before:] {
+			if err := p.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if p.InstanceID == opaque.InstanceID && p.OwnershipGeneration == opaque.Generation {
+				foundOpaque = true
+			}
+		}
+		if !foundOpaque {
+			t.Fatal("opaque generation omitted")
+		}
 	}
 	record, err := r.Lookup(scope.InstanceID)
 	if err != nil || record.LaunchState != "reserved" {

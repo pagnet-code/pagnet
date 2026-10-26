@@ -19,11 +19,9 @@ type NativeWorkerAvailabilityPayload struct {
 }
 
 func (p NativeWorkerAvailabilityPayload) Validate() error {
-	for _, value := range []string{p.InstanceID, p.OwnershipGeneration} {
-		id, err := domain.ParseID(value)
-		if err != nil || id.String() != value {
-			return errors.New("invalid native worker availability identity")
-		}
+	id, err := domain.ParseID(p.InstanceID)
+	if err != nil || id.String() != p.InstanceID || len(p.OwnershipGeneration) == 0 || len(p.OwnershipGeneration) > 256 {
+		return errors.New("invalid native worker availability identity")
 	}
 	if p.Sequence <= 0 || (p.State != "connected" && p.State != "unavailable" && p.State != "unknown") {
 		return errors.New("invalid native worker availability observation")

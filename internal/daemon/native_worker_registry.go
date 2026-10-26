@@ -173,6 +173,11 @@ func (r *NativeWorkerRegistry) Owns(instanceID string) bool {
 	return err != nil || n > 0
 } // fail closed on registry errors
 func (r *NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
+	return r.list(false)
+}
+
+// Availability is advisory and can skip corrupt rows without hiding healthy peers.
+func (r *NativeWorkerRegistry) list(skipInvalid bool) ([]NativeWorkerRecord, error) {
 	rows, err := r.db.Query(`SELECT instance_id FROM native_workers ORDER BY instance_id LIMIT ?`, maxNativeWorkerRecords+1)
 	if err != nil {
 		return nil, err
@@ -198,6 +203,9 @@ func (r *NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
 	for _, id := range ids {
 		record, err := r.Lookup(id)
 		if err != nil {
+			if skipInvalid {
+				continue
+			}
 			return nil, err
 		}
 		records = append(records, record)

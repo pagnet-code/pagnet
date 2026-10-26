@@ -276,11 +276,12 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		return err
 	}
 	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.composedSideportSocket()); err != nil {
+		d.recordNativeWorkerReadinessFailure(connection, record, err)
 		return err
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)
 	if err != nil {
-		connection.recordNativeWorkerAttachFailure(record.Scope)
+		connection.recordNativeWorkerAttachFailure(record.Scope, err)
 		return err
 	}
 	// Consult the durable marker on every ordinary drain, including reconnects.

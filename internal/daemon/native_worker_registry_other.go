@@ -30,6 +30,9 @@ func (*NativeWorkerRegistry) Owns(string) bool               { return true }
 func (*NativeWorkerRegistry) Lookup(string) (NativeWorkerRecord, error) {
 	return NativeWorkerRecord{}, errNativeWorkerPlatform
 }
+func (*NativeWorkerRegistry) list(bool) ([]NativeWorkerRecord, error) {
+	return nil, errNativeWorkerPlatform
+}
 func (*NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
 	return nil, errNativeWorkerPlatform
 }
