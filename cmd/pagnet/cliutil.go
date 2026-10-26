@@ -28,8 +28,8 @@ type cliCtx struct {
 	// scopes the user credential (keyring key + account config dir).
 	account string
 	// token is the user/admin bearer for REST calls. NEVER the host
-	// credential (cfg.Credential): host identities are WSS-only and the
-	// REST API rejects them (403 host_identity).
+	// credential (cfg.Credential): host identities use WSS and only a narrow,
+	// allowlisted host REST surface; these user/admin REST calls reject them.
 	token string
 	// principal marks a bearer that is a PRINCIPAL endpoint credential
 	// (pgn_epd_) rather than a human's: the caller acts as an agent or a
