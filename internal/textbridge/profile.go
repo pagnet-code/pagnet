@@ -90,8 +90,12 @@ func SaveProfile(dir string, p Profile) error {
 }
 
 // SavePrivateJSON atomically writes JSON with mode 0600 in a private directory.
-// The directory must have passed PrivateDir and name must be a local filename.
+// The directory must have passed PrivateDir. Only single-component local filenames
+// are accepted.
 func SavePrivateJSON(dir, name string, value any) error {
+	if err := validatePrivateFilename(name); err != nil {
+		return err
+	}
 	f, err := os.CreateTemp(dir, ".profile-*")
 	if err != nil {
 		return err
@@ -119,6 +123,15 @@ func SavePrivateJSON(dir, name string, value any) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// validatePrivateFilename rejects separators on every supported platform so a
+// caller cannot turn a local filename into a path outside the private directory.
+func validatePrivateFilename(name string) error {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, "/\\\x00") {
+		return errors.New("invalid local text bridge filename")
+	}
+	return nil
 }
 
 // ProfileDirectory resolves a service beneath the current OS user's private state.

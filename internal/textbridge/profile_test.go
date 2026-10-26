@@ -173,3 +173,59 @@ func TestReadProfileStatusDoesNotRecreateMissingLedger(t *testing.T) {
 		t.Fatal("status recreated missing ledger")
 	}
 }
+
+func TestSavePrivateJSONRejectsPaths(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "private")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.json")
+	const original = "unchanged"
+	if err := os.WriteFile(outside, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"", ".", "..", "../outside.json", "nested/../../outside.json", "nested/profile.json", "profile.json/", `..\outside.json`, `nested\profile.json`, outside, "bad\x00name"} {
+		t.Run(name, func(t *testing.T) {
+			if err := SavePrivateJSON(dir, name, map[string]string{"value": "replacement"}); err == nil {
+				t.Fatal("accepted a filename containing a path")
+			}
+			raw, err := os.ReadFile(outside)
+			if err != nil || string(raw) != original {
+				t.Fatal("modified file outside private directory")
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatal("invalid filename created a file in private directory")
+			}
+		})
+	}
+}
+
+func TestSavePrivateJSONLocalFilename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile.json")
+	if err := os.WriteFile(path, []byte("old profile"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"value": "saved"}
+	if err := SavePrivateJSON(dir, "profile.json", want); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(raw, &got); err != nil || got["value"] != want["value"] {
+		t.Fatal("valid filename did not save JSON")
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("saved file is not private")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "profile.json" {
+		t.Fatal("save left temporary files")
+	}
+}
