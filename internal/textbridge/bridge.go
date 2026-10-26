@@ -352,9 +352,14 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 				var quota *sdk.SharingProjectMessageQuotaError
 				if errors.As(err, &quota) {
 					until := quotaRetryAt(quota, time.Now())
-					b.quota[key] = until
 					if !until.IsZero() {
+						b.quota[key] = until
 						return quotaWait{until}
+					}
+					// Temporary capacity limits without a usable hint await an
+					// explicit wake; only permanent limits stay suppressed.
+					if quota.StatusCode != http.StatusTooManyRequests {
+						b.quota[key] = until
 					}
 					return err
 				}

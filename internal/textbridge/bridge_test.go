@@ -786,6 +786,61 @@ func TestQuotaWithoutHintDoesNotSpinAcrossWake(t *testing.T) {
 		t.Fatal("permanent quota retried")
 	}
 }
+func TestTemporaryQuotaWithoutHintRecoversOnWake(t *testing.T) {
+	b, s, tr, p, m := setup(t)
+	accept(t, b, m)
+	var capacityRestored atomic.Bool
+	var replyIDs []string
+	tr.onSend = func() {
+		replyIDs = append(replyIDs, tr.prepared.ID)
+		tr.sendErr = nil
+		if !capacityRestored.Load() {
+			tr.sendErr = &sdk.SharingProjectMessageQuotaError{StatusCode: 429, Limit: "maxInFlight", Maximum: 1}
+		}
+	}
+	reported := make(chan error, 8)
+	b.config.OnError = func(err error) { reported <- err }
+	ctx, cancel := context.WithCancel(testContext)
+	done := make(chan error, 1)
+	go func() { done <- b.Run(ctx) }()
+	stopped := false
+	defer func() {
+		cancel()
+		if !stopped {
+			<-done
+		}
+	}()
+	select {
+	case err := <-reported:
+		var quota *sdk.SharingProjectMessageQuotaError
+		if !errors.As(err, &quota) {
+			t.Fatalf("expected quota error, got %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("initial quota send did not complete")
+	}
+	preparedID := stored(t, s).Data.ReplyID
+	select {
+	case err := <-reported:
+		t.Fatalf("idle quota retried without a wake: %v", err)
+	case <-time.After(1100 * time.Millisecond):
+	}
+	capacityRestored.Store(true)
+	b.Wake()
+	deadline := time.Now().Add(4 * time.Second)
+	for stored(t, s).Phase != ledger.Admitted {
+		if time.Now().After(deadline) {
+			t.Fatal("quota retry did not recover after wake")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	stopped = true
+	if tr.sends != 2 || tr.prepares != 1 || p.calls != 1 || len(replyIDs) != 2 || replyIDs[0] != preparedID || replyIDs[1] != preparedID {
+		t.Fatal("quota wake did not reuse the prepared reply exactly once")
+	}
+}
 func TestQuotaRetryHints(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	reset := now.Add(time.Second)
