@@ -96,23 +96,30 @@ func TestInputBounds(t *testing.T) {
 
 func TestResponseBoundsAndValidation(t *testing.T) {
 	cases := map[string]string{
-		"body limit":       strings.Repeat("x", MaxResponseBytes+1),
-		"output limit":     textResponse(strings.Repeat("a", MaxOutputChars+1)),
-		"malformed":        `{"choices":`,
-		"trailing JSON":    textResponse("ok") + ` {}`,
-		"missing choices":  `{}`,
-		"empty choices":    `{"choices":[]}`,
-		"multiple choices": `{"choices":[{},{}]}`,
-		"tool calls":       `{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{"type":"function"}]},"finish_reason":"stop"}]}`,
-		"tool finish":      `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"tool_calls"}]}`,
-		"length finish":    `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"length"}]}`,
-		"content array":    `{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"stop"}]}`,
-		"null content":     `{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}`,
-		"wrong role":       `{"choices":[{"message":{"role":"user","content":"ok"},"finish_reason":"stop"}]}`,
-		"audio":            `{"choices":[{"message":{"role":"assistant","content":"ok","audio":{}},"finish_reason":"stop"}]}`,
-		"empty text":       textResponse("  "),
-		"invalid UTF8":     textResponse("ok") + string([]byte{0xff}),
-		"duplicate field":  `{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{}],"tool_calls":null},"finish_reason":"stop"}]}`,
+		"body limit":                strings.Repeat("x", MaxResponseBytes+1),
+		"output limit":              textResponse(strings.Repeat("a", MaxOutputChars+1)),
+		"malformed":                 `{"choices":`,
+		"trailing JSON":             textResponse("ok") + ` {}`,
+		"missing choices":           `{}`,
+		"empty choices":             `{"choices":[]}`,
+		"multiple choices":          `{"choices":[{},{}]}`,
+		"tool calls":                `{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{"type":"function"}]},"finish_reason":"stop"}]}`,
+		"tool finish":               `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"tool_calls"}]}`,
+		"length finish":             `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"length"}]}`,
+		"content array":             `{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"finish_reason":"stop"}]}`,
+		"null content":              `{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}`,
+		"wrong role":                `{"choices":[{"message":{"role":"user","content":"ok"},"finish_reason":"stop"}]}`,
+		"audio":                     `{"choices":[{"message":{"role":"assistant","content":"ok","audio":{}},"finish_reason":"stop"}]}`,
+		"empty text":                textResponse("  "),
+		"invalid UTF8":              textResponse("ok") + string([]byte{0xff}),
+		"duplicate field":           `{"choices":[{"message":{"role":"assistant","content":"ok","tool_calls":[{}],"tool_calls":null},"finish_reason":"stop"}]}`,
+		"choices alias hides tools": `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{}]},"finish_reason":"tool_calls"}],"Choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		"message alias hides tools": `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{}]},"Message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		"finish alias hides tools":  `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"tool_calls","Finish_Reason":"stop"}]}`,
+		"choices alias only":        `{"Choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		"message alias only":        `{"choices":[{"Message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+		"finish alias only":         `{"choices":[{"message":{"role":"assistant","content":"ok"},"Finish_Reason":"stop"}]}`,
+		"tool alias":                `{"choices":[{"message":{"role":"assistant","content":"ok","Tool_Calls":[{}]},"finish_reason":"stop"}]}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -122,6 +129,13 @@ func TestResponseBoundsAndValidation(t *testing.T) {
 				t.Fatalf("accepted response: %q, %v", got, err)
 			}
 		})
+	}
+}
+
+func TestResponseProviderMetadata(t *testing.T) {
+	raw := `{"id":"completion-id","object":"chat.completion","model":"owner-model","usage":{"prompt_tokens":10,"completion_tokens":2},"choices":[{"index":0,"logprobs":null,"message":{"role":"assistant","content":"ok","tool_calls":null},"finish_reason":"stop"}]}`
+	if got, err := decodeResponse([]byte(raw)); err != nil || got != "ok" {
+		t.Fatalf("provider metadata rejected: %q, %v", got, err)
 	}
 }
 
@@ -143,14 +157,14 @@ func TestTimeout(t *testing.T) {
 }
 
 func TestURLAndConfigValidation(t *testing.T) {
-	for _, endpoint := range []string{"", "https:///", "ftp://localhost", "http://example.com", "http://127.0.0.1.evil", "https://user:secret@example.com", "https://example.com/base", "https://example.com?x=y", "https://example.com?", "https://example.com/#secret", "https://example.com/#", "https://example.com/%2f", "https://[::1"} {
+	for _, endpoint := range []string{"", "https:///", "ftp://localhost", "http://localhost", "http://localhost:1234", "http://LOCALHOST:1234", "http://example.com", "http://127.0.0.1.evil", "https://user:secret@example.com", "https://example.com/base", "https://example.com?x=y", "https://example.com?", "https://example.com/#secret", "https://example.com/#", "https://example.com/%2f", "https://[::1"} {
 		t.Run(endpoint, func(t *testing.T) {
 			if _, err := New(Config{endpoint, "model", testKey}); err == nil {
 				t.Fatal("accepted invalid URL")
 			}
 		})
 	}
-	for _, endpoint := range []string{"https://example.com", "http://localhost:1234", "http://127.0.0.2", "http://[::1]:1234"} {
+	for _, endpoint := range []string{"https://example.com", "http://127.0.0.1:1234", "http://127.0.0.2", "http://127.255.255.254", "http://[::1]:1234"} {
 		newTestClient(t, endpoint)
 	}
 	for _, config := range []Config{{"https://example.com", "", testKey}, {"https://example.com", "model\n", testKey}, {"https://example.com", "model", ""}, {"https://example.com", "model", "key\r\n"}} {

@@ -45,8 +45,8 @@ func New(config Config) (*Client, error) {
 	}
 	if u.Scheme != "https" {
 		ip := net.ParseIP(u.Hostname())
-		if u.Scheme != "http" || (u.Hostname() != "localhost" && (ip == nil || !ip.IsLoopback())) {
-			return nil, errors.New("provider requires HTTPS or HTTP loopback")
+		if u.Scheme != "http" || ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("provider requires HTTPS or HTTP with a literal loopback IP")
 		}
 	}
 	if strings.TrimSpace(config.Model) == "" || len(config.Model) > 256 || strings.ContainsAny(config.Model, "\r\n") {
@@ -107,18 +107,22 @@ func (c *Client) Complete(ctx context.Context, input string) (string, error) {
 
 func decodeResponse(raw []byte) (string, error) {
 	invalid := errors.New("provider returned an invalid text response")
-	var response struct {
-		Choices []struct {
-			Message      map[string]json.RawMessage `json:"message"`
-			FinishReason string                     `json:"finish_reason"`
-		} `json:"choices"`
-	}
-	if json.Unmarshal(raw, &response) != nil || !uniqueFields(json.NewDecoder(bytes.NewReader(raw))) || len(response.Choices) != 1 || response.Choices[0].FinishReason != "stop" {
+	response, ok := responseObject(raw, "choices")
+	if !ok || !uniqueFields(json.NewDecoder(bytes.NewReader(raw))) {
 		return "", invalid
 	}
-	m := response.Choices[0].Message
+	var choices []json.RawMessage
+	if json.Unmarshal(response["choices"], &choices) != nil || len(choices) != 1 {
+		return "", invalid
+	}
+	choice, ok := responseObject(choices[0], "message", "finish_reason")
+	var finishReason string
+	if !ok || json.Unmarshal(choice["finish_reason"], &finishReason) != nil || finishReason != "stop" {
+		return "", invalid
+	}
+	m, ok := responseObject(choice["message"], "role", "content", "tool_calls", "function_call", "audio", "refusal", "annotations")
 	var role, content string
-	if json.Unmarshal(m["role"], &role) != nil || role != "assistant" || bytes.Equal(m["content"], []byte("null")) || json.Unmarshal(m["content"], &content) != nil {
+	if !ok || json.Unmarshal(m["role"], &role) != nil || role != "assistant" || bytes.Equal(m["content"], []byte("null")) || json.Unmarshal(m["content"], &content) != nil {
 		return "", invalid
 	}
 	for field, value := range m {
@@ -140,6 +144,23 @@ func decodeResponse(raw []byte) (string, error) {
 		return "", invalid
 	}
 	return content, nil
+}
+
+// Parse consumed fields by their exact names. Case aliases are ambiguous even
+// alongside canonical names; unrelated provider metadata may be preserved.
+func responseObject(raw []byte, fields ...string) (map[string]json.RawMessage, bool) {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return nil, false
+	}
+	for name := range object {
+		for _, field := range fields {
+			if name != field && strings.EqualFold(name, field) {
+				return nil, false
+			}
+		}
+	}
+	return object, true
 }
 
 // Duplicate fields must not hide an earlier tool call or change the selected
