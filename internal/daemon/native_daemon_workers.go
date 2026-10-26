@@ -280,6 +280,7 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)
 	if err != nil {
+		connection.recordNativeWorkerAttachFailure(record.Scope)
 		return err
 	}
 	// Consult the durable marker on every ordinary drain, including reconnects.
