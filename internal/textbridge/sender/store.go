@@ -150,10 +150,12 @@ func syncDir(dir string) error {
 }
 
 // Refuse symlinks throughout the directory path, not only at the leaf.
-func privateDir(dir string) error {
+func privateDir(dir string) error { return privateDirWithSync(dir, syncDir) }
+
+func privateDirWithSync(dir string, syncDirectory func(string) error) error {
 	parent := filepath.Dir(dir)
 	if parent != dir {
-		if err := privateDir(parent); err != nil {
+		if err := privateDirWithSync(parent, syncDirectory); err != nil {
 			return err
 		}
 	}
@@ -162,7 +164,7 @@ func privateDir(dir string) error {
 		if err = os.Mkdir(dir, 0700); err != nil {
 			return err
 		}
-		return syncDir(parent)
+		return syncDirectory(parent)
 	}
 	if err != nil {
 		return err
@@ -173,7 +175,7 @@ func privateDir(dir string) error {
 	// A previous attempt may have created this entry but stopped before
 	// syncing its parent. Reopening must complete that durability barrier.
 	if parent != dir {
-		return syncDir(parent)
+		return syncDirectory(parent)
 	}
 	return nil
 }
@@ -234,7 +236,13 @@ func atomicWrite(dir, name string, data []byte) error {
 // Open creates an empty store only in an empty directory. Initialization evidence
 // without either key or state fails closed; an incomplete first initialization
 // therefore also requires operator investigation. No network action occurs here.
+// The caller must hold an exclusive lock and ensure path ancestors are trusted;
+// this store refuses symlinks but cannot protect against concurrent path swaps.
 func Open(dir string, binding Binding) (*Store, error) {
+	return openWithSync(dir, binding, syncDir)
+}
+
+func openWithSync(dir string, binding Binding, syncDirectory func(string) error) (*Store, error) {
 	b, err := normalizeBinding(binding)
 	if err != nil {
 		return nil, err
@@ -243,7 +251,7 @@ func Open(dir string, binding Binding) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = privateDir(dir); err != nil {
+	if err = privateDirWithSync(dir, syncDirectory); err != nil {
 		return nil, err
 	}
 	if err = os.Chmod(dir, 0700); err != nil {
@@ -251,7 +259,7 @@ func Open(dir string, binding Binding) (*Store, error) {
 	}
 	// A visible state file is not enough to acknowledge a redelivered reply:
 	// finish any earlier rename's directory sync before trusting it.
-	if err = syncDir(dir); err != nil {
+	if err = syncDirectory(dir); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(dir)

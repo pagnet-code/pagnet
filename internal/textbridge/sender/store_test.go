@@ -181,6 +181,35 @@ func TestReplyDurabilityDuplicatesAndConflicts(t *testing.T) {
 	}
 }
 
+func TestReopenRequiresDirectorySyncBeforeReplayAcknowledgement(t *testing.T) {
+	s, dir := openTest(t)
+	o := reserveTest(t, s)
+	reply := replyFor(o)
+	if _, err := s.RecordReply(ctx, reply); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	seen := map[string]int{}
+	syncFailure := errors.New("directory sync failed")
+	_, err := openWithSync(dir, binding(), func(path string) error {
+		seen[path]++
+		if path == dir {
+			return syncFailure
+		}
+		return nil
+	})
+	if !errors.Is(err, syncFailure) || seen[dir] != 1 || seen[filepath.Dir(dir)] == 0 {
+		t.Fatalf("reopen accepted unsynced reply: %v, sync calls: %v", err, seen)
+	}
+	reopened, err := Open(dir, binding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.RecordReply(ctx, reply); err != nil {
+		t.Fatalf("durable duplicate must be idempotent: %v", err)
+	}
+}
+
 func TestMissingCorruptAndBindingMismatchFailClosed(t *testing.T) {
 	for _, name := range []string{"missing key", "missing state", "corrupt key", "corrupt state", "tampered ciphertext", "permissions", "binding", "origin"} {
 		t.Run(name, func(t *testing.T) {
