@@ -2,7 +2,10 @@ package ledger
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -17,7 +20,9 @@ var ctx = context.Background()
 
 func binding() Binding { return Binding{"https://EXAMPLE.com:443/", "principal"} }
 func data() Data {
-	return Data{Header: []byte(`{"kind":"ASK"}`), WireDigest: strings.Repeat("a", 64), Input: []byte("private input"), ProviderConfigFingerprint: "config-sha256"}
+	wire := []byte("original ASK wire\n")
+	digest := sha256.Sum256(wire)
+	return Data{Header: []byte(`{"kind":"ASK"}`), PredecessorWire: wire, WireDigest: hex.EncodeToString(digest[:]), Input: []byte("private input"), ProviderConfigFingerprint: "config-sha256"}
 }
 func openTest(t *testing.T) (*Store, string) {
 	t.Helper()
@@ -216,7 +221,9 @@ func TestIdempotenceConflictAndTerminalRetention(t *testing.T) {
 		t.Fatal(again, e)
 	}
 	conflicting := data()
-	conflicting.WireDigest = strings.Repeat("b", 64)
+	conflicting.PredecessorWire = []byte("different ASK wire\n")
+	digest := sha256.Sum256(conflicting.PredecessorWire)
+	conflicting.WireDigest = hex.EncodeToString(digest[:])
 	if _, e = s.Insert(ctx, j.ProjectID, j.AskID, conflicting); !errors.Is(e, ErrConflict) {
 		t.Fatal(e)
 	}
@@ -235,6 +242,81 @@ func TestIdempotenceConflictAndTerminalRetention(t *testing.T) {
 		t.Fatal(e)
 	}
 }
+func TestPredecessorWireDigestValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Data)
+	}{
+		{"missing", func(d *Data) { d.PredecessorWire = nil }},
+		{"empty", func(d *Data) {
+			d.PredecessorWire = []byte{}
+			digest := sha256.Sum256(d.PredecessorWire)
+			d.WireDigest = hex.EncodeToString(digest[:])
+		}},
+		{"different bytes", func(d *Data) { d.PredecessorWire[0] ^= 1 }},
+		{"trailing whitespace", func(d *Data) { d.PredecessorWire = append(d.PredecessorWire, ' ') }},
+		{"wrong digest", func(d *Data) { d.WireDigest = strings.Repeat("a", 64) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, dir := openTest(t)
+			d := data()
+			tc.mutate(&d)
+			if _, err := s.Insert(ctx, "project", "invalid", d); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("insert: %v", err)
+			}
+			j := insert(t, s)
+			if _, err := s.CompareAndSwap(ctx, j, Rejected, d); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("transition: %v", err)
+			}
+			// Seal invalid plaintext directly to verify reopening validates the
+			// stored wire and digest even when authentication succeeds.
+			plaintext, err := json.Marshal(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sealed, err := s.seal(plaintext, s.jobAAD(j))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.ExecContext(ctx, "UPDATE jobs SET sealed=? WHERE project_id=? AND ask_id=?", sealed, j.ProjectID, j.AskID); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if reopened, err := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100}); !errors.Is(err, ErrInvalid) {
+				if reopened != nil {
+					reopened.Close()
+				}
+				t.Fatalf("reopen: %v", err)
+			}
+		})
+	}
+}
+
+func TestPredecessorWireImmutable(t *testing.T) {
+	s, _ := openTest(t)
+	j := insert(t, s)
+	for _, recompute := range []bool{false, true} {
+		t.Run(strconv.FormatBool(recompute), func(t *testing.T) {
+			expected := j
+			expected.Data = data()
+			expected.Data.PredecessorWire[0] ^= 1
+			if recompute {
+				digest := sha256.Sum256(expected.Data.PredecessorWire)
+				expected.Data.WireDigest = hex.EncodeToString(digest[:])
+			}
+			if _, err := s.CompareAndSwap(ctx, expected, Rejected, expected.Data); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("changed predecessor accepted: %v", err)
+			}
+		})
+	}
+	stored, err := s.Get(ctx, j.ProjectID, j.AskID)
+	if err != nil || string(stored.Data.PredecessorWire) != string(j.Data.PredecessorWire) || stored.Revision != j.Revision {
+		t.Fatalf("rejected mutation changed stored job: %v", err)
+	}
+}
+
 func TestCASAcrossStoresAndRevocation(t *testing.T) {
 	s, dir := openTest(t)
 	j := insert(t, s)

@@ -8,6 +8,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -51,6 +52,7 @@ type Binding struct {
 // their original JSON; provider credentials must never be stored here.
 type Data struct {
 	Header                    json.RawMessage
+	PredecessorWire           []byte
 	WireDigest                string
 	Input                     []byte
 	ProviderConfigFingerprint string
@@ -382,7 +384,8 @@ func validPhase(p Phase) bool {
 }
 func validDigest(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
 func validData(d Data) bool {
-	return validDigest(d.WireDigest) && json.Valid(d.Header) && (len(d.Receipt) == 0 || json.Valid(d.Receipt)) && (d.ReplyDigest == "" || validDigest(d.ReplyDigest))
+	digest := sha256.Sum256(d.PredecessorWire)
+	return len(d.PredecessorWire) > 0 && d.WireDigest == hex.EncodeToString(digest[:]) && json.Valid(d.Header) && (len(d.Receipt) == 0 || json.Valid(d.Receipt)) && (d.ReplyDigest == "" || validDigest(d.ReplyDigest))
 }
 func (s *Store) jobAAD(j Job) []byte {
 	b, _ := json.Marshal(aad{s.binding, j.ProjectID, j.AskID, j.Revision, j.Phase, j.Revoked})
@@ -545,7 +548,7 @@ func (s *Store) replace(ctx context.Context, expected, j Job) (Job, error) {
 	if stored.Revision != expected.Revision || stored.Phase != expected.Phase || stored.Revoked != expected.Revoked {
 		return Job{}, ErrStale
 	}
-	if j.Data.WireDigest != stored.Data.WireDigest || !bytes.Equal(j.Data.Header, stored.Data.Header) || !bytes.Equal(j.Data.Input, stored.Data.Input) || j.Data.ProviderConfigFingerprint != stored.Data.ProviderConfigFingerprint {
+	if j.Data.WireDigest != stored.Data.WireDigest || !bytes.Equal(j.Data.PredecessorWire, stored.Data.PredecessorWire) || !bytes.Equal(j.Data.Header, stored.Data.Header) || !bytes.Equal(j.Data.Input, stored.Data.Input) || j.Data.ProviderConfigFingerprint != stored.Data.ProviderConfigFingerprint {
 		return Job{}, ErrInvalid
 	}
 	if expected.Revoked && (stored.Data.ReplyID == "" || j.Data.ReplyID != stored.Data.ReplyID || j.Data.ReplyDigest != stored.Data.ReplyDigest) {
