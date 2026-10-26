@@ -325,11 +325,16 @@ func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderP
 	callbackErrors := make(chan error, 1)
 	projectID, askID := operation.ProjectID, operation.AskID
 	conn.OnSharingProjectMessage(func(callbackCtx context.Context, message sdk.SharingProjectMessage) error {
+		if message.Header.Kind != "REPLY" {
+			return nil // A sender service never dispatches incoming ASK work.
+		}
 		o, err := textBridgeSenderReply(callbackCtx, store, p.Service, message)
 		if err != nil {
-			select {
-			case callbackErrors <- errors.New("sender could not persist an authenticated reply; inbox delivery remains pending"):
-			default:
+			if message.Header.ProjectID == projectID && message.Header.CorrelationID != nil && *message.Header.CorrelationID == askID {
+				select {
+				case callbackErrors <- errors.New("sender could not persist an authenticated reply; inbox delivery remains pending"):
+				default:
+				}
 			}
 			return err
 		}

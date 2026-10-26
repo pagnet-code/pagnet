@@ -69,6 +69,7 @@ type textBridgeSenderFake struct {
 	replyOnEnable       bool
 	closed              bool
 	messageErr          error
+	onEnable            func()
 }
 
 func (f *textBridgeSenderFake) WhoAmI(context.Context) (*sdk.Identity, error) {
@@ -131,9 +132,63 @@ func (f *textBridgeSenderFake) OnSharingProjectMessage(h func(context.Context, s
 }
 func (f *textBridgeSenderFake) OnSharingProjectReady(h func(string)) { f.ready = h }
 func (f *textBridgeSenderFake) EnableSharingProjects() {
+	if f.onEnable != nil {
+		f.onEnable()
+		return
+	}
 	f.ready(textBridgeSenderProject)
 	if f.replyOnEnable {
 		f.deliver(context.Background())
+	}
+}
+
+func TestTextBridgeSenderUnrelatedASKDoesNotEndWait(t *testing.T) {
+	state, dir, _ := textBridgeSenderSetup(t)
+	f := &textBridgeSenderFake{t: t, dir: dir}
+	f.onEnable = func() {
+		if err := f.handler(context.Background(), sdk.SharingProjectMessage{Header: sdk.SharingProjectMessageHeader{Kind: "ASK", ProjectID: textBridgeSenderRecipient}}); err != nil {
+			t.Fatalf("sender did not ACK-discard ASK: %v", err)
+		}
+	}
+	_, err := textBridgeSenderExecute(t, textBridgeSenderDeps(f), "test prompt", "--state-dir", state, "sender", "ask", "--service", textBridgeTestService, "--project", textBridgeSenderProject, "--to", textBridgeSenderRecipient, "--wait", "50ms")
+	if !errors.Is(err, context.DeadlineExceeded) || f.prepares != 0 || f.sends != 0 {
+		t.Fatalf("unrelated ASK ended foreground wait or dispatched work: %v", err)
+	}
+}
+
+func TestTextBridgeSenderUnrelatedInvalidReplyDoesNotEndWait(t *testing.T) {
+	for _, otherProject := range []bool{false, true} {
+		t.Run(map[bool]string{false: "other ASK", true: "other project"}[otherProject], func(t *testing.T) {
+			state, dir, p := textBridgeSenderSetup(t)
+			f := &textBridgeSenderFake{t: t, dir: dir}
+			f.onEnable = func() {
+				store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				operations, err := store.List(context.Background())
+				if err != nil || len(operations) != 1 {
+					t.Fatalf("reservation missing: %v", err)
+				}
+				ask, project := operations[0].AskID, textBridgeSenderProject
+				if otherProject {
+					project = textBridgeSenderRecipient
+				} else {
+					id, _ := uuid.NewV7()
+					ask = id.String()
+				}
+				id, _ := uuid.NewV7()
+				m := sdk.SharingProjectMessage{Header: sdk.SharingProjectMessageHeader{Kind: "REPLY", ProjectID: project, ID: id.String(), ThreadID: ask, CorrelationID: &ask, SenderPrincipalID: textBridgeSenderRecipient, RecipientPrincipalID: p.Service}, Plaintext: []byte("answer"), Wire: []byte("authenticated reply")}
+				if err := f.handler(context.Background(), m); err == nil {
+					t.Fatal("invalid unrelated REPLY silently ACKed")
+				}
+			}
+			_, err := textBridgeSenderExecute(t, textBridgeSenderDeps(f), "test prompt", "--state-dir", state, "sender", "ask", "--service", p.Service, "--project", textBridgeSenderProject, "--to", textBridgeSenderRecipient, "--wait", "50ms")
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("unrelated REPLY ended foreground wait: %v", err)
+			}
+		})
 	}
 }
 func (f *textBridgeSenderFake) Done() <-chan struct{} { return nil }
