@@ -20,9 +20,12 @@ func TestInstanceWorkerAvailabilityStatus(t *testing.T) {
 		{`{"Status":"working","workerAvailability":{"state":"unknown"}}`, "worker unknown (last state: working)"},
 		{`{"Status":"stopped","workerAvailability":{"state":"unavailable"}}`, "stopped"},
 		{`{"Status":"failed","workerAvailability":{"state":"unknown"}}`, "failed"},
-		{`{"Status":"blocked","workerAvailability":{"state":"unavailable"}}`, "blocked"},
-		{`{"Status":"auth_required","workerAvailability":{"state":"unknown"}}`, "auth_required"},
-		{`{"Status":"rate_limited","workerAvailability":{"state":"unavailable"}}`, "rate_limited"},
+		{`{"Status":"blocked","workerAvailability":{"state":"unavailable"}}`, "blocked (worker unavailable)"},
+		{`{"Status":"blocked","workerAvailability":{"state":"unknown"}}`, "blocked (worker unknown)"},
+		{`{"Status":"hibernated","workerAvailability":{"state":"unavailable"}}`, "hibernated (worker unavailable)"},
+		{`{"Status":"hibernated","workerAvailability":{"state":"unknown"}}`, "hibernated (worker unknown)"},
+		{`{"Status":"auth_required","workerAvailability":{"state":"unknown"}}`, "auth_required (worker unknown)"},
+		{`{"Status":"rate_limited","workerAvailability":{"state":"unavailable"}}`, "rate_limited (worker unavailable)"},
 	} {
 		var instance agentInstanceView
 		if err := json.Unmarshal([]byte(tc.wire), &instance); err != nil {
@@ -51,6 +54,12 @@ func TestStopPendingAndConfirmedReceipt(t *testing.T) {
 		{"unavailable detail", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"idle","workerAvailability":{"state":"unavailable"}}}`, "stop pending: worker unavailable; stopping is not confirmed", "", time.Second, 1},
 		{"deadline", `{"commandId":"command","status":"pending"}`, ``, "stop pending: stopping is not confirmed", "", 0, 0},
 		{"receipt", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"stopped","workerAvailability":{"state":"unavailable"}}}`, "", "stopped", time.Second, 1},
+		{"native sleeping unknown", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"hibernated","workerAvailability":{"state":"unknown"}}}`, "stop pending: stopping is not confirmed", "", 5 * time.Millisecond, -1},
+		{"native admission sleeping detail", `{"commandId":"command","status":"pending","workerAvailability":{"state":"unknown"}}`, `{"instance":{"Status":"hibernated"}}`, "stop pending: stopping is not confirmed", "", 5 * time.Millisecond, -1},
+		{"native sleeping connected", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"hibernated","workerAvailability":{"state":"connected"}}}`, "stop pending: stopping is not confirmed", "", 5 * time.Millisecond, -1},
+		{"native sleeping unavailable", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"hibernated","workerAvailability":{"state":"unavailable"}}}`, "stop pending: worker unavailable; stopping is not confirmed", "", time.Second, 1},
+		{"native host stop label", `{"commandId":"command","status":"pending"}`, `{"instance":{"Status":"stopped_by_host","workerAvailability":{"state":"unknown"}}}`, "stop pending: stopping is not confirmed", "", 5 * time.Millisecond, -1},
+		{"legacy sleeping", `{}`, `{"instance":{"Status":"hibernated"}}`, "", "hibernated", time.Second, 1},
 		{"legacy receipt", `{}`, `{"instance":{"Status":"stopped"}}`, "", "stopped", time.Second, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -80,7 +89,7 @@ func TestStopPendingAndConfirmedReceipt(t *testing.T) {
 			if status != tc.wantStatus || strings.Contains(status, "dispatched") {
 				t.Fatalf("status %q", status)
 			}
-			if posts != 1 || gets != tc.wantGets {
+			if posts != 1 || (tc.wantGets >= 0 && gets != tc.wantGets) || (tc.wantGets < 0 && gets == 0) {
 				t.Fatalf("unexpected request counts: post=%d get=%d", posts, gets)
 			}
 		})

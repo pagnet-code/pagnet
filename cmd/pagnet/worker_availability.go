@@ -17,8 +17,10 @@ func instanceStatus(status string, availability *workerAvailabilityView) string 
 		return status
 	}
 	switch status {
-	case "stopped", "stopped_by_host", "failed", "hibernated", "blocked", "auth_required", "rate_limited":
+	case "stopped", "stopped_by_host", "failed":
 		return status
+	case "hibernated", "blocked", "auth_required", "rate_limited":
+		return fmt.Sprintf("%s (worker %s)", status, availability.State)
 	}
 	return fmt.Sprintf("worker %s (last state: %s)", availability.State, status)
 }
@@ -54,13 +56,21 @@ func (c *cliCtx) performInstanceAction(path, action string, timeout, interval ti
 	if action == "restart" {
 		settle = restartSettle
 	}
+	native := admission.WorkerAvailability != nil
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var cur struct {
 			Instance agentInstanceView `json:"instance"`
 		}
 		if err := c.get(path, &cur); err == nil {
-			if settle[cur.Instance.Status] {
+			native = native || cur.Instance.WorkerAvailability != nil
+			settled := settle[cur.Instance.Status]
+			if action == "stop" && native {
+				// A sleeping native instance is not evidence that this stop
+				// completed; retain that compatibility only for legacy views.
+				settled = cur.Instance.Status == "stopped"
+			}
+			if settled {
 				return cur.Instance.displayStatus(), nil
 			}
 			if action == "stop" && cur.Instance.WorkerAvailability != nil && cur.Instance.WorkerAvailability.State == "unavailable" {
