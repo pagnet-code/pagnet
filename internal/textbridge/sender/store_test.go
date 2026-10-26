@@ -24,9 +24,20 @@ func binding() Binding {
 const project = "22222222-2222-4222-8222-222222222222"
 const recipient = "33333333-3333-4333-8333-333333333333"
 
+// canonicalTempDir resolves system temporary-directory symlinks before tests
+// construct store paths or add the symlinks they intend to exercise.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func openTest(t *testing.T) (*Store, string) {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "private")
+	dir := filepath.Join(canonicalTempDir(t), "private")
 	s, err := Open(dir, binding())
 	if err != nil {
 		t.Fatal(err)
@@ -295,7 +306,7 @@ func TestAuthenticatedStateStillRequiresValidTransitions(t *testing.T) {
 
 func TestSymlinksRefused(t *testing.T) {
 	t.Run("ancestor", func(t *testing.T) {
-		root := t.TempDir()
+		root := canonicalTempDir(t)
 		real := filepath.Join(root, "real")
 		os.Mkdir(real, 0700)
 		link := filepath.Join(root, "link")
@@ -309,7 +320,7 @@ func TestSymlinksRefused(t *testing.T) {
 			s, dir := openTest(t)
 			reserveTest(t, s)
 			path := filepath.Join(dir, name)
-			target := filepath.Join(t.TempDir(), name)
+			target := filepath.Join(canonicalTempDir(t), name)
 			os.Rename(path, target)
 			os.Symlink(target, path)
 			if _, err := Open(dir, binding()); err == nil {

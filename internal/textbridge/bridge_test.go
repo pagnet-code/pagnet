@@ -100,7 +100,11 @@ func (f *fakeTransport) SendPreparedSharingProjectMessage(ctx context.Context, p
 
 func setup(t *testing.T) (*Bridge, *ledger.Store, *fakeTransport, *fakeProvider, sdk.SharingProjectMessage) {
 	t.Helper()
-	store, err := ledger.Open(filepath.Join(t.TempDir(), "ledger"), ledger.Binding{ServiceOrigin: "https://example.com", PrincipalID: "owner"}, ledger.Limits{CallsPerDay: 10, MaxConcurrent: 10})
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := ledger.Open(filepath.Join(root, "ledger"), ledger.Binding{ServiceOrigin: "https://example.com", PrincipalID: "owner"}, ledger.Limits{CallsPerDay: 10, MaxConcurrent: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

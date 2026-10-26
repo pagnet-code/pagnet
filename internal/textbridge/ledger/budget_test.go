@@ -48,7 +48,7 @@ func advance(t *testing.T, s *Store, j Job, next Phase, d Data) Job {
 
 func openBudget(t *testing.T, limits Limits) (*Store, *Store, string) {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "ledger")
+	dir := filepath.Join(canonicalTempDir(t), "ledger")
 	s, err := Open(dir, binding(), limits)
 	if err != nil {
 		t.Fatal(err)

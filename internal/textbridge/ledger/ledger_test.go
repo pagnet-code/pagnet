@@ -24,9 +24,21 @@ func data() Data {
 	digest := sha256.Sum256(wire)
 	return Data{Header: []byte(`{"kind":"ASK"}`), PredecessorWire: wire, WireDigest: hex.EncodeToString(digest[:]), Input: []byte("private input"), ProviderConfigFingerprint: "config-sha256"}
 }
+
+// canonicalTempDir resolves system temporary-directory symlinks before tests
+// construct store paths or add the symlinks they intend to exercise.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 func openTest(t *testing.T) (*Store, string) {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "ledger")
+	dir := filepath.Join(canonicalTempDir(t), "ledger")
 	s, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
 		t.Fatal(e)
@@ -80,7 +92,7 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 	}
 }
 func TestNestedPrivateDirectoryCreation(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	dir := filepath.Join(root, "private", "nested", "ledger")
 	s, e := Open(dir, binding(), Limits{CallsPerDay: 100, MaxConcurrent: 100})
 	if e != nil {
@@ -106,7 +118,7 @@ func TestNestedPrivateDirectoryCreation(t *testing.T) {
 	}
 }
 func TestDirectorySyncRetryIncludesExistingAncestors(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	first := filepath.Join(root, "private")
 	dir := filepath.Join(first, "nested", "ledger")
 	interrupted := errors.New("interrupted after mkdir before parent sync")
@@ -151,7 +163,7 @@ func TestDirectorySyncRetryIncludesExistingAncestors(t *testing.T) {
 func TestRejectSymlinkDirectory(t *testing.T) {
 	for _, nested := range []bool{false, true} {
 		t.Run(strconv.FormatBool(nested), func(t *testing.T) {
-			root := t.TempDir()
+			root := canonicalTempDir(t)
 			target := filepath.Join(root, "target")
 			if err := os.Mkdir(target, 0700); err != nil {
 				t.Fatal(err)
@@ -198,7 +210,7 @@ func TestMissingDatabaseAfterTerminalJobFailsClosed(t *testing.T) {
 func TestInitializationEvidenceWithoutDatabaseFailsClosed(t *testing.T) {
 	for _, name := range []string{"key", ".key-incomplete", ".ledger-incomplete", "ledger.sqlite-journal", "ledger.sqlite-wal"} {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := canonicalTempDir(t)
 			if e := os.WriteFile(filepath.Join(dir, name), []byte("initialization evidence"), 0600); e != nil {
 				t.Fatal(e)
 			}
