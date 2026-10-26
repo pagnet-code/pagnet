@@ -427,10 +427,7 @@ func indexByte(b []byte, c byte) int {
 
 // findInstance resolves an agent by name and picks its instance (the only
 // one, or --instance).
-func (c *cliCtx) findInstance(netID, agentName, instanceID string) (defID string, inst *struct {
-	ID     string `json:"ID"`
-	Status string `json:"Status"`
-}, err error) {
+func (c *cliCtx) findInstance(netID, agentName, instanceID string) (defID string, inst *agentInstanceView, err error) {
 	var agents []struct {
 		ID   string `json:"ID"`
 		Name string `json:"Name"`
@@ -447,10 +444,7 @@ func (c *cliCtx) findInstance(netID, agentName, instanceID string) (defID string
 	if def == "" {
 		return "", nil, fmt.Errorf("agent %q not found in this network", agentName)
 	}
-	var insts []struct {
-		ID     string `json:"ID"`
-		Status string `json:"Status"`
-	}
+	var insts []agentInstanceView
 	if err := c.get("/api/v1/networks/"+netID+"/agents/"+def+"/instances", &insts); err != nil {
 		return "", nil, err
 	}
@@ -463,7 +457,7 @@ func (c *cliCtx) findInstance(netID, agentName, instanceID string) (defID string
 	if instanceID == "" {
 		fmt.Println("instances:")
 		for _, i := range insts {
-			fmt.Printf("  %s  %s\n", i.ID, i.Status)
+			fmt.Printf("  %s  %s\n", i.ID, i.displayStatus())
 		}
 		return "", nil, fmt.Errorf("pick one with --instance")
 	}

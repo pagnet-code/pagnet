@@ -49,19 +49,20 @@ type v2Endpoint struct {
 // pre-cutover server returns the legacy capitalized shape. omitempty keeps
 // --json output clean (only the server's actual shape is emitted).
 type v2Participant struct {
-	ID           string         `json:"id,omitempty"`
-	IDLegacy     string         `json:"ID,omitempty"`
-	Name         string         `json:"name,omitempty"`
-	NameLegacy   string         `json:"Name,omitempty"`
-	Kind         string         `json:"kind,omitempty"`
-	KindLegacy   string         `json:"Kind,omitempty"`
-	Runtime      string         `json:"runtime,omitempty"`
-	Status       string         `json:"status,omitempty"`
-	Description  string         `json:"description,omitempty"`
-	Capabilities []v2Capability `json:"capabilities,omitempty"`
-	Endpoints    []v2Endpoint   `json:"endpoints,omitempty"`
-	Permissions  []string       `json:"permissions,omitempty"`
-	State        string         `json:"state,omitempty"`
+	ID                 string                  `json:"id,omitempty"`
+	IDLegacy           string                  `json:"ID,omitempty"`
+	Name               string                  `json:"name,omitempty"`
+	NameLegacy         string                  `json:"Name,omitempty"`
+	Kind               string                  `json:"kind,omitempty"`
+	KindLegacy         string                  `json:"Kind,omitempty"`
+	Runtime            string                  `json:"runtime,omitempty"`
+	Status             string                  `json:"status,omitempty"`
+	WorkerAvailability *workerAvailabilityView `json:"workerAvailability,omitempty"`
+	Description        string                  `json:"description,omitempty"`
+	Capabilities       []v2Capability          `json:"capabilities,omitempty"`
+	Endpoints          []v2Endpoint            `json:"endpoints,omitempty"`
+	Permissions        []string                `json:"permissions,omitempty"`
+	State              string                  `json:"state,omitempty"`
 }
 
 func (p v2Participant) pID() string {
@@ -91,7 +92,7 @@ func (p v2Participant) pKind() string {
 
 func (p v2Participant) endpointStatus() string {
 	if p.Status != "" {
-		return p.Status
+		return instanceStatus(p.Status, p.WorkerAvailability)
 	}
 	if len(p.Endpoints) == 0 {
 		return ""

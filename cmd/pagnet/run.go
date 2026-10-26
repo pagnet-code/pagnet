@@ -279,10 +279,7 @@ func runCmd() *cobra.Command {
 			}
 
 			// 8. Launch the instance on the target host.
-			var inst struct {
-				ID     string `json:"ID"`
-				Status string `json:"Status"`
-			}
+			var inst agentInstanceView
 			launchBody := map[string]any{"hostId": targetID, "workspaceId": workspaceID}
 			if runtimeProfile != "" {
 				launchBody["profile"] = runtimeProfile
@@ -303,14 +300,14 @@ func runCmd() *cobra.Command {
 			deadline := time.Now().Add(30 * time.Second)
 			for time.Now().Before(deadline) {
 				var cur struct {
-					Instance struct {
-						Status string `json:"Status"`
-					} `json:"instance"`
+					Instance agentInstanceView `json:"instance"`
 				}
 				if err := c.get("/api/v1/networks/"+netID+"/agents/"+defID+"/instances/"+inst.ID, &cur); err != nil {
 					return err
 				}
-				status = cur.Instance.Status
+				cur.Instance.ID = inst.ID
+				inst = cur.Instance
+				status = inst.Status
 				if status == "idle" || status == "working" || status == "hibernated" {
 					break
 				}
@@ -323,7 +320,7 @@ func runCmd() *cobra.Command {
 			fmt.Printf("workspace:    %s  (%s)\n", td.WorkspacePath(workspaceID), workspaceID)
 			fmt.Printf("network:      %s  (%s)\n", netName, netID)
 			fmt.Printf("agent:        %s  (%s)\n", agentName, defID)
-			fmt.Printf("instance:     %s  (status=%s)\n", inst.ID, status)
+			fmt.Printf("instance:     %s  (status=%s)\n", inst.ID, inst.displayStatus())
 			fmt.Println("the daemon injects the pagnet MCP bridge + coordination contract into the runtime")
 			fmt.Println("this command exits now — the agent keeps running on the host daemon")
 			fmt.Printf("watch it in the web console (Agents page → %s), or join its terminal: pagnet attach %s\n",

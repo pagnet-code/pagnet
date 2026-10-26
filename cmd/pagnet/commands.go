@@ -184,19 +184,12 @@ func (c *cliCtx) instanceRows(netID string) ([][]string, error) {
 	}
 	rows := make([][]string, 0, 8)
 	for _, a := range agents {
-		var insts []struct {
-			ID             string  `json:"ID"`
-			HostID         string  `json:"HostID"`
-			Status         string  `json:"Status"`
-			Runtime        string  `json:"Runtime"`
-			LastActivityAt string  `json:"LastActivityAt"`
-			RetryAt        *string `json:"AvailabilityRetryAt"`
-		}
+		var insts []agentInstanceView
 		if err := c.get("/api/v1/networks/"+netID+"/agents/"+a.ID+"/instances", &insts); err != nil {
 			return nil, err
 		}
 		for _, i := range insts {
-			status := i.Status
+			status := i.displayStatus()
 			if i.RetryAt != nil {
 				status += " (retry " + *i.RetryAt + ")"
 			}
@@ -312,9 +305,17 @@ func (c *cliCtx) agentDefinition(netID, nameOrID string) (*agentDefinitionView, 
 // agentInstanceView is one instance of a definition (domain.AgentInstance
 // marshals its Go field names).
 type agentInstanceView struct {
-	ID     string `json:"ID"`
-	Status string `json:"Status"`
-	HostID string `json:"HostID"`
+	ID                 string                  `json:"ID"`
+	Status             string                  `json:"Status"`
+	HostID             string                  `json:"HostID"`
+	Runtime            string                  `json:"Runtime"`
+	LastActivityAt     string                  `json:"LastActivityAt"`
+	RetryAt            *string                 `json:"AvailabilityRetryAt"`
+	WorkerAvailability *workerAvailabilityView `json:"workerAvailability,omitempty"`
+}
+
+func (i agentInstanceView) displayStatus() string {
+	return instanceStatus(i.Status, i.WorkerAvailability)
 }
 
 func (c *cliCtx) definitionInstances(netID, defID string) ([]agentInstanceView, error) {
@@ -348,7 +349,7 @@ func selectSendInstance(agentName, instance string, insts []agentInstanceView) (
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "agent %s has %d instances — choose one with --instance <id> (see `pagnet list instances`):\n", agentName, len(insts))
 	for _, i := range insts {
-		fmt.Fprintf(&sb, "  %s  %s\n", i.ID, i.Status)
+		fmt.Fprintf(&sb, "  %s  %s\n", i.ID, i.displayStatus())
 	}
 	return nil, errors.New(strings.TrimRight(sb.String(), "\n"))
 }
