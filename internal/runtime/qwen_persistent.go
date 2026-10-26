@@ -520,6 +520,10 @@ type qwenEndpoint struct {
 	// error text lie about it). Set once at launch, immutable after.
 	startupBudget   time.Duration
 	startupDeadline time.Time
+	// Both timeout paths retain the liveness observed before either retires
+	// the endpoint. Ordinary processGone checks must keep observing exits.
+	startupProcessOnce  sync.Once
+	startupProcessState string
 	// readerDone is closed when the event-file reader exits (the process
 	// has exited). It is the liveness signal.
 	readerDone chan struct{}
@@ -593,16 +597,19 @@ func (e *qwenEndpoint) processGone() bool {
 // text is self-explanatory and log-safe: no newlines, no absolute paths
 // (the tail content is the qwen bridge's own event output, which is fine).
 func (e *qwenEndpoint) startupDiag() string {
-	return e.eventsFileDiag() + "; process=" + e.processStateDiag()
+	return e.eventsFileDiag() + "; process=" + e.timeoutProcessStateDiag()
 }
 
-// processStateDiag renders the endpoint's process liveness as the
-// diagnostic suffix value ("alive" / "exited").
-func (e *qwenEndpoint) processStateDiag() string {
-	if e.processGone() {
-		return "exited"
-	}
-	return "alive"
+// timeoutProcessStateDiag snapshots process liveness once for both startup
+// timeout paths, before either path can terminate the endpoint.
+func (e *qwenEndpoint) timeoutProcessStateDiag() string {
+	e.startupProcessOnce.Do(func() {
+		e.startupProcessState = "alive"
+		if e.processGone() {
+			e.startupProcessState = "exited"
+		}
+	})
+	return e.startupProcessState
 }
 
 // eventsFileDiag renders the events-file fact for the diagnostic:
@@ -1143,7 +1150,7 @@ func (e *qwenEndpoint) waitForEventsFile() (*os.File, error) {
 	}
 	// The file-absence fact is already in the message — only the process
 	// state is appended (the driver owns both facts at this moment).
-	return nil, fmt.Errorf("qwen event file did not appear within the %s startup budget; process=%s", startupBudgetText(e.startupBudget), e.processStateDiag())
+	return nil, fmt.Errorf("qwen event file did not appear within the %s startup budget; process=%s", startupBudgetText(e.startupBudget), e.timeoutProcessStateDiag())
 }
 
 // handleEventLine processes one event line: it runs the state machine and
