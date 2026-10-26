@@ -170,6 +170,11 @@ func privateDir(dir string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return ErrInvalid
 	}
+	// A previous attempt may have created this entry but stopped before
+	// syncing its parent. Reopening must complete that durability barrier.
+	if parent != dir {
+		return syncDir(parent)
+	}
 	return nil
 }
 
@@ -242,6 +247,11 @@ func Open(dir string, binding Binding) (*Store, error) {
 		return nil, err
 	}
 	if err = os.Chmod(dir, 0700); err != nil {
+		return nil, err
+	}
+	// A visible state file is not enough to acknowledge a redelivered reply:
+	// finish any earlier rename's directory sync before trusting it.
+	if err = syncDir(dir); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(dir)
