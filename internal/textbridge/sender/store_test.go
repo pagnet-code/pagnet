@@ -87,13 +87,20 @@ func TestReservedRecoveryKeepsIdentityAndProtectedInput(t *testing.T) {
 func TestReconcilePreparedAndAdmitted(t *testing.T) {
 	s, dir := openTest(t)
 	o := reserveTest(t, s)
+	if _, err := s.MarkPrepared(ctx, project, o.AskID, preparedFor(o)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("preparation entry was bypassed: %v", err)
+	}
+	o, err := s.MarkPreparing(ctx, project, o.AskID)
+	if err != nil || o.Phase != Preparing {
+		t.Fatalf("preparation entry: %+v %v", o, err)
+	}
 	// Simulate a crash after SDK preparation but before the sender transition.
 	prepared := preparedFor(o)
 	s, _ = Open(dir, binding())
 	if _, err := s.MarkAdmitted(ctx, project, o.AskID, sdk.SharingProjectMessageReceipt{}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("admitted reserved state: %v", err)
 	}
-	o, err := s.MarkPrepared(ctx, project, o.AskID, prepared)
+	o, err = s.MarkPrepared(ctx, project, o.AskID, prepared)
 	if err != nil || o.Phase != Prepared || o.WireDigest != digest(prepared.Wire) {
 		t.Fatalf("prepare: %+v %v", o, err)
 	}
@@ -130,6 +137,29 @@ func TestReconcilePreparedAndAdmitted(t *testing.T) {
 	r.AdmissionSeq++
 	if _, err = s.MarkAdmitted(ctx, project, o.AskID, r); !errors.Is(err, ErrConflict) {
 		t.Fatalf("receipt conflict: %v", err)
+	}
+}
+
+func TestPreparingSurvivesCrashBeforeSDKCallWithoutReentry(t *testing.T) {
+	s, dir := openTest(t)
+	o := reserveTest(t, s)
+	if _, err := s.MarkPreparing(ctx, project, o.AskID); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err := Open(dir, binding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	unresolved, err := s.List(ctx, Preparing)
+	if err != nil || len(unresolved) != 1 || unresolved[0].AskID != o.AskID {
+		t.Fatalf("ambiguous preparation lost: %+v %v", unresolved, err)
+	}
+	if _, err := s.MarkPreparing(ctx, project, o.AskID); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("reentered preparation: %v", err)
+	}
+	if _, err := s.MarkAdmitted(ctx, project, o.AskID, sdk.SharingProjectMessageReceipt{}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("admitted unprepared operation: %v", err)
 	}
 }
 

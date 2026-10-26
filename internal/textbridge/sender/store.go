@@ -37,9 +37,10 @@ const (
 type Phase string
 
 const (
-	Reserved Phase = "reserved"
-	Prepared Phase = "prepared"
-	Admitted Phase = "admitted"
+	Reserved  Phase = "reserved"
+	Preparing Phase = "preparing"
+	Prepared  Phase = "prepared"
+	Admitted  Phase = "admitted"
 )
 
 var (
@@ -54,8 +55,9 @@ type Binding struct {
 }
 
 // Operation deliberately excludes the recoverable prompt. Reserved operations
-// are unresolved: recovery may load existing SDK ciphertext, but must never
-// invoke preparation again merely because that ciphertext cannot be found.
+// have not entered preparation. Preparing operations are unresolved: recovery
+// may load SDK ciphertext, but must never invoke preparation again merely
+// because that ciphertext cannot be found.
 type Operation struct {
 	ProjectID    string
 	AskID        string
@@ -335,7 +337,7 @@ func (s *Store) read() (state, error) {
 			return st, ErrInvalid
 		}
 		switch o.Phase {
-		case Reserved:
+		case Reserved, Preparing:
 			if o.WireDigest != "" || o.Receipt != nil {
 				return st, ErrInvalid
 			}
@@ -470,7 +472,7 @@ func (s *Store) List(ctx context.Context, phases ...Phase) ([]Operation, error) 
 		return nil, err
 	}
 	for _, p := range phases {
-		if p != Reserved && p != Prepared && p != Admitted {
+		if p != Reserved && p != Preparing && p != Prepared && p != Admitted {
 			return nil, ErrInvalid
 		}
 	}
@@ -490,8 +492,9 @@ func (s *Store) List(ctx context.Context, phases ...Phase) ([]Operation, error) 
 	return result, nil
 }
 
-// RecoverPrompt explicitly requests sensitive input for the initial preparation.
-// Its availability does not authorize preparing a recovered reserved operation.
+// RecoverPrompt explicitly requests sensitive input for a reserved operation's
+// initial preparation. Its availability never authorizes re-preparing an
+// operation that has already entered Preparing.
 func (s *Store) RecoverPrompt(ctx context.Context, project, ask string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -502,9 +505,29 @@ func (s *Store) RecoverPrompt(ctx context.Context, project, ask string) (string,
 	return o.Prompt, err
 }
 
+// MarkPreparing durably records entry before the sole SDK preparation attempt.
+// It deliberately rejects repeated transitions, including after reopening:
+// Preparing without ciphertext is ambiguous and must never be prepared again.
+func (s *Store) MarkPreparing(ctx context.Context, project, ask string) (Operation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(ctx); err != nil {
+		return Operation{}, err
+	}
+	stored, err := s.get(project, ask)
+	if err != nil {
+		return Operation{}, err
+	}
+	if stored.Operation.Phase != Reserved {
+		return Operation{}, ErrInvalid
+	}
+	stored.Operation.Phase = Preparing
+	return s.save(stored)
+}
+
 // MarkPrepared accepts evidence loaded from the authoritative SDK spool. It
 // never stores ciphertext or calls preparation. Reconciliation can advance a
-// reserved operation after a crash between SDK preparation and this transition.
+// preparing operation after a crash between SDK preparation and this transition.
 func (s *Store) MarkPrepared(ctx context.Context, project, ask string, prepared sdk.PreparedSharingProjectMessage) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -518,8 +541,11 @@ func (s *Store) MarkPrepared(ctx context.Context, project, ask string, prepared 
 	if prepared.ID != ask || len(prepared.Wire) == 0 {
 		return Operation{}, ErrInvalid
 	}
+	if stored.Operation.Phase == Reserved {
+		return Operation{}, ErrInvalid
+	}
 	d := digest(prepared.Wire)
-	if stored.Operation.Phase != Reserved {
+	if stored.Operation.Phase != Preparing {
 		if stored.Operation.WireDigest != d {
 			return Operation{}, ErrConflict
 		}
@@ -543,7 +569,7 @@ func (s *Store) MarkAdmitted(ctx context.Context, project, ask string, receipt s
 	if err != nil {
 		return Operation{}, err
 	}
-	if stored.Operation.Phase == Reserved || !validReceipt(stored.Operation, receipt) {
+	if (stored.Operation.Phase != Prepared && stored.Operation.Phase != Admitted) || !validReceipt(stored.Operation, receipt) {
 		return Operation{}, ErrInvalid
 	}
 	if stored.Operation.Receipt != nil {

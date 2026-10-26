@@ -91,7 +91,7 @@ func (f *textBridgeSenderFake) PrepareSharingProjectMessageWithID(project, recip
 	}
 	defer store.Close()
 	o, err := store.Get(context.Background(), project, id)
-	if err != nil || o.Phase != sender.Reserved || o.RecipientID != recipient || kind != "ASK" || string(input) != "test prompt" || len(predecessor) != 0 {
+	if err != nil || o.Phase != sender.Preparing || o.RecipientID != recipient || kind != "ASK" || string(input) != "test prompt" || len(predecessor) != 0 {
 		f.t.Fatalf("preparation before durable reservation: %+v %v", o, err)
 	}
 	if f.prepareErr != nil {
@@ -269,7 +269,7 @@ func TestTextBridgeSenderAskPersistsBeforePrepareAndACK(t *testing.T) {
 	}
 }
 
-func TestTextBridgeSenderResumeNeverRepreparesReserved(t *testing.T) {
+func TestTextBridgeSenderResumeNeverRepreparesPreparing(t *testing.T) {
 	state, dir, _ := textBridgeSenderSetup(t)
 	f := &textBridgeSenderFake{t: t, dir: dir, prepareErr: errors.New("uncertain preparation")}
 	out, err := textBridgeSenderExecute(t, textBridgeSenderDeps(f), "test prompt", "--state-dir", state, "sender", "ask", "--service", textBridgeTestService, "--project", textBridgeSenderProject, "--to", textBridgeSenderRecipient, "--wait", "1s")
@@ -280,6 +280,68 @@ func TestTextBridgeSenderResumeNeverRepreparesReserved(t *testing.T) {
 	_, err = textBridgeSenderExecute(t, textBridgeSenderDeps(f), "", "--state-dir", state, "sender", "resume", "--service", textBridgeTestService, "--project", textBridgeSenderProject, "--ask", ask, "--wait", "1s")
 	if err == nil || f.prepares != 1 || f.sends != 0 {
 		t.Fatalf("resume regenerated ciphertext: %v", err)
+	}
+}
+
+func TestTextBridgeSenderResumeReservedAfterConnectionFailure(t *testing.T) {
+	state, dir, p := textBridgeSenderSetup(t)
+	failed := textBridgeDependencies{senderConnect: func(context.Context, sdk.Config) (textBridgeSenderConnection, error) {
+		return nil, errors.New("offline")
+	}}
+	out, err := textBridgeSenderExecute(t, failed, "test prompt", "--state-dir", state, "sender", "ask", "--service", p.Service, "--project", textBridgeSenderProject, "--to", textBridgeSenderRecipient, "--wait", "1s")
+	ask := strings.TrimSpace(out)
+	if err == nil || !textBridgeUUID(ask) {
+		t.Fatalf("connection failure lost ASK: %q %v", out, err)
+	}
+	store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := store.Get(context.Background(), textBridgeSenderProject, ask)
+	if err != nil || o.Phase != sender.Reserved {
+		t.Fatalf("preparation was entered before connection: %+v %v", o, err)
+	}
+	store.Close()
+	f := &textBridgeSenderFake{t: t, dir: dir, replyOnSend: true}
+	out, err = textBridgeSenderExecute(t, textBridgeSenderDeps(f), "", "--state-dir", state, "sender", "resume", "--service", p.Service, "--project", textBridgeSenderProject, "--ask", ask, "--wait", "1s")
+	if err != nil || out != "saved answer\n" || f.prepares != 1 || f.sends != 1 || f.prepared.ID != ask {
+		t.Fatalf("reserved resume: %q %v prepares=%d sends=%d", out, err, f.prepares, f.sends)
+	}
+}
+
+func TestTextBridgeSenderResumePreparingRequiresSpoolEvidence(t *testing.T) {
+	for _, spooled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "crash before SDK call", true: "crash after SDK prepare"}[spooled], func(t *testing.T) {
+			state, dir, p := textBridgeSenderSetup(t)
+			store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+			if err != nil {
+				t.Fatal(err)
+			}
+			o, err := store.Reserve(context.Background(), textBridgeSenderProject, textBridgeSenderRecipient, "test prompt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			o, err = store.MarkPreparing(context.Background(), o.ProjectID, o.AskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+			f := &textBridgeSenderFake{t: t, dir: dir, replyOnSend: true}
+			if spooled {
+				f.prepared = sdk.PreparedSharingProjectMessage{ID: o.AskID, Wire: []byte("existing SDK ciphertext")}
+			}
+			out, err := textBridgeSenderExecute(t, textBridgeSenderDeps(f), "", "--state-dir", state, "sender", "resume", "--service", p.Service, "--project", o.ProjectID, "--ask", o.AskID, "--wait", "1s")
+			if f.prepares != 0 {
+				t.Fatal("resumed ambiguous preparation by preparing again")
+			}
+			if spooled {
+				if err != nil || out != "saved answer\n" || f.sends != 1 {
+					t.Fatalf("spool reconciliation: %q %v sends=%d", out, err, f.sends)
+				}
+			} else if err == nil || f.sends != 0 {
+				t.Fatalf("missing spool was not left unresolved: %v", err)
+			}
+		})
 	}
 }
 
@@ -318,6 +380,10 @@ func TestTextBridgeSenderResumeReceiptAfterSDKRetiresCiphertext(t *testing.T) {
 		t.Fatal(err)
 	}
 	wire := []byte("ciphertext retired after admission")
+	o, err = store.MarkPreparing(context.Background(), o.ProjectID, o.AskID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	o, err = store.MarkPrepared(context.Background(), o.ProjectID, o.AskID, sdk.PreparedSharingProjectMessage{ID: o.AskID, Wire: wire})
 	if err != nil {
 		t.Fatal(err)

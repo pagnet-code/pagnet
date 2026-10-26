@@ -198,11 +198,10 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			}
 			defer store.Close()
 			var operation sender.Operation
-			var prompt string
 			if action == "ask" {
-				prompt, err = textBridgeSenderInput(cmd.InOrStdin(), file)
-				if err != nil {
-					return err
+				prompt, inputErr := textBridgeSenderInput(cmd.InOrStdin(), file)
+				if inputErr != nil {
+					return inputErr
 				}
 				operation, err = store.Reserve(cmd.Context(), project, recipient, prompt)
 				if err != nil {
@@ -228,7 +227,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if err := textBridgePrivateDir(filepath.Join(dir, "sdk")); err != nil {
 				return err
 			}
-			operation, err = textBridgeSenderRun(cmd.Context(), dir, p, store, operation, prompt, action == "ask", wait, deps)
+			operation, err = textBridgeSenderRun(cmd.Context(), dir, p, store, operation, wait, deps)
 			if err != nil {
 				return err
 			}
@@ -294,7 +293,7 @@ func textBridgeSenderReply(ctx context.Context, store *sender.Store, principal s
 	return store.RecordReply(ctx, sender.Reply{ProjectID: h.ProjectID, AskID: *h.CorrelationID, ReplyID: h.ID, WireDigest: hex.EncodeToString(sum[:]), SenderID: h.SenderPrincipalID, RecipientID: h.RecipientPrincipalID, Text: string(message.Plaintext)})
 }
 
-func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderProfile, store *sender.Store, operation sender.Operation, prompt string, fresh bool, wait time.Duration, deps textBridgeSenderDependencies) (sender.Operation, error) {
+func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderProfile, store *sender.Store, operation sender.Operation, wait time.Duration, deps textBridgeSenderDependencies) (sender.Operation, error) {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, wait)
@@ -358,8 +357,7 @@ func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderP
 	for {
 		select {
 		case <-ready:
-			operation, err = textBridgeSenderReconcile(ctx, conn, store, operation, prompt, fresh)
-			fresh = false
+			operation, err = textBridgeSenderReconcile(ctx, conn, store, operation)
 			if err != nil {
 				return operation, err
 			}
@@ -381,7 +379,7 @@ func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderP
 	}
 }
 
-func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnection, store *sender.Store, operation sender.Operation, prompt string, fresh bool) (sender.Operation, error) {
+func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnection, store *sender.Store, operation sender.Operation) (sender.Operation, error) {
 	operation, err := store.Get(ctx, operation.ProjectID, operation.AskID)
 	if err != nil {
 		return operation, err
@@ -399,7 +397,15 @@ func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnect
 		return operation, errors.New("sender project is not ready; resume the saved ASK after enrollment")
 	}
 	var prepared sdk.PreparedSharingProjectMessage
-	if fresh && operation.Phase == sender.Reserved {
+	if operation.Phase == sender.Reserved {
+		prompt, promptErr := store.RecoverPrompt(ctx, operation.ProjectID, operation.AskID)
+		if promptErr != nil {
+			return operation, promptErr
+		}
+		operation, err = store.MarkPreparing(ctx, operation.ProjectID, operation.AskID)
+		if err != nil {
+			return operation, err
+		}
 		prepared, err = conn.PrepareSharingProjectMessageWithID(operation.ProjectID, operation.RecipientID, "ASK", operation.AskID, []byte(prompt), nil)
 		if err != nil {
 			prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
@@ -408,7 +414,7 @@ func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnect
 		prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
 	}
 	if err != nil {
-		return operation, errors.New("saved ASK has no recoverable prepared ciphertext; operation remains unresolved and must not be prepared again")
+		return operation, errors.New("saved ASK has no recoverable prepared ciphertext; preparation outcome remains unresolved and must not be prepared again")
 	}
 	operation, err = store.MarkPrepared(ctx, operation.ProjectID, operation.AskID, prepared)
 	if err != nil {
