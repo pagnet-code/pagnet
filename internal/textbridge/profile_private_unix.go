@@ -1,6 +1,6 @@
 //go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly
 
-package main
+package textbridge
 
 import (
 	"errors"
@@ -94,7 +94,8 @@ func textBridgePrivateInfo(file *os.File, directory bool) bool {
 	return unix.Fstat(int(file.Fd()), &stat) == nil && stat.Uid == uint32(os.Getuid())
 }
 
-func textBridgePrivateDir(path string) error {
+// PrivateDir creates or checks a private directory owned by the current OS user.
+func PrivateDir(path string) error {
 	dir, err := textBridgeOpenDir(path, true)
 	if err != nil {
 		return err
@@ -106,7 +107,8 @@ func textBridgePrivateDir(path string) error {
 	return nil
 }
 
-func textBridgeReadPrivate(path string, max int64) ([]byte, error) {
+// ReadPrivate reads a bounded private regular file without following symlinks.
+func ReadPrivate(path string, max int64) ([]byte, error) {
 	if max < 0 || path == "" {
 		return nil, errTextBridgePrivate
 	}
@@ -151,7 +153,8 @@ func textBridgeReadPrivate(path string, max int64) ([]byte, error) {
 	return data, nil
 }
 
-func textBridgeLock(path string) (func(), error) {
+// LockProfile takes the nonblocking exclusive local responder lock.
+func LockProfile(path string) (func(), error) {
 	dir, err := textBridgeOpenDir(path, false)
 	if err != nil {
 		return nil, errTextBridgePrivate

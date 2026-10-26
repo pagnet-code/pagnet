@@ -1,10 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,15 +20,6 @@ import (
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/spf13/cobra"
 )
-
-// Profiles bind a single service to immutable provider policy. There is no
-// re-enable operation: disabled profiles cannot revive previously queued work.
-type textBridgeProfile struct {
-	Service, Server, Credential                 string
-	ProviderOrigin, Model, KeyFile, Fingerprint string
-	Limits                                      ledger.Limits
-	Disabled                                    bool
-}
 
 type textBridgeConnection interface {
 	textbridge.Transport
@@ -73,7 +61,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		if err != nil {
 			return errors.New("invalid local key file path")
 		}
-		key, err := textBridgeKey(keyPath)
+		key, err := textbridge.ReadProviderKey(keyPath)
 		if err != nil {
 			return err
 		}
@@ -81,7 +69,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		if _, err := deps.provider(config); err != nil {
 			return err
 		}
-		base, err := textBridgeBase(stateDir)
+		base, err := textbridge.ProfileBase(stateDir)
 		if err != nil {
 			return err
 		}
@@ -109,15 +97,15 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 				retErr = fmt.Errorf("service %s was created but local setup failed; inspect this service in Services before retrying: %w", created.ID, retErr)
 			}
 		}()
-		p := textBridgeProfile{Service: created.ID, Server: owner.base, Credential: created.Credential, ProviderOrigin: origin, Model: model, KeyFile: keyPath, Fingerprint: textBridgeFingerprint(config), Limits: ledger.Limits{CallsPerDay: calls, MaxConcurrent: 1}}
+		p := textbridge.Profile{Service: created.ID, Server: owner.base, Credential: created.Credential, ProviderOrigin: origin, Model: model, KeyFile: keyPath, Fingerprint: textbridge.ProviderFingerprint(config), Limits: ledger.Limits{CallsPerDay: calls, MaxConcurrent: 1}}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created service has invalid connection configuration; inspect Services")
 		}
 		dir := filepath.Join(base, p.Service)
-		if err := textBridgePrivateDir(dir); err != nil {
+		if err := textbridge.PrivateDir(dir); err != nil {
 			return err
 		}
-		unlock, err := textBridgeLock(dir)
+		unlock, err := textbridge.LockProfile(dir)
 		if err != nil {
 			return err
 		}
@@ -132,7 +120,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		if err := store.Close(); err != nil {
 			return err
 		}
-		if err := textBridgeSaveProfile(dir, p); err != nil {
+		if err := textbridge.SaveProfile(dir, p); err != nil {
 			return errors.New("service created but local setup could not be saved; inspect Services before creating another service")
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), p.Service)
@@ -155,30 +143,27 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 			if op == "resolve" && (!textBridgeUUID(project) || !textBridgeUUID(ask) || !abandon || !accept) {
 				return errors.New("resolve requires --project UUID --ask UUID --abandon --accept-possible-charge")
 			}
-			base, err := textBridgeBase(stateDir)
-			if err != nil {
-				return err
-			}
-			dir := filepath.Join(base, service)
-			if err := textBridgePrivateDir(dir); err != nil {
-				return err
-			}
-			if op != "status" {
-				unlock, err := textBridgeLock(dir)
+			if op == "status" {
+				status, err := textbridge.ReadProfileStatus(cmd.Context(), stateDir, service)
 				if err != nil {
 					return err
 				}
-				defer unlock()
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(status)
 			}
-			p, err := textBridgeLoadProfile(dir, service)
+			dir, err := textbridge.ProfileDirectory(stateDir, service)
 			if err != nil {
 				return err
 			}
-			// A saved profile must never initialize a replacement empty ledger.
-			if _, err := os.Lstat(filepath.Join(dir, "ledger", "ledger.sqlite")); err != nil {
-				return errors.New("saved text bridge ledger is missing or inaccessible")
+			unlock, err := textbridge.LockProfile(dir)
+			if err != nil {
+				return err
 			}
-			store, err := ledger.Open(filepath.Join(dir, "ledger"), ledger.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service}, p.Limits)
+			defer unlock()
+			p, err := textbridge.LoadProfile(dir, service)
+			if err != nil {
+				return err
+			}
+			store, err := textbridge.OpenProfileLedger(dir, p)
 			if err != nil {
 				return err
 			}
@@ -188,18 +173,12 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 				return err
 			}
 			switch op {
-			case "status":
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(struct {
-					Service  string
-					Disabled bool
-					Budget   ledger.BudgetStatus
-				}{p.Service, p.Disabled, budget})
 			case "disable":
 				if err := store.SetEnabled(cmd.Context(), false); err != nil {
 					return err
 				}
 				p.Disabled = true
-				return textBridgeSaveProfile(dir, p)
+				return textbridge.SaveProfile(dir, p)
 			case "resolve":
 				if !p.Disabled || budget.Enabled {
 					return errors.New("disable this service before resolving an unknown provider claim")
@@ -235,104 +214,20 @@ func textBridgeUUID(s string) bool {
 	return err == nil && id.String() == s && id != uuid.Nil
 }
 
-func textBridgeBase(state string) (string, error) {
-	if state == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		state = filepath.Join(home, ".pagnet")
-	}
-	base, err := filepath.Abs(filepath.Join(state, "text-bridge"))
-	if err != nil {
-		return "", err
-	}
-	return base, textBridgePrivateDir(base)
-}
-
-func textBridgeKey(path string) (string, error) {
-	raw, err := textBridgeReadPrivate(path, 8192)
-	if err != nil {
-		return "", err
-	}
-	key := strings.TrimSpace(string(raw))
-	if key == "" {
-		return "", errors.New("provider key file is empty")
-	}
-	return key, nil
-}
-
-func textBridgeFingerprint(c provider.Config) string {
-	raw, _ := json.Marshal(c)
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
-}
-
-func textBridgeLoadProfile(dir, service string) (textBridgeProfile, error) {
-	var p textBridgeProfile
-	raw, err := textBridgeReadPrivate(filepath.Join(dir, "profile.json"), 32768)
-	if err != nil {
-		return p, err
-	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service || !filepath.IsAbs(p.KeyFile) || p.Fingerprint == "" || p.Limits.CallsPerDay <= 0 || p.Limits.MaxConcurrent != 1 {
-		return p, errors.New("invalid local text bridge profile")
-	}
-	if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: service}).Validate(); err != nil {
-		return p, errors.New("invalid local text bridge connection profile")
-	}
-	return p, nil
-}
-
-func textBridgeSaveProfile(dir string, p textBridgeProfile) error {
-	return textBridgeSaveJSON(dir, "profile.json", p)
-}
-
-func textBridgeSaveJSON(dir, name string, value any) error {
-	f, err := os.CreateTemp(dir, ".profile-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(0600); err == nil {
-		err = json.NewEncoder(f).Encode(value)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err = os.Rename(f.Name(), filepath.Join(dir, name)); err != nil {
-		return err
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
-func textBridgeRun(parent context.Context, dir string, p textBridgeProfile, store *ledger.Store, deps textBridgeDependencies, stderr io.Writer) error {
-	key, err := textBridgeKey(p.KeyFile)
+func textBridgeRun(parent context.Context, dir string, p textbridge.Profile, store *ledger.Store, deps textBridgeDependencies, stderr io.Writer) error {
+	key, err := textbridge.ReadProviderKey(p.KeyFile)
 	if err != nil {
 		return err
 	}
 	config := provider.Config{BaseURL: p.ProviderOrigin, Model: p.Model, APIKey: key}
-	if textBridgeFingerprint(config) != p.Fingerprint {
+	if textbridge.ProviderFingerprint(config) != p.Fingerprint {
 		return errors.New("provider configuration changed; create a new service for new configuration")
 	}
 	client, err := deps.provider(config)
 	if err != nil {
 		return err
 	}
-	if err := textBridgePrivateDir(filepath.Join(dir, "sdk")); err != nil {
+	if err := textbridge.PrivateDir(filepath.Join(dir, "sdk")); err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)

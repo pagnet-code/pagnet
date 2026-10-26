@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 )
@@ -39,11 +40,11 @@ func textBridgeSenderSetup(t *testing.T) (string, string, textBridgeSenderProfil
 	t.Helper()
 	state := textBridgeTestDir(t)
 	dir := filepath.Join(state, "text-bridge", "senders", textBridgeTestService)
-	if err := textBridgePrivateDir(dir); err != nil {
+	if err := textbridge.PrivateDir(dir); err != nil {
 		t.Fatal(err)
 	}
 	p := textBridgeSenderProfile{Service: textBridgeTestService, Server: "https://example.com", Credential: "pgn_act_v1_private-sender-credential"}
-	if err := textBridgeSaveJSON(dir, "profile.json", p); err != nil {
+	if err := textbridge.SavePrivateJSON(dir, "profile.json", p); err != nil {
 		t.Fatal(err)
 	}
 	store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})

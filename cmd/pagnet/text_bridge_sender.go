@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/spf13/cobra"
@@ -92,12 +93,12 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		if strings.TrimSpace(name) == "" {
 			return errors.New("--name is required")
 		}
-		base, err := textBridgeBase(*stateDir)
+		base, err := textbridge.ProfileBase(*stateDir)
 		if err != nil {
 			return err
 		}
 		base = filepath.Join(base, "senders")
-		if err = textBridgePrivateDir(base); err != nil {
+		if err = textbridge.PrivateDir(base); err != nil {
 			return err
 		}
 		// Establish durable local storage before creating a remote service.
@@ -128,10 +129,10 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			return errors.New("created sender has invalid connection configuration")
 		}
 		dir := filepath.Join(base, p.Service)
-		if err := textBridgePrivateDir(dir); err != nil {
+		if err := textbridge.PrivateDir(dir); err != nil {
 			return err
 		}
-		unlock, err := textBridgeLock(dir)
+		unlock, err := textbridge.LockProfile(dir)
 		if err != nil {
 			return err
 		}
@@ -146,7 +147,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		if err := store.Close(); err != nil {
 			return err
 		}
-		if err := textBridgeSaveJSON(dir, "profile.json", p); err != nil {
+		if err := textbridge.SavePrivateJSON(dir, "profile.json", p); err != nil {
 			return errors.New("sender profile could not be saved")
 		}
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), p.Service)
@@ -171,15 +172,15 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if action != "result" && wait <= 0 {
 				return errors.New("--wait must be a positive duration")
 			}
-			base, err := textBridgeBase(*stateDir)
+			base, err := textbridge.ProfileBase(*stateDir)
 			if err != nil {
 				return err
 			}
 			dir := filepath.Join(base, "senders", service)
-			if err := textBridgePrivateDir(dir); err != nil {
+			if err := textbridge.PrivateDir(dir); err != nil {
 				return err
 			}
-			unlock, err := textBridgeLock(dir)
+			unlock, err := textbridge.LockProfile(dir)
 			if err != nil {
 				return err
 			}
@@ -189,7 +190,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				return err
 			}
 			// A saved profile must never recreate missing deduplication state.
-			if _, err := textBridgeReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
+			if _, err := textbridge.ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
 				return errors.New("saved sender operation state is missing or inaccessible")
 			}
 			store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
@@ -224,7 +225,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				_, err := fmt.Fprintln(cmd.OutOrStdout(), operation.Reply.Text)
 				return err
 			}
-			if err := textBridgePrivateDir(filepath.Join(dir, "sdk")); err != nil {
+			if err := textbridge.PrivateDir(filepath.Join(dir, "sdk")); err != nil {
 				return err
 			}
 			operation, err = textBridgeSenderRun(cmd.Context(), dir, p, store, operation, wait, deps)
@@ -252,7 +253,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 
 func textBridgeSenderLoadProfile(dir, service string) (textBridgeSenderProfile, error) {
 	var p textBridgeSenderProfile
-	raw, err := textBridgeReadPrivate(filepath.Join(dir, "profile.json"), 32768)
+	raw, err := textbridge.ReadPrivate(filepath.Join(dir, "profile.json"), 32768)
 	if err != nil {
 		return p, errors.New("sender profile unavailable")
 	}
