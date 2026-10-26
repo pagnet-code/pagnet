@@ -40,7 +40,7 @@ const (
 	perfP99Target10kUS  = 3000  // p99 search latency budget at 10,000 documents
 	perfP99Target100kUS = 15000 // p99 search latency budget at 100,000 documents
 	perfP99Target1MUS   = 15000 // p99 search latency budget at 1,000,000 documents
-	perfSamples         = 100   // latency samples per query shape
+	perfSamples         = 1000  // latency samples per query shape
 	perfWarmup          = 20    // discarded warm-up queries per shape
 )
 
@@ -102,7 +102,38 @@ func perfTargetUS(n int) int {
 	}
 }
 
+// perfPercentile returns the nearest-rank percentile of nonempty sorted samples.
+// percentile must be between 1 and 100, inclusive.
+func perfPercentile(samples []time.Duration, percentile int) time.Duration {
+	return samples[(len(samples)*percentile+99)/100-1]
+}
+
+func TestPerfPercentile(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		n    int
+		want time.Duration
+	}{
+		{"100 samples excludes maximum", 100, 99},
+		{"1000 samples selects 990th", 1000, 990},
+		{"fractional rank rounds up", 3, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			samples := make([]time.Duration, tc.n)
+			for i := range samples {
+				samples[i] = time.Duration(i + 1)
+			}
+			if got := perfPercentile(samples, 99); got != tc.want {
+				t.Fatalf("p99 of %d samples = %d, want %d", tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSearchPerformanceTargets(t *testing.T) {
+	previousGOMAXPROCS := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(previousGOMAXPROCS)
+
 	sizes := []int{10000, 100000, 1000000}
 	if value := os.Getenv("SEARCH_PERF_SIZES"); value != "" {
 		sizes = nil
@@ -150,31 +181,38 @@ func TestSearchPerformanceTargets(t *testing.T) {
 				work = w
 			}
 			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-			p99 := latencies[len(latencies)*99/100]
+			p99 := perfPercentile(latencies, 99)
+			maxLatency := latencies[len(latencies)-1]
+			target := perfTargetUS(n)
+			aboveTarget := 0
 			mean := time.Duration(0)
 			for _, d := range latencies {
 				mean += d
+				if d > time.Duration(target)*time.Microsecond {
+					aboveTarget++
+				}
 			}
 			mean /= time.Duration(len(latencies))
-			target := perfTargetUS(n)
 			row, _ := json.Marshal(struct {
 				Corpus      int
 				Query       string
 				Operator    Operator
 				MeanUS      int64
 				P99US       int64
+				MaxUS       int64
 				TargetUS    int
+				AboveTarget int
 				ThroughputK float64
 				ScoredDocs  uint64
 				Nodes       uint64
-			}{n, shape.query, shape.operator, int64(mean) / 1000, int64(p99) / 1000, target, float64(1) / mean.Seconds() / 1000, work.ScoredDocuments, work.Nodes})
+			}{n, shape.query, shape.operator, int64(mean) / 1000, int64(p99) / 1000, int64(maxLatency) / 1000, target, aboveTarget, float64(1) / mean.Seconds() / 1000, work.ScoredDocuments, work.Nodes})
 			t.Logf("perf: %s", row)
 			if probe {
 				continue
 			}
 			if p99 > time.Duration(target)*time.Microsecond {
-				t.Fatalf("corpus=%d query=%q op=%s: p99 %s exceeds the locked budget of %dµs (mean %s); remeasure on the runner class with SEARCH_PERF_PROBE=1 before re-locking",
-					n, shape.query, shape.operator, p99, target, mean)
+				t.Fatalf("corpus=%d query=%q op=%s: p99 %s exceeds the locked budget of %dµs (mean %s, max %s, above target %d/%d); remeasure on the runner class with SEARCH_PERF_PROBE=1 before re-locking",
+					n, shape.query, shape.operator, p99, target, mean, maxLatency, aboveTarget, len(latencies))
 			}
 		}
 	}

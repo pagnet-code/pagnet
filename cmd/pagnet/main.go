@@ -175,6 +175,7 @@ func newRootCmd() *cobra.Command {
 	registerDaemonFlags(root)
 
 	root.AddCommand(
+		textBridgeCmd(),
 		loginCmd(),
 		accountCmd(),
 		runtimeProfilesCmd(),
