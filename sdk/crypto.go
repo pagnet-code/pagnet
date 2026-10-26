@@ -194,6 +194,18 @@ func (c *Client) handleCryptoChallenge(p EndpointCryptoChallengePayload) error {
 	return nil
 }
 
+// enrollmentTransportError marks only proof-send failures as reconnectable.
+// Authentication, decryption, and persistence failures remain fatal.
+type enrollmentTransportError struct {
+	cause error
+}
+
+func (e *enrollmentTransportError) Error() string {
+	return fmt.Sprintf("sdk: send crypto prove: %v", e.cause)
+}
+
+func (e *enrollmentTransportError) Unwrap() error { return e.cause }
+
 // answerChallenge decrypts the challenge and sends the proof.
 func (c *Client) answerChallenge(networkID string, p EndpointCryptoChallengePayload) error {
 	plain, err := c.decryptObject(networkID, p.Challenge.Envelope, p.Challenge.AAD)
@@ -212,7 +224,7 @@ func (c *Client) answerChallenge(networkID string, p EndpointCryptoChallengePayl
 		NetworkID: networkID,
 		Proof:     proof,
 	}); err != nil {
-		return fmt.Errorf("sdk: send crypto prove: %w", err)
+		return &enrollmentTransportError{cause: err}
 	}
 	c.markCryptoReady(networkID)
 	return nil
