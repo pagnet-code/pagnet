@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -57,10 +60,11 @@ type Bridge struct {
 	config    Config
 	wake      chan struct{}
 	running   atomic.Bool
+	quota     map[string]time.Time
 }
 
 func New(store Ledger, transport Transport, provider Provider, config Config) *Bridge {
-	return &Bridge{store: store, transport: transport, provider: provider, config: config, wake: make(chan struct{}, 1)}
+	return &Bridge{store: store, transport: transport, provider: provider, config: config, wake: make(chan struct{}, 1), quota: make(map[string]time.Time)}
 }
 
 // Wake requests one recovery pass, for example when the SDK becomes ready.
@@ -154,30 +158,45 @@ func (b *Bridge) Run(ctx context.Context) error {
 			continue
 		}
 		retryNeeded := false
+		var eligible time.Time
 		for _, job := range jobs {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err := b.process(ctx, job); err != nil {
+				var wait quotaWait
+				if errors.As(err, &wait) {
+					if eligible.IsZero() || wait.until.Before(eligible) {
+						eligible = wait.until
+					}
+					continue
+				}
 				b.report(err)
 				var transient transportError
 				var storage storageError
 				retryNeeded = retryNeeded || errors.As(err, &transient) || errors.As(err, &storage)
 			}
 		}
-		// A one-shot timer exists only after an explicit transport or storage failure. No idle
-		// scan, provider retry, or second preparation is scheduled. At most five
-		// automatic retries follow a wake, so persistent failure stops scanning.
+		// One-shot timers follow failures or quota hints; there is no idle scan.
+		// Storage and ordinary transport failures get at most five retries per wake.
+		// Quota hints retain their own deadline across wakes.
+		var next time.Duration
 		if retryNeeded && retries < 5 {
 			retries++
-			timer = time.NewTimer(delay)
-			retry = timer.C
+			next = delay
 			delay = min(delay*2, 30*time.Second)
-		} else {
-			if retryNeeded {
-				b.report(errors.New("text bridge retry limit reached; awaiting wake"))
+		} else if retryNeeded {
+			b.report(errors.New("text bridge retry limit reached; awaiting wake"))
+		}
+		if !eligible.IsZero() {
+			quotaDelay := max(time.Until(eligible), time.Millisecond)
+			if next == 0 || quotaDelay < next {
+				next = quotaDelay
 			}
-			delay = time.Second
+		}
+		if next > 0 {
+			timer = time.NewTimer(next)
+			retry = timer.C
 		}
 	}
 }
@@ -235,7 +254,10 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			}
 			claimed, token, err := b.store.ClaimProvider(ctx, job, time.Now())
 			if err != nil {
-				return err
+				if errors.Is(err, ledger.ErrLimit) || errors.Is(err, ledger.ErrStale) || errors.Is(err, ledger.ErrInvalid) {
+					return err
+				}
+				return storageFailure(err)
 			}
 			output, callErr := b.provider.Complete(ctx, string(claimed.Data.Input))
 			succeeded := callErr == nil && validText([]byte(output), provider.MaxOutputChars)
@@ -274,7 +296,7 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if prepareErr != nil {
 				prepared, err = b.transport.LoadPreparedSharingProjectMessage(job.ProjectID, job.Data.ReplyID)
 				if err != nil {
-					return b.unknown(ctx, job)
+					return b.loadFailure(ctx, job, err)
 				}
 			}
 			if err = b.prepared(ctx, job, prepared); err != nil {
@@ -287,7 +309,7 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			}
 			prepared, err := b.transport.LoadPreparedSharingProjectMessage(job.ProjectID, job.Data.ReplyID)
 			if err != nil {
-				return b.unknown(ctx, job)
+				return b.loadFailure(ctx, job, err)
 			}
 			if err = b.prepared(ctx, job, prepared); err != nil {
 				return storageFailure(err)
@@ -298,13 +320,44 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 				if !validReceipt(job, receipt) {
 					return errors.New("text bridge receipt binding mismatch")
 				}
+				job, err = b.store.Get(ctx, job.ProjectID, job.AskID)
+				if err != nil {
+					return storageFailure(err)
+				}
 				return b.admit(ctx, job, receipt)
+			}
+			key := job.ProjectID + "/" + job.AskID
+			if until, limited := b.quota[key]; limited {
+				if until.IsZero() {
+					return nil
+				}
+				if time.Now().Before(until) {
+					return quotaWait{until}
+				}
+				delete(b.quota, key)
 			}
 			if active, err := b.authorized(ctx, job); err != nil || !active {
 				return err
 			}
+			// Status and receipt lookups can block while local authority changes.
+			job, err = b.store.Get(ctx, job.ProjectID, job.AskID)
+			if err != nil {
+				return storageFailure(err)
+			}
+			if job.Phase != ledger.ReplyPrepared || job.Revoked || b.config.Enabled == nil || !b.config.Enabled(job.ProjectID) {
+				return nil
+			}
 			receipt, err = b.transport.SendPreparedSharingProjectMessage(ctx, job.ProjectID, job.Data.ReplyID)
 			if err != nil {
+				var quota *sdk.SharingProjectMessageQuotaError
+				if errors.As(err, &quota) {
+					until := quotaRetryAt(quota, time.Now())
+					b.quota[key] = until
+					if !until.IsZero() {
+						return quotaWait{until}
+					}
+					return err
+				}
 				return transportError{err}
 			}
 			if !validReceipt(job, receipt) {
@@ -321,6 +374,33 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			return nil
 		}
 	}
+}
+
+// quotaWait schedules a one-shot wake without consuming storage retry allowance.
+type quotaWait struct{ until time.Time }
+
+func (e quotaWait) Error() string { return "text bridge waiting for quota reset" }
+func quotaRetryAt(q *sdk.SharingProjectMessageQuotaError, now time.Time) time.Time {
+	var until time.Time
+	if q.ResetAt != nil && q.ResetAt.After(now) {
+		until = *q.ResetAt
+	}
+	if seconds, err := strconv.ParseInt(q.RetryAfter, 10, 64); err == nil && seconds > 0 && seconds <= int64((1<<63-1)/int64(time.Second)) {
+		retry := now.Add(time.Duration(seconds) * time.Second)
+		if retry.After(until) {
+			until = retry
+		}
+	} else if retry, err := http.ParseTime(q.RetryAfter); err == nil && retry.After(now) && retry.After(until) {
+		until = retry
+	}
+	return until
+}
+func (b *Bridge) loadFailure(ctx context.Context, job ledger.Job, err error) error {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, sdk.ErrSharingProjectMessageAbandoned) {
+		return b.unknown(ctx, job)
+	}
+	// SDK read errors are not evidence that ciphertext is absent or invalid.
+	return storageFailure(err)
 }
 func (b *Bridge) unknown(ctx context.Context, job ledger.Job) error {
 	_, err := b.store.CompareAndSwap(ctx, job, ledger.Unknown, job.Data)
@@ -343,6 +423,7 @@ func (b *Bridge) admit(ctx context.Context, job ledger.Job, receipt sdk.SharingP
 	if !validReceipt(job, receipt) {
 		return errors.New("text bridge receipt binding mismatch")
 	}
+	delete(b.quota, job.ProjectID+"/"+job.AskID)
 	data := job.Data
 	data.Receipt, _ = json.Marshal(receipt)
 	_, err := b.store.CompareAndSwap(ctx, job, ledger.Admitted, data)

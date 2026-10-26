@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -44,9 +45,15 @@ type fakeTransport struct {
 	predecessor                              []byte
 	onSend                                   func()
 	onPrepare                                func()
+	onReceipt                                func()
+	onStatus                                 func()
+	onLoad                                   func()
 }
 
 func (f *fakeTransport) SharingProjectStatus(context.Context, string) (sdk.SharingProjectStatus, error) {
+	if f.onStatus != nil {
+		f.onStatus()
+	}
 	return f.status, f.statusErr
 }
 func (f *fakeTransport) PrepareSharingProjectMessageWithID(project, recipient, kind, id string, output, predecessor []byte) (sdk.PreparedSharingProjectMessage, error) {
@@ -64,10 +71,16 @@ func (f *fakeTransport) PrepareSharingProjectMessageWithID(project, recipient, k
 }
 func (f *fakeTransport) LoadPreparedSharingProjectMessage(string, string) (sdk.PreparedSharingProjectMessage, error) {
 	f.loads++
+	if f.onLoad != nil {
+		f.onLoad()
+	}
 	return f.prepared, f.loadErr
 }
 func (f *fakeTransport) SharingProjectMessageReceipt(context.Context, string, string) (sdk.SharingProjectMessageReceipt, error) {
 	f.receipts++
+	if f.onReceipt != nil {
+		f.onReceipt()
+	}
 	return f.receipt, f.receiptErr
 }
 func receiptFor(id string, wire []byte) sdk.SharingProjectMessageReceipt {
@@ -221,7 +234,7 @@ func TestPreparingRecoveryLoadsOnlyPersistedID(t *testing.T) {
 			j := replyPreparing(t, b, s, m)
 			tr.prepared = sdk.PreparedSharingProjectMessage{ID: j.Data.ReplyID, Wire: []byte("immutable reply")}
 			if missing {
-				tr.loadErr = boundaryError
+				tr.loadErr = os.ErrNotExist
 			}
 			process(t, b, s)
 			want := ledger.Admitted
@@ -241,7 +254,7 @@ func TestPrepareErrorRecoversOnlyDurableCandidate(t *testing.T) {
 			outputReady(t, b, s, m)
 			tr.prepareErr = boundaryError
 			if missing {
-				tr.loadErr = boundaryError
+				tr.loadErr = os.ErrNotExist
 			}
 			process(t, b, s)
 			want := ledger.Admitted
@@ -587,5 +600,234 @@ func TestPostSendLedgerErrorRetriesReceiptOnly(t *testing.T) {
 	stopped = true
 	if p.calls != 1 || tr.prepares != 1 || tr.sends != 1 || tr.loads != 0 {
 		t.Fatal("admission write retry repeated external work")
+	}
+}
+
+func TestRevocationDuringReplyLookupsPreventsSend(t *testing.T) {
+	for _, boundary := range []string{"receipt", "status"} {
+		t.Run(boundary, func(t *testing.T) {
+			b, s, tr, _, m := setup(t)
+			replyPrepared(t, b, s, tr, m)
+			revoke := func() {
+				if _, err := s.Revoke(testContext, stored(t, s)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if boundary == "receipt" {
+				tr.onReceipt = revoke
+			} else {
+				tr.onStatus = revoke
+			}
+			process(t, b, s)
+			if tr.sends != 0 || !stored(t, s).Revoked {
+				t.Fatal("lookup raced revocation into send")
+			}
+		})
+	}
+}
+
+type retryClaim struct {
+	Ledger
+	calls     int
+	uncertain bool
+	failure   error
+}
+
+func (l *retryClaim) ClaimProvider(ctx context.Context, j ledger.Job, now time.Time) (ledger.Job, string, error) {
+	l.calls++
+	if l.calls == 1 {
+		if l.uncertain {
+			if _, _, err := l.Ledger.ClaimProvider(ctx, j, now); err != nil {
+				return ledger.Job{}, "", err
+			}
+		}
+		return ledger.Job{}, "", l.failure
+	}
+	return l.Ledger.ClaimProvider(ctx, j, now)
+}
+func runUntil(t *testing.T, b *Bridge, ready func() bool) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(testContext)
+	done := make(chan error, 1)
+	go func() { done <- b.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(4 * time.Second)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatal("automatic recovery did not complete")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+func TestClaimStorageFailureRetriesFreshPhase(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(fmt.Sprint(uncertain), func(t *testing.T) {
+			b, s, _, p, m := setup(t)
+			accept(t, b, m)
+			l := &retryClaim{Ledger: s, uncertain: uncertain, failure: boundaryError}
+			b.store = l
+			if uncertain {
+				observed := &observedLedger{Ledger: l, scanned: make(chan struct{})}
+				b.store = observed
+				runUntil(t, b, func() bool { return observed.scans.Load() >= 2 })
+				// Fresh recovery of an uncertain committed claim never invokes the provider.
+				process(t, b, s)
+				if l.calls != 1 || p.calls != 0 {
+					t.Fatal("uncertain claim retried provider")
+				}
+			} else {
+				runUntil(t, b, func() bool { return stored(t, s).Phase == ledger.Admitted })
+				if l.calls != 2 || p.calls != 1 {
+					t.Fatal("claim storage failure did not safely recover")
+				}
+			}
+		})
+	}
+}
+func TestClaimPolicyFailuresDoNotScheduleRetry(t *testing.T) {
+	for _, failure := range []error{ledger.ErrLimit, ledger.ErrStale, ledger.ErrInvalid} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			b, s, _, _, m := setup(t)
+			accept(t, b, m)
+			b.store = &retryClaim{Ledger: s, failure: failure}
+			err := b.process(testContext, stored(t, s))
+			var retry storageError
+			if !errors.Is(err, failure) || errors.As(err, &retry) {
+				t.Fatal("policy failure scheduled storage retry")
+			}
+		})
+	}
+}
+func TestTransientPreparedReadPreservesCandidateAndRetries(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+			b, s, tr, p, m := setup(t)
+			if initial {
+				outputReady(t, b, s, m)
+				tr.prepareErr = boundaryError
+			} else {
+				j := replyPreparing(t, b, s, m)
+				tr.prepared = sdk.PreparedSharingProjectMessage{ID: j.Data.ReplyID, Wire: []byte("immutable reply")}
+			}
+			tr.onLoad = func() {
+				if tr.loads == 1 {
+					tr.loadErr = &os.PathError{Op: "read", Path: "candidate", Err: os.ErrPermission}
+				} else {
+					tr.loadErr = nil
+				}
+			}
+			runUntil(t, b, func() bool { return stored(t, s).Phase == ledger.Admitted })
+			want := 0
+			if initial {
+				want = 1
+			}
+			if tr.loads != 2 || tr.prepares != want || p.calls != 0 {
+				t.Fatal("transient read discarded or reprepared candidate")
+			}
+		})
+	}
+}
+func TestQuotaCooldownSurvivesWakeAndRetries(t *testing.T) {
+	b, s, tr, p, m := setup(t)
+	replyPrepared(t, b, s, tr, m)
+	reset := time.Now().Add(1200 * time.Millisecond)
+	tr.sendErr = &sdk.SharingProjectMessageQuotaError{StatusCode: 429, ResetAt: &reset}
+	ctx, cancel := context.WithCancel(testContext)
+	done := make(chan error, 1)
+	var limited atomic.Bool
+	b.config.OnError = func(error) {}
+	// Observe the first quota send without reading the fake concurrently.
+	tr.onSend = func() {
+		if tr.sends == 1 {
+			limited.Store(true)
+		} else {
+			if time.Now().Before(reset) {
+				t.Error("sent before quota reset")
+			}
+			tr.sendErr = nil
+		}
+	}
+	go func() { done <- b.Run(ctx) }()
+	stopped := false
+	defer func() {
+		cancel()
+		if !stopped {
+			<-done
+		}
+	}()
+	deadline := time.Now().Add(4 * time.Second)
+	for stored(t, s).Phase != ledger.Admitted {
+		if time.Now().After(deadline) {
+			t.Fatal("quota retry did not recover")
+		}
+		if limited.Load() {
+			b.Wake()
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	stopped = true
+	if tr.sends != 2 || tr.prepares != 0 || p.calls != 0 {
+		t.Fatal("quota wake repeated work")
+	}
+}
+func TestQuotaWithoutHintDoesNotSpinAcrossWake(t *testing.T) {
+	b, s, tr, _, m := setup(t)
+	replyPrepared(t, b, s, tr, m)
+	tr.sendErr = &sdk.SharingProjectMessageQuotaError{StatusCode: 413}
+	if err := b.process(testContext, stored(t, s)); err == nil {
+		t.Fatal("missing quota error")
+	}
+	for i := 0; i < 3; i++ {
+		process(t, b, s)
+	}
+	if tr.sends != 1 {
+		t.Fatal("permanent quota retried")
+	}
+}
+func TestQuotaRetryHints(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	reset := now.Add(time.Second)
+	for _, hint := range []string{"3", now.Add(3 * time.Second).UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")} {
+		got := quotaRetryAt(&sdk.SharingProjectMessageQuotaError{RetryAfter: hint, ResetAt: &reset}, now)
+		if !got.Equal(now.Add(3 * time.Second)) {
+			t.Fatalf("retry hint: %s", got)
+		}
+	}
+}
+
+func TestReceiptDuringRevocationStillReconciles(t *testing.T) {
+	b, s, tr, _, m := setup(t)
+	j := replyPrepared(t, b, s, tr, m)
+	tr.receipt = receiptFor(j.Data.ReplyID, tr.prepared.Wire)
+	tr.receiptErr = nil
+	tr.onReceipt = func() {
+		if _, err := s.Revoke(testContext, stored(t, s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	process(t, b, s)
+	if stored(t, s).Phase != ledger.Admitted || tr.sends != 0 {
+		t.Fatal("revocation prevented valid receipt reconciliation")
+	}
+}
+func TestInvalidPreparedBindingBecomesUnknown(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+			b, s, tr, _, m := setup(t)
+			if initial {
+				outputReady(t, b, s, m)
+				tr.prepareErr = boundaryError
+				tr.onLoad = func() { tr.prepared.ID = "wrong" }
+			} else {
+				replyPreparing(t, b, s, m)
+				tr.prepared = sdk.PreparedSharingProjectMessage{ID: "wrong", Wire: []byte("wire")}
+			}
+			process(t, b, s)
+			if stored(t, s).Phase != ledger.Unknown || tr.sends != 0 {
+				t.Fatal("invalid candidate binding retained")
+			}
+		})
 	}
 }
