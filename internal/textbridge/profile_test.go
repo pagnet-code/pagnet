@@ -72,6 +72,144 @@ func TestResolveProfileSameOSOwner(t *testing.T) {
 	}
 }
 
+func TestProfileRegistrationLegacy(t *testing.T) {
+	_, dir, p := savedTestProfile(t)
+	raw, err := os.ReadFile(filepath.Join(dir, "profile.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["Registration"]; ok {
+		t.Fatal("legacy profile gained registration metadata")
+	}
+	got, err := LoadProfile(dir, p.Service)
+	if err != nil || got != p || got.Registration != nil {
+		t.Fatal("legacy profile did not load unchanged")
+	}
+}
+
+func testProfileRegistration() ProfileRegistration {
+	return ProfileRegistration{
+		InstallationID: "6e6cb40a-72d4-4a64-8ed5-32db95d2cb60",
+		HostID:         "b8fc428b-e874-4aaf-8ada-f50decd99b60",
+		Role:           "responder", ProfileVersion: 1, Pending: true,
+	}
+}
+
+func TestProfileRegistrationRoundTrip(t *testing.T) {
+	for _, state := range []string{"pending", "pending enabled", "enabled", "disabled"} {
+		t.Run(state, func(t *testing.T) {
+			_, dir, p := savedTestProfile(t)
+			r := testProfileRegistration()
+			if state != "pending" {
+				r.TenantID = profileTestService
+				r.OwnerUserID = "90ef464b-3467-44d7-a70c-91258ec310ee"
+				r.Generation = 2
+				r.DesiredState = "enabled"
+				r.Pending = state == "pending enabled"
+				if state == "disabled" {
+					r.DesiredState = "disabled"
+				}
+			}
+			p.Registration = &r
+			if err := SaveProfile(dir, p); err != nil {
+				t.Fatal(err)
+			}
+			got, err := LoadProfile(dir, p.Service)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Registration == nil || *got.Registration != r {
+				t.Fatal("registration metadata did not round trip")
+			}
+			got.Registration = p.Registration
+			if got != p {
+				t.Fatal("registration changed profile fields")
+			}
+		})
+	}
+}
+
+func TestProfileRegistrationRejectsMalformed(t *testing.T) {
+	cases := map[string]func(*ProfileRegistration){
+		"missing installation":      func(r *ProfileRegistration) { r.InstallationID = "" },
+		"nil installation":          func(r *ProfileRegistration) { r.InstallationID = "00000000-0000-0000-0000-000000000000" },
+		"noncanonical installation": func(r *ProfileRegistration) { r.InstallationID = strings.ToUpper(r.InstallationID) },
+		"invalid host":              func(r *ProfileRegistration) { r.HostID = "host" },
+		"nil host":                  func(r *ProfileRegistration) { r.HostID = "00000000-0000-0000-0000-000000000000" },
+		"noncanonical host":         func(r *ProfileRegistration) { r.HostID = strings.ReplaceAll(r.HostID, "-", "") },
+		"invalid role":              func(r *ProfileRegistration) { r.Role = "owner" },
+		"missing version":           func(r *ProfileRegistration) { r.ProfileVersion = 0 },
+		"unknown version":           func(r *ProfileRegistration) { r.ProfileVersion = 2 },
+		"unconfirmed nonpending":    func(r *ProfileRegistration) { r.Pending = false },
+		"partial tenant":            func(r *ProfileRegistration) { r.TenantID = profileTestService },
+		"partial owner":             func(r *ProfileRegistration) { r.OwnerUserID = profileTestService },
+		"partial generation":        func(r *ProfileRegistration) { r.Generation = 1 },
+		"partial state":             func(r *ProfileRegistration) { r.DesiredState = "enabled" },
+		"negative generation":       func(r *ProfileRegistration) { r.Generation = -1 },
+	}
+	for _, field := range []string{"tenant", "owner", "generation", "state"} {
+		for _, pending := range []bool{false, true} {
+			name := field
+			if pending {
+				name += " pending"
+			}
+			cases[name] = func(r *ProfileRegistration) {
+				r.TenantID, r.OwnerUserID = profileTestService, profileTestService
+				r.Generation, r.DesiredState, r.Pending = 1, "enabled", pending
+				switch field {
+				case "tenant":
+					r.TenantID = strings.ToUpper(r.TenantID)
+				case "owner":
+					r.OwnerUserID = "00000000-0000-0000-0000-000000000000"
+				case "generation":
+					r.Generation = 0
+				case "state":
+					r.DesiredState = "unknown"
+				}
+			}
+		}
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, dir, p := savedTestProfile(t)
+			r := testProfileRegistration()
+			mutate(&r)
+			p.Registration = &r
+			if err := SaveProfile(dir, p); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadProfile(dir, p.Service); err == nil {
+				t.Fatal("accepted invalid registration metadata")
+			}
+		})
+	}
+}
+
+func TestProfileRegistrationRejectsUnknownFields(t *testing.T) {
+	for _, field := range []string{"Credential", "ProviderOrigin", "Unknown"} {
+		t.Run(field, func(t *testing.T) {
+			_, dir, p := savedTestProfile(t)
+			r := testProfileRegistration()
+			p.Registration = &r
+			raw, err := json.Marshal(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw = append(raw[:len(raw)-2], []byte(`,"`+field+`":"private-marker"}}`)...)
+			if err := os.WriteFile(filepath.Join(dir, "profile.json"), raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadProfile(dir, p.Service); err == nil || strings.Contains(err.Error(), "private-marker") {
+				t.Fatal("accepted unknown registration field or disclosed its contents")
+			}
+		})
+	}
+}
+
 func TestReadProfileStatusDisabledAndPrivate(t *testing.T) {
 	state, dir, p := savedTestProfile(t)
 	unlock, err := LockProfile(dir)

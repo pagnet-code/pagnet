@@ -32,9 +32,12 @@ type textBridgeConnection interface {
 }
 
 type textBridgeDependencies struct {
-	owner         func() (*cliCtx, error)
-	provider      func(provider.Config) (textbridge.Provider, error)
-	connect       func(context.Context, sdk.Config) (textBridgeConnection, error)
+	owner                    func() (*cliCtx, error)
+	provider                 func(provider.Config) (textbridge.Provider, error)
+	connect                  func(context.Context, sdk.Config) (textBridgeConnection, error)
+	registrationContext      func() (*cliCtx, error)
+	registrationAuthenticate func(*cliCtx) error
+
 	senderConnect func(context.Context, sdk.Config) (textBridgeSenderConnection, error)
 }
 
@@ -50,6 +53,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 	cmd := &cobra.Command{Use: "text-bridge", Short: "Run a local, bounded text-only provider service", Args: cobra.NoArgs}
 	var stateDir string
 	cmd.PersistentFlags().StringVar(&stateDir, "state-dir", "", "private local state directory (default ~/.pagnet)")
+	cmd.AddCommand(textBridgeRegisterCmd(&stateDir, deps))
 	cmd.AddCommand(textBridgeSenderCmd(&stateDir, textBridgeSenderDependencies{owner: deps.owner, connect: deps.senderConnect}))
 	var name, origin, model, keyFile string
 	var calls int64
@@ -190,7 +194,10 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 				_, err = store.AbandonProviderClaim(cmd.Context(), project, ask, job.Revision)
 				return err
 			case "run":
-				if p.Disabled || !budget.Enabled {
+				if p.Registration != nil && p.Registration.Pending {
+					return fmt.Errorf("text bridge registration is unconfirmed; retry pagnet text-bridge register --service %s before running", p.Service)
+				}
+				if p.Disabled || !budget.Enabled || (p.Registration != nil && p.Registration.DesiredState == "disabled") {
 					return errors.New("text bridge is disabled; create a new service to enable new work")
 				}
 				return textBridgeRun(cmd.Context(), dir, p, store, deps, cmd.ErrOrStderr())

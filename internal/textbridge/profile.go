@@ -26,6 +26,36 @@ type Profile struct {
 	ProviderOrigin, Model, KeyFile, Fingerprint string
 	Limits                                      ledger.Limits
 	Disabled                                    bool
+	Registration                                *ProfileRegistration `json:",omitempty"`
+}
+
+// ProfileRegistration binds a local installation to its confirmed owner state.
+// Pending registrations may have no response pins until registration succeeds.
+type ProfileRegistration struct {
+	InstallationID, HostID string
+	Role                   string
+	ProfileVersion         int
+	TenantID, OwnerUserID  string
+	Generation             int64
+	DesiredState           string
+	Pending                bool
+}
+
+func (r *ProfileRegistration) valid() bool {
+	if r == nil {
+		return true
+	}
+	canonicalUUID := func(value string) bool {
+		id, err := uuid.Parse(value)
+		return err == nil && id != uuid.Nil && id.String() == value
+	}
+	if !canonicalUUID(r.InstallationID) || !canonicalUUID(r.HostID) || r.Role != "responder" || r.ProfileVersion != 1 {
+		return false
+	}
+	if r.Pending && r.TenantID == "" && r.OwnerUserID == "" && r.Generation == 0 && r.DesiredState == "" {
+		return true
+	}
+	return canonicalUUID(r.TenantID) && canonicalUUID(r.OwnerUserID) && r.Generation >= 1 && (r.DesiredState == "enabled" || r.DesiredState == "disabled")
 }
 
 // ProfileBase resolves the private text bridge directory beneath state. Empty state
@@ -75,7 +105,7 @@ func LoadProfile(dir, service string) (Profile, error) {
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
-	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service || !filepath.IsAbs(p.KeyFile) || p.Fingerprint == "" || p.Limits.CallsPerDay <= 0 || p.Limits.MaxConcurrent != 1 {
+	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service || !filepath.IsAbs(p.KeyFile) || p.Fingerprint == "" || p.Limits.CallsPerDay <= 0 || p.Limits.MaxConcurrent != 1 || !p.Registration.valid() {
 		return p, errors.New("invalid local text bridge profile")
 	}
 	if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: service}).Validate(); err != nil {

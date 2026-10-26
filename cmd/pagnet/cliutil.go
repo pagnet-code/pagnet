@@ -103,6 +103,15 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := authenticateCLI(c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// authenticateCLI resolves the user bearer for an already selected context.
+// Callers with enrollment constraints must verify its server before calling.
+func authenticateCLI(c *cliCtx) error {
 	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no
 	// auth endpoint is called at all), then the account's stored
 	// credential, else the sign-in flow (interactive) / fail (non-interactive).
@@ -112,11 +121,11 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 		c.interactive = interactiveMode()
 		tok, err := ensureUserToken(c.stateDir, c.account, c.base, c.noBrowser, c.interactive)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		c.token = tok
 	}
-	return c, nil
+	return nil
 }
 
 // do performs an authenticated request against the control plane. The
