@@ -84,6 +84,8 @@ func (pc *conn) readLoop() {
 			case <-pc.c.closeCh:
 				return
 			}
+		case sharingProjectWakeType:
+			pc.c.handleSharingProjectWake(pc, env)
 		case sharingPairWakeType:
 			pc.c.handleSharingPairWake(pc, env)
 		case transport.MsgEndpointInvocationResultAck:

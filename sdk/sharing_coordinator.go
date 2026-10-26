@@ -20,18 +20,22 @@ const sharingPairWakeCap = 256
 // a replacement connection becomes live while an old callback is cancelling.
 // All fields except notify are protected by Client.sharingMu.
 type sharingCoordinator struct {
-	notify        chan struct{}
-	pending       map[string]sharingPairWake
-	blocked       map[string]bool
-	full          bool
-	handler       func(context.Context, SharingMessage) error
-	ready         func()
-	ctx           context.Context
-	cancel        context.CancelFunc
-	connection    int64
-	revision      uint64
-	fullRevision  uint64
-	grantRevision map[string]uint64
+	notify          chan struct{}
+	pending         map[string]sharingPairWake
+	blocked         map[string]bool
+	full            bool
+	handler         func(context.Context, SharingMessage) error
+	ready           func()
+	pairsEnabled    bool
+	projectsEnabled bool
+	projectHandler  func(context.Context, SharingProjectMessage) error
+	projectReady    func(string)
+	ctx             context.Context
+	cancel          context.CancelFunc
+	connection      int64
+	revision        uint64
+	fullRevision    uint64
+	grantRevision   map[string]uint64
 }
 
 type sharingPairWake struct {
@@ -52,6 +56,7 @@ func (c *Client) OnSharingMessage(handler func(context.Context, SharingMessage) 
 		return
 	}
 	coordinator := c.ensureSharingCoordinatorLocked()
+	coordinator.pairsEnabled = true
 	coordinator.handler = handler
 	c.kickSharingCoordinatorLocked(coordinator)
 }
@@ -65,7 +70,9 @@ func (c *Client) EnableSharingPairs() {
 	if c.closed.Load() {
 		return
 	}
-	c.kickSharingCoordinatorLocked(c.ensureSharingCoordinatorLocked())
+	s := c.ensureSharingCoordinatorLocked()
+	s.pairsEnabled = true
+	c.kickSharingCoordinatorLocked(s)
 }
 
 // OnSharingPairReady registers a nonblocking local wake after pair authority is
@@ -77,6 +84,7 @@ func (c *Client) OnSharingPairReady(handler func()) {
 		return
 	}
 	s := c.ensureSharingCoordinatorLocked()
+	s.pairsEnabled = true
 	s.ready = handler
 	c.kickSharingCoordinatorLocked(s)
 }
@@ -181,13 +189,24 @@ func (c *Client) handleSharingPairWake(pc *conn, env transport.Envelope) {
 	c.queueSharingPairWake(wake)
 }
 func (c *Client) queueSharingPairWake(wake sharingPairWake) {
+	c.queueSharingWake(wake, false)
+}
+func (c *Client) queueSharingWake(wake sharingPairWake, project bool) {
 	c.sharingMu.Lock()
 	s := c.sharingCoordinator
 	if s == nil || s.ctx == nil || c.closed.Load() || !c.connected.Load() || s.connection != c.connGeneration.Load() {
 		c.sharingMu.Unlock()
 		return
 	}
-	if _, exists := s.pending[wake.GrantID]; !exists && len(s.pending) >= sharingPairWakeCap {
+	if (project && !s.projectsEnabled) || (!project && !s.pairsEnabled) {
+		c.sharingMu.Unlock()
+		return
+	}
+	key := wake.GrantID
+	if project {
+		key = sharingProjectJobKey(key)
+	}
+	if _, exists := s.pending[key]; !exists && len(s.pending) >= sharingPairWakeCap {
 		// An overflow cannot silently lose work. Cancel this session and close its
 		// socket; onLive's full rescan reconstructs state and pending inboxes.
 		if s.cancel != nil {
@@ -205,7 +224,7 @@ func (c *Client) queueSharingPairWake(wake sharingPairWake) {
 		}
 		return
 	}
-	old, exists := s.pending[wake.GrantID]
+	old, exists := s.pending[key]
 	merged := wake
 	if exists && old.Generation > wake.Generation {
 		merged = old
@@ -213,16 +232,18 @@ func (c *Client) queueSharingPairWake(wake sharingPairWake) {
 	if old.Kind == "state" || wake.Kind == "state" {
 		merged.Kind = "state"
 	}
-	s.pending[wake.GrantID] = merged
+	s.pending[key] = merged
 	s.revision++
-	s.grantRevision[wake.GrantID] = s.revision
-	delete(s.blocked, wake.GrantID)
+	s.grantRevision[key] = s.revision
+	delete(s.blocked, key)
 	signalSharingCoordinator(s)
 	c.sharingMu.Unlock()
 }
 
 type sharingReconcileJob struct {
 	grant      string
+	project    bool
+	key        string
 	kind       string
 	full       bool
 	ctx        context.Context
@@ -243,7 +264,9 @@ func (c *Client) nextSharingJob(s *sharingCoordinator) (sharingReconcileJob, boo
 	}
 	for grant, wake := range s.pending {
 		delete(s.pending, grant)
-		job.grant = grant
+		job.grant = wake.GrantID
+		job.key = grant
+		job.project = grant == sharingProjectJobKey(wake.GrantID)
 		job.kind = wake.Kind
 		return job, true
 	}
@@ -303,9 +326,9 @@ func (c *Client) runSharingCoordinator(s *sharingCoordinator) {
 		if s.ctx == job.ctx && s.connection == job.connection {
 			if job.full {
 				s.full = true
-			} else if !s.blocked[job.grant] {
-				if _, queued := s.pending[job.grant]; !queued {
-					s.pending[job.grant] = sharingPairWake{GrantID: job.grant, Kind: job.kind}
+			} else if !s.blocked[job.key] {
+				if _, queued := s.pending[job.key]; !queued {
+					s.pending[job.key] = sharingPairWake{GrantID: job.grant, Kind: job.kind}
 				}
 			}
 			signalSharingCoordinator(s)
@@ -329,7 +352,21 @@ func retrySharingReconcile(err error) bool {
 }
 func (c *Client) runSharingReconcile(s *sharingCoordinator, job sharingReconcileJob) error {
 	if !job.full {
+		if job.project {
+			return c.reconcileSharingProject(s, job, job.grant)
+		}
 		return c.reconcileSharingGrant(s, job, job.grant)
+	}
+	c.sharingMu.Lock()
+	pairs, projects := s.pairsEnabled, s.projectsEnabled
+	c.sharingMu.Unlock()
+	if projects {
+		if err := c.reconcileSharingProjects(s, job); err != nil {
+			return err
+		}
+	}
+	if !pairs {
+		return nil
 	}
 	cursor := ""
 	for {
