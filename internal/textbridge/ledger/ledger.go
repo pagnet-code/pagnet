@@ -117,6 +117,29 @@ func syncDir(path string) error {
 	defer f.Close()
 	return f.Sync()
 }
+func makePrivateDir(path string) error {
+	info, err := os.Stat(path)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("text bridge ledger path is not a directory: %s", path)
+		}
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if err = makePrivateDir(parent); err != nil {
+		return err
+	}
+	if err = os.Mkdir(path, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if err = os.Chmod(path, 0700); err != nil {
+		return err
+	}
+	return syncDir(parent)
+}
 func readKey(dir string, exists bool) ([]byte, error) {
 	path := filepath.Join(dir, "key")
 	key, err := os.ReadFile(path)
@@ -159,13 +182,15 @@ func readKey(dir string, exists bool) ([]byte, error) {
 }
 
 // Open creates a private ledger or authenticates the complete existing ledger.
-// An existing database is never reinitialized, including after key loss.
+// An existing database is never reinitialized, including after key loss. Missing
+// databases with initialization evidence also fail closed to retain deduplication.
 func Open(dir string, b Binding) (*Store, error) {
 	b, err := normalizeBinding(b)
 	if err != nil {
 		return nil, err
 	}
-	if err = os.MkdirAll(dir, 0700); err != nil {
+	dir = filepath.Clean(dir)
+	if err = makePrivateDir(dir); err != nil {
 		return nil, err
 	}
 	if err = os.Chmod(dir, 0700); err != nil {
@@ -179,6 +204,15 @@ func Open(dir string, b Binding) (*Store, error) {
 	exists := err == nil
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	if !exists {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, err
+		}
+		if len(entries) != 0 {
+			return nil, errors.New("text bridge ledger database missing with initialization evidence")
+		}
 	}
 	key, err := readKey(dir, exists)
 	if err != nil {
@@ -423,12 +457,12 @@ func allowed(from, to Phase) bool {
 	if from == Admitted || from == Unknown || from == Rejected {
 		return false
 	}
-	if to == Unknown || to == Rejected {
+	if to == Unknown {
 		return true
 	}
 	switch from {
 	case Queued:
-		return to == ProviderStarted
+		return to == ProviderStarted || to == Rejected
 	case ProviderStarted:
 		return to == OutputReady
 	case OutputReady:
@@ -442,9 +476,13 @@ func allowed(from, to Phase) bool {
 }
 
 // CompareAndSwap advances exactly the caller's observed revision. A revoked
-// job cannot advance, and the immutable incoming ASK digest cannot change.
+// job can only reconcile a previously prepared reply's validated receipt. The
+// immutable incoming ASK digest cannot change.
 func (s *Store) CompareAndSwap(ctx context.Context, expected Job, next Phase, d Data) (Job, error) {
-	if expected.Revoked || !allowed(expected.Phase, next) || d.WireDigest != expected.Data.WireDigest {
+	if expected.Revoked && (expected.Phase != ReplyPrepared || next != Admitted || len(d.Receipt) == 0 || bytes.Equal(bytes.TrimSpace(d.Receipt), []byte("null"))) {
+		return Job{}, ErrInvalid
+	}
+	if !allowed(expected.Phase, next) || d.WireDigest != expected.Data.WireDigest {
 		return Job{}, ErrInvalid
 	}
 	j := expected
@@ -475,7 +513,10 @@ func (s *Store) replace(ctx context.Context, expected, j Job) (Job, error) {
 	if j.Data.WireDigest != stored.Data.WireDigest || !bytes.Equal(j.Data.Header, stored.Data.Header) || !bytes.Equal(j.Data.Input, stored.Data.Input) || j.Data.ProviderConfigFingerprint != stored.Data.ProviderConfigFingerprint {
 		return Job{}, ErrInvalid
 	}
-	if j.Revoked {
+	if expected.Revoked && (stored.Data.ReplyID == "" || j.Data.ReplyID != stored.Data.ReplyID || j.Data.ReplyDigest != stored.Data.ReplyDigest) {
+		return Job{}, ErrInvalid
+	}
+	if j.Revoked && !expected.Revoked {
 		j.Data = stored.Data
 	}
 	sealed, e := s.encode(j)

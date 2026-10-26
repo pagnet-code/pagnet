@@ -72,6 +72,75 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 		t.Fatal("plaintext leaked")
 	}
 }
+func TestNestedPrivateDirectoryCreation(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "private", "nested", "ledger")
+	s, e := Open(dir, binding())
+	if e != nil {
+		t.Fatal(e)
+	}
+	insert(t, s)
+	if e = s.Close(); e != nil {
+		t.Fatal(e)
+	}
+	for path := dir; path != root; path = filepath.Dir(path) {
+		info, e := os.Stat(path)
+		if e != nil || info.Mode().Perm() != 0700 {
+			t.Fatalf("permissions %s: %v %v", path, info, e)
+		}
+	}
+	s, e = Open(dir, binding())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	if _, e = s.Get(ctx, "project", "ask"); e != nil {
+		t.Fatal(e)
+	}
+}
+func TestMissingDatabaseAfterTerminalJobFailsClosed(t *testing.T) {
+	s, dir := openTest(t)
+	j := insert(t, s)
+	for _, phase := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared, Admitted} {
+		var e error
+		j, e = s.CompareAndSwap(ctx, j, phase, j.Data)
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	if e := s.Close(); e != nil {
+		t.Fatal(e)
+	}
+	path := filepath.Join(dir, "ledger.sqlite")
+	if e := os.Remove(path); e != nil {
+		t.Fatal(e)
+	}
+	if reopened, e := Open(dir, binding()); e == nil {
+		reopened.Close()
+		t.Fatal("lost terminal job history accepted; duplicate ASK could run again")
+	}
+	if _, e := os.Stat(path); !errors.Is(e, os.ErrNotExist) {
+		t.Fatalf("missing database recreated: %v", e)
+	}
+}
+func TestInitializationEvidenceWithoutDatabaseFailsClosed(t *testing.T) {
+	for _, name := range []string{"key", ".key-incomplete", ".ledger-incomplete", "ledger.sqlite-journal", "ledger.sqlite-wal"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if e := os.WriteFile(filepath.Join(dir, name), []byte("initialization evidence"), 0600); e != nil {
+				t.Fatal(e)
+			}
+			if s, e := Open(dir, binding()); e == nil {
+				s.Close()
+				t.Fatal("initialization evidence ignored")
+			}
+			entries, e := os.ReadDir(dir)
+			if e != nil || len(entries) != 1 || entries[0].Name() != name {
+				t.Fatalf("failed open changed initialization evidence: %v %v", entries, e)
+			}
+		})
+	}
+}
 func TestIdempotenceConflictAndTerminalRetention(t *testing.T) {
 	s, _ := openTest(t)
 	j := insert(t, s)
@@ -172,6 +241,137 @@ func TestUncertaintyAndImmutableInput(t *testing.T) {
 	}
 	if _, e = s.CompareAndSwap(ctx, j, Queued, j.Data); !errors.Is(e, ErrInvalid) {
 		t.Fatal(e)
+	}
+}
+func TestRejectionOnlyBeforeProviderStarted(t *testing.T) {
+	for _, phase := range []Phase{Queued, ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared, Admitted, Unknown, Rejected} {
+		t.Run(string(phase), func(t *testing.T) {
+			s, _ := openTest(t)
+			j := insert(t, s)
+			if phase == Unknown || phase == Rejected {
+				var e error
+				j, e = s.CompareAndSwap(ctx, j, phase, j.Data)
+				if e != nil {
+					t.Fatal(e)
+				}
+			} else {
+				for _, next := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared, Admitted} {
+					if j.Phase == phase {
+						break
+					}
+					var e error
+					j, e = s.CompareAndSwap(ctx, j, next, j.Data)
+					if e != nil {
+						t.Fatal(e)
+					}
+				}
+			}
+			_, e := s.CompareAndSwap(ctx, j, Rejected, j.Data)
+			if phase == Queued && e != nil {
+				t.Fatal(e)
+			}
+			if phase != Queued && !errors.Is(e, ErrInvalid) {
+				t.Fatalf("rejected after %s: %v", phase, e)
+			}
+		})
+	}
+}
+func TestRevokedPreparedReplyReceiptReconciliation(t *testing.T) {
+	for _, phase := range []Phase{Queued, ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared} {
+		t.Run(string(phase), func(t *testing.T) {
+			s, dir := openTest(t)
+			j := insert(t, s)
+			for _, next := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared} {
+				if j.Phase == phase {
+					break
+				}
+				d := j.Data
+				if next == ReplyPrepared {
+					d.ReplyID = "reply"
+					d.ReplyDigest = strings.Repeat("b", 64)
+				}
+				var e error
+				j, e = s.CompareAndSwap(ctx, j, next, d)
+				if e != nil {
+					t.Fatal(e)
+				}
+			}
+			j, e := s.Revoke(ctx, j)
+			if e != nil {
+				t.Fatal(e)
+			}
+			for _, next := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared} {
+				if _, e = s.CompareAndSwap(ctx, j, next, j.Data); !errors.Is(e, ErrInvalid) {
+					t.Fatalf("revoked transition to %s: %v", next, e)
+				}
+			}
+			if _, e = s.CompareAndSwap(ctx, j, Admitted, j.Data); !errors.Is(e, ErrInvalid) {
+				t.Fatalf("missing receipt accepted: %v", e)
+			}
+			d := j.Data
+			d.Receipt = []byte(`{"validated":true}`)
+			if phase != ReplyPrepared {
+				if _, e = s.CompareAndSwap(ctx, j, Admitted, d); !errors.Is(e, ErrInvalid) {
+					t.Fatalf("receipt admitted from %s: %v", phase, e)
+				}
+				return
+			}
+			for _, kind := range []string{"missing reply ID", "changed reply ID", "changed reply digest", "invalid receipt", "null receipt"} {
+				invalid := d
+				switch kind {
+				case "missing reply ID":
+					invalid.ReplyID = ""
+				case "changed reply ID":
+					invalid.ReplyID = "different"
+				case "changed reply digest":
+					invalid.ReplyDigest = strings.Repeat("c", 64)
+				case "invalid receipt":
+					invalid.Receipt = []byte("invalid JSON")
+				case "null receipt":
+					invalid.Receipt = []byte(" null ")
+				}
+				if _, e = s.CompareAndSwap(ctx, j, Admitted, invalid); !errors.Is(e, ErrInvalid) {
+					t.Fatalf("%s reconciliation accepted: %v", kind, e)
+				}
+			}
+			j, e = s.CompareAndSwap(ctx, j, Admitted, d)
+			if e != nil || !j.Revoked || string(j.Data.Receipt) != string(d.Receipt) {
+				t.Fatalf("reconciliation: %+v %v", j, e)
+			}
+			if e = s.Close(); e != nil {
+				t.Fatal(e)
+			}
+			s, e = Open(dir, binding())
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer s.Close()
+			got, e := s.Get(ctx, j.ProjectID, j.AskID)
+			if e != nil || got.Phase != Admitted || !got.Revoked || string(got.Data.Receipt) != string(d.Receipt) {
+				t.Fatalf("persisted reconciliation: %+v %v", got, e)
+			}
+		})
+	}
+}
+func TestRevokedReconciliationRequiresStoredReplyID(t *testing.T) {
+	s, _ := openTest(t)
+	j := insert(t, s)
+	for _, next := range []Phase{ProviderStarted, OutputReady, ReplyPreparing, ReplyPrepared} {
+		var e error
+		j, e = s.CompareAndSwap(ctx, j, next, j.Data)
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	j, e := s.Revoke(ctx, j)
+	if e != nil {
+		t.Fatal(e)
+	}
+	j.Data.ReplyID = "caller-only-reply"
+	d := j.Data
+	d.Receipt = []byte(`{"validated":true}`)
+	if _, e = s.CompareAndSwap(ctx, j, Admitted, d); !errors.Is(e, ErrInvalid) {
+		t.Fatalf("reconciled without persisted reply identity: %v", e)
 	}
 }
 func TestTamperFailsClosed(t *testing.T) {
