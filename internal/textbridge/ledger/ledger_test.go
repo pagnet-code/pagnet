@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,75 @@ func TestNestedPrivateDirectoryCreation(t *testing.T) {
 	defer s.Close()
 	if _, e = s.Get(ctx, "project", "ask"); e != nil {
 		t.Fatal(e)
+	}
+}
+func TestDirectorySyncRetryIncludesExistingAncestors(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "private")
+	dir := filepath.Join(first, "nested", "ledger")
+	interrupted := errors.New("interrupted after mkdir before parent sync")
+	err := makePrivateDir(dir, func(path string) error {
+		if path == root {
+			return interrupted
+		}
+		return syncDir(path)
+	})
+	if !errors.Is(err, interrupted) {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(first); err != nil || !info.IsDir() {
+		t.Fatalf("interruption must leave the unsynced directory: %v %v", info, err)
+	}
+	// Retry once to finish creation, then again with every directory already
+	// present. Both retries must sync every parent through the filesystem root.
+	for attempt := 0; attempt < 2; attempt++ {
+		synced := make(map[string]bool)
+		if err := makePrivateDir(dir, func(path string) error {
+			synced[path] = true
+			return syncDir(path)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for path := filepath.Dir(dir); ; path = filepath.Dir(path) {
+			if !synced[path] {
+				t.Fatalf("retry %d skipped existing ancestor %s", attempt, path)
+			}
+			if filepath.Dir(path) == path {
+				break
+			}
+		}
+	}
+	s, err := Open(dir, binding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	insert(t, s)
+}
+func TestRejectSymlinkDirectory(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		t.Run(strconv.FormatBool(nested), func(t *testing.T) {
+			root := t.TempDir()
+			target := filepath.Join(root, "target")
+			if err := os.Mkdir(target, 0700); err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(root, "link")
+			if err := os.Symlink(target, dir); err != nil {
+				t.Fatal(err)
+			}
+			if nested {
+				dir = filepath.Join(dir, "ledger")
+			}
+			if s, err := Open(dir, binding()); err == nil {
+				s.Close()
+				t.Fatal("symlink ledger path accepted")
+			}
+			entries, err := os.ReadDir(target)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("symlink target changed: %v %v", entries, err)
+			}
+		})
 	}
 }
 func TestMissingDatabaseAfterTerminalJobFailsClosed(t *testing.T) {

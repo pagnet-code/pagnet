@@ -117,28 +117,43 @@ func syncDir(path string) error {
 	defer f.Close()
 	return f.Sync()
 }
-func makePrivateDir(path string) error {
-	info, err := os.Stat(path)
-	if err == nil {
+
+// makePrivateDir requires an absolute path. Sync every ancestor's directory
+// entry, even if it already exists: an earlier attempt may have stopped after
+// mkdir but before syncing its parent. Reject symlinks so the walked parents
+// are the same directories that will contain the ledger.
+func makePrivateDir(path string, syncDirectory func(string) error) error {
+	info, err := os.Lstat(path)
+	missing := errors.Is(err, os.ErrNotExist)
+	if err != nil && !missing {
+		return err
+	}
+	if !missing && !info.IsDir() {
+		return fmt.Errorf("text bridge ledger path is not a directory: %s", path)
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return nil
+	}
+	if err = makePrivateDir(parent, syncDirectory); err != nil {
+		return err
+	}
+	if missing {
+		if err = os.Mkdir(path, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			return err
+		}
+		info, err = os.Lstat(path)
+		if err != nil {
+			return err
+		}
 		if !info.IsDir() {
 			return fmt.Errorf("text bridge ledger path is not a directory: %s", path)
 		}
-		return nil
+		if err = os.Chmod(path, 0700); err != nil {
+			return err
+		}
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	parent := filepath.Dir(path)
-	if err = makePrivateDir(parent); err != nil {
-		return err
-	}
-	if err = os.Mkdir(path, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
-	}
-	if err = os.Chmod(path, 0700); err != nil {
-		return err
-	}
-	return syncDir(parent)
+	return syncDirectory(parent)
 }
 func readKey(dir string, exists bool) ([]byte, error) {
 	path := filepath.Join(dir, "key")
@@ -189,14 +204,14 @@ func Open(dir string, b Binding) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir = filepath.Clean(dir)
-	if err = makePrivateDir(dir); err != nil {
+	dir, err = filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err = makePrivateDir(dir, syncDir); err != nil {
 		return nil, err
 	}
 	if err = os.Chmod(dir, 0700); err != nil {
-		return nil, err
-	}
-	if err = syncDir(filepath.Dir(dir)); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dir, "ledger.sqlite")
