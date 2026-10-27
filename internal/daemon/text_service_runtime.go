@@ -174,19 +174,22 @@ func (s *textServiceSupervisor) stopRuntime(r *textServiceRuntime, disable bool)
 	}
 	r.disable = r.disable || disable
 	if r.disable {
-		r.profile.Disabled = true
-		r.profile.Registration.DesiredState = "disabled"
-		ledgerErr := r.store.SetEnabled(context.Background(), false)
-		profileErr := textbridge.SaveProfile(r.dir, r.profile)
-		if ledgerErr != nil {
-			return ledgerErr
-		}
-		if profileErr != nil {
-			return profileErr
+		if err := s.disableProfile(r.dir, r.profile, r.store); err != nil {
+			return err
 		}
 	}
 	close(r.release)
 	<-r.done
 	r.released = true
 	return nil
+}
+
+// Attempt both writes on every reconciliation: either durable gate prevents
+// standalone dispatch while the other write is retried after a partial failure.
+func (s *textServiceSupervisor) disableProfile(dir string, p textbridge.Profile, store *ledger.Store) error {
+	p.Disabled = true
+	p.Registration.DesiredState = "disabled"
+	ledgerErr := s.disableLedger(store)
+	profileErr := s.savePrivate(dir, "profile.json", p)
+	return errors.Join(ledgerErr, profileErr)
 }

@@ -443,3 +443,84 @@ func TestTextServiceAmbiguousClaimSnapshotEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestTextServiceRemoteDisableRepairsPartialWrites(t *testing.T) {
+	for _, failure := range []string{"ledger", "profile"} {
+		t.Run(failure, func(t *testing.T) {
+			s, c, dir, p, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("disabled installation sent HTTP request") })
+			v.DesiredState = "disabled"
+			v.Generation++
+			disable := s.disableLedger
+			save := s.savePrivate
+			ledgerWrites, profileWrites := 0, 0
+			s.disableLedger = func(store *ledger.Store) error {
+				ledgerWrites++
+				if failure == "ledger" && ledgerWrites == 1 {
+					return errors.New("injected ledger disable failure")
+				}
+				return disable(store)
+			}
+			s.savePrivate = func(dir, name string, value any) error {
+				if name == "profile.json" {
+					profileWrites++
+					if failure == "profile" && profileWrites == 1 {
+						return errors.New("injected profile save failure")
+					}
+				}
+				return save(dir, name, value)
+			}
+			if err := s.installation(context.Background(), c, v); err == nil {
+				t.Fatal("partial write failure ignored")
+			}
+			check := func(wantProfile, wantLedger bool) {
+				t.Helper()
+				saved, err := textbridge.LoadProfile(dir, p.Service)
+				if err != nil {
+					t.Fatal(err)
+				}
+				store, err := textbridge.OpenProfileLedger(dir, saved)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				budget, err := store.BudgetSnapshot(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if saved.Disabled != wantProfile || (!budget.Enabled) != wantLedger {
+					t.Fatal("durable disable state did not match writes")
+				}
+				if wantProfile && (saved.Registration.DesiredState != "disabled" || saved.Registration.Generation != v.Generation) {
+					t.Fatal("disabled registration metadata lost")
+				}
+			}
+			check(failure != "profile", failure != "ledger")
+			if err := s.installation(context.Background(), c, v); err != nil {
+				t.Fatal(err)
+			}
+			check(true, true)
+			if ledgerWrites != 2 || profileWrites != 2 {
+				t.Fatal("partial disable did not retry both durable flags")
+			}
+			if err := s.installation(context.Background(), c, v); err != nil {
+				t.Fatal(err)
+			}
+			check(true, true)
+		})
+	}
+}
+
+func TestTextServiceRemoteDisablePreservesBindingGate(t *testing.T) {
+	s, c, dir, p, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("binding mismatch sent HTTP") })
+	p.Disabled = true
+	p.Registration.OwnerUserID = uuid.NewString()
+	if err := textbridge.SaveProfile(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	v.DesiredState = "disabled"
+	s.disableLedger = func(*ledger.Store) error { t.Fatal("wrong binding disabled ledger"); return nil }
+	s.savePrivate = func(string, string, any) error { t.Fatal("wrong binding rewrote profile"); return nil }
+	if err := s.installation(context.Background(), c, v); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/textbridge"
+	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/pagnet-code/pagnet/transport"
@@ -133,22 +134,23 @@ type textServiceAttempt struct {
 }
 
 type textServiceSupervisor struct {
-	daemon      *Daemon
-	mu          sync.Mutex
-	controlMu   sync.Mutex
-	client      *textServiceClient
-	wake        chan struct{}
-	retry       time.Duration
-	savePrivate func(string, string, any) error
-	running     map[string]*textServiceRuntime
-	runProfile  func(context.Context, string, textbridge.Profile, textbridge.Ledger, textbridge.RuntimeConfig) error
-	connect     func(context.Context, sdk.Config) (textbridge.RuntimeConnection, error)
-	newProvider func(provider.Config) (textbridge.Provider, error)
-	proofRetry  time.Duration
+	daemon        *Daemon
+	mu            sync.Mutex
+	controlMu     sync.Mutex
+	client        *textServiceClient
+	wake          chan struct{}
+	retry         time.Duration
+	savePrivate   func(string, string, any) error
+	running       map[string]*textServiceRuntime
+	runProfile    func(context.Context, string, textbridge.Profile, textbridge.Ledger, textbridge.RuntimeConfig) error
+	connect       func(context.Context, sdk.Config) (textbridge.RuntimeConnection, error)
+	newProvider   func(provider.Config) (textbridge.Provider, error)
+	proofRetry    time.Duration
+	disableLedger func(*ledger.Store) error
 }
 
 func newTextServiceSupervisor(d *Daemon) *textServiceSupervisor {
-	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, proofRetry: time.Second}
+	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, proofRetry: time.Second, disableLedger: func(store *ledger.Store) error { return store.SetEnabled(context.Background(), false) }}
 }
 func (s *textServiceSupervisor) signal() {
 	select {
@@ -308,7 +310,10 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		return nil
 	}
 	r := p.Registration
-	if r == nil || p.Disabled || r.DesiredState == "disabled" {
+	if r == nil {
+		return nil
+	}
+	if v.DesiredState != "disabled" && (p.Disabled || r.DesiredState == "disabled") {
 		return nil
 	}
 	if r.Pending {
@@ -319,6 +324,12 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	}
 	store, e := textbridge.OpenProfileLedger(dir, p)
 	if e != nil {
+		if v.DesiredState == "disabled" {
+			p.Disabled = true
+			r.DesiredState = "disabled"
+			r.Generation = v.Generation
+			return errors.Join(e, s.savePrivate(dir, "profile.json", p))
+		}
 		return nil
 	}
 	defer func() {
@@ -331,20 +342,15 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		retained, err = s.startRuntime(ctx, c, dir, p, store, unlock, a)
 		return err
 	}
+	// An authoritative disable must repair both durable flags even if a
+	// previous partial write already closed one of the local dispatch gates.
+	if v.DesiredState == "disabled" {
+		r.Generation = v.Generation
+		return s.disableProfile(dir, p, store)
+	}
 	budget, e := store.BudgetSnapshot(ctx)
 	if e != nil {
 		return e
-	}
-	if v.DesiredState == "disabled" {
-		p.Disabled = true
-		p.Registration.DesiredState = "disabled"
-		p.Registration.Generation = v.Generation
-		ledgerErr := store.SetEnabled(context.Background(), false)
-		profileErr := textbridge.SaveProfile(dir, p)
-		if ledgerErr != nil {
-			return ledgerErr
-		}
-		return profileErr
 	}
 	if !budget.Enabled {
 		return nil

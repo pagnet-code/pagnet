@@ -18,6 +18,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
+	"github.com/pagnet-code/pagnet/sdk"
 	"gopkg.in/yaml.v3"
 )
 
@@ -466,6 +467,46 @@ func TestTextBridgeRegisterEncodedServerPaths(t *testing.T) {
 						t.Fatal("encoded separator accepted as enrollment server")
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestTextBridgeRunBlocksPartialRemoteDisable(t *testing.T) {
+	for _, state := range []string{"profile only", "ledger only", "both"} {
+		t.Run(state, func(t *testing.T) {
+			f := newRegisterFixture(t)
+			p := f.p
+			p.Registration = &textbridge.ProfileRegistration{InstallationID: registerTestTenant, HostID: registerTestHost, Role: "responder", ProfileVersion: 1, TenantID: registerTestTenant, OwnerUserID: registerTestOwner, Generation: 1, DesiredState: "enabled"}
+			if state != "ledger only" {
+				p.Disabled = true
+				p.Registration.DesiredState = "disabled"
+			}
+			f.save(t, p)
+			if state != "profile only" {
+				store, err := textbridge.OpenProfileLedger(f.dir, p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = store.SetEnabled(context.Background(), false); err != nil {
+					t.Fatal(err)
+				}
+				store.Close()
+			}
+			if err := os.WriteFile(p.KeyFile, []byte("provider-secret"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.deps.provider = func(provider.Config) (textbridge.Provider, error) {
+				t.Fatal("partial disable initialized provider")
+				return nil, errors.New("unexpected provider")
+			}
+			f.deps.connect = func(context.Context, sdk.Config) (textBridgeConnection, error) {
+				t.Fatal("partial disable connected SDK")
+				return nil, errors.New("unexpected SDK")
+			}
+			_, err := textBridgeExecute(t, f.deps, "run", "--service", p.Service, "--state-dir", f.state)
+			if err == nil || !strings.Contains(err.Error(), "text bridge is disabled") {
+				t.Fatal("partial durable disable allowed standalone run")
 			}
 		})
 	}
