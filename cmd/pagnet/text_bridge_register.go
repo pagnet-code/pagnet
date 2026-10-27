@@ -45,8 +45,11 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 	if deps.registrationAuthenticate == nil {
 		deps.registrationAuthenticate = authenticateCLI
 	}
-	var service, role string
+	var service, role, projectContract string
 	cmd := &cobra.Command{Use: "register", Short: "Register an enabled local text service on the enrolled host", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		if err := textBridgeValidateProjectContract(projectContract); err != nil {
+			return err
+		}
 		dir, err := textbridge.ProfileDirectoryForRole(*stateDir, service, role)
 		if err != nil {
 			return err
@@ -59,6 +62,9 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 		p, err := textbridge.LoadProfile(dir, service)
 		if err != nil {
 			return err
+		}
+		if cmd.Flags().Changed("project-contract") && projectContract != p.ProjectContractName() {
+			return errors.New("saved project contract cannot change; create a separate profile and store")
 		}
 		if p.ServiceRole() != role {
 			return errors.New("saved text bridge role does not match --role")
@@ -158,6 +164,7 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 		fmt.Fprintf(cmd.OutOrStdout(), "service %s installation %s host %s: %s; pending daemon verification\n", p.Service, r.InstallationID, r.HostID, r.DesiredState)
 		return nil
 	}}
+	cmd.Flags().StringVar(&projectContract, "project-contract", textbridge.SharingProjectContract, "verify saved contract: sdk_project_v2 or owner_text_project_v1")
 	cmd.Flags().StringVar(&service, "service", "", "existing local service UUID")
 	cmd.Flags().StringVar(&role, "role", "responder", "local service role: responder or sender")
 	return cmd

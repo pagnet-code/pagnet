@@ -77,8 +77,11 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		}
 	}
 	cmd := &cobra.Command{Use: "sender", Short: "Send text from a separate personal service", Args: cobra.NoArgs}
-	var name string
+	var name, projectContract string
 	create := &cobra.Command{Use: "create", Short: "Create a sender service and private local profile", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) (retErr error) {
+		if err := textBridgeValidateProjectContract(projectContract); err != nil {
+			return err
+		}
 		if strings.TrimSpace(name) == "" {
 			return errors.New("--name is required")
 		}
@@ -114,6 +117,9 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			}
 		}()
 		p := textBridgeSenderProfile{Role: "sender", Service: created.ID, Server: owner.base, Credential: created.Credential}
+		if cmd.Flags().Changed("project-contract") {
+			p.ProjectContract = projectContract
+		}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created sender has invalid connection configuration")
 		}
@@ -129,7 +135,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		if _, err := os.Lstat(filepath.Join(dir, "profile.json")); !errors.Is(err, os.ErrNotExist) {
 			return errors.New("sender profile already exists or cannot be inspected")
 		}
-		store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+		store, err := sender.Open(filepath.Join(dir, "operations"), p.SenderBinding())
 		if err != nil {
 			return err
 		}
@@ -142,6 +148,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), p.Service)
 		return err
 	}}
+	create.Flags().StringVar(&projectContract, "project-contract", textbridge.SharingProjectContract, "project contract: sdk_project_v2 or owner_text_project_v1")
 	create.Flags().StringVar(&name, "name", "", "personal sender service name")
 	cmd.AddCommand(create)
 	for _, action := range []string{"ask", "resume", "result"} {
@@ -187,6 +194,9 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if p.Registration != nil {
 				return managed()
 			}
+			if p.ProjectContract == textbridge.OwnerTextProjectContract && action != "result" {
+				return errors.New("owner project sender requires confirmed managed installation registration")
+			}
 			unlock, err := textbridge.LockProfile(dir)
 			if err != nil {
 				return err
@@ -202,6 +212,10 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				unlock()
 				return managed()
 			}
+			if p.ProjectContract == textbridge.OwnerTextProjectContract && action != "result" {
+				unlock()
+				return errors.New("owner project sender requires confirmed managed installation registration")
+			}
 			defer unlock()
 			if action != "result" && p.Disabled {
 				return errors.New("sender is disabled")
@@ -210,7 +224,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if _, err := textbridge.ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
 				return errors.New("saved sender operation state is missing or inaccessible")
 			}
-			store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+			store, err := sender.Open(filepath.Join(dir, "operations"), p.SenderBinding())
 			if err != nil {
 				return err
 			}

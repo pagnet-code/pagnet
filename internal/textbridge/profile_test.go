@@ -400,3 +400,41 @@ func TestSenderProfileCompatibilityAndProviderRejection(t *testing.T) {
 		}
 	}
 }
+
+func TestProfileExplicitProjectContract(t *testing.T) {
+	for _, contract := range []string{"", SharingProjectContract, OwnerTextProjectContract, "unknown"} {
+		t.Run(contract, func(t *testing.T) {
+			_, dir, p := savedTestProfile(t)
+			p.ProjectContract = contract
+			if err := SaveProfile(dir, p); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadProfile(dir, p.Service)
+			if contract == "unknown" {
+				if err == nil {
+					t.Fatal("unknown contract loaded")
+				}
+				return
+			}
+			if err != nil || loaded.ProjectContract != contract {
+				t.Fatal("contract not preserved")
+			}
+			if contract == OwnerTextProjectContract {
+				if loaded.validateProjectContract() == nil {
+					t.Fatal("unregistered owner profile allowed runtime startup")
+				}
+				registration := testProfileRegistration()
+				loaded.Registration = &registration
+				if err := SaveProfile(dir, loaded); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := LoadProfile(dir, p.Service); err != nil {
+					t.Fatal("pending registration cannot be loaded for retry")
+				}
+				if loaded.validateProjectContract() == nil {
+					t.Fatal("pending owner registration allowed runtime startup")
+				}
+			}
+		})
+	}
+}

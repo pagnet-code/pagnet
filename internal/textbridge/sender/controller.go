@@ -255,13 +255,22 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.mu.Unlock()
 		c.Wake()
 	})
+	enrolled := false
+	if enrollment, ok := c.conn.(interface{ EnrollProjects(context.Context) error }); ok {
+		if err := enrollment.EnrollProjects(ctx); err != nil {
+			return err
+		}
+		enrolled = true
+	}
 	c.mu.Lock()
 	c.live, c.runContext = true, ctx
 	c.mu.Unlock()
 	if c.config.OnReady != nil {
 		cleanup = c.config.OnReady(c)
 	}
-	c.conn.EnableSharingProjects()
+	if !enrolled {
+		c.conn.EnableSharingProjects()
+	}
 	c.Wake()
 	conn := controllerConnection{Connection: c.conn, controller: c, ctx: ctx}
 	var timer *time.Timer

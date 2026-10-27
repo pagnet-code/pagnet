@@ -42,6 +42,12 @@ type RuntimeConfig struct {
 // its SDK connection and joins its worker before returning. It does not install
 // process signal handlers or close the caller's ledger.
 func RunProfile(parent context.Context, dir string, p Profile, store Ledger, config RuntimeConfig) error {
+	if err := p.validateProjectContract(); err != nil {
+		return err
+	}
+	if p.ProjectContract == OwnerTextProjectContract && (p.ServiceRole() != "responder" || config.Authorize == nil) {
+		return errors.New("owner responder requires installation authorization")
+	}
 	key, err := ReadProviderKey(p.KeyFile)
 	if err != nil {
 		return err
@@ -86,8 +92,12 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 		}
 	}()
 	identity, err := conn.WhoAmI(ctx)
-	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != p.Service {
+	if err != nil || !ownerIdentityMatches(p, identity) {
 		return errors.New("text bridge authenticated identity does not match saved service")
+	}
+	endpoint, endpointDone, err := ownerEndpointSession(conn, p)
+	if err != nil {
+		return err
 	}
 	if config.Authorize != nil {
 		if err := config.Authorize(ctx, conn); err != nil {
@@ -102,17 +112,37 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 		return errors.New("text bridge service connection terminated")
 	default:
 	}
+	adapter, err := selectOwnerProjectAdapter(ctx, conn, p, identity, endpoint, endpointDone)
+	if err != nil {
+		return err
+	}
+	var projectTransport Transport = conn
+	var callbacks interface {
+		OnSharingProjectMessage(func(context.Context, sdk.SharingProjectMessage) error)
+		OnSharingProjectReady(func(string))
+	} = conn
+	projectDone := conn.Done()
+	if adapter != nil {
+		projectTransport = adapter
+		callbacks = adapter
+		projectDone = adapter.Done()
+	}
 	enabled := func(project string) bool {
 		select {
-		case <-conn.Done():
+		case <-projectDone:
 			return false
 		default:
 		}
-		return ctx.Err() == nil && config.Enabled != nil && config.Enabled(project)
+		return ctx.Err() == nil && config.Enabled != nil && config.Enabled(project) && (adapter == nil || adapter.Ready(project))
 	}
-	b := New(store, conn, client, Config{ProviderConfigFingerprint: p.Fingerprint, Enabled: enabled, OnError: config.OnError})
-	conn.OnSharingProjectMessage(b.HandleMessage)
-	conn.OnSharingProjectReady(func(string) { b.Wake() })
+	b := New(store, projectTransport, client, Config{ProviderConfigFingerprint: p.Fingerprint, Enabled: enabled, OnError: config.OnError, DeferMessageWake: adapter != nil})
+	callbacks.OnSharingProjectMessage(b.HandleMessage)
+	callbacks.OnSharingProjectReady(func(string) { b.Wake() })
+	if adapter != nil {
+		if err := adapter.EnrollProjects(ctx); err != nil {
+			return err
+		}
+	}
 	worker := make(chan error, 1)
 	go func() { worker <- b.Run(ctx) }()
 	select {
@@ -121,7 +151,7 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 			return nil
 		}
 		return err
-	case <-conn.Done():
+	case <-projectDone:
 		cancel()
 		<-worker
 		if conn.Err() != nil {

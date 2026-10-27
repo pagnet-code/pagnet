@@ -46,9 +46,12 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 	cmd.PersistentFlags().StringVar(&stateDir, "state-dir", "", "private local state directory (default ~/.pagnet)")
 	cmd.AddCommand(textBridgeRegisterCmd(&stateDir, deps))
 	cmd.AddCommand(textBridgeSenderCmd(&stateDir, textBridgeSenderDependencies{owner: deps.owner, connect: deps.senderConnect}))
-	var name, origin, model, keyFile string
+	var name, origin, model, keyFile, projectContract string
 	var calls int64
 	enable := &cobra.Command{Use: "enable", Args: cobra.NoArgs, Short: "Create a service and save its private local responder profile", RunE: func(cmd *cobra.Command, _ []string) (retErr error) {
+		if err := textBridgeValidateProjectContract(projectContract); err != nil {
+			return err
+		}
 		if strings.TrimSpace(name) == "" || calls <= 0 || keyFile == "" {
 			return errors.New("--name, --provider-origin, --model, --key-file and positive --calls-per-day are required")
 		}
@@ -93,6 +96,9 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 			}
 		}()
 		p := textbridge.Profile{Service: created.ID, Server: owner.base, Credential: created.Credential, ProviderOrigin: origin, Model: model, KeyFile: keyPath, Fingerprint: textbridge.ProviderFingerprint(config), Limits: ledger.Limits{CallsPerDay: calls, MaxConcurrent: 1}}
+		if cmd.Flags().Changed("project-contract") {
+			p.ProjectContract = projectContract
+		}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created service has invalid connection configuration; inspect Services")
 		}
@@ -108,7 +114,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		if _, err := os.Lstat(filepath.Join(dir, "profile.json")); !errors.Is(err, os.ErrNotExist) {
 			return errors.New("service profile already exists or cannot be inspected")
 		}
-		store, err := ledger.Open(filepath.Join(dir, "ledger"), ledger.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service}, p.Limits)
+		store, err := ledger.Open(filepath.Join(dir, "ledger"), p.LedgerBinding(), p.Limits)
 		if err != nil {
 			return err
 		}
@@ -121,6 +127,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 		fmt.Fprintln(cmd.OutOrStdout(), p.Service)
 		return nil
 	}}
+	enable.Flags().StringVar(&projectContract, "project-contract", textbridge.SharingProjectContract, "project contract: sdk_project_v2 or owner_text_project_v1")
 	enable.Flags().StringVar(&name, "name", "", "service name")
 	enable.Flags().StringVar(&origin, "provider-origin", "", "owner-selected provider origin")
 	enable.Flags().StringVar(&model, "model", "", "fixed provider model")
@@ -232,4 +239,11 @@ func textBridgeReportError(stderr io.Writer, err error) {
 		message = "text bridge provider dispatch is disabled"
 	}
 	fmt.Fprintln(stderr, message)
+}
+
+func textBridgeValidateProjectContract(contract string) error {
+	if contract != textbridge.SharingProjectContract && contract != textbridge.OwnerTextProjectContract {
+		return errors.New("--project-contract must be sdk_project_v2 or owner_text_project_v1")
+	}
+	return nil
 }

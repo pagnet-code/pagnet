@@ -23,6 +23,7 @@ import (
 // Profiles bind a single service to immutable provider policy. There is no
 // re-enable operation: disabled profiles cannot revive previously queued work.
 type Profile struct {
+	ProjectContract                             string `json:",omitempty"`
 	Role                                        string `json:",omitempty"`
 	Service, Server, Credential                 string
 	ProviderOrigin, Model, KeyFile, Fingerprint string
@@ -116,7 +117,7 @@ func LoadProfile(dir, service string) (Profile, error) {
 		p.Role = "sender"
 	}
 	role := p.ServiceRole()
-	if (role != "sender" && role != "responder") || (p.Registration != nil && p.Registration.Role != role) {
+	if (role != "sender" && role != "responder") || (p.Registration != nil && p.Registration.Role != role) || p.validateProjectContractName() != nil {
 		return p, errors.New("invalid local text bridge role")
 	}
 	if role == "sender" {
@@ -215,7 +216,7 @@ func OpenProfileLedger(dir string, p Profile) (*ledger.Store, error) {
 	if _, err := os.Lstat(filepath.Join(dir, "ledger", "ledger.sqlite")); err != nil {
 		return nil, errors.New("saved text bridge ledger is missing or inaccessible")
 	}
-	return ledger.Open(filepath.Join(dir, "ledger"), ledger.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service}, p.Limits)
+	return ledger.Open(filepath.Join(dir, "ledger"), p.LedgerBinding(), p.Limits)
 }
 
 // ProfileStatus is the owner-safe local status view. It deliberately contains
@@ -282,5 +283,43 @@ func OpenSenderStore(dir string, p Profile) (*sender.Store, error) {
 	if _, err := ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
 		return nil, errors.New("saved sender operation state is missing or inaccessible")
 	}
-	return sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+	return sender.Open(filepath.Join(dir, "operations"), p.SenderBinding())
+}
+
+const OwnerTextProjectContract = "owner_text_project_v1"
+const SharingProjectContract = "sdk_project_v2"
+
+func (p Profile) validateProjectContractName() error {
+	if p.ProjectContract != "" && p.ProjectContract != SharingProjectContract && p.ProjectContract != OwnerTextProjectContract {
+		return errors.New("unknown text bridge project contract")
+	}
+	return nil
+}
+func (p Profile) ProjectContractName() string {
+	if p.ProjectContract == "" {
+		return SharingProjectContract
+	}
+	return p.ProjectContract
+}
+func (p Profile) validateProjectContract() error {
+	if err := p.validateProjectContractName(); err != nil {
+		return err
+	}
+	if p.ProjectContract == "" || p.ProjectContract == SharingProjectContract {
+		return nil
+	}
+	if p.ProjectContract != OwnerTextProjectContract {
+		return errors.New("unknown text bridge project contract")
+	}
+	r := p.Registration
+	if r == nil || !r.valid() || r.Pending || r.DesiredState != "enabled" || r.Role != p.ServiceRole() {
+		return errors.New("owner project requires confirmed enabled installation registration")
+	}
+	return nil
+}
+func (p Profile) LedgerBinding() ledger.Binding {
+	return ledger.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service, ProjectContract: p.ProjectContract}
+}
+func (p Profile) SenderBinding() sender.Binding {
+	return sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service, ProjectContract: p.ProjectContract}
 }

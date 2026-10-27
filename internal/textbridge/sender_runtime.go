@@ -14,6 +14,9 @@ import (
 // or transport termination. The caller owns the sender store and profile lock.
 // Authorize must prove the pinned installation before handlers or work begin.
 func RunSenderProfile(parent context.Context, dir string, p Profile, store *sender.Store, config RuntimeConfig) error {
+	if err := p.validateProjectContract(); err != nil {
+		return err
+	}
 	if p.ServiceRole() != "sender" || p.Disabled || config.Authorize == nil {
 		return errors.New("enabled managed sender profile and authorization required")
 	}
@@ -49,8 +52,12 @@ func RunSenderProfile(parent context.Context, dir string, p Profile, store *send
 		}
 	}()
 	identity, err := conn.WhoAmI(ctx)
-	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != p.Service {
+	if err != nil || !ownerIdentityMatches(p, identity) {
 		return errors.New("sender authenticated identity does not match saved service")
+	}
+	endpoint, endpointDone, err := ownerEndpointSession(conn, p)
+	if err != nil {
+		return err
 	}
 	if err := config.Authorize(ctx, conn); err != nil {
 		return err
@@ -58,9 +65,19 @@ func RunSenderProfile(parent context.Context, dir string, p Profile, store *send
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	senderConn, ok := conn.(sender.Connection)
-	if !ok {
-		return errors.New("SDK connection does not support sender operations")
+	adapter, err := selectOwnerProjectAdapter(ctx, conn, p, identity, endpoint, endpointDone)
+	if err != nil {
+		return err
+	}
+	var senderConn sender.Connection
+	if adapter != nil {
+		senderConn = adapter
+	} else {
+		var ok bool
+		senderConn, ok = conn.(sender.Connection)
+		if !ok {
+			return errors.New("SDK connection does not support sender operations")
+		}
 	}
 	controller := sender.NewController(store, senderConn, p.Service, sender.ControllerConfig{Enabled: config.Enabled, OnError: config.OnError, OnReady: config.OnSenderReady})
 	return controller.Run(ctx)

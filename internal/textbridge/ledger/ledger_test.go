@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -18,7 +19,9 @@ import (
 
 var ctx = context.Background()
 
-func binding() Binding { return Binding{"https://EXAMPLE.com:443/", "principal"} }
+func binding() Binding {
+	return Binding{ServiceOrigin: "https://EXAMPLE.com:443/", PrincipalID: "principal"}
+}
 func data() Data {
 	wire := []byte("original ASK wire\n")
 	digest := sha256.Sum256(wire)
@@ -77,7 +80,7 @@ func TestPermissionsBindingAndPersistence(t *testing.T) {
 	if e != nil || string(got.Data.Input) != "private input" || got.Revision != 1 {
 		t.Fatalf("restart: %+v %v", got, e)
 	}
-	for _, b := range []Binding{{"https://other.example", "principal"}, {"https://example.com", "other"}} {
+	for _, b := range []Binding{{ServiceOrigin: "https://other.example", PrincipalID: "principal"}, {ServiceOrigin: "https://example.com", PrincipalID: "other"}} {
 		if other, e := Open(dir, b, Limits{CallsPerDay: 100, MaxConcurrent: 100}); e == nil {
 			other.Close()
 			t.Fatal("binding mismatch accepted")
@@ -568,5 +571,47 @@ func TestPragmasAndMissingJob(t *testing.T) {
 	}
 	if _, e := s.Get(ctx, "none", "none"); !errors.Is(e, sql.ErrNoRows) {
 		t.Fatal(e)
+	}
+}
+
+func TestLedgerProjectContractBinding(t *testing.T) {
+	legacy := binding()
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("ProjectContract")) {
+		t.Fatal("legacy binding JSON/AAD changed")
+	}
+	for _, contract := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+		t.Run(contract, func(t *testing.T) {
+			dir := t.TempDir()
+			b := legacy
+			b.ProjectContract = contract
+			store, err := Open(dir, b, Limits{CallsPerDay: 2, MaxConcurrent: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+			for _, other := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+				candidate := legacy
+				candidate.ProjectContract = other
+				reopened, err := Open(dir, candidate, Limits{CallsPerDay: 2, MaxConcurrent: 1})
+				if other == contract {
+					if err != nil {
+						t.Fatal(err)
+					}
+					reopened.Close()
+				} else if err == nil {
+					reopened.Close()
+					t.Fatal("cross-contract ledger opened")
+				}
+			}
+		})
+	}
+	unknown := legacy
+	unknown.ProjectContract = "unknown"
+	if _, err := Open(t.TempDir(), unknown, Limits{CallsPerDay: 2, MaxConcurrent: 1}); err == nil {
+		t.Fatal("unknown contract accepted")
 	}
 }

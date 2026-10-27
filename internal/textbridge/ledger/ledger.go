@@ -44,8 +44,9 @@ var (
 )
 
 type Binding struct {
-	ServiceOrigin string
-	PrincipalID   string
+	ServiceOrigin   string
+	PrincipalID     string
+	ProjectContract string `json:",omitempty"`
 }
 
 // Data contains previously validated protocol data. Header and Receipt retain
@@ -86,6 +87,9 @@ type aad struct {
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	if b.ProjectContract != "" && b.ProjectContract != "sdk_project_v2" && b.ProjectContract != "owner_text_project_v1" {
+		return b, ErrInvalid
+	}
 	u, err := url.Parse(b.ServiceOrigin)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || strings.TrimSpace(b.PrincipalID) == "" {
 		return b, ErrInvalid

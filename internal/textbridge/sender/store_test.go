@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -399,5 +400,47 @@ func TestReserveWithIDIsIdempotentAndGloballyBound(t *testing.T) {
 	}
 	if _, err := s.ReserveWithID(ctx, project, recipient, o.AskID, "prompt"); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("repeat bypassed durable gate: %v", err)
+	}
+}
+
+func TestStoreProjectContractBinding(t *testing.T) {
+	legacy := binding()
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("ProjectContract")) {
+		t.Fatal("legacy binding JSON/AAD changed")
+	}
+	for _, contract := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+		t.Run(contract, func(t *testing.T) {
+			dir := t.TempDir()
+			b := legacy
+			b.ProjectContract = contract
+			store, err := Open(dir, b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+			for _, other := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+				candidate := legacy
+				candidate.ProjectContract = other
+				reopened, err := Open(dir, candidate)
+				if other == contract {
+					if err != nil {
+						t.Fatal(err)
+					}
+					reopened.Close()
+				} else if err == nil {
+					reopened.Close()
+					t.Fatal("cross-contract store opened")
+				}
+			}
+		})
+	}
+	unknown := legacy
+	unknown.ProjectContract = "unknown"
+	if _, err := Open(t.TempDir(), unknown); err == nil {
+		t.Fatal("unknown contract accepted")
 	}
 }

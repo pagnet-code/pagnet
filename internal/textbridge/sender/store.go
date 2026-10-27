@@ -51,8 +51,9 @@ var (
 )
 
 type Binding struct {
-	ServiceOrigin string
-	PrincipalID   string
+	ServiceOrigin   string
+	PrincipalID     string
+	ProjectContract string `json:",omitempty"`
 }
 
 // Operation deliberately excludes the recoverable prompt. Reserved operations
@@ -108,6 +109,9 @@ func validID(id string, v7 bool) bool {
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	if b.ProjectContract != "" && b.ProjectContract != "sdk_project_v2" && b.ProjectContract != "owner_text_project_v1" {
+		return b, ErrInvalid
+	}
 	u, err := url.Parse(b.ServiceOrigin)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || !validID(b.PrincipalID, false) {
 		return b, ErrInvalid
