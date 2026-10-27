@@ -19,6 +19,7 @@ type controllerEndpoint struct {
 	wires                     map[string]sdk.PreparedSharingProjectMessage
 	receipts                  map[string]sdk.SharingProjectMessageReceipt
 	prepares, sends, statuses int
+	sendErr                   error
 	uncertain                 bool
 	ready                     func(string)
 	message                   func(context.Context, sdk.SharingProjectMessage) error
@@ -67,6 +68,9 @@ func (f *controllerEndpoint) SendPreparedSharingProjectMessage(_ context.Context
 	defer f.mu.Unlock()
 	f.sends++
 	f.sent <- id
+	if f.sendErr != nil {
+		return sdk.SharingProjectMessageReceipt{}, f.sendErr
+	}
 	if f.uncertain {
 		return sdk.SharingProjectMessageReceipt{}, errors.New("uncertain admission")
 	}
@@ -209,5 +213,178 @@ func TestControllerAndStoreDisableFenceDispatch(t *testing.T) {
 	}
 	if _, err := Reconcile(ctx, f, reopened, o); !errors.Is(err, ErrDisabled) {
 		t.Fatal("standalone engine bypassed disable", err)
+	}
+}
+
+func TestControllerRetriesTransientAdmissionWithoutWake(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	o := reserveTest(t, s)
+	f := newControllerEndpoint()
+	f.uncertain = true
+	c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }})
+	c.retryDelay = time.Millisecond
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(runCtx) }()
+	defer func() { cancel(); <-done }()
+	if id := controllerAwait(t, f.sent); id != o.AskID {
+		t.Fatal("changed ASK")
+	}
+	f.mu.Lock()
+	wire := string(f.wires[o.AskID].Wire)
+	f.uncertain = false
+	f.mu.Unlock()
+	if id := controllerAwait(t, f.sent); id != o.AskID {
+		t.Fatal("retry replaced ASK")
+	}
+	time.Sleep(50 * time.Millisecond)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.prepares != 1 || f.sends != 2 || string(f.wires[o.AskID].Wire) != wire {
+		t.Fatal("retry regenerated ciphertext or polled after admission")
+	}
+	got, err := s.Get(ctx, project, o.AskID)
+	if err != nil || got.Phase != Admitted {
+		t.Fatalf("transient admission unresolved: %+v %v", got, err)
+	}
+}
+
+type receiptFailureEndpoint struct {
+	*controllerEndpoint
+	calls atomic.Int32
+}
+
+func (f *receiptFailureEndpoint) SharingProjectMessageReceipt(ctx context.Context, project, id string) (sdk.SharingProjectMessageReceipt, error) {
+	if f.calls.Add(1) <= 2 {
+		return sdk.SharingProjectMessageReceipt{}, errors.New("temporary receipt read failure")
+	}
+	return f.controllerEndpoint.SharingProjectMessageReceipt(ctx, project, id)
+}
+
+// Receipt evidence must recover before project readiness, even after the SDK
+// retired ciphertext. Successful recovery leaves no outstanding retry timer.
+func (f *receiptFailureEndpoint) EnableSharingProjects() { close(f.started) }
+func TestControllerRetriesTransientReceiptWithoutReadiness(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	o := reserveTest(t, s)
+	o, err := s.MarkPreparing(ctx, project, o.AskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := preparedFor(o)
+	o, err = s.MarkPrepared(ctx, project, o.AskID, prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(prepared.Wire)
+	f := &receiptFailureEndpoint{controllerEndpoint: newControllerEndpoint()}
+	f.receipts[o.AskID] = sdk.SharingProjectMessageReceipt{MessageID: o.AskID, RequestDigest: sum[:], AdmissionSeq: 1, CreatedAt: time.Now().UTC(), Status: "pending"}
+	c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }})
+	c.retryDelay = time.Millisecond
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(runCtx) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(time.Second)
+	for f.calls.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if f.calls.Load() != 3 {
+		t.Fatal("receipt recovery lost bounded retry or polled while idle", f.calls.Load())
+	}
+	got, err := s.Get(ctx, project, o.AskID)
+	if err != nil || got.Phase != Admitted {
+		t.Fatalf("receipt recovery: %+v %v", got, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.prepares != 0 || f.sends != 0 {
+		t.Fatal("receipt retry prepared or resent retired ciphertext")
+	}
+}
+
+func TestControllerRetriesLongOutageAndStopsForAmbiguousPreparation(t *testing.T) {
+	for _, preparing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "outage beyond five attempts", true: "missing ciphertext"}[preparing], func(t *testing.T) {
+			s, _ := openTest(t)
+			defer s.Close()
+			o := reserveTest(t, s)
+			if preparing {
+				if _, err := s.MarkPreparing(ctx, project, o.AskID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f := newControllerEndpoint()
+			f.uncertain = true
+			c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }})
+			c.retryDelay, c.retryMaxDelay = time.Millisecond, 2*time.Millisecond
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- c.Run(runCtx) }()
+			defer func() { cancel(); <-done }()
+			if preparing {
+				<-f.started
+				time.Sleep(60 * time.Millisecond)
+			} else {
+				for range 7 {
+					if id := controllerAwait(t, f.sent); id != o.AskID {
+						t.Fatal("retry changed ASK")
+					}
+				}
+				f.mu.Lock()
+				f.uncertain = false
+				f.mu.Unlock()
+				if id := controllerAwait(t, f.sent); id != o.AskID {
+					t.Fatal("recovery changed ASK")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			f.mu.Lock()
+			sends, prepares, statuses := f.sends, f.prepares, f.statuses
+			f.mu.Unlock()
+			if preparing {
+				if sends != 0 || prepares != 0 || statuses != 1 {
+					t.Fatal("ambiguous preparation retried or regenerated", sends, prepares, statuses)
+				}
+			} else if sends != 8 || prepares != 1 {
+				t.Fatal("long outage recovery stopped or polled after admission", sends, prepares)
+			}
+		})
+	}
+}
+
+func TestControllerStopsRetryOnDisableOrTerminalAdmission(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "disabled", true: "terminal credential"}[terminal], func(t *testing.T) {
+			s, _ := openTest(t)
+			defer s.Close()
+			reserveTest(t, s)
+			f := newControllerEndpoint()
+			f.uncertain = true
+			if terminal {
+				f.sendErr = sdk.ErrCredentialDead
+			}
+			var enabled atomic.Bool
+			enabled.Store(true)
+			c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return enabled.Load() }})
+			c.retryDelay, c.retryMaxDelay = time.Millisecond, 2*time.Millisecond
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- c.Run(runCtx) }()
+			defer func() { cancel(); <-done }()
+			controllerAwait(t, f.sent)
+			if !terminal {
+				enabled.Store(false)
+			}
+			time.Sleep(60 * time.Millisecond)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.sends != 1 || f.prepares != 1 {
+				t.Fatal("disabled or terminal sender kept retrying", f.sends, f.prepares)
+			}
+		})
 	}
 }

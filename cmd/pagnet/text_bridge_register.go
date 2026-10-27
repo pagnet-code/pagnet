@@ -126,7 +126,11 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 			return errors.New("registration pending state could not be saved; no registration request was sent")
 		}
 		installation, err := textBridgePutInstallation(cmd.Context(), server, owner.token, p)
-		retry := fmt.Sprintf("installation %s registration unconfirmed; retry pagnet text-bridge register --service %s to reconcile; pending daemon verification", p.Registration.InstallationID, p.Service)
+		retryRole := ""
+		if role == "sender" {
+			retryRole = " --role sender"
+		}
+		retry := fmt.Sprintf("installation %s registration unconfirmed; retry pagnet text-bridge register --service %s%s to reconcile; pending daemon verification", p.Registration.InstallationID, p.Service, retryRole)
 		if err != nil {
 			return errors.New(retry)
 		}

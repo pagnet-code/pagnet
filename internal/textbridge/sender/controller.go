@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pagnet-code/pagnet/sdk"
 )
@@ -21,18 +22,20 @@ type ControllerConfig struct {
 // The caller owns the connection and holds the Store's external profile lock
 // until Run and all callers have joined. It installs the connection callbacks.
 type Controller struct {
-	store     *Store
-	conn      Connection
-	principal string
-	config    ControllerConfig
-	wake      chan struct{}
-	mu        sync.Mutex
-	ready     map[string]bool
-	running   atomic.Bool
+	store         *Store
+	conn          Connection
+	principal     string
+	config        ControllerConfig
+	wake          chan struct{}
+	mu            sync.Mutex
+	ready         map[string]bool
+	running       atomic.Bool
+	retryDelay    time.Duration
+	retryMaxDelay time.Duration
 }
 
 func NewController(store *Store, conn Connection, principal string, config ControllerConfig) *Controller {
-	return &Controller{store: store, conn: conn, principal: principal, config: config, wake: make(chan struct{}, 1), ready: make(map[string]bool)}
+	return &Controller{store: store, conn: conn, principal: principal, config: config, wake: make(chan struct{}, 1), retryDelay: time.Second, retryMaxDelay: 30 * time.Second, ready: make(map[string]bool)}
 }
 
 // Wake requests a recovery scan. Signals coalesce and never schedule idle polls.
@@ -73,7 +76,8 @@ func (c *Controller) HandleMessage(ctx context.Context, message sdk.SharingProje
 
 // Run recovers saved work at startup and on readiness or explicit wakes. The
 // caller must prove the pinned SDK installation before invoking Run. Per-ASK
-// failures remain durable and await a wake; one failure does not block other ASKs.
+// failures retain their durable identity. Transient outstanding work retries
+// with capped backoff; idle or ambiguous unspooled work has no timer.
 func (c *Controller) Run(ctx context.Context) error {
 	if !c.running.CompareAndSwap(false, true) {
 		return errors.New("sender controller already running")
@@ -93,6 +97,14 @@ func (c *Controller) Run(ctx context.Context) error {
 	c.conn.EnableSharingProjects()
 	c.Wake()
 	conn := controllerConnection{Connection: c.conn, controller: c, ctx: ctx}
+	var timer *time.Timer
+	var retry <-chan time.Time
+	delay := c.retryDelay
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -100,7 +112,14 @@ func (c *Controller) Run(ctx context.Context) error {
 		case <-c.conn.Done():
 			return errors.New("sender connection ended; saved ASKs remain recoverable")
 		case <-c.wake:
+			delay = c.retryDelay
+		case <-retry:
 		}
+		if timer != nil {
+			timer.Stop()
+		}
+		retry = nil
+		retryNeeded := false
 		operations, err := c.store.List(ctx, Reserved, Preparing, Prepared)
 		if err != nil {
 			return err
@@ -109,23 +128,38 @@ func (c *Controller) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			receiptRetry := false
 			// Historical admission evidence survives SDK ciphertext retirement and is
 			// reconciled even before this connection receives project readiness.
 			if o.Phase == Prepared {
-				if receipt, err := c.conn.SharingProjectMessageReceipt(ctx, o.ProjectID, o.AskID); err == nil {
+				receipt, receiptErr := c.conn.SharingProjectMessageReceipt(ctx, o.ProjectID, o.AskID)
+				if receiptErr == nil {
 					_, err = c.store.MarkAdmitted(ctx, o.ProjectID, o.AskID, receipt)
 					c.report(err)
 					continue
+				}
+				if retryableSDKError(receiptErr) {
+					c.report(receiptErr)
+					receiptRetry = true
 				}
 			}
 			c.mu.Lock()
 			ready := c.ready[o.ProjectID]
 			c.mu.Unlock()
 			if !ready || !conn.enabled(o.ProjectID) {
+				retryNeeded = retryNeeded || (receiptRetry && conn.enabled(o.ProjectID))
 				continue
 			}
 			_, err := Reconcile(ctx, conn, c.store, o)
 			c.report(err)
+			var transient retryableError
+			var terminal terminalError
+			retryNeeded = retryNeeded || (err != nil && conn.enabled(o.ProjectID) && !errors.As(err, &terminal) && (receiptRetry || errors.As(err, &transient)))
+		}
+		if retryNeeded {
+			timer = time.NewTimer(delay)
+			retry = timer.C
+			delay = min(delay*2, c.retryMaxDelay)
 		}
 	}
 }

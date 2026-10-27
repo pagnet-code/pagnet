@@ -567,3 +567,26 @@ func TestTextBridgeRegisterSenderWithoutProvider(t *testing.T) {
 		})
 	}
 }
+
+func TestTextBridgeRegisterSenderRetryGuidancePreservesRole(t *testing.T) {
+	f := newRegisterFixture(t)
+	dir, err := textbridge.ProfileDirectoryForRole(f.state, f.p.Service, "sender")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := textbridge.Profile{Role: "sender", Service: f.p.Service, Server: f.p.Server, Credential: f.p.Credential}
+	if err := textbridge.SaveProfile(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	f.dir, f.p = dir, p
+	f.respond = func(w http.ResponseWriter, _ *http.Request, _ textBridgeInstallation) { w.WriteHeader(500) }
+	_, err = textBridgeExecute(t, f.deps, "register", "--service", p.Service, "--role", "sender", "--state-dir", f.state)
+	if err == nil || !strings.Contains(err.Error(), "register --service "+p.Service+" --role sender") {
+		t.Fatal("sender retry command omitted role", err)
+	}
+}

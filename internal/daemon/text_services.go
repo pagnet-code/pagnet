@@ -149,10 +149,11 @@ type textServiceSupervisor struct {
 	newProvider   func(provider.Config) (textbridge.Provider, error)
 	proofRetry    time.Duration
 	disableLedger func(*ledger.Store) error
+	disableSender func(*sender.Store) error
 }
 
 func newTextServiceSupervisor(d *Daemon) *textServiceSupervisor {
-	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, runSender: textbridge.RunSenderProfile, proofRetry: time.Second, disableLedger: func(store *ledger.Store) error { return store.SetEnabled(context.Background(), false) }}
+	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, runSender: textbridge.RunSenderProfile, proofRetry: time.Second, disableSender: func(store *sender.Store) error { return store.Disable(context.Background()) }, disableLedger: func(store *ledger.Store) error { return store.SetEnabled(context.Background(), false) }}
 }
 func (s *textServiceSupervisor) signal() {
 	select {

@@ -164,8 +164,8 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 		if store != nil {
 			store.Close()
 		}
-		if senderStore != nil {
-			senderStore.Close()
+		if r.senderStore != nil {
+			r.senderStore.Close()
 		}
 		unlock()
 	}()
@@ -185,6 +185,22 @@ func (s *textServiceSupervisor) stopRuntime(r *textServiceRuntime, disable bool)
 	}
 	r.disable = r.disable || disable
 	if r.disable {
+		if r.profile.ServiceRole() == "sender" {
+			// Disable may have renamed state before its fsync failed, poisoning the
+			// handle. The controller is joined and the profile lock is still retained:
+			// reopen authenticated durable evidence on every attempt before retrying.
+			r.profile.Disabled = true
+			r.profile.Registration.DesiredState = "disabled"
+			if r.senderStore != nil {
+				r.senderStore.Close()
+				r.senderStore = nil
+			}
+			store, err := textbridge.OpenSenderStore(r.dir, r.profile)
+			if err != nil {
+				return errors.Join(err, s.savePrivate(r.dir, "profile.json", r.profile))
+			}
+			r.senderStore = store
+		}
 		if err := s.disableProfile(r.dir, r.profile, r.store, r.senderStore); err != nil {
 			return err
 		}
@@ -202,7 +218,7 @@ func (s *textServiceSupervisor) disableProfile(dir string, p textbridge.Profile,
 	p.Registration.DesiredState = "disabled"
 	var ledgerErr error
 	if senderStore != nil {
-		ledgerErr = senderStore.Disable(context.Background())
+		ledgerErr = s.disableSender(senderStore)
 	} else {
 		ledgerErr = s.disableLedger(store)
 	}

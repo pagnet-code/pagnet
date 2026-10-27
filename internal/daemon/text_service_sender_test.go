@@ -344,3 +344,76 @@ func TestTextServiceSenderRepairsPartialDisable(t *testing.T) {
 		})
 	}
 }
+
+func TestTextServiceSenderDisableReopensPoisonedStore(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("requires filesystem write permissions to be enforced")
+	}
+	f, state, o := senderLifecycle(t)
+	endpoint := f.start(t)
+	awaitSenderSend(t, state, o.AskID)
+	original := f.s.disableSender
+	var failed *sender.Store
+	calls := 0
+	f.s.disableSender = func(store *sender.Store) error {
+		calls++
+		if calls == 1 {
+			failed = store
+			operations := filepath.Join(f.dir, "operations")
+			if err := os.Chmod(operations, 0500); err != nil {
+				t.Fatal(err)
+			}
+			err := original(store)
+			if restoreErr := os.Chmod(operations, 0700); restoreErr != nil {
+				t.Fatal(restoreErr)
+			}
+			if err == nil {
+				t.Fatal("injected sender persist failure did not fail")
+			}
+			if _, loadErr := store.Enabled(context.Background()); !errors.Is(loadErr, sender.ErrInvalid) {
+				t.Fatal("persist failure did not poison handle", loadErr)
+			}
+			return err
+		}
+		if store == failed {
+			t.Fatal("retried disable on poisoned sender handle")
+		}
+		return original(store)
+	}
+	f.mu.Lock()
+	f.item.DesiredState = "disabled"
+	f.item.Generation++
+	f.mu.Unlock()
+	if err := f.s.reconcile(context.Background(), f.c); err == nil {
+		t.Fatal("disable disk failure ignored")
+	}
+	textAwait(t, endpoint.closed)
+	if unlock, err := textbridge.LockProfile(f.dir); err == nil {
+		unlock()
+		t.Fatal("failed disable released profile lock")
+	}
+	p, err := textbridge.LoadProfile(f.dir, f.profile.Service)
+	if err != nil || !p.Disabled || p.Registration.DesiredState != "disabled" {
+		t.Fatal("failed store disable lost profile gate", err)
+	}
+	if err := f.s.reconcile(context.Background(), f.c); err != nil {
+		t.Fatal("transient disable failure wedged recovery", err)
+	}
+	if unlock, err := textbridge.LockProfile(f.dir); err != nil {
+		t.Fatal("recovered disable retained profile lock", err)
+	} else {
+		unlock()
+	}
+	store, err := textbridge.OpenSenderStore(f.dir, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	enabled, err := store.Enabled(context.Background())
+	if err != nil || enabled {
+		t.Fatal("recovered sender disable not durable", err)
+	}
+	if calls < 2 {
+		t.Fatal("disable was not retried")
+	}
+}

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
 
 	"github.com/pagnet-code/pagnet/sdk"
 )
@@ -139,7 +141,14 @@ func Reconcile(ctx context.Context, conn Connection, store *Store, operation Ope
 		return operation, ErrDisabled
 	}
 	status, err := conn.SharingProjectStatus(ctx, operation.ProjectID)
-	if err != nil || status.ProjectID != operation.ProjectID || status.State != "active" || !status.EndpointProved {
+	if err != nil {
+		unavailable := errors.New("sender project is not ready; resume the saved ASK after enrollment")
+		if retryableSDKError(err) {
+			return operation, retryableError{unavailable}
+		}
+		return operation, terminalError{unavailable}
+	}
+	if status.ProjectID != operation.ProjectID || status.State != "active" || !status.EndpointProved {
 		return operation, errors.New("sender project is not ready; resume the saved ASK after enrollment")
 	}
 	var prepared sdk.PreparedSharingProjectMessage
@@ -160,7 +169,14 @@ func Reconcile(ctx context.Context, conn Connection, store *Store, operation Ope
 		prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
 	}
 	if err != nil {
-		return operation, errors.New("saved ASK has no recoverable prepared ciphertext; preparation outcome remains unresolved and must not be prepared again")
+		unresolved := errors.New("saved ASK has no recoverable prepared ciphertext; preparation outcome remains unresolved and must not be prepared again")
+		if retryableSDKError(err) {
+			return operation, retryableError{unresolved}
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return operation, terminalError{unresolved}
+		}
+		return operation, unresolved
 	}
 	operation, err = store.MarkPrepared(ctx, operation.ProjectID, operation.AskID, prepared)
 	if err != nil {
@@ -175,8 +191,35 @@ func Reconcile(ctx context.Context, conn Connection, store *Store, operation Ope
 		}
 		receipt, err = conn.SendPreparedSharingProjectMessage(ctx, operation.ProjectID, operation.AskID)
 		if err != nil {
-			return operation, errors.New("sender admission outcome unresolved; resume the same saved ASK")
+			if errors.Is(err, ErrDisabled) {
+				return operation, ErrDisabled
+			}
+			unresolved := errors.New("sender admission outcome unresolved; resume the same saved ASK")
+			if retryableSDKError(err) {
+				return operation, retryableError{unresolved}
+			}
+			return operation, terminalError{unresolved}
 		}
 	}
 	return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
+}
+
+// retryableError marks recovery that can reuse durable SDK evidence. Missing
+// ciphertext after ambiguous preparation is deliberately excluded.
+type retryableError struct{ error }
+
+func (e retryableError) Unwrap() error { return e.error }
+
+// terminalError suppresses receipt-recovery retries after explicit revocation,
+// abandonment or a permanent admission rejection.
+type terminalError struct{ error }
+
+func (e terminalError) Unwrap() error { return e.error }
+
+func retryableSDKError(err error) bool {
+	if err == nil || errors.Is(err, os.ErrNotExist) || errors.Is(err, sdk.ErrSharingProjectMessageAbandoned) || errors.Is(err, sdk.ErrCredentialDead) || errors.Is(err, ErrDisabled) || errors.Is(err, ErrInvalid) || errors.Is(err, ErrConflict) {
+		return false
+	}
+	var quota *sdk.SharingProjectMessageQuotaError
+	return !errors.As(err, &quota) || quota.StatusCode == http.StatusTooManyRequests
 }
