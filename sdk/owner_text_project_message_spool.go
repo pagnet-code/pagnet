@@ -55,7 +55,7 @@ func (k *keyring) initOwnerTextProjectMessages(principal string) error {
 		return errors.New("sdk: invalid owner text project spool principal")
 	}
 	parent := filepath.Join(k.root, principal)
-	for _, dir := range []string{parent, k.ownerTextProjectMessageDir(principal)} {
+	for _, dir := range []string{k.root, parent, k.ownerTextProjectMessageDir(principal)} {
 		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
@@ -355,7 +355,7 @@ func (k *keyring) loadOwnerTextProjectMessageBinding(principal string, private [
 }
 func validateOwnerTextProjectRecordReceipt(receipt OwnerTextProjectMessageReceipt, record ownerTextProjectMessageRecord) error {
 	digest, err := hex.DecodeString(record.WireDigest)
-	if err != nil || len(digest) != 32 || receipt.MessageID != record.Reservation.Header.ID || !bytes.Equal(receipt.RequestDigest, digest) || receipt.AdmissionSeq <= 0 || receipt.CreatedAt.IsZero() || (receipt.Status != "pending" && receipt.Status != "acknowledged") || (record.State == "admitted" && receipt.AdmissionSeq != record.AdmissionSeq) {
+	if err != nil || len(digest) != 32 || receipt.MessageID != record.Reservation.Header.ID || !bytes.Equal(receipt.RequestDigest, digest) || receipt.AdmissionSeq <= 0 || !validOwnerTextProjectReceiptTimes(receipt) || (record.State == "admitted" && receipt.AdmissionSeq != record.AdmissionSeq) {
 		return errors.New("sdk: owner text project message receipt binding mismatch")
 	}
 	return nil
@@ -432,4 +432,15 @@ func validOwnerTextProjectReservedHeader(h OwnerTextProjectMessageHeader) bool {
 		return h.ID == h.ThreadID && h.CorrelationID == nil
 	}
 	return h.Kind == "REPLY" && h.CorrelationID != nil && *h.CorrelationID == h.ThreadID && h.ID != h.ThreadID
+}
+
+func (k *keyring) validateOwnerTextProjectMessageRoot() error {
+	info, err := os.Lstat(k.root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0700 {
+		return errors.New("sdk: owner text project spool root is not private")
+	}
+	return nil
 }

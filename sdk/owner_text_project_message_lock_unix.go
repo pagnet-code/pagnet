@@ -11,6 +11,9 @@ import (
 )
 
 func (k *keyring) lockOwnerTextProjectMessages(principal string) (func(), error) {
+	if err := k.validateOwnerTextProjectMessageRoot(); err != nil {
+		return nil, err
+	}
 	fd, err := unix.Open(filepath.Join(k.root, "owner-text-project-messages.lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err

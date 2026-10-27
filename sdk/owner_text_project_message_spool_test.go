@@ -379,3 +379,38 @@ func TestOwnerTextSpoolConcurrentIDReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOwnerTextSpoolRejectsUnsafeRoot(t *testing.T) {
+	for _, kind := range []string{"permissions", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			project, clients := ownerTextMessageFixture(t)
+			sender := clients[0]
+			if kind == "permissions" {
+				if err := os.Chmod(sender.kr.root, 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				original := sender.kr.root
+				moved := original + "-real"
+				if err := os.Rename(original, moved); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(moved, original); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := sender.kr.lockOwnerTextProjectMessages(sender.PrincipalID()); err == nil {
+				t.Fatal("unsafe root opened a lock")
+			}
+			if err := sender.kr.initOwnerTextProjectMessages(sender.PrincipalID()); err == nil {
+				t.Fatal("unsafe root initialized spool")
+			}
+			if _, err := sender.PrepareOwnerTextProjectMessage(project, clients[1].PrincipalID(), "ASK", nil, nil); err == nil {
+				t.Fatal("unsafe root prepared message")
+			}
+			if _, err := os.Lstat(filepath.Join(sender.kr.root, "owner-text-project-messages.lock")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("lock created under unsafe root")
+			}
+		})
+	}
+}
