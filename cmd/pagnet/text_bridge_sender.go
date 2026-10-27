@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,16 +61,7 @@ func textBridgeCreateService(ctx context.Context, owner *cliCtx, name string) (c
 type textBridgeSenderProfile struct{ Service, Server, Credential string }
 
 type textBridgeSenderConnection interface {
-	WhoAmI(context.Context) (*sdk.Identity, error)
-	SharingProjectStatus(context.Context, string) (sdk.SharingProjectStatus, error)
-	PrepareSharingProjectMessageWithID(string, string, string, string, []byte, []byte) (sdk.PreparedSharingProjectMessage, error)
-	LoadPreparedSharingProjectMessage(string, string) (sdk.PreparedSharingProjectMessage, error)
-	SharingProjectMessageReceipt(context.Context, string, string) (sdk.SharingProjectMessageReceipt, error)
-	SendPreparedSharingProjectMessage(context.Context, string, string) (sdk.SharingProjectMessageReceipt, error)
-	OnSharingProjectMessage(func(context.Context, sdk.SharingProjectMessage) error)
-	OnSharingProjectReady(func(string))
-	EnableSharingProjects()
-	Done() <-chan struct{}
+	sender.Connection
 	Close() error
 }
 
@@ -286,12 +275,7 @@ func textBridgeSenderInput(stdin io.Reader, file string) (string, error) {
 }
 
 func textBridgeSenderReply(ctx context.Context, store *sender.Store, principal string, message sdk.SharingProjectMessage) (sender.Operation, error) {
-	h := message.Header
-	if h.Kind != "REPLY" || h.CorrelationID == nil || h.ThreadID != *h.CorrelationID || h.RecipientPrincipalID != principal || len(message.Wire) == 0 {
-		return sender.Operation{}, errors.New("sender requires an authenticated correlated REPLY")
-	}
-	sum := sha256.Sum256(message.Wire)
-	return store.RecordReply(ctx, sender.Reply{ProjectID: h.ProjectID, AskID: *h.CorrelationID, ReplyID: h.ID, WireDigest: hex.EncodeToString(sum[:]), SenderID: h.SenderPrincipalID, RecipientID: h.RecipientPrincipalID, Text: string(message.Plaintext)})
+	return sender.RecordReply(ctx, store, principal, message)
 }
 
 func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderProfile, store *sender.Store, operation sender.Operation, wait time.Duration, deps textBridgeSenderDependencies) (sender.Operation, error) {
@@ -304,129 +288,5 @@ func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderP
 		return operation, errors.New("sender service connection failed; resume the saved ASK")
 	}
 	defer conn.Close()
-	identity, err := conn.WhoAmI(ctx)
-	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != p.Service {
-		return operation, errors.New("sender authenticated identity does not match saved service")
-	}
-	// SDK admission retires ciphertext before this store can record the receipt.
-	// Reconcile historical evidence before waiting for active project authority.
-	if operation.Phase == sender.Prepared {
-		if receipt, receiptErr := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID); receiptErr == nil {
-			operation, err = store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
-			if err != nil {
-				return operation, err
-			}
-		}
-	}
-	if operation.Phase == sender.Admitted && operation.Reply != nil {
-		return operation, nil
-	}
-	ready, received := make(chan struct{}, 1), make(chan struct{}, 1)
-	callbackErrors := make(chan error, 1)
-	projectID, askID := operation.ProjectID, operation.AskID
-	conn.OnSharingProjectMessage(func(callbackCtx context.Context, message sdk.SharingProjectMessage) error {
-		if message.Header.Kind != "REPLY" {
-			return nil // A sender service never dispatches incoming ASK work.
-		}
-		o, err := textBridgeSenderReply(callbackCtx, store, p.Service, message)
-		if err != nil {
-			if message.Header.ProjectID == projectID && message.Header.CorrelationID != nil && *message.Header.CorrelationID == askID {
-				select {
-				case callbackErrors <- errors.New("sender could not persist an authenticated reply; inbox delivery remains pending"):
-				default:
-				}
-			}
-			return err
-		}
-		if o.ProjectID == projectID && o.AskID == askID {
-			select {
-			case received <- struct{}{}:
-			default:
-			}
-		}
-		return nil // Durable reply commit precedes the SDK's ACK.
-	})
-	conn.OnSharingProjectReady(func(project string) {
-		if project == projectID {
-			select {
-			case ready <- struct{}{}:
-			default:
-			}
-		}
-	})
-	conn.EnableSharingProjects()
-	for {
-		select {
-		case <-ready:
-			operation, err = textBridgeSenderReconcile(ctx, conn, store, operation)
-			if err != nil {
-				return operation, err
-			}
-		case <-received:
-			operation, err = store.Get(ctx, operation.ProjectID, operation.AskID)
-			if err != nil {
-				return operation, err
-			}
-		case err := <-callbackErrors:
-			return operation, err
-		case <-conn.Done():
-			return operation, errors.New("sender connection ended; resume the saved ASK")
-		case <-ctx.Done():
-			return operation, fmt.Errorf("sender wait ended; resume or inspect the saved ASK: %w", ctx.Err())
-		}
-		if operation.Phase == sender.Admitted && operation.Reply != nil {
-			return operation, nil
-		}
-	}
-}
-
-func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnection, store *sender.Store, operation sender.Operation) (sender.Operation, error) {
-	operation, err := store.Get(ctx, operation.ProjectID, operation.AskID)
-	if err != nil {
-		return operation, err
-	}
-	if operation.Phase == sender.Admitted {
-		return operation, nil
-	}
-	if operation.Phase == sender.Prepared {
-		if receipt, receiptErr := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID); receiptErr == nil {
-			return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
-		}
-	}
-	status, err := conn.SharingProjectStatus(ctx, operation.ProjectID)
-	if err != nil || status.ProjectID != operation.ProjectID || status.State != "active" || !status.EndpointProved {
-		return operation, errors.New("sender project is not ready; resume the saved ASK after enrollment")
-	}
-	var prepared sdk.PreparedSharingProjectMessage
-	if operation.Phase == sender.Reserved {
-		prompt, promptErr := store.RecoverPrompt(ctx, operation.ProjectID, operation.AskID)
-		if promptErr != nil {
-			return operation, promptErr
-		}
-		operation, err = store.MarkPreparing(ctx, operation.ProjectID, operation.AskID)
-		if err != nil {
-			return operation, err
-		}
-		prepared, err = conn.PrepareSharingProjectMessageWithID(operation.ProjectID, operation.RecipientID, "ASK", operation.AskID, []byte(prompt), nil)
-		if err != nil {
-			prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
-		}
-	} else {
-		prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
-	}
-	if err != nil {
-		return operation, errors.New("saved ASK has no recoverable prepared ciphertext; preparation outcome remains unresolved and must not be prepared again")
-	}
-	operation, err = store.MarkPrepared(ctx, operation.ProjectID, operation.AskID, prepared)
-	if err != nil {
-		return operation, err
-	}
-	receipt, err := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID)
-	if err != nil {
-		receipt, err = conn.SendPreparedSharingProjectMessage(ctx, operation.ProjectID, operation.AskID)
-		if err != nil {
-			return operation, errors.New("sender admission outcome unresolved; resume the same saved ASK")
-		}
-	}
-	return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
+	return sender.Run(ctx, conn, store, p.Service, operation)
 }
