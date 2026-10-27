@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,17 +59,20 @@ func TestNativeWorkerRecoveryDurableFenceAndPhases(t *testing.T) {
 		if _, err := registry.Reserve(scope, spec, "original", ""); err == nil {
 			t.Fatalf("%s tombstone allowed reservation replay", phase)
 		}
-		if err := EnsureNativeWorker(context.Background(), registry, original, "/does-not-exist", nil, ""); err == nil || !strings.Contains(err.Error(), "fenced by recovery") {
+		if err := registry.checkRecoveryFence(scope.InstanceID, scope.Generation); !errors.Is(err, errNativeWorkerRecoveryFenced) {
+			t.Fatalf("%s tombstone did not return typed fence: %v", phase, err)
+		}
+		if err := EnsureNativeWorker(context.Background(), registry, original, "/does-not-exist", nil, ""); !errors.Is(err, errNativeWorkerRecoveryFenced) {
 			t.Fatalf("%s tombstone did not refuse activation: %v", phase, err)
 		}
 		if _, err := os.Stat(original.Dir); !os.IsNotExist(err) {
 			t.Fatalf("fenced activation created bootstrap state: %v", err)
 		}
 		d := &Daemon{nativeRegistry: registry, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: {proxy: &NativeWorkerProxy{scope: scope}}}}
-		if _, err := d.nativeWorkerFor(nil, scope.InstanceID); err == nil {
+		if _, err := d.nativeWorkerFor(nil, scope.InstanceID); !errors.Is(err, errNativeWorkerRecoveryFenced) {
 			t.Fatalf("%s tombstone allowed cached worker reuse", phase)
 		}
-		if err := d.connectNativeWorker(nil, nil, original); err == nil {
+		if err := d.connectNativeWorker(nil, nil, original); !errors.Is(err, errNativeWorkerRecoveryFenced) {
 			t.Fatalf("%s tombstone allowed cached connection activation", phase)
 		}
 	}
@@ -146,6 +150,9 @@ func TestNativeWorkerRecoveryConcurrentExactReplay(t *testing.T) {
 	registry.Close()
 	if fenced, err := registry.RecoveryTombstoned(scope.InstanceID, scope.Generation); err == nil || !fenced {
 		t.Fatalf("registry failure did not fail closed: %v %v", fenced, err)
+	}
+	if err := registry.checkRecoveryFence(scope.InstanceID, scope.Generation); err == nil || errors.Is(err, errNativeWorkerRecoveryFenced) {
+		t.Fatalf("registry failure classified as recovery fence: %v", err)
 	}
 }
 
