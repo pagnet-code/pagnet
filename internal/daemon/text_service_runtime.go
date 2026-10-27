@@ -22,6 +22,7 @@ type textServiceRuntime struct {
 	dir                    string
 	store                  *ledger.Store
 	senderStore            *sender.Store
+	controller             *sender.Controller
 	generation             int64
 	claimID                string
 	cancel                 context.CancelFunc
@@ -73,13 +74,27 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 		}
 		return r.enabled.Load() && ctx.Err() == nil && c.ctx.Err() == nil
 	}}
-	if p.ServiceRole() == "sender" && s.senderIPC != nil {
+	if p.ServiceRole() == "sender" {
 		config.OnSenderReady = func(controller *sender.Controller) func() {
-			cleanup, err := s.senderIPC.Publish(senderipc.Binding{Server: p.Server, TenantID: c.session.TenantID, OwnerUserID: c.session.AccountID, HostID: c.session.HostID, InstallationID: a.InstallationID, ServiceID: p.Service}, controller)
-			if err != nil {
-				cancel()
+			s.mu.Lock()
+			r.controller = controller
+			s.mu.Unlock()
+			var cleanup func()
+			if s.senderIPC != nil {
+				var err error
+				cleanup, err = s.senderIPC.Publish(senderipc.Binding{Server: p.Server, TenantID: c.session.TenantID, OwnerUserID: c.session.AccountID, HostID: c.session.HostID, InstallationID: a.InstallationID, ServiceID: p.Service}, controller)
+				if err != nil {
+					cancel()
+				}
 			}
-			return cleanup
+			return func() {
+				s.mu.Lock()
+				r.controller = nil
+				s.mu.Unlock()
+				if cleanup != nil {
+					cleanup()
+				}
+			}
 		}
 	}
 	config.Authorize = func(authCtx context.Context, conn textbridge.RuntimeConnection) error {

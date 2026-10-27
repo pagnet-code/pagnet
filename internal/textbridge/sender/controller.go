@@ -34,6 +34,7 @@ type Controller struct {
 	mu            sync.Mutex
 	ready         map[string]bool
 	changed       chan struct{}
+	revision      uint64
 	live          bool
 	runContext    context.Context
 	running       atomic.Bool
@@ -79,6 +80,7 @@ func (c *Controller) authority(ctx context.Context, project string) error {
 }
 
 func (c *Controller) notifyLocked() {
+	c.revision++
 	close(c.changed)
 	c.changed = make(chan struct{})
 }
@@ -143,6 +145,68 @@ func (c *Controller) Wait(ctx context.Context, project, ask string) (Operation, 
 			return Operation{}, ErrDisabled
 		case <-c.conn.Done():
 			return Operation{}, ErrDisabled
+		case <-changed:
+		}
+	}
+}
+
+// List returns a bounded page in stable ASK ID order within one project.
+func (c *Controller) List(ctx context.Context, project, after string, limit int) ([]Operation, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if limit < 1 || limit > 100 || !validID(project, false) || (after != "" && !validID(after, true)) {
+		return nil, ErrInvalid
+	}
+	if err := c.authority(ctx, project); err != nil {
+		return nil, err
+	}
+	all, err := c.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := []Operation{}
+	for _, operation := range all {
+		if operation.ProjectID == project && operation.AskID > after {
+			result = append(result, operation)
+			if len(result) == limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+// Revision snapshots the event-driven change counter for this live controller.
+func (c *Controller) Revision(ctx context.Context, project string) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.authority(ctx, project); err != nil {
+		return 0, err
+	}
+	return c.revision, nil
+}
+
+// WaitRevision returns on a persisted transition or runtime fencing. It never
+// polls, and a revision belongs only to this controller's lifetime.
+func (c *Controller) WaitRevision(ctx context.Context, project string, after uint64) (uint64, error) {
+	for {
+		c.mu.Lock()
+		if err := c.authority(ctx, project); err != nil {
+			c.mu.Unlock()
+			return 0, err
+		}
+		revision, changed, done := c.revision, c.changed, c.runContext.Done()
+		c.mu.Unlock()
+		if revision != after {
+			return revision, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-done:
+			return 0, ErrDisabled
+		case <-c.conn.Done():
+			return 0, ErrDisabled
 		case <-changed:
 		}
 	}
