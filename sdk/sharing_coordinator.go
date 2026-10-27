@@ -20,22 +20,24 @@ const sharingPairWakeCap = 256
 // a replacement connection becomes live while an old callback is cancelling.
 // All fields except notify are protected by Client.sharingMu.
 type sharingCoordinator struct {
-	notify          chan struct{}
-	pending         map[string]sharingPairWake
-	blocked         map[string]bool
-	full            bool
-	handler         func(context.Context, SharingMessage) error
-	ready           func()
-	pairsEnabled    bool
-	projectsEnabled bool
-	projectHandler  func(context.Context, SharingProjectMessage) error
-	projectReady    func(string)
-	ctx             context.Context
-	cancel          context.CancelFunc
-	connection      int64
-	revision        uint64
-	fullRevision    uint64
-	grantRevision   map[string]uint64
+	notify                chan struct{}
+	pending               map[string]sharingPairWake
+	blocked               map[string]bool
+	full                  bool
+	handler               func(context.Context, SharingMessage) error
+	ready                 func()
+	pairsEnabled          bool
+	projectsEnabled       bool
+	projectHandler        func(context.Context, SharingProjectMessage) error
+	projectReady          func(string)
+	ownerTextInstallation string
+	ownerTextReady        func(string)
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	connection            int64
+	revision              uint64
+	fullRevision          uint64
+	grantRevision         map[string]uint64
 }
 
 type sharingPairWake struct {
@@ -358,8 +360,13 @@ func (c *Client) runSharingReconcile(s *sharingCoordinator, job sharingReconcile
 		return c.reconcileSharingGrant(s, job, job.grant)
 	}
 	c.sharingMu.Lock()
-	pairs, projects := s.pairsEnabled, s.projectsEnabled
+	pairs, projects, installation := s.pairsEnabled, s.projectsEnabled, s.ownerTextInstallation
 	c.sharingMu.Unlock()
+	if installation != "" {
+		if err := c.reconcileOwnerTextProjects(s, job, installation); err != nil {
+			return err
+		}
+	}
 	if projects {
 		if err := c.reconcileSharingProjects(s, job); err != nil {
 			return err
