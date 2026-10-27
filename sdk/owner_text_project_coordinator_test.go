@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -430,5 +431,54 @@ func TestOwnerTextCoordinatorContinuationCapacity(t *testing.T) {
 				t.Fatal("overflow did not fence for resumable full reconciliation")
 			}
 		})
+	}
+}
+
+func TestOwnerTextContinuationOverflowClosesCapturedSocket(t *testing.T) {
+	accepted := make(chan *websocket.Conn, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		socket, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		accepted <- socket
+	}))
+	defer server.Close()
+	dial := func() (*websocket.Conn, *websocket.Conn) {
+		client, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer := <-accepted
+		t.Cleanup(func() { client.Close(); peer.Close() })
+		return client, peer
+	}
+	old, _ := dial()
+	replacement, peer := dial()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &Client{}
+	c.connected.Store(true)
+	s := &sharingCoordinator{ctx: ctx, cancel: cancel, socket: &conn{ws: old}, notify: make(chan struct{}, 1), pending: map[string]sharingPairWake{}, blocked: map[string]bool{}}
+	c.sharingCoordinator = s
+	// Replacement publication can precede onLive's coordinator session reset.
+	c.connMu.Lock()
+	c.cur = &conn{ws: replacement}
+	c.connMu.Unlock()
+	for i := 0; i < sharingPairWakeCap; i++ {
+		id := uuid.NewString()
+		enqueueSharingPendingLocked(s, ownerTextProjectJobKey(id), sharingPairWake{GrantID: id, Kind: "message"})
+	}
+	c.requeueOwnerTextProjectDrain(s, sharingReconcileJob{ctx: ctx}, enrollmentProjectID)
+	if err := peer.WriteMessage(websocket.TextMessage, []byte("replacement alive")); err != nil {
+		t.Fatal(err)
+	}
+	replacement.SetReadDeadline(time.Now().Add(time.Second))
+	if _, body, err := replacement.ReadMessage(); err != nil || string(body) != "replacement alive" {
+		t.Fatalf("overflow closed replacement socket: %v", err)
+	}
+	old.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := old.ReadMessage(); err == nil {
+		t.Fatal("old session socket remained open")
 	}
 }

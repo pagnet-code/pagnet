@@ -37,6 +37,7 @@ type sharingCoordinator struct {
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	connection            int64
+	socket                *conn
 	revision              uint64
 	fullRevision          uint64
 	grantRevision         map[string]uint64
@@ -132,6 +133,9 @@ func (c *Client) startSharingSessionLocked(s *sharingCoordinator) {
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.connection = c.connGeneration.Load()
+	c.connMu.Lock()
+	s.socket = c.cur
+	c.connMu.Unlock()
 	s.pending = map[string]sharingPairWake{}
 	s.pendingOrder = nil
 	s.blocked = map[string]bool{}
@@ -227,10 +231,8 @@ func (c *Client) queueSharingWakeDomain(wake sharingPairWake, project, ownerProj
 		s.pending = map[string]sharingPairWake{}
 		s.pendingOrder = nil
 		s.full = true
+		pc := s.socket
 		c.sharingMu.Unlock()
-		c.connMu.Lock()
-		pc := c.cur
-		c.connMu.Unlock()
 		if pc != nil {
 			_ = pc.ws.Close()
 		}

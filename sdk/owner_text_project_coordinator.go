@@ -220,10 +220,8 @@ func (c *Client) requeueOwnerTextProjectDrain(s *sharingCoordinator, job sharing
 		s.pending = map[string]sharingPairWake{}
 		s.pendingOrder = nil
 		s.full = true
+		pc := s.socket
 		c.sharingMu.Unlock()
-		c.connMu.Lock()
-		pc := c.cur
-		c.connMu.Unlock()
 		if pc != nil {
 			_ = pc.ws.Close()
 		}
