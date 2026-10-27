@@ -173,19 +173,7 @@ func (c *Client) reconcileOwnerTextProject(s *sharingCoordinator, job sharingRec
 		c.notifyOwnerTextProjectReady(s, job, project, installation)
 	}
 	if errors.Is(err, ErrOwnerTextProjectReceiveLimit) {
-		c.sharingMu.Lock()
-		if s.ctx == job.ctx && s.connection == job.connection && !s.blocked[key] {
-			wake := sharingPairWake{GrantID: project, Kind: "message"}
-			if queued, exists := s.pending[key]; exists && queued.Kind == "state" {
-				wake.Kind = "state"
-			}
-			// A capped project yields to all queued work, including wakes that
-			// arrived while its handlers were running.
-			delete(s.pending, key)
-			enqueueSharingPendingLocked(s, key, wake)
-			signalSharingCoordinator(s)
-		}
-		c.sharingMu.Unlock()
+		c.requeueOwnerTextProjectDrain(s, job, project)
 		return nil
 	}
 	if failed {
@@ -208,4 +196,40 @@ func (c *Client) notifyOwnerTextProjectReady(s *sharingCoordinator, job sharingR
 	if current && ready != nil && job.ctx.Err() == nil {
 		func() { defer func() { _ = recover() }(); ready(project) }()
 	}
+}
+
+// Continuations share the same capacity as external wakes. If other projects
+// fill the queue during a drain, reconnect/full reconciliation recovers work.
+func (c *Client) requeueOwnerTextProjectDrain(s *sharingCoordinator, job sharingReconcileJob, project string) {
+	key := ownerTextProjectJobKey(project)
+	c.sharingMu.Lock()
+	if s.ctx != job.ctx || s.connection != job.connection || s.blocked[key] {
+		c.sharingMu.Unlock()
+		return
+	}
+	wake := sharingPairWake{GrantID: project, Kind: "message"}
+	if queued, exists := s.pending[key]; exists && queued.Kind == "state" {
+		wake.Kind = "state"
+	}
+	delete(s.pending, key)
+	if len(s.pending) >= sharingPairWakeCap {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.ctx = nil
+		s.pending = map[string]sharingPairWake{}
+		s.pendingOrder = nil
+		s.full = true
+		c.sharingMu.Unlock()
+		c.connMu.Lock()
+		pc := c.cur
+		c.connMu.Unlock()
+		if pc != nil {
+			_ = pc.ws.Close()
+		}
+		return
+	}
+	enqueueSharingPendingLocked(s, key, wake)
+	signalSharingCoordinator(s)
+	c.sharingMu.Unlock()
 }

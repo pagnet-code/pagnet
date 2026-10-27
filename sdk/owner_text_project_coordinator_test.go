@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -397,5 +398,37 @@ func TestOwnerTextMessageCoordinatorCapRequeuesWithoutTimer(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if f.count() != before {
 		t.Fatal("drain cap introduced idle polling")
+	}
+}
+
+func TestOwnerTextCoordinatorContinuationCapacity(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "overflow reconnects", true: "coalesces at capacity"}[existing], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c := &Client{}
+			c.connected.Store(true)
+			s := &sharingCoordinator{ctx: ctx, cancel: cancel, notify: make(chan struct{}, 1), pending: map[string]sharingPairWake{}, blocked: map[string]bool{}, grantRevision: map[string]uint64{}, ownerTextInstallation: ownerTextInstallation}
+			c.sharingCoordinator = s
+			for i := 0; i < sharingPairWakeCap; i++ {
+				id := uuid.NewString()
+				enqueueSharingPendingLocked(s, ownerTextProjectJobKey(id), sharingPairWake{GrantID: id, Kind: "message"})
+			}
+			if existing {
+				key := s.pendingOrder[0]
+				delete(s.pending, key)
+				s.pendingOrder = s.pendingOrder[1:]
+				enqueueSharingPendingLocked(s, ownerTextProjectJobKey(enrollmentProjectID), sharingPairWake{GrantID: enrollmentProjectID, Kind: "state"})
+			}
+			job := sharingReconcileJob{ctx: ctx}
+			c.requeueOwnerTextProjectDrain(s, job, enrollmentProjectID)
+			if existing {
+				if len(s.pending) != sharingPairWakeCap || len(s.pendingOrder) != sharingPairWakeCap || s.pendingOrder[len(s.pendingOrder)-1] != ownerTextProjectJobKey(enrollmentProjectID) || s.pending[ownerTextProjectJobKey(enrollmentProjectID)].Kind != "state" {
+					t.Fatal("continuation exceeded capacity or lost FIFO/state")
+				}
+			} else if s.ctx != nil || !s.full || ctx.Err() == nil || len(s.pending) != 0 || len(s.pendingOrder) != 0 {
+				t.Fatal("overflow did not fence for resumable full reconciliation")
+			}
+		})
 	}
 }
