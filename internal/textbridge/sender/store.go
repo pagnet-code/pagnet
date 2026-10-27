@@ -427,9 +427,18 @@ func (s *Store) save(stored storedOperation) (Operation, error) {
 	return clone(stored.Operation), nil
 }
 
-// Reserve is the sole ID generation point. It durably binds input and identity
-// before SDK preparation. Each invocation is a new operation; resume via Get.
+// Reserve generates a new ASK and durably binds its input before preparation.
 func (s *Store) Reserve(ctx context.Context, project, recipient, prompt string) (Operation, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Operation{}, err
+	}
+	return s.ReserveWithID(ctx, project, recipient, id.String(), prompt)
+}
+
+// ReserveWithID durably binds a caller-supplied ASK. Repeating the same input
+// returns its current operation without preparing or creating another ASK.
+func (s *Store) ReserveWithID(ctx context.Context, project, recipient, ask, prompt string) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.load(ctx); err != nil {
@@ -438,14 +447,21 @@ func (s *Store) Reserve(ctx context.Context, project, recipient, prompt string) 
 	if s.state.Disabled {
 		return Operation{}, ErrDisabled
 	}
-	if !validID(project, false) || !validID(recipient, false) || !validText(prompt, MaxPromptChars) {
+	if !validID(project, false) || !validID(recipient, false) || !validID(ask, true) || !validText(prompt, MaxPromptChars) {
 		return Operation{}, ErrInvalid
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return Operation{}, err
+	promptDigest := digest([]byte(prompt))
+	for _, stored := range s.state.Operations {
+		o := stored.Operation
+		if o.AskID != ask {
+			continue
+		}
+		if o.ProjectID != project || o.RecipientID != recipient || o.PromptDigest != promptDigest || stored.Prompt != prompt {
+			return Operation{}, ErrConflict
+		}
+		return clone(o), nil
 	}
-	o := Operation{ProjectID: project, AskID: id.String(), RecipientID: recipient, PromptDigest: digest([]byte(prompt)), Phase: Reserved}
+	o := Operation{ProjectID: project, AskID: ask, RecipientID: recipient, PromptDigest: promptDigest, Phase: Reserved}
 	return s.save(storedOperation{Operation: o, Prompt: prompt})
 }
 

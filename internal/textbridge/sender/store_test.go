@@ -364,3 +364,40 @@ func TestCanceledOperationDoesNotReserve(t *testing.T) {
 		t.Fatal("canceled reservation persisted")
 	}
 }
+
+func TestReserveWithIDIsIdempotentAndGloballyBound(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	id, _ := uuid.NewV7()
+	o, err := s.ReserveWithID(ctx, project, recipient, id.String(), "prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.MarkPreparing(ctx, project, o.AskID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReserveWithID(ctx, project, recipient, o.AskID, "prompt")
+	if err != nil || got.Phase != Preparing || got.AskID != o.AskID {
+		t.Fatalf("repeat changed operation: %+v %v", got, err)
+	}
+	for _, input := range []struct{ project, recipient, prompt string }{
+		{binding().PrincipalID, recipient, "prompt"},
+		{project, binding().PrincipalID, "prompt"},
+		{project, recipient, "changed"},
+	} {
+		if _, err := s.ReserveWithID(ctx, input.project, input.recipient, o.AskID, input.prompt); !errors.Is(err, ErrConflict) {
+			t.Fatalf("changed binding: %v", err)
+		}
+	}
+	for _, id := range []string{uuid.Nil.String(), project, strings.ToUpper(o.AskID), "invalid"} {
+		if _, err := s.ReserveWithID(ctx, project, recipient, id, "prompt"); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("accepted invalid ASK %q: %v", id, err)
+		}
+	}
+	if err := s.Disable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReserveWithID(ctx, project, recipient, o.AskID, "prompt"); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("repeat bypassed durable gate: %v", err)
+	}
+}

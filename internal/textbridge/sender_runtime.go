@@ -62,6 +62,6 @@ func RunSenderProfile(parent context.Context, dir string, p Profile, store *send
 	if !ok {
 		return errors.New("SDK connection does not support sender operations")
 	}
-	controller := sender.NewController(store, senderConn, p.Service, sender.ControllerConfig{Enabled: config.Enabled, OnError: config.OnError})
+	controller := sender.NewController(store, senderConn, p.Service, sender.ControllerConfig{Enabled: config.Enabled, OnError: config.OnError, OnReady: config.OnSenderReady})
 	return controller.Run(ctx)
 }

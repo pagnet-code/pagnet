@@ -24,6 +24,7 @@ type controllerEndpoint struct {
 	ready                     func(string)
 	message                   func(context.Context, sdk.SharingProjectMessage) error
 	started                   chan struct{}
+	done                      chan struct{}
 	sent                      chan string
 }
 
@@ -84,7 +85,7 @@ func (f *controllerEndpoint) OnSharingProjectMessage(h func(context.Context, sdk
 }
 func (f *controllerEndpoint) OnSharingProjectReady(h func(string)) { f.ready = h }
 func (f *controllerEndpoint) EnableSharingProjects()               { f.ready(project); close(f.started) }
-func (f *controllerEndpoint) Done() <-chan struct{}                { return nil }
+func (f *controllerEndpoint) Done() <-chan struct{}                { return f.done }
 func controllerAwait(t *testing.T, ch <-chan string) string {
 	t.Helper()
 	select {
@@ -386,5 +387,131 @@ func TestControllerStopsRetryOnDisableOrTerminalAdmission(t *testing.T) {
 				t.Fatal("disabled or terminal sender kept retrying", f.sends, f.prepares)
 			}
 		})
+	}
+}
+
+func TestControllerWaitReplyAndShutdownCleanup(t *testing.T) {
+	for _, reply := range []bool{false, true} {
+		t.Run(map[bool]string{false: "shutdown", true: "reply"}[reply], func(t *testing.T) {
+			s, _ := openTest(t)
+			defer s.Close()
+			o := reserveTest(t, s)
+			f := newControllerEndpoint()
+			waitResult := make(chan error, 1)
+			cleanupDone := make(chan struct{})
+			c := NewController(s, f, binding().PrincipalID, ControllerConfig{
+				Enabled: func(string) bool { return true },
+				OnReady: func(c *Controller) func() {
+					go func() {
+						got, err := c.Wait(ctx, project, o.AskID)
+						if err == nil && (got.Phase != Admitted || got.Reply == nil) {
+							err = errors.New("incomplete wait result")
+						}
+						waitResult <- err
+					}()
+					return func() { <-cleanupDone }
+				},
+			})
+			runCtx, cancel := context.WithCancel(ctx)
+			done := make(chan error, 1)
+			go func() { done <- c.Run(runCtx) }()
+			controllerAwait(t, f.sent)
+			if reply {
+				r := replyFor(o)
+				err := f.message(ctx, sdk.SharingProjectMessage{Header: sdk.SharingProjectMessageHeader{Kind: "REPLY", ProjectID: project, ID: r.ReplyID, ThreadID: o.AskID, CorrelationID: &o.AskID, SenderPrincipalID: recipient, RecipientPrincipalID: binding().PrincipalID}, Plaintext: []byte("answer"), Wire: []byte("reply wire")})
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cancel()
+			}
+			select {
+			case err := <-waitResult:
+				if reply && err != nil || !reply && !errors.Is(err, ErrDisabled) {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("wait missed change or blocked cleanup")
+			}
+			close(cleanupDone)
+			cancel()
+			<-done
+			if _, err := c.Get(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+				t.Fatal("stopped controller read store", err)
+			}
+		})
+	}
+}
+
+func TestControllerSuppliedIDAndReadGates(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	f := newControllerEndpoint()
+	var enabled atomic.Bool
+	enabled.Store(true)
+	published := make(chan *Controller, 1)
+	c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return enabled.Load() }, OnReady: func(c *Controller) func() { published <- c; return nil }})
+	o := reserveTest(t, s)
+	if _, err := c.Get(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+		t.Fatal(err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(runCtx) }()
+	defer func() { cancel(); <-done }()
+	<-published
+	repeated, err := c.ReserveWithID(ctx, project, recipient, o.AskID, "sensitive prompt 🦊")
+	if err != nil || repeated.AskID != o.AskID {
+		t.Fatal(repeated, err)
+	}
+	if _, err := c.Resume(ctx, project, "019abcdef000-7000-8000-000000000000"); !errors.Is(err, ErrInvalid) {
+		t.Fatal(err)
+	}
+	if _, err := c.Resume(ctx, project, "019abcde-f000-7000-8000-000000000000"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("resume created missing operation", err)
+	}
+	enabled.Store(false)
+	if _, err := c.Get(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+		t.Fatal(err)
+	}
+	if _, err := c.Wait(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+		t.Fatal(err)
+	}
+	if _, err := c.ReserveWithID(ctx, project, recipient, o.AskID, "sensitive prompt 🦊"); !errors.Is(err, ErrDisabled) {
+		t.Fatal(err)
+	}
+	enabled.Store(true)
+	if err := s.Disable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ReserveWithID(ctx, project, recipient, o.AskID, "sensitive prompt 🦊"); !errors.Is(err, ErrDisabled) {
+		t.Fatal(err)
+	}
+}
+
+func TestControllerWaitCancellationAndConnectionGate(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	o := reserveTest(t, s)
+	f := newControllerEndpoint()
+	f.done = make(chan struct{})
+	published := make(chan struct{})
+	c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }, OnReady: func(*Controller) func() { close(published); return nil }})
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- c.Run(runCtx) }()
+	defer func() { cancel(); <-done }()
+	<-published
+	waitCtx, stopWait := context.WithCancel(ctx)
+	stopWait()
+	if _, err := c.Wait(waitCtx, project, o.AskID); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	close(f.done)
+	if _, err := c.Get(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+		t.Fatal("ended connection retained read authority", err)
+	}
+	if _, err := c.Wait(ctx, project, o.AskID); !errors.Is(err, ErrDisabled) {
+		t.Fatal("ended connection retained wait authority", err)
 	}
 }

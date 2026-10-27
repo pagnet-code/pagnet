@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -31,6 +32,8 @@ type RuntimeConfig struct {
 	Authorize func(context.Context, RuntimeConnection) error
 	Enabled   func(string) bool
 	OnError   func(error)
+	// OnSenderReady publishes a proved sender and returns cleanup joining its callers.
+	OnSenderReady func(*sender.Controller) func()
 }
 
 // RunProfile runs a local responder until cancellation, connection termination,

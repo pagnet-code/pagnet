@@ -7,15 +7,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
 // ControllerConfig supplies the current owner/session dispatch gate. A nil
 // Enabled fences all dispatch. OnError reports unresolved operations and must
 // return promptly; errors never cause a new ASK or new preparation attempt.
+// OnReady publishes the live controller and returns cleanup that unpublishes and
+// joins its callers. Shutdown wakes waiters before invoking that cleanup.
 type ControllerConfig struct {
 	Enabled func(string) bool
 	OnError func(error)
+	OnReady func(*Controller) func()
 }
 
 // Controller multiplexes saved ASKs on one authenticated, authorized connection.
@@ -29,13 +33,16 @@ type Controller struct {
 	wake          chan struct{}
 	mu            sync.Mutex
 	ready         map[string]bool
+	changed       chan struct{}
+	live          bool
+	runContext    context.Context
 	running       atomic.Bool
 	retryDelay    time.Duration
 	retryMaxDelay time.Duration
 }
 
 func NewController(store *Store, conn Connection, principal string, config ControllerConfig) *Controller {
-	return &Controller{store: store, conn: conn, principal: principal, config: config, wake: make(chan struct{}, 1), retryDelay: time.Second, retryMaxDelay: 30 * time.Second, ready: make(map[string]bool)}
+	return &Controller{store: store, conn: conn, principal: principal, config: config, wake: make(chan struct{}, 1), retryDelay: time.Second, retryMaxDelay: 30 * time.Second, ready: make(map[string]bool), changed: make(chan struct{})}
 }
 
 // Wake requests a recovery scan. Signals coalesce and never schedule idle polls.
@@ -49,17 +56,96 @@ func (c *Controller) Wake() {
 // Reserve persists a new stable ASK before waking the controller. A successful
 // return exposes its ID even if preparation or admission later remains unresolved.
 func (c *Controller) Reserve(ctx context.Context, project, recipient, prompt string) (Operation, error) {
-	if ctx.Err() != nil {
-		return Operation{}, ctx.Err()
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Operation{}, err
 	}
-	if !c.running.Load() || c.config.Enabled == nil || !c.config.Enabled(project) {
-		return Operation{}, ErrDisabled
+	return c.ReserveWithID(ctx, project, recipient, id.String(), prompt)
+}
+
+func (c *Controller) authority(ctx context.Context, project string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	o, err := c.store.Reserve(ctx, project, recipient, prompt)
+	if !c.live || c.runContext.Err() != nil || c.config.Enabled == nil || !c.config.Enabled(project) {
+		return ErrDisabled
+	}
+	select {
+	case <-c.conn.Done():
+		return ErrDisabled
+	default:
+		return nil
+	}
+}
+
+func (c *Controller) notifyLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *Controller) notify() {
+	c.mu.Lock()
+	c.notifyLocked()
+	c.mu.Unlock()
+}
+
+func (c *Controller) ReserveWithID(ctx context.Context, project, recipient, ask, prompt string) (Operation, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.authority(ctx, project); err != nil {
+		return Operation{}, err
+	}
+	o, err := c.store.ReserveWithID(ctx, project, recipient, ask, prompt)
+	if err == nil {
+		c.notifyLocked()
+		c.Wake()
+	}
+	return o, err
+}
+
+func (c *Controller) Get(ctx context.Context, project, ask string) (Operation, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.authority(ctx, project); err != nil {
+		return Operation{}, err
+	}
+	return c.store.Get(ctx, project, ask)
+}
+
+func (c *Controller) Resume(ctx context.Context, project, ask string) (Operation, error) {
+	o, err := c.Get(ctx, project, ask)
 	if err == nil {
 		c.Wake()
 	}
 	return o, err
+}
+
+// Wait snapshots the notification before reading, so a concurrent persisted
+// transition cannot be lost between the read and waiting for its notification.
+func (c *Controller) Wait(ctx context.Context, project, ask string) (Operation, error) {
+	for {
+		c.mu.Lock()
+		changed := c.changed
+		if err := c.authority(ctx, project); err != nil {
+			c.mu.Unlock()
+			return Operation{}, err
+		}
+		runDone := c.runContext.Done()
+		o, err := c.store.Get(ctx, project, ask)
+		c.mu.Unlock()
+		if err != nil || (o.Phase == Admitted && o.Reply != nil) {
+			return o, err
+		}
+		select {
+		case <-ctx.Done():
+			return Operation{}, ctx.Err()
+		case <-runDone:
+			return Operation{}, ErrDisabled
+		case <-c.conn.Done():
+			return Operation{}, ErrDisabled
+		case <-changed:
+		}
+	}
 }
 
 // HandleMessage commits only authenticated correlated replies before SDK ACK.
@@ -69,6 +155,7 @@ func (c *Controller) HandleMessage(ctx context.Context, message sdk.SharingProje
 	}
 	_, err := RecordReply(ctx, c.store, c.principal, message)
 	if err == nil {
+		c.notify()
 		c.Wake()
 	}
 	return err
@@ -82,7 +169,17 @@ func (c *Controller) Run(ctx context.Context) error {
 	if !c.running.CompareAndSwap(false, true) {
 		return errors.New("sender controller already running")
 	}
-	defer c.running.Store(false)
+	var cleanup func()
+	defer func() {
+		c.mu.Lock()
+		c.live = false
+		c.notifyLocked()
+		c.mu.Unlock()
+		if cleanup != nil {
+			cleanup()
+		}
+		c.running.Store(false)
+	}()
 	identity, err := c.conn.WhoAmI(ctx)
 	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != c.principal {
 		return errors.New("sender authenticated identity does not match saved service")
@@ -94,6 +191,12 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.mu.Unlock()
 		c.Wake()
 	})
+	c.mu.Lock()
+	c.live, c.runContext = true, ctx
+	c.mu.Unlock()
+	if c.config.OnReady != nil {
+		cleanup = c.config.OnReady(c)
+	}
 	c.conn.EnableSharingProjects()
 	c.Wake()
 	conn := controllerConnection{Connection: c.conn, controller: c, ctx: ctx}
@@ -136,6 +239,9 @@ func (c *Controller) Run(ctx context.Context) error {
 				if receiptErr == nil {
 					_, err = c.store.MarkAdmitted(ctx, o.ProjectID, o.AskID, receipt)
 					c.report(err)
+					if err == nil {
+						c.notify()
+					}
 					continue
 				}
 				if retryableSDKError(receiptErr) {
@@ -151,6 +257,7 @@ func (c *Controller) Run(ctx context.Context) error {
 				continue
 			}
 			_, err := Reconcile(ctx, conn, c.store, o)
+			c.notify()
 			c.report(err)
 			var transient retryableError
 			var terminal terminalError

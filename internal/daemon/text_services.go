@@ -23,6 +23,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -136,6 +137,7 @@ type textServiceAttempt struct {
 
 type textServiceSupervisor struct {
 	daemon        *Daemon
+	senderIPC     *senderipc.Server
 	mu            sync.Mutex
 	controlMu     sync.Mutex
 	client        *textServiceClient

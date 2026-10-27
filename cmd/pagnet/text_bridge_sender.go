@@ -155,7 +155,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if action == "ask" && !textBridgeUUID(recipient) {
 				return errors.New("--to must be a recipient UUID")
 			}
-			if action != "ask" && !textBridgeUUID(ask) {
+			if (action != "ask" || ask != "") && !textBridgeSenderAskUUID(ask) {
 				return errors.New("--ask must be an ASK UUID")
 			}
 			if action != "result" && wait <= 0 {
@@ -169,17 +169,42 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if err := textbridge.PrivateDir(dir); err != nil {
 				return err
 			}
-			unlock, err := textbridge.LockProfile(dir)
-			if err != nil {
-				return err
-			}
-			defer unlock()
 			p, err := textBridgeSenderLoadProfile(dir, service)
 			if err != nil {
 				return err
 			}
-			if action != "result" && (p.Disabled || (p.Registration != nil && (p.Registration.Pending || p.Registration.DesiredState == "disabled"))) {
-				return errors.New("sender is disabled or registration is unconfirmed")
+			managed := func() error {
+				operation, err := textBridgeSenderManaged(cmd, filepath.Dir(base), p, action, project, recipient, ask, file, wait)
+				if err != nil {
+					return err
+				}
+				if action == "result" {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(operation)
+				}
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), operation.Reply.Text)
+				return err
+			}
+			if p.Registration != nil {
+				return managed()
+			}
+			unlock, err := textbridge.LockProfile(dir)
+			if err != nil {
+				return err
+			}
+			// Registration may have completed after the first unlocked read. Never
+			// connect a foreground SDK after acquiring a newly registered profile.
+			p, err = textBridgeSenderLoadProfile(dir, service)
+			if err != nil {
+				unlock()
+				return err
+			}
+			if p.Registration != nil {
+				unlock()
+				return managed()
+			}
+			defer unlock()
+			if action != "result" && p.Disabled {
+				return errors.New("sender is disabled")
 			}
 			// A saved profile must never recreate missing deduplication state.
 			if _, err := textbridge.ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
@@ -196,7 +221,11 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				if inputErr != nil {
 					return inputErr
 				}
-				operation, err = store.Reserve(cmd.Context(), project, recipient, prompt)
+				if ask == "" {
+					operation, err = store.Reserve(cmd.Context(), project, recipient, prompt)
+				} else {
+					operation, err = store.ReserveWithID(cmd.Context(), project, recipient, ask, prompt)
+				}
 				if err != nil {
 					return err
 				}
@@ -230,6 +259,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		sub.Flags().StringVar(&service, "service", "", "saved sender service UUID")
 		sub.Flags().StringVar(&project, "project", "", "sharing project UUID")
 		if action == "ask" {
+			sub.Flags().StringVar(&ask, "ask", "", "retry an existing durable ASK UUID")
 			sub.Flags().StringVar(&recipient, "to", "", "recipient service UUID")
 			sub.Flags().StringVar(&file, "file", "-", "UTF-8 prompt file, or - for stdin")
 		} else {

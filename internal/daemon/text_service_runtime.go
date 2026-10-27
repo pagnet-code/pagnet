@@ -12,6 +12,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -72,6 +73,15 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 		}
 		return r.enabled.Load() && ctx.Err() == nil && c.ctx.Err() == nil
 	}}
+	if p.ServiceRole() == "sender" && s.senderIPC != nil {
+		config.OnSenderReady = func(controller *sender.Controller) func() {
+			cleanup, err := s.senderIPC.Publish(senderipc.Binding{Server: p.Server, TenantID: c.session.TenantID, OwnerUserID: c.session.AccountID, HostID: c.session.HostID, InstallationID: a.InstallationID, ServiceID: p.Service}, controller)
+			if err != nil {
+				cancel()
+			}
+			return cleanup
+		}
+	}
 	config.Authorize = func(authCtx context.Context, conn textbridge.RuntimeConnection) error {
 		pinned, ok := conn.(interface {
 			TextServiceEndpointSession() (string, <-chan struct{}, error)

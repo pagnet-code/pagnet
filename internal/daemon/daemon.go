@@ -29,6 +29,7 @@ import (
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -946,6 +947,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer releaseLock()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	d.textServices = newTextServiceSupervisor(d)
+	if senderipc.Supported() {
+		senderRPC, err := senderipc.Listen(d.StateDir)
+		if err != nil {
+			return err
+		}
+		defer senderRPC.Close()
+		d.textServices.senderIPC = senderRPC
+	}
 	textDone := make(chan struct{})
 	go func() { defer close(textDone); d.textServices.run(bridgeCtx) }()
 	defer func() { bridgeCancel(); <-textDone }()

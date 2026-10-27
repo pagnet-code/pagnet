@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -415,5 +416,113 @@ func TestTextServiceSenderDisableReopensPoisonedStore(t *testing.T) {
 	}
 	if calls < 2 {
 		t.Fatal("disable was not retried")
+	}
+}
+
+func TestTextServiceSenderRPCProofGateAndSessionShutdown(t *testing.T) {
+	f, state, o := senderLifecycle(t)
+	server, err := senderipc.Listen(f.s.daemon.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	f.s.senderIPC = server
+	endpoint := &textSenderEndpoint{textRuntimeEndpoint: newTextRuntimeEndpoint(f.profile.Service), state: state}
+	entered, release := make(chan struct{}), make(chan struct{})
+	endpoint.proof = func(ctx context.Context, p sdk.TextServiceInstallationProof) (sdk.TextServiceReadiness, error) {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return sdk.TextServiceReadiness{}, ctx.Err()
+		}
+		return sdk.TextServiceReadiness{InstallationID: p.InstallationID, ClaimID: &p.ClaimID, Generation: p.Generation, Ready: true}, nil
+	}
+	f.s.connect = func(context.Context, sdk.Config) (textbridge.RuntimeConnection, error) { return endpoint, nil }
+	if err := f.s.reconcile(context.Background(), f.c); err != nil {
+		t.Fatal(err)
+	}
+	textAwait(t, entered)
+	binding := senderipc.Binding{Server: f.profile.Server, TenantID: f.c.session.TenantID, OwnerUserID: f.c.session.AccountID, HostID: f.c.session.HostID, InstallationID: f.item.ID, ServiceID: f.profile.Service}
+	req := senderipc.Request{Version: 1, Binding: binding, Action: "result", ProjectID: o.ProjectID, AskID: o.AskID}
+	if _, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); !errors.Is(err, senderipc.ErrUnavailable) {
+		t.Fatal("unproved controller was published", err)
+	}
+	close(release)
+	awaitSenderSend(t, state, o.AskID)
+	if got, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); err != nil || got.AskID != o.AskID {
+		t.Fatalf("proved controller result under runtime lock: %+v %v", got, err)
+	}
+	req.Action = "resume"
+	req.WaitMillis = senderipc.MaxWait.Milliseconds()
+	waited := make(chan error, 1)
+	go func() { _, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); waited <- err }()
+	runtime := f.runtime()
+	endpoint.swap()
+	textAwait(t, runtime.stopped)
+	select {
+	case err := <-waited:
+		if err == nil {
+			t.Fatal("session revocation returned pending operation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("revoked RPC wait did not join")
+	}
+	if unlock, err := textbridge.LockProfile(f.dir); err == nil {
+		unlock()
+		t.Fatal("RPC cleanup released lock before runtime ownership release")
+	}
+	if _, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); !errors.Is(err, senderipc.ErrUnavailable) {
+		t.Fatal("stopped controller remained published", err)
+	}
+	f.s.disconnect()
+	if unlock, err := textbridge.LockProfile(f.dir); err != nil {
+		t.Fatal("joined RPC runtime retained lock", err)
+	} else {
+		unlock()
+	}
+}
+
+func TestTextServiceSenderRPCReconnectReplacesPublication(t *testing.T) {
+	f, state, o := senderLifecycle(t)
+	server, err := senderipc.Listen(f.s.daemon.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	f.s.senderIPC = server
+	state.uncertain = true
+	first := f.start(t)
+	awaitSenderSend(t, state, o.AskID)
+	req := senderipc.Request{Version: 1, Binding: senderipc.Binding{Server: f.profile.Server, TenantID: f.c.session.TenantID, OwnerUserID: f.c.session.AccountID, HostID: f.c.session.HostID, InstallationID: f.item.ID, ServiceID: f.profile.Service}, Action: "result", ProjectID: o.ProjectID, AskID: o.AskID}
+	if _, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); err != nil {
+		t.Fatal("initial proved controller unavailable", err)
+	}
+	f.s.disconnect()
+	textAwait(t, first.closed)
+	if _, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); !errors.Is(err, senderipc.ErrUnavailable) {
+		t.Fatal("disconnected controller remained published", err)
+	}
+	state.mu.Lock()
+	wire := string(state.wires[o.AskID].Wire)
+	state.uncertain = false
+	state.mu.Unlock()
+	session := f.c.session
+	session.NativeAdmissionID, session.RunnerID = uuid.NewString(), uuid.NewString()
+	session.RunnerEpoch = time.Now().UTC()
+	f.s.admit(session)
+	f.s.mu.Lock()
+	f.c = f.s.client
+	f.s.mu.Unlock()
+	f.start(t)
+	awaitSenderSend(t, state, o.AskID)
+	if got, err := senderipc.Call(context.Background(), f.s.daemon.StateDir, req); err != nil || got.AskID != o.AskID {
+		t.Fatalf("reconnected publication: %+v %v", got, err)
+	}
+	state.mu.Lock()
+	same := string(state.wires[o.AskID].Wire) == wire
+	state.mu.Unlock()
+	if !same || state.prepares.Load() != 1 || state.sends.Load() != 2 {
+		t.Fatal("publication reconnect changed durable ASK")
 	}
 }
