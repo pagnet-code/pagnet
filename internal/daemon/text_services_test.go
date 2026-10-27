@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,7 +28,7 @@ func textFixture(t *testing.T, handler http.HandlerFunc) (*textServiceSupervisor
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	p := transport.HostSessionPayload{TenantID: uuid.NewString(), AccountID: uuid.NewString(), HostID: uuid.NewString(), NativeAdmissionID: uuid.NewString(), RunnerID: uuid.NewString(), HostCredentialID: uuid.NewString(), BootID: uuid.NewString(), OwnershipScope: "personal", RunnerEpoch: time.Now().UTC()}
+	p := transport.HostSessionPayload{TenantID: uuid.NewString(), AccountID: uuid.NewString(), HostID: uuid.NewString(), NativeAdmissionID: uuid.NewString(), RunnerID: uuid.NewString(), HostCredentialID: uuid.NewString(), BootID: uuid.NewString(), OwnershipScope: "personal", ProtocolFeatures: []string{textServiceBridgeProtocol}, RunnerEpoch: time.Now().UTC()}
 	state := t.TempDir()
 	if e := os.Chmod(state, 0700); e != nil {
 		t.Fatal(e)
@@ -122,6 +123,9 @@ func TestTextServiceAmbiguousClaimRetriesDurableBody(t *testing.T) {
 	if e := s.installation(context.Background(), c, v); e == nil {
 		t.Fatal("ambiguous request succeeded")
 	}
+	var attempted textServiceClaimBody
+	json.Unmarshal(bodies[0], &attempted)
+	v.ActiveClaimID = &attempted.ClaimID
 	v.Generation++ // authoritative GET after a committed but lost response
 	if e := s.installation(context.Background(), c, v); e != nil {
 		t.Fatal(e)
@@ -243,9 +247,28 @@ func TestTextServiceCapabilityAndCoalescedWake(t *testing.T) {
 	}
 }
 
-func TestTextServiceOldAdmissionAttemptIsNotRebound(t *testing.T) {
-	var calls atomic.Int32
-	s, c, dir, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) })
+func TestTextServiceReconnectRetiresOldAttempt(t *testing.T) {
+	var bodies [][]byte
+	var item textServiceInstallation
+	var admission string
+	s, c, dir, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.Header.Get("X-Pagnet-Native-Admission-Id") != admission {
+				t.Error("GET used old admission")
+			}
+			json.NewEncoder(w).Encode([]textServiceInstallation{item})
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		if len(bodies) == 1 {
+			w.WriteHeader(500)
+			return
+		}
+		var b textServiceClaimBody
+		json.Unmarshal(raw, &b)
+		json.NewEncoder(w).Encode(sdk.TextServiceReadiness{InstallationID: item.ID, ClaimID: &b.ClaimID, Generation: b.ExpectedGeneration + 1})
+	})
 	if e := s.installation(context.Background(), c, v); e == nil {
 		t.Fatal("expected ambiguous outcome")
 	}
@@ -253,18 +276,169 @@ func TestTextServiceOldAdmissionAttemptIsNotRebound(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	var old textServiceClaimBody
+	json.Unmarshal(bodies[0], &old)
+	v.Generation++
+	v.ActiveClaimID = &old.ClaimID
+	item = v
 	replacement := c.session
 	replacement.NativeAdmissionID = uuid.NewString()
 	replacement.RunnerEpoch = replacement.RunnerEpoch.Add(time.Second)
+	admission = replacement.NativeAdmissionID
 	s.admit(replacement)
-	if e = s.installation(context.Background(), s.client, v); e != nil {
+	if e = s.reconcile(context.Background(), s.client); e != nil {
+		t.Fatal(e)
+	}
+	retired, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt-retired.json"), 8192)
+	if e != nil || !bytes.Equal(before, retired) {
+		t.Fatal("old attempt not durably retired")
+	}
+	var fresh textServiceClaimBody
+	json.Unmarshal(bodies[1], &fresh)
+	if len(bodies) != 2 || fresh.ClaimID == old.ClaimID || fresh.Nonce == old.Nonce || fresh.ExpectedGeneration != v.Generation || !fresh.ConnectionEpoch.Equal(replacement.RunnerEpoch) {
+		t.Fatal("replacement replayed old attempt")
+	}
+}
+
+func TestTextServiceUnsupportedSessionStaysDormant(t *testing.T) {
+	var calls atomic.Int32
+	s, c, _, _, _ := textFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(404) })
+	p := c.session
+	p.ProtocolFeatures = []string{"unrelated"}
+	s.admit(p)
+	if s.client != nil {
+		t.Fatal("unsupported session admitted")
+	}
+	s.retry = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.run(ctx) }()
+	s.signal()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	<-done
+	if calls.Load() != 0 {
+		t.Fatal("unsupported server received GET or retry")
+	}
+}
+
+func TestTextServiceAttemptRepersistedAfterUncertainDirectorySync(t *testing.T) {
+	var posts int
+	var current textServiceInstallation
+	s, c, dir, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		posts++
+		var b textServiceClaimBody
+		json.NewDecoder(r.Body).Decode(&b)
+		json.NewEncoder(w).Encode(sdk.TextServiceReadiness{InstallationID: current.ID, ClaimID: &b.ClaimID, Generation: b.ExpectedGeneration + 1})
+	})
+	current = v
+	writes := 0
+	s.savePrivate = func(dir, name string, value any) error {
+		if e := textbridge.SavePrivateJSON(dir, name, value); e != nil {
+			return e
+		}
+		if name == "claim-attempt.json" {
+			writes++
+			if writes == 1 {
+				return errors.New("injected directory sync failure after rename")
+			}
+		}
+		return nil
+	}
+	if e := s.installation(context.Background(), c, v); e == nil {
+		t.Fatal("durability failure ignored")
+	}
+	if posts != 0 {
+		t.Fatal("POST sent before durability confirmed")
+	}
+	before, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = s.installation(context.Background(), c, v); e != nil {
 		t.Fatal(e)
 	}
 	after, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if calls.Load() != 1 || !bytes.Equal(before, after) {
-		t.Fatal("old attempt rebound to replacement session")
+	var a, b textServiceAttempt
+	json.Unmarshal(before, &a)
+	json.Unmarshal(after, &b)
+	if posts != 1 || writes != 3 || !bytes.Equal(a.Body, b.Body) {
+		t.Fatal("existing attempt was not re-persisted unchanged before POST")
+	}
+}
+
+func TestTextServiceAmbiguousClaimSnapshotEvidence(t *testing.T) {
+	for _, evidence := range []string{"superseded", "missing-active", "own-wrong-generation", "regressed"} {
+		t.Run(evidence, func(t *testing.T) {
+			var bodies [][]byte
+			var snapshot textServiceInstallation
+			s, c, dir, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					json.NewEncoder(w).Encode([]textServiceInstallation{snapshot})
+					return
+				}
+				raw, _ := io.ReadAll(r.Body)
+				bodies = append(bodies, raw)
+				if len(bodies) == 1 {
+					w.WriteHeader(500)
+					return
+				}
+				var b textServiceClaimBody
+				json.Unmarshal(raw, &b)
+				json.NewEncoder(w).Encode(sdk.TextServiceReadiness{InstallationID: snapshot.ID, ClaimID: &b.ClaimID, Generation: b.ExpectedGeneration + 1})
+			})
+			if e := s.installation(context.Background(), c, v); e == nil {
+				t.Fatal("expected ambiguous outcome")
+			}
+			before, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+			if e != nil {
+				t.Fatal(e)
+			}
+			var old textServiceClaimBody
+			json.Unmarshal(bodies[0], &old)
+			v.Generation += 2
+			switch evidence {
+			case "superseded":
+				other := uuid.NewString()
+				v.ActiveClaimID = &other
+			case "own-wrong-generation":
+				v.ActiveClaimID = &old.ClaimID
+			case "regressed":
+				v.Generation = old.ExpectedGeneration - 1
+			}
+			snapshot = v
+			if evidence == "regressed" { // A valid snapshot may still precede a retained attempt.
+				var a textServiceAttempt
+				json.Unmarshal(before, &a)
+				old.ExpectedGeneration = 3
+				a.Body, _ = json.Marshal(old)
+				if e = textbridge.SavePrivateJSON(dir, "claim-attempt.json", a); e != nil {
+					t.Fatal(e)
+				}
+				snapshot.Generation = 2
+			}
+			if e = s.reconcile(context.Background(), c); e != nil {
+				t.Fatal(e)
+			}
+			if evidence == "superseded" {
+				if len(bodies) != 2 {
+					t.Fatal("superseded attempt stranded")
+				}
+				var fresh textServiceClaimBody
+				json.Unmarshal(bodies[1], &fresh)
+				if fresh.ClaimID == old.ClaimID || fresh.Nonce == old.Nonce || fresh.ExpectedGeneration != snapshot.Generation {
+					t.Fatal("superseded claim replayed")
+				}
+				retired, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt-retired.json"), 8192)
+				if e != nil || !bytes.Equal(before, retired) {
+					t.Fatal("superseded attempt not retired")
+				}
+			} else if len(bodies) != 1 {
+				t.Fatal("uncertain snapshot authorized a claim")
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -58,7 +59,7 @@ func newTextServiceClient(d *Daemon, p transport.HostSessionPayload) (*textServi
 			return nil, errTextServiceSession
 		}
 	}
-	if p.HostID != d.HostID || p.OwnershipScope != "personal" || p.RunnerEpoch.IsZero() {
+	if !slices.Contains(p.ProtocolFeatures, textServiceBridgeProtocol) || p.HostID != d.HostID || p.OwnershipScope != "personal" || p.RunnerEpoch.IsZero() {
 		return nil, errTextServiceSession
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,15 +131,16 @@ type textServiceAttempt struct {
 }
 
 type textServiceSupervisor struct {
-	daemon *Daemon
-	mu     sync.Mutex
-	client *textServiceClient
-	wake   chan struct{}
-	retry  time.Duration
+	daemon      *Daemon
+	mu          sync.Mutex
+	client      *textServiceClient
+	wake        chan struct{}
+	retry       time.Duration
+	savePrivate func(string, string, any) error
 }
 
 func newTextServiceSupervisor(d *Daemon) *textServiceSupervisor {
-	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second}
+	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON}
 }
 func (s *textServiceSupervisor) signal() {
 	select {
@@ -197,7 +199,7 @@ func (s *textServiceSupervisor) reconcile(ctx context.Context, c *textServiceCli
 	}
 	seen := map[string]bool{}
 	for _, v := range all {
-		if !textServiceUUID(v.ID) || !textServiceUUID(v.ServiceID) || v.HostID != c.session.HostID || v.Role != "responder" || v.ProfileVersion != 1 || v.Generation < 1 || seen[v.ID] || (v.DesiredState != "enabled" && v.DesiredState != "disabled") {
+		if !textServiceUUID(v.ID) || !textServiceUUID(v.ServiceID) || v.HostID != c.session.HostID || v.Role != "responder" || v.ProfileVersion != 1 || v.Generation < 1 || (v.ActiveClaimID != nil && !textServiceUUID(*v.ActiveClaimID)) || seen[v.ID] || (v.DesiredState != "enabled" && v.DesiredState != "disabled") {
 			return errTextServiceOutstanding
 		}
 		seen[v.ID] = true
@@ -255,42 +257,83 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	if !budget.Enabled || v.DesiredState != "enabled" {
 		return nil
 	}
-	// Serialize the final session check and all local claim mutations with
-	// disconnect. HTTP remains cancelable without holding the supervisor lock.
 	var a textServiceAttempt
 	raw, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
-	if e == nil {
-		if json.Unmarshal(raw, &a) != nil || a.InstallationID != v.ID || a.Server != c.server || a.AdmissionID != c.session.NativeAdmissionID {
+	exists := e == nil
+	if exists {
+		if json.Unmarshal(raw, &a) != nil || a.InstallationID != v.ID || a.Server != c.server {
 			return nil
 		}
-	} else {
-		if _, statErr := os.Lstat(filepath.Join(dir, "claim-attempt.json")); !errors.Is(statErr, os.ErrNotExist) {
-			return errTextServiceOutstanding
+	} else if _, statErr := os.Lstat(filepath.Join(dir, "claim-attempt.json")); !errors.Is(statErr, os.ErrNotExist) {
+		return errTextServiceOutstanding
+	}
+	var body textServiceClaimBody
+	replace := !exists
+	if exists {
+		if json.Unmarshal(a.Body, &body) != nil || !textServiceUUID(body.ClaimID) || body.ExpectedGeneration < 1 {
+			return nil
+		}
+		nonce, err := base64.StdEncoding.Strict().DecodeString(body.Nonce)
+		if err != nil || len(nonce) != 32 {
+			return nil
+		}
+		// A reconnect does not excuse inconsistent installation evidence.
+		if v.Generation < body.ExpectedGeneration {
+			return nil
+		}
+		if v.ActiveClaimID != nil && *v.ActiveClaimID == body.ClaimID && v.Generation != body.ExpectedGeneration+1 {
+			return nil
+		}
+		if v.Generation > body.ExpectedGeneration && (v.ActiveClaimID == nil || !textServiceUUID(*v.ActiveClaimID)) {
+			return nil
+		}
+		if a.AdmissionID != c.session.NativeAdmissionID {
+			// v came from the new session's authoritative GET. Retain the old
+			// attempt as retired before replacing it; never transport its nonce.
+			replace = true
+		} else {
+			if body.RunnerID != c.session.RunnerID || !body.ConnectionEpoch.Equal(c.session.RunnerEpoch) {
+				return nil
+			}
+			if v.Generation > body.ExpectedGeneration && *v.ActiveClaimID != body.ClaimID {
+				// Another active claim conclusively superseded this attempt.
+				// Retrying its old expected generation could only conflict.
+				replace = true
+			} else if a.Result != nil {
+				return nil
+			}
+		}
+	}
+	// Serialize all local mutations with disconnect. Each POST requires a
+	// successful full persistence pass, even for an existing attempt: a prior
+	// rename may have succeeded while its directory fsync returned an error.
+	s.mu.Lock()
+	if s.client != c || c.ctx.Err() != nil {
+		s.mu.Unlock()
+		return errTextServiceSession
+	}
+	if replace {
+		if exists {
+			if e = s.savePrivate(dir, "claim-attempt-retired.json", a); e != nil {
+				s.mu.Unlock()
+				return e
+			}
 		}
 		nonce := make([]byte, 32)
 		if _, e = rand.Read(nonce); e != nil {
-			return e
-		}
-		body, _ := json.Marshal(textServiceClaimBody{uuid.NewString(), base64.StdEncoding.EncodeToString(nonce), c.session.RunnerID, c.session.RunnerEpoch, v.Generation})
-		a = textServiceAttempt{InstallationID: v.ID, Server: c.server, AdmissionID: c.session.NativeAdmissionID, Body: body}
-		s.mu.Lock()
-		if s.client != c || c.ctx.Err() != nil {
 			s.mu.Unlock()
-			return errTextServiceSession
-		}
-		e = textbridge.SavePrivateJSON(dir, "claim-attempt.json", a)
-		s.mu.Unlock()
-		if e != nil {
 			return e
 		}
+		body = textServiceClaimBody{uuid.NewString(), base64.StdEncoding.EncodeToString(nonce), c.session.RunnerID, c.session.RunnerEpoch, v.Generation}
+		encoded, _ := json.Marshal(body)
+		a = textServiceAttempt{InstallationID: v.ID, Server: c.server, AdmissionID: c.session.NativeAdmissionID, Body: encoded}
 	}
-	if a.Result != nil {
-		return nil
+	e = s.savePrivate(dir, "claim-attempt.json", a)
+	s.mu.Unlock()
+	if e != nil {
+		return e
 	}
-	var body textServiceClaimBody
-	if json.Unmarshal(a.Body, &body) != nil || !textServiceUUID(body.ClaimID) || body.RunnerID != c.session.RunnerID || !body.ConnectionEpoch.Equal(c.session.RunnerEpoch) || body.ExpectedGeneration < 1 {
-		return nil
-	}
+
 	var result sdk.TextServiceReadiness
 	if e = c.request(ctx, http.MethodPost, "/"+v.ID+"/claim", a.Body, &result); e != nil {
 		return e
@@ -304,5 +347,5 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		return errTextServiceSession
 	}
 	a.Result = &result
-	return textbridge.SavePrivateJSON(dir, "claim-attempt.json", a)
+	return s.savePrivate(dir, "claim-attempt.json", a)
 }
