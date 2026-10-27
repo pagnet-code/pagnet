@@ -181,6 +181,7 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
+	textServices     *textServiceSupervisor
 	sharingBridges   *sharingBridgeSupervisor
 	ownerMailboxMu   sync.Mutex
 	ownerMailboxUsed map[string]time.Time
@@ -944,6 +945,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer releaseLock()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	d.textServices = newTextServiceSupervisor(d)
+	textDone := make(chan struct{})
+	go func() { defer close(textDone); d.textServices.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-textDone }()
 	d.sharingBridges = newSharingBridgeSupervisor(d)
 	bridgeDone := make(chan struct{})
 	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
@@ -1047,6 +1052,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
+	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
@@ -1103,6 +1109,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		return d.write(conn, raw)
 	})
 	defer ownerMailboxes.close()
+	if d.textServices != nil {
+		defer d.textServices.disconnect()
+	}
 	if d.sharingBridges != nil {
 		defer d.sharingBridges.disconnect()
 	}
@@ -1275,6 +1284,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				return connectedAt, fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				if d.textServices != nil {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						d.textServices.admit(session)
+					}
+				}
 				if d.sharingBridges != nil {
 					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
 						d.sharingBridges.admit(session)
@@ -1565,6 +1579,10 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case textServicesChanged:
+		if d.textServices != nil {
+			d.textServices.signal()
+		}
 	case sharingBridgeCommand:
 		var p struct {
 			InstallationID string `json:"installationId"`

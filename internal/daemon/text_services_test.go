@@ -1,0 +1,270 @@
+//go:build unix
+
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/pagnet-code/pagnet/internal/textbridge"
+	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
+	"github.com/pagnet-code/pagnet/sdk"
+	"github.com/pagnet-code/pagnet/transport"
+)
+
+func textFixture(t *testing.T, handler http.HandlerFunc) (*textServiceSupervisor, *textServiceClient, string, textbridge.Profile, textServiceInstallation) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	p := transport.HostSessionPayload{TenantID: uuid.NewString(), AccountID: uuid.NewString(), HostID: uuid.NewString(), NativeAdmissionID: uuid.NewString(), RunnerID: uuid.NewString(), HostCredentialID: uuid.NewString(), BootID: uuid.NewString(), OwnershipScope: "personal", RunnerEpoch: time.Now().UTC()}
+	state := t.TempDir()
+	if e := os.Chmod(state, 0700); e != nil {
+		t.Fatal(e)
+	}
+	s := newTextServiceSupervisor(&Daemon{Config: Config{ServerURL: server.URL, HostID: p.HostID, Credential: "test-host", StateDir: state}})
+	s.admit(p)
+	t.Cleanup(s.disconnect)
+	v := textServiceInstallation{ID: uuid.NewString(), ServiceID: uuid.NewString(), HostID: p.HostID, Role: "responder", ProfileVersion: 1, DesiredState: "enabled", Generation: 1}
+	dir, e := textbridge.ProfileDirectory(state, v.ServiceID)
+	if e != nil {
+		t.Fatal(e)
+	}
+	profile := textbridge.Profile{Service: v.ServiceID, Server: server.URL, Credential: "pgn_act_v1_test", KeyFile: filepath.Join(state, "key"), Fingerprint: "fixed", Limits: ledger.Limits{CallsPerDay: 2, MaxConcurrent: 1}, Registration: &textbridge.ProfileRegistration{InstallationID: v.ID, HostID: v.HostID, Role: v.Role, ProfileVersion: 1, TenantID: p.TenantID, OwnerUserID: p.AccountID, Generation: 1, DesiredState: "enabled"}}
+	if e = textbridge.SaveProfile(dir, profile); e != nil {
+		t.Fatal(e)
+	}
+	st, e := ledger.Open(filepath.Join(dir, "ledger"), ledger.Binding{ServiceOrigin: profile.Server, PrincipalID: profile.Service}, profile.Limits)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = st.Close(); e != nil {
+		t.Fatal(e)
+	}
+	return s, s.client, dir, profile, v
+}
+
+func TestTextServiceGates(t *testing.T) {
+	for _, gate := range []string{"owner", "server", "host", "pending", "disabled", "ledger", "remote-disabled"} {
+		t.Run(gate, func(t *testing.T) {
+			var calls atomic.Int32
+			s, c, dir, p, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) })
+			switch gate {
+			case "owner":
+				p.Registration.OwnerUserID = uuid.NewString()
+			case "server":
+				p.Server = "https://other.example"
+			case "host":
+				p.Registration.HostID = uuid.NewString()
+			case "pending":
+				p.Registration.Pending = true
+			case "disabled":
+				p.Disabled = true
+			case "remote-disabled":
+				v.DesiredState = "disabled"
+			case "ledger":
+				st, e := textbridge.OpenProfileLedger(dir, p)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if e = st.SetEnabled(context.Background(), false); e != nil {
+					t.Fatal(e)
+				}
+				st.Close()
+			}
+			if e := textbridge.SaveProfile(dir, p); e != nil {
+				t.Fatal(e)
+			}
+			e := s.installation(context.Background(), c, v)
+			if gate == "pending" && e == nil {
+				t.Fatal("pending must retain outstanding retry")
+			}
+			if calls.Load() != 0 {
+				t.Fatal("gate sent claim")
+			}
+		})
+	}
+}
+
+func TestTextServiceAmbiguousClaimRetriesDurableBody(t *testing.T) {
+	var bodies [][]byte
+	var dir string
+	s, c, d, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Pagnet-Native-Admission-Id") == "" {
+			t.Error("missing admission")
+		}
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		saved, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+		var a textServiceAttempt
+		if e != nil || json.Unmarshal(saved, &a) != nil || !bytes.Equal(a.Body, raw) {
+			t.Error("POST preceded exact durable record")
+		}
+		if len(bodies) == 1 {
+			w.WriteHeader(500)
+			return
+		}
+		var body textServiceClaimBody
+		json.Unmarshal(raw, &body)
+		json.NewEncoder(w).Encode(sdk.TextServiceReadiness{InstallationID: a.InstallationID, ClaimID: &body.ClaimID, Generation: body.ExpectedGeneration + 1})
+	})
+	dir = d
+	if e := s.installation(context.Background(), c, v); e == nil {
+		t.Fatal("ambiguous request succeeded")
+	}
+	v.Generation++ // authoritative GET after a committed but lost response
+	if e := s.installation(context.Background(), c, v); e != nil {
+		t.Fatal(e)
+	}
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatal("ambiguous retry changed claim")
+	}
+	if e := s.installation(context.Background(), c, v); e != nil {
+		t.Fatal(e)
+	}
+	if len(bodies) != 2 {
+		t.Fatal("confirmed claim repeated")
+	}
+	info, e := os.Stat(filepath.Join(dir, "claim-attempt.json"))
+	if e != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("attempt not private")
+	}
+}
+
+func TestTextServiceRejectsStaleResponse(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	s, c, _, _, _ := textFixture(t, func(w http.ResponseWriter, r *http.Request) { close(entered); <-release; w.Write([]byte("[]")) })
+	done := make(chan error, 1)
+	go func() {
+		var out []textServiceInstallation
+		done <- c.request(context.Background(), http.MethodGet, "", nil, &out)
+	}()
+	<-entered
+	s.disconnect()
+	close(release)
+	if e := <-done; e == nil {
+		t.Fatal("accepted disconnected response")
+	}
+}
+
+func TestTextServiceRegistrationLockWakeRace(t *testing.T) {
+	var posts atomic.Int32
+	var v textServiceInstallation
+	s, c, dir, p, item := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			json.NewEncoder(w).Encode([]textServiceInstallation{v})
+			return
+		}
+		posts.Add(1)
+		var b textServiceClaimBody
+		json.NewDecoder(r.Body).Decode(&b)
+		json.NewEncoder(w).Encode(sdk.TextServiceReadiness{InstallationID: v.ID, ClaimID: &b.ClaimID, Generation: 2})
+	})
+	v = item
+	unlock, e := textbridge.LockProfile(dir)
+	if e != nil {
+		t.Fatal(e)
+	}
+	p.Registration.Pending = true
+	if e = textbridge.SaveProfile(dir, p); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.installation(context.Background(), c, v); e == nil {
+		t.Fatal("contention lost outstanding work")
+	}
+	s.retry = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.run(ctx) }()
+	s.signal() // remote wake arrives while registration still holds the lock
+	time.Sleep(20 * time.Millisecond)
+	p.Registration.Pending = false
+	if e = textbridge.SaveProfile(dir, p); e != nil {
+		t.Fatal(e)
+	}
+	unlock()
+	deadline := time.Now().Add(time.Second)
+	for posts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	if posts.Load() != 1 {
+		t.Fatal("registration completion was stranded")
+	}
+}
+
+func TestTextServiceAdmissionWrongSession(t *testing.T) {
+	s, c, _, _, _ := textFixture(t, func(w http.ResponseWriter, r *http.Request) { t.Error("invalid session made request") })
+	for _, kind := range []string{"host", "scope", "admission"} {
+		p := c.session
+		switch kind {
+		case "host":
+			p.HostID = uuid.NewString()
+		case "scope":
+			p.OwnershipScope = "network"
+		case "admission":
+			p.NativeAdmissionID = "bad"
+		}
+		if got, e := newTextServiceClient(s.daemon, p); e == nil {
+			got.cancel()
+			t.Fatal("invalid session accepted")
+		}
+	}
+}
+
+func TestTextServiceCapabilityAndCoalescedWake(t *testing.T) {
+	d := &Daemon{Config: Config{ServerURL: "https://control.example"}}
+	u, e := url.Parse(d.wsURL(context.Background()))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if u.Query().Get("text_service_bridge") != textServiceBridgeProtocol {
+		t.Fatal("capability absent")
+	}
+	s := newTextServiceSupervisor(d)
+	d.textServices = s
+	for range 10 {
+		d.handleCommand(nil, transport.Envelope{Type: textServicesChanged})
+	}
+	if len(s.wake) != 1 {
+		t.Fatal("wakes did not coalesce")
+	}
+}
+
+func TestTextServiceOldAdmissionAttemptIsNotRebound(t *testing.T) {
+	var calls atomic.Int32
+	s, c, dir, _, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { calls.Add(1); w.WriteHeader(500) })
+	if e := s.installation(context.Background(), c, v); e == nil {
+		t.Fatal("expected ambiguous outcome")
+	}
+	before, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+	if e != nil {
+		t.Fatal(e)
+	}
+	replacement := c.session
+	replacement.NativeAdmissionID = uuid.NewString()
+	replacement.RunnerEpoch = replacement.RunnerEpoch.Add(time.Second)
+	s.admit(replacement)
+	if e = s.installation(context.Background(), s.client, v); e != nil {
+		t.Fatal(e)
+	}
+	after, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if calls.Load() != 1 || !bytes.Equal(before, after) {
+		t.Fatal("old attempt rebound to replacement session")
+	}
+}
