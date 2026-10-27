@@ -85,6 +85,8 @@ func (pc *conn) readLoop() {
 			case <-pc.c.closeCh:
 				return
 			}
+		case ownerTextProjectWakeType:
+			pc.c.handleOwnerTextProjectWake(pc, env)
 		case sharingProjectWakeType:
 			pc.c.handleSharingProjectWake(pc, env)
 		case sharingPairWakeType:

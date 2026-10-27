@@ -458,3 +458,33 @@ func TestOwnerTextTransportAcknowledgedReceipt(t *testing.T) {
 		t.Fatalf("acknowledged receipt: %v", err)
 	}
 }
+
+func TestOwnerTextTransportAllowsOfflinePeer(t *testing.T) {
+	for _, operation := range []string{"send", "receipt", "inbox", "ack"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newOwnerTextTransportFixture(t)
+			caller := f.clients[0]
+			prepared, err := caller.PrepareOwnerTextProjectMessage(f.project, f.clients[1].PrincipalID(), "ASK", nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.wire = prepared.Wire
+			f.status.Roles[1].Ready = false
+			f.status.PrincipalsProved = 1
+			f.status.Ready = false
+			switch operation {
+			case "send":
+				_, err = caller.SendPreparedOwnerTextProjectMessage(context.Background(), f.project, prepared.ID)
+			case "receipt":
+				_, err = caller.OwnerTextProjectMessageReceipt(context.Background(), f.project, prepared.ID)
+			case "inbox":
+				_, err = caller.OwnerTextProjectInbox(context.Background(), f.project, "", 1)
+			case "ack":
+				err = caller.AckOwnerTextProjectMessage(context.Background(), f.project, prepared.ID)
+			}
+			if err != nil {
+				t.Fatalf("offline peer blocked caller's %s: %v", operation, err)
+			}
+		})
+	}
+}

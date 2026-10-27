@@ -110,7 +110,7 @@ func (c *Client) ownerTextProjectTransportSession(ctx context.Context, project s
 			return s, err
 		}
 	}
-	if status.State != "active" || !status.Ready || !status.EndpointProved {
+	if status.State != "active" || !status.EndpointProved {
 		return s, errors.New("sdk: owner text messaging requires active enrollment and current endpoint proof")
 	}
 	return s, s.current(c)
