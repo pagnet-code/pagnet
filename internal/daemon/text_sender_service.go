@@ -2,9 +2,25 @@ package daemon
 
 import (
 	"context"
+	"errors"
 
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 )
+
+// ErrTextSenderUnavailable hides local storage and runtime implementation details.
+var ErrTextSenderUnavailable = errors.New("text sender operation unavailable")
+
+func textSenderError(err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, known := range []error{context.Canceled, context.DeadlineExceeded, sender.ErrInvalid, sender.ErrConflict, sender.ErrDisabled, sender.ErrNotFound} {
+		if errors.Is(err, known) {
+			return known
+		}
+	}
+	return ErrTextSenderUnavailable
+}
 
 // TextSender is an in-process handle to one proved installation and project.
 // It remains pinned to that runtime: callers must resolve a fresh handle after
@@ -53,7 +69,7 @@ func (d *Daemon) TextSender(ctx context.Context, installation, project string) (
 		return nil, sender.ErrDisabled
 	}
 	if _, err := controller.Revision(ctx, project); err != nil {
-		return nil, err
+		return nil, textSenderError(err)
 	}
 	return &TextSender{controller: controller, project: project}, nil
 }
@@ -70,17 +86,17 @@ func textSenderProjection(o sender.Operation) TextSenderOperation {
 // return the durable store's conflict error instead of creating another ASK.
 func (s *TextSender) Submit(ctx context.Context, ask, recipient, prompt string) (TextSenderOperation, error) {
 	o, err := s.controller.ReserveWithID(ctx, s.project, recipient, ask, prompt)
-	return textSenderProjection(o), err
+	return textSenderProjection(o), textSenderError(err)
 }
 
 func (s *TextSender) Read(ctx context.Context, ask string) (TextSenderOperation, error) {
 	o, err := s.controller.Get(ctx, s.project, ask)
-	return textSenderProjection(o), err
+	return textSenderProjection(o), textSenderError(err)
 }
 
 func (s *TextSender) Resume(ctx context.Context, ask string) (TextSenderOperation, error) {
 	o, err := s.controller.Resume(ctx, s.project, ask)
-	return textSenderProjection(o), err
+	return textSenderProjection(o), textSenderError(err)
 }
 
 // List returns at most limit operations (1..100), ordered by ASK UUID, after
@@ -88,7 +104,7 @@ func (s *TextSender) Resume(ctx context.Context, ask string) (TextSenderOperatio
 func (s *TextSender) List(ctx context.Context, after string, limit int) ([]TextSenderOperation, error) {
 	operations, err := s.controller.List(ctx, s.project, after, limit)
 	if err != nil {
-		return nil, err
+		return nil, textSenderError(err)
 	}
 	result := make([]TextSenderOperation, 0, len(operations))
 	for _, o := range operations {
@@ -102,9 +118,11 @@ func (s *TextSender) List(ctx context.Context, after string, limit int) ([]TextS
 // Status returns the runtime's current revision. Subscribe waits for a revision
 // change without an idle timer and ends with ErrDisabled when the runtime fences.
 func (s *TextSender) Status(ctx context.Context) (uint64, error) {
-	return s.controller.Revision(ctx, s.project)
+	revision, err := s.controller.Revision(ctx, s.project)
+	return revision, textSenderError(err)
 }
 
 func (s *TextSender) Subscribe(ctx context.Context, after uint64) (uint64, error) {
-	return s.controller.WaitRevision(ctx, s.project, after)
+	revision, err := s.controller.WaitRevision(ctx, s.project, after)
+	return revision, textSenderError(err)
 }
