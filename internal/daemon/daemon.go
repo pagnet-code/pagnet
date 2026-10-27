@@ -1592,7 +1592,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		}
 		d.enqueueInstance(p.InstanceID, func() {
 			if err := d.handleNativeWorkerRecoveryState(conn, p, CollectKernelBootEvidence); err != nil && d.Log != nil {
-				d.Log.Warn("native worker loss recovery deferred", "instance", p.InstanceID)
+				if errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+					d.Log.Debug("native worker loss recovery waiting", "instance", p.InstanceID, "err", err)
+				} else {
+					d.Log.Warn("native worker loss recovery deferred", "instance", p.InstanceID, "err", err)
+				}
 			}
 		})
 	case transport.MsgNativeOwnershipPrepare:
