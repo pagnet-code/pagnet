@@ -367,3 +367,30 @@ func TestOwnerTextProjectPinRejectsSymlinkAndInsecureDirectory(t *testing.T) {
 		})
 	}
 }
+
+func TestOwnerTextProjectEnrollmentAllowsServerSessionClockSkew(t *testing.T) {
+	f, c := newOwnerTextEnrollmentFixture(t)
+	f.mutateAAD = func(a *ownerTextProjectProofAAD) {
+		a.EndpointStartedAt = time.Now().Add(2 * time.Second).UTC()
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			f.mu.Lock()
+			f.status.EndpointProved = false
+			f.status.PrincipalsProved = 1
+			f.status.Roles[0].Ready = false
+			f.status.Ready = false
+			f.mu.Unlock()
+			c.connGeneration.Add(1)
+		}
+		result, err := c.EnrollOwnerTextProject(context.Background(), enrollmentProjectID, ownerTextInstallation)
+		if err != nil || result.Pending {
+			t.Fatalf("attempt %d: pending=%v error=%v", attempt, result.Pending, err)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.challenges != 2 || f.proofs != 2 {
+		t.Fatalf("challenges=%d proofs=%d", f.challenges, f.proofs)
+	}
+}
