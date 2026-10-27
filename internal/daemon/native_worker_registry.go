@@ -409,7 +409,7 @@ func (r *NativeWorkerRegistry) checkRecoveryFence(instanceID, generation string)
 		return err
 	}
 	if fenced {
-		return errors.New("native worker generation is fenced by recovery")
+		return errNativeWorkerRecoveryFenced
 	}
 	return nil
 }
