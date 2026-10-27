@@ -46,6 +46,7 @@ const (
 var (
 	ErrInvalid  = errors.New("invalid sender operation state")
 	ErrConflict = errors.New("sender operation conflicts with durable state")
+	ErrDisabled = errors.New("sender is disabled")
 	ErrNotFound = errors.New("sender operation not found")
 )
 
@@ -86,6 +87,7 @@ type storedOperation struct {
 }
 
 type state struct {
+	Disabled   bool `json:",omitempty"`
 	Version    int
 	Binding    Binding
 	Operations map[string]storedOperation
@@ -433,6 +435,9 @@ func (s *Store) Reserve(ctx context.Context, project, recipient, prompt string) 
 	if err := s.load(ctx); err != nil {
 		return Operation{}, err
 	}
+	if s.state.Disabled {
+		return Operation{}, ErrDisabled
+	}
 	if !validID(project, false) || !validID(recipient, false) || !validText(prompt, MaxPromptChars) {
 		return Operation{}, ErrInvalid
 	}
@@ -615,3 +620,28 @@ func (s *Store) RecordReply(ctx context.Context, reply Reply) (Operation, error)
 
 // Close releases no OS resources; the caller owns the external exclusive lock.
 func (s *Store) Close() error { s.mu.Lock(); defer s.mu.Unlock(); s.failed = true; return nil }
+
+// Enabled reads the durable, irreversible sender dispatch gate.
+func (s *Store) Enabled(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(ctx); err != nil {
+		return false, err
+	}
+	return !s.state.Disabled, nil
+}
+
+// Disable retains all operation evidence while permanently fencing new work.
+func (s *Store) Disable(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(ctx); err != nil {
+		return err
+	}
+	s.state.Disabled = true
+	if err := s.persist(s.state); err != nil {
+		s.failed = true
+		return err
+	}
+	return nil
+}

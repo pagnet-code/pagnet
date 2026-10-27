@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -22,6 +23,7 @@ import (
 // Profiles bind a single service to immutable provider policy. There is no
 // re-enable operation: disabled profiles cannot revive previously queued work.
 type Profile struct {
+	Role                                        string `json:",omitempty"`
 	Service, Server, Credential                 string
 	ProviderOrigin, Model, KeyFile, Fingerprint string
 	Limits                                      ledger.Limits
@@ -49,7 +51,7 @@ func (r *ProfileRegistration) valid() bool {
 		id, err := uuid.Parse(value)
 		return err == nil && id != uuid.Nil && id.String() == value
 	}
-	if !canonicalUUID(r.InstallationID) || !canonicalUUID(r.HostID) || r.Role != "responder" || r.ProfileVersion != 1 {
+	if !canonicalUUID(r.InstallationID) || !canonicalUUID(r.HostID) || (r.Role != "responder" && r.Role != "sender") || r.ProfileVersion != 1 {
 		return false
 	}
 	if r.Pending && r.TenantID == "" && r.OwnerUserID == "" && r.Generation == 0 && r.DesiredState == "" {
@@ -105,8 +107,24 @@ func LoadProfile(dir, service string) (Profile, error) {
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
-	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service || !filepath.IsAbs(p.KeyFile) || p.Fingerprint == "" || p.Limits.CallsPerDay <= 0 || p.Limits.MaxConcurrent != 1 || !p.Registration.valid() {
+	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service || !p.Registration.valid() {
 		return p, errors.New("invalid local text bridge profile")
+	}
+	// Legacy CLI sender profiles contain only connection fields. Their existing
+	// directory identifies the role; no profile files or SDK spool are migrated.
+	if p.Role == "" && filepath.Base(filepath.Dir(dir)) == "senders" {
+		p.Role = "sender"
+	}
+	role := p.ServiceRole()
+	if (role != "sender" && role != "responder") || (p.Registration != nil && p.Registration.Role != role) {
+		return p, errors.New("invalid local text bridge role")
+	}
+	if role == "sender" {
+		if p.ProviderOrigin != "" || p.Model != "" || p.KeyFile != "" || p.Fingerprint != "" || p.Limits != (ledger.Limits{}) {
+			return p, errors.New("sender profile must not contain provider configuration")
+		}
+	} else if !filepath.IsAbs(p.KeyFile) || p.Fingerprint == "" || p.Limits.CallsPerDay <= 0 || p.Limits.MaxConcurrent != 1 {
+		return p, errors.New("invalid local text bridge provider profile")
 	}
 	if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: service}).Validate(); err != nil {
 		return p, errors.New("invalid local text bridge connection profile")
@@ -225,4 +243,44 @@ func ReadProfileStatus(ctx context.Context, state, service string) (ProfileStatu
 		return ProfileStatus{}, err
 	}
 	return ProfileStatus{Service: p.Service, Disabled: p.Disabled, Budget: budget}, nil
+}
+
+// ServiceRole preserves the implicit responder role of existing profiles.
+func (p Profile) ServiceRole() string {
+	if p.Role == "" {
+		return "responder"
+	}
+	return p.Role
+}
+
+// ProfileDirectoryForRole retains the existing separate sender state directory.
+func ProfileDirectoryForRole(state, service, role string) (string, error) {
+	if role == "responder" {
+		return ProfileDirectory(state, service)
+	}
+	if role != "sender" {
+		return "", errors.New("text bridge role must be sender or responder")
+	}
+	id, err := uuid.Parse(service)
+	if err != nil || id == uuid.Nil || id.String() != service {
+		return "", errors.New("--service must be a service UUID")
+	}
+	base, err := ProfileBase(state)
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "senders", service)
+	return dir, PrivateDir(dir)
+}
+
+// OpenSenderStore never recreates missing saved sender operation state.
+// The caller must hold the profile lock throughout the store's lifetime.
+func OpenSenderStore(dir string, p Profile) (*sender.Store, error) {
+	if p.ServiceRole() != "sender" {
+		return nil, errors.New("sender profile required")
+	}
+	if _, err := ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
+		return nil, errors.New("saved sender operation state is missing or inaccessible")
+	}
+	return sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
 }

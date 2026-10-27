@@ -11,6 +11,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 )
 
@@ -19,6 +20,7 @@ type textServiceRuntime struct {
 	profile                textbridge.Profile
 	dir                    string
 	store                  *ledger.Store
+	senderStore            *sender.Store
 	generation             int64
 	claimID                string
 	cancel                 context.CancelFunc
@@ -30,8 +32,8 @@ type textServiceRuntime struct {
 	released, disable      bool
 }
 
-func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServiceClient, dir string, p textbridge.Profile, store *ledger.Store, unlock func(), a textServiceAttempt) (bool, error) {
-	if s.runProfile == nil {
+func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServiceClient, dir string, p textbridge.Profile, store *ledger.Store, senderStore *sender.Store, unlock func(), a textServiceAttempt) (bool, error) {
+	if (p.ServiceRole() == "sender" && s.runSender == nil) || (p.ServiceRole() == "responder" && s.runProfile == nil) {
 		return false, nil
 	}
 	var body textServiceClaimBody
@@ -57,7 +59,7 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 	}
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(c.ctx, cancel)
-	r := &textServiceRuntime{client: c, profile: p, dir: dir, store: store, generation: a.Result.Generation, claimID: body.ClaimID, cancel: cancel, stopped: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+	r := &textServiceRuntime{client: c, profile: p, dir: dir, store: store, senderStore: senderStore, generation: a.Result.Generation, claimID: body.ClaimID, cancel: cancel, stopped: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
 	s.running[a.InstallationID] = r
 	proof := sdk.TextServiceInstallationProof{InstallationID: a.InstallationID, ClaimID: body.ClaimID, Generation: a.Result.Generation, Nonce: nonce}
 	config := textbridge.RuntimeConfig{Connect: s.connect, NewProvider: s.newProvider, Enabled: func(string) bool {
@@ -144,7 +146,11 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 	}
 	go func() {
 		defer close(r.done)
-		s.runProfile(ctx, dir, p, store, config)
+		if p.ServiceRole() == "sender" {
+			s.runSender(ctx, dir, p, senderStore, config)
+		} else {
+			s.runProfile(ctx, dir, p, store, config)
+		}
 		r.enabled.Store(false)
 		cancel()
 		stop()
@@ -155,7 +161,12 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 		// Completion is an outstanding recovery, never an idle polling timer.
 		time.AfterFunc(s.retry, s.signal)
 		<-r.release
-		store.Close()
+		if store != nil {
+			store.Close()
+		}
+		if senderStore != nil {
+			senderStore.Close()
+		}
 		unlock()
 	}()
 	return true, nil
@@ -174,7 +185,7 @@ func (s *textServiceSupervisor) stopRuntime(r *textServiceRuntime, disable bool)
 	}
 	r.disable = r.disable || disable
 	if r.disable {
-		if err := s.disableProfile(r.dir, r.profile, r.store); err != nil {
+		if err := s.disableProfile(r.dir, r.profile, r.store, r.senderStore); err != nil {
 			return err
 		}
 	}
@@ -186,10 +197,15 @@ func (s *textServiceSupervisor) stopRuntime(r *textServiceRuntime, disable bool)
 
 // Attempt both writes on every reconciliation: either durable gate prevents
 // standalone dispatch while the other write is retried after a partial failure.
-func (s *textServiceSupervisor) disableProfile(dir string, p textbridge.Profile, store *ledger.Store) error {
+func (s *textServiceSupervisor) disableProfile(dir string, p textbridge.Profile, store *ledger.Store, senderStore *sender.Store) error {
 	p.Disabled = true
 	p.Registration.DesiredState = "disabled"
-	ledgerErr := s.disableLedger(store)
+	var ledgerErr error
+	if senderStore != nil {
+		ledgerErr = senderStore.Disable(context.Background())
+	} else {
+		ledgerErr = s.disableLedger(store)
+	}
 	profileErr := s.savePrivate(dir, "profile.json", p)
 	return errors.Join(ledgerErr, profileErr)
 }

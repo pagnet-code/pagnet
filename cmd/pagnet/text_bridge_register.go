@@ -18,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/textbridge"
+	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -43,9 +45,9 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 	if deps.registrationAuthenticate == nil {
 		deps.registrationAuthenticate = authenticateCLI
 	}
-	var service string
-	cmd := &cobra.Command{Use: "register", Short: "Register an enabled local responder on the enrolled host", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		dir, err := textbridge.ProfileDirectory(*stateDir, service)
+	var service, role string
+	cmd := &cobra.Command{Use: "register", Short: "Register an enabled local text service on the enrolled host", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		dir, err := textbridge.ProfileDirectoryForRole(*stateDir, service, role)
 		if err != nil {
 			return err
 		}
@@ -58,21 +60,42 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 		if err != nil {
 			return err
 		}
+		if p.ServiceRole() != role {
+			return errors.New("saved text bridge role does not match --role")
+		}
 		if p.Disabled {
-			return errors.New("text bridge is disabled; registration requires an enabled responder")
+			return errors.New("text bridge is disabled; registration requires an enabled service")
 		}
-		store, err := textbridge.OpenProfileLedger(dir, p)
-		if err != nil {
-			return err
+		var store *ledger.Store
+		var senderStore *sender.Store
+		if role == "sender" {
+			senderStore, err = textbridge.OpenSenderStore(dir, p)
+			if err != nil {
+				return err
+			}
+			defer senderStore.Close()
+			enabled, err := senderStore.Enabled(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if !enabled {
+				return errors.New("text bridge is disabled; registration requires an enabled service")
+			}
+		} else {
+			store, err = textbridge.OpenProfileLedger(dir, p)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			budget, err := store.BudgetSnapshot(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if !budget.Enabled {
+				return errors.New("text bridge is disabled; registration requires an enabled responder")
+			}
 		}
-		defer store.Close()
-		budget, err := store.BudgetSnapshot(cmd.Context())
-		if err != nil {
-			return err
-		}
-		if !budget.Enabled {
-			return errors.New("text bridge is disabled; registration requires an enabled responder")
-		}
+
 		// Resolve config without loading or validating an owner token. In
 		// particular, an overridden URL must be rejected before bearerMe.
 		owner, err := deps.registrationContext()
@@ -94,7 +117,7 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 			return errors.New("registration requires an owner user token for the matching enrolled account")
 		}
 		if p.Registration == nil {
-			p.Registration = &textbridge.ProfileRegistration{InstallationID: uuid.NewString(), HostID: owner.cfg.HostID, Role: "responder", ProfileVersion: 1, Pending: true}
+			p.Registration = &textbridge.ProfileRegistration{InstallationID: uuid.NewString(), HostID: owner.cfg.HostID, Role: role, ProfileVersion: 1, Pending: true}
 		}
 		// Persist the immutable retry tuple before any owner-authenticated PUT. An
 		// interrupted or uncertain request must never cause a replacement ID.
@@ -116,7 +139,11 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 		var disableErr error
 		if installation.DesiredState == "disabled" {
 			p.Disabled = true
-			disableErr = store.SetEnabled(cmd.Context(), false)
+			if role == "sender" {
+				disableErr = senderStore.Disable(cmd.Context())
+			} else {
+				disableErr = store.SetEnabled(cmd.Context(), false)
+			}
 		}
 		// Always persist the disabled profile even if disabling the ledger
 		// failed; either local gate prevents dispatch after remote disable.
@@ -127,7 +154,8 @@ func textBridgeRegisterCmd(stateDir *string, deps textBridgeDependencies) *cobra
 		fmt.Fprintf(cmd.OutOrStdout(), "service %s installation %s host %s: %s; pending daemon verification\n", p.Service, r.InstallationID, r.HostID, r.DesiredState)
 		return nil
 	}}
-	cmd.Flags().StringVar(&service, "service", "", "existing local responder service UUID")
+	cmd.Flags().StringVar(&service, "service", "", "existing local service UUID")
+	cmd.Flags().StringVar(&role, "role", "responder", "local service role: responder or sender")
 	return cmd
 }
 

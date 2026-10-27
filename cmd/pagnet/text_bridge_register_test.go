@@ -18,6 +18,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 	"gopkg.in/yaml.v3"
 )
@@ -68,10 +69,10 @@ func newRegisterFixture(t *testing.T) *registerFixture {
 			t.Error("incorrect owner authentication")
 		}
 		var tuple map[string]any
-		if json.Unmarshal(body, &tuple) != nil || len(tuple) != 4 || tuple["serviceId"] != f.p.Service || tuple["hostId"] != registerTestHost || tuple["role"] != "responder" || tuple["profileVersion"] != float64(1) {
+		if json.Unmarshal(body, &tuple) != nil || len(tuple) != 4 || tuple["serviceId"] != f.p.Service || tuple["hostId"] != registerTestHost || tuple["role"] != f.p.ServiceRole() || tuple["profileVersion"] != float64(1) {
 			t.Error("request disclosed fields outside immutable tuple")
 		}
-		v := textBridgeInstallation{ID: p.Registration.InstallationID, ServiceID: f.p.Service, HostID: registerTestHost, Role: "responder", ProfileVersion: 1, TenantID: registerTestTenant, OwnerUserID: registerTestOwner, Generation: 1, DesiredState: "enabled"}
+		v := textBridgeInstallation{ID: p.Registration.InstallationID, ServiceID: f.p.Service, HostID: registerTestHost, Role: f.p.ServiceRole(), ProfileVersion: 1, TenantID: registerTestTenant, OwnerUserID: registerTestOwner, Generation: 1, DesiredState: "enabled"}
 		if f.respond != nil {
 			f.respond(w, r, v)
 			return
@@ -507,6 +508,61 @@ func TestTextBridgeRunBlocksPartialRemoteDisable(t *testing.T) {
 			_, err := textBridgeExecute(t, f.deps, "run", "--service", p.Service, "--state-dir", f.state)
 			if err == nil || !strings.Contains(err.Error(), "text bridge is disabled") {
 				t.Fatal("partial durable disable allowed standalone run")
+			}
+		})
+	}
+}
+
+func TestTextBridgeRegisterSenderWithoutProvider(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		t.Run(map[bool]string{false: "enabled", true: "remote disable"}[disabled], func(t *testing.T) {
+			f := newRegisterFixture(t)
+			dir, err := textbridge.ProfileDirectoryForRole(f.state, f.p.Service, "sender")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Preserve an existing CLI profile containing only its connection tuple.
+			legacy := textBridgeSenderProfile{Service: f.p.Service, Server: f.p.Server, Credential: f.p.Credential}
+			if err := textbridge.SavePrivateJSON(dir, "profile.json", struct{ Service, Server, Credential string }{legacy.Service, legacy.Server, legacy.Credential}); err != nil {
+				t.Fatal(err)
+			}
+			store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: legacy.Server, PrincipalID: legacy.Service})
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+			f.dir = dir
+			f.p = legacy
+			f.p.Role = "sender"
+			if disabled {
+				f.respond = func(w http.ResponseWriter, _ *http.Request, v textBridgeInstallation) {
+					v.DesiredState = "disabled"
+					json.NewEncoder(w).Encode(v)
+				}
+			}
+			out, err := textBridgeExecute(t, f.deps, "register", "--service", f.p.Service, "--role", "sender", "--state-dir", f.state)
+			registerOutputPrivate(t, out, err)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := f.load(t)
+			if p.ServiceRole() != "sender" || p.Registration.Role != "sender" || p.Registration.Pending || p.Disabled != disabled {
+				t.Fatalf("sender registration: %+v", p.Registration)
+			}
+			store, err = textbridge.OpenSenderStore(dir, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			enabled, err := store.Enabled(context.Background())
+			if err != nil || enabled == disabled {
+				t.Fatalf("sender disable gate: %v %v", enabled, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "ledger")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("sender initialized provider ledger")
+			}
+			if _, err := textBridgeSenderLoadProfile(dir, p.Service); err != nil {
+				t.Fatal("registration broke CLI sender profile loading", err)
 			}
 		})
 	}

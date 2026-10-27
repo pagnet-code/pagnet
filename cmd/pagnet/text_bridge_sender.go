@@ -58,7 +58,7 @@ func textBridgeCreateService(ctx context.Context, owner *cliCtx, name string) (c
 	return created, nil
 }
 
-type textBridgeSenderProfile struct{ Service, Server, Credential string }
+type textBridgeSenderProfile = textbridge.Profile
 
 type textBridgeSenderConnection interface {
 	sender.Connection
@@ -113,7 +113,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				retErr = fmt.Errorf("service %s was created but local sender setup failed; inspect Services before retrying: %w", created.ID, retErr)
 			}
 		}()
-		p := textBridgeSenderProfile{Service: created.ID, Server: owner.base, Credential: created.Credential}
+		p := textBridgeSenderProfile{Role: "sender", Service: created.ID, Server: owner.base, Credential: created.Credential}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created sender has invalid connection configuration")
 		}
@@ -178,6 +178,9 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if err != nil {
 				return err
 			}
+			if action != "result" && (p.Disabled || (p.Registration != nil && (p.Registration.Pending || p.Registration.DesiredState == "disabled"))) {
+				return errors.New("sender is disabled or registration is unconfirmed")
+			}
 			// A saved profile must never recreate missing deduplication state.
 			if _, err := textbridge.ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
 				return errors.New("saved sender operation state is missing or inaccessible")
@@ -241,18 +244,12 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 }
 
 func textBridgeSenderLoadProfile(dir, service string) (textBridgeSenderProfile, error) {
-	var p textBridgeSenderProfile
-	raw, err := textbridge.ReadPrivate(filepath.Join(dir, "profile.json"), 32768)
+	p, err := textbridge.LoadProfile(dir, service)
 	if err != nil {
-		return p, errors.New("sender profile unavailable")
+		return p, err
 	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service {
+	if p.ServiceRole() != "sender" {
 		return p, errors.New("invalid local sender profile")
-	}
-	if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: service}).Validate(); err != nil {
-		return p, errors.New("invalid local sender connection profile")
 	}
 	return p, nil
 }

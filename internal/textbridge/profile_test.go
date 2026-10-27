@@ -367,3 +367,36 @@ func TestSavePrivateJSONLocalFilename(t *testing.T) {
 		t.Fatal("save left temporary files")
 	}
 }
+
+func TestSenderProfileCompatibilityAndProviderRejection(t *testing.T) {
+	state, _, _ := savedTestProfile(t)
+	dir, err := ProfileDirectoryForRole(state, profileTestService, "sender")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := struct{ Service, Server, Credential string }{profileTestService, "https://example.com", "pgn_act_v1_test"}
+	if err := SavePrivateJSON(dir, "profile.json", legacy); err != nil {
+		t.Fatal(err)
+	}
+	p, err := LoadProfile(dir, profileTestService)
+	if err != nil || p.ServiceRole() != "sender" || p.ProviderOrigin != "" {
+		t.Fatalf("legacy sender: %+v %v", p, err)
+	}
+	for _, mutate := range []func(*Profile){
+		func(p *Profile) { p.ProviderOrigin = "https://provider.example" },
+		func(p *Profile) { p.Model = "model" },
+		func(p *Profile) { p.KeyFile = "/key" },
+		func(p *Profile) { p.Fingerprint = "fingerprint" },
+		func(p *Profile) { p.Limits.CallsPerDay = 1 },
+		func(p *Profile) { p.Role = "other" },
+	} {
+		bad := p
+		mutate(&bad)
+		if err := SaveProfile(dir, bad); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadProfile(dir, profileTestService); err == nil {
+			t.Fatal("accepted invalid sender provider/role configuration")
+		}
+	}
+}

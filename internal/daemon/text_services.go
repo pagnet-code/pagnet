@@ -22,6 +22,7 @@ import (
 	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/ledger"
 	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
+	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -142,6 +143,7 @@ type textServiceSupervisor struct {
 	retry         time.Duration
 	savePrivate   func(string, string, any) error
 	running       map[string]*textServiceRuntime
+	runSender     func(context.Context, string, textbridge.Profile, *sender.Store, textbridge.RuntimeConfig) error
 	runProfile    func(context.Context, string, textbridge.Profile, textbridge.Ledger, textbridge.RuntimeConfig) error
 	connect       func(context.Context, sdk.Config) (textbridge.RuntimeConnection, error)
 	newProvider   func(provider.Config) (textbridge.Provider, error)
@@ -150,7 +152,7 @@ type textServiceSupervisor struct {
 }
 
 func newTextServiceSupervisor(d *Daemon) *textServiceSupervisor {
-	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, proofRetry: time.Second, disableLedger: func(store *ledger.Store) error { return store.SetEnabled(context.Background(), false) }}
+	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, runSender: textbridge.RunSenderProfile, proofRetry: time.Second, disableLedger: func(store *ledger.Store) error { return store.SetEnabled(context.Background(), false) }}
 }
 func (s *textServiceSupervisor) signal() {
 	select {
@@ -230,7 +232,7 @@ func (s *textServiceSupervisor) reconcile(ctx context.Context, c *textServiceCli
 	}
 	seen := map[string]bool{}
 	for _, v := range all {
-		if !textServiceUUID(v.ID) || !textServiceUUID(v.ServiceID) || v.HostID != c.session.HostID || v.Role != "responder" || v.ProfileVersion != 1 || v.Generation < 1 || (v.ActiveClaimID != nil && !textServiceUUID(*v.ActiveClaimID)) || seen[v.ID] || (v.DesiredState != "enabled" && v.DesiredState != "disabled") {
+		if !textServiceUUID(v.ID) || !textServiceUUID(v.ServiceID) || v.HostID != c.session.HostID || (v.Role != "responder" && v.Role != "sender") || v.ProfileVersion != 1 || v.Generation < 1 || (v.ActiveClaimID != nil && !textServiceUUID(*v.ActiveClaimID)) || seen[v.ID] || (v.DesiredState != "enabled" && v.DesiredState != "disabled") {
 			s.fenceRuntimes(c)
 			return errTextServiceOutstanding
 		}
@@ -255,7 +257,7 @@ func (s *textServiceSupervisor) reconcile(ctx context.Context, c *textServiceCli
 			stopped = true
 		default:
 		}
-		matches := exists && v.ServiceID == r.profile.Service && v.HostID == c.session.HostID && v.Role == "responder" && v.ProfileVersion == 1 && v.Generation == r.generation && v.ActiveClaimID != nil && *v.ActiveClaimID == r.claimID && v.DesiredState == "enabled" && r.client == c
+		matches := exists && v.ServiceID == r.profile.Service && v.HostID == c.session.HostID && v.Role == r.profile.ServiceRole() && v.ProfileVersion == 1 && v.Generation == r.generation && v.ActiveClaimID != nil && *v.ActiveClaimID == r.claimID && v.DesiredState == "enabled" && r.client == c
 		if !matches || stopped {
 			if e := s.stopRuntime(r, exists && v.DesiredState == "disabled"); e != nil {
 				outstanding = true
@@ -290,6 +292,9 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		return e
 	}
 	dir := filepath.Join(base, v.ServiceID)
+	if v.Role == "sender" {
+		dir = filepath.Join(base, "senders", v.ServiceID)
+	}
 	if _, err := os.Lstat(filepath.Join(dir, "profile.json")); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -322,7 +327,16 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	if textServiceServer(p.Server) == "" || textServiceServer(p.Server) != textServiceServer(c.server) || r.InstallationID != v.ID || r.HostID != c.session.HostID || r.TenantID != c.session.TenantID || r.OwnerUserID != c.session.AccountID || r.Role != v.Role || r.ProfileVersion != v.ProfileVersion || r.Generation > v.Generation {
 		return nil
 	}
-	store, e := textbridge.OpenProfileLedger(dir, p)
+	if p.ServiceRole() != v.Role {
+		return nil
+	}
+	var store *ledger.Store
+	var senderStore *sender.Store
+	if v.Role == "sender" {
+		senderStore, e = textbridge.OpenSenderStore(dir, p)
+	} else {
+		store, e = textbridge.OpenProfileLedger(dir, p)
+	}
 	if e != nil {
 		if v.DesiredState == "disabled" {
 			p.Disabled = true
@@ -334,26 +348,40 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	}
 	defer func() {
 		if !retained {
-			store.Close()
+			if store != nil {
+				store.Close()
+			}
+			if senderStore != nil {
+				senderStore.Close()
+			}
 		}
 	}()
 	launch := func(a textServiceAttempt) error {
 		var err error
-		retained, err = s.startRuntime(ctx, c, dir, p, store, unlock, a)
+		retained, err = s.startRuntime(ctx, c, dir, p, store, senderStore, unlock, a)
 		return err
 	}
-	// An authoritative disable must repair both durable flags even if a
-	// previous partial write already closed one of the local dispatch gates.
+	// Repair both durable gates after a partially persisted remote disable.
 	if v.DesiredState == "disabled" {
 		r.Generation = v.Generation
-		return s.disableProfile(dir, p, store)
+		return s.disableProfile(dir, p, store, senderStore)
 	}
-	budget, e := store.BudgetSnapshot(ctx)
-	if e != nil {
-		return e
-	}
-	if !budget.Enabled {
-		return nil
+	if senderStore != nil {
+		enabled, err := senderStore.Enabled(ctx)
+		if err != nil {
+			return err
+		}
+		if !enabled {
+			return nil
+		}
+	} else {
+		budget, err := store.BudgetSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		if !budget.Enabled {
+			return nil
+		}
 	}
 	var a textServiceAttempt
 	raw, e := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)

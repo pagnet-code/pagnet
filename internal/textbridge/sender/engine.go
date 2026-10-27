@@ -133,6 +133,11 @@ func Reconcile(ctx context.Context, conn Connection, store *Store, operation Ope
 			return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
 		}
 	}
+	if enabled, gateErr := store.Enabled(ctx); gateErr != nil {
+		return operation, gateErr
+	} else if !enabled {
+		return operation, ErrDisabled
+	}
 	status, err := conn.SharingProjectStatus(ctx, operation.ProjectID)
 	if err != nil || status.ProjectID != operation.ProjectID || status.State != "active" || !status.EndpointProved {
 		return operation, errors.New("sender project is not ready; resume the saved ASK after enrollment")
@@ -163,6 +168,11 @@ func Reconcile(ctx context.Context, conn Connection, store *Store, operation Ope
 	}
 	receipt, err := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID)
 	if err != nil {
+		if enabled, gateErr := store.Enabled(ctx); gateErr != nil {
+			return operation, gateErr
+		} else if !enabled {
+			return operation, ErrDisabled
+		}
 		receipt, err = conn.SendPreparedSharingProjectMessage(ctx, operation.ProjectID, operation.AskID)
 		if err != nil {
 			return operation, errors.New("sender admission outcome unresolved; resume the same saved ASK")
