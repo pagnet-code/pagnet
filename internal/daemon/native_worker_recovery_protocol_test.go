@@ -3,12 +3,15 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +56,62 @@ func recoveryProtocolFixture(t *testing.T) (*Daemon, *NativeObservationConnectio
 
 func bootReader(boot transport.KernelBootEvidence) func() (transport.KernelBootEvidence, error) {
 	return func() (transport.KernelBootEvidence, error) { return boot, nil }
+}
+
+func TestNativeWorkerRecoveryStateLogging(t *testing.T) {
+	for _, unexpected := range []bool{false, true} {
+		name := "same-boot-deferred"
+		if unexpected {
+			name = "unexpected-error"
+		}
+		t.Run(name, func(t *testing.T) {
+			d, _, p, acks, _ := recoveryProtocolFixture(t)
+			boot, err := CollectKernelBootEvidence()
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.PrepareBoot, p.OriginalBoot = boot, &boot
+			if unexpected {
+				p.HostID = domain.NewID().String()
+			}
+			var output bytes.Buffer
+			d.Log = slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			d.instQueues = make(map[string]*instQueue)
+			t.Cleanup(func() { d.finishQueue(p.InstanceID) })
+			env, err := transport.NewEnvelope(transport.MsgNativeWorkerRecoveryState, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				d.handleCommand(nil, env)
+			}
+			done := make(chan struct{})
+			if !d.enqueueInstance(p.InstanceID, func() { close(done) }) {
+				t.Fatal("completion barrier enqueue failed")
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("recovery state handling did not finish")
+			}
+			level, category := "DEBUG", ErrNativeOriginAdmissionDeferred
+			if unexpected {
+				level, category = "WARN", ErrNativeObservationConflict
+			}
+			if got := strings.Count(output.String(), "level="+level); got != 3 {
+				t.Fatalf("%s entries = %d, want 3: %s", level, got, output.String())
+			}
+			if !unexpected && strings.Contains(output.String(), "level=WARN") {
+				t.Fatalf("same-boot retry warned: %s", output.String())
+			}
+			if !strings.Contains(output.String(), category.Error()) {
+				t.Fatalf("missing actual error: %s", output.String())
+			}
+			if len(*acks) != 0 {
+				t.Fatal("deferred or invalid recovery state acknowledged")
+			}
+		})
+	}
 }
 
 func TestNativeWorkerRecoveryProtocolDurableFenceBeforeAck(t *testing.T) {
