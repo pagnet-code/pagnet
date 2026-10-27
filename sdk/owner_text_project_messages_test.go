@@ -40,7 +40,7 @@ func ownerTextID(t *testing.T) string {
 func TestOwnerTextMessagesRoundTripAndAuthenticatedReply(t *testing.T) {
 	project, clients := ownerTextMessageFixture(t)
 	sender, responder := clients[0], clients[1]
-	ask, err := sender.EncryptOwnerTextProjectMessage(project, responder.PrincipalID(), "ASK", ownerTextID(t), []byte("question"), nil)
+	ask, err := sender.PrepareOwnerTextProjectMessageWithID(project, responder.PrincipalID(), "ASK", ownerTextID(t), []byte("question"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestOwnerTextMessagesRoundTripAndAuthenticatedReply(t *testing.T) {
 	if err != nil || string(opened.Plaintext) != "question" || opened.Header.ThreadID != ask.ID || opened.Header.CorrelationID != nil {
 		t.Fatalf("ASK: %+v %v", opened, err)
 	}
-	reply, err := responder.EncryptOwnerTextProjectMessage(project, sender.PrincipalID(), "REPLY", ownerTextID(t), []byte("answer"), ask.Wire)
+	reply, err := responder.PrepareOwnerTextProjectMessageWithID(project, sender.PrincipalID(), "REPLY", ownerTextID(t), []byte("answer"), ask.Wire)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,23 +62,23 @@ func TestOwnerTextMessagesRoundTripAndAuthenticatedReply(t *testing.T) {
 	if _, err = sender.DecryptOwnerTextProjectMessage(project, reply.Wire, ask.Wire, reply.LocalEvidence); err == nil {
 		t.Fatal("wrong evidence accepted")
 	}
-	if _, err = sender.EncryptOwnerTextProjectMessage(project, responder.PrincipalID(), "REPLY", ownerTextID(t), nil, reply.Wire); err == nil {
+	if _, err = sender.PrepareOwnerTextProjectMessageWithID(project, responder.PrincipalID(), "REPLY", ownerTextID(t), nil, reply.Wire); err == nil {
 		t.Fatal("REPLY-to-REPLY accepted")
 	}
-	if _, err = responder.EncryptOwnerTextProjectMessage(project, sender.PrincipalID(), "ASK", ownerTextID(t), nil, nil); err == nil {
+	if _, err = responder.PrepareOwnerTextProjectMessageWithID(project, sender.PrincipalID(), "ASK", ownerTextID(t), nil, nil); err == nil {
 		t.Fatal("wrong ASK role accepted")
 	}
-	if _, err = sender.EncryptOwnerTextProjectMessage(project, responder.PrincipalID(), "REPLY", ownerTextID(t), nil, ask.Wire); err == nil {
+	if _, err = sender.PrepareOwnerTextProjectMessageWithID(project, responder.PrincipalID(), "REPLY", ownerTextID(t), nil, ask.Wire); err == nil {
 		t.Fatal("wrong REPLY role accepted")
 	}
-	if _, err = sender.EncryptOwnerTextProjectMessage(project, responder.PrincipalID(), "ASK", uuid.NewString(), nil, nil); err == nil {
+	if _, err = sender.PrepareOwnerTextProjectMessageWithID(project, responder.PrincipalID(), "ASK", uuid.NewString(), nil, nil); err == nil {
 		t.Fatal("non-v7 ID accepted")
 	}
 }
 func TestOwnerTextMessagesRejectTamperingAndCanonicalBytes(t *testing.T) {
 	project, clients := ownerTextMessageFixture(t)
 	sender, responder := clients[0], clients[1]
-	ask, err := sender.EncryptOwnerTextProjectMessage(project, responder.PrincipalID(), "ASK", ownerTextID(t), []byte("secret"), nil)
+	ask, err := sender.PrepareOwnerTextProjectMessageWithID(project, responder.PrincipalID(), "ASK", ownerTextID(t), []byte("secret"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestOwnerTextMessagesRejectTamperingAndCanonicalBytes(t *testing.T) {
 			if _, err := responder.DecryptOwnerTextProjectMessage(project, raw, nil, nil); err == nil {
 				t.Fatal("tampering accepted")
 			}
-			if _, err := responder.EncryptOwnerTextProjectMessage(project, sender.PrincipalID(), "REPLY", ownerTextID(t), nil, raw); err == nil {
+			if _, err := responder.PrepareOwnerTextProjectMessageWithID(project, sender.PrincipalID(), "REPLY", ownerTextID(t), nil, raw); err == nil {
 				t.Fatal("untrusted ASK accepted")
 			}
 		})
@@ -188,7 +188,7 @@ func TestOwnerTextMessagesValidatePinnedDescriptorAndKey(t *testing.T) {
 			if err = os.WriteFile(path, raw, 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err = sender.EncryptOwnerTextProjectMessage(project, clients[1].PrincipalID(), "ASK", ownerTextID(t), nil, nil); err == nil {
+			if _, err = sender.PrepareOwnerTextProjectMessageWithID(project, clients[1].PrincipalID(), "ASK", ownerTextID(t), nil, nil); err == nil {
 				t.Fatal("invalid pin accepted")
 			}
 		})

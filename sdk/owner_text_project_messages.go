@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/e2ee"
 )
 
@@ -44,11 +45,10 @@ type ownerTextProjectMessageWire struct {
 	Envelope ownerTextProjectMessageEnvelope `json:"envelope"`
 }
 
-// EncryptedOwnerTextProjectMessage contains canonical wire bytes and local
-// evidence authenticating those exact bytes to the preparing identity. Retain
-// ASK evidence to decrypt its REPLY. This API does not persist or reserve IDs;
-// callers must allocate a fresh UUIDv7 and retain exact bytes for retries.
-type EncryptedOwnerTextProjectMessage struct {
+// PreparedOwnerTextProjectMessage contains immutable canonical wire bytes and
+// local evidence authenticating those exact bytes to the preparing identity.
+// Preparation reserves the ID durably before encryption; retry by loading it.
+type PreparedOwnerTextProjectMessage struct {
 	ID            string
 	Wire          []byte
 	LocalEvidence []byte
@@ -146,17 +146,29 @@ func validateOwnerTextReply(w, ask ownerTextProjectMessageWire) error {
 	}
 	return nil
 }
-func (c *Client) ownerTextMessageEvidence(wire []byte) []byte {
-	mac := hmac.New(sha256.New, c.identityPriv)
+func ownerTextProjectLocalEvidence(private, wire []byte) []byte {
+	mac := hmac.New(sha256.New, private)
 	mac.Write([]byte("pagnet/owner-text-project/local-message-evidence/v1\x00"))
 	mac.Write(wire)
 	return mac.Sum(nil)
 }
 
-// EncryptOwnerTextProjectMessage encrypts using an explicit fresh UUIDv7. A
-// REPLY requires the root ASK wire, authenticated with the pinned sender key.
-func (c *Client) EncryptOwnerTextProjectMessage(project, recipient, kind, id string, plaintext, predecessorWire []byte) (EncryptedOwnerTextProjectMessage, error) {
-	result := EncryptedOwnerTextProjectMessage{ID: id}
+// PrepareOwnerTextProjectMessage reserves a new UUIDv7 before encryption and
+// durably stores the canonical wire. An error may return a reserved ID; a
+// reservation without wire is unresolved and must never be reencrypted.
+func (c *Client) PrepareOwnerTextProjectMessage(project, recipient, kind string, plaintext, predecessorWire []byte) (PreparedOwnerTextProjectMessage, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return PreparedOwnerTextProjectMessage{}, err
+	}
+	return c.PrepareOwnerTextProjectMessageWithID(project, recipient, kind, id.String(), plaintext, predecessorWire)
+}
+
+// PrepareOwnerTextProjectMessageWithID reserves an explicit strict UUIDv7. The
+// ID is returned on every error for reconciliation with LoadPreparedOwnerTextProjectMessage.
+// A reserved ID cannot be prepared again, even when its reservation has no wire.
+func (c *Client) PrepareOwnerTextProjectMessageWithID(project, recipient, kind, id string, plaintext, predecessorWire []byte) (PreparedOwnerTextProjectMessage, error) {
+	result := PreparedOwnerTextProjectMessage{ID: id}
 	d, hash, err := c.ownerTextMessageDescriptor(project)
 	if err != nil {
 		return result, err
@@ -191,6 +203,13 @@ func (c *Client) EncryptOwnerTextProjectMessage(project, recipient, kind, id str
 		return result, err
 	}
 	aad, _ := json.Marshal(w.OwnerTextProjectMessageHeader)
+	input := sha256.New()
+	input.Write(aad)
+	input.Write(plaintext)
+	reservation := ownerTextProjectMessageReservation{Header: w.OwnerTextProjectMessageHeader, InputDigest: hex.EncodeToString(input.Sum(nil)), ExpiresAt: d.ExpiresAt}
+	if err = c.kr.reserveOwnerTextProjectMessage(c.principalID.Load(), c.identityPriv, reservation); err != nil {
+		return result, err
+	}
 	enc, ct, err := e2ee.HPKEWrapAuth(key, c.identityPriv, []byte(ownerTextProjectMessageInfo), aad, plaintext)
 	if err != nil {
 		return result, err
@@ -200,13 +219,17 @@ func (c *Client) EncryptOwnerTextProjectMessage(project, recipient, kind, id str
 	if _, _, _, err = parseOwnerTextProjectMessage(raw, d, hash); err != nil {
 		return result, err
 	}
-	result.Wire, result.LocalEvidence = raw, c.ownerTextMessageEvidence(raw)
+	evidence := ownerTextProjectLocalEvidence(c.identityPriv, raw)
+	if err = c.kr.storeOwnerTextProjectMessage(c.principalID.Load(), c.identityPriv, reservation, raw, evidence); err != nil {
+		return result, err
+	}
+	result.Wire, result.LocalEvidence = raw, evidence
 	return result, nil
 }
 
-// DecryptOwnerTextProjectMessage requires the original root ASK and its local
-// evidence when opening a REPLY. Arbitrary caller-supplied predecessor bytes do
-// not authenticate a locally sent ASK. ASK messages require neither argument.
+// DecryptOwnerTextProjectMessage authenticates REPLY predecessors using either
+// a durable local ASK binding (when both predecessor arguments are absent) or
+// exact original ASK wire and its local evidence. ASK requires neither argument.
 func (c *Client) DecryptOwnerTextProjectMessage(project string, wire, predecessorWire, predecessorEvidence []byte) (DecryptedOwnerTextProjectMessage, error) {
 	var result DecryptedOwnerTextProjectMessage
 	d, hash, err := c.ownerTextMessageDescriptor(project)
@@ -218,12 +241,24 @@ func (c *Client) DecryptOwnerTextProjectMessage(project string, wire, predecesso
 		return result, err
 	}
 	if w.Kind == "REPLY" {
-		if !hmac.Equal(predecessorEvidence, c.ownerTextMessageEvidence(predecessorWire)) {
-			return result, errors.New("sdk: unauthenticated owner text predecessor")
-		}
-		ask, _, _, err := parseOwnerTextProjectMessage(predecessorWire, d, hash)
-		if err != nil {
-			return result, err
+		var ask ownerTextProjectMessageWire
+		if len(predecessorWire) == 0 && len(predecessorEvidence) == 0 {
+			record, loadErr := c.kr.loadOwnerTextProjectMessageBinding(c.principalID.Load(), c.identityPriv, *w.CorrelationID)
+			if loadErr != nil {
+				return result, loadErr
+			}
+			if record.Reservation.Header.ProjectID != project || record.Reservation.Header.DescriptorHash != hex.EncodeToString(hash) {
+				return result, errors.New("sdk: owner text predecessor project binding mismatch")
+			}
+			ask.OwnerTextProjectMessageHeader = record.Reservation.Header
+		} else {
+			if !hmac.Equal(predecessorEvidence, ownerTextProjectLocalEvidence(c.identityPriv, predecessorWire)) {
+				return result, errors.New("sdk: unauthenticated owner text predecessor")
+			}
+			ask, _, _, err = parseOwnerTextProjectMessage(predecessorWire, d, hash)
+			if err != nil {
+				return result, err
+			}
 		}
 		if ask.SenderPrincipalID != c.principalID.Load() {
 			return result, errors.New("sdk: owner text predecessor belongs to another sender")
@@ -239,5 +274,33 @@ func (c *Client) DecryptOwnerTextProjectMessage(project string, wire, predecesso
 		return result, err
 	}
 	result.Header = w.OwnerTextProjectMessageHeader
+	return result, nil
+}
+
+// LoadPreparedOwnerTextProjectMessage returns the exact persisted retry wire.
+// Reserved, admitted and abandoned messages cannot be loaded for retry.
+func (c *Client) LoadPreparedOwnerTextProjectMessage(project, id string) (PreparedOwnerTextProjectMessage, error) {
+	result := PreparedOwnerTextProjectMessage{ID: id}
+	if c.kr == nil || !projectUUID(project, false) || !projectUUID(id, true) || !projectUUID(c.principalID.Load(), false) {
+		return result, errors.New("sdk: invalid owner text prepared message identity")
+	}
+	record, err := c.kr.loadOwnerTextProjectMessage(c.principalID.Load(), c.identityPriv, id)
+	if err != nil {
+		return result, err
+	}
+	d, hash, err := c.ownerTextMessageDescriptor(project)
+	if err != nil {
+		return result, err
+	}
+	w, _, _, err := parseOwnerTextProjectMessage(record.Wire, d, hash)
+	if err != nil {
+		return result, err
+	}
+	header, _ := json.Marshal(w.OwnerTextProjectMessageHeader)
+	reserved, _ := json.Marshal(record.Reservation.Header)
+	if !bytes.Equal(header, reserved) || w.SenderPrincipalID != c.principalID.Load() || record.Reservation.ExpiresAt != d.ExpiresAt {
+		return result, errors.New("sdk: owner text prepared message binding mismatch")
+	}
+	result.Wire, result.LocalEvidence = record.Wire, record.LocalEvidence
 	return result, nil
 }
