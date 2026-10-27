@@ -27,8 +27,10 @@ type RuntimeConnection interface {
 type RuntimeConfig struct {
 	NewProvider func(provider.Config) (Provider, error)
 	Connect     func(context.Context, sdk.Config) (RuntimeConnection, error)
-	Enabled     func(string) bool
-	OnError     func(error)
+	// Authorize runs on the authenticated endpoint before handlers or dispatch.
+	Authorize func(context.Context, RuntimeConnection) error
+	Enabled   func(string) bool
+	OnError   func(error)
 }
 
 // RunProfile runs a local responder until cancellation, connection termination,
@@ -69,11 +71,43 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 		return errors.New("text bridge service connection failed")
 	}
 	defer conn.Close()
+	monitorDone := make(chan struct{})
+	monitorExited := make(chan struct{})
+	defer func() { close(monitorDone); <-monitorExited }()
+	go func() {
+		defer close(monitorExited)
+		select {
+		case <-conn.Done():
+			cancel()
+		case <-monitorDone:
+		}
+	}()
 	identity, err := conn.WhoAmI(ctx)
 	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != p.Service {
 		return errors.New("text bridge authenticated identity does not match saved service")
 	}
-	b := New(store, conn, client, Config{ProviderConfigFingerprint: p.Fingerprint, Enabled: config.Enabled, OnError: config.OnError})
+	if config.Authorize != nil {
+		if err := config.Authorize(ctx, conn); err != nil {
+			return err
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	select {
+	case <-conn.Done():
+		return errors.New("text bridge service connection terminated")
+	default:
+	}
+	enabled := func(project string) bool {
+		select {
+		case <-conn.Done():
+			return false
+		default:
+		}
+		return ctx.Err() == nil && config.Enabled != nil && config.Enabled(project)
+	}
+	b := New(store, conn, client, Config{ProviderConfigFingerprint: p.Fingerprint, Enabled: enabled, OnError: config.OnError})
 	conn.OnSharingProjectMessage(b.HandleMessage)
 	conn.OnSharingProjectReady(func(string) { b.Wake() })
 	worker := make(chan error, 1)

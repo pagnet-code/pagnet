@@ -26,7 +26,7 @@ func textProofClient(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Helper()
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	c := &Client{}
+	c := &Client{cur: &conn{dead: make(chan struct{})}}
 	c.endpointID.Store(textEndpointID)
 	c.credential.Store("pgn_epd_v1_current-secret")
 	c.connected.Store(true)
@@ -266,5 +266,40 @@ func TestProveTextServiceInstallationKeepsSharedRedirectPolicy(t *testing.T) {
 	}
 	if c.rest != originalRest || c.rest.http != originalHTTP || !errors.Is(c.rest.http.CheckRedirect(nil, nil), marker) || policyCalls != 1 {
 		t.Fatal("proof changed shared REST redirect policy")
+	}
+}
+
+func TestProveTextServiceInstallationRejectsReplacedEndpoint(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	c := textProofClient(t, func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		json.NewEncoder(w).Encode(textProofResponse())
+	})
+	endpoint, dead, err := c.TextServiceEndpointSession()
+	if err != nil || endpoint != textEndpointID {
+		t.Fatal("live session unavailable")
+	}
+	done := make(chan error, 1)
+	go func() { _, err := c.ProveTextServiceInstallation(context.Background(), textProofInput()); done <- err }()
+	<-entered
+	c.connMu.Lock()
+	close(c.cur.dead)
+	c.cur = &conn{dead: make(chan struct{})}
+	c.endpointID.Store("f6ac6a1b-677e-42dc-a641-112198a736ed")
+	c.connMu.Unlock()
+	close(release)
+	if err = <-done; err == nil {
+		t.Fatal("proof response survived endpoint replacement")
+	}
+	select {
+	case <-dead:
+	default:
+		t.Fatal("old endpoint pin remained live")
+	}
+	fresh, freshDone, err := c.TextServiceEndpointSession()
+	if err != nil || fresh == endpoint || freshDone == dead {
+		t.Fatal("replacement inherited old session pin")
 	}
 }

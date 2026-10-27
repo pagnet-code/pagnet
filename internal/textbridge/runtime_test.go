@@ -247,3 +247,94 @@ func TestRunProfileRejectsChangedProviderKeyBeforeFactories(t *testing.T) {
 		t.Fatal("provider fingerprint mismatch did not fail safely")
 	}
 }
+
+func TestRunProfileAuthorizationBeforeDispatch(t *testing.T) {
+	for _, kind := range []string{"reject", "identity mismatch", "success"} {
+		t.Run(kind, func(t *testing.T) {
+			dir, p, store, conn := runtimeFixture(t)
+			client := &fakeProvider{}
+			cfg := runtimeConfig(t, dir, p, conn, client)
+			authorized := false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cfg.Authorize = func(ctx context.Context, got RuntimeConnection) error {
+				if got != conn || conn.message != nil || conn.ready != nil || client.calls != 0 {
+					t.Fatal("dispatch preceded authorization")
+				}
+				authorized = true
+				if kind == "reject" {
+					return errors.New("rejected")
+				}
+				return nil
+			}
+			if kind == "identity mismatch" {
+				conn.identity.PrincipalID = "other"
+			}
+			conn.onReady = func() {
+				if !authorized {
+					t.Error("callbacks preceded authorization")
+				}
+				cancel()
+			}
+			err := RunProfile(ctx, dir, p, store, cfg)
+			if kind == "success" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil {
+				t.Fatal("authorization failure accepted")
+			}
+			if kind == "identity mismatch" && authorized {
+				t.Fatal("hook ran for wrong identity")
+			}
+			if kind != "success" && (conn.message != nil || conn.ready != nil) {
+				t.Fatal("callbacks installed after rejection")
+			}
+			if client.calls != 0 {
+				t.Fatal("provider dispatched before authorization")
+			}
+		})
+	}
+}
+
+func TestRunProfileJoinsAuthorizationOnCancellation(t *testing.T) {
+	for _, cause := range []string{"parent", "endpoint"} {
+		t.Run(cause, func(t *testing.T) {
+			dir, p, store, conn := runtimeFixture(t)
+			cfg := runtimeConfig(t, dir, p, conn, &fakeProvider{})
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			cancelled := make(chan struct{})
+			cfg.Authorize = func(ctx context.Context, _ RuntimeConnection) error {
+				close(entered)
+				<-ctx.Done()
+				close(cancelled)
+				<-release
+				return ctx.Err()
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- RunProfile(ctx, dir, p, store, cfg) }()
+			runtimeAwait(t, entered, "authorization start")
+			if cause == "parent" {
+				cancel()
+			} else {
+				close(conn.terminal)
+			}
+			runtimeAwait(t, cancelled, "authorization cancellation")
+			select {
+			case <-done:
+				t.Fatal("runtime returned before joining authorization")
+			default:
+			}
+			close(release)
+			if err := <-done; err == nil {
+				t.Fatal("cancelled authorization accepted")
+			}
+			if conn.message != nil || conn.ready != nil {
+				t.Fatal("cancelled startup installed callbacks")
+			}
+		})
+	}
+}

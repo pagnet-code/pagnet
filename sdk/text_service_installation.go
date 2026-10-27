@@ -49,10 +49,26 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	if err := c.checkOpen(); err != nil {
 		return out, err
 	}
-	endpoint := c.EndpointID()
-	credential, _ := c.credential.Load().(string)
-	if !c.connected.Load() || !projectUUID(endpoint, false) || !strings.HasPrefix(credential, "pgn_epd_v1_") || c.rest == nil || c.rest.http == nil {
+	endpoint, credential, sessionDone, sessionErr := c.textServiceEndpointSession()
+	if sessionErr != nil || !strings.HasPrefix(credential, "pgn_epd_v1_") || c.rest == nil || c.rest.http == nil {
 		return out, errors.New("sdk: text service installation proof requires a connected endpoint credential")
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	watcherDone := make(chan struct{})
+	watcherExited := make(chan struct{})
+	go func() {
+		defer close(watcherExited)
+		select {
+		case <-sessionDone:
+			cancel()
+		case <-watcherDone:
+		}
+	}()
+	defer func() { close(watcherDone); cancel(); <-watcherExited }()
+	select {
+	case <-sessionDone:
+		return out, errors.New("sdk: text service endpoint session ended")
+	default:
 	}
 	body := struct {
 		ClaimID    string `json:"claimId"`
@@ -64,10 +80,11 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	// replay the nonce and bearer, even to another path on the same server.
 	// Copy both clients so other SDK methods retain their redirect policy.
 	rest := *c.rest
+	rest.cred = func() string { return credential }
 	transport := *rest.http
 	transport.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	rest.http = &transport
-	err := rest.do(ctx, http.MethodPost, "/sharing/text-services/installations/"+proof.InstallationID+"/prove", body, &out)
+	err := rest.do(requestCtx, http.MethodPost, "/sharing/text-services/installations/"+proof.InstallationID+"/prove", body, &out)
 	if err != nil {
 		// A server or transport error may echo the request. Never expose its body or
 		// underlying error, which could contain a nonce or endpoint credential.
@@ -83,8 +100,46 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 		}
 		return TextServiceReadiness{}, errors.New("sdk: text service installation proof request failed")
 	}
+	select {
+	case <-sessionDone:
+		return TextServiceReadiness{}, errors.New("sdk: text service endpoint session ended")
+	default:
+	}
+	if requestCtx.Err() != nil {
+		return TextServiceReadiness{}, requestCtx.Err()
+	}
+	current, _, currentDone, currentErr := c.textServiceEndpointSession()
+	if currentErr != nil || current != endpoint || currentDone != sessionDone {
+		return TextServiceReadiness{}, errors.New("sdk: text service endpoint session ended")
+	}
 	if out.InstallationID != proof.InstallationID || out.Generation != proof.Generation || out.ClaimID == nil || *out.ClaimID != proof.ClaimID {
 		return TextServiceReadiness{}, errors.New("sdk: text service installation proof response binding mismatch")
 	}
 	return out, nil
+}
+
+// TextServiceEndpointSession pins one authenticated endpoint transport. Its done
+// channel closes on transient disconnect too; a replacement endpoint requires a
+// fresh installation claim and proof even when Client.Done remains open.
+func (c *Client) TextServiceEndpointSession() (string, <-chan struct{}, error) {
+	endpoint, _, done, err := c.textServiceEndpointSession()
+	return endpoint, done, err
+}
+func (c *Client) textServiceEndpointSession() (string, string, <-chan struct{}, error) {
+	if err := c.checkOpen(); err != nil {
+		return "", "", nil, err
+	}
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	endpoint := c.EndpointID()
+	credential, _ := c.credential.Load().(string)
+	if c.cur == nil || !c.connected.Load() || !projectUUID(endpoint, false) {
+		return "", "", nil, errors.New("sdk: text service requires a connected endpoint session")
+	}
+	select {
+	case <-c.cur.dead:
+		return "", "", nil, errors.New("sdk: text service endpoint session ended")
+	default:
+	}
+	return endpoint, credential, c.cur.dead, nil
 }

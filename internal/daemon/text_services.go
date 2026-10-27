@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/textbridge"
+	"github.com/pagnet-code/pagnet/internal/textbridge/provider"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -127,20 +128,27 @@ type textServiceClaimBody struct {
 type textServiceAttempt struct {
 	InstallationID, Server, AdmissionID string
 	Body                                json.RawMessage
+	Started                             bool                      `json:",omitempty"`
 	Result                              *sdk.TextServiceReadiness `json:",omitempty"`
 }
 
 type textServiceSupervisor struct {
 	daemon      *Daemon
 	mu          sync.Mutex
+	controlMu   sync.Mutex
 	client      *textServiceClient
 	wake        chan struct{}
 	retry       time.Duration
 	savePrivate func(string, string, any) error
+	running     map[string]*textServiceRuntime
+	runProfile  func(context.Context, string, textbridge.Profile, textbridge.Ledger, textbridge.RuntimeConfig) error
+	connect     func(context.Context, sdk.Config) (textbridge.RuntimeConnection, error)
+	newProvider func(provider.Config) (textbridge.Provider, error)
+	proofRetry  time.Duration
 }
 
 func newTextServiceSupervisor(d *Daemon) *textServiceSupervisor {
-	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON}
+	return &textServiceSupervisor{daemon: d, wake: make(chan struct{}, 1), retry: time.Second, savePrivate: textbridge.SavePrivateJSON, running: map[string]*textServiceRuntime{}, runProfile: textbridge.RunProfile, proofRetry: time.Second}
 }
 func (s *textServiceSupervisor) signal() {
 	select {
@@ -149,12 +157,9 @@ func (s *textServiceSupervisor) signal() {
 	}
 }
 func (s *textServiceSupervisor) admit(p transport.HostSessionPayload) {
+	s.disconnect()
 	c, e := newTextServiceClient(s.daemon, p)
 	s.mu.Lock()
-	if s.client != nil {
-		s.client.cancel()
-	}
-	s.client = nil
 	if e == nil {
 		s.client = c
 	}
@@ -167,7 +172,24 @@ func (s *textServiceSupervisor) disconnect() {
 		s.client.cancel()
 	}
 	s.client = nil
+	all := make(map[string]*textServiceRuntime, len(s.running))
+	for id, r := range s.running {
+		r.enabled.Store(false)
+		r.cancel()
+		all[id] = r
+	}
 	s.mu.Unlock()
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	for id, r := range all {
+		if s.stopRuntime(r, false) == nil {
+			s.mu.Lock()
+			if s.running[id] == r {
+				delete(s.running, id)
+			}
+			s.mu.Unlock()
+		}
+	}
 	s.signal()
 }
 func (s *textServiceSupervisor) run(ctx context.Context) {
@@ -194,17 +216,56 @@ func (s *textServiceSupervisor) run(ctx context.Context) {
 }
 func (s *textServiceSupervisor) reconcile(ctx context.Context, c *textServiceClient) error {
 	var all []textServiceInstallation
-	if e := c.request(ctx, http.MethodGet, "", nil, &all); e != nil {
-		return e
+	requestErr := c.request(ctx, http.MethodGet, "", nil, &all)
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if requestErr != nil {
+		s.fenceRuntimes(c)
+		return requestErr
+	}
+	if c.ctx.Err() != nil {
+		return errTextServiceSession
 	}
 	seen := map[string]bool{}
 	for _, v := range all {
 		if !textServiceUUID(v.ID) || !textServiceUUID(v.ServiceID) || v.HostID != c.session.HostID || v.Role != "responder" || v.ProfileVersion != 1 || v.Generation < 1 || (v.ActiveClaimID != nil && !textServiceUUID(*v.ActiveClaimID)) || seen[v.ID] || (v.DesiredState != "enabled" && v.DesiredState != "disabled") {
+			s.fenceRuntimes(c)
 			return errTextServiceOutstanding
 		}
 		seen[v.ID] = true
 	}
 	var outstanding bool
+	desired := make(map[string]textServiceInstallation, len(all))
+	for _, v := range all {
+		desired[v.ID] = v
+	}
+	s.mu.Lock()
+	running := make(map[string]*textServiceRuntime, len(s.running))
+	for id, r := range s.running {
+		running[id] = r
+	}
+	s.mu.Unlock()
+	for id, r := range running {
+		v, exists := desired[id]
+		stopped := false
+		select {
+		case <-r.stopped:
+			stopped = true
+		default:
+		}
+		matches := exists && v.ServiceID == r.profile.Service && v.HostID == c.session.HostID && v.Role == "responder" && v.ProfileVersion == 1 && v.Generation == r.generation && v.ActiveClaimID != nil && *v.ActiveClaimID == r.claimID && v.DesiredState == "enabled" && r.client == c
+		if !matches || stopped {
+			if e := s.stopRuntime(r, exists && v.DesiredState == "disabled"); e != nil {
+				outstanding = true
+				continue
+			}
+			s.mu.Lock()
+			if s.running[id] == r {
+				delete(s.running, id)
+			}
+			s.mu.Unlock()
+		}
+	}
 	for _, v := range all {
 		if e := s.installation(ctx, c, v); e != nil {
 			outstanding = true
@@ -216,6 +277,12 @@ func (s *textServiceSupervisor) reconcile(ctx context.Context, c *textServiceCli
 	return nil
 }
 func (s *textServiceSupervisor) installation(ctx context.Context, c *textServiceClient, v textServiceInstallation) error {
+	s.mu.Lock()
+	existing := s.running[v.ID]
+	s.mu.Unlock()
+	if existing != nil {
+		return nil
+	}
 	base, e := textbridge.ProfileBase(s.daemon.StateDir)
 	if e != nil {
 		return e
@@ -230,7 +297,12 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	if e != nil {
 		return e
 	}
-	defer unlock()
+	retained := false
+	defer func() {
+		if !retained {
+			unlock()
+		}
+	}()
 	p, e := textbridge.LoadProfile(dir, v.ServiceID)
 	if e != nil {
 		return nil
@@ -249,12 +321,32 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	if e != nil {
 		return nil
 	}
-	defer store.Close()
+	defer func() {
+		if !retained {
+			store.Close()
+		}
+	}()
+	launch := func(a textServiceAttempt) error {
+		var err error
+		retained, err = s.startRuntime(ctx, c, dir, p, store, unlock, a)
+		return err
+	}
 	budget, e := store.BudgetSnapshot(ctx)
 	if e != nil {
 		return e
 	}
-	if !budget.Enabled || v.DesiredState != "enabled" {
+	if v.DesiredState == "disabled" {
+		p.Disabled = true
+		p.Registration.DesiredState = "disabled"
+		p.Registration.Generation = v.Generation
+		ledgerErr := store.SetEnabled(context.Background(), false)
+		profileErr := textbridge.SaveProfile(dir, p)
+		if ledgerErr != nil {
+			return ledgerErr
+		}
+		return profileErr
+	}
+	if !budget.Enabled {
 		return nil
 	}
 	var a textServiceAttempt
@@ -299,8 +391,13 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 				// Another active claim conclusively superseded this attempt.
 				// Retrying its old expected generation could only conflict.
 				replace = true
+			} else if a.Started || (a.Result != nil && a.Result.ClaimExpiresAt != nil && !a.Result.ClaimExpiresAt.After(time.Now())) {
+				replace = true
 			} else if a.Result != nil {
-				return nil
+				if v.Generation != body.ExpectedGeneration+1 {
+					return nil
+				}
+				return launch(a)
 			}
 		}
 	}
@@ -342,10 +439,37 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		return errTextServiceOutstanding
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.client != c || c.ctx.Err() != nil {
+		s.mu.Unlock()
 		return errTextServiceSession
 	}
 	a.Result = &result
-	return s.savePrivate(dir, "claim-attempt.json", a)
+	e = s.savePrivate(dir, "claim-attempt.json", a)
+	s.mu.Unlock()
+	if e != nil {
+		return e
+	}
+	return launch(a)
+}
+
+// Unknown authority fences dispatch until an authoritative snapshot recovers.
+// Caller holds controlMu, serializing disable persistence with disconnect.
+func (s *textServiceSupervisor) fenceRuntimes(c *textServiceClient) {
+	s.mu.Lock()
+	all := make(map[string]*textServiceRuntime)
+	for id, r := range s.running {
+		if r.client == c {
+			all[id] = r
+		}
+	}
+	s.mu.Unlock()
+	for id, r := range all {
+		if s.stopRuntime(r, false) == nil {
+			s.mu.Lock()
+			if s.running[id] == r {
+				delete(s.running, id)
+			}
+			s.mu.Unlock()
+		}
+	}
 }

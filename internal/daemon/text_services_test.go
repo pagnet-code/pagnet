@@ -35,6 +35,7 @@ func textFixture(t *testing.T, handler http.HandlerFunc) (*textServiceSupervisor
 	}
 	s := newTextServiceSupervisor(&Daemon{Config: Config{ServerURL: server.URL, HostID: p.HostID, Credential: "test-host", StateDir: state}})
 	s.admit(p)
+	s.runProfile = nil // phase-one claim tests deliberately stop before runtime startup
 	t.Cleanup(s.disconnect)
 	v := textServiceInstallation{ID: uuid.NewString(), ServiceID: uuid.NewString(), HostID: p.HostID, Role: "responder", ProfileVersion: 1, DesiredState: "enabled", Generation: 1}
 	dir, e := textbridge.ProfileDirectory(state, v.ServiceID)
