@@ -668,14 +668,17 @@ type InstanceStatus struct {
 	PID        int    `json:"pid,omitempty"`
 }
 
+const OwnerTextConsoleProtocol = "owner_text_console_v1"
+
 // InventoryPayload reports detected runtimes and workspaces.
 type InventoryPayload struct {
-	OwnerContextProtocol string                       `json:"ownerContextProtocol,omitempty"`
-	HostID               string                       `json:"hostId"`
-	Runtimes             []RuntimeInstallation        `json:"runtimes"`
-	RuntimeProfiles      []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
-	Workspaces           []WorkspaceReport            `json:"workspaces"`
-	AllowedRoots         []string                     `json:"allowedRoots"`
+	OwnerContextProtocol     string                       `json:"ownerContextProtocol,omitempty"`
+	OwnerTextConsoleProtocol string                       `json:"ownerTextConsoleProtocol,omitempty"`
+	HostID                   string                       `json:"hostId"`
+	Runtimes                 []RuntimeInstallation        `json:"runtimes"`
+	RuntimeProfiles          []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
+	Workspaces               []WorkspaceReport            `json:"workspaces"`
+	AllowedRoots             []string                     `json:"allowedRoots"`
 	// Crypto is the host's stable per-host E2EE public identity (plan
 	// §11.5), reported so the control plane knows the host is crypto-capable
 	// and can address it for Private Network activation/enrollment. Public
