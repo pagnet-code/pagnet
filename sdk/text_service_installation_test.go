@@ -303,3 +303,38 @@ func TestProveTextServiceInstallationRejectsReplacedEndpoint(t *testing.T) {
 		t.Fatal("replacement inherited old session pin")
 	}
 }
+
+func TestProveTextServiceInstallationContractBinding(t *testing.T) {
+	for _, contract := range []string{"sdk_project_v2", "owner_text_project_v1"} {
+		for _, responseContract := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+			t.Run(contract+"/"+responseContract, func(t *testing.T) {
+				proof := textProofInput()
+				proof.ProjectContract = contract
+				var bodies [][]byte
+				c := textProofClient(t, func(w http.ResponseWriter, r *http.Request) {
+					var body map[string]json.RawMessage
+					json.NewDecoder(r.Body).Decode(&body)
+					raw, _ := json.Marshal(body)
+					bodies = append(bodies, raw)
+					var got string
+					json.Unmarshal(body["projectContract"], &got)
+					if got != contract {
+						t.Error("proof omitted contract")
+					}
+					out := textProofResponse()
+					out.ProjectContract = responseContract
+					json.NewEncoder(w).Encode(out)
+				})
+				for i := 0; i < 2; i++ {
+					_, err := c.ProveTextServiceInstallation(context.Background(), proof)
+					if (err == nil) != (contract == responseContract) {
+						t.Fatalf("contract binding accepted=%v", err == nil)
+					}
+				}
+				if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+					t.Fatal("proof retry changed body")
+				}
+			})
+		}
+	}
+}

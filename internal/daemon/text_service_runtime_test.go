@@ -565,3 +565,64 @@ func TestTextServiceRuntimeDisableJoinsBeforeDisconnectReleasesLock(t *testing.T
 		t.Fatal("disable lost ambiguous provider result")
 	}
 }
+
+func TestTextServiceOwnerProofBeforeDispatch(t *testing.T) {
+	for _, responseContract := range []string{"", textbridge.SharingProjectContract, textbridge.OwnerTextProjectContract} {
+		t.Run(responseContract, func(t *testing.T) {
+			f := textLifecycle(t)
+			f.profile = textFixtureContract(t, f.dir, f.profile, textbridge.OwnerTextProjectContract)
+			f.c.session.ProtocolFeatures = append(f.c.session.ProtocolFeatures, textServiceContractsProtocol)
+			e := newTextRuntimeEndpoint(f.profile.Service)
+			entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			e.proof = func(_ context.Context, p sdk.TextServiceInstallationProof) (sdk.TextServiceReadiness, error) {
+				if p.ProjectContract != textbridge.OwnerTextProjectContract {
+					t.Error("owner proof omitted contract")
+				}
+				close(entered)
+				<-release
+				return sdk.TextServiceReadiness{InstallationID: p.InstallationID, ClaimID: &p.ClaimID, Generation: p.Generation, Ready: true, ProjectContract: responseContract}, nil
+			}
+			var dispatched atomic.Bool
+			f.s.runProfile = func(ctx context.Context, _ string, _ textbridge.Profile, _ textbridge.Ledger, config textbridge.RuntimeConfig) error {
+				defer close(finished)
+				if config.Enabled("project") {
+					t.Error("enabled before proof")
+				}
+				err := config.Authorize(ctx, e)
+				if err != nil {
+					return err
+				}
+				if !config.Enabled("project") {
+					t.Error("matching proof did not enable dispatch")
+				}
+				dispatched.Store(true)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			if err := f.s.reconcile(context.Background(), f.c); err != nil {
+				t.Fatal(err)
+			}
+			textAwait(t, entered)
+			if f.runtime().enabled.Load() || dispatched.Load() {
+				t.Fatal("dispatch preceded proof response")
+			}
+			close(release)
+			if responseContract == textbridge.OwnerTextProjectContract {
+				deadline := time.Now().Add(3 * time.Second)
+				for !dispatched.Load() && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+				}
+				if !dispatched.Load() {
+					t.Fatal("matching owner proof did not dispatch")
+				}
+			} else {
+				textAwait(t, finished)
+				if dispatched.Load() {
+					t.Fatal("unbound owner proof dispatched")
+				}
+			}
+			f.s.disconnect()
+			textAwait(t, finished)
+		})
+	}
+}

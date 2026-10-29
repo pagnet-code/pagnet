@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,9 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 	if json.Unmarshal(a.Body, &body) != nil || a.InstallationID != p.Registration.InstallationID || a.Server != c.server || a.AdmissionID != c.session.NativeAdmissionID || body.RunnerID != c.session.RunnerID || !body.ConnectionEpoch.Equal(c.session.RunnerEpoch) || !textServiceUUID(body.ClaimID) || a.Result == nil || a.Result.InstallationID != a.InstallationID || a.Result.ClaimID == nil || *a.Result.ClaimID != body.ClaimID || a.Result.Generation != body.ExpectedGeneration+1 || a.Result.ClaimExpiresAt == nil {
 		return false, errTextServiceSession
 	}
+	if body.ProjectContract != p.ProjectContract || (p.ProjectContractName() == textbridge.OwnerTextProjectContract && !slices.Contains(c.session.ProtocolFeatures, textServiceContractsProtocol)) {
+		return false, errTextServiceSession
+	}
 	nonce, e := base64.StdEncoding.Strict().DecodeString(body.Nonce)
 	if e != nil || len(nonce) != 32 {
 		return false, errTextServiceSession
@@ -63,7 +67,7 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 	stop := context.AfterFunc(c.ctx, cancel)
 	r := &textServiceRuntime{client: c, profile: p, dir: dir, store: store, senderStore: senderStore, generation: a.Result.Generation, claimID: body.ClaimID, cancel: cancel, stopped: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
 	s.running[a.InstallationID] = r
-	proof := sdk.TextServiceInstallationProof{InstallationID: a.InstallationID, ClaimID: body.ClaimID, Generation: a.Result.Generation, Nonce: nonce}
+	proof := sdk.TextServiceInstallationProof{InstallationID: a.InstallationID, ClaimID: body.ClaimID, Generation: a.Result.Generation, Nonce: nonce, ProjectContract: body.ProjectContract}
 	config := textbridge.RuntimeConfig{Connect: s.connect, NewProvider: s.newProvider, Enabled: func(string) bool {
 		if done, ok := r.endpoint.Load().(<-chan struct{}); ok {
 			select {
@@ -146,7 +150,7 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 			default:
 			}
 			if err == nil {
-				if result.InstallationID != proof.InstallationID || result.ClaimID == nil || *result.ClaimID != proof.ClaimID || result.Generation != proof.Generation || !result.Ready {
+				if result.InstallationID != proof.InstallationID || result.ClaimID == nil || *result.ClaimID != proof.ClaimID || result.Generation != proof.Generation || !result.Ready || (proof.ProjectContract != "" && result.ProjectContract != proof.ProjectContract) {
 					return errors.New("text service endpoint proof rejected")
 				}
 				select {

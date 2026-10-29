@@ -14,10 +14,11 @@ import (
 // endpoint. Keep the same claim, generation and nonce for an explicit retry.
 // Nonce is local secret material and must contain exactly 32 bytes.
 type TextServiceInstallationProof struct {
-	InstallationID string
-	ClaimID        string
-	Generation     int64
-	Nonce          []byte `json:"-"`
+	InstallationID  string
+	ClaimID         string
+	Generation      int64
+	ProjectContract string `json:",omitempty"`
+	Nonce           []byte `json:"-"`
 }
 
 // String redacts the local proof secret from ordinary diagnostic formatting.
@@ -31,11 +32,12 @@ func (p TextServiceInstallationProof) GoString() string { return p.String() }
 // TextServiceReadiness contains installation metadata only, never a nonce or
 // credential. Readiness is a server snapshot, not permission to dispatch work.
 type TextServiceReadiness struct {
-	InstallationID string     `json:"installationId"`
-	Generation     int64      `json:"generation"`
-	ClaimID        *string    `json:"claimId,omitempty"`
-	ClaimExpiresAt *time.Time `json:"claimExpiresAt,omitempty"`
-	Ready          bool       `json:"ready"`
+	InstallationID  string     `json:"installationId"`
+	Generation      int64      `json:"generation"`
+	ClaimID         *string    `json:"claimId,omitempty"`
+	ClaimExpiresAt  *time.Time `json:"claimExpiresAt,omitempty"`
+	Ready           bool       `json:"ready"`
+	ProjectContract string     `json:"projectContract,omitempty"`
 }
 
 // ProveTextServiceInstallation proves a host's installation claim using the
@@ -43,7 +45,7 @@ type TextServiceReadiness struct {
 // callers may explicitly retry the exact proof after an ambiguous failure.
 func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextServiceInstallationProof) (TextServiceReadiness, error) {
 	var out TextServiceReadiness
-	if !projectUUID(proof.InstallationID, false) || !projectUUID(proof.ClaimID, false) || proof.Generation < 1 || len(proof.Nonce) != 32 {
+	if !projectUUID(proof.InstallationID, false) || !projectUUID(proof.ClaimID, false) || proof.Generation < 1 || len(proof.Nonce) != 32 || (proof.ProjectContract != "" && proof.ProjectContract != "sdk_project_v2" && proof.ProjectContract != "owner_text_project_v1") {
 		return out, errors.New("sdk: invalid text service installation proof")
 	}
 	if err := c.checkOpen(); err != nil {
@@ -71,11 +73,12 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	default:
 	}
 	body := struct {
-		ClaimID    string `json:"claimId"`
-		Generation int64  `json:"generation"`
-		Nonce      string `json:"nonce"`
-		EndpointID string `json:"endpointId"`
-	}{proof.ClaimID, proof.Generation, base64.StdEncoding.EncodeToString(proof.Nonce), endpoint}
+		ClaimID         string `json:"claimId"`
+		Generation      int64  `json:"generation"`
+		Nonce           string `json:"nonce"`
+		EndpointID      string `json:"endpointId"`
+		ProjectContract string `json:"projectContract,omitempty"`
+	}{proof.ClaimID, proof.Generation, base64.StdEncoding.EncodeToString(proof.Nonce), endpoint, proof.ProjectContract}
 	// A proof is one request. In particular, 307/308 redirects must never
 	// replay the nonce and bearer, even to another path on the same server.
 	// Copy both clients so other SDK methods retain their redirect policy.
@@ -112,7 +115,7 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	if currentErr != nil || current != endpoint || currentDone != sessionDone {
 		return TextServiceReadiness{}, errors.New("sdk: text service endpoint session ended")
 	}
-	if out.InstallationID != proof.InstallationID || out.Generation != proof.Generation || out.ClaimID == nil || *out.ClaimID != proof.ClaimID {
+	if out.InstallationID != proof.InstallationID || out.Generation != proof.Generation || out.ClaimID == nil || *out.ClaimID != proof.ClaimID || (proof.ProjectContract != "" && out.ProjectContract != proof.ProjectContract) {
 		return TextServiceReadiness{}, errors.New("sdk: text service installation proof response binding mismatch")
 	}
 	return out, nil

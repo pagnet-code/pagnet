@@ -524,3 +524,80 @@ func TestTextServiceRemoteDisablePreservesBindingGate(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func textFixtureContract(t *testing.T, dir string, p textbridge.Profile, contract string) textbridge.Profile {
+	t.Helper()
+	p.ProjectContract = contract
+	if err := textbridge.SaveProfile(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "ledger")); err != nil {
+		t.Fatal(err)
+	}
+	store, err := ledger.Open(filepath.Join(dir, "ledger"), p.LedgerBinding(), p.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestTextServiceContractClaimRetry(t *testing.T) {
+	for _, contract := range []string{"", textbridge.SharingProjectContract, textbridge.OwnerTextProjectContract} {
+		t.Run(contract, func(t *testing.T) {
+			var bodies [][]byte
+			s, c, dir, p, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				bodies = append(bodies, raw)
+				w.WriteHeader(500)
+			})
+			c.session.ProtocolFeatures = append(c.session.ProtocolFeatures, textServiceContractsProtocol)
+			p = textFixtureContract(t, dir, p, contract)
+			for i := 0; i < 2; i++ {
+				if err := s.installation(context.Background(), c, v); err == nil {
+					t.Fatal("ambiguous claim accepted")
+				}
+			}
+			if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+				t.Fatal("retry changed body")
+			}
+			var body map[string]json.RawMessage
+			json.Unmarshal(bodies[0], &body)
+			var got string
+			json.Unmarshal(body["projectContract"], &got)
+			if got != contract || (contract == "" && body["projectContract"] != nil) {
+				t.Fatal("wrong claim contract")
+			}
+			raw, err := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := textbridge.OwnerTextProjectContract
+			if contract == next {
+				next = textbridge.SharingProjectContract
+			}
+			textFixtureContract(t, dir, p, next)
+			if err := s.installation(context.Background(), c, v); !errors.Is(err, errTextServiceSession) {
+				t.Fatal("changed contract accepted")
+			}
+			after, err := textbridge.ReadPrivate(filepath.Join(dir, "claim-attempt.json"), 8192)
+			if err != nil || !bytes.Equal(raw, after) || len(bodies) != 2 {
+				t.Fatal("changed contract mutated or transported attempt")
+			}
+		})
+	}
+}
+
+func TestTextServiceOwnerRequiresContractProtocol(t *testing.T) {
+	var calls int
+	s, c, dir, p, v := textFixture(t, func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) })
+	textFixtureContract(t, dir, p, textbridge.OwnerTextProjectContract)
+	if err := s.installation(context.Background(), c, v); !errors.Is(err, errTextServiceSession) || calls != 0 {
+		t.Fatal("old server accepted owner claim")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "claim-attempt.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("old server created owner attempt")
+	}
+}

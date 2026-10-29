@@ -29,22 +29,24 @@ import (
 )
 
 const textServiceBridgeProtocol = "text_service_bridge_v1"
+const textServiceContractsProtocol = "text_service_contracts_v1"
 const textServicesChanged = "host.text_services_changed"
 
 var errTextServiceSession = errors.New("text service session unavailable")
 var errTextServiceOutstanding = errors.New("text service reconciliation outstanding")
 
 type textServiceInstallation struct {
-	ID             string     `json:"id"`
-	ServiceID      string     `json:"serviceId"`
-	HostID         string     `json:"hostId"`
-	Role           string     `json:"role"`
-	ProfileVersion int        `json:"profileVersion"`
-	DesiredState   string     `json:"desiredState"`
-	Generation     int64      `json:"generation"`
-	ActiveClaimID  *string    `json:"activeClaimId,omitempty"`
-	ClaimExpiresAt *time.Time `json:"claimExpiresAt,omitempty"`
-	Ready          bool       `json:"ready"`
+	ID              string     `json:"id"`
+	ServiceID       string     `json:"serviceId"`
+	HostID          string     `json:"hostId"`
+	Role            string     `json:"role"`
+	ProfileVersion  int        `json:"profileVersion"`
+	DesiredState    string     `json:"desiredState"`
+	Generation      int64      `json:"generation"`
+	ActiveClaimID   *string    `json:"activeClaimId,omitempty"`
+	ClaimExpiresAt  *time.Time `json:"claimExpiresAt,omitempty"`
+	Ready           bool       `json:"ready"`
+	ProjectContract string     `json:"projectContract,omitempty"`
 }
 
 // Each client owns an immutable admission and cancellation context. It never
@@ -124,6 +126,7 @@ type textServiceClaimBody struct {
 	RunnerID           string    `json:"runnerId"`
 	ConnectionEpoch    time.Time `json:"connectionEpoch"`
 	ExpectedGeneration int64     `json:"expectedGeneration"`
+	ProjectContract    string    `json:"projectContract,omitempty"`
 }
 
 // This private durable record precedes POST and retains the exact encoded body.
@@ -369,6 +372,9 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		r.Generation = v.Generation
 		return s.disableProfile(dir, p, store, senderStore)
 	}
+	if p.ProjectContractName() == textbridge.OwnerTextProjectContract && !slices.Contains(c.session.ProtocolFeatures, textServiceContractsProtocol) {
+		return errTextServiceSession
+	}
 	if senderStore != nil {
 		enabled, err := senderStore.Enabled(ctx)
 		if err != nil {
@@ -396,6 +402,10 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 	} else if _, statErr := os.Lstat(filepath.Join(dir, "claim-attempt.json")); !errors.Is(statErr, os.ErrNotExist) {
 		return errTextServiceOutstanding
 	}
+	projectContract := ""
+	if p.ProjectContract != "" {
+		projectContract = p.ProjectContractName()
+	}
 	var body textServiceClaimBody
 	replace := !exists
 	if exists {
@@ -405,6 +415,10 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 		nonce, err := base64.StdEncoding.Strict().DecodeString(body.Nonce)
 		if err != nil || len(nonce) != 32 {
 			return nil
+		}
+		// An existing attempt is immutable, including a legacy omitted contract.
+		if body.ProjectContract != projectContract {
+			return errTextServiceSession
 		}
 		// A reconnect does not excuse inconsistent installation evidence.
 		if v.Generation < body.ExpectedGeneration {
@@ -458,7 +472,7 @@ func (s *textServiceSupervisor) installation(ctx context.Context, c *textService
 			s.mu.Unlock()
 			return e
 		}
-		body = textServiceClaimBody{uuid.NewString(), base64.StdEncoding.EncodeToString(nonce), c.session.RunnerID, c.session.RunnerEpoch, v.Generation}
+		body = textServiceClaimBody{uuid.NewString(), base64.StdEncoding.EncodeToString(nonce), c.session.RunnerID, c.session.RunnerEpoch, v.Generation, projectContract}
 		encoded, _ := json.Marshal(body)
 		a = textServiceAttempt{InstallationID: v.ID, Server: c.server, AdmissionID: c.session.NativeAdmissionID, Body: encoded}
 	}
