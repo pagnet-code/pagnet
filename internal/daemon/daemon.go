@@ -182,10 +182,13 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	textServices     *textServiceSupervisor
-	sharingBridges   *sharingBridgeSupervisor
-	ownerMailboxMu   sync.Mutex
-	ownerMailboxUsed map[string]time.Time
+	textServices             *textServiceSupervisor
+	sharingBridges           *sharingBridgeSupervisor
+	ownerMailboxMu           sync.Mutex
+	ownerMailboxUsed         map[string]time.Time
+	ownerTextConsoleMu       sync.Mutex
+	ownerTextConsoleUsed     map[string]time.Time
+	ownerTextConsoleHandlers int
 
 	nativeRegistry     *NativeWorkerRegistry
 	nativeWorkersMu    sync.Mutex
@@ -1118,6 +1121,18 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		return d.write(conn, raw)
 	})
 	defer ownerMailboxes.close()
+	ownerTextConsoles := newOwnerTextConsoleConnection(d, nativeConn, func(typ string, payload any) error {
+		env, err := transport.NewEnvelope(typ, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		return d.write(conn, raw)
+	})
+	defer ownerTextConsoles.close()
 	if d.textServices != nil {
 		defer d.textServices.disconnect()
 	}
@@ -1307,6 +1322,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
+			continue
+		}
+		if env.Type == transport.MsgOwnerTextConsoleOpen || env.Type == transport.MsgOwnerTextConsoleFrame || env.Type == transport.MsgOwnerTextConsoleClose {
+			ownerTextConsoles.handle(env, len(raw))
 			continue
 		}
 		if env.Type == transport.MsgOwnerMailboxOpen || env.Type == transport.MsgOwnerMailboxClose ||

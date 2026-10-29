@@ -24,6 +24,7 @@ type textServiceRuntime struct {
 	store                  *ledger.Store
 	senderStore            *sender.Store
 	controller             *sender.Controller
+	consoleBinding         func(context.Context, string, string) (sdk.OwnerTextProjectBindingSnapshot, <-chan struct{}, error)
 	generation             int64
 	claimID                string
 	cancel                 context.CancelFunc
@@ -91,10 +92,16 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 					cancel()
 				}
 			}
+			if p.ProjectContract == textbridge.OwnerTextProjectContract {
+				go s.daemon.refreshOwnerTextConsoleInventory(c.session)
+			}
 			return func() {
 				s.mu.Lock()
 				r.controller = nil
 				s.mu.Unlock()
+				if p.ProjectContract == textbridge.OwnerTextProjectContract {
+					go s.daemon.refreshOwnerTextConsoleInventory(c.session)
+				}
 				if cleanup != nil {
 					cleanup()
 				}
@@ -107,6 +114,13 @@ func (s *textServiceSupervisor) startRuntime(parent context.Context, c *textServ
 		})
 		if !ok {
 			return errors.New("text service endpoint cannot pin its session")
+		}
+		if binding, ok := conn.(interface {
+			OwnerTextProjectBinding(context.Context, string, string) (sdk.OwnerTextProjectBindingSnapshot, <-chan struct{}, error)
+		}); ok {
+			s.mu.Lock()
+			r.consoleBinding = binding.OwnerTextProjectBinding
+			s.mu.Unlock()
 		}
 		endpointID, endpointDone, err := pinned.TextServiceEndpointSession()
 		if err != nil || !textServiceUUID(endpointID) {
