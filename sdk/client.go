@@ -75,6 +75,10 @@ type Client struct {
 	networkTenants sync.Map     // network ID -> immutable, authorized owning tenant
 	credential     atomic.Value // string: current principal credential
 
+	// Installation proof and project snapshots are local to one physical session.
+	ownerTextBindingMu    sync.Mutex
+	ownerTextInstallation *ownerTextInstallationBinding
+
 	// connection
 	connMu    sync.Mutex
 	cur       *conn
@@ -756,6 +760,7 @@ func (c *Client) supervisor() {
 				// one for the same principal.
 				current := c.credential.Load().(string)
 				if stored, kerr := c.kr.CredentialForCredential(current); kerr == nil && stored != "" && stored != current {
+					c.invalidateOwnerTextBinding()
 					c.credential.Store(stored)
 					continue // retry immediately with the durable credential
 				}
@@ -976,6 +981,7 @@ func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 	if c.cfg.ExpectedPrincipalID != "" && p.PrincipalID != c.cfg.ExpectedPrincipalID {
 		return errors.New("sdk: authenticated principal does not match ExpectedPrincipalID")
 	}
+	c.invalidateOwnerTextBinding()
 	c.principalID.Store(p.PrincipalID)
 	c.endpointID.Store(p.EndpointID)
 	if p.Credential != "" {

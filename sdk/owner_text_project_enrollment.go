@@ -25,18 +25,20 @@ const ownerTextProjectProofDomain = "pagnet/owner-text-project/proof/v1"
 // when an independent trust channel is available. Readiness describes current
 // enrollment proofs; it does not authorize message transport.
 type OwnerTextProjectStatus struct {
-	ProjectID        string                       `json:"projectId"`
-	NetworkID        string                       `json:"networkId"`
-	State            string                       `json:"state"`
-	Descriptor       []byte                       `json:"descriptor"`
-	DescriptorHash   []byte                       `json:"descriptorHash"`
-	KeysPinned       int                          `json:"keysPinned"`
-	PrincipalsProved int                          `json:"principalsProved"`
-	RosterSize       int                          `json:"rosterSize"`
-	EndpointProved   bool                         `json:"endpointProved"`
-	Ready            bool                         `json:"ready"`
-	Roles            []OwnerTextProjectRoleStatus `json:"roles"`
-	BlockedReason    string                       `json:"blockedReason"`
+	ProjectID        string                         `json:"projectId"`
+	ProjectVersion   string                         `json:"projectVersion"`
+	EndpointProof    *OwnerTextProjectEndpointProof `json:"endpointProof,omitempty"`
+	NetworkID        string                         `json:"networkId"`
+	State            string                         `json:"state"`
+	Descriptor       []byte                         `json:"descriptor"`
+	DescriptorHash   []byte                         `json:"descriptorHash"`
+	KeysPinned       int                            `json:"keysPinned"`
+	PrincipalsProved int                            `json:"principalsProved"`
+	RosterSize       int                            `json:"rosterSize"`
+	EndpointProved   bool                           `json:"endpointProved"`
+	Ready            bool                           `json:"ready"`
+	Roles            []OwnerTextProjectRoleStatus   `json:"roles"`
+	BlockedReason    string                         `json:"blockedReason"`
 }
 
 type OwnerTextProjectRoleStatus struct {
@@ -225,6 +227,7 @@ func (c *Client) EnrollOwnerTextProjectWithPolicyHash(ctx context.Context, proje
 		if len(response) != 32 || !sameConnection() {
 			return result, errors.New("sdk: invalid project proof response or changed connection")
 		}
+		c.retainOwnerTextProjectAAD(projectID, aad)
 		err = c.rest.do(ctx, http.MethodPost, base+"/prove", map[string]any{"endpointId": endpoint, "challengeId": challenge.ChallengeID, "response": response}, &status)
 		// Recover a committed proof whose response was lost; the next explicit call
 		// obtains a fresh challenge if the server did not commit it.

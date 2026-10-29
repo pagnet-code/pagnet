@@ -55,6 +55,14 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	if sessionErr != nil || !strings.HasPrefix(credential, "pgn_epd_v1_") || c.rest == nil || c.rest.http == nil {
 		return out, errors.New("sdk: text service installation proof requires a connected endpoint credential")
 	}
+	principal, connection := c.principalID.Load(), c.connGeneration.Load()
+	// A replacement may commit even if its response is lost. Retire old
+	// project snapshots before submitting a different installation claim.
+	c.ownerTextBindingMu.Lock()
+	if b := c.ownerTextInstallation; b != nil && (!b.current(c) || b.installation != proof.InstallationID || b.claim != proof.ClaimID || b.generation != proof.Generation || (proof.ProjectContract != "" && b.contract != proof.ProjectContract)) {
+		c.invalidateOwnerTextBindingLocked()
+	}
+	c.ownerTextBindingMu.Unlock()
 	requestCtx, cancel := context.WithCancel(ctx)
 	watcherDone := make(chan struct{})
 	watcherExited := make(chan struct{})
@@ -111,12 +119,15 @@ func (c *Client) ProveTextServiceInstallation(ctx context.Context, proof TextSer
 	if requestCtx.Err() != nil {
 		return TextServiceReadiness{}, requestCtx.Err()
 	}
-	current, _, currentDone, currentErr := c.textServiceEndpointSession()
-	if currentErr != nil || current != endpoint || currentDone != sessionDone {
+	current, currentCredential, currentDone, currentErr := c.textServiceEndpointSession()
+	if currentErr != nil || current != endpoint || currentCredential != credential || currentDone != sessionDone {
 		return TextServiceReadiness{}, errors.New("sdk: text service endpoint session ended")
 	}
 	if out.InstallationID != proof.InstallationID || out.Generation != proof.Generation || out.ClaimID == nil || *out.ClaimID != proof.ClaimID || (proof.ProjectContract != "" && out.ProjectContract != proof.ProjectContract) {
 		return TextServiceReadiness{}, errors.New("sdk: text service installation proof response binding mismatch")
+	}
+	if !c.retainTextServiceInstallation(proof, out.ProjectContract, endpoint, credential, principal, connection, sessionDone) {
+		return TextServiceReadiness{}, errors.New("sdk: text service endpoint session ended")
 	}
 	return out, nil
 }
