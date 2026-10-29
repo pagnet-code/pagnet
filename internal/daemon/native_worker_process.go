@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -74,6 +75,7 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 	if current.Scope != record.Scope || current.Dir != record.Dir || current.ProfileFingerprint != record.ProfileFingerprint {
 		return errors.New("native worker launch identity conflict")
 	}
+	var exited <-chan error
 	if current.LaunchState == "reserved" {
 		if err := agentruntime.PreflightExecutable(current.Spec.Binary, pairs, current.Spec.Workspace); err != nil {
 			return err
@@ -116,7 +118,9 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			locked = false
 			// Reap when this controller remains alive; the child is independent when it
 			// exits. Never use CommandContext or cancel/kill the original process.
-			go func() { _ = cmd.Wait() }()
+			waited := make(chan error, 1)
+			exited = waited
+			go func() { waited <- cmd.Wait() }()
 			// Bounded private pipe; writer closure ensures original worker sees EOF.
 			written := make(chan error, 1)
 			go func() {
@@ -127,7 +131,19 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			select {
 			case err = <-written:
 				if err != nil {
-					return err
+					// A child can exit before reading its private bootstrap pipe.
+					// Allow its reaper to report a safe status, but do not wait
+					// indefinitely if a live child merely closed the descriptor.
+					wait := time.NewTimer(time.Second)
+					defer wait.Stop()
+					select {
+					case exitErr := <-exited:
+						return nativeWorkerReadinessExit(exitErr)
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-wait.C:
+						return errors.Join(errNativeWorkerReadinessUnavailable, errors.New("original native worker environment pipe unavailable; automatic replacement forbidden"))
+					}
 				}
 			case <-ctx.Done():
 				_ = output.Close()
@@ -147,11 +163,22 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 	if err != nil {
 		return err
 	}
-	deadline := time.NewTimer(5 * time.Second)
+	// A newly started worker may need time to initialize under load. Previously
+	// launched owners keep the short probe and can never be relaunched here.
+	readinessTimeout := 5 * time.Second
+	if exited != nil {
+		readinessTimeout = 30 * time.Second
+	}
+	deadline := time.NewTimer(readinessTimeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
+		select {
+		case err := <-exited:
+			return nativeWorkerReadinessExit(err)
+		default:
+		}
 		info, err := os.Lstat(path)
 		if err == nil {
 			stat, ok := info.Sys().(*syscall.Stat_t)
@@ -170,9 +197,21 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-exited:
+			return nativeWorkerReadinessExit(err)
 		case <-deadline.C:
 			return errors.Join(errNativeWorkerReadinessUnavailable, errors.New("original native worker unavailable; automatic replacement forbidden"))
 		case <-tick.C:
 		}
 	}
+}
+
+// Report only the exit status: worker stderr and environment can contain secrets.
+func nativeWorkerReadinessExit(err error) error {
+	diagnostic := "original native worker exited before readiness; automatic replacement forbidden"
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		diagnostic += fmt.Sprintf(" (exit code %d)", exitErr.ExitCode())
+	}
+	return errors.Join(errNativeWorkerReadinessUnavailable, errors.New(diagnostic))
 }
