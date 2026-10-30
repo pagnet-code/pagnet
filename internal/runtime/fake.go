@@ -134,21 +134,33 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 	// TMPDIR is the per-instance scratch (an explicit pair — it overrides
 	// any inherited TMPDIR whose target is not in the sandbox allowlist).
 	cmd.Env = EnsureTurnMarker(ChildEnv(f.Env, spec.Env, []string{"TMPDIR=" + scratch}), spec.TurnID)
-	stdin, err := cmd.StdinPipe()
+	// Own both ends explicitly: the supervisor can refuse Launch before
+	// cmd.Start, and it reaps with Process.Wait rather than cmd.Wait.
+	stdinRead, stdin, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	stdout, err := cmd.StdoutPipe()
+	defer stdinRead.Close()
+	defer stdin.Close()
+	cmd.Stdin = stdinRead
+	stdout, stdoutWrite, err := os.Pipe()
 	if err != nil {
 		return err
 	}
+	defer stdout.Close()
+	defer stdoutWrite.Close()
+	cmd.Stdout = stdoutWrite
 	// The supervisor reaps with Process.Wait and never calls cmd.Wait
 	// (see capturedStderr), so stderr gets the driver-owned drain, not
 	// the io.Writer form whose exec copier would never be joined.
-	stderr, err := attachStderrDrain(cmd)
+	stderrRead, stderrWrite, err := os.Pipe()
 	if err != nil {
 		return err
 	}
+	defer stderrRead.Close()
+	defer stderrWrite.Close()
+	cmd.Stderr = stderrWrite
+	stderr := newCapturedStderr(stderrRead, stderrDrainBound)
 
 	// The supervisor owns the Start, the process group (Setpgid), the
 	// launch guards, and the lifecycle. The ctx is handed to it (its
@@ -166,6 +178,11 @@ func (f *Fake) StartTurn(ctx context.Context, spec TurnSpec, events chan TurnEve
 		Marker:     "PAGNET_TURN_ID=" + spec.TurnID,
 		Sandbox:    f.SandboxSpec(spec),
 	})
+	// Only the child uses these ends after Start. Close our copies even
+	// when launch is refused, so readers (including stderr's drain) see EOF.
+	_ = stdinRead.Close()
+	_ = stdoutWrite.Close()
+	_ = stderrWrite.Close()
 	if err != nil {
 		return err
 	}
