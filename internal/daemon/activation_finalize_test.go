@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,20 +12,36 @@ import (
 )
 
 type finalizationDriver struct {
-	notuiDriver
 	hibernated chan struct{}
 }
 
+func (*finalizationDriver) Name() domain.RuntimeName { return "test-finalization" }
+
+func (*finalizationDriver) Capabilities() session.Capabilities {
+	return session.Capabilities{PersistentEndpoint: true, StructuredEvents: true, NativeSubmit: true}
+}
+
 func (d *finalizationDriver) Activate(ctx context.Context, sess *session.RuntimeSession, events chan<- session.SessionEvent) (*session.RuntimeEndpoint, error) {
-	endpoint, err := d.notuiDriver.Activate(ctx, sess, events)
 	events <- session.SessionEvent{Type: session.EventSessionStarted, SessionID: "cold-native"}
-	return endpoint, err
+	return &session.RuntimeEndpoint{
+		ID: "ep-" + sess.InstanceID, Runtime: sess.Runtime,
+		Ownership: session.OwnershipPagnet, Lease: session.LeaseClaimed,
+		Healthy: true, Transport: "none", StartedAt: time.Now(),
+	}, nil
 }
 
 func (d *finalizationDriver) Hibernate(context.Context, *session.RuntimeSession) error {
 	close(d.hibernated)
 	return nil
 }
+
+func (*finalizationDriver) Submit(context.Context, *session.RuntimeSession, session.SubmitRequest, chan<- session.SessionEvent) error {
+	return errors.New("finalization test driver does not submit")
+}
+
+func (*finalizationDriver) Stop(string) error { return nil }
+func (*finalizationDriver) PID(string) *int   { return nil }
+func (*finalizationDriver) Live(string) bool  { return false }
 
 func TestDaemonTerminalStopWaitsForActivationFinalization(t *testing.T) {
 	d := newTestDaemon(t)
