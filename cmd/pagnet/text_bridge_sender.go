@@ -3,8 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +16,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/pagnet-code/pagnet/internal/textbridge"
 	"github.com/pagnet-code/pagnet/internal/textbridge/sender"
 	"github.com/pagnet-code/pagnet/sdk"
 	"github.com/spf13/cobra"
@@ -59,19 +58,10 @@ func textBridgeCreateService(ctx context.Context, owner *cliCtx, name string) (c
 	return created, nil
 }
 
-type textBridgeSenderProfile struct{ Service, Server, Credential string }
+type textBridgeSenderProfile = textbridge.Profile
 
 type textBridgeSenderConnection interface {
-	WhoAmI(context.Context) (*sdk.Identity, error)
-	SharingProjectStatus(context.Context, string) (sdk.SharingProjectStatus, error)
-	PrepareSharingProjectMessageWithID(string, string, string, string, []byte, []byte) (sdk.PreparedSharingProjectMessage, error)
-	LoadPreparedSharingProjectMessage(string, string) (sdk.PreparedSharingProjectMessage, error)
-	SharingProjectMessageReceipt(context.Context, string, string) (sdk.SharingProjectMessageReceipt, error)
-	SendPreparedSharingProjectMessage(context.Context, string, string) (sdk.SharingProjectMessageReceipt, error)
-	OnSharingProjectMessage(func(context.Context, sdk.SharingProjectMessage) error)
-	OnSharingProjectReady(func(string))
-	EnableSharingProjects()
-	Done() <-chan struct{}
+	sender.Connection
 	Close() error
 }
 
@@ -87,17 +77,20 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		}
 	}
 	cmd := &cobra.Command{Use: "sender", Short: "Send text from a separate personal service", Args: cobra.NoArgs}
-	var name string
+	var name, projectContract string
 	create := &cobra.Command{Use: "create", Short: "Create a sender service and private local profile", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) (retErr error) {
+		if err := textBridgeValidateProjectContract(projectContract); err != nil {
+			return err
+		}
 		if strings.TrimSpace(name) == "" {
 			return errors.New("--name is required")
 		}
-		base, err := textBridgeBase(*stateDir)
+		base, err := textbridge.ProfileBase(*stateDir)
 		if err != nil {
 			return err
 		}
 		base = filepath.Join(base, "senders")
-		if err = textBridgePrivateDir(base); err != nil {
+		if err = textbridge.PrivateDir(base); err != nil {
 			return err
 		}
 		// Establish durable local storage before creating a remote service.
@@ -123,15 +116,18 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				retErr = fmt.Errorf("service %s was created but local sender setup failed; inspect Services before retrying: %w", created.ID, retErr)
 			}
 		}()
-		p := textBridgeSenderProfile{Service: created.ID, Server: owner.base, Credential: created.Credential}
+		p := textBridgeSenderProfile{Role: "sender", Service: created.ID, Server: owner.base, Credential: created.Credential}
+		if cmd.Flags().Changed("project-contract") {
+			p.ProjectContract = projectContract
+		}
 		if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: p.Service}).Validate(); err != nil {
 			return errors.New("created sender has invalid connection configuration")
 		}
 		dir := filepath.Join(base, p.Service)
-		if err := textBridgePrivateDir(dir); err != nil {
+		if err := textbridge.PrivateDir(dir); err != nil {
 			return err
 		}
-		unlock, err := textBridgeLock(dir)
+		unlock, err := textbridge.LockProfile(dir)
 		if err != nil {
 			return err
 		}
@@ -139,19 +135,20 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		if _, err := os.Lstat(filepath.Join(dir, "profile.json")); !errors.Is(err, os.ErrNotExist) {
 			return errors.New("sender profile already exists or cannot be inspected")
 		}
-		store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+		store, err := sender.Open(filepath.Join(dir, "operations"), p.SenderBinding())
 		if err != nil {
 			return err
 		}
 		if err := store.Close(); err != nil {
 			return err
 		}
-		if err := textBridgeSaveJSON(dir, "profile.json", p); err != nil {
+		if err := textbridge.SavePrivateJSON(dir, "profile.json", p); err != nil {
 			return errors.New("sender profile could not be saved")
 		}
 		_, err = fmt.Fprintln(cmd.OutOrStdout(), p.Service)
 		return err
 	}}
+	create.Flags().StringVar(&projectContract, "project-contract", textbridge.SharingProjectContract, "project contract: sdk_project_v2 or owner_text_project_v1")
 	create.Flags().StringVar(&name, "name", "", "personal sender service name")
 	cmd.AddCommand(create)
 	for _, action := range []string{"ask", "resume", "result"} {
@@ -165,34 +162,69 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 			if action == "ask" && !textBridgeUUID(recipient) {
 				return errors.New("--to must be a recipient UUID")
 			}
-			if action != "ask" && !textBridgeUUID(ask) {
+			if (action != "ask" || ask != "") && !textBridgeSenderAskUUID(ask) {
 				return errors.New("--ask must be an ASK UUID")
 			}
 			if action != "result" && wait <= 0 {
 				return errors.New("--wait must be a positive duration")
 			}
-			base, err := textBridgeBase(*stateDir)
+			base, err := textbridge.ProfileBase(*stateDir)
 			if err != nil {
 				return err
 			}
 			dir := filepath.Join(base, "senders", service)
-			if err := textBridgePrivateDir(dir); err != nil {
+			if err := textbridge.PrivateDir(dir); err != nil {
 				return err
 			}
-			unlock, err := textBridgeLock(dir)
-			if err != nil {
-				return err
-			}
-			defer unlock()
 			p, err := textBridgeSenderLoadProfile(dir, service)
 			if err != nil {
 				return err
 			}
+			managed := func() error {
+				operation, err := textBridgeSenderManaged(cmd, filepath.Dir(base), p, action, project, recipient, ask, file, wait)
+				if err != nil {
+					return err
+				}
+				if action == "result" {
+					return json.NewEncoder(cmd.OutOrStdout()).Encode(operation)
+				}
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), operation.Reply.Text)
+				return err
+			}
+			if p.Registration != nil {
+				return managed()
+			}
+			if p.ProjectContract == textbridge.OwnerTextProjectContract && action != "result" {
+				return errors.New("owner project sender requires confirmed managed installation registration")
+			}
+			unlock, err := textbridge.LockProfile(dir)
+			if err != nil {
+				return err
+			}
+			// Registration may have completed after the first unlocked read. Never
+			// connect a foreground SDK after acquiring a newly registered profile.
+			p, err = textBridgeSenderLoadProfile(dir, service)
+			if err != nil {
+				unlock()
+				return err
+			}
+			if p.Registration != nil {
+				unlock()
+				return managed()
+			}
+			if p.ProjectContract == textbridge.OwnerTextProjectContract && action != "result" {
+				unlock()
+				return errors.New("owner project sender requires confirmed managed installation registration")
+			}
+			defer unlock()
+			if action != "result" && p.Disabled {
+				return errors.New("sender is disabled")
+			}
 			// A saved profile must never recreate missing deduplication state.
-			if _, err := textBridgeReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
+			if _, err := textbridge.ReadPrivate(filepath.Join(dir, "operations", "state"), 64<<20); err != nil {
 				return errors.New("saved sender operation state is missing or inaccessible")
 			}
-			store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+			store, err := sender.Open(filepath.Join(dir, "operations"), p.SenderBinding())
 			if err != nil {
 				return err
 			}
@@ -203,7 +235,11 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				if inputErr != nil {
 					return inputErr
 				}
-				operation, err = store.Reserve(cmd.Context(), project, recipient, prompt)
+				if ask == "" {
+					operation, err = store.Reserve(cmd.Context(), project, recipient, prompt)
+				} else {
+					operation, err = store.ReserveWithID(cmd.Context(), project, recipient, ask, prompt)
+				}
 				if err != nil {
 					return err
 				}
@@ -224,7 +260,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 				_, err := fmt.Fprintln(cmd.OutOrStdout(), operation.Reply.Text)
 				return err
 			}
-			if err := textBridgePrivateDir(filepath.Join(dir, "sdk")); err != nil {
+			if err := textbridge.PrivateDir(filepath.Join(dir, "sdk")); err != nil {
 				return err
 			}
 			operation, err = textBridgeSenderRun(cmd.Context(), dir, p, store, operation, wait, deps)
@@ -237,6 +273,7 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 		sub.Flags().StringVar(&service, "service", "", "saved sender service UUID")
 		sub.Flags().StringVar(&project, "project", "", "sharing project UUID")
 		if action == "ask" {
+			sub.Flags().StringVar(&ask, "ask", "", "retry an existing durable ASK UUID")
 			sub.Flags().StringVar(&recipient, "to", "", "recipient service UUID")
 			sub.Flags().StringVar(&file, "file", "-", "UTF-8 prompt file, or - for stdin")
 		} else {
@@ -251,18 +288,12 @@ func textBridgeSenderCmd(stateDir *string, deps textBridgeSenderDependencies) *c
 }
 
 func textBridgeSenderLoadProfile(dir, service string) (textBridgeSenderProfile, error) {
-	var p textBridgeSenderProfile
-	raw, err := textBridgeReadPrivate(filepath.Join(dir, "profile.json"), 32768)
+	p, err := textbridge.LoadProfile(dir, service)
 	if err != nil {
-		return p, errors.New("sender profile unavailable")
+		return p, err
 	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if d.Decode(&p) != nil || d.Decode(new(any)) != io.EOF || p.Service != service {
+	if p.ServiceRole() != "sender" {
 		return p, errors.New("invalid local sender profile")
-	}
-	if err := (sdk.Config{Server: p.Server, Credential: p.Credential, ExpectedPrincipalID: service}).Validate(); err != nil {
-		return p, errors.New("invalid local sender connection profile")
 	}
 	return p, nil
 }
@@ -285,12 +316,7 @@ func textBridgeSenderInput(stdin io.Reader, file string) (string, error) {
 }
 
 func textBridgeSenderReply(ctx context.Context, store *sender.Store, principal string, message sdk.SharingProjectMessage) (sender.Operation, error) {
-	h := message.Header
-	if h.Kind != "REPLY" || h.CorrelationID == nil || h.ThreadID != *h.CorrelationID || h.RecipientPrincipalID != principal || len(message.Wire) == 0 {
-		return sender.Operation{}, errors.New("sender requires an authenticated correlated REPLY")
-	}
-	sum := sha256.Sum256(message.Wire)
-	return store.RecordReply(ctx, sender.Reply{ProjectID: h.ProjectID, AskID: *h.CorrelationID, ReplyID: h.ID, WireDigest: hex.EncodeToString(sum[:]), SenderID: h.SenderPrincipalID, RecipientID: h.RecipientPrincipalID, Text: string(message.Plaintext)})
+	return sender.RecordReply(ctx, store, principal, message)
 }
 
 func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderProfile, store *sender.Store, operation sender.Operation, wait time.Duration, deps textBridgeSenderDependencies) (sender.Operation, error) {
@@ -303,129 +329,5 @@ func textBridgeSenderRun(parent context.Context, dir string, p textBridgeSenderP
 		return operation, errors.New("sender service connection failed; resume the saved ASK")
 	}
 	defer conn.Close()
-	identity, err := conn.WhoAmI(ctx)
-	if err != nil || identity == nil || identity.Kind != "service" || identity.PrincipalID != p.Service {
-		return operation, errors.New("sender authenticated identity does not match saved service")
-	}
-	// SDK admission retires ciphertext before this store can record the receipt.
-	// Reconcile historical evidence before waiting for active project authority.
-	if operation.Phase == sender.Prepared {
-		if receipt, receiptErr := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID); receiptErr == nil {
-			operation, err = store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
-			if err != nil {
-				return operation, err
-			}
-		}
-	}
-	if operation.Phase == sender.Admitted && operation.Reply != nil {
-		return operation, nil
-	}
-	ready, received := make(chan struct{}, 1), make(chan struct{}, 1)
-	callbackErrors := make(chan error, 1)
-	projectID, askID := operation.ProjectID, operation.AskID
-	conn.OnSharingProjectMessage(func(callbackCtx context.Context, message sdk.SharingProjectMessage) error {
-		if message.Header.Kind != "REPLY" {
-			return nil // A sender service never dispatches incoming ASK work.
-		}
-		o, err := textBridgeSenderReply(callbackCtx, store, p.Service, message)
-		if err != nil {
-			if message.Header.ProjectID == projectID && message.Header.CorrelationID != nil && *message.Header.CorrelationID == askID {
-				select {
-				case callbackErrors <- errors.New("sender could not persist an authenticated reply; inbox delivery remains pending"):
-				default:
-				}
-			}
-			return err
-		}
-		if o.ProjectID == projectID && o.AskID == askID {
-			select {
-			case received <- struct{}{}:
-			default:
-			}
-		}
-		return nil // Durable reply commit precedes the SDK's ACK.
-	})
-	conn.OnSharingProjectReady(func(project string) {
-		if project == projectID {
-			select {
-			case ready <- struct{}{}:
-			default:
-			}
-		}
-	})
-	conn.EnableSharingProjects()
-	for {
-		select {
-		case <-ready:
-			operation, err = textBridgeSenderReconcile(ctx, conn, store, operation)
-			if err != nil {
-				return operation, err
-			}
-		case <-received:
-			operation, err = store.Get(ctx, operation.ProjectID, operation.AskID)
-			if err != nil {
-				return operation, err
-			}
-		case err := <-callbackErrors:
-			return operation, err
-		case <-conn.Done():
-			return operation, errors.New("sender connection ended; resume the saved ASK")
-		case <-ctx.Done():
-			return operation, fmt.Errorf("sender wait ended; resume or inspect the saved ASK: %w", ctx.Err())
-		}
-		if operation.Phase == sender.Admitted && operation.Reply != nil {
-			return operation, nil
-		}
-	}
-}
-
-func textBridgeSenderReconcile(ctx context.Context, conn textBridgeSenderConnection, store *sender.Store, operation sender.Operation) (sender.Operation, error) {
-	operation, err := store.Get(ctx, operation.ProjectID, operation.AskID)
-	if err != nil {
-		return operation, err
-	}
-	if operation.Phase == sender.Admitted {
-		return operation, nil
-	}
-	if operation.Phase == sender.Prepared {
-		if receipt, receiptErr := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID); receiptErr == nil {
-			return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
-		}
-	}
-	status, err := conn.SharingProjectStatus(ctx, operation.ProjectID)
-	if err != nil || status.ProjectID != operation.ProjectID || status.State != "active" || !status.EndpointProved {
-		return operation, errors.New("sender project is not ready; resume the saved ASK after enrollment")
-	}
-	var prepared sdk.PreparedSharingProjectMessage
-	if operation.Phase == sender.Reserved {
-		prompt, promptErr := store.RecoverPrompt(ctx, operation.ProjectID, operation.AskID)
-		if promptErr != nil {
-			return operation, promptErr
-		}
-		operation, err = store.MarkPreparing(ctx, operation.ProjectID, operation.AskID)
-		if err != nil {
-			return operation, err
-		}
-		prepared, err = conn.PrepareSharingProjectMessageWithID(operation.ProjectID, operation.RecipientID, "ASK", operation.AskID, []byte(prompt), nil)
-		if err != nil {
-			prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
-		}
-	} else {
-		prepared, err = conn.LoadPreparedSharingProjectMessage(operation.ProjectID, operation.AskID)
-	}
-	if err != nil {
-		return operation, errors.New("saved ASK has no recoverable prepared ciphertext; preparation outcome remains unresolved and must not be prepared again")
-	}
-	operation, err = store.MarkPrepared(ctx, operation.ProjectID, operation.AskID, prepared)
-	if err != nil {
-		return operation, err
-	}
-	receipt, err := conn.SharingProjectMessageReceipt(ctx, operation.ProjectID, operation.AskID)
-	if err != nil {
-		receipt, err = conn.SendPreparedSharingProjectMessage(ctx, operation.ProjectID, operation.AskID)
-		if err != nil {
-			return operation, errors.New("sender admission outcome unresolved; resume the same saved ASK")
-		}
-	}
-	return store.MarkAdmitted(ctx, operation.ProjectID, operation.AskID, receipt)
+	return sender.Run(ctx, conn, store, p.Service, operation)
 }

@@ -104,7 +104,7 @@ func TestTextBridgeEnableStatusDisable(t *testing.T) {
 	if _, err := textBridgeExecute(t, deps, "disable", "--service", textBridgeTestService, "--state-dir", state); err != nil {
 		t.Fatal(err)
 	}
-	p, err := textBridgeLoadProfile(dir, textBridgeTestService)
+	p, err := textbridge.LoadProfile(dir, textBridgeTestService)
 	if err != nil || !p.Disabled {
 		t.Fatalf("disable profile: %v", err)
 	}
@@ -166,15 +166,15 @@ func TestTextBridgeResolveRequiresExplicitAcceptance(t *testing.T) {
 	}
 }
 
-func textBridgeTestProfile(t *testing.T) (string, string, textBridgeProfile, *ledger.Store) {
+func textBridgeTestProfile(t *testing.T) (string, string, textbridge.Profile, *ledger.Store) {
 	t.Helper()
 	state := textBridgeTestDir(t)
-	base, err := textBridgeBase(state)
+	base, err := textbridge.ProfileBase(state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(base, textBridgeTestService)
-	if err := textBridgePrivateDir(dir); err != nil {
+	if err := textbridge.PrivateDir(dir); err != nil {
 		t.Fatal(err)
 	}
 	key := filepath.Join(state, "key")
@@ -182,8 +182,8 @@ func textBridgeTestProfile(t *testing.T) (string, string, textBridgeProfile, *le
 		t.Fatal(err)
 	}
 	c := provider.Config{BaseURL: "https://provider.example", Model: "fixed", APIKey: "provider-secret"}
-	p := textBridgeProfile{Service: textBridgeTestService, Server: "https://control.example", Credential: "pgn_act_v1_secret", ProviderOrigin: c.BaseURL, Model: c.Model, KeyFile: key, Fingerprint: textBridgeFingerprint(c), Limits: ledger.Limits{CallsPerDay: 2, MaxConcurrent: 1}}
-	if err := textBridgeSaveProfile(dir, p); err != nil {
+	p := textbridge.Profile{Service: textBridgeTestService, Server: "https://control.example", Credential: "pgn_act_v1_secret", ProviderOrigin: c.BaseURL, Model: c.Model, KeyFile: key, Fingerprint: textbridge.ProviderFingerprint(c), Limits: ledger.Limits{CallsPerDay: 2, MaxConcurrent: 1}}
+	if err := textbridge.SaveProfile(dir, p); err != nil {
 		t.Fatal(err)
 	}
 	s, err := ledger.Open(filepath.Join(dir, "ledger"), ledger.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service}, p.Limits)
@@ -334,5 +334,45 @@ func TestTextBridgeBackgroundErrorsAreRedacted(t *testing.T) {
 	textBridgeReportError(&out, errors.New("secret provider response with ASK contents"))
 	if strings.Contains(out.String(), "secret") || strings.Contains(out.String(), "ASK") || !strings.Contains(out.String(), "inspect status") {
 		t.Fatalf("unsafe background error: %s", out.String())
+	}
+}
+
+func TestTextBridgeStatusUsesLocalProfileWithoutProviderKey(t *testing.T) {
+	state, _, p, _ := textBridgeTestProfile(t)
+	if err := os.Remove(p.KeyFile); err != nil {
+		t.Fatal(err)
+	}
+	out, err := textBridgeExecute(t, textBridgeDependencies{}, "status", "--service", p.Service, "--state-dir", state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status) != 3 || status["Service"] == nil || status["Disabled"] == nil || status["Budget"] == nil {
+		t.Fatal("status JSON fields changed")
+	}
+	expected, err := textbridge.ReadProfileStatus(context.Background(), state, p.Service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(expected)
+	if err != nil || strings.TrimSpace(out) != string(raw) {
+		t.Fatal("CLI status differs from reusable status")
+	}
+}
+
+func TestTextBridgeStatusRejectsMalformedProfileWithoutDisclosure(t *testing.T) {
+	state, dir, _, _ := textBridgeTestProfile(t)
+	if err := os.WriteFile(filepath.Join(dir, "profile.json"), []byte(`{"Credential":"private-malformed-marker",`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := textBridgeExecute(t, textBridgeDependencies{}, "status", "--service", textBridgeTestService, "--state-dir", state)
+	if err == nil {
+		t.Fatal("status accepted malformed profile")
+	}
+	if strings.Contains(out+err.Error(), "private-malformed-marker") {
+		t.Fatal("status exposed profile contents")
 	}
 }

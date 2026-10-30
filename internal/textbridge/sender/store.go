@@ -46,12 +46,14 @@ const (
 var (
 	ErrInvalid  = errors.New("invalid sender operation state")
 	ErrConflict = errors.New("sender operation conflicts with durable state")
+	ErrDisabled = errors.New("sender is disabled")
 	ErrNotFound = errors.New("sender operation not found")
 )
 
 type Binding struct {
-	ServiceOrigin string
-	PrincipalID   string
+	ServiceOrigin   string
+	PrincipalID     string
+	ProjectContract string `json:",omitempty"`
 }
 
 // Operation deliberately excludes the recoverable prompt. Reserved operations
@@ -86,6 +88,7 @@ type storedOperation struct {
 }
 
 type state struct {
+	Disabled   bool `json:",omitempty"`
 	Version    int
 	Binding    Binding
 	Operations map[string]storedOperation
@@ -106,6 +109,9 @@ func validID(id string, v7 bool) bool {
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	if b.ProjectContract != "" && b.ProjectContract != "sdk_project_v2" && b.ProjectContract != "owner_text_project_v1" {
+		return b, ErrInvalid
+	}
 	u, err := url.Parse(b.ServiceOrigin)
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || !validID(b.PrincipalID, false) {
 		return b, ErrInvalid
@@ -425,22 +431,41 @@ func (s *Store) save(stored storedOperation) (Operation, error) {
 	return clone(stored.Operation), nil
 }
 
-// Reserve is the sole ID generation point. It durably binds input and identity
-// before SDK preparation. Each invocation is a new operation; resume via Get.
+// Reserve generates a new ASK and durably binds its input before preparation.
 func (s *Store) Reserve(ctx context.Context, project, recipient, prompt string) (Operation, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Operation{}, err
+	}
+	return s.ReserveWithID(ctx, project, recipient, id.String(), prompt)
+}
+
+// ReserveWithID durably binds a caller-supplied ASK. Repeating the same input
+// returns its current operation without preparing or creating another ASK.
+func (s *Store) ReserveWithID(ctx context.Context, project, recipient, ask, prompt string) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.load(ctx); err != nil {
 		return Operation{}, err
 	}
-	if !validID(project, false) || !validID(recipient, false) || !validText(prompt, MaxPromptChars) {
+	if s.state.Disabled {
+		return Operation{}, ErrDisabled
+	}
+	if !validID(project, false) || !validID(recipient, false) || !validID(ask, true) || !validText(prompt, MaxPromptChars) {
 		return Operation{}, ErrInvalid
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return Operation{}, err
+	promptDigest := digest([]byte(prompt))
+	for _, stored := range s.state.Operations {
+		o := stored.Operation
+		if o.AskID != ask {
+			continue
+		}
+		if o.ProjectID != project || o.RecipientID != recipient || o.PromptDigest != promptDigest || stored.Prompt != prompt {
+			return Operation{}, ErrConflict
+		}
+		return clone(o), nil
 	}
-	o := Operation{ProjectID: project, AskID: id.String(), RecipientID: recipient, PromptDigest: digest([]byte(prompt)), Phase: Reserved}
+	o := Operation{ProjectID: project, AskID: ask, RecipientID: recipient, PromptDigest: promptDigest, Phase: Reserved}
 	return s.save(storedOperation{Operation: o, Prompt: prompt})
 }
 
@@ -615,3 +640,28 @@ func (s *Store) RecordReply(ctx context.Context, reply Reply) (Operation, error)
 
 // Close releases no OS resources; the caller owns the external exclusive lock.
 func (s *Store) Close() error { s.mu.Lock(); defer s.mu.Unlock(); s.failed = true; return nil }
+
+// Enabled reads the durable, irreversible sender dispatch gate.
+func (s *Store) Enabled(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(ctx); err != nil {
+		return false, err
+	}
+	return !s.state.Disabled, nil
+}
+
+// Disable retains all operation evidence while permanently fencing new work.
+func (s *Store) Disable(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.load(ctx); err != nil {
+		return err
+	}
+	s.state.Disabled = true
+	if err := s.persist(s.state); err != nil {
+		s.failed = true
+		return err
+	}
+	return nil
+}

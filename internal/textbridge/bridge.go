@@ -49,6 +49,7 @@ type Provider interface {
 // must use a different fingerprint to prevent old work using new credentials.
 type Config struct {
 	ProviderConfigFingerprint string
+	DeferMessageWake          bool
 	Enabled                   func(projectID string) bool
 	OnError                   func(error)
 }
@@ -107,7 +108,9 @@ func (b *Bridge) HandleMessage(ctx context.Context, message sdk.SharingProjectMe
 			return err
 		}
 	}
-	b.Wake()
+	if !b.config.DeferMessageWake {
+		b.Wake()
+	}
 	return nil
 }
 

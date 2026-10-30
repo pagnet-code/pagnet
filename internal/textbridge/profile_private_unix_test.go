@@ -1,6 +1,6 @@
 //go:build linux || darwin || freebsd || openbsd || netbsd || dragonfly
 
-package main
+package textbridge
 
 import (
 	"os"
@@ -29,7 +29,7 @@ func TestTextBridgePrivateDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "new", "private")
-	if err := textBridgePrivateDir(path); err != nil {
+	if err := PrivateDir(path); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range []string{filepath.Dir(path), path} {
@@ -38,7 +38,7 @@ func TestTextBridgePrivateDir(t *testing.T) {
 			t.Fatalf("directory mode: %v, %v", info, err)
 		}
 	}
-	if err := textBridgePrivateDir(root); err == nil {
+	if err := PrivateDir(root); err == nil {
 		t.Fatal("accepted public final directory")
 	}
 	link := filepath.Join(root, "link")
@@ -46,7 +46,7 @@ func TestTextBridgePrivateDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{link, filepath.Join(link, "private"), link + "/../new/private"} {
-		if err := textBridgePrivateDir(p); err == nil {
+		if err := PrivateDir(p); err == nil {
 			t.Fatalf("accepted symlink component %q", p)
 		}
 	}
@@ -59,17 +59,17 @@ func TestTextBridgeReadPrivate(t *testing.T) {
 	if err := os.WriteFile(path, []byte(secret), 0600); err != nil {
 		t.Fatal(err)
 	}
-	data, err := textBridgeReadPrivate(path, int64(len(secret)))
+	data, err := ReadPrivate(path, int64(len(secret)))
 	if err != nil || string(data) != secret {
 		t.Fatalf("private read failed: %v", err)
 	}
-	if data, err := textBridgeReadPrivate(path, 3); err == nil || data != nil || strings.Contains(err.Error(), secret) {
+	if data, err := ReadPrivate(path, 3); err == nil || data != nil || strings.Contains(err.Error(), secret) {
 		t.Fatal("oversized read did not fail safely")
 	}
 	if err := os.Chmod(path, 0640); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := textBridgeReadPrivate(path, 100); err == nil {
+	if _, err := ReadPrivate(path, 100); err == nil {
 		t.Fatal("accepted public file")
 	}
 	if err := os.Chmod(path, 0600); err != nil {
@@ -79,14 +79,14 @@ func TestTextBridgeReadPrivate(t *testing.T) {
 	if err := os.Symlink(path, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := textBridgeReadPrivate(link, 100); err == nil {
+	if _, err := ReadPrivate(link, 100); err == nil {
 		t.Fatal("accepted symlink file")
 	}
 	dirLink := filepath.Join(root, "directory-link")
 	if err := os.Symlink(root, dirLink); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := textBridgeReadPrivate(filepath.Join(dirLink, "credentials"), 100); err == nil {
+	if _, err := ReadPrivate(filepath.Join(dirLink, "credentials"), 100); err == nil {
 		t.Fatal("accepted symlink parent directory")
 	}
 	fifo := filepath.Join(root, "fifo")
@@ -94,7 +94,7 @@ func TestTextBridgeReadPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{fifo, root} {
-		if _, err := textBridgeReadPrivate(p, 100); err == nil {
+		if _, err := ReadPrivate(p, 100); err == nil {
 			t.Fatal("accepted nonregular file")
 		}
 	}
@@ -109,22 +109,22 @@ func TestTextBridgeLock(t *testing.T) {
 	if err := os.Symlink(root, dirLink); err != nil {
 		t.Fatal(err)
 	}
-	if unlock, err := textBridgeLock(dirLink); err == nil {
+	if unlock, err := LockProfile(dirLink); err == nil {
 		unlock()
 		t.Fatal("accepted symlink lock directory")
 	}
-	unlock, err := textBridgeLock(root)
+	unlock, err := LockProfile(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unlock()
-	if other, err := textBridgeLock(root); err == nil {
+	if other, err := LockProfile(root); err == nil {
 		other()
 		t.Fatal("acquired contended lock")
 	}
 	unlock()
 	unlock()
-	other, err := textBridgeLock(root)
+	other, err := LockProfile(root)
 	if err != nil {
 		t.Fatalf("lock not released: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestTextBridgeLock(t *testing.T) {
 	if err := os.Chmod(path, 0644); err != nil {
 		t.Fatal(err)
 	}
-	if unlock, err := textBridgeLock(root); err == nil {
+	if unlock, err := LockProfile(root); err == nil {
 		unlock()
 		t.Fatal("accepted insecure lock file")
 	}
@@ -143,7 +143,7 @@ func TestTextBridgeLock(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "target"), path); err != nil {
 		t.Fatal(err)
 	}
-	if unlock, err := textBridgeLock(root); err == nil {
+	if unlock, err := LockProfile(root); err == nil {
 		unlock()
 		t.Fatal("accepted symlink lock file")
 	}
@@ -166,13 +166,13 @@ func TestTextBridgePrivateUnsafeAncestors(t *testing.T) {
 	if err := os.Chmod(parent, 0777); err != nil {
 		t.Fatal(err)
 	}
-	if err := textBridgePrivateDir(child); err == nil {
+	if err := PrivateDir(child); err == nil {
 		t.Fatal("accepted world-writable ancestor without sticky bit")
 	}
-	if _, err := textBridgeReadPrivate(file, 100); err == nil {
+	if _, err := ReadPrivate(file, 100); err == nil {
 		t.Fatal("read through world-writable ancestor without sticky bit")
 	}
-	if unlock, err := textBridgeLock(child); err == nil {
+	if unlock, err := LockProfile(child); err == nil {
 		unlock()
 		t.Fatal("locked through world-writable ancestor without sticky bit")
 	}
@@ -182,7 +182,7 @@ func TestTextBridgePrivateStickyAncestor(t *testing.T) {
 	root := textBridgePrivateTestDir(t)
 	// The standard temporary directory is normally a root-owned sticky
 	// directory; the user-owned temporary child must remain usable.
-	if err := textBridgePrivateDir(root); err != nil {
+	if err := PrivateDir(root); err != nil {
 		t.Fatal(err)
 	}
 	if os.Getuid() != 0 {
@@ -196,7 +196,7 @@ func TestTextBridgePrivateStickyAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 	child := filepath.Join(sticky, "private")
-	if err := textBridgePrivateDir(child); err != nil {
+	if err := PrivateDir(child); err != nil {
 		t.Fatalf("rejected user-owned child of sticky directory: %v", err)
 	}
 	foreign := filepath.Join(sticky, "foreign")
@@ -206,7 +206,7 @@ func TestTextBridgePrivateStickyAncestor(t *testing.T) {
 	if err := os.Chown(foreign, 1, -1); err != nil {
 		t.Fatal(err)
 	}
-	if err := textBridgePrivateDir(filepath.Join(foreign, "private")); err == nil {
+	if err := PrivateDir(filepath.Join(foreign, "private")); err == nil {
 		t.Fatal("accepted foreign-owned child of sticky directory")
 	}
 }
@@ -227,13 +227,13 @@ func TestTextBridgePrivateForeignAncestor(t *testing.T) {
 	if err := os.Chown(parent, 1, -1); err != nil {
 		t.Fatal(err)
 	}
-	if err := textBridgePrivateDir(child); err == nil {
+	if err := PrivateDir(child); err == nil {
 		t.Fatal("accepted foreign-owned writable ancestor")
 	}
 	if err := os.Chmod(parent, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := textBridgePrivateDir(child); err == nil {
+	if err := PrivateDir(child); err == nil {
 		t.Fatal("accepted foreign-owned ancestor")
 	}
 }

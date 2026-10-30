@@ -165,6 +165,18 @@ func runList(c *cliCtx, target, network string) error {
 	return nil
 }
 
+const preparedRecoveryStatus = "recovery prepared; awaiting host reboot verification"
+const committedRecoveryStatus = "recovery committed; cleanup pending"
+
+// workerRecoverySummary deliberately reads only the recovery display summary.
+type workerRecoverySummary struct {
+	ID           string `json:"id"`
+	InstanceID   string `json:"instanceId"`
+	DefinitionID string `json:"definitionId"`
+	State        string `json:"state"`
+	HostID       string `json:"hostId"`
+}
+
 // instanceRows lists every worker instance of a network with its host.
 func (c *cliCtx) instanceRows(netID string) ([][]string, error) {
 	var agents []struct {
@@ -188,10 +200,36 @@ func (c *cliCtx) instanceRows(netID string) ([][]string, error) {
 		if err := c.get("/api/v1/networks/"+netID+"/agents/"+a.ID+"/instances", &insts); err != nil {
 			return nil, err
 		}
+		var recoveries []workerRecoverySummary
+		for _, i := range insts {
+			if i.Status == "blocked" {
+				// Diagnostics are optional and must never trigger sign-in.
+				optional := *c
+				optional.reauth = false
+				if err := optional.get("/api/v1/agents/"+a.ID+"/worker-recoveries", &recoveries); err != nil {
+					recoveries = nil
+				}
+				break
+			}
+		}
 		for _, i := range insts {
 			status := i.displayStatus()
 			if i.RetryAt != nil {
 				status += " (retry " + *i.RetryAt + ")"
+			}
+			if i.Status == "blocked" && i.ID != "" && a.ID != "" && i.HostID != "" {
+				for _, recovery := range recoveries {
+					if recovery.ID == "" || recovery.InstanceID != i.ID || recovery.DefinitionID != a.ID || recovery.HostID != i.HostID {
+						continue
+					}
+					switch recovery.State {
+					case "prepared":
+						status += " (" + preparedRecoveryStatus + ")"
+					case "committed":
+						status += " (" + committedRecoveryStatus + ")"
+					}
+					break
+				}
 			}
 			rows = append(rows, []string{a.Name, i.ID, status, hostNames[i.HostID], i.Runtime, orDash(i.LastActivityAt)})
 		}
@@ -250,6 +288,12 @@ func statusCmd() *cobra.Command {
 			} else {
 				fmt.Println("\ninstances:")
 				printTable([]string{"AGENT", "INSTANCE", "STATUS", "HOST", "RUNTIME", "LAST ACTIVITY"}, rows)
+				for _, row := range rows {
+					if strings.Contains(row[2], "("+preparedRecoveryStatus+")") {
+						fmt.Println("Recovery requires a host OS reboot after preparation; restarting pagnet is insufficient.")
+						break
+					}
+				}
 			}
 
 			// V2 memberships (D10): the network's agents + services with

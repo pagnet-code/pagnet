@@ -29,6 +29,7 @@ import (
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -181,9 +182,13 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	sharingBridges   *sharingBridgeSupervisor
-	ownerMailboxMu   sync.Mutex
-	ownerMailboxUsed map[string]time.Time
+	textServices             *textServiceSupervisor
+	sharingBridges           *sharingBridgeSupervisor
+	ownerMailboxMu           sync.Mutex
+	ownerMailboxUsed         map[string]time.Time
+	ownerTextConsoleMu       sync.Mutex
+	ownerTextConsoleUsed     map[string]time.Time
+	ownerTextConsoleHandlers int
 
 	nativeRegistry     *NativeWorkerRegistry
 	nativeWorkersMu    sync.Mutex
@@ -944,6 +949,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer releaseLock()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	defer bridgeCancel()
+	d.textServices = newTextServiceSupervisor(d)
+	if senderipc.Supported() {
+		senderRPC, err := senderipc.Listen(d.StateDir)
+		if err != nil {
+			return err
+		}
+		defer senderRPC.Close()
+		d.textServices.senderIPC = senderRPC
+	}
+	textDone := make(chan struct{})
+	go func() { defer close(textDone); d.textServices.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-textDone }()
 	d.sharingBridges = newSharingBridgeSupervisor(d)
 	bridgeDone := make(chan struct{})
 	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
@@ -1047,6 +1065,7 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
+	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
@@ -1103,6 +1122,21 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		return d.write(conn, raw)
 	})
 	defer ownerMailboxes.close()
+	ownerTextConsoles := newOwnerTextConsoleConnection(d, nativeConn, func(typ string, payload any) error {
+		env, err := transport.NewEnvelope(typ, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		return d.write(conn, raw)
+	})
+	defer ownerTextConsoles.close()
+	if d.textServices != nil {
+		defer d.textServices.disconnect()
+	}
 	if d.sharingBridges != nil {
 		defer d.sharingBridges.disconnect()
 	}
@@ -1275,6 +1309,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				return connectedAt, fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				if d.textServices != nil {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						d.textServices.admit(session)
+					}
+				}
 				if d.sharingBridges != nil {
 					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
 						d.sharingBridges.admit(session)
@@ -1284,6 +1323,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
+			continue
+		}
+		if env.Type == transport.MsgOwnerTextConsoleOpen || env.Type == transport.MsgOwnerTextConsoleFrame || env.Type == transport.MsgOwnerTextConsoleClose {
+			ownerTextConsoles.handle(env, len(raw))
 			continue
 		}
 		if env.Type == transport.MsgOwnerMailboxOpen || env.Type == transport.MsgOwnerMailboxClose ||
@@ -1565,6 +1608,10 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	switch env.Type {
+	case textServicesChanged:
+		if d.textServices != nil {
+			d.textServices.signal()
+		}
 	case sharingBridgeCommand:
 		var p struct {
 			InstallationID string `json:"installationId"`
@@ -3165,27 +3212,26 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 	// Stop the endpoint, PRESERVING the session (invariant F). The driver's
 	// hibernate is synchronous: it runs the TERM → grace → KILL sequence
 	// and waits for the endpoint to be reaped.
+	finalize := func(snapshot session.LifecycleSnapshot) error {
+		if snapshot.Materialised && snapshot.NativeID != "" {
+			row.SessionID = snapshot.NativeID
+		}
+		d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
+		d.invalidateHostedSideport(instanceID)
+		_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
+		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
+			"instanceId": instanceID, "sessionId": row.SessionID,
+			"reason": reason,
+		})
+		d.reportEndpointStatus(conn, instanceID) // offline (hibernated)
+		d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
+			"instance", instanceID, "session", row.SessionID, "reason", reason)
+		return nil
+	}
 	if sess := d.sessions.GetSession(instanceID); sess != nil {
-		if err := d.sessions.Hibernate(context.Background(), sess); err != nil {
-			return err
-		}
+		return d.sessions.HibernateAndFinalize(context.Background(), sess, finalize)
 	}
-	if materialised, ok := d.sessions.Materialised(instanceID); ok && materialised {
-		if nativeID, ok := d.sessions.NativeID(instanceID); ok && nativeID != "" {
-			row.SessionID = nativeID
-		}
-	}
-	d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
-	d.invalidateHostedSideport(instanceID)
-	_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
-	_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
-		"instanceId": instanceID, "sessionId": row.SessionID,
-		"reason": reason,
-	})
-	d.reportEndpointStatus(conn, instanceID) // offline (hibernated)
-	d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
-		"instance", instanceID, "session", row.SessionID, "reason", reason)
-	return nil
+	return finalize(session.LifecycleSnapshot{})
 }
 
 func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload) error {
@@ -4393,87 +4439,83 @@ func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) err
 	spec := d.turnSpecFor(row, row.SessionID != "", "", "terminal")
 	sess := d.prepareSession(row, spec)
 	events := make(chan session.SessionEvent, 16)
-	_, err := d.sessions.EnsureActive(d.turnCtx, sess, events)
-	// The driver sends the activation events and returns when activation
-	// settles (it does NOT close the channel — the caller owns the
-	// lifecycle). Drain non-blockingly, then close.
-drain:
-	for {
-		select {
-		case ev := <-events:
-			switch ev.Type {
-			case session.EventSessionStarted, session.EventSessionResumed:
-				d.reportSession(conn, row.InstanceID, ev.SessionID,
-					ev.Type == session.EventSessionResumed)
-				// A resumed session is materialised by definition (the
-				// resume gate): persist its id. A cold start is not yet
-				// materialised (no real exchange): keep the status
-				// transition but do NOT persist the minted id (the
-				// Materialised invariant — see the doc above).
-				persistID := ""
-				if ev.Type == session.EventSessionResumed {
-					persistID = ev.SessionID
+	return d.sessions.EnsureActiveAndFinalize(d.turnCtx, sess, events, func(_ *session.RuntimeEndpoint, snapshot session.LifecycleSnapshot, err error) error {
+		// The driver sends the activation events and returns when activation
+		// settles (it does NOT close the channel — the caller owns the
+		// lifecycle). Drain non-blockingly, then close.
+	drain:
+		for {
+			select {
+			case ev := <-events:
+				switch ev.Type {
+				case session.EventSessionStarted, session.EventSessionResumed:
+					d.reportSession(conn, row.InstanceID, ev.SessionID,
+						ev.Type == session.EventSessionResumed)
+					// A resumed session is materialised by definition (the
+					// resume gate): persist its id. A cold start is not yet
+					// materialised (no real exchange): keep the status
+					// transition but do NOT persist the minted id (the
+					// Materialised invariant — see the doc above).
+					persistID := ""
+					if ev.Type == session.EventSessionResumed {
+						persistID = ev.SessionID
+					}
+					_ = d.state.SetInstanceStatus(row.InstanceID, "working", persistID)
+				case session.EventSessionLost:
+					// Surfaced via the error below (invariant F).
 				}
-				_ = d.state.SetInstanceStatus(row.InstanceID, "working", persistID)
-			case session.EventSessionLost:
-				// Surfaced via the error below (invariant F).
+			default:
+				break drain
 			}
-		default:
-			break drain
 		}
-	}
-	close(events)
-	if err != nil {
-		if errors.Is(err, session.ErrSessionLost) {
-			// The resume failed — do NOT silently start a fresh session.
-			// Drop the local reference and block until a human explicitly
-			// restarts (cold start). Same handling as the turn path.
-			_ = d.state.SetInstanceSession(row.InstanceID, "")
-			_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
-			d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
-			d.Log.Warn("activation lost the session; instance blocked",
-				"instance", row.InstanceID)
-			return fmt.Errorf("session lost: no resumable session (instance blocked)")
+		close(events)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionLost) {
+				// The resume failed — do NOT silently start a fresh session.
+				// Drop the local reference and block until a human explicitly
+				// restarts (cold start). Same handling as the turn path.
+				_ = d.state.SetInstanceSession(row.InstanceID, "")
+				_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
+				d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
+				d.Log.Warn("activation lost the session; instance blocked",
+					"instance", row.InstanceID)
+				return fmt.Errorf("session lost: no resumable session (instance blocked)")
+			}
+			d.Log.Warn("session activation failed", "instance", row.InstanceID,
+				"error", err.Error())
+			return err
 		}
-		d.Log.Warn("session activation failed", "instance", row.InstanceID,
-			"error", err.Error())
-		return err
-	}
-	// Persist the session id on the row only when the session is
-	// MATERIALISED (see the doc above).
-	sessionID := ""
-	if mat, ok := d.sessions.Materialised(row.InstanceID); ok && mat {
-		// Locked read through the Manager (NativeID is mutated by the
-		// Manager and the drivers under its mutex; a direct sess.NativeID
-		// read here would race it).
-		if id, ok := d.sessions.NativeID(row.InstanceID); ok && id != "" {
-			sessionID = id
+		// Persist the session id on the row only when the session is
+		// MATERIALISED (see the doc above).
+		sessionID := ""
+		if snapshot.Materialised {
+			sessionID = snapshot.NativeID
 		}
-	}
-	// Settle the instance to idle — but ONLY if no turn has started while the
-	// activation was settling. This path now runs off the per-instance FIFO
-	// (the launch-time activation is backgrounded, and a concurrent attach
-	// joins it), so a deliver may have begun a turn in the meantime; the
-	// turn owns the status then and an unconditional "idle" write would
-	// clobber its "working". The endpoint view is ensured regardless
-	// (observational + idempotent).
-	if !d.turnInFlight(row.InstanceID) {
-		_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
-		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
-			"instanceId": row.InstanceID, "status": "idle",
-		})
-	}
-	d.reportEndpointStatus(conn, row.InstanceID) // online (idle or working)
-	d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
-		"instance", row.InstanceID, "session", sessionID)
-	d.ensureEndpointView(row)
-	// Settle marker (see the settleGens field): the activation is done and
-	// the status write above is final — daemon tests wait on this instead
-	// of polling the ambiguous row status.
-	d.settleMu.Lock()
-	d.settleGens[row.InstanceID]++
-	d.settleMu.Unlock()
-	return nil
+		// Settle the instance to idle — but ONLY if no turn has started while the
+		// activation was settling. This path now runs off the per-instance FIFO
+		// (the launch-time activation is backgrounded, and a concurrent attach
+		// joins it), so a deliver may have begun a turn in the meantime; the
+		// turn owns the status then and an unconditional "idle" write would
+		// clobber its "working". The endpoint view is ensured regardless
+		// (observational + idempotent).
+		if !d.turnInFlight(row.InstanceID) {
+			_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
+			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+				"instanceId": row.InstanceID, "status": "idle",
+			})
+		}
+		d.reportEndpointStatus(conn, row.InstanceID) // online (idle or working)
+		d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
+			"instance", row.InstanceID, "session", sessionID)
+		d.ensureEndpointView(row)
+		// Settle marker (see the settleGens field): the activation is done and
+		// the status write above is final — daemon tests wait on this instead
+		// of polling the ambiguous row status.
+		d.settleMu.Lock()
+		d.settleGens[row.InstanceID]++
+		d.settleMu.Unlock()
+		return nil
+	})
 }
 
 // settleGeneration returns the instance's settle generation (0 when no

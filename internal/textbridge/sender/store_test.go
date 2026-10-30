@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -362,5 +363,84 @@ func TestCanceledOperationDoesNotReserve(t *testing.T) {
 	all, _ := s.List(ctx)
 	if len(all) != 0 {
 		t.Fatal("canceled reservation persisted")
+	}
+}
+
+func TestReserveWithIDIsIdempotentAndGloballyBound(t *testing.T) {
+	s, _ := openTest(t)
+	defer s.Close()
+	id, _ := uuid.NewV7()
+	o, err := s.ReserveWithID(ctx, project, recipient, id.String(), "prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.MarkPreparing(ctx, project, o.AskID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReserveWithID(ctx, project, recipient, o.AskID, "prompt")
+	if err != nil || got.Phase != Preparing || got.AskID != o.AskID {
+		t.Fatalf("repeat changed operation: %+v %v", got, err)
+	}
+	for _, input := range []struct{ project, recipient, prompt string }{
+		{binding().PrincipalID, recipient, "prompt"},
+		{project, binding().PrincipalID, "prompt"},
+		{project, recipient, "changed"},
+	} {
+		if _, err := s.ReserveWithID(ctx, input.project, input.recipient, o.AskID, input.prompt); !errors.Is(err, ErrConflict) {
+			t.Fatalf("changed binding: %v", err)
+		}
+	}
+	for _, id := range []string{uuid.Nil.String(), project, strings.ToUpper(o.AskID), "invalid"} {
+		if _, err := s.ReserveWithID(ctx, project, recipient, id, "prompt"); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("accepted invalid ASK %q: %v", id, err)
+		}
+	}
+	if err := s.Disable(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReserveWithID(ctx, project, recipient, o.AskID, "prompt"); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("repeat bypassed durable gate: %v", err)
+	}
+}
+
+func TestStoreProjectContractBinding(t *testing.T) {
+	legacy := binding()
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("ProjectContract")) {
+		t.Fatal("legacy binding JSON/AAD changed")
+	}
+	for _, contract := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+		t.Run(contract, func(t *testing.T) {
+			dir := t.TempDir()
+			b := legacy
+			b.ProjectContract = contract
+			store, err := Open(dir, b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store.Close()
+			for _, other := range []string{"", "sdk_project_v2", "owner_text_project_v1"} {
+				candidate := legacy
+				candidate.ProjectContract = other
+				reopened, err := Open(dir, candidate)
+				if other == contract {
+					if err != nil {
+						t.Fatal(err)
+					}
+					reopened.Close()
+				} else if err == nil {
+					reopened.Close()
+					t.Fatal("cross-contract store opened")
+				}
+			}
+		})
+	}
+	unknown := legacy
+	unknown.ProjectContract = "unknown"
+	if _, err := Open(t.TempDir(), unknown); err == nil {
+		t.Fatal("unknown contract accepted")
 	}
 }
