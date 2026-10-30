@@ -19,7 +19,16 @@ type nativeTerminalManager struct {
 	mu       sync.Mutex
 	captures map[string]*nativeTerminalCapture
 }
+type nativeTerminalWorker interface {
+	Snapshot(context.Context) (sessionworker.NativeSnapshot, error)
+	NativeTerminalOutput(context.Context, string, int64) (sessionworker.OutputPage, error)
+}
+
 type nativeTerminalCapture struct {
+	// pump serializes replay consumption with first-snapshot publication.
+	pump     sync.Mutex
+	changed  chan struct{}
+	worker   nativeTerminalWorker
 	mu       sync.Mutex
 	proxy    *NativeWorkerProxy
 	source   sessionworker.NativeSnapshot
@@ -53,11 +62,18 @@ func (d *Daemon) nativeTerminalCaptureFor(p *NativeWorkerProxy, snapshot session
 	if len(manager.captures) >= 128 {
 		return nil, errors.New("native terminal view capacity reached")
 	}
-	capture := &nativeTerminalCapture{proxy: p, source: snapshot, windows: map[string]*nativeTerminalWindow{}}
+	capture := &nativeTerminalCapture{proxy: p, worker: p, changed: make(chan struct{}, 1), source: snapshot, windows: map[string]*nativeTerminalWindow{}}
 	manager.captures[p.scope.InstanceID] = capture
 	go capture.run(d, manager)
 	return capture, nil
 }
+func (c *nativeTerminalCapture) wake() {
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+}
+
 func (c *nativeTerminalCapture) close(d *Daemon, reason string) {
 	c.mu.Lock()
 	if c.closed {
@@ -65,6 +81,7 @@ func (c *nativeTerminalCapture) close(d *Daemon, reason string) {
 		return
 	}
 	c.closed = true
+	c.wake()
 	windows := make([]*nativeTerminalWindow, 0, len(c.windows))
 	for _, window := range c.windows {
 		windows = append(windows, window)
@@ -90,122 +107,191 @@ func (c *nativeTerminalCapture) run(d *Daemon, manager *nativeTerminalManager) {
 		}
 		manager.mu.Unlock()
 	}()
-	timer := time.NewTicker(100 * time.Millisecond)
-	defer timer.Stop()
-	for {
-		select {
-		case <-c.proxy.done:
-			return
-		case <-d.turnCtx.Done():
-			return
-		case <-timer.C:
+	c.watch(d.turnCtx, c.proxy.done, func() error { return c.poll(d) })
+}
+
+func (c *nativeTerminalCapture) watch(ctx context.Context, done <-chan struct{}, poll func() error) {
+	var timer *time.Ticker
+	defer func() {
+		if timer != nil {
+			timer.Stop()
 		}
+	}()
+	for {
 		c.mu.Lock()
-		closed := c.closed
+		closed, viewed := c.closed, len(c.windows) > 0
 		c.mu.Unlock()
 		if closed {
 			return
 		}
-		ctx, cancel := context.WithTimeout(d.turnCtx, 2*time.Second)
-		snapshot, err := c.proxy.Snapshot(ctx)
-		if err != nil || !snapshot.HasTerminal || snapshot.NativeGeneration != c.source.NativeGeneration || snapshot.NativeSessionID != c.source.NativeSessionID || snapshot.NativeStartIdentity != c.source.NativeStartIdentity || !bytes.Equal(snapshot.Origin, c.source.Origin) {
-			cancel()
+		var tick <-chan time.Time
+		if viewed {
+			if timer == nil {
+				timer = time.NewTicker(100 * time.Millisecond)
+			}
+			tick = timer.C
+		} else if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-c.changed:
+			continue
+		case <-tick:
+		}
+		c.pump.Lock()
+		c.mu.Lock()
+		viewed = !c.closed && len(c.windows) > 0
+		c.mu.Unlock()
+		if !viewed {
+			c.pump.Unlock()
+			continue
+		}
+		err := poll()
+		c.pump.Unlock()
+		if err != nil {
 			return
 		}
-		// An idle native terminal must release keys on authority/epoch revoke
-		// even when there are no new PTY bytes to trigger an output check.
-		c.mu.Lock()
-		views := make([]*nativeTerminalWindow, 0, len(c.windows))
-		for _, window := range c.windows {
-			views = append(views, window)
-		}
-		c.mu.Unlock()
-		for _, window := range views {
-			current, err := d.nativeWorkerFor(window.conn, window.meta.InstanceID)
-			if err == nil && current != window.proxy {
-				err = ErrNativeOriginAdmissionDeferred
-			}
-			if err == nil {
-				window.mu.Lock()
-				if !window.closed {
-					err = window.currentEpoch(d)
-				}
-				window.mu.Unlock()
-			}
-			if err != nil {
-				c.detach(d, window.meta.SessionID, "input_unavailable")
-			}
-		}
-		for batch := 0; batch < 4; batch++ {
-			page, err := c.proxy.NativeTerminalOutput(ctx, c.replay, c.cursor)
-			if err != nil {
-				cancel()
-				return
-			}
-			if page.Gap && c.replay != "" {
-				cancel()
-				return
-			}
-			c.replay = page.ReplayGeneration
-			for _, record := range page.Records {
-				c.cursor = record.Sequence
-				if record.Kind != "terminal" {
-					continue
-				}
-				if record.NativeGeneration != c.source.NativeGeneration || !bytes.Equal(record.Origin, c.source.Origin) {
-					continue
-				}
-				var data []byte
-				if json.Unmarshal(record.Data, &data) != nil || len(data) == 0 || len(data) > terminalChunk {
-					cancel()
-					return
-				}
-				c.mu.Lock()
-				if c.closed || c.sequence+uint64(len(data)) > e2ee.TerminalMaxSafeSequence {
-					c.mu.Unlock()
-					clear(data)
-					cancel()
-					return
-				}
-				c.sequence += uint64(len(data))
-				sequence := c.sequence
-				c.ring = append(c.ring, data...)
-				if len(c.ring) > terminalRingCap {
-					extra := len(c.ring) - terminalRingCap
-					copy(c.ring, c.ring[extra:])
-					clear(c.ring[terminalRingCap:])
-					c.ring = c.ring[:terminalRingCap]
-				}
-				windows := make([]*nativeTerminalWindow, 0, len(c.windows))
-				for _, window := range c.windows {
-					windows = append(windows, window)
-				}
-				c.mu.Unlock()
-				for _, window := range windows {
-					frame, err := window.output(d, data, sequence, false)
-					if errors.Is(err, ErrNativeOriginAdmissionDeferred) {
-						continue
-					}
-					if err == nil {
-						err = d.nativeSendTerminal(window.conn, c.proxy, transport.MsgTerminalOutput, frame)
-					}
-					if err != nil {
-						c.detach(d, window.meta.SessionID, "input_unavailable")
-					}
-				}
-				clear(data)
-			}
-			if len(page.Records) == 0 || c.cursor >= page.NextSequence-1 {
-				break
-			}
-		}
-		cancel()
 	}
 }
+
+func (c *nativeTerminalCapture) poll(d *Daemon) error {
+	ctx, cancel := context.WithTimeout(d.turnCtx, 2*time.Second)
+	defer cancel()
+	snapshot, err := c.worker.Snapshot(ctx)
+	if err != nil || !snapshot.HasTerminal || snapshot.NativeGeneration != c.source.NativeGeneration || snapshot.NativeSessionID != c.source.NativeSessionID || snapshot.NativeStartIdentity != c.source.NativeStartIdentity || !bytes.Equal(snapshot.Origin, c.source.Origin) {
+		return ErrNativeObservationConflict
+	}
+	// An idle native terminal must release keys on authority/epoch revoke
+	// even when there are no new PTY bytes to trigger an output check.
+	c.mu.Lock()
+	views := make([]*nativeTerminalWindow, 0, len(c.windows))
+	for _, window := range c.windows {
+		views = append(views, window)
+	}
+	c.mu.Unlock()
+	for _, window := range views {
+		current, err := d.nativeWorkerFor(window.conn, window.meta.InstanceID)
+		if err == nil && current != window.proxy {
+			err = ErrNativeOriginAdmissionDeferred
+		}
+		if err == nil {
+			window.mu.Lock()
+			if !window.closed {
+				err = window.currentEpoch(d)
+			}
+			window.mu.Unlock()
+		}
+		if err != nil {
+			c.detach(d, window.meta.SessionID, "input_unavailable")
+		}
+	}
+	c.mu.Lock()
+	viewed := len(c.windows) > 0 && !c.closed
+	c.mu.Unlock()
+	if !viewed {
+		return nil
+	}
+	return c.readOutput(d, ctx, false)
+}
+
+// catchUp is used only before the first viewer is inserted. A replay gap then
+// replaces the stale ring, while the byte sequence remains monotonic. Catch-up
+// stops at the first page's high-water mark so a busy PTY cannot starve bootstrap.
+func (c *nativeTerminalCapture) readOutput(d *Daemon, ctx context.Context, catchUp bool) error {
+	var through int64
+	for batch := 0; catchUp || batch < 4; batch++ {
+		if !catchUp {
+			c.mu.Lock()
+			viewed := !c.closed && len(c.windows) > 0
+			c.mu.Unlock()
+			if !viewed {
+				return nil
+			}
+		}
+		page, err := c.worker.NativeTerminalOutput(ctx, c.replay, c.cursor)
+		if err != nil {
+			return ErrNativeObservationConflict
+		}
+		if batch == 0 {
+			through = page.NextSequence - 1
+		} else if page.ReplayGeneration != c.replay {
+			// The bootstrap high-water mark belongs to the first replay.
+			return ErrNativeObservationConflict
+		}
+		if page.Gap && c.replay != "" {
+			if !catchUp {
+				return ErrNativeObservationConflict
+			}
+			c.mu.Lock()
+			clear(c.ring)
+			c.ring = nil
+			c.mu.Unlock()
+			c.cursor = page.RetiredThrough
+		}
+		c.replay = page.ReplayGeneration
+		for _, record := range page.Records {
+			c.cursor = record.Sequence
+			if record.Kind != "terminal" {
+				continue
+			}
+			if record.NativeGeneration != c.source.NativeGeneration || !bytes.Equal(record.Origin, c.source.Origin) {
+				continue
+			}
+			var data []byte
+			if json.Unmarshal(record.Data, &data) != nil || len(data) == 0 || len(data) > terminalChunk {
+				return ErrNativeObservationConflict
+			}
+			c.mu.Lock()
+			if c.closed || c.sequence+uint64(len(data)) > e2ee.TerminalMaxSafeSequence {
+				c.mu.Unlock()
+				clear(data)
+				return ErrNativeObservationConflict
+			}
+			c.sequence += uint64(len(data))
+			sequence := c.sequence
+			c.ring = append(c.ring, data...)
+			if len(c.ring) > terminalRingCap {
+				extra := len(c.ring) - terminalRingCap
+				copy(c.ring, c.ring[extra:])
+				clear(c.ring[terminalRingCap:])
+				c.ring = c.ring[:terminalRingCap]
+			}
+			windows := make([]*nativeTerminalWindow, 0, len(c.windows))
+			for _, window := range c.windows {
+				windows = append(windows, window)
+			}
+			c.mu.Unlock()
+			for _, window := range windows {
+				frame, err := window.output(d, data, sequence, false)
+				if errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+					continue
+				}
+				if err == nil {
+					err = d.nativeSendTerminal(window.conn, c.proxy, transport.MsgTerminalOutput, frame)
+				}
+				if err != nil {
+					c.detach(d, window.meta.SessionID, "input_unavailable")
+				}
+			}
+			clear(data)
+		}
+		if len(page.Records) == 0 || c.cursor >= page.NextSequence-1 || (catchUp && c.cursor >= through) {
+			break
+		}
+	}
+	return nil
+}
+
 func (c *nativeTerminalCapture) detach(d *Daemon, session, reason string) {
 	c.mu.Lock()
 	window := c.windows[session]
 	delete(c.windows, session)
+	c.wake()
 	c.mu.Unlock()
 	if window == nil {
 		return
@@ -341,6 +427,17 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 		stream.Close()
 		return err
 	}
+	capture.pump.Lock()
+	defer capture.pump.Unlock()
+	capture.mu.Lock()
+	dormant := len(capture.windows) == 0 && !capture.closed
+	capture.mu.Unlock()
+	if dormant {
+		if err := capture.readOutput(d, ctx, true); err != nil {
+			window.close()
+			return errors.Join(ErrDeferred, err)
+		}
+	}
 	capture.mu.Lock()
 	if capture.closed || len(capture.windows) >= 32 {
 		capture.mu.Unlock()
@@ -353,6 +450,7 @@ func (d *Daemon) doNativeAttachTerminal(conn *websocket.Conn, p transport.Termin
 		return ErrDeferred
 	}
 	capture.windows[p.SessionID] = window
+	capture.wake()
 	capture.mu.Unlock()
 	detached, err = d.state.TerminalDetached(p.InstanceID, p.SessionID)
 	if err != nil || detached {
