@@ -1,8 +1,8 @@
 # Cross-account sharing and usage budgets
 
-Status: v1 requires compatible client, server and web releases. Check the deployed versions before using this flow. V1 supports a dedicated pair of SDK service principals with bilateral human owner consent, isolated encrypted direct `ASK`/`REPLY`, six aggregate limits and an owner-visible usage snapshot. The SDK implements durable message reservations and event-driven enrollment and delivery recovery.
+Status: implemented sharing foundations, with broader collaboration still planned. The deployed/main foundation includes SDK pair v1 (two named service principals, bilateral human owner consent and isolated encrypted `ASK`/`REPLY`), SDK project v2 (a fixed service roster across two independent personal owners), the host sharing bridge and per-share usage limits. Use compatible client, server and web releases; code in a feature branch alone does not establish deployment.
 
-The broader design below remains future work: sharing managed agents, approved actions/capabilities, multiparty shared networks and owner-enforced host execution profiles. Implementation status is not a claim that these changes are deployed. The v1 setup below describes the implemented contract; later requirements describe the target behavior unless explicitly identified as v1.
+The owner-text browser console and cross-account owner budget require the coordinated client v0.15.0, server and web deployment. Confirm the deployed versions before using them. Managed review doors record consent only: they do not execute a review or grant host tools. General shared-network invitations and collaboration, managed-agent actions and an executable directional entry door remain future work.
 
 ## Model and existing evidence
 
@@ -17,11 +17,22 @@ The repository already supplies the following foundations:
 - [Private owner contexts](OWNER_CONTENT_CONTEXTS.md) protect personal representative permission details independently of network membership. [Bridge process binding](BRIDGE_PROCESS_BINDING.md) documents kernel process authentication and the separate filesystem boundary.
 - [Federation transport](../fabric/federation/README.md) provides tested cryptographic components and explicitly identifies missing product integration. It is not evidence of a deployed entry-door service.
 
-The general API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP create limiter of 120 requests per minute. That limiter is process-local; it is not durable multi-replica admission or a per-principal, per-grant or per-network usage policy. Neither general control supplies sharing budgets. V1 additionally enforces its six accepted pair limits through aggregate durable admission; the broader directional, owner/project and runtime budgets below remain future requirements.
+The general API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP create limiter of 120 requests per minute. That limiter is process-local; it is not durable multi-replica admission or a per-principal, per-grant or per-network usage policy. Neither general control supplies sharing budgets. Pair v1 additionally enforces its six accepted limits through aggregate durable admission. Project v2 also has accepted per-project limits; this does not provide a general shared-network or runtime budget. The cross-account owner budget requires the coordinated deployment above; broader directional and runtime controls below remain future requirements.
+
+## What can be set up today
+
+For personal sharing, each person keeps their own account, service principals and hosts. For organization sharing, the required organization administrator acts for that organization; this is different from adding the other person to the organization. Neither setup transfers a principal or host to the other owner.
+
+- **SDK pair v1:** each owner runs one named service, agrees to the invitation and six limits, then both endpoints enroll keys. Use the detailed pair steps below for encrypted requests and correlated replies.
+- **SDK project v2:** this is available only between two independent personal owners, not organization owners. Agree on their complete service roster and the project policy before consent and enrollment. This roster is fixed for that project. Run the named SDK services; use `OnSharingProjectMessage` or `EnableSharingProjects` for enrollment/recovery, and prepared project messages for delivery. The [enrollment code](../sdk/sharing_project_enrollment.go), [coordinator](../sdk/sharing_project_coordinator.go) and [message code](../sdk/sharing_project_messages.go) implement this separate versioned contract. It is a bounded service exchange, not a general invitation for arbitrary agents, tasks or events. It does not grant reciprocal actions.
+- **Host sharing bridge:** the owner's enrolled host can run the sharing service endpoint through the [bridge](../internal/daemon/sharing_bridge.go). This does not grant the peer launch, attach or filesystem rights on that host.
+- **Managed review door:** owners may record the proposed scope and consent. Treat this as consent only; a review request cannot execute through that door today.
+
+The owner-text browser console and cross-account owner budget depend on that coordinated deployment. Check the running versions before relying on a browser console or owner-wide cap.
 
 ## Edu–Conti v1 setup
 
-For the built-in manual inbox, each person enrolls their own personal host and chooses **Set up inbox** in Settings → Sharing. Conti copies the inbox's public sharing address to Edu. Edu pastes it into **Connect with someone**, reviews the six limits and requests the connection. Conti accepts the incoming invitation; the two bridges enroll and prove the pair automatically. Once the pair is active, either person opens their encrypted inbox to send, read and reply. The same inbox can serve several independent bilateral pairs. Neither account gains access to the other's host, private networks or other agents. Invitations and activation refresh on events, and the UI also has an explicit Refresh action.
+Where the compatible built-in manual inbox is available, each person enrolls their own personal host and chooses **Set up inbox** in Settings → Sharing. Conti copies the inbox's public sharing address to Edu. Edu pastes it into **Connect with someone**, reviews the six limits and requests the connection. Conti accepts the incoming invitation; the two bridges enroll and prove the pair automatically. Once the pair is active, either person opens their encrypted inbox to send, read and reply. The same inbox can serve several independent bilateral pairs. Neither account gains access to the other's host, private networks or other agents. Invitations and activation refresh on events, and the UI also has an explicit Refresh action.
 
 The following steps are the advanced SDK-controlled service flow. They use the same pair consent and limits but let an SDK application handle messages directly.
 
@@ -78,34 +89,34 @@ For joint project work, Edu and Conti can instead create a dedicated shared netw
 
 ## Exactly twenty use cases
 
-These cases retain the broader product design. Cases 01–03, 05, 07–13 and 16–19 are **future-only as described**: v1 does not execute review/calendar/submission actions, connect managed representatives or create multiparty project networks. Case 06 can use v1 only as direct SDK chat; submission actions remain future. Case 20 covers v1 direct-share revocation, with multiparty membership/history behavior still future. Cases 04, 14 and 15 describe existing relationship types, not new v1 sharing features.
+The setup column separates usable foundations from the intended full workflow. “SDK project” means the fixed service roster of two independent personal owners above; it does not promise general shared-network invitations or managed-agent execution.
 
-| ID | Situation | Appropriate relationship |
-| --- | --- | --- |
-| 01 | Edu requests a proposal review from Conti's private assistant. | Share Conti's agent with approved review action |
-| 02 | Edu and Conti's agents jointly plan a project and exchange tasks and events. | Dedicated shared network |
-| 03 | Conti separately requests a calendar slot from Edu after granting proposal reviews. | Separate Edu-issued calendar action share |
-| 04 | A new employee joins company administration and internal collaboration. | Tenant membership, then explicit network access |
-| 05 | A contractor contributes to one project without company administration. | Dedicated shared network |
-| 06 | A customer submits a support ticket to a vendor agent. | Share vendor agent for support chat or submission |
-| 07 | Two companies jointly operate an incident room with shared updates. | Dedicated shared network |
-| 08 | A monitoring provider sends only alerts into a customer's private operations network. | Share an ingestion agent with alert submission only |
-| 09 | A data supplier sells access to one aggregate query capability. | Share supplier agent with approved query action |
-| 10 | An auditor inspects approved evidence without browsing all internal participants. | Share evidence agent with approved evidence action |
-| 11 | A family shares household planning agents while keeping personal assistants private. | Dedicated shared network |
-| 12 | A research consortium shares project datasets and analysis agents. | Dedicated shared network |
-| 13 | A developer publishes a discoverable formatter service for external callers. | Public discovery plus accepted agent share for formatter action |
-| 14 | One person's laptop and desktop agents collaborate on private work. | Personal network with separately enrolled hosts |
-| 15 | A company subsidiary needs actual parent-organization administration. | Tenant membership according to governance |
-| 16 | A Telegram user asks their own representative to invoke a partner service. | Existing account binding plus accepted partner agent share |
-| 17 | A friend requests a free-time summary without seeing a personal calendar. | Share personal agent with calendar-summary action |
-| 18 | A release partner submits a build candidate but may not launch processes on the recipient's host. | Share submission agent with approved submission action |
-| 19 | A temporary workshop gives agents a common discussion space until the event ends. | Expiring shared network memberships |
-| 20 | A departing partner must lose future service and project access while prior records remain auditable. | Revoke shares and memberships; rotate affected network epochs |
+| ID | Situation | Appropriate relationship | How to set up in Pagnet today / not yet |
+| --- | --- | --- | --- |
+| 01 | Edu requests a proposal review from Conti's private assistant. | Share Conti's agent for a bounded review | Today: exchange the proposal and a manual reply through an SDK pair. A managed review door is consent only; automated review execution is not yet available. |
+| 02 | Edu and Conti's agents jointly plan a project and exchange tasks and events. | Dedicated shared network | Today: Edu and Conti can exchange encrypted service messages through a fixed SDK project if both are independent personal owners. General agent collaboration, tasks and events through shared-network invitations are not yet available. |
+| 03 | Conti separately requests a calendar slot from Edu after granting proposal reviews. | Separate Edu-issued calendar action share | Today: ask and reply manually through their pair. Not yet: calendar execution; review consent gives Conti no reverse calendar grant. |
+| 04 | A new employee joins company administration and internal collaboration. | Organization tenant membership, then explicit network access | Today: use organization membership and selected internal network permissions under the organization's roles. This is broader than an external share. |
+| 05 | A contractor contributes to one project without company administration. | Dedicated shared network | Today: a fixed SDK project supports service messages only if both sides are independent personal owners. An organization-owned contractor project and general contractor-agent invitations are not yet available; do not add organization administration just for chat. |
+| 06 | A customer submits a support ticket to a vendor agent. | Share vendor agent for support chat or submission | Today: a named customer service and vendor service can use an accepted pair for messages. Not yet: an executable ticket-submission action or anonymous intake. |
+| 07 | Two companies jointly operate an incident room with shared updates. | Dedicated shared network | Not yet: an SDK project between organizations or a general incident room with responder invitations, tasks and events. Named services may exchange manual messages through an SDK pair where compatible; this does not create an incident room. |
+| 08 | A monitoring provider sends only alerts into a customer's private operations network. | Directional ingestion door | Not yet: an executable directional entry door. A pair can carry messages, but does not admit the provider into the private network or enforce an alert-submission action. |
+| 09 | A data supplier sells access to one aggregate query capability. | Share supplier agent with approved query action | Not yet: bounded query execution. An accepted SDK pair can carry manual requests and responses only under its message contract. |
+| 10 | An auditor inspects approved evidence without browsing all internal participants. | Share evidence agent with approved evidence action | Today: deliberately release approved evidence through an accepted pair. Not yet: automated evidence action; never enroll the auditor in a private epoch just to disclose selected records. |
+| 11 | A family shares household planning agents while keeping personal assistants private. | Dedicated shared network | Today: two independent personal owners can use a fixed SDK project for selected services. Not yet: general family-agent invitations or a multiparty household network. |
+| 12 | A research consortium shares project datasets and analysis agents. | Dedicated shared network | Not yet: an organization-owned consortium project, general consortium membership or analysis execution. Two independent personal owners can exchange SDK project messages within wire-size limits; this does not create consortium membership or grant dataset access. |
+| 13 | A developer publishes a discoverable formatter service for external callers. | Public discovery plus accepted action share | Not yet: public executable formatter sharing. Discovery alone grants no chat, action or host authority. |
+| 14 | One person's laptop and desktop agents collaborate on private work. | Personal network with separately enrolled hosts | Today: enroll both hosts under the same personal owner and use that owner's private network. This is not cross-account sharing. |
+| 15 | A company subsidiary needs actual parent-organization administration. | Organization tenant membership according to governance | Today: use the existing organization role and membership flow when governance authorizes it. A service share cannot supply administration. |
+| 16 | A Telegram user asks their own representative to invoke a partner service. | Account binding plus accepted partner action share | Today: bind Telegram to the user's own account. Not yet: partner action execution; binding itself grants no partner authority. |
+| 17 | A friend requests a free-time summary without seeing a personal calendar. | Share personal agent with calendar-summary action | Today: send a deliberately prepared summary through a pair. Not yet: externally triggered calendar-summary execution. |
+| 18 | A release partner submits a build candidate but may not launch processes on the recipient's host. | Share submission agent with approved submission action | Today: exchange a message or reference through a pair within its limits. Not yet: executable submission action; sharing never grants foreign host launch or filesystem rights. |
+| 19 | A temporary workshop gives agents a common discussion space until the event ends. | Expiring shared network memberships | Not yet: general workshop-agent invitations. A fixed SDK project between two independent personal owners with an agreed expiry supports only its named service roster. |
+| 20 | A departing partner must lose future service and project access while prior records remain auditable. | Revoke shares and memberships; rotate affected network epochs | Today: revoke the accepted pair/project to stop future admission. Retained keys and plaintext cannot be erased. General shared-network removal and historical-key policy remain separate requirements. |
 
 ## Ten representative decisions
 
-“Tenant” below means adding the foreign person to the owning tenant, not changing principal ownership. Recommendations assume the circumstances in the use-case table and carry the same future-only labels; this is a design comparison, not a list of v1 controls.
+“Tenant” below means adding the foreign person to the owning tenant, not changing principal ownership. Recommendations describe the full intended workflows in the use-case table. Use its setup column for current availability; this comparison is not a list of executable sharing controls.
 
 | Case | Tenant membership | Shared network | Share an agent | Recommendation |
 | --- | --- | --- | --- | --- |
@@ -122,20 +133,20 @@ These cases retain the broader product design. Cases 01–03, 05, 07–13 and 16
 
 ## Ten setup journeys
 
-These journeys are ordered from personal collaboration to organization workflows. The v1 inbox handles only the named bilateral service exchange; the proposed steps are not yet controls in Pagnet.
+These journeys describe the full workflows. SDK pair messaging and fixed SDK project messaging between two independent personal owners are available foundations; general agent invitations and action execution remain proposed. A managed review door records consent only.
 
 | Case | Process in Pagnet | Status |
 | --- | --- | --- |
 | 01 Edu–Conti review | Each sets up an inbox, Edu requests a pair from Conti's public address, Conti accepts, then they exchange an encrypted proposal and reply. An approved review action on Conti's agent is the later automation step. | Manual exchange in v1; agent action proposed |
 | 03 Reverse calendar request | Conti can send a manual request back through the active pair. A future Edu-issued calendar action would return only approved availability. | Reverse manual message in v1; calendar action proposed |
 | 04 Employee | An owner adds the employee to the organization, assigns a role, then grants selected internal network access. | Separate existing membership flow |
-| 05 Contractor project | A project owner creates a dedicated network, invites only the contractor's project principal with narrow permissions and an expiry; each principal owner accepts. | Foreign-principal project enrollment proposed |
+| 05 Contractor project | If both sides are independent personal owners, agree to a fixed service roster and policy, then enroll their SDK project services. Organization-owned projects and general invitations for a contractor's managed project agent are not yet available. | SDK project only for two personal owners; organization projects and general invitations proposed |
 | 06 Customer support | A named customer and vendor can use a v1 pair for direct SDK chat. A vendor support intake action would accept tickets without admitting customers to its network. | Bilateral chat in v1; support intake proposed |
-| 07 Joint incident room | One company owns a short-lived common network and admits selected responders from both companies; each keeps its own hosts and administration. | Multiparty shared network proposed |
+| 07 Joint incident room | The intended incident room has one company own a short-lived network and admit selected responders from both companies. Today, compatible SDK pairs can carry manual service messages only. | Organization SDK project and general incident room not yet available |
 | 09 Aggregate data query | A supplier exposes one bounded query action; the buyer accepts the scope and limits, then invokes it without receiving supplier network keys. | Bounded action proposed |
 | 10 Auditor evidence | An organization exposes an evidence projection with an expiry; the auditor requests only approved records, never internal hosts or participant inventory. | Bounded action proposed |
 | 16 Telegram partner request | Telegram binds to Edu's account; Edu's representative uses a separately accepted Conti action grant. The Telegram identity never selects Conti's authority. | Account binding exists; partner agent action proposed |
-| 02 Joint project | A project network owner invites selected Edu and Conti principals to a shared key scope for tasks and events; both owners consent and keep private networks separate. | Shared project network proposed |
+| 02 Joint project | If Edu and Conti are independent personal owners, they agree to a fixed SDK service roster and project policy, consent and enroll. Organization-owned projects and general invitations for project agents, tasks and events are not yet available. | SDK project only for two personal owners; general shared network proposed |
 
 ## Security and operation boundaries
 
@@ -169,7 +180,7 @@ Network revocation must deny future authorized traffic and enrollment, close app
 
 ## V1 usage contract and future usage controls
 
-V1 accepts exactly six limits: `maxMessageWireBytes`, `maxMessagesPerMinute`, `maxMessagesPerDay`, `maxWireBytesPerDay`, `maxInFlight` and `maxTurnsPerThread`. These apply to aggregate pair traffic, including admitted replies; they are not six independent allowances per sender. The usage endpoint provides the current counters, in-flight reservations and reset times for that invitation. Wire bytes are the canonical serialized pair request, including its encrypted envelope and bound metadata, not plaintext, model tokens or provider spend. V1 is not a hard monetary cap, a general owner/project budget or a promise of separate uploaded/delivered fan-out quotas.
+V1 accepts exactly six limits: `maxMessageWireBytes`, `maxMessagesPerMinute`, `maxMessagesPerDay`, `maxWireBytesPerDay`, `maxInFlight` and `maxTurnsPerThread`. These apply to aggregate pair traffic, including admitted replies; they are not six independent allowances per sender. The usage endpoint provides the current counters, in-flight reservations and reset times for that invitation. Wire bytes are the canonical serialized pair request, including its encrypted envelope and bound metadata, not plaintext, model tokens or provider spend. Pair v1 is not a hard monetary cap or a promise of separate uploaded/delivered fan-out quotas. Project v2, limited to two independent personal owners, has its own accepted limits for its fixed roster; its byte quotas also account for encrypted serialized wire size, not plaintext or model tokens. The cross-account owner budget requires the coordinated deployment above; neither message contract is a provider-spend cap.
 
 The remaining controls in this section are the broader target requirements; do not infer that v1 implements every rate/burst, queue, directional byte, execution-time or runtime policy described here.
 
