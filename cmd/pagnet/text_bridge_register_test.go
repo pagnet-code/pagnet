@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pagnet-code/pagnet/internal/accounts"
 	"github.com/pagnet-code/pagnet/internal/config"
@@ -181,7 +182,9 @@ func TestTextBridgeRegisterRetryPending(t *testing.T) {
 				f.save(t, p)
 			} else {
 				var cancel context.CancelFunc
+				handlerDone := make(chan struct{})
 				f.respond = func(w http.ResponseWriter, r *http.Request, v textBridgeInstallation) {
+					defer close(handlerDone)
 					switch kind {
 					case "dropped response":
 						conn, _, err := w.(http.Hijacker).Hijack()
@@ -214,6 +217,11 @@ func TestTextBridgeRegisterRetryPending(t *testing.T) {
 					out = buf.String()
 				} else {
 					out, err = f.run(t)
+				}
+				select {
+				case <-handlerDone:
+				case <-time.After(5 * time.Second):
+					t.Fatal("registration failure handler did not finish")
 				}
 				registerOutputPrivate(t, out, err)
 				if err == nil {
