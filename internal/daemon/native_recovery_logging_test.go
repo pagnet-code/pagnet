@@ -23,7 +23,10 @@ func TestNativeRecoveryFenceLogging(t *testing.T) {
 		{"fenced", errNativeWorkerRecoveryFenced, "DEBUG", errNativeWorkerRecoveryFenced.Error()},
 		{"wrapped fence", fmt.Errorf("private worker path: %w", errNativeWorkerRecoveryFenced), "DEBUG", errNativeWorkerRecoveryFenced.Error()},
 		{"untyped fence text", errors.New(errNativeWorkerRecoveryFenced.Error()), "WARN", "*errors.errorString"},
-		{"connection refused", &net.OpError{Op: "dial", Net: "unix", Err: syscall.ECONNREFUSED}, "WARN", "*net.OpError"},
+		{"connection refused", &net.OpError{Op: "dial", Net: "unix", Err: syscall.ECONNREFUSED}, "WARN", "native worker socket unavailable; explicit lost-worker recovery required"},
+		{"wrapped unix connection refused", fmt.Errorf("private worker path: %w", &net.OpError{Op: "dial", Net: "unix", Addr: &net.UnixAddr{Name: "/private worker path/worker.sock", Net: "unix"}, Err: fmt.Errorf("connect: %w", syscall.ECONNREFUSED)}), "WARN", "native worker socket unavailable; explicit lost-worker recovery required"},
+		{"wrapped tcp connection refused", fmt.Errorf("private worker path: %w", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}), "WARN", "*fmt.wrapError"},
+		{"wrapped non-dial connection refused", fmt.Errorf("private worker path: %w", &net.OpError{Op: "read", Net: "unix", Addr: &net.UnixAddr{Name: "/private worker path/worker.sock", Net: "unix"}, Err: syscall.ECONNREFUSED}), "WARN", "*fmt.wrapError"},
 		{"registry failure", sql.ErrConnDone, "WARN", "*errors.errorString"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
