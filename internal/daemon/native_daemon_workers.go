@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -474,8 +476,12 @@ func nativeRecoveryFailureReporter(log *slog.Logger, now func() time.Time) func(
 		failures[instanceID] = recoveryFailure{fingerprint: fingerprint, firstSeen: firstSeen, loggedAt: at, level: level}
 		if log != nil {
 			// Arbitrary errors can contain worker paths or configuration. Only
-			// emit known sentinel messages, falling back to the error's type.
+			// emit known safe categories, falling back to the error's type.
 			category := fmt.Sprintf("%T", err)
+			var opErr *net.OpError
+			if errors.As(err, &opErr) && opErr.Op == "dial" && opErr.Net == "unix" && errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+				category = "native worker socket unavailable; explicit lost-worker recovery required"
+			}
 			for _, known := range []error{errNativeWorkerRecoveryFenced, ErrNativeOriginAdmissionDeferred, ErrNativeOriginAdmissionRejected, ErrNativeObservationConflict, ErrNativeSourceUnsupported, context.Canceled, context.DeadlineExceeded, sql.ErrNoRows} {
 				if errors.Is(err, known) {
 					category = known.Error()
