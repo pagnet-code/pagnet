@@ -113,9 +113,45 @@ func (f *ownerTextCoordinatorFixture) inject(t *testing.T, sender, recipient int
 	return prepared
 }
 func (f *ownerTextCoordinatorFixture) count() int { f.mu.Lock(); defer f.mu.Unlock(); return f.calls }
-func (f *ownerTextCoordinatorFixture) waitIdle(t *testing.T) {
+func (f *ownerTextCoordinatorFixture) onReady(index int, handler func(string)) <-chan struct{} {
+	client := f.transport.clients[index]
+	done := make(chan struct{})
+	var once sync.Once
+	client.OnOwnerTextProjectReady(func(project string) {
+		if handler != nil {
+			handler(project)
+		}
+		client.sharingMu.Lock()
+		s := client.sharingCoordinator
+		drained := !s.full && len(s.pending) == 0
+		client.sharingMu.Unlock()
+		if drained {
+			once.Do(func() { close(done) })
+		}
+	})
+	return done
+}
+func waitOwnerTextCoordinatorReady(t *testing.T, done ...<-chan struct{}) {
 	t.Helper()
-	waitSharing(t, func() bool { before := f.count(); time.Sleep(30 * time.Millisecond); return before == f.count() })
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for _, ready := range done {
+		select {
+		case <-ready:
+		case <-timeout.C:
+			t.Fatal("owner coordinator startup did not drain")
+		}
+	}
+}
+func (f *ownerTextCoordinatorFixture) waitBlocked(t *testing.T, index int) {
+	t.Helper()
+	client := f.transport.clients[index]
+	waitSharing(t, func() bool {
+		client.sharingMu.Lock()
+		defer client.sharingMu.Unlock()
+		s := client.sharingCoordinator
+		return s.blocked[ownerTextProjectJobKey(f.transport.project)] && !s.full && len(s.pending) == 0
+	})
 }
 func TestOwnerTextMessageCoordinatorAskReplyAndIdle(t *testing.T) {
 	f := newOwnerTextCoordinatorFixture(t)
@@ -123,9 +159,12 @@ func TestOwnerTextMessageCoordinatorAskReplyAndIdle(t *testing.T) {
 	received := make(chan OwnerTextProjectMessage, 2)
 	sender.OnOwnerTextProjectMessage(func(ctx context.Context, m OwnerTextProjectMessage) error { received <- m; return nil })
 	responder.OnOwnerTextProjectMessage(func(ctx context.Context, m OwnerTextProjectMessage) error { received <- m; return nil })
+	// Readiness follows the initial inbox drain, including slow enrollment writes.
+	senderReady := f.onReady(0, nil)
+	responderReady := f.onReady(1, nil)
 	f.enable(t, 0)
 	f.enable(t, 1)
-	f.waitIdle(t)
+	waitOwnerTextCoordinatorReady(t, senderReady, responderReady)
 	before := f.count()
 	time.Sleep(150 * time.Millisecond)
 	if f.count() != before {
@@ -166,11 +205,12 @@ func TestOwnerTextMessageCoordinatorHandlerFailureAndReconnect(t *testing.T) {
 				}
 				return errors.New("retry")
 			})
+			startupReady := f.onReady(1, nil)
 			f.enable(t, 1)
-			f.waitIdle(t)
+			waitOwnerTextCoordinatorReady(t, startupReady)
 			f.inject(t, 0, 1, "ASK", "pending", nil)
 			waitSharing(t, func() bool { return calls.Load() == 1 })
-			f.waitIdle(t)
+			f.waitBlocked(t, 1)
 			before := f.count()
 			time.Sleep(150 * time.Millisecond)
 			f.mu.Lock()
@@ -180,6 +220,8 @@ func TestOwnerTextMessageCoordinatorHandlerFailureAndReconnect(t *testing.T) {
 				t.Fatal("failed callback ACKed or retried while idle")
 			}
 			responder.OnOwnerTextProjectMessage(func(context.Context, OwnerTextProjectMessage) error { calls.Add(1); return nil })
+			retryReady := f.onReady(1, nil)
+			waitOwnerTextCoordinatorReady(t, retryReady)
 			waitSharing(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.transport.acks == 1 })
 			if calls.Load() != 2 {
 				t.Fatal("failure not redelivered")
@@ -201,7 +243,8 @@ func TestOwnerTextMessageCoordinatorHandlerFailureAndReconnect(t *testing.T) {
 					return ctx.Err()
 				}
 			})
-			f.waitIdle(t)
+			reconnectReady := f.onReady(1, nil)
+			waitOwnerTextCoordinatorReady(t, reconnectReady)
 			f.inject(t, 0, 1, "ASK", "reconnect", nil)
 			select {
 			case <-started:
@@ -241,7 +284,7 @@ func TestOwnerTextMessageCoordinatorMaxInFlightReplyAfterACK(t *testing.T) {
 		outbox = &prepared
 		return nil
 	})
-	responder.OnOwnerTextProjectReady(func(project string) {
+	startupReady := f.onReady(1, func(project string) {
 		if outbox == nil {
 			return
 		}
@@ -260,7 +303,7 @@ func TestOwnerTextMessageCoordinatorMaxInFlightReplyAfterACK(t *testing.T) {
 		outbox = nil
 	})
 	f.enable(t, 1)
-	f.waitIdle(t)
+	waitOwnerTextCoordinatorReady(t, startupReady)
 	f.inject(t, 0, 1, "ASK", "question", nil)
 	select {
 	case <-sent:
@@ -359,7 +402,7 @@ func TestOwnerTextMessageCoordinatorReadyAfterPartialACKFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("committed ACK did not notify ready")
 	}
-	f.waitIdle(t)
+	f.waitBlocked(t, 1)
 	if calls.Load() != 2 {
 		t.Fatal("failed later message retried while idle")
 	}
@@ -379,7 +422,24 @@ func TestOwnerTextMessageCoordinatorCapRequeuesWithoutTimer(t *testing.T) {
 	var calls atomic.Int32
 	batches := make(chan int, 2)
 	responder.OnOwnerTextProjectMessage(func(context.Context, OwnerTextProjectMessage) error { calls.Add(1); return nil })
-	responder.OnOwnerTextProjectReady(func(string) { f.mu.Lock(); acks := f.transport.acks; f.mu.Unlock(); batches <- acks })
+	drained := make(chan struct{})
+	var drainOnce sync.Once
+	responder.OnOwnerTextProjectReady(func(string) {
+		f.mu.Lock()
+		acks := f.transport.acks
+		f.mu.Unlock()
+		select {
+		case batches <- acks:
+		default:
+		}
+		responder.sharingMu.Lock()
+		s := responder.sharingCoordinator
+		empty := !s.full && len(s.pending) == 0
+		responder.sharingMu.Unlock()
+		if acks == 257 && empty {
+			drainOnce.Do(func() { close(drained) })
+		}
+	})
 	f.enable(t, 1)
 	for _, expected := range []int{256, 257} {
 		select {
@@ -394,7 +454,8 @@ func TestOwnerTextMessageCoordinatorCapRequeuesWithoutTimer(t *testing.T) {
 	if calls.Load() != 257 {
 		t.Fatal("pending messages lost at drain cap")
 	}
-	f.waitIdle(t)
+	// A startup full reconciliation or drain continuation may still be queued.
+	waitOwnerTextCoordinatorReady(t, drained)
 	before := f.count()
 	time.Sleep(150 * time.Millisecond)
 	if f.count() != before {
