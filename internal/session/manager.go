@@ -365,7 +365,8 @@ func (m *Manager) lifecycleSnapshotLocked(sess *RuntimeSession) LifecycleSnapsho
 
 // EnsureActiveAndFinalize keeps activation and its caller-owned publication in
 // one per-instance critical section. finalize runs even when activation fails,
-// without m.mu held; it must not start another lifecycle operation for sess.
+// without m.mu held. It must not start another lifecycle operation or call
+// NativeID or RestoreNativeState: those methods reacquire the activation lock.
 func (m *Manager) EnsureActiveAndFinalize(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent, finalize func(*RuntimeEndpoint, LifecycleSnapshot, error) error) error {
 	lock := m.activationLock(sess.InstanceID)
 	lock.Lock()
@@ -751,8 +752,9 @@ func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
 }
 
 // HibernateAndFinalize publishes a successful hibernation before another
-// activation can begin. finalize runs without m.mu held and must not start
-// another lifecycle operation for sess.
+// activation can begin. finalize runs without m.mu held. It must not start
+// another lifecycle operation or call NativeID or RestoreNativeState: those
+// methods reacquire the activation lock.
 func (m *Manager) HibernateAndFinalize(ctx context.Context, sess *RuntimeSession, finalize func(LifecycleSnapshot) error) error {
 	// Submit owns this lock before activation, closing the idle window between
 	// EnsureActive and StateBusy. Do not wait for a turn and then kill its
