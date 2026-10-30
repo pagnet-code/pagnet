@@ -949,6 +949,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer releaseLock()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
 	if senderipc.Supported() {
 		senderRPC, err := senderipc.Listen(d.StateDir)
