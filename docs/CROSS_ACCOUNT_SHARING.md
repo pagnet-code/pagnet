@@ -2,7 +2,7 @@
 
 Status: implemented sharing foundations, with broader collaboration still planned. The deployed/main foundation includes SDK pair v1 (two named service principals, bilateral human owner consent and isolated encrypted `ASK`/`REPLY`), SDK project v2 (a fixed service roster across two independent personal owners), the host sharing bridge and per-share usage limits. Use compatible client, server and web releases; code in a feature branch alone does not establish deployment.
 
-The owner-text browser console and cross-account owner budget require the coordinated client v0.15.0, server and web deployment. Confirm the deployed versions before using them. Managed review doors record consent only: they do not execute a review or grant host tools. General shared-network invitations and collaboration, managed-agent actions and an executable directional entry door remain future work.
+The owner-text browser console and cross-account owner budget require a coordinated, compatible signed client, server and web deployment. Confirm the deployed versions before using them. Managed review doors record consent only: they do not execute a review or grant host tools. General shared-network invitations and collaboration, managed-agent actions and an executable directional entry door remain future work.
 
 ## Model and existing evidence
 
