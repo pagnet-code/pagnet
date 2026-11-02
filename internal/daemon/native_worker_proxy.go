@@ -285,5 +285,6 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 	p.confirmedGeneration = snapshot.NativeGeneration
 	p.confirmedStart = snapshot.NativeStartIdentity
 	p.confirmedAt = time.Now()
+	p.connection.retryNativeWorkerObservations(origin.ID)
 	return nil
 }

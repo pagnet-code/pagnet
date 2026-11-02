@@ -177,10 +177,32 @@ func (c *NativeObservationConnection) stageWorkerContent(ctx context.Context, o 
 	return true, nil
 }
 
+type nativeObservationRetry struct {
+	originID string
+	wake     chan struct{}
+}
+
+// A freshly verified session can make an already deferred lifecycle source
+// admissible. Wake only this origin's pending deliveries; a wake is never a
+// receipt and cannot authorize a private journal ACK.
+func (c *NativeObservationConnection) retryNativeWorkerObservations(originID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, retry := range c.pendingObservationRetries {
+		if retry.originID == originID {
+			select {
+			case retry.wake <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
 func (c *NativeObservationConnection) deliverWorkerObservation(ctx context.Context, p transport.NativeObservationPayload) (transport.NativeObservationReceiptPayload, error) {
 	ctx, cancel := nativeDeliveryContext(ctx)
 	defer cancel()
 	ch := make(chan transport.NativeObservationReceiptPayload, 1)
+	retry := nativeObservationRetry{originID: p.OriginID, wake: make(chan struct{}, 1)}
 	c.mu.Lock()
 	if err := c.deliveryReadyLocked(false); err != nil {
 		c.mu.Unlock()
@@ -193,31 +215,57 @@ func (c *NativeObservationConnection) deliverWorkerObservation(ctx context.Conte
 	if c.pendingObservations == nil {
 		c.pendingObservations = make(map[string]chan transport.NativeObservationReceiptPayload)
 	}
+	if c.pendingObservationRetries == nil {
+		c.pendingObservationRetries = make(map[string]nativeObservationRetry)
+	}
 	if c.pendingObservations[p.ObservationID] != nil {
 		c.mu.Unlock()
 		return transport.NativeObservationReceiptPayload{}, ErrNativeObservationConflict
 	}
 	c.pendingObservations[p.ObservationID] = ch
+	c.pendingObservationRetries[p.ObservationID] = retry
 	c.mu.Unlock()
-	defer func() { c.mu.Lock(); delete(c.pendingObservations, p.ObservationID); c.mu.Unlock() }()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pendingObservations, p.ObservationID)
+		delete(c.pendingObservationRetries, p.ObservationID)
+		c.mu.Unlock()
+	}()
 	if err := c.send(ctx, transport.MsgNativeObservation, p); err != nil {
 		return transport.NativeObservationReceiptPayload{}, err
 	}
-	select {
-	case <-ctx.Done():
-		return transport.NativeObservationReceiptPayload{}, ctx.Err()
-	case <-c.closed:
-		return transport.NativeObservationReceiptPayload{}, ErrNativeOriginAdmissionDeferred
-	case reply := <-ch:
-		c.mu.Lock()
-		err := c.deliveryReadyLocked(false)
-		c.mu.Unlock()
-		if err != nil {
-			return reply, err
+	for {
+		select {
+		case <-ctx.Done():
+			return transport.NativeObservationReceiptPayload{}, ctx.Err()
+		case <-c.closed:
+			return transport.NativeObservationReceiptPayload{}, ErrNativeOriginAdmissionDeferred
+		case <-retry.wake:
+			if err := ctx.Err(); err != nil {
+				return transport.NativeObservationReceiptPayload{}, err
+			}
+			c.mu.Lock()
+			err := c.deliveryReadyLocked(false)
+			c.mu.Unlock()
+			if err != nil {
+				return transport.NativeObservationReceiptPayload{}, err
+			}
+			// Reuse the same waiter and immutable payload under the original
+			// deadline, so a late receipt for either send remains authentic.
+			if err := c.send(ctx, transport.MsgNativeObservation, p); err != nil {
+				return transport.NativeObservationReceiptPayload{}, err
+			}
+		case reply := <-ch:
+			c.mu.Lock()
+			err := c.deliveryReadyLocked(false)
+			c.mu.Unlock()
+			if err != nil {
+				return reply, err
+			}
+			if reply.ObservationID != p.ObservationID || reply.OriginID != p.OriginID || reply.Digest != p.Digest {
+				return reply, ErrNativeObservationConflict
+			}
+			return reply, nil
 		}
-		if reply.ObservationID != p.ObservationID || reply.OriginID != p.OriginID || reply.Digest != p.Digest {
-			return reply, ErrNativeObservationConflict
-		}
-		return reply, nil
 	}
 }
