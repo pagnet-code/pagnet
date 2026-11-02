@@ -216,7 +216,7 @@ func TestNativeShareBindingChallengeAndReplay(t *testing.T) {
 	}
 	prepared.HolderX25519 = hex.EncodeToString(holder.PublicKey().Bytes())
 	prepared.BindingDigest, _ = prepared.Digest()
-	request := NativeShareBindingProvePayload{Version: 1, CommandID: "10000000-0000-4000-8000-000000000014", BindingDigest: prepared.BindingDigest, ChallengeID: "10000000-0000-4000-8000-000000000015"}
+	request := NativeShareBindingProvePayload{BindingID: prepared.Prepare.Binding.BindingID, Version: 1, CommandID: "10000000-0000-4000-8000-000000000014", BindingDigest: prepared.BindingDigest, ChallengeID: "10000000-0000-4000-8000-000000000015"}
 	challenge := make([]byte, 32)
 	if _, err := rand.Read(challenge); err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestNativeShareBindingChallengeAndReplay(t *testing.T) {
 	if err != nil || !bytes.Equal(plain, challenge) {
 		t.Fatal("challenge unwrap failed", err)
 	}
-	reply := NativeShareBindingProvedPayload{Version: 1, CommandID: request.CommandID, BindingDigest: request.BindingDigest, ChallengeID: request.ChallengeID, Challenge: plain}
+	reply := NativeShareBindingProvedPayload{BindingID: request.BindingID, Version: 1, CommandID: request.CommandID, BindingDigest: request.BindingDigest, ChallengeID: request.ChallengeID, Challenge: plain}
 	raw, err := reply.SignatureBytes()
 	if err != nil {
 		t.Fatal(err)
@@ -242,10 +242,12 @@ func TestNativeShareBindingChallengeAndReplay(t *testing.T) {
 	if err := reply.Verify(request, challenge, pub); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"CommandID", "BindingDigest", "ChallengeID"} {
+	for _, name := range []string{"BindingID", "CommandID", "BindingDigest", "ChallengeID"} {
 		t.Run(name, func(t *testing.T) {
 			changed := request
 			switch name {
+			case "BindingID":
+				changed.BindingID = "20000000-0000-4000-8000-000000000004"
 			case "CommandID":
 				changed.CommandID = domain.ID("20000000-0000-4000-8000-000000000001")
 			case "BindingDigest":

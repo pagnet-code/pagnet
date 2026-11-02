@@ -71,7 +71,10 @@ type NativeShareBindingPreparedPayload struct {
 	Signature     []byte                           `json:"signature"`
 }
 
+// BindingID routes restart-safe proof lookup and is authenticated in both the
+// encrypted challenge AAD and the signed reply. It never selects a caller path.
 type NativeShareBindingProvePayload struct {
+	BindingID     domain.ID      `json:"bindingId"`
 	Version       int            `json:"version"`
 	CommandID     domain.ID      `json:"commandId"`
 	BindingDigest string         `json:"bindingDigest"`
@@ -80,6 +83,7 @@ type NativeShareBindingProvePayload struct {
 }
 
 type NativeShareBindingProvedPayload struct {
+	BindingID     domain.ID `json:"bindingId"`
 	Version       int       `json:"version"`
 	CommandID     domain.ID `json:"commandId"`
 	BindingDigest string    `json:"bindingDigest"`
@@ -184,15 +188,16 @@ func (p NativeShareBindingPreparedPayload) Verify(expected NativeShareBindingPre
 // e2ee HPKE base suite. The plaintext must be a fresh random 32-byte challenge.
 // The encrypted challenge is excluded from its own AAD.
 func (p NativeShareBindingProvePayload) ChallengeAAD() ([]byte, error) {
-	if p.Version != NativeShareBindingVersion || !admissionID(p.CommandID) || !admissionID(p.ChallengeID) || !admissionHex(p.BindingDigest) {
+	if p.Version != NativeShareBindingVersion || !admissionID(p.BindingID) || !admissionID(p.CommandID) || !admissionID(p.ChallengeID) || !admissionHex(p.BindingDigest) {
 		return nil, errNativeShareBinding
 	}
 	raw, err := json.Marshal(struct {
+		BindingID     domain.ID `json:"bindingId"`
 		Version       int       `json:"version"`
 		CommandID     domain.ID `json:"commandId"`
 		BindingDigest string    `json:"bindingDigest"`
 		ChallengeID   domain.ID `json:"challengeId"`
-	}{p.Version, p.CommandID, p.BindingDigest, p.ChallengeID})
+	}{p.BindingID, p.Version, p.CommandID, p.BindingDigest, p.ChallengeID})
 	return append([]byte("pagnet/native-share-binding/challenge-aad/v1/"), raw...), err
 }
 
@@ -207,7 +212,7 @@ func (p NativeShareBindingProvePayload) CanonicalBytes() ([]byte, error) {
 }
 
 func (p NativeShareBindingProvedPayload) SignatureBytes() ([]byte, error) {
-	if _, err := (NativeShareBindingProvePayload{Version: p.Version, CommandID: p.CommandID, BindingDigest: p.BindingDigest, ChallengeID: p.ChallengeID}).ChallengeAAD(); err != nil {
+	if _, err := (NativeShareBindingProvePayload{BindingID: p.BindingID, Version: p.Version, CommandID: p.CommandID, BindingDigest: p.BindingDigest, ChallengeID: p.ChallengeID}).ChallengeAAD(); err != nil {
 		return nil, err
 	}
 	if len(p.Challenge) != 32 {
@@ -228,7 +233,7 @@ func (p NativeShareBindingProvedPayload) Verify(expected NativeShareBindingProve
 	if err != nil {
 		return err
 	}
-	if p.Version != expected.Version || p.CommandID != expected.CommandID || p.BindingDigest != expected.BindingDigest || p.ChallengeID != expected.ChallengeID || !bytes.Equal(p.Challenge, challenge) || len(host) != ed25519.PublicKeySize || !ed25519.Verify(host, raw, p.Signature) {
+	if p.BindingID != expected.BindingID || p.Version != expected.Version || p.CommandID != expected.CommandID || p.BindingDigest != expected.BindingDigest || p.ChallengeID != expected.ChallengeID || !bytes.Equal(p.Challenge, challenge) || len(host) != ed25519.PublicKeySize || !ed25519.Verify(host, raw, p.Signature) {
 		return errNativeShareBinding
 	}
 	return nil

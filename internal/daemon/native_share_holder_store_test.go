@@ -46,7 +46,7 @@ func nativeShareStoreFixture(t *testing.T) (*NativeShareHolderStore, *hostcrypto
 }
 
 func nativeShareStorePath(store *NativeShareHolderStore, request transport.NativeShareBindingPreparePayload) string {
-	return filepath.Join(store.registry.root, "closed-share-bindings", string(request.Binding.BindingID), string(request.Binding.InstanceID), string(request.Binding.ContextID))
+	return filepath.Join(store.registry.root, "closed-share-bindings", string(request.Binding.BindingID))
 }
 
 func TestNativeShareHolderStoreRestartRetryAndIsolation(t *testing.T) {
@@ -211,7 +211,7 @@ func TestNativeShareHolderStoreUnsafeOrPartialState(t *testing.T) {
 			}
 			directory := nativeShareStorePath(store, request)
 			target := filepath.Join(directory, "holder.json")
-			bindingDir := filepath.Dir(filepath.Dir(directory))
+			bindingDir := directory
 			switch name {
 			case "pending":
 				if err := os.Remove(target); err != nil {
@@ -348,7 +348,7 @@ func TestNativeShareHolderStoreConcurrentRetry(t *testing.T) {
 func TestNativeShareHolderStoreRecoveryWhileWaiting(t *testing.T) {
 	store, _, request, session := nativeShareStoreFixture(t)
 	// Precreate only private namespace/lock directories; no holder exists yet.
-	bindingPath := filepath.Dir(filepath.Dir(nativeShareStorePath(store, request)))
+	bindingPath := nativeShareStorePath(store, request)
 	if err := os.MkdirAll(bindingPath, 0700); err != nil {
 		t.Fatal(err)
 	}

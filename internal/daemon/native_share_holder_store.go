@@ -8,6 +8,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -122,42 +123,12 @@ func (s *NativeShareHolderStore) Prepare(request transport.NativeShareBindingPre
 		return empty, errNativeShareHolder
 	}
 	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
-	var payload []byte
-	var state string
-	if err := conn.QueryRowContext(context.Background(), `SELECT payload,launch_state FROM native_workers WHERE instance_id=?`, string(request.Binding.InstanceID)).Scan(&payload, &state); err != nil {
-		return empty, errNativeShareHolder
-	}
-	worker, err = s.registry.decodeRecord(string(request.Binding.InstanceID), payload, state)
-	if err != nil {
-		return empty, errNativeShareHolder
-	}
-	var fenced int
-	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation='')`, worker.Scope.InstanceID, worker.Scope.Generation).Scan(&fenced); err != nil || fenced != 0 {
-		return empty, errNativeShareHolder
-	}
-	subject, err = ValidateNativeShareBinding(request, capturedServerURL, session, worker)
+	subject, err = s.subject(conn, request, capturedServerURL, session)
 	if err != nil {
 		return empty, err
 	}
-	// Lock by binding ID before selecting instance/context children. A reused ID
-	// can never silently create a second holder under a different instance/context.
-	if err := nativeShareHolderEntries(binding, "holder.lock", string(request.Binding.InstanceID)); err != nil {
-		return empty, err
-	}
-	instance, err := nativeShareHolderChild(binding, string(request.Binding.InstanceID))
-	if err != nil {
-		return empty, err
-	}
-	defer instance.Close()
-	if err := nativeShareHolderEntries(instance, string(request.Binding.ContextID)); err != nil {
-		return empty, err
-	}
-	directory, err := nativeShareHolderChild(instance, string(request.Binding.ContextID))
-	if err != nil {
-		return empty, err
-	}
-	defer directory.Close()
-	if err := nativeShareHolderEntries(directory, "holder.json"); err != nil {
+	directory := binding
+	if err := nativeShareHolderEntries(directory, "holder.lock", "holder.json"); err != nil {
 		return empty, err
 	}
 	file, err := nativeShareHolderOpen(directory, "holder.json", false)
@@ -244,14 +215,31 @@ func (s *NativeShareHolderStore) Prepare(request transport.NativeShareBindingPre
 }
 
 func (s *NativeShareHolderStore) load(file *os.File, request transport.NativeShareBindingPreparePayload, subject transport.NativeShareBindingSubject) (transport.NativeShareBindingPreparedPayload, error) {
-	var empty transport.NativeShareBindingPreparedPayload
+	record, err := s.loadRecord(file)
+	if err != nil {
+		return transport.NativeShareBindingPreparedPayload{}, err
+	}
+	defer clear(record.PrivateKey)
+	if err := record.Prepared.Verify(request, subject, s.signer.Public().(ed25519.PublicKey)); err != nil {
+		return transport.NativeShareBindingPreparedPayload{}, errNativeShareHolder
+	}
+	return record.Prepared, nil
+}
+
+func (s *NativeShareHolderStore) loadRecord(file *os.File) (nativeShareHolderRecord, error) {
+	var empty nativeShareHolderRecord
 	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
 	defer clear(raw)
 	if err != nil || len(raw) > nativeShareHolderMaxBytes {
 		return empty, errNativeShareHolder
 	}
 	var record nativeShareHolderRecord
-	defer func() { clear(record.PrivateKey) }()
+	valid := false
+	defer func() {
+		if !valid {
+			clear(record.PrivateKey)
+		}
+	}()
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&record); err != nil {
@@ -264,10 +252,31 @@ func (s *NativeShareHolderStore) load(file *os.File, request transport.NativeSha
 	if err != nil || record.Prepared.HolderX25519 != hex.EncodeToString(key.PublicKey().Bytes()) {
 		return empty, errNativeShareHolder
 	}
-	if err := record.Prepared.Verify(request, subject, s.signer.Public().(ed25519.PublicKey)); err != nil {
+	if err := record.Prepared.Verify(record.Prepared.Prepare, record.Prepared.Subject, s.signer.Public().(ed25519.PublicKey)); err != nil {
 		return empty, errNativeShareHolder
 	}
-	return record.Prepared, nil
+	valid = true
+	return record, nil
+}
+
+// subject reads only through the active authority transaction. The reservation
+// must remain held through signing and a successful COMMIT before evidence leaves.
+func (s *NativeShareHolderStore) subject(conn *sql.Conn, request transport.NativeShareBindingPreparePayload, endpoint string, session transport.HostSessionPayload) (transport.NativeShareBindingSubject, error) {
+	var empty transport.NativeShareBindingSubject
+	var payload []byte
+	var state string
+	if err := conn.QueryRowContext(context.Background(), `SELECT payload,launch_state FROM native_workers WHERE instance_id=?`, string(request.Binding.InstanceID)).Scan(&payload, &state); err != nil {
+		return empty, errNativeShareHolder
+	}
+	worker, err := s.registry.decodeRecord(string(request.Binding.InstanceID), payload, state)
+	if err != nil {
+		return empty, errNativeShareHolder
+	}
+	var fenced int
+	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation='')`, worker.Scope.InstanceID, worker.Scope.Generation).Scan(&fenced); err != nil || fenced != 0 {
+		return empty, errNativeShareHolder
+	}
+	return ValidateNativeShareBinding(request, endpoint, session, worker)
 }
 
 // Descriptor-relative walks mirror the native admission ledger: ancestors may
@@ -359,7 +368,15 @@ func nativeShareHolderOpen(directory *os.File, name string, create bool) (*os.Fi
 }
 
 func nativeShareHolderLock(directory *os.File) (*os.File, error) {
-	fd, err := unix.Openat(int(directory.Fd()), "holder.lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0600)
+	return nativeShareHolderLockMode(directory, true)
+}
+
+func nativeShareHolderLockMode(directory *os.File, create bool) (*os.File, error) {
+	flags := unix.O_RDWR | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
+	if create {
+		flags |= unix.O_CREAT
+	}
+	fd, err := unix.Openat(int(directory.Fd()), "holder.lock", flags, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -372,11 +389,11 @@ func nativeShareHolderLock(directory *os.File) (*os.File, error) {
 			}
 		}
 	}
-	if err == nil {
+	if err == nil && create {
 		err = lock.Sync()
-	}
-	if err == nil {
-		err = directory.Sync()
+		if err == nil {
+			err = directory.Sync()
+		}
 	}
 	if err != nil {
 		lock.Close()
@@ -403,4 +420,16 @@ func nativeShareHolderEntries(directory *os.File, allowed ...string) error {
 		}
 	}
 	return nil
+}
+
+func nativeShareHolderExistingChild(parent *os.File, name string) (*os.File, error) {
+	child, err := nativeShareHolderOpenDir(parent, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := nativeShareHolderPrivate(child, true); err != nil {
+		child.Close()
+		return nil, err
+	}
+	return child, nil
 }
