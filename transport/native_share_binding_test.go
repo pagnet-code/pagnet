@@ -21,12 +21,9 @@ func nativeShareBindingFixture() NativeShareBindingPreparePayload {
 		Binding: NativeShareBinding{
 			Version: 1, BindingID: "10000000-0000-4000-8000-000000000002",
 			ProposalID: "10000000-0000-4000-8000-000000000003", GrantID: "10000000-0000-4000-8000-000000000004",
-			NetworkID: "10000000-0000-4000-8000-000000000005", ProposalGeneration: 1, GrantGeneration: 2,
-			OwningTenantID: "10000000-0000-4000-8000-000000000016", OwnerUserID: "10000000-0000-4000-8000-000000000017",
+			NetworkID: "10000000-0000-4000-8000-000000000005", ProposalRevision: 1, GrantGeneration: 2,
 			PrincipalID: "10000000-0000-4000-8000-000000000006", InstanceID: "10000000-0000-4000-8000-000000000007",
-			HostID: "10000000-0000-4000-8000-000000000008", NativeAdmissionID: "10000000-0000-4000-8000-000000000009",
-			RunnerID: "10000000-0000-4000-8000-000000000010", RunnerIncarnationID: "10000000-0000-4000-8000-000000000011",
-			RunnerGeneration: 3, ProfileFingerprint: strings.Repeat("ab", 32), ContextID: "10000000-0000-4000-8000-000000000012",
+			NativeGeneration: "original-native-generation", ContextID: "10000000-0000-4000-8000-000000000012",
 			ExpiresAt: "2027-01-02T03:04:05Z",
 		},
 	}
@@ -38,7 +35,11 @@ func nativeSharePrepared(t *testing.T) (NativeShareBindingPreparedPayload, ed255
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := NativeShareBindingPreparedPayload{Prepare: nativeShareBindingFixture(), HolderID: "10000000-0000-4000-8000-000000000013", HolderX25519: strings.Repeat("cd", 32)}
+	p := NativeShareBindingPreparedPayload{Prepare: nativeShareBindingFixture(), Subject: NativeShareBindingSubject{
+		ServerURL: "https://example.test", TenantID: "10000000-0000-4000-8000-000000000016", AccountID: "10000000-0000-4000-8000-000000000017",
+		HostID: "10000000-0000-4000-8000-000000000008", NativeAdmissionID: "10000000-0000-4000-8000-000000000009",
+		RunnerID: "10000000-0000-4000-8000-000000000010", RunnerEpoch: "2026-11-02T09:10:11.123456789Z", BootID: "linux-boot-id", ProfileFingerprint: strings.Repeat("ab", 32),
+	}, HolderID: "10000000-0000-4000-8000-000000000013", HolderX25519: strings.Repeat("cd", 32)}
 	p.BindingDigest, err = p.Digest()
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +66,7 @@ func TestNativeShareBindingDeterministic(t *testing.T) {
 	if err != nil || !bytes.Equal(raw, again) {
 		t.Fatal("canonical transcript changed after round trip")
 	}
-	if err := p.Verify(decoded, pub); err != nil {
+	if err := p.Verify(decoded, p.Subject, pub); err != nil {
 		t.Fatal(err)
 	}
 	digest, _ := p.Digest()
@@ -73,7 +74,7 @@ func TestNativeShareBindingDeterministic(t *testing.T) {
 		t.Fatal("unstable digest or generation encoding")
 	}
 	p.Signature[0] ^= 1
-	if p.Verify(decoded, pub) == nil {
+	if p.Verify(decoded, p.Subject, pub) == nil {
 		t.Fatal("accepted tampered signature")
 	}
 }
@@ -94,8 +95,8 @@ func TestNativeShareBindingEveryFieldRequiredAndBound(t *testing.T) {
 			switch field.Kind() {
 			case reflect.String:
 				switch typ.Field(i).Name {
-				case "ProfileFingerprint":
-					field.SetString(strings.Repeat("ef", 32))
+				case "NativeGeneration":
+					field.SetString("another-opaque-native-generation")
 				case "ExpiresAt":
 					field.SetString("2027-01-02T03:04:06Z")
 				default:
@@ -106,7 +107,7 @@ func TestNativeShareBindingEveryFieldRequiredAndBound(t *testing.T) {
 			case reflect.Int:
 				field.SetInt(2)
 			}
-			if changed.Verify(p.Prepare, pub) == nil {
+			if changed.Verify(p.Prepare, p.Subject, pub) == nil {
 				t.Fatal("accepted changed binding")
 			}
 			if typ.Field(i).Name != "Version" {
@@ -127,7 +128,7 @@ func TestNativeShareBindingEveryFieldRequiredAndBound(t *testing.T) {
 		changed := p
 		mutate(&changed)
 		digest, err := changed.Digest()
-		if err != nil || digest == p.BindingDigest || changed.Verify(p.Prepare, pub) == nil {
+		if err != nil || digest == p.BindingDigest || changed.Verify(p.Prepare, p.Subject, pub) == nil {
 			t.Fatal("prepare command or holder mutation was not bound", err)
 		}
 	}
@@ -139,10 +140,71 @@ func TestNativeShareBindingEveryFieldRequiredAndBound(t *testing.T) {
 			} else {
 				reflect.ValueOf(&changed).Elem().FieldByName(name).SetZero()
 			}
-			if changed.Verify(p.Prepare, pub) == nil {
+			if changed.Verify(p.Prepare, p.Subject, pub) == nil {
 				t.Fatal("accepted omitted receipt field")
 			}
 		})
+	}
+}
+
+func TestNativeShareBindingSubjectRequiredAndBound(t *testing.T) {
+	p, pub, private := nativeSharePrepared(t)
+	typ := reflect.TypeOf(p.Subject)
+	for i := 0; i < typ.NumField(); i++ {
+		t.Run(typ.Field(i).Name, func(t *testing.T) {
+			changed := p
+			field := reflect.ValueOf(&changed.Subject).Elem().Field(i)
+			field.SetZero()
+			if _, err := changed.Digest(); err == nil {
+				t.Fatal("accepted omitted subject field")
+			}
+			changed = p
+			field = reflect.ValueOf(&changed.Subject).Elem().Field(i)
+			switch typ.Field(i).Name {
+			case "ServerURL":
+				field.SetString("https://other.example.test")
+			case "RunnerEpoch":
+				field.SetString("2026-11-02T09:10:12.123456789Z")
+			case "BootID":
+				field.SetString("another-boot")
+			case "ProfileFingerprint":
+				field.SetString(strings.Repeat("ef", 32))
+			default:
+				field.SetString("20000000-0000-4000-8000-000000000001")
+			}
+			digest, err := changed.Digest()
+			if err != nil || digest == p.BindingDigest {
+				t.Fatal("subject field is not bound", err)
+			}
+			changed.BindingDigest = digest
+			raw, err := changed.SignatureBytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed.Signature = ed25519.Sign(private, raw)
+			if changed.Verify(p.Prepare, p.Subject, pub) == nil {
+				t.Fatal("accepted transcript substitution with valid signature")
+			}
+		})
+	}
+	for _, epoch := range []string{"2026-11-02T09:10:11.123456789+00:00", "2026-11-02T09:10:11.1234567890Z", "0001-01-01T00:00:00Z"} {
+		changed := p.Subject
+		changed.RunnerEpoch = epoch
+		if _, err := changed.CanonicalBytes(); err == nil {
+			t.Fatal("accepted noncanonical or zero runner epoch", epoch)
+		}
+	}
+	raw, err := p.Subject.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var subject NativeShareBindingSubject
+	if err := json.Unmarshal(raw, &subject); err != nil {
+		t.Fatal(err)
+	}
+	again, err := subject.CanonicalBytes()
+	if err != nil || !bytes.Equal(raw, again) {
+		t.Fatal("subject timestamp round trip changed transcript", err)
 	}
 }
 

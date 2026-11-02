@@ -7,6 +7,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -16,32 +19,40 @@ const MsgNativeShareBindingPrepare = "host.native_share_binding_prepare"
 const MsgNativeShareBindingProve = "host.native_share_binding_prove"
 const NativeShareBindingChallengeInfo = "pagnet/native-share-binding/challenge/v1/"
 
-// NativeShareBinding is public, immutable selection metadata for a dedicated
-// context holder. It contains no epoch material or local filesystem locations.
-// The server derives the selected account identity; the client checks it against
-// its local account registry.
-// Generations are nonzero decimal strings on the wire. Expiry is canonical UTC
-// RFC3339Nano; current selection, expiry and replay checks remain the caller's job.
+// NativeShareBinding is a server-authoritative principal selection for a new,
+// closed binding. PrincipalID is not inferred from a local worker record. Owner
+// authorization remains server-side. NativeGeneration is the exact opaque native
+// Scope.Generation, never a numeric runner generation. All timestamps are UTC
+// RFC3339Nano. This metadata grants no membership or access to epoch material.
 type NativeShareBinding struct {
-	Version             int       `json:"version"`
-	BindingID           domain.ID `json:"bindingId"`
-	ProposalID          domain.ID `json:"proposalId"`
-	GrantID             domain.ID `json:"grantId"`
-	NetworkID           domain.ID `json:"networkId"`
-	ProposalGeneration  uint64    `json:"proposalGeneration,string"`
-	GrantGeneration     uint64    `json:"grantGeneration,string"`
-	PrincipalID         domain.ID `json:"principalId"`
-	OwningTenantID      domain.ID `json:"owningTenantId"`
-	OwnerUserID         domain.ID `json:"ownerUserId"`
-	InstanceID          domain.ID `json:"instanceId"`
-	HostID              domain.ID `json:"hostId"`
-	NativeAdmissionID   domain.ID `json:"nativeAdmissionId"`
-	RunnerID            domain.ID `json:"runnerId"`
-	RunnerIncarnationID domain.ID `json:"runnerIncarnationId"`
-	RunnerGeneration    uint64    `json:"runnerGeneration,string"`
-	ProfileFingerprint  string    `json:"profileFingerprint"`
-	ContextID           domain.ID `json:"contextId"`
-	ExpiresAt           string    `json:"expiresAt"`
+	Version          int       `json:"version"`
+	BindingID        domain.ID `json:"bindingId"`
+	ProposalID       domain.ID `json:"proposalId"`
+	GrantID          domain.ID `json:"grantId"`
+	NetworkID        domain.ID `json:"networkId"`
+	ProposalRevision uint64    `json:"proposalRevision,string"`
+	GrantGeneration  uint64    `json:"grantGeneration,string"`
+	PrincipalID      domain.ID `json:"principalId"`
+	InstanceID       domain.ID `json:"instanceId"`
+	NativeGeneration string    `json:"nativeGeneration"`
+	ContextID        domain.ID `json:"contextId"`
+	ExpiresAt        string    `json:"expiresAt"`
+}
+
+// NativeShareBindingSubject is public evidence captured from the original local
+// registry and authenticated host session. RunnerEpoch is the existing session
+// timestamp, encoded once as canonical UTC RFC3339Nano. No paths or secrets enter
+// the transcript. Current expiry, registry and replay checks remain caller duties.
+type NativeShareBindingSubject struct {
+	ServerURL          string    `json:"serverUrl"`
+	TenantID           domain.ID `json:"tenantId"`
+	AccountID          domain.ID `json:"accountId"`
+	HostID             domain.ID `json:"hostId"`
+	NativeAdmissionID  domain.ID `json:"nativeAdmissionId"`
+	RunnerID           domain.ID `json:"runnerId"`
+	RunnerEpoch        string    `json:"runnerEpoch"`
+	BootID             string    `json:"bootId"`
+	ProfileFingerprint string    `json:"profileFingerprint"`
 }
 
 // These dormant payloads are intended for reliable host commands. Command IDs
@@ -53,6 +64,7 @@ type NativeShareBindingPreparePayload struct {
 
 type NativeShareBindingPreparedPayload struct {
 	Prepare       NativeShareBindingPreparePayload `json:"prepare"`
+	Subject       NativeShareBindingSubject        `json:"subject"`
 	HolderID      domain.ID                        `json:"holderId"`
 	HolderX25519  string                           `json:"holderX25519"`
 	BindingDigest string                           `json:"bindingDigest"`
@@ -78,16 +90,33 @@ type NativeShareBindingProvedPayload struct {
 
 var errNativeShareBinding = errors.New("transport: invalid native share binding")
 
+func nativeShareOpaque(s string) bool {
+	return s != "" && len(s) <= 256 && utf8.ValidString(s) && strings.TrimSpace(s) == s && !strings.ContainsAny(s, "\x00\r\n")
+}
+
 func (b NativeShareBinding) CanonicalBytes() ([]byte, error) {
-	if b.Version != NativeShareBindingVersion || b.ProposalGeneration == 0 || b.GrantGeneration == 0 || b.RunnerGeneration == 0 || !admissionHex(b.ProfileFingerprint) || !admissionTime(b.ExpiresAt) {
+	if b.Version != NativeShareBindingVersion || b.ProposalRevision == 0 || b.GrantGeneration == 0 || !nativeShareOpaque(b.NativeGeneration) || !admissionTime(b.ExpiresAt) {
 		return nil, errNativeShareBinding
 	}
-	for _, id := range []domain.ID{b.BindingID, b.ProposalID, b.GrantID, b.NetworkID, b.PrincipalID, b.OwningTenantID, b.OwnerUserID, b.InstanceID, b.HostID, b.NativeAdmissionID, b.RunnerID, b.RunnerIncarnationID, b.ContextID} {
+	for _, id := range []domain.ID{b.BindingID, b.ProposalID, b.GrantID, b.NetworkID, b.PrincipalID, b.InstanceID, b.ContextID} {
 		if !admissionID(id) {
 			return nil, errNativeShareBinding
 		}
 	}
 	return json.Marshal(b)
+}
+
+func (s NativeShareBindingSubject) CanonicalBytes() ([]byte, error) {
+	endpoint, err := url.Parse(s.ServerURL)
+	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || !nativeShareOpaque(s.BootID) || !admissionTime(s.RunnerEpoch) || !admissionHex(s.ProfileFingerprint) {
+		return nil, errNativeShareBinding
+	}
+	for _, id := range []domain.ID{s.TenantID, s.AccountID, s.HostID, s.NativeAdmissionID, s.RunnerID} {
+		if !admissionID(id) {
+			return nil, errNativeShareBinding
+		}
+	}
+	return json.Marshal(s)
 }
 
 func (p NativeShareBindingPreparePayload) CanonicalBytes() ([]byte, error) {
@@ -106,14 +135,18 @@ func (p NativeShareBindingPreparedPayload) Digest() (string, error) {
 	if _, err := p.Prepare.CanonicalBytes(); err != nil {
 		return "", err
 	}
+	if _, err := p.Subject.CanonicalBytes(); err != nil {
+		return "", err
+	}
 	if !admissionID(p.HolderID) || !admissionHex(p.HolderX25519) {
 		return "", errNativeShareBinding
 	}
 	raw, err := json.Marshal(struct {
 		Prepare      NativeShareBindingPreparePayload `json:"prepare"`
+		Subject      NativeShareBindingSubject        `json:"subject"`
 		HolderID     domain.ID                        `json:"holderId"`
 		HolderX25519 string                           `json:"holderX25519"`
-	}{p.Prepare, p.HolderID, p.HolderX25519})
+	}{p.Prepare, p.Subject, p.HolderID, p.HolderX25519})
 	if err != nil {
 		return "", err
 	}
@@ -132,14 +165,16 @@ func (p NativeShareBindingPreparedPayload) SignatureBytes() ([]byte, error) {
 	return []byte("pagnet/native-share-binding/prepared/v1/" + digest), nil
 }
 
-// Verify requires the independently selected command and trusted host key.
+// Verify requires the independently selected command, captured subject and
+// trusted host key. It compares the complete transcript rather than trusting
+// substituted subject metadata in the reply.
 // It does not authorize installation, admission, or use of any epoch key.
-func (p NativeShareBindingPreparedPayload) Verify(expected NativeShareBindingPreparePayload, host ed25519.PublicKey) error {
+func (p NativeShareBindingPreparedPayload) Verify(expected NativeShareBindingPreparePayload, subject NativeShareBindingSubject, host ed25519.PublicKey) error {
 	raw, err := p.SignatureBytes()
 	if err != nil {
 		return err
 	}
-	if p.Prepare != expected || len(host) != ed25519.PublicKeySize || !ed25519.Verify(host, raw, p.Signature) {
+	if p.Prepare != expected || p.Subject != subject || len(host) != ed25519.PublicKeySize || !ed25519.Verify(host, raw, p.Signature) {
 		return errNativeShareBinding
 	}
 	return nil
