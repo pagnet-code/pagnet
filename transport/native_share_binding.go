@@ -18,6 +18,8 @@ const NativeShareBindingChallengeInfo = "pagnet/native-share-binding/challenge/v
 
 // NativeShareBinding is public, immutable selection metadata for a dedicated
 // context holder. It contains no epoch material or local filesystem locations.
+// The server derives the selected account identity; the client checks it against
+// its local account registry.
 // Generations are nonzero decimal strings on the wire. Expiry is canonical UTC
 // RFC3339Nano; current selection, expiry and replay checks remain the caller's job.
 type NativeShareBinding struct {
@@ -29,6 +31,8 @@ type NativeShareBinding struct {
 	ProposalGeneration  uint64    `json:"proposalGeneration,string"`
 	GrantGeneration     uint64    `json:"grantGeneration,string"`
 	PrincipalID         domain.ID `json:"principalId"`
+	OwningTenantID      domain.ID `json:"owningTenantId"`
+	OwnerUserID         domain.ID `json:"ownerUserId"`
 	InstanceID          domain.ID `json:"instanceId"`
 	HostID              domain.ID `json:"hostId"`
 	NativeAdmissionID   domain.ID `json:"nativeAdmissionId"`
@@ -78,7 +82,7 @@ func (b NativeShareBinding) CanonicalBytes() ([]byte, error) {
 	if b.Version != NativeShareBindingVersion || b.ProposalGeneration == 0 || b.GrantGeneration == 0 || b.RunnerGeneration == 0 || !admissionHex(b.ProfileFingerprint) || !admissionTime(b.ExpiresAt) {
 		return nil, errNativeShareBinding
 	}
-	for _, id := range []domain.ID{b.BindingID, b.ProposalID, b.GrantID, b.NetworkID, b.PrincipalID, b.InstanceID, b.HostID, b.NativeAdmissionID, b.RunnerID, b.RunnerIncarnationID, b.ContextID} {
+	for _, id := range []domain.ID{b.BindingID, b.ProposalID, b.GrantID, b.NetworkID, b.PrincipalID, b.OwningTenantID, b.OwnerUserID, b.InstanceID, b.HostID, b.NativeAdmissionID, b.RunnerID, b.RunnerIncarnationID, b.ContextID} {
 		if !admissionID(id) {
 			return nil, errNativeShareBinding
 		}
