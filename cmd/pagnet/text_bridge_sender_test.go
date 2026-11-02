@@ -399,11 +399,35 @@ func TestTextBridgeSenderResumeReceiptAfterSDKRetiresCiphertext(t *testing.T) {
 }
 
 func TestTextBridgeSenderWaitIsBoundedWithoutPolling(t *testing.T) {
-	state, dir, _ := textBridgeSenderSetup(t)
-	f := &textBridgeSenderFake{t: t, dir: dir}
-	out, err := textBridgeSenderExecute(t, textBridgeSenderDeps(f), "test prompt", "--state-dir", state, "sender", "ask", "--service", textBridgeTestService, "--project", textBridgeSenderProject, "--to", textBridgeSenderRecipient, "--wait", "200ms")
-	if !errors.Is(err, context.DeadlineExceeded) || strings.TrimSpace(out) != f.prepared.ID || f.prepares != 1 || f.sends != 1 || f.statusCalls != 1 || !f.closed {
-		t.Fatalf("bounded wait: %q %v prepares=%d sends=%d status=%d", out, err, f.prepares, f.sends, f.statusCalls)
+	_, dir, p := textBridgeSenderSetup(t)
+	store, err := sender.Open(filepath.Join(dir, "operations"), sender.Binding{ServiceOrigin: p.Server, PrincipalID: p.Service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operation, err := store.Reserve(context.Background(), textBridgeSenderProject, textBridgeSenderRecipient, "test prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &textBridgeSenderFake{t: t, dir: dir, onEnable: func() {}}
+	defer f.Close()
+	// Finish durable preparation and admission before starting the wait deadline.
+	operation, err = sender.Reconcile(context.Background(), f, store, operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Phase != sender.Admitted || operation.Receipt == nil {
+		t.Fatalf("ASK was not admitted before waiting: %+v", operation)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	waited, err := sender.Run(ctx, f, store, p.Service, operation)
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "sender wait ended; resume or inspect the saved ASK") || waited.AskID != operation.AskID || f.prepares != 1 || f.sends != 1 || f.statusCalls != 1 || f.closed {
+		t.Fatalf("bounded wait: %+v %v prepares=%d sends=%d status=%d closed=%v", waited, err, f.prepares, f.sends, f.statusCalls, f.closed)
+	}
+	saved, err := store.Get(context.Background(), operation.ProjectID, operation.AskID)
+	if err != nil || saved.AskID != operation.AskID || saved.Phase != sender.Admitted || saved.Receipt == nil || saved.Reply != nil {
+		t.Fatalf("saved ASK is not resumable after wait: %+v %v", saved, err)
 	}
 }
 
