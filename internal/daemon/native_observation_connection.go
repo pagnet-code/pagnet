@@ -29,6 +29,8 @@ type NativeObservationConnection struct {
 	pendingSessions      map[string]chan transport.NativeOriginSessionConfirmedPayload
 	pendingContent       map[string]chan transport.NativeContentStagedPayload
 	pendingObservations  map[string]chan transport.NativeObservationReceiptPayload
+
+	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
 	// their raw reply channel: both the publish/invoke result and the
 	// catalog page reply correlate on the same lane (the typed exchanges

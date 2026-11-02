@@ -347,6 +347,7 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 		}
 	}()
 	go d.pumpNativeBridge(ctx, link)
+	go d.pumpNativeAdmission(ctx, link)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var nextCancellation time.Time
@@ -356,9 +357,6 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 			return
 		case <-ticker.C:
 		}
-		// The admission gate belongs to this exact authenticated connection. A
-		// disconnect stops forwarding; the independently owned session survives.
-		_ = link.proxy.Reconcile(ctx)
 		_ = link.proxy.DrainSources(ctx)
 		d.reconcileHostedSideport(ctx, link)
 
@@ -374,6 +372,24 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 			link.ownership = *updated
 			link.mu.Unlock()
 		}
+	}
+}
+
+// Admission must keep progressing while source delivery waits for a receipt:
+// a lifecycle observation may need the next live-session confirmation before
+// the server can commit it. Reconcile retains its own serialization gate.
+func (d *Daemon) pumpNativeAdmission(ctx context.Context, link *nativeWorkerLink) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		// This exact authenticated connection owns the admission gate. The
+		// shared pump context cancels it on disconnect; the session survives.
+		_ = link.proxy.Reconcile(ctx)
 	}
 }
 
