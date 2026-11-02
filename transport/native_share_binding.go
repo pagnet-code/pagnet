@@ -9,8 +9,10 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/domain"
 )
 
@@ -94,16 +96,31 @@ type NativeShareBindingProvedPayload struct {
 
 var errNativeShareBinding = errors.New("transport: invalid native share binding")
 
+func nativeShareBindingID(id domain.ID) bool {
+	u, err := uuid.Parse(string(id))
+	return err == nil && u != uuid.Nil && u.String() == string(id)
+}
+
+func nativeShareBindingHex(s string) bool {
+	b, err := hex.DecodeString(s)
+	return err == nil && len(b) == 32 && hex.EncodeToString(b) == s
+}
+
+func nativeShareBindingTime(s string) bool {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	return err == nil && !t.IsZero() && t.UTC().Format(time.RFC3339Nano) == s
+}
+
 func nativeShareOpaque(s string) bool {
 	return s != "" && len(s) <= 256 && utf8.ValidString(s) && strings.TrimSpace(s) == s && !strings.ContainsAny(s, "\x00\r\n")
 }
 
 func (b NativeShareBinding) CanonicalBytes() ([]byte, error) {
-	if b.Version != NativeShareBindingVersion || b.ProposalRevision == 0 || b.GrantGeneration == 0 || !nativeShareOpaque(b.NativeGeneration) || !admissionTime(b.ExpiresAt) {
+	if b.Version != NativeShareBindingVersion || b.ProposalRevision == 0 || b.GrantGeneration == 0 || !nativeShareOpaque(b.NativeGeneration) || !nativeShareBindingTime(b.ExpiresAt) {
 		return nil, errNativeShareBinding
 	}
 	for _, id := range []domain.ID{b.BindingID, b.ProposalID, b.GrantID, b.NetworkID, b.PrincipalID, b.InstanceID, b.ContextID} {
-		if !admissionID(id) {
+		if !nativeShareBindingID(id) {
 			return nil, errNativeShareBinding
 		}
 	}
@@ -112,11 +129,11 @@ func (b NativeShareBinding) CanonicalBytes() ([]byte, error) {
 
 func (s NativeShareBindingSubject) CanonicalBytes() ([]byte, error) {
 	endpoint, err := url.Parse(s.ServerURL)
-	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || !nativeShareOpaque(s.BootID) || !admissionTime(s.RunnerEpoch) || !admissionHex(s.ProfileFingerprint) {
+	if err != nil || (endpoint.Scheme != "https" && endpoint.Scheme != "http") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || !nativeShareOpaque(s.BootID) || !nativeShareBindingTime(s.RunnerEpoch) || !nativeShareBindingHex(s.ProfileFingerprint) {
 		return nil, errNativeShareBinding
 	}
 	for _, id := range []domain.ID{s.TenantID, s.AccountID, s.HostID, s.NativeAdmissionID, s.RunnerID} {
-		if !admissionID(id) {
+		if !nativeShareBindingID(id) {
 			return nil, errNativeShareBinding
 		}
 	}
@@ -124,7 +141,7 @@ func (s NativeShareBindingSubject) CanonicalBytes() ([]byte, error) {
 }
 
 func (p NativeShareBindingPreparePayload) CanonicalBytes() ([]byte, error) {
-	if !admissionID(p.CommandID) {
+	if !nativeShareBindingID(p.CommandID) {
 		return nil, errNativeShareBinding
 	}
 	if _, err := p.Binding.CanonicalBytes(); err != nil {
@@ -142,7 +159,7 @@ func (p NativeShareBindingPreparedPayload) Digest() (string, error) {
 	if _, err := p.Subject.CanonicalBytes(); err != nil {
 		return "", err
 	}
-	if !admissionID(p.HolderID) || !admissionHex(p.HolderX25519) {
+	if !nativeShareBindingID(p.HolderID) || !nativeShareBindingHex(p.HolderX25519) {
 		return "", errNativeShareBinding
 	}
 	raw, err := json.Marshal(struct {
@@ -188,7 +205,7 @@ func (p NativeShareBindingPreparedPayload) Verify(expected NativeShareBindingPre
 // e2ee HPKE base suite. The plaintext must be a fresh random 32-byte challenge.
 // The encrypted challenge is excluded from its own AAD.
 func (p NativeShareBindingProvePayload) ChallengeAAD() ([]byte, error) {
-	if p.Version != NativeShareBindingVersion || !admissionID(p.BindingID) || !admissionID(p.CommandID) || !admissionID(p.ChallengeID) || !admissionHex(p.BindingDigest) {
+	if p.Version != NativeShareBindingVersion || !nativeShareBindingID(p.BindingID) || !nativeShareBindingID(p.CommandID) || !nativeShareBindingID(p.ChallengeID) || !nativeShareBindingHex(p.BindingDigest) {
 		return nil, errNativeShareBinding
 	}
 	raw, err := json.Marshal(struct {
