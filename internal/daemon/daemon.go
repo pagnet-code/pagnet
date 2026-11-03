@@ -1085,9 +1085,11 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
 	}
 	q.Del("native_worker_recovery")
+	q.Del("native_worker_prior_launch_boot_recovery")
 	if d.nativeRegistry != nil {
 		q.Set("native_worker_availability", transport.NativeWorkerAvailabilityProtocol)
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
+		q.Set("native_worker_prior_launch_boot_recovery", transport.NativeWorkerPriorLaunchBootRecoveryProtocol)
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)

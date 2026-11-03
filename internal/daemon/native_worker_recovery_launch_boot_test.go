@@ -5,6 +5,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"path/filepath"
 	"testing"
 
@@ -180,5 +181,32 @@ func TestNativeWorkerRecoveryPriorLaunchBootFeatureDowngrade(t *testing.T) {
 	}
 	if len(*acks) != 2 || (*acks)[1].DeathProof != nil {
 		t.Fatal("legacy socket received unsupported proof")
+	}
+}
+
+func TestNativeWorkerRecoveryPriorLaunchBootOfferRequiresEcho(t *testing.T) {
+	d, p, acks, _ := priorLaunchFixture(t)
+	// An old server accepts the base protocol and ignores the new query offer.
+	d.nativeConn.session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerRecoveryProtocol}
+	offered, err := url.Parse(d.wsURL(t.Context()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offered.Query().Get("native_worker_prior_launch_boot_recovery") != transport.NativeWorkerPriorLaunchBootRecoveryProtocol {
+		t.Fatal("missing prior-launch-boot offer")
+	}
+	if err = d.handleNativeWorkerRecoveryState(nil, p, bootReader(p.PrepareBoot)); !errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+		t.Fatalf("query offer bypassed session negotiation: %v", err)
+	}
+	record, err := d.nativeRegistry.LookupRecovery(p.RecoveryID)
+	if err != nil || record.LaunchProof != (NativeWorkerLaunchRecoveryProof{}) || len(*acks) != 0 {
+		t.Fatalf("unnegotiated proof prepared: %+v %v", record, err)
+	}
+	next := recoveryBoot("33333333-3333-4333-8333-333333333333")
+	if err = d.handleNativeWorkerRecoveryState(nil, p, bootReader(next)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*acks) != 1 || (*acks)[0].DeathProof != nil {
+		t.Fatal("legacy recovery did not retain reboot-after-fence behavior")
 	}
 }
