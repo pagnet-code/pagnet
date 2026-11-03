@@ -76,3 +76,7 @@ func (*NativeWorkerRegistry) confirmRecoveryCleaned(string) error { return errNa
 func (*NativeWorkerRegistry) collectRecovery(NativeWorkerRecovery) error {
 	return errNativeWorkerPlatform
 }
+
+func (*NativeWorkerRegistry) preparePriorLaunchBootProof(record NativeWorkerRecovery, _ string, _ func() (transport.KernelBootEvidence, error)) (NativeWorkerRecovery, error) {
+	return record, errNativeWorkerPlatform
+}
