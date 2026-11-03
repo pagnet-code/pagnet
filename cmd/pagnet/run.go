@@ -37,9 +37,10 @@ func runCmd() *cobra.Command {
 		host, workspace                       string
 	)
 	cmd := &cobra.Command{
-		Use:   "run [dir|resource]",
-		Short: "Quick launch: start an agent on this host (or --host <h>)",
-		Args:  cobra.MaximumNArgs(1),
+		Use:     "run [dir|resource]",
+		Short:   "Quick launch: start an agent on this host (or --host <h>)",
+		Example: "  pagnet run .\n  pagnet run --name telegram-v2 --network xema --host lince.iot",
+		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := newCLI(stateDir)
 			if err != nil {
@@ -68,21 +69,12 @@ func runCmd() *cobra.Command {
 			case len(args) == 0 && host == "":
 				absDir, _ = filepath.Abs(".")
 			case len(args) == 0:
-				return errors.New("remote launch needs a directory (`run . --host owl`) or a resource (`run github.com/o/r --host owl`)")
+				// An existing managed definition needs no directory or resource.
 			case isLocalDir(args[0]):
 				absDir, _ = filepath.Abs(args[0])
 			default:
 				key = args[0]
 			}
-			if absDir != "" && isGitRepo(absDir) {
-				remote, key, err = gitResourceKey(absDir)
-				if err != nil {
-					return err
-				}
-			}
-			// Non-git directory (fresh or non-repository project): the
-			// workspace is just a path under an allowed root — no logical
-			// resource, launch works the same.
 
 			// Optional project config (spec §13) — never required for a
 			// basic launch; provides the network and agent defaults below.
@@ -102,6 +94,33 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			var agents []runAgentDefinition
+			if err := c.get("/api/v1/networks/"+netID+"/agents", &agents); err != nil {
+				return err
+			}
+			selected, err := selectRunAgent(agents, name)
+			if err != nil {
+				return err
+			}
+			if selected != nil && selected.ExecutionMode == "managed" {
+				if len(args) != 0 || workspace != "" {
+					return errors.New("managed agents launch without a workspace; omit the directory/resource argument and --workspace")
+				}
+				return launchManagedRun(cmd, c, *selected, netID, netName, targetID, targetName, runtimeName, runtimeProfile)
+			}
+			if len(args) == 0 && host != "" {
+				return errors.New("remote launch needs an existing managed --name, a directory (`run . --host owl`), or a resource (`run github.com/o/r --host owl`)")
+			}
+			if absDir != "" && isGitRepo(absDir) {
+				remote, key, err = gitResourceKey(absDir)
+				if err != nil {
+					return err
+				}
+			}
+			// Non-git directory (fresh or non-repository project): the
+			// workspace is just a path under an allowed root — no logical
+			// resource, launch works the same.
 
 			// 4. The target host must be online (it executes the launch).
 			td, err := c.hostDetail(targetID)
@@ -128,6 +147,49 @@ func runCmd() *cobra.Command {
 					return fmt.Errorf("runtime profile %q is not available on host %s", runtimeProfile, td.Name)
 				}
 			}
+			// Resolve the definition before any workspace/resource mutations.
+			//    Defaults: flags > .pagnet.yaml agent entry > <repo|dir>[-<role>].
+			agentName := name
+			base := key
+			if base == "" {
+				base = filepath.Base(absDir)
+			}
+			if i := strings.LastIndex(base, "/"); i >= 0 {
+				base = base[i+1:]
+			}
+			if agentName == "" && yamlCfg != nil {
+				for _, e := range yamlCfg.Agents {
+					if e.Name == base || e.Name == base+"-"+role ||
+						(e.Role == "" && role == "" && len(yamlCfg.Agents) == 1) {
+						agentName = e.Name
+						if !cmd.Flags().Changed("runtime") && e.Runtime != "" {
+							runtimeName = e.Runtime
+						}
+						if role == "" {
+							role = e.Role
+						}
+						break
+					}
+				}
+			}
+			if agentName == "" {
+				agentName = base
+				if role != "" {
+					agentName += "-" + role
+				}
+			}
+			selected, err = selectRunAgent(agents, agentName)
+			if err != nil {
+				return err
+			}
+			defID := ""
+			if selected != nil {
+				if selected.ExecutionMode == "managed" {
+					return fmt.Errorf("managed agent %q launches without a workspace; use `pagnet run --name %s --network %s`", selected.Name, selected.ID, netID)
+				}
+				defID = selected.ID
+			}
+
 			// 5. Pick the workspace on the target host.
 			workspaceID := ""
 			switch {
@@ -205,50 +267,6 @@ func runCmd() *cobra.Command {
 				}
 			}
 
-			// 7. Agent definition (created if new; bound to the resource).
-			//    Defaults: flags > .pagnet.yaml agent entry > <repo|dir>[-<role>].
-			agentName := name
-			base := key
-			if base == "" {
-				base = filepath.Base(absDir)
-			}
-			if i := strings.LastIndex(base, "/"); i >= 0 {
-				base = base[i+1:]
-			}
-			if agentName == "" && yamlCfg != nil {
-				for _, e := range yamlCfg.Agents {
-					if e.Name == base || e.Name == base+"-"+role ||
-						(e.Role == "" && role == "" && len(yamlCfg.Agents) == 1) {
-						agentName = e.Name
-						if !cmd.Flags().Changed("runtime") && e.Runtime != "" {
-							runtimeName = e.Runtime
-						}
-						if role == "" {
-							role = e.Role
-						}
-						break
-					}
-				}
-			}
-			if agentName == "" {
-				agentName = base
-				if role != "" {
-					agentName += "-" + role
-				}
-			}
-			var agents []struct {
-				ID   string `json:"ID"`
-				Name string `json:"Name"`
-			}
-			if err := c.get("/api/v1/networks/"+netID+"/agents", &agents); err != nil {
-				return err
-			}
-			defID := ""
-			for _, a := range agents {
-				if a.Name == agentName {
-					defID = a.ID
-				}
-			}
 			// A NEW definition carries the resolved concrete runtime
 			// (autoPickRuntime — the console's "Auto" behavior, from the
 			// host's reported inventory); the create body and the launch
@@ -329,7 +347,7 @@ func runCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&network, "network", "n", "", "network id, name, or slug (default: the saved/only network)")
-	cmd.Flags().StringVar(&name, "name", "", "agent name (default: <repo>[-<role>])")
+	cmd.Flags().StringVar(&name, "name", "", "agent name or id (existing managed agents need no directory; default: <repo>[-<role>])")
 	cmd.Flags().StringVar(&runtimeProfile, "profile", "", "named runtime execution profile configured on the target host")
 	cmd.Flags().StringVarP(&runtimeName, "runtime", "r", "",
 		"runtime for the agent (qwen|claude|opencode|codex|fake); empty = resolved from the host's reported runtimes (real runtimes first, the console's Auto behavior; fake is debug-only)")
@@ -340,6 +358,96 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&access, "access", "read_write", "workspace access: read_write | read_only (second+ RW agents get a git worktree)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "daemon state dir with the login (default ~/.pagnet)")
 	return cmd
+}
+
+// runAgentDefinition includes the execution mode needed to choose the lifecycle API.
+type runAgentDefinition struct {
+	ID            string `json:"ID"`
+	Name          string `json:"Name"`
+	ExecutionMode string `json:"ExecutionMode"`
+}
+
+func selectRunAgent(agents []runAgentDefinition, nameOrID string) (*runAgentDefinition, error) {
+	if nameOrID == "" {
+		return nil, nil
+	}
+	for i := range agents {
+		if agents[i].ID == nameOrID {
+			return &agents[i], nil
+		}
+	}
+	var found *runAgentDefinition
+	for i := range agents {
+		if agents[i].Name == nameOrID {
+			if found != nil {
+				return nil, fmt.Errorf("agent name %q is ambiguous; use --name <agent-id>", nameOrID)
+			}
+			found = &agents[i]
+		}
+	}
+	return found, nil
+}
+
+// Managed representatives have no resource/workspace binding. Let the server
+// validate the selected host, saved runtime (or override), and runtime profile.
+func launchManagedRun(cmd *cobra.Command, c *cliCtx, agent runAgentDefinition, netID, netName, hostID, hostName, runtime, profile string) error {
+	path := "/api/v1/representatives/" + agent.ID + "/instances"
+	body := map[string]any{"hostId": hostID}
+	if runtime != "" {
+		body["runtime"] = runtime
+	}
+	if profile != "" {
+		body["profile"] = profile
+	}
+	var inst agentInstanceView
+	if err := c.post(path, body, &inst); err != nil {
+		return fmt.Errorf("launch managed agent: %w", err)
+	}
+	if inst.ID == "" {
+		return errors.New("managed launch returned no instance id")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	confirmed := false
+	for {
+		var instances []agentInstanceView
+		if err := c.get(path, &instances); err != nil {
+			return fmt.Errorf("poll managed instance %s: %w", inst.ID, err)
+		}
+		found := false
+		for _, current := range instances {
+			if current.ID == inst.ID {
+				inst, found = current, true
+				break
+			}
+		}
+		if found && inst.Status != "starting" && inst.Status != "waking" && inst.Status != "" {
+			confirmed = true
+			break
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
+		case <-time.After(time.Second):
+		}
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "host:         %s  (%s)\nnetwork:      %s  (%s)\nagent:        %s  (%s)\ninstance:     %s  (status=%s)\n",
+		hostName, hostID, netName, netID, agent.Name, agent.ID, inst.ID, inst.displayStatus())
+	if !confirmed {
+		return fmt.Errorf("managed instance %s launch pending; running state was not confirmed", inst.ID)
+	}
+	switch inst.Status {
+	case "idle", "working", "hibernated":
+		if inst.WorkerAvailability != nil && (inst.WorkerAvailability.State == "unavailable" || inst.WorkerAvailability.State == "unknown") {
+			return fmt.Errorf("managed instance %s: %s; running state was not confirmed", inst.ID, inst.displayStatus())
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "the agent remains on the host daemon; watch its status in the web console")
+		return nil
+	default:
+		return fmt.Errorf("managed instance %s is %s", inst.ID, inst.displayStatus())
+	}
 }
 
 // agentCreateBody builds the V2 agent-creation body for
