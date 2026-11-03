@@ -203,9 +203,12 @@ type FrozenSummaryPlan struct {
 	fingerprint string
 }
 
-// ResolveFrozenSummary rechecks the private approval, expiry and current local
-// provider policy. Future dispatch must resolve again before each provider call
-// and compare Fingerprint with queued work; a cached plan cannot detect disable.
+// ResolveFrozenSummary rechecks the private approval, expiry and supplied local
+// provider policy. Before every dispatch, callers must freshly LoadProfile from
+// disk under the appropriate lifecycle lock and pass that profile here. A cached
+// Profile can miss saved disable or policy changes. Immediately before each
+// provider call, resolve again and compare Fingerprint with queued work; a cached
+// plan cannot detect disable.
 func ResolveFrozenSummary(dir, id string, current Profile, now time.Time) (*FrozenSummaryPlan, error) {
 	a, err := LoadFrozenSummaryApproval(dir, id)
 	if err != nil {
