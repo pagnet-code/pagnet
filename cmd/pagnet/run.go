@@ -420,7 +420,7 @@ func launchManagedRun(cmd *cobra.Command, c *cliCtx, agent runAgentDefinition, n
 				break
 			}
 		}
-		if found && inst.Status != "starting" && inst.Status != "waking" && inst.Status != "" {
+		if found && inst.Status != "starting" && inst.Status != "waking" && inst.Status != "hibernating" && inst.Status != "" {
 			confirmed = true
 			break
 		}

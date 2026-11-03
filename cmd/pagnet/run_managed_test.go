@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -157,5 +161,45 @@ func TestRunManagedPendingCancellation(t *testing.T) {
 	}
 	if srv.noCall("GET", path) {
 		t.Fatal("managed status was not polled")
+	}
+}
+
+func TestRunManagedHibernatingTransition(t *testing.T) {
+	const path = "/api/v1/representatives/def-1/instances"
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/v1/networks":
+			fmt.Fprint(w, `[{"ID":"net-1","Name":"default"}]`)
+		case "GET /api/v1/networks/net-1/agents":
+			fmt.Fprint(w, `[{"ID":"def-1","Name":"telegram-v2","ExecutionMode":"managed"}]`)
+		case "POST " + path:
+			fmt.Fprint(w, `{"ID":"inst-1","Status":"starting"}`)
+		case "GET " + path:
+			status := "hibernating"
+			if polls.Add(1) > 1 {
+				status = "hibernated"
+			}
+			fmt.Fprintf(w, `[{"ID":"inst-1","Status":%q}]`, status)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	cliFlags(t, srv)
+	stateDir := t.TempDir()
+	seedHostConfig(t, stateDir, srv.URL, "host-1")
+	cmd := runCmd()
+	cmd.SetArgs([]string{"--state-dir", stateDir, "--name", "telegram-v2", "--network", "default"})
+	out, err := captureStdoutErr(t, func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polls.Load() != 2 {
+		t.Fatalf("polls = %d, want 2", polls.Load())
+	}
+	if !strings.Contains(out, "status=hibernated") {
+		t.Fatalf("final status missing: %s", out)
 	}
 }
