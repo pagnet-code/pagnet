@@ -105,9 +105,8 @@ func frozenSummaryDirectory(dir string) (string, error) {
 	return path, PrivateDir(path)
 }
 
-// CreateFrozenSummaryApproval snapshots an owner file and provider binding into
-// a new approval ID. It never overwrites an approval or persists an API key.
-func CreateFrozenSummaryApproval(dir string, in FrozenSummaryInput, now time.Time) (FrozenSummaryApproval, error) {
+// prepareFrozenSummaryApproval validates and captures owner input without writes.
+func prepareFrozenSummaryApproval(in FrozenSummaryInput, now time.Time) (FrozenSummaryApproval, error) {
 	var zero FrozenSummaryApproval
 	p := in.Profile
 	if p.Disabled || p.ServiceRole() != "responder" || p.ProjectContractName() != SharingProjectContract || p.Limits.MaxConcurrent != 1 || in.CallsPerDay != p.Limits.CallsPerDay {
@@ -135,6 +134,22 @@ func CreateFrozenSummaryApproval(dir string, in FrozenSummaryInput, now time.Tim
 		return zero, errors.New("frozen summary approval has expired")
 	}
 	if _, err := provider.NewSnapshot(config, a.Instructions); err != nil {
+		return zero, err
+	}
+	return a, nil
+}
+
+// ValidateFrozenSummaryInput checks owner input without publishing local state.
+func ValidateFrozenSummaryInput(in FrozenSummaryInput, now time.Time) error {
+	_, err := prepareFrozenSummaryApproval(in, now)
+	return err
+}
+
+// CreateFrozenSummaryApproval snapshots owner input before publishing its approval.
+func CreateFrozenSummaryApproval(dir string, in FrozenSummaryInput, now time.Time) (FrozenSummaryApproval, error) {
+	var zero FrozenSummaryApproval
+	a, err := prepareFrozenSummaryApproval(in, now)
+	if err != nil {
 		return zero, err
 	}
 	store, err := frozenSummaryDirectory(dir)

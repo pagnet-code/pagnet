@@ -134,6 +134,7 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 	enable.Flags().StringVar(&keyFile, "key-file", "", "owner-only local provider key file")
 	enable.Flags().Int64Var(&calls, "calls-per-day", 0, "maximum provider calls per UTC day")
 	cmd.AddCommand(enable)
+	cmd.AddCommand(textBridgeFrozenSummaryCmd(&stateDir, deps))
 	for _, operation := range []string{"run", "status", "disable", "resolve"} {
 		op := operation
 		var service, project, ask string
