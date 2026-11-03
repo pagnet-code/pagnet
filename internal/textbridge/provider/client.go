@@ -35,10 +35,24 @@ type Config struct {
 
 type Client struct {
 	endpoint, model, key string
+	system               string
 	http                 *http.Client
 }
 
 func New(config Config) (*Client, error) {
+	return newClient(config, SystemMessage)
+}
+
+// NewSnapshot is an explicit opt-in for an owner-approved, immutable external
+// instruction snapshot. It does not load agent instructions or enable tools.
+func NewSnapshot(config Config, snapshot string) (*Client, error) {
+	if !utf8.ValidString(snapshot) || strings.TrimSpace(snapshot) == "" || len(snapshot) > MaxInputChars*utf8.UTFMax || utf8.RuneCountInString(snapshot) > MaxInputChars {
+		return nil, errors.New("invalid or oversized system snapshot")
+	}
+	return newClient(config, snapshot)
+}
+
+func newClient(config Config, system string) (*Client, error) {
 	u, err := url.Parse(config.BaseURL)
 	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(config.BaseURL, "#") || u.Opaque != "" || (u.Path != "" && u.Path != "/") || u.RawPath != "" {
 		return nil, errors.New("invalid provider base URL")
@@ -56,14 +70,14 @@ func New(config Config) (*Client, error) {
 		return nil, errors.New("invalid provider credential")
 	}
 	u.Path = "/v1/chat/completions"
-	return &Client{endpoint: u.String(), model: config.Model, key: config.APIKey, http: &http.Client{
+	return &Client{endpoint: u.String(), model: config.Model, key: config.APIKey, system: system, http: &http.Client{
 		Timeout:       RequestTimeout,
 		Transport:     &http.Transport{TLSHandshakeTimeout: 10 * time.Second, IdleConnTimeout: 90 * time.Second, MaxIdleConns: 10},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil
 }
 
-// Complete sends exactly the fixed system message and one bounded user message.
+// Complete sends exactly the configured system message and one bounded user message.
 // Errors never contain credentials, provider response bodies, or transport errors.
 func (c *Client) Complete(ctx context.Context, input string) (string, error) {
 	if !utf8.ValidString(input) || strings.TrimSpace(input) == "" || len(input) > MaxInputChars*utf8.UTFMax || utf8.RuneCountInString(input) > MaxInputChars {
@@ -78,7 +92,7 @@ func (c *Client) Complete(ctx context.Context, input string) (string, error) {
 		Messages  []message `json:"messages"`
 		Stream    bool      `json:"stream"`
 		MaxTokens int       `json:"max_tokens"`
-	}{c.model, []message{{"system", SystemMessage}, {"user", input}}, false, MaxOutputTokens})
+	}{c.model, []message{{"system", c.system}, {"user", input}}, false, MaxOutputTokens})
 	if err != nil {
 		return "", errors.New("invalid text request")
 	}
