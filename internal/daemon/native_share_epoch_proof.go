@@ -152,7 +152,7 @@ func (s *NativeShareEpochStore) Prove(request, expected transport.NativeShareEpo
 	}
 	canonical.Receipt = NativeShareEpochStageReceipt{Version: 1, BindingID: request.BindingID, OperationID: a.Expected.OperationID, Digest: canonical.Digest}
 	canonical.Receipt.Signature = record.Receipt.Signature
-	if !ed25519.Verify(s.signer.Public().(ed25519.PublicKey), nativeShareEpochStageReceiptBytes(canonical.Receipt), canonical.Receipt.Signature) {
+	if err := canonical.Receipt.Verify(request.BindingID, a.Expected.OperationID, s.signer.Public().(ed25519.PublicKey)); err != nil {
 		return empty, errNativeShareEpochStage
 	}
 	raw, err := json.Marshal(canonical)

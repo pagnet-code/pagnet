@@ -124,7 +124,7 @@ func TestNativeShareEpochStoreRestartRetryAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ed25519.Verify(f.identity.Ed25519Verifier(), nativeShareEpochStageReceiptBytes(first), first.Signature) {
+	if err := first.Verify(f.auth.Prepared.Prepare.Binding.BindingID, f.auth.Expected.OperationID, f.identity.Ed25519Verifier()); err != nil {
 		t.Fatal("invalid stage receipt signature")
 	}
 	stageBefore := nativeEpochRead(t, filepath.Join(f.directory(), "stage.json"))
