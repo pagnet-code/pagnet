@@ -2,6 +2,7 @@ package textbridge
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -175,6 +176,17 @@ func LoadFrozenSummaryApproval(dir, id string) (FrozenSummaryApproval, error) {
 
 // DisableFrozenSummaryApproval is irreversible. Edits require a new approval ID.
 func DisableFrozenSummaryApproval(dir, id string) error {
+	return DisableFrozenSummaryApprovalContext(context.Background(), dir, id)
+}
+
+// DisableFrozenSummaryApprovalContext serializes retirement with profile policy.
+// Lock order is profile policy.lock, then the approval-directory lock.
+func DisableFrozenSummaryApprovalContext(ctx context.Context, dir, id string) error {
+	unlockPolicy, err := LockProfilePolicy(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer unlockPolicy()
 	store, err := frozenSummaryDirectory(dir)
 	if err != nil {
 		return err

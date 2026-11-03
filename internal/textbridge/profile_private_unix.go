@@ -3,12 +3,14 @@
 package textbridge
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -183,4 +185,63 @@ func LockProfile(path string) (func(), error) {
 			file.Close()
 		})
 	}, nil
+}
+
+// LockProfilePolicy takes the exclusive cross-process policy lock, waiting until
+// it is available or ctx is canceled. When both locks are needed, acquire
+// run.lock before policy.lock; never acquire run.lock while holding policy.lock.
+func LockProfilePolicy(ctx context.Context, path string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dir, err := textBridgeOpenDir(path, false)
+	if err != nil {
+		return nil, errTextBridgePrivate
+	}
+	defer dir.Close()
+	if !textBridgePrivateInfo(dir, true) {
+		return nil, errTextBridgePrivate
+	}
+	fd, err := unix.Openat(int(dir.Fd()), "policy.lock", unix.O_RDWR|unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, errTextBridgePrivate
+	}
+	file := os.NewFile(uintptr(fd), "text bridge policy lock")
+	if !textBridgePrivateInfo(file, false) {
+		file.Close()
+		return nil, errTextBridgePrivate
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			if err := ctx.Err(); err != nil {
+				unix.Flock(fd, unix.LOCK_UN)
+				file.Close()
+				return nil, err
+			}
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					unix.Flock(fd, unix.LOCK_UN)
+					file.Close()
+				})
+			}, nil
+		}
+		if err != unix.EWOULDBLOCK && err != unix.EAGAIN && err != unix.EINTR {
+			file.Close()
+			return nil, errors.New("text bridge cannot acquire its policy lock")
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			file.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

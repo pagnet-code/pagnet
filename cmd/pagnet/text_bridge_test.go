@@ -376,3 +376,26 @@ func TestTextBridgeStatusRejectsMalformedProfileWithoutDisclosure(t *testing.T) 
 		t.Fatal("status exposed profile contents")
 	}
 }
+
+func TestTextBridgeDisableWhileResponderRunning(t *testing.T) {
+	state, dir, p, store := textBridgeTestProfile(t)
+	unlock, err := textbridge.LockProfile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := textBridgeExecute(t, textBridgeDependencies{}, "disable", "--service", p.Service, "--state-dir", state); err != nil {
+		t.Fatal(err)
+	}
+	current, err := textbridge.LoadProfile(dir, p.Service)
+	if err != nil || !current.Disabled {
+		t.Fatalf("live disable profile: %v", err)
+	}
+	budget, err := store.BudgetSnapshot(context.Background())
+	if err != nil || budget.Enabled {
+		t.Fatalf("live disable ledger: %v", err)
+	}
+	if err := textbridge.SaveProfile(dir, p); err == nil {
+		t.Fatal("stale profile revived after live disable")
+	}
+}
