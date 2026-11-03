@@ -98,7 +98,13 @@ func SealNativeShareEpoch(fresh *FreshNativeShareEpoch, metadata transport.Nativ
 	key := s.key
 	s.key = nil
 	defer clearNativeShareEpoch(key)
-	if len(key) != 32 || metadata.EpochID != s.id || len(source) != ed25519.PrivateKeySize {
+	return sealNativeShareEpochKey(key, s.id, metadata, source, now)
+}
+
+// sealNativeShareEpochKey never takes ownership or exposes the fresh key.
+func sealNativeShareEpochKey(key []byte, id domain.ID, metadata transport.NativeShareEpochMetadata, source ed25519.PrivateKey, now time.Time) (transport.NativeShareEpochPackage, error) {
+	var p transport.NativeShareEpochPackage
+	if len(key) != 32 || metadata.EpochID != id || len(source) != ed25519.PrivateKeySize {
 		return p, errNativeShareEpoch
 	}
 	aad, err := metadata.AAD()
