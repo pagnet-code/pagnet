@@ -17,6 +17,7 @@ import (
 
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // EnsureNativeWorker launches a reserved original worker at most once. Socket
@@ -24,6 +25,10 @@ import (
 // Cancellation, TCP disconnect and daemon Close never kill this process. An
 // unavailable previously launched owner requires explicit recovery, not restart.
 func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record NativeWorkerRecord, binary string, runtimeEnv []string, sideportSocket string) error {
+	return ensureNativeWorker(ctx, r, record, binary, runtimeEnv, sideportSocket, CollectKernelBootEvidence)
+}
+
+func ensureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record NativeWorkerRecord, binary string, runtimeEnv []string, sideportSocket string, readBoot func() (transport.KernelBootEvidence, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -84,15 +89,17 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 		if err != nil {
 			return err
 		}
-		result, claimErr := r.db.Exec(`UPDATE native_workers SET launch_state='launching' WHERE instance_id=? AND launch_state='reserved'`, current.Scope.InstanceID)
-		if claimErr != nil {
-			return claimErr
+		boot, bootErr := readBoot()
+		if bootErr != nil || !boot.Valid() || boot.Quality != "boot_uuid" {
+			// Optional recovery evidence must not make legacy launches unavailable.
+			// Never persist an inventory boot time or an untrusted partial tuple.
+			boot = transport.KernelBootEvidence{}
 		}
-		n, err := result.RowsAffected()
+		claimed, err := r.claimLaunch(current, boot)
 		if err != nil {
 			return err
 		}
-		if n == 1 {
+		if claimed {
 			input, output, err := os.Pipe()
 			if err != nil {
 				return err
@@ -107,13 +114,11 @@ func EnsureNativeWorker(ctx context.Context, r *NativeWorkerRegistry, record Nat
 			if home, err := os.UserHomeDir(); err == nil {
 				cmd.Env = append(cmd.Env, "HOME="+home)
 			}
-			if err = cmd.Start(); err != nil {
-				// No process was started. Only this exact claim can become retryable.
-				_, _ = r.db.Exec(`UPDATE native_workers SET launch_state='reserved' WHERE instance_id=? AND launch_state='launching'`, current.Scope.InstanceID)
-				return err
+			started, markErr := r.startLaunch(ctx, current, boot, cmd.Start)
+			if !started {
+				return markErr
 			}
 			_ = input.Close()
-			_, markErr := r.db.Exec(`UPDATE native_workers SET launch_state='launched' WHERE instance_id=? AND launch_state='launching'`, current.Scope.InstanceID)
 			r.mu.Unlock()
 			locked = false
 			// Reap when this controller remains alive; the child is independent when it

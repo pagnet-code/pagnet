@@ -32,6 +32,9 @@ type NativeWorkerRecord struct {
 	Profile, ProfileFingerprint, OriginalOwnershipID string
 	Ownership                                        *transport.NativeWorkerOwnership `json:",omitempty"`
 	LaunchState                                      string
+	// LaunchBoot belongs to the consumed launch claim, independently of ownership.
+	// Legacy consumed claims intentionally retain absent evidence.
+	LaunchBoot *transport.KernelBootEvidence `json:",omitempty"`
 }
 type NativeWorkerRegistry struct {
 	db   *sql.DB
@@ -173,6 +176,9 @@ func (r *NativeWorkerRegistry) decodeRecord(instanceID string, raw []byte, state
 	if state != "reserved" && state != "launching" && state != "launched" {
 		return NativeWorkerRecord{}, errors.New("native worker registry launch state corrupt")
 	}
+	if record.LaunchBoot != nil && (!record.LaunchBoot.Valid() || record.LaunchBoot.Quality != "boot_uuid" || state == "reserved") {
+		return NativeWorkerRecord{}, errors.New("native worker launch boot evidence corrupt")
+	}
 	record.LaunchState = state
 	return record, nil
 }
@@ -268,6 +274,110 @@ func (r *NativeWorkerRegistry) Reserve(scope sessionworker.Scope, spec sessionwo
 	}
 	return record, nil
 }
+
+// launchTransaction acquires SQLite's writer lock before reading the fence.
+// The lock also excludes fences prepared through another registry connection.
+func (r *NativeWorkerRegistry) launchTransaction(record NativeWorkerRecord) (*sql.Tx, NativeWorkerRecord, error) {
+	tx, err := r.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, NativeWorkerRecord{}, err
+	}
+	fail := func(err error) (*sql.Tx, NativeWorkerRecord, error) {
+		_ = tx.Rollback()
+		return nil, NativeWorkerRecord{}, err
+	}
+	if _, err = tx.Exec(`UPDATE native_workers SET launch_state=launch_state WHERE instance_id=?`, record.Scope.InstanceID); err != nil {
+		return fail(err)
+	}
+	var raw []byte
+	var state string
+	if err = tx.QueryRow(`SELECT payload,launch_state FROM native_workers WHERE instance_id=?`, record.Scope.InstanceID).Scan(&raw, &state); err != nil {
+		return fail(err)
+	}
+	current, err := r.decodeRecord(record.Scope.InstanceID, raw, state)
+	if err != nil {
+		return fail(err)
+	}
+	if current.Scope != record.Scope || current.Dir != record.Dir || current.ProfileFingerprint != record.ProfileFingerprint {
+		return fail(errors.New("native worker launch identity conflict"))
+	}
+	var fences int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation='')`, record.Scope.InstanceID, record.Scope.Generation).Scan(&fences); err != nil {
+		return fail(err)
+	}
+	if fences != 0 {
+		return fail(errNativeWorkerRecoveryFenced)
+	}
+	return tx, current, nil
+}
+
+// claimLaunch commits the boot tuple and reserved→launching CAS together before
+// any process can start. A crash from this point leaves a consumed claim.
+func (r *NativeWorkerRegistry) claimLaunch(record NativeWorkerRecord, boot transport.KernelBootEvidence) (bool, error) {
+	if boot != (transport.KernelBootEvidence{}) && (!boot.Valid() || boot.Quality != "boot_uuid") {
+		return false, errors.New("native worker launch requires kernel boot UUID")
+	}
+	tx, current, err := r.launchTransaction(record)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if current.LaunchState != "reserved" {
+		return false, nil
+	}
+	if boot != (transport.KernelBootEvidence{}) {
+		current.LaunchBoot = &boot
+	}
+	current.LaunchState = "launching"
+	raw, err := json.Marshal(current)
+	if err != nil || len(raw) > 256<<10 {
+		return false, errors.New("native worker registry record exceeds bound")
+	}
+	if _, err = tx.Exec(`UPDATE native_workers SET payload=?,launch_state='launching' WHERE instance_id=? AND launch_state='reserved'`, raw, record.Scope.InstanceID); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// startLaunch rechecks the fence after the durable claim, holding the writer
+// lock only across Start and its state update. A fence winning the intervening
+// gap prevents Start and leaves the claim consumed. A crash or commit failure
+// after Start likewise retains the previously committed launching evidence.
+func (r *NativeWorkerRegistry) startLaunch(ctx context.Context, record NativeWorkerRecord, boot transport.KernelBootEvidence, start func() error) (bool, error) {
+	tx, current, err := r.launchTransaction(record)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	bootMatches := current.LaunchBoot == nil && boot == (transport.KernelBootEvidence{})
+	if current.LaunchBoot != nil {
+		bootMatches = *current.LaunchBoot == boot
+	}
+	if current.LaunchState != "launching" || !bootMatches {
+		return false, errors.New("native worker launch claim conflict")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := start(); err != nil {
+		// Start proved that no process exists. Clear only this exact claim.
+		current.LaunchBoot = nil
+		current.LaunchState = "reserved"
+		raw, marshalErr := json.Marshal(current)
+		if marshalErr != nil {
+			return false, errors.Join(err, marshalErr)
+		}
+		if _, resetErr := tx.Exec(`UPDATE native_workers SET payload=?,launch_state='reserved' WHERE instance_id=? AND launch_state='launching'`, raw, record.Scope.InstanceID); resetErr != nil {
+			return false, errors.Join(err, resetErr)
+		}
+		return false, errors.Join(err, tx.Commit())
+	}
+	if _, err = tx.Exec(`UPDATE native_workers SET launch_state='launched' WHERE instance_id=? AND launch_state='launching'`, record.Scope.InstanceID); err != nil {
+		return true, err
+	}
+	return true, tx.Commit()
+}
+
 func (r *NativeWorkerRegistry) BindOwnership(record NativeWorkerRecord, ownership transport.NativeWorkerOwnership) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -464,6 +574,11 @@ func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (Nat
 		return NativeWorkerRecovery{}, err
 	}
 	defer tx.Rollback()
+	// Take the writer lock before reading so a concurrent launch can complete
+	// its immediate Start section without a stale read-to-write upgrade here.
+	if _, err = tx.Exec(`UPDATE native_worker_recoveries SET phase=phase WHERE recovery_id=?`, record.RecoveryID); err != nil {
+		return NativeWorkerRecovery{}, err
+	}
 	var count int
 	// Completed tombstones are permanent generation fences. Counting them
 	// against the in-flight limit would eventually prevent every future

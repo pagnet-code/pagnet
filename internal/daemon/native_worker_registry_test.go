@@ -278,7 +278,7 @@ func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) 
 		t.Fatal("stalled private pipe did not cancel safely", err)
 	}
 	loaded, err := r.Lookup(s.InstanceID)
-	if err != nil || loaded.LaunchState != "launched" {
+	if err != nil || (loaded.LaunchState != "launching" && loaded.LaunchState != "launched") {
 		t.Fatal("cancellation made original owner replaceable", err)
 	}
 	// The synthetic child exits naturally; the helper never kills uncertain PIDs.
