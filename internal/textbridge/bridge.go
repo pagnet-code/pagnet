@@ -63,7 +63,10 @@ type DispatchScope struct {
 // DispatchGate must freshly authorize scope and invoke dispatch synchronously,
 // at most once, while holding the policy lock through its return. Denial must
 // return without invoking dispatch. Policy changes must use the same lock.
-type DispatchGate func(context.Context, DispatchAction, DispatchScope, func() error) error
+// The supplied nonnil revalidate function must freshly check policy (including
+// expiry) without reacquiring that lock; the bridge calls it after blocking work
+// and immediately before side effects.
+type DispatchGate func(context.Context, DispatchAction, DispatchScope, func(revalidate func() error) error) error
 
 // Config contains only owner-supplied policy. Enabled must consult current local
 // enablement and revocation; a nil function disables dispatch. OnError, if set,
@@ -283,25 +286,31 @@ func (b *Bridge) dispatchEligible(ctx context.Context, expected ledger.Job) (led
 		b.config.Enabled != nil && b.config.Enabled(fresh.ProjectID), nil
 }
 
-func (b *Bridge) dispatch(ctx context.Context, action DispatchAction, job *ledger.Job, effect func() error) (bool, error) {
+func (b *Bridge) dispatch(ctx context.Context, action DispatchAction, job *ledger.Job, effect func(revalidate func() error) error) (bool, error) {
 	if b.config.DispatchGate == nil {
-		return true, effect()
+		return true, effect(func() error { return nil })
 	}
 	expected := *job
 	called := false
 	entered := false
-	err := b.config.DispatchGate(ctx, action, DispatchScope{expected.ProjectID, expected.AskID, expected.Data.ProviderConfigFingerprint}, func() error {
+	err := b.config.DispatchGate(ctx, action, DispatchScope{expected.ProjectID, expected.AskID, expected.Data.ProviderConfigFingerprint}, func(revalidate func() error) error {
 		if entered {
 			return errors.New("text bridge dispatch callback repeated")
 		}
 		entered = true
+		if revalidate == nil {
+			return errors.New("text bridge dispatch validator missing")
+		}
 		fresh, active, err := b.dispatchEligible(ctx, expected)
 		if err != nil || !active {
 			return err
 		}
 		*job = fresh
+		if err := revalidate(); err != nil {
+			return err
+		}
 		called = true
-		return effect()
+		return effect(revalidate)
 	})
 	return called, err
 }
@@ -326,7 +335,7 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if active, err := b.authorized(ctx, job); err != nil || !active {
 				return err
 			}
-			called, err := b.dispatch(ctx, DispatchProvider, &job, func() error {
+			called, err := b.dispatch(ctx, DispatchProvider, &job, func(revalidate func() error) error {
 				claimed, token, err := b.store.ClaimProvider(ctx, job, time.Now())
 				if err != nil {
 					if errors.Is(err, ledger.ErrLimit) || errors.Is(err, ledger.ErrStale) || errors.Is(err, ledger.ErrInvalid) {
@@ -339,6 +348,9 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 						// The durable claim remains unresolved and can never be replayed.
 						return err
 					}
+				}
+				if err := revalidate(); err != nil {
+					return err
 				}
 				output, callErr := b.provider.Complete(ctx, string(claimed.Data.Input))
 				succeeded := callErr == nil && validText([]byte(output), provider.MaxOutputChars)
@@ -362,7 +374,7 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if active, err := b.authorized(ctx, job); err != nil || !active {
 				return err
 			}
-			called, err := b.dispatch(ctx, DispatchPrepareReply, &job, func() error {
+			called, err := b.dispatch(ctx, DispatchPrepareReply, &job, func(revalidate func() error) error {
 				id, err := uuid.NewV7()
 				if err != nil {
 					return storageFailure(err)
@@ -383,6 +395,9 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 					if _, active, err := b.dispatchEligible(ctx, job); err != nil || !active {
 						return err
 					}
+				}
+				if err := revalidate(); err != nil {
+					return err
 				}
 				prepared, prepareErr := b.transport.PrepareSharingProjectMessageWithID(job.ProjectID, header.SenderPrincipalID, "REPLY", job.Data.ReplyID, job.Data.Output, job.Data.PredecessorWire)
 				if prepareErr != nil {
@@ -444,7 +459,7 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if job.Phase != ledger.ReplyPrepared || job.Revoked || b.config.Enabled == nil || !b.config.Enabled(job.ProjectID) {
 				return nil
 			}
-			called, err := b.dispatch(ctx, DispatchSendReply, &job, func() error {
+			called, err := b.dispatch(ctx, DispatchSendReply, &job, func(revalidate func() error) error {
 				var sendErr error
 				receipt, sendErr = b.transport.SendPreparedSharingProjectMessage(ctx, job.ProjectID, job.Data.ReplyID)
 				return sendErr

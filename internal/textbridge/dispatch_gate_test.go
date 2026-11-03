@@ -2,6 +2,7 @@ package textbridge
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,14 +28,14 @@ func TestDispatchGateHoldsThroughEffectsAndDeduplicates(t *testing.T) {
 	b, s, tr, p, m := setup(t)
 	inside := false
 	var actions []DispatchAction
-	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, scope DispatchScope, dispatch func() error) error {
+	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, scope DispatchScope, dispatch func(func() error) error) error {
 		if scope != (DispatchScope{"project", "ask", "fixed-owner-config"}) {
 			t.Fatalf("scope=%+v", scope)
 		}
 		inside = true
 		defer func() { inside = false }()
 		actions = append(actions, action)
-		return dispatch()
+		return dispatch(func() error { return nil })
 	}
 	check := func() {
 		if !inside {
@@ -58,7 +59,7 @@ func TestDispatchGateRechecksBeforeClaim(t *testing.T) {
 		t.Run(change, func(t *testing.T) {
 			b, s, tr, p, m := setup(t)
 			accept(t, b, m)
-			b.config.DispatchGate = func(ctx context.Context, action DispatchAction, scope DispatchScope, dispatch func() error) error {
+			b.config.DispatchGate = func(ctx context.Context, action DispatchAction, scope DispatchScope, dispatch func(func() error) error) error {
 				switch change {
 				case "disable":
 					b.config.Enabled = func(string) bool { return false }
@@ -73,7 +74,7 @@ func TestDispatchGateRechecksBeforeClaim(t *testing.T) {
 				case "deny":
 					return nil
 				}
-				return dispatch()
+				return dispatch(func() error { return nil })
 			}
 			process(t, b, s)
 			budget, err := s.BudgetSnapshot(testContext)
@@ -92,8 +93,8 @@ func TestDispatchGateDenialAfterClaimRetainsReservation(t *testing.T) {
 		t.Run(change, func(t *testing.T) {
 			b, s, tr, p, m := setup(t)
 			accept(t, b, m)
-			b.config.DispatchGate = func(_ context.Context, _ DispatchAction, _ DispatchScope, dispatch func() error) error {
-				return dispatch()
+			b.config.DispatchGate = func(_ context.Context, _ DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
+				return dispatch(func() error { return nil })
 			}
 			b.store = claimHookLedger{Ledger: s, afterClaim: func() {
 				switch change {
@@ -127,8 +128,8 @@ func TestDispatchGateRevokedDuringProviderDoesNotReply(t *testing.T) {
 	var enabled atomic.Bool
 	enabled.Store(true)
 	b.config.Enabled = func(string) bool { return enabled.Load() }
-	b.config.DispatchGate = func(_ context.Context, _ DispatchAction, _ DispatchScope, dispatch func() error) error {
-		return dispatch()
+	b.config.DispatchGate = func(_ context.Context, _ DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
+		return dispatch(func() error { return nil })
 	}
 	started, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	p.complete = func() (string, error) { close(started); <-release; return "answer", nil }
@@ -152,14 +153,14 @@ func TestDispatchGateRevokedDuringProviderDoesNotReply(t *testing.T) {
 func TestDispatchGateRechecksPreparedReplyAndReconcilesReceipt(t *testing.T) {
 	b, s, tr, p, m := setup(t)
 	replyPrepared(t, b, s, tr, m)
-	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, _ DispatchScope, dispatch func() error) error {
+	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
 		if action != DispatchSendReply {
 			t.Fatal(action)
 		}
 		if _, err := s.Revoke(ctx, stored(t, s)); err != nil {
 			t.Fatal(err)
 		}
-		return dispatch()
+		return dispatch(func() error { return nil })
 	}
 	process(t, b, s)
 	if tr.sends != 0 || p.calls != 0 || stored(t, s).Phase != ledger.ReplyPrepared {
@@ -167,7 +168,7 @@ func TestDispatchGateRechecksPreparedReplyAndReconcilesReceipt(t *testing.T) {
 	}
 	tr.receiptErr = nil
 	tr.receipt = receiptFor(tr.prepared.ID, tr.prepared.Wire)
-	b.config.DispatchGate = func(context.Context, DispatchAction, DispatchScope, func() error) error {
+	b.config.DispatchGate = func(context.Context, DispatchAction, DispatchScope, func(func() error) error) error {
 		t.Fatal("receipt reconciliation entered dispatch gate")
 		return nil
 	}
@@ -192,13 +193,13 @@ func TestDispatchGateHoldsPolicyLockDuringProvider(t *testing.T) {
 	b, s, tr, p, m := setup(t)
 	var policy sync.Mutex
 	enabled := true
-	b.config.DispatchGate = func(_ context.Context, action DispatchAction, _ DispatchScope, dispatch func() error) error {
+	b.config.DispatchGate = func(_ context.Context, action DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
 		policy.Lock()
 		defer policy.Unlock()
 		if !enabled || action != DispatchProvider {
 			return nil
 		}
-		return dispatch()
+		return dispatch(func() error { return nil })
 	}
 	started, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	p.complete = func() (string, error) { close(started); <-release; return "answer", nil }
@@ -233,17 +234,122 @@ func TestDispatchGateHoldsPolicyLockDuringProvider(t *testing.T) {
 func TestDispatchGateRechecksBeforeReplyPreparation(t *testing.T) {
 	b, s, tr, p, m := setup(t)
 	outputReady(t, b, s, m)
-	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, _ DispatchScope, dispatch func() error) error {
+	b.config.DispatchGate = func(ctx context.Context, action DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
 		if action != DispatchPrepareReply {
 			t.Fatal(action)
 		}
 		if _, err := s.Revoke(ctx, stored(t, s)); err != nil {
 			t.Fatal(err)
 		}
-		return dispatch()
+		return dispatch(func() error { return nil })
 	}
 	process(t, b, s)
 	if stored(t, s).Phase != ledger.OutputReady || p.calls != 0 || tr.prepares != 0 || tr.sends != 0 {
 		t.Fatal("revoked output prepared a reply")
+	}
+}
+
+func TestDispatchGateRejectsMissingValidator(t *testing.T) {
+	for _, action := range []DispatchAction{DispatchProvider, DispatchPrepareReply, DispatchSendReply} {
+		t.Run(string(action), func(t *testing.T) {
+			b, s, tr, p, m := setup(t)
+			switch action {
+			case DispatchProvider:
+				accept(t, b, m)
+			case DispatchPrepareReply:
+				outputReady(t, b, s, m)
+			case DispatchSendReply:
+				replyPrepared(t, b, s, tr, m)
+			}
+			before := stored(t, s)
+			b.config.DispatchGate = func(_ context.Context, _ DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
+				return dispatch(nil)
+			}
+			if err := b.process(testContext, before); err == nil {
+				t.Fatal("missing validator accepted")
+			}
+			after := stored(t, s)
+			if before.Revision != after.Revision || p.calls != 0 || tr.prepares != 0 || tr.sends != 0 {
+				t.Fatal("missing validator allowed a side effect")
+			}
+		})
+	}
+}
+
+func TestDispatchGateRevalidatesExpiryAfterBlockingStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		action      DispatchAction
+		statusCheck int
+		wantPhase   ledger.Phase
+	}{
+		{"before_claim", DispatchProvider, 1, ledger.Queued},
+		{"after_claim", DispatchProvider, 2, ledger.ProviderStarted},
+		{"before_reply_identity", DispatchPrepareReply, 1, ledger.OutputReady},
+		{"after_reply_identity", DispatchPrepareReply, 2, ledger.ReplyPreparing},
+		{"before_send", DispatchSendReply, 1, ledger.ReplyPrepared},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, s, tr, p, m := setup(t)
+			switch tc.action {
+			case DispatchProvider:
+				accept(t, b, m)
+			case DispatchPrepareReply:
+				outputReady(t, b, s, m)
+			case DispatchSendReply:
+				replyPrepared(t, b, s, tr, m)
+			}
+			var expired atomic.Bool
+			inGate := false
+			b.config.DispatchGate = func(_ context.Context, action DispatchAction, _ DispatchScope, dispatch func(func() error) error) error {
+				if action != tc.action {
+					t.Fatalf("action=%s", action)
+				}
+				inGate = true
+				defer func() { inGate = false }()
+				return dispatch(func() error {
+					if expired.Load() {
+						return boundaryError
+					}
+					return nil
+				})
+			}
+			started, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+			checks := 0
+			tr.onStatus = func() {
+				if !inGate {
+					return
+				}
+				checks++
+				if checks == tc.statusCheck {
+					close(started)
+					<-release
+				}
+			}
+			job := stored(t, s)
+			go func() { done <- b.process(testContext, job) }()
+			<-started
+			expired.Store(true)
+			close(release)
+			if err := <-done; !errors.Is(err, boundaryError) {
+				t.Fatalf("expiry error=%v", err)
+			}
+			if stored(t, s).Phase != tc.wantPhase || p.calls != 0 || tr.prepares != 0 || tr.sends != 0 {
+				t.Fatalf("phase=%s; expired scope dispatched", stored(t, s).Phase)
+			}
+			if tc.wantPhase == ledger.ProviderStarted {
+				budget, err := s.BudgetSnapshot(testContext)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if budget.Used != 1 || len(budget.Active) != 1 {
+					t.Fatal("expired post-claim scope refunded reservation")
+				}
+				process(t, b, s)
+				if p.calls != 0 {
+					t.Fatal("expired post-claim scope replayed")
+				}
+			}
+		})
 	}
 }
