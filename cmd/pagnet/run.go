@@ -388,10 +388,24 @@ func selectRunAgent(agents []runAgentDefinition, nameOrID string) (*runAgentDefi
 	return found, nil
 }
 
-// Managed representatives have no resource/workspace binding. Let the server
+// Managed agents launch without a resource/workspace binding. Let the server
 // validate the selected host, saved runtime (or override), and runtime profile.
 func launchManagedRun(cmd *cobra.Command, c *cliCtx, agent runAgentDefinition, netID, netName, hostID, hostName, runtime, profile string) error {
-	path := "/api/v1/representatives/" + agent.ID + "/instances"
+	var representatives []struct {
+		AgentPrincipalID string `json:"AgentPrincipalID"`
+	}
+	if err := c.get("/api/v1/representatives", &representatives); err != nil {
+		return fmt.Errorf("resolve managed agent representative binding: %w", err)
+	}
+	path := "/api/v1/networks/" + netID + "/agents/" + agent.ID
+	launchPath, instancesPath := path+"/launch", path+"/instances"
+	for _, representative := range representatives {
+		if representative.AgentPrincipalID == agent.ID {
+			launchPath = "/api/v1/representatives/" + agent.ID + "/instances"
+			instancesPath = launchPath
+			break
+		}
+	}
 	body := map[string]any{"hostId": hostID}
 	if runtime != "" {
 		body["runtime"] = runtime
@@ -400,7 +414,7 @@ func launchManagedRun(cmd *cobra.Command, c *cliCtx, agent runAgentDefinition, n
 		body["profile"] = profile
 	}
 	var inst agentInstanceView
-	if err := c.post(path, body, &inst); err != nil {
+	if err := c.post(launchPath, body, &inst); err != nil {
 		return fmt.Errorf("launch managed agent: %w", err)
 	}
 	if inst.ID == "" {
@@ -410,7 +424,7 @@ func launchManagedRun(cmd *cobra.Command, c *cliCtx, agent runAgentDefinition, n
 	confirmed := false
 	for {
 		var instances []agentInstanceView
-		if err := c.get(path, &instances); err != nil {
+		if err := c.get(instancesPath, &instances); err != nil {
 			return fmt.Errorf("poll managed instance %s: %w", inst.ID, err)
 		}
 		found := false
