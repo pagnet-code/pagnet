@@ -16,7 +16,7 @@ import (
 )
 
 func snapshotApproval() SnapshotApproval {
-	return SnapshotApproval{Profile: SnapshotProfileVersion, Target: SnapshotTarget{"10000000-0000-4000-8000-000000000001", 3, "sha256:" + strings.Repeat("ab", 32)}, OwnerApproved: true, ExternalInstructions: "PRIVATE approved external instructions", Provider: provider.Config{BaseURL: "https://provider.example", Model: "fixed-model", APIKey: "PRIVATE-credential"}, CallsPerDay: 9, CommitmentKey: []byte(strings.Repeat("K", 32))}
+	return SnapshotApproval{Profile: SnapshotProfileVersion, Target: SnapshotTarget{AgentID: "10000000-0000-4000-8000-000000000001", DefinitionRevision: 3, DefinitionFingerprint: "sha256:" + strings.Repeat("ab", 32)}, OwnerApproved: true, ExternalInstructions: "PRIVATE approved external instructions", Provider: provider.Config{BaseURL: "https://provider.example", Model: "fixed-model", APIKey: "PRIVATE-credential"}, CallsPerDay: 9, CommitmentKey: []byte(strings.Repeat("K", 32))}
 }
 func resolveTestSnapshot(t *testing.T, a SnapshotApproval) *SnapshotPlan {
 	t.Helper()
