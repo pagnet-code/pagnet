@@ -157,6 +157,10 @@ func (r *NativeWorkerRegistry) Lookup(instanceID string) (NativeWorkerRecord, er
 	if err := r.db.QueryRow(`SELECT payload,launch_state FROM native_workers WHERE instance_id=?`, instanceID).Scan(&raw, &state); err != nil {
 		return NativeWorkerRecord{}, err
 	}
+	return r.decodeRecord(instanceID, raw, state)
+}
+
+func (r *NativeWorkerRegistry) decodeRecord(instanceID string, raw []byte, state string) (NativeWorkerRecord, error) {
 	var record NativeWorkerRecord
 	if len(raw) > 256<<10 || json.Unmarshal(raw, &record) != nil || record.Scope.InstanceID != instanceID || record.Dir != r.Dir(record.Scope) || record.ProfileFingerprint != sessionworker.NativeProfileFingerprint(record.Spec) {
 		return NativeWorkerRecord{}, errors.New("native worker registry identity corrupt")
