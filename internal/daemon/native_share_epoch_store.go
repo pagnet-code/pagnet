@@ -45,13 +45,8 @@ type NativeShareEpochStageAuthorization struct {
 	Reauthorize   func(NativeShareEpochStageAuthorization) error
 }
 
-type NativeShareEpochStageReceipt struct {
-	Version     int       `json:"version"`
-	BindingID   domain.ID `json:"bindingId"`
-	OperationID domain.ID `json:"operationId"`
-	Digest      string    `json:"digest"`
-	Signature   []byte    `json:"signature"`
-}
+// NativeShareEpochStageReceipt preserves the daemon API for the transport receipt.
+type NativeShareEpochStageReceipt = transport.NativeShareEpochStageReceipt
 
 // This snapshot binds session fields outside Prepared.Subject. It is public
 // retry context, never persisted authority. Features are a sorted distinct set.
@@ -152,12 +147,6 @@ func nativeShareEpochStageDigest(record nativeShareEpochStageRecord) (string, er
 	}
 	digest := sha256.Sum256(append([]byte("pagnet/native-share-epoch/stage/v1/"), raw...))
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func nativeShareEpochStageReceiptBytes(r NativeShareEpochStageReceipt) []byte {
-	r.Signature = nil
-	raw, _ := json.Marshal(r)
-	return append([]byte("pagnet/native-share-epoch/staged/v1/"), raw...)
 }
 
 // Stage opens only an existing dedicated holder. It decrypts briefly to verify
@@ -287,7 +276,11 @@ func (s *NativeShareEpochStore) Stage(bindingID domain.ID, rawPackage []byte, a 
 		return empty, err
 	}
 	record.Receipt = NativeShareEpochStageReceipt{Version: 1, BindingID: bindingID, OperationID: a.Expected.OperationID, Digest: record.Digest}
-	record.Receipt.Signature = ed25519.Sign(s.signer, nativeShareEpochStageReceiptBytes(record.Receipt))
+	receiptBytes, err := record.Receipt.CanonicalBytes()
+	if err != nil {
+		return empty, errNativeShareEpochStage
+	}
+	record.Receipt.Signature = ed25519.Sign(s.signer, receiptBytes)
 	raw, err := json.Marshal(record)
 	if err != nil || len(raw) > nativeShareEpochStageMaxBytes {
 		return empty, errNativeShareEpochStage
