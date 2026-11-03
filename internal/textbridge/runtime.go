@@ -24,11 +24,16 @@ type RuntimeConnection interface {
 
 // RuntimeConfig supplies current owner policy and optional boundary factories.
 // A nil Enabled predicate fences all dispatch. Enabled and OnError follow the
-// same contract as Config. Nil factories use the standard provider and SDK.
+// same contract as Config. Enabled must not acquire the profile policy lock;
+// selected frozen summaries consult saved policy separately for each dispatch.
+// Nil factories use the standard provider and SDK.
 type RuntimeConfig struct {
 	NewProvider func(provider.Config) (Provider, error)
-	Connect     func(context.Context, sdk.Config) (RuntimeConnection, error)
+	// NewSnapshotProvider is used only for an explicitly selected frozen summary.
+	NewSnapshotProvider func(provider.Config, string) (Provider, error)
+	Connect             func(context.Context, sdk.Config) (RuntimeConnection, error)
 	// Authorize runs on the authenticated endpoint before handlers or dispatch.
+	// For selected frozen summaries it runs under policy.lock and must not acquire it.
 	Authorize func(context.Context, RuntimeConnection) error
 	Enabled   func(string) bool
 	OnError   func(error)
@@ -48,21 +53,83 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 	if p.ProjectContract == OwnerTextProjectContract && (p.ServiceRole() != "responder" || config.Authorize == nil) {
 		return errors.New("owner responder requires installation authorization")
 	}
-	key, err := ReadProviderKey(p.KeyFile)
-	if err != nil {
-		return err
+	var err error
+	var client Provider
+	var plan *FrozenSummaryPlan
+	fingerprint := p.Fingerprint
+	if p.FrozenSummaryApprovalID != "" {
+		current, err := LoadProfile(dir, p.Service)
+		if err != nil {
+			return err
+		}
+		if current.FrozenSummaryApprovalID != p.FrozenSummaryApprovalID {
+			return errors.New("frozen summary selection changed")
+		}
+		plan, err = ResolveFrozenSummary(dir, p.FrozenSummaryApprovalID, current, time.Now())
+		if err != nil {
+			return err
+		}
+		p = current
+		fingerprint = plan.Fingerprint()
+		newSnapshot := config.NewSnapshotProvider
+		if newSnapshot == nil {
+			newSnapshot = func(c provider.Config, instructions string) (Provider, error) {
+				return provider.NewSnapshot(c, instructions)
+			}
+		}
+		client, err = newSnapshot(plan.config, plan.approval.Instructions)
+		if err != nil {
+			return err
+		}
+	} else {
+		key, err := ReadProviderKey(p.KeyFile)
+		if err != nil {
+			return err
+		}
+		providerConfig := provider.Config{BaseURL: p.ProviderOrigin, Model: p.Model, APIKey: key}
+		if ProviderFingerprint(providerConfig) != p.Fingerprint {
+			return errors.New("provider configuration changed; create a new service for new configuration")
+		}
+		newProvider := config.NewProvider
+		if newProvider == nil {
+			newProvider = func(c provider.Config) (Provider, error) { return provider.New(c) }
+		}
+		client, err = newProvider(providerConfig)
+		if err != nil {
+			return err
+		}
 	}
-	providerConfig := provider.Config{BaseURL: p.ProviderOrigin, Model: p.Model, APIKey: key}
-	if ProviderFingerprint(providerConfig) != p.Fingerprint {
-		return errors.New("provider configuration changed; create a new service for new configuration")
+	// Call only while holding policy.lock. A new plan is resolved each time so
+	// expiry and provider key changes remain visible even while that lock is held.
+	validateSelection := func() (*FrozenSummaryPlan, error) {
+		current, err := LoadProfile(dir, p.Service)
+		if err != nil {
+			return nil, err
+		}
+		if current.FrozenSummaryApprovalID != p.FrozenSummaryApprovalID {
+			return nil, errors.New("frozen summary selection changed")
+		}
+		fresh, err := ResolveFrozenSummary(dir, p.FrozenSummaryApprovalID, current, time.Now())
+		if err != nil {
+			return nil, err
+		}
+		if fresh.Fingerprint() != fingerprint {
+			return nil, errors.New("frozen summary configuration changed")
+		}
+		return fresh, nil
 	}
-	newProvider := config.NewProvider
-	if newProvider == nil {
-		newProvider = func(c provider.Config) (Provider, error) { return provider.New(c) }
-	}
-	client, err := newProvider(providerConfig)
-	if err != nil {
-		return err
+	startupPolicy := func(ctx context.Context, effect func() error) error {
+		if plan != nil {
+			unlock, err := LockProfilePolicy(ctx, dir)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			if _, err := validateSelection(); err != nil {
+				return err
+			}
+		}
+		return effect()
 	}
 	if err := PrivateDir(filepath.Join(dir, "sdk")); err != nil {
 		return err
@@ -99,10 +166,13 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 	if err != nil {
 		return err
 	}
-	if config.Authorize != nil {
-		if err := config.Authorize(ctx, conn); err != nil {
-			return err
+	if err := startupPolicy(ctx, func() error {
+		if config.Authorize != nil {
+			return config.Authorize(ctx, conn)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -133,11 +203,40 @@ func RunProfile(parent context.Context, dir string, p Profile, store Ledger, con
 			return false
 		default:
 		}
-		return ctx.Err() == nil && config.Enabled != nil && config.Enabled(project) && (adapter == nil || adapter.Ready(project))
+		return ctx.Err() == nil && config.Enabled != nil && config.Enabled(project) && (adapter == nil || adapter.Ready(project)) && (plan == nil || plan.AllowsProject(project))
 	}
-	b := New(store, projectTransport, client, Config{ProviderConfigFingerprint: p.Fingerprint, Enabled: enabled, OnError: config.OnError, DeferMessageWake: adapter != nil})
-	callbacks.OnSharingProjectMessage(b.HandleMessage)
-	callbacks.OnSharingProjectReady(func(string) { b.Wake() })
+	var gate DispatchGate
+	if plan != nil {
+		gate = func(ctx context.Context, _ DispatchAction, scope DispatchScope, dispatch func(func() error) error) error {
+			unlock, err := LockProfilePolicy(ctx, dir)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			revalidate := func() error {
+				fresh, err := validateSelection()
+				if err != nil {
+					return err
+				}
+				if !fresh.AllowsProject(scope.ProjectID) || fresh.Fingerprint() != scope.QueuedFingerprint {
+					return errors.New("frozen summary dispatch scope changed")
+				}
+				return nil
+			}
+			if err := revalidate(); err != nil {
+				return err
+			}
+			return dispatch(revalidate)
+		}
+	}
+	b := New(store, projectTransport, client, Config{ProviderConfigFingerprint: fingerprint, DispatchGate: gate, Enabled: enabled, OnError: config.OnError, DeferMessageWake: adapter != nil})
+	if err := startupPolicy(ctx, func() error {
+		callbacks.OnSharingProjectMessage(b.HandleMessage)
+		callbacks.OnSharingProjectReady(func(string) { b.Wake() })
+		return nil
+	}); err != nil {
+		return err
+	}
 	if adapter != nil {
 		if err := adapter.EnrollProjects(ctx); err != nil {
 			return err

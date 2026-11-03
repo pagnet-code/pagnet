@@ -208,7 +208,8 @@ func DisableFrozenSummaryApprovalContext(ctx context.Context, dir, id string) er
 }
 
 // FrozenSummaryPlan captures immutable request semantics by value. It grants no
-// tools, workspace, history, or live-agent identity. No production route selects it.
+// tools, workspace, history, or live-agent identity. RunProfile selects it only
+// through an explicitly saved frozen summary approval.
 type FrozenSummaryPlan struct {
 	approval    FrozenSummaryApproval
 	config      provider.Config
