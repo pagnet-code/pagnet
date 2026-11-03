@@ -192,3 +192,75 @@ func TestNativeShareEpochStageCommandResultStrictJSON(t *testing.T) {
 		})
 	}
 }
+
+func TestParseNativeShareEpochStageExpiredWithoutVerification(t *testing.T) {
+	c, r, _, now := nativeStageCommandFixture(t)
+	c.Expected.Deadline = now.Add(-time.Hour).Format(time.RFC3339Nano)
+	// Neither parser verifies the package signature against the changed metadata,
+	// or the result's detached signatures against any key.
+	c.Package = []byte("unverified original package")
+	r.Signature = make([]byte, ed25519.SignatureSize)
+	r.Receipt.Signature = make([]byte, ed25519.SignatureSize)
+	wire, _ := json.Marshal(c)
+	got, err := ParseNativeShareEpochStageCommand(wire)
+	if err != nil || !reflect.DeepEqual(got, c) {
+		t.Fatal("expired command shape rejected", err)
+	}
+	if _, err := DecodeNativeShareEpochStageCommand(wire, c.Expected.CommandID, c.BindingID, c.Expected, c.SourceSigningPublicKey, now); err == nil {
+		t.Fatal("verified decoder accepted expired unverified command")
+	}
+	wire, _ = json.Marshal(r)
+	result, err := ParseNativeShareEpochStageResult(wire)
+	if err != nil || !reflect.DeepEqual(result, r) {
+		t.Fatal("unverified result shape rejected", err)
+	}
+}
+
+func TestParseNativeShareEpochStageStrictByteFields(t *testing.T) {
+	c, r, _, _ := nativeStageCommandFixture(t)
+	for _, kind := range []string{"command", "result"} {
+		t.Run(kind, func(t *testing.T) {
+			var wire []byte
+			var parse func([]byte) error
+			var paths [][]string
+			if kind == "command" {
+				wire, _ = json.Marshal(c)
+				parse = func(raw []byte) error { _, err := ParseNativeShareEpochStageCommand(raw); return err }
+				paths = [][]string{{"sourceSigningPublicKey"}, {"package"}}
+			} else {
+				wire, _ = json.Marshal(r)
+				parse = func(raw []byte) error { _, err := ParseNativeShareEpochStageResult(raw); return err }
+				paths = [][]string{{"signature"}, {"receipt", "signature"}}
+			}
+			for _, path := range paths {
+				for _, bad := range []string{"numeric array", "noncanonical base64"} {
+					t.Run(strings.Join(path, "/")+"/"+bad, func(t *testing.T) {
+						var fields map[string]json.RawMessage
+						_ = json.Unmarshal(wire, &fields)
+						var target map[string]json.RawMessage
+						if len(path) == 2 {
+							_ = json.Unmarshal(fields[path[0]], &target)
+						} else {
+							target = fields
+						}
+						name := path[len(path)-1]
+						if bad == "numeric array" {
+							target[name] = json.RawMessage(`[1,2,3]`)
+						} else {
+							var value string
+							_ = json.Unmarshal(target[name], &value)
+							target[name], _ = json.Marshal(value + "\n")
+						}
+						if len(path) == 2 {
+							fields[path[0]], _ = json.Marshal(target)
+						}
+						raw, _ := json.Marshal(fields)
+						if parse(raw) == nil {
+							t.Fatal("ambiguous byte encoding accepted")
+						}
+					})
+				}
+			}
+		})
+	}
+}

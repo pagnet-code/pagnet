@@ -58,10 +58,24 @@ func (c NativeShareEpochStageCommand) Verify(commandID, bindingID domain.ID, exp
 	return nil
 }
 
+// ParseNativeShareEpochStageCommand checks strict wire shape, bounds and static
+// values without verifying signatures, current time or retained authority.
+// Callers must Verify before authorizing new work.
+func ParseNativeShareEpochStageCommand(raw []byte) (NativeShareEpochStageCommand, error) {
+	var c NativeShareEpochStageCommand
+	if len(raw) > 32<<10 || !strictNativeShareStageWireJSON(raw, "command") || json.Unmarshal(raw, &c) != nil {
+		return NativeShareEpochStageCommand{}, errNativeShareEpochStageCommand
+	}
+	if _, err := c.Digest(); err != nil {
+		return NativeShareEpochStageCommand{}, errNativeShareEpochStageCommand
+	}
+	return c, nil
+}
+
 // DecodeNativeShareEpochStageCommand validates shape, bounds and retained context.
 func DecodeNativeShareEpochStageCommand(raw []byte, commandID, bindingID domain.ID, expected NativeShareEpochMetadata, trustedSource ed25519.PublicKey, now time.Time) (NativeShareEpochStageCommand, error) {
-	var c NativeShareEpochStageCommand
-	if len(raw) > 32<<10 || !strictNativeShareStageWireJSON(raw, "command") || json.Unmarshal(raw, &c) != nil || c.Verify(commandID, bindingID, expected, trustedSource, now) != nil {
+	c, err := ParseNativeShareEpochStageCommand(raw)
+	if err != nil || c.Verify(commandID, bindingID, expected, trustedSource, now) != nil {
 		return NativeShareEpochStageCommand{}, errNativeShareEpochStageCommand
 	}
 	return c, nil
@@ -109,9 +123,23 @@ func (r NativeShareEpochStageResult) Verify(commandID domain.ID, command NativeS
 	return nil
 }
 
-func DecodeNativeShareEpochStageResult(raw []byte, commandID domain.ID, command NativeShareEpochStageCommand, trustedRecipientHost ed25519.PublicKey) (NativeShareEpochStageResult, error) {
+// ParseNativeShareEpochStageResult checks strict wire shape, bounds and static
+// values without signature or retained-context verification. It can parse
+// immutable replay evidence after the original command deadline has passed.
+func ParseNativeShareEpochStageResult(raw []byte) (NativeShareEpochStageResult, error) {
 	var r NativeShareEpochStageResult
-	if len(raw) > 8<<10 || !strictNativeShareStageWireJSON(raw, "result") || json.Unmarshal(raw, &r) != nil || r.Verify(commandID, command, trustedRecipientHost) != nil {
+	if len(raw) > 8<<10 || !strictNativeShareStageWireJSON(raw, "result") || json.Unmarshal(raw, &r) != nil || len(r.Signature) != ed25519.SignatureSize {
+		return NativeShareEpochStageResult{}, errNativeShareEpochStageCommand
+	}
+	if _, err := r.SignatureBytes(); err != nil {
+		return NativeShareEpochStageResult{}, errNativeShareEpochStageCommand
+	}
+	return r, nil
+}
+
+func DecodeNativeShareEpochStageResult(raw []byte, commandID domain.ID, command NativeShareEpochStageCommand, trustedRecipientHost ed25519.PublicKey) (NativeShareEpochStageResult, error) {
+	r, err := ParseNativeShareEpochStageResult(raw)
+	if err != nil || r.Verify(commandID, command, trustedRecipientHost) != nil {
 		return NativeShareEpochStageResult{}, errNativeShareEpochStageCommand
 	}
 	return r, nil
