@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,7 @@ import (
 )
 
 func snapshotApproval() SnapshotApproval {
-	return SnapshotApproval{Profile: SnapshotProfileVersion, Target: SnapshotTarget{"managed-agent-1", 3, "definition-sha256"}, OwnerApproved: true, ExternalInstructions: "PRIVATE approved external instructions", Provider: provider.Config{BaseURL: "https://provider.example", Model: "fixed-model", APIKey: "PRIVATE-credential"}, CallsPerDay: 9}
+	return SnapshotApproval{Profile: SnapshotProfileVersion, Target: SnapshotTarget{"10000000-0000-4000-8000-000000000001", 3, "sha256:" + strings.Repeat("ab", 32)}, OwnerApproved: true, ExternalInstructions: "PRIVATE approved external instructions", Provider: provider.Config{BaseURL: "https://provider.example", Model: "fixed-model", APIKey: "PRIVATE-credential"}, CallsPerDay: 9, CommitmentKey: []byte(strings.Repeat("K", 32))}
 }
 func resolveTestSnapshot(t *testing.T, a SnapshotApproval) *SnapshotPlan {
 	t.Helper()
@@ -29,13 +30,14 @@ func TestSnapshotDigestAndPrivacy(t *testing.T) {
 	a := snapshotApproval()
 	p := resolveTestSnapshot(t, a)
 	changes := map[string]func(*SnapshotApproval){
-		"instructions": func(a *SnapshotApproval) { a.ExternalInstructions += " changed" },
-		"model":        func(a *SnapshotApproval) { a.Provider.Model += "-other" },
-		"origin":       func(a *SnapshotApproval) { a.Provider.BaseURL = "https://other.example" },
-		"target":       func(a *SnapshotApproval) { a.Target.AgentID += "-other" },
-		"revision":     func(a *SnapshotApproval) { a.Target.DefinitionRevision++ },
-		"definition":   func(a *SnapshotApproval) { a.Target.DefinitionFingerprint += "-other" },
-		"allowance":    func(a *SnapshotApproval) { a.CallsPerDay++ },
+		"commitment key": func(a *SnapshotApproval) { a.CommitmentKey = []byte(strings.Repeat("L", 32)) },
+		"instructions":   func(a *SnapshotApproval) { a.ExternalInstructions += " changed" },
+		"model":          func(a *SnapshotApproval) { a.Provider.Model += "-other" },
+		"origin":         func(a *SnapshotApproval) { a.Provider.BaseURL = "https://other.example" },
+		"target":         func(a *SnapshotApproval) { a.Target.AgentID = "10000000-0000-4000-8000-000000000002" },
+		"revision":       func(a *SnapshotApproval) { a.Target.DefinitionRevision++ },
+		"definition":     func(a *SnapshotApproval) { a.Target.DefinitionFingerprint = "sha256:" + strings.Repeat("cd", 32) },
+		"allowance":      func(a *SnapshotApproval) { a.CallsPerDay++ },
 	}
 	for name, change := range changes {
 		t.Run(name, func(t *testing.T) {
@@ -53,7 +55,7 @@ func TestSnapshotDigestAndPrivacy(t *testing.T) {
 		t.Fatal("credential commitment must remain private")
 	}
 	raw, _ := json.Marshal(p.Descriptor())
-	for _, secret := range []string{a.ExternalInstructions, a.Provider.APIKey, p.credentialFingerprint, a.Provider.BaseURL, a.Provider.Model, a.Target.AgentID} {
+	for _, secret := range []string{a.ExternalInstructions, a.Provider.APIKey, p.credentialFingerprint, a.Provider.BaseURL, a.Provider.Model, a.Target.AgentID, string(a.CommitmentKey)} {
 		if strings.Contains(string(raw), secret) {
 			t.Fatal("public descriptor leaked private configuration")
 		}
@@ -77,15 +79,18 @@ func TestSnapshotDigestAndPrivacy(t *testing.T) {
 func TestSnapshotSelectionIdentityAndBounds(t *testing.T) {
 	a := snapshotApproval()
 	for name, change := range map[string]func(*SnapshotApproval){
-		"unselected":         func(a *SnapshotApproval) { a.Profile = "" },
-		"unapproved":         func(a *SnapshotApproval) { a.OwnerApproved = false },
-		"agent":              func(a *SnapshotApproval) { a.Target.AgentID += "other" },
-		"revision":           func(a *SnapshotApproval) { a.Target.DefinitionRevision++ },
-		"fingerprint":        func(a *SnapshotApproval) { a.Target.DefinitionFingerprint += "other" },
-		"no allowance":       func(a *SnapshotApproval) { a.CallsPerDay = 0 },
-		"empty snapshot":     func(a *SnapshotApproval) { a.ExternalInstructions = " " },
-		"oversized snapshot": func(a *SnapshotApproval) { a.ExternalInstructions = strings.Repeat("界", 16001) },
-		"invalid utf8":       func(a *SnapshotApproval) { a.ExternalInstructions = "\xff" },
+		"unselected":          func(a *SnapshotApproval) { a.Profile = "" },
+		"unapproved":          func(a *SnapshotApproval) { a.OwnerApproved = false },
+		"agent":               func(a *SnapshotApproval) { a.Target.AgentID += "other" },
+		"revision":            func(a *SnapshotApproval) { a.Target.DefinitionRevision++ },
+		"fingerprint":         func(a *SnapshotApproval) { a.Target.DefinitionFingerprint += "other" },
+		"no allowance":        func(a *SnapshotApproval) { a.CallsPerDay = 0 },
+		"empty snapshot":      func(a *SnapshotApproval) { a.ExternalInstructions = " " },
+		"oversized snapshot":  func(a *SnapshotApproval) { a.ExternalInstructions = strings.Repeat("界", 16001) },
+		"missing commitment":  func(a *SnapshotApproval) { a.CommitmentKey = nil },
+		"invalid origin utf8": func(a *SnapshotApproval) { a.Provider.BaseURL = "https://provider.example/\xff" },
+		"invalid model utf8":  func(a *SnapshotApproval) { a.Provider.Model = "\xff" },
+		"invalid utf8":        func(a *SnapshotApproval) { a.ExternalInstructions = "\xff" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			bad := a
@@ -145,7 +150,7 @@ func TestSnapshotProviderRequestUsesResolvedPlan(t *testing.T) {
 	}
 }
 func snapshotBinding(target SnapshotTarget) SnapshotPreparationBinding {
-	return SnapshotPreparationBinding{InstallationID: "installation", ServiceID: "service", Generation: 1, TenantID: "tenant", HostID: "host", Target: target, RunnerID: "runner", Epoch: 1, BootID: "boot", ServerChallenge: "challenge", ServerRevision: 1}
+	return SnapshotPreparationBinding{InstallationID: "10000000-0000-4000-8000-000000000010", ServiceID: "10000000-0000-4000-8000-000000000011", Generation: 1, TenantID: "10000000-0000-4000-8000-000000000012", HostID: "10000000-0000-4000-8000-000000000013", Target: target, RunnerID: "10000000-0000-4000-8000-000000000014", Epoch: "2026-11-03T10:00:00.123456Z", ServerAudience: "https://server.example", BootID: "boot", ServerChallenge: base64.RawURLEncoding.EncodeToString(make([]byte, 32)), ServerRevision: 1}
 }
 func TestSnapshotPreparedSignatureBindingsAndExpiry(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -174,7 +179,7 @@ func TestSnapshotPreparedSignatureBindingsAndExpiry(t *testing.T) {
 		"definition fingerprint": func(t *SnapshotPreparedTranscript) { t.Binding.Target.DefinitionFingerprint += "x" },
 		"profile":                func(t *SnapshotPreparedTranscript) { t.Profile.Digest += "x" },
 		"runner":                 func(t *SnapshotPreparedTranscript) { t.Binding.RunnerID += "x" },
-		"epoch":                  func(t *SnapshotPreparedTranscript) { t.Binding.Epoch++ },
+		"epoch":                  func(t *SnapshotPreparedTranscript) { t.Binding.Epoch = "2026-11-03T10:00:01.123456Z" },
 		"boot":                   func(t *SnapshotPreparedTranscript) { t.Binding.BootID += "x" },
 		"challenge":              func(t *SnapshotPreparedTranscript) { t.Binding.ServerChallenge += "x" },
 		"server revision":        func(t *SnapshotPreparedTranscript) { t.Binding.ServerRevision++ },

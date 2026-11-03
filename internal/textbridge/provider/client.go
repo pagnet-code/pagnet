@@ -46,7 +46,7 @@ func New(config Config) (*Client, error) {
 // NewSnapshot is an explicit opt-in for an owner-approved, immutable external
 // instruction snapshot. It does not load agent instructions or enable tools.
 func NewSnapshot(config Config, snapshot string) (*Client, error) {
-	if !utf8.ValidString(snapshot) || strings.TrimSpace(snapshot) == "" || len(snapshot) > MaxInputChars*utf8.UTFMax || utf8.RuneCountInString(snapshot) > MaxInputChars {
+	if !utf8.ValidString(config.BaseURL) || !utf8.ValidString(config.Model) || !utf8.ValidString(snapshot) || strings.TrimSpace(snapshot) == "" || len(snapshot) > MaxInputChars*utf8.UTFMax || utf8.RuneCountInString(snapshot) > MaxInputChars {
 		return nil, errors.New("invalid or oversized system snapshot")
 	}
 	return newClient(config, snapshot)
