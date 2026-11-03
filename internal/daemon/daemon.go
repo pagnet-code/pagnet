@@ -1049,6 +1049,10 @@ func isAuthReject(err error) bool {
 }
 
 func (d *Daemon) wsURL(ctx context.Context) string {
+	return d.wsURLWithSnapshotSigningKey(ctx, "")
+}
+
+func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSigningPublicKey string) string {
 	base := strings.TrimSuffix(d.ServerURL, "/")
 	u, err := url.Parse(base)
 	if err != nil {
@@ -1067,6 +1071,12 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("boot_id", d.bootID)
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Del("snapshot_signing_key")
+	q.Del("snapshot_signing_public_key")
+	if snapshotSigningPublicKey != "" {
+		q.Set("snapshot_signing_key", transport.HostSnapshotSigningKeyProtocol)
+		q.Set("snapshot_signing_public_key", snapshotSigningPublicKey)
+	}
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
 	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
@@ -1105,13 +1115,17 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	if err := netpolicy.Check(d.ServerURL, d.InsecureRemoteHTTP); err != nil {
 		return connectedAt, err
 	}
+	snapshotSigningPublicKey, err := d.snapshotSigningPublicKey()
+	if err != nil {
+		return connectedAt, err
+	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
 	dialer, err := hostWSDialer(d.HostWSIPv4Only)
 	if err != nil {
 		return connectedAt, err
 	}
-	conn, resp, err := dialer.DialContext(ctx, d.wsURL(ctx), hdr)
+	conn, resp, err := dialer.DialContext(ctx, d.wsURLWithSnapshotSigningKey(ctx, snapshotSigningPublicKey), hdr)
 	if err != nil {
 		if resp != nil {
 			return connectedAt, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)
@@ -1120,6 +1134,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	}
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
+	nativeConn.offeredSnapshotSigningPublicKey = snapshotSigningPublicKey
 	defer nativeConn.Close()
 	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
 	defer shareBindings.close()

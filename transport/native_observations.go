@@ -6,6 +6,7 @@ import (
 )
 
 const NativeObservationReceiptProtocol = "native-observation-receipt-v1"
+const HostSnapshotSigningKeyProtocol = "host-snapshot-signing-key-v1"
 const (
 	MsgHostSession                  = "host.session"
 	MsgNativeOriginRegister         = "host.native_origin_register"
@@ -31,6 +32,8 @@ type HostSessionPayload struct {
 	RunnerEpoch       time.Time `json:"runnerEpoch"`
 	BootID            string    `json:"bootId"`
 	ProtocolFeatures  []string  `json:"protocolFeatures"`
+
+	SnapshotSigningPublicKey string `json:"snapshotSigningPublicKey,omitempty"`
 }
 
 type NativeOriginRegisterPayload struct {
