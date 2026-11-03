@@ -54,6 +54,7 @@ type Outcome struct {
 // runtime environments, host credentials and native approval secrets are not
 // written into this journal. Every admission is committed before native effect.
 type Journal struct {
+	gatewayCapability    *gatewayAdmissionCapability
 	localReadiness       *localReadiness
 	cloudReadiness       *localReadiness
 	outputEncoder        nativeOutputEncoder
@@ -246,6 +247,9 @@ func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (
 		return fail(err)
 	}
 	if err = j.initializeDispatches(); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeGatewayAdmissions(); err != nil {
 		return fail(err)
 	}
 	if err = j.validateHistory(); err != nil {
