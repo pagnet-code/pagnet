@@ -315,12 +315,12 @@ func TestNativeWorkerRecoveryProtocolArchiveReplayAfterRename(t *testing.T) {
 
 func TestNativeWorkerRecoveryProtocolNegotiation(t *testing.T) {
 	d, _, _, _, _ := recoveryProtocolFixture(t)
-	d.ServerURL += "?native_worker_recovery=injected"
+	d.ServerURL += "?native_worker_recovery=injected&native_worker_prior_launch_boot_recovery=injected"
 	parsed, err := url.Parse(d.wsURL(t.Context()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Query().Get("native_worker_recovery") != transport.NativeWorkerRecoveryProtocol || parsed.Query().Get("native_observations") != transport.NativeObservationReceiptProtocol {
+	if parsed.Query().Get("native_worker_recovery") != transport.NativeWorkerRecoveryProtocol || parsed.Query().Get("native_worker_prior_launch_boot_recovery") != transport.NativeWorkerPriorLaunchBootRecoveryProtocol || parsed.Query().Get("native_observations") != transport.NativeObservationReceiptProtocol {
 		t.Fatal("recovery protocol not advertised with native observations")
 	}
 	d.nativeRegistry = nil
@@ -328,7 +328,7 @@ func TestNativeWorkerRecoveryProtocolNegotiation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Query().Has("native_worker_recovery") {
+	if parsed.Query().Has("native_worker_recovery") || parsed.Query().Has("native_worker_prior_launch_boot_recovery") {
 		t.Fatal("configured URL enabled recovery without durable registry")
 	}
 }
