@@ -92,6 +92,7 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 	} else if err == nil {
 		expected.FenceBoot = record.FenceBoot
 		expected.LocalGeneration = record.LocalGeneration
+		expected.LaunchProof = record.LaunchProof
 		identity := record
 		identity.Phase = "prepared"
 		identity.ServerCleaned = false
@@ -111,8 +112,15 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 	if record.ServerCleaned {
 		return nil
 	}
+	priorLaunchEnabled := slices.Contains(session.ProtocolFeatures, transport.NativeWorkerPriorLaunchBootRecoveryProtocol)
+	if priorLaunchEnabled && record.Phase == "prepared" {
+		record, err = d.nativeRegistry.preparePriorLaunchBootProof(record, d.ServerURL, readBoot)
+		if err != nil {
+			return err
+		}
+	}
 	current, err := readBoot()
-	if err != nil || !record.ProvesNewBoot(current) {
+	if err != nil || (!record.ProvesNewBoot(current) && !(priorLaunchEnabled && record.provesPriorLaunchBoot(current))) {
 		return ErrNativeOriginAdmissionDeferred
 	}
 	if p.State == "prepared" {
@@ -142,7 +150,16 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 func (d *Daemon) sendNativeWorkerRecoveryAck(c *NativeObservationConnection, r NativeWorkerRecovery, phase string) error {
 	// The writer belongs to this exact authenticated socket; it cannot silently
 	// move evidence to a replacement runner. No source command is acknowledged.
-	return c.send(context.Background(), transport.MsgNativeWorkerRecoveryAck, transport.NativeWorkerRecoveryAck{RecoveryID: r.RecoveryID, InstanceID: r.InstanceID, OwnershipGeneration: r.OriginalGeneration, Action: r.Action, LocalPhase: phase, LocalFenceBoot: r.FenceBoot})
+	var proof *transport.NativeWorkerRecoveryDeathProof
+	session, err := c.AuthenticatedNativeHostSession()
+	if err != nil {
+		return err
+	}
+	if r.LaunchProof.DeathProof.Kind != "" && slices.Contains(session.ProtocolFeatures, transport.NativeWorkerPriorLaunchBootRecoveryProtocol) {
+		copy := r.LaunchProof.DeathProof
+		proof = &copy
+	}
+	return c.send(context.Background(), transport.MsgNativeWorkerRecoveryAck, transport.NativeWorkerRecoveryAck{DeathProof: proof, RecoveryID: r.RecoveryID, InstanceID: r.InstanceID, OwnershipGeneration: r.OriginalGeneration, Action: r.Action, LocalPhase: phase, LocalFenceBoot: r.FenceBoot})
 }
 
 func (d *Daemon) resumeNativeWorkerRecoveryAcks(conn *websocket.Conn) {
@@ -160,6 +177,12 @@ func (d *Daemon) resumeNativeWorkerRecoveryAcks(conn *websocket.Conn) {
 		}
 		if _, _, err = d.nativeRecoveryConnection(conn); err != nil {
 			return
+		}
+		if r.LaunchProof != (NativeWorkerLaunchRecoveryProof{}) && !slices.Contains(session.ProtocolFeatures, transport.NativeWorkerPriorLaunchBootRecoveryProtocol) {
+			current, bootErr := CollectKernelBootEvidence()
+			if bootErr != nil || !r.ProvesNewBoot(current) {
+				continue
+			}
 		}
 		if err = d.sendNativeWorkerRecoveryAck(c, r, "collected"); err != nil {
 			return

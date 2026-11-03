@@ -466,6 +466,9 @@ func (r *NativeWorkerRegistry) prepare(record NativeWorkerRecord) error {
 }
 
 func validNativeRecovery(record NativeWorkerRecovery) bool {
+	if !validLaunchRecoveryProof(record) {
+		return false
+	}
 	for _, value := range []string{record.RecoveryID, record.InstanceID} {
 		if !validNativeRecoveryToken(value, false) {
 			return false
@@ -554,6 +557,9 @@ func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (Nat
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return NativeWorkerRecovery{}, err
+	}
+	if record.LaunchProof != (NativeWorkerLaunchRecoveryProof{}) {
+		return NativeWorkerRecovery{}, errors.New("native worker launch proof requires committed fence")
 	}
 	worker, err := r.Lookup(record.InstanceID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
