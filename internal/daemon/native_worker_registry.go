@@ -143,7 +143,12 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &NativeWorkerRegistry{db: db, root: root}, nil
+	registry := &NativeWorkerRegistry{db: db, root: root}
+	if err := registry.initSourceHolderInstallation(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return registry, nil
 }
 func (r *NativeWorkerRegistry) Close() error { return r.db.Close() }
 func (r *NativeWorkerRegistry) Dir(scope sessionworker.Scope) string {
