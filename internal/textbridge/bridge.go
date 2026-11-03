@@ -43,13 +43,38 @@ type Provider interface {
 	Complete(context.Context, string) (string, error)
 }
 
+// DispatchAction identifies the side effect protected by a dispatch gate.
+type DispatchAction string
+
+const (
+	DispatchProvider     DispatchAction = "provider"
+	DispatchPrepareReply DispatchAction = "prepare_reply"
+	DispatchSendReply    DispatchAction = "send_reply"
+)
+
+// DispatchScope binds policy evaluation to the immutable queued job identity.
+// It deliberately contains no ASK, provider output, or credentials.
+type DispatchScope struct {
+	ProjectID         string
+	AskID             string
+	QueuedFingerprint string
+}
+
+// DispatchGate must freshly authorize scope and invoke dispatch synchronously,
+// at most once, while holding the policy lock through its return. Denial must
+// return without invoking dispatch. Policy changes must use the same lock.
+type DispatchGate func(context.Context, DispatchAction, DispatchScope, func() error) error
+
 // Config contains only owner-supplied policy. Enabled must consult current local
 // enablement and revocation; a nil function disables dispatch. OnError, if set,
 // receives background failures and must return promptly. Configuration changes
 // must use a different fingerprint to prevent old work using new credentials.
+// When DispatchGate is set, Enabled is also called inside its callback and must
+// return promptly without acquiring the lock held by DispatchGate.
 type Config struct {
 	ProviderConfigFingerprint string
 	DeferMessageWake          bool
+	DispatchGate              DispatchGate
 	Enabled                   func(projectID string) bool
 	OnError                   func(error)
 }
@@ -235,6 +260,52 @@ func (b *Bridge) authorized(ctx context.Context, job ledger.Job) (bool, error) {
 	return status.ProjectID == job.ProjectID && status.State == "active" && status.EndpointProved && b.config.Enabled(job.ProjectID), nil
 }
 
+// dispatchEligible reloads after the potentially blocking status lookup as well.
+// The gate serializes policy changes; ledger revocation still requires a fresh read.
+func (b *Bridge) dispatchEligible(ctx context.Context, expected ledger.Job) (ledger.Job, bool, error) {
+	job, err := b.store.Get(ctx, expected.ProjectID, expected.AskID)
+	if err != nil {
+		return job, false, storageFailure(err)
+	}
+	if job.Phase != expected.Phase || job.Data.ProviderConfigFingerprint != expected.Data.ProviderConfigFingerprint {
+		return job, false, nil
+	}
+	active, err := b.authorized(ctx, job)
+	if err != nil || !active {
+		return job, false, err
+	}
+	fresh, err := b.store.Get(ctx, job.ProjectID, job.AskID)
+	if err != nil {
+		return fresh, false, storageFailure(err)
+	}
+	return fresh, fresh.Revision == job.Revision && !fresh.Revoked &&
+		fresh.Data.ProviderConfigFingerprint == b.config.ProviderConfigFingerprint &&
+		b.config.Enabled != nil && b.config.Enabled(fresh.ProjectID), nil
+}
+
+func (b *Bridge) dispatch(ctx context.Context, action DispatchAction, job *ledger.Job, effect func() error) (bool, error) {
+	if b.config.DispatchGate == nil {
+		return true, effect()
+	}
+	expected := *job
+	called := false
+	entered := false
+	err := b.config.DispatchGate(ctx, action, DispatchScope{expected.ProjectID, expected.AskID, expected.Data.ProviderConfigFingerprint}, func() error {
+		if entered {
+			return errors.New("text bridge dispatch callback repeated")
+		}
+		entered = true
+		fresh, active, err := b.dispatchEligible(ctx, expected)
+		if err != nil || !active {
+			return err
+		}
+		*job = fresh
+		called = true
+		return effect()
+	})
+	return called, err
+}
+
 func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 	for {
 		var err error
@@ -255,55 +326,78 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if active, err := b.authorized(ctx, job); err != nil || !active {
 				return err
 			}
-			claimed, token, err := b.store.ClaimProvider(ctx, job, time.Now())
-			if err != nil {
-				if errors.Is(err, ledger.ErrLimit) || errors.Is(err, ledger.ErrStale) || errors.Is(err, ledger.ErrInvalid) {
-					return err
+			called, err := b.dispatch(ctx, DispatchProvider, &job, func() error {
+				claimed, token, err := b.store.ClaimProvider(ctx, job, time.Now())
+				if err != nil {
+					if errors.Is(err, ledger.ErrLimit) || errors.Is(err, ledger.ErrStale) || errors.Is(err, ledger.ErrInvalid) {
+						return err
+					}
+					return storageFailure(err)
 				}
-				return storageFailure(err)
-			}
-			output, callErr := b.provider.Complete(ctx, string(claimed.Data.Input))
-			succeeded := callErr == nil && validText([]byte(output), provider.MaxOutputChars)
-			// Even canceled dispatches must durably record ambiguity if storage remains
-			// available. A failed finish leaves ProviderStarted, which is never replayed.
-			finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			_, err = b.store.FinishProvider(finishCtx, job.ProjectID, job.AskID, token, []byte(output), succeeded)
-			cancel()
-			if err != nil {
-				return storageFailure(err)
-			}
-			if !succeeded {
-				return errors.New("text bridge provider result unknown")
+				if b.config.DispatchGate != nil {
+					if _, active, err := b.dispatchEligible(ctx, claimed); err != nil || !active {
+						// The durable claim remains unresolved and can never be replayed.
+						return err
+					}
+				}
+				output, callErr := b.provider.Complete(ctx, string(claimed.Data.Input))
+				succeeded := callErr == nil && validText([]byte(output), provider.MaxOutputChars)
+				// Even canceled dispatches must durably record ambiguity if storage remains
+				// available. A failed finish leaves ProviderStarted, which is never replayed.
+				finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				_, err = b.store.FinishProvider(finishCtx, job.ProjectID, job.AskID, token, []byte(output), succeeded)
+				cancel()
+				if err != nil {
+					return storageFailure(err)
+				}
+				if !succeeded {
+					return errors.New("text bridge provider result unknown")
+				}
+				return nil
+			})
+			if err != nil || !called {
+				return err
 			}
 		case ledger.OutputReady:
 			if active, err := b.authorized(ctx, job); err != nil || !active {
 				return err
 			}
-			id, err := uuid.NewV7()
-			if err != nil {
-				return storageFailure(err)
-			}
-			data := job.Data
-			data.ReplyID = id.String()
-			job, err = b.store.CompareAndSwap(ctx, job, ledger.ReplyPreparing, data)
-			if err != nil {
-				return storageFailure(err)
-			}
-			var header sdk.SharingProjectMessageHeader
-			if err = json.Unmarshal(job.Data.Header, &header); err != nil {
-				return b.unknown(ctx, job)
-			}
-			// The ReplyID is durable before entering the SDK. This is the sole place
-			// where preparation is allowed, including after any SDK error.
-			prepared, prepareErr := b.transport.PrepareSharingProjectMessageWithID(job.ProjectID, header.SenderPrincipalID, "REPLY", job.Data.ReplyID, job.Data.Output, job.Data.PredecessorWire)
-			if prepareErr != nil {
-				prepared, err = b.transport.LoadPreparedSharingProjectMessage(job.ProjectID, job.Data.ReplyID)
+			called, err := b.dispatch(ctx, DispatchPrepareReply, &job, func() error {
+				id, err := uuid.NewV7()
 				if err != nil {
-					return b.loadFailure(ctx, job, err)
+					return storageFailure(err)
 				}
-			}
-			if err = b.prepared(ctx, job, prepared); err != nil {
-				return storageFailure(err)
+				data := job.Data
+				data.ReplyID = id.String()
+				job, err = b.store.CompareAndSwap(ctx, job, ledger.ReplyPreparing, data)
+				if err != nil {
+					return storageFailure(err)
+				}
+				var header sdk.SharingProjectMessageHeader
+				if err = json.Unmarshal(job.Data.Header, &header); err != nil {
+					return b.unknown(ctx, job)
+				}
+				// The ReplyID is durable before entering the SDK. This is the sole place
+				// where preparation is allowed, including after any SDK error.
+				if b.config.DispatchGate != nil {
+					if _, active, err := b.dispatchEligible(ctx, job); err != nil || !active {
+						return err
+					}
+				}
+				prepared, prepareErr := b.transport.PrepareSharingProjectMessageWithID(job.ProjectID, header.SenderPrincipalID, "REPLY", job.Data.ReplyID, job.Data.Output, job.Data.PredecessorWire)
+				if prepareErr != nil {
+					prepared, err = b.transport.LoadPreparedSharingProjectMessage(job.ProjectID, job.Data.ReplyID)
+					if err != nil {
+						return b.loadFailure(ctx, job, err)
+					}
+				}
+				if err = b.prepared(ctx, job, prepared); err != nil {
+					return storageFailure(err)
+				}
+				return nil
+			})
+			if err != nil || !called {
+				return err
 			}
 		case ledger.ReplyPreparing:
 			// Missing ciphertext after a crash is ambiguous. Never prepare a second time.
@@ -350,7 +444,14 @@ func (b *Bridge) process(ctx context.Context, job ledger.Job) error {
 			if job.Phase != ledger.ReplyPrepared || job.Revoked || b.config.Enabled == nil || !b.config.Enabled(job.ProjectID) {
 				return nil
 			}
-			receipt, err = b.transport.SendPreparedSharingProjectMessage(ctx, job.ProjectID, job.Data.ReplyID)
+			called, err := b.dispatch(ctx, DispatchSendReply, &job, func() error {
+				var sendErr error
+				receipt, sendErr = b.transport.SendPreparedSharingProjectMessage(ctx, job.ProjectID, job.Data.ReplyID)
+				return sendErr
+			})
+			if err == nil && !called {
+				return nil
+			}
 			if err != nil {
 				var quota *sdk.SharingProjectMessageQuotaError
 				if errors.As(err, &quota) {
