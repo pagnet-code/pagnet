@@ -39,6 +39,10 @@ type NativeShareHolderStore struct {
 	now      func() time.Time
 }
 
+func (s *NativeShareHolderStore) nativeShareBindingReady() bool {
+	return s != nil && s.registry != nil && len(s.signer) == ed25519.PrivateKeySize && s.now != nil
+}
+
 func (s *NativeShareHolderStore) String() string { return "NativeShareHolderStore{closed}" }
 
 func NewNativeShareHolderStore(registry *NativeWorkerRegistry, identity *hostcrypto.HostIdentity) (*NativeShareHolderStore, error) {

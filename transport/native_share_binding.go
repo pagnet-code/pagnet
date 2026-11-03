@@ -16,6 +16,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 )
 
+const NativeShareBindingProtocol = "native-share-binding-v1"
 const NativeShareBindingVersion = 1
 const MsgNativeShareBindingPrepare = "host.native_share_binding_prepare"
 const MsgNativeShareBindingProve = "host.native_share_binding_prove"

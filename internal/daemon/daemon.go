@@ -192,10 +192,11 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	nativeRegistry     *NativeWorkerRegistry
-	nativeWorkersMu    sync.Mutex
-	nativeConnectLocks [16]sync.Mutex
-	nativeWorkers      map[string]*nativeWorkerLink
+	nativeShareBindings nativeShareBindingExecutor // nil until explicitly composed; dormant preview
+	nativeRegistry      *NativeWorkerRegistry
+	nativeWorkersMu     sync.Mutex
+	nativeConnectLocks  [16]sync.Mutex
+	nativeWorkers       map[string]*nativeWorkerLink
 
 	// compositionMu guards Config.HostedFabricSideports and
 	// Config.HostedFabricSideportSocket: composition may happen before OR
@@ -1069,6 +1070,10 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
 	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
+	q.Del("native_share_binding")
+	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
+		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
+	}
 	q.Del("native_worker_recovery")
 	if d.nativeRegistry != nil {
 		q.Set("native_worker_availability", transport.NativeWorkerAvailabilityProtocol)
@@ -1116,6 +1121,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
 	defer nativeConn.Close()
+	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
+	defer shareBindings.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
 		env, err := transport.NewEnvelope(typ, payload)
 		if err != nil {
@@ -1362,6 +1369,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			// (status + announced epoch + tenant id). The handler only
 			// updates the in-memory cache — it never blocks the read loop.
 			d.handleNetworkCrypto(env)
+			continue
+		}
+		if shareBindings.handle(env) {
 			continue
 		}
 		d.handleCommand(conn, env)
