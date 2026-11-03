@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -21,7 +22,8 @@ func nativeShareEpochFixture(t *testing.T) (NativeShareEpochPackage, ed25519.Pub
 		Version: 1, OperationID: "10000000-0000-4000-8000-000000000001",
 		TenantID: "10000000-0000-4000-8000-000000000002", NetworkID: "10000000-0000-4000-8000-000000000003",
 		PreviousEpochID: "10000000-0000-4000-8000-000000000004", EpochID: "10000000-0000-4000-8000-000000000005",
-		ProposalRevision: 1, GrantGeneration: 2, BindingDigest: strings.Repeat("ab", 32),
+		EpochPossessionVerifier: hex.EncodeToString(pub),
+		ProposalRevision:        1, GrantGeneration: 2, BindingDigest: strings.Repeat("ab", 32),
 		HolderID: "10000000-0000-4000-8000-000000000006", HolderX25519: strings.Repeat("cd", 32),
 		CommandID: "10000000-0000-4000-8000-000000000007", CommandConnectionID: "command-connection", AuthorityConnectionID: "authority-connection",
 		Deadline: "2027-01-02T03:04:05Z",
@@ -72,7 +74,7 @@ func TestNativeShareEpochEveryMetadataFieldBound(t *testing.T) {
 				field.SetUint(field.Uint() + 1)
 			case reflect.String:
 				switch typ.Field(i).Name {
-				case "BindingDigest", "HolderX25519":
+				case "EpochPossessionVerifier", "BindingDigest", "HolderX25519":
 					field.SetString(strings.Repeat("ef", 32))
 				case "Deadline":
 					field.SetString("2027-01-02T03:04:06Z")
@@ -114,6 +116,10 @@ func TestNativeShareEpochRejectsMalformedMetadata(t *testing.T) {
 		"malformed id":          func(m *NativeShareEpochMetadata) { m.NetworkID = "invalid" },
 		"zero id":               func(m *NativeShareEpochMetadata) { m.NetworkID = "00000000-0000-0000-0000-000000000000" },
 		"uppercase digest":      func(m *NativeShareEpochMetadata) { m.BindingDigest = strings.Repeat("AB", 32) },
+		"uppercase verifier":    func(m *NativeShareEpochMetadata) { m.EpochPossessionVerifier = strings.Repeat("AB", 32) },
+		"short verifier":        func(m *NativeShareEpochMetadata) { m.EpochPossessionVerifier = strings.Repeat("ab", 31) },
+		"long verifier":         func(m *NativeShareEpochMetadata) { m.EpochPossessionVerifier = strings.Repeat("ab", 33) },
+		"nonhex verifier":       func(m *NativeShareEpochMetadata) { m.EpochPossessionVerifier = strings.Repeat("gg", 32) },
 		"short holder key":      func(m *NativeShareEpochMetadata) { m.HolderX25519 = "ab" },
 		"invalid deadline":      func(m *NativeShareEpochMetadata) { m.Deadline = "tomorrow" },
 		"zero deadline":         func(m *NativeShareEpochMetadata) { m.Deadline = "0001-01-01T00:00:00Z" },

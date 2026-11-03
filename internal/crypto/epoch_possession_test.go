@@ -3,6 +3,7 @@ package crypto
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -53,5 +54,17 @@ func TestEpochPossessionDerivationScopeAndKey(t *testing.T) {
 				t.Fatal("scope/key change retained readiness")
 			}
 		})
+	}
+}
+
+func TestEpochPossessionDerivationCompatibility(t *testing.T) {
+	kr := &Keyring{NetworkID: "network", Epochs: []KeyEpoch{{ID: "epoch", State: EpochActive, Key: bytes.Repeat([]byte{7}, 32)}}}
+	signer, err := EpochPossessionSigner(kr, "epoch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearNativeShareEpoch(signer)
+	if hex.EncodeToString(signer.Seed()) != "025ccf3772bffb7239f4899f410f61b2b60831fcb3eadc8ee31b278ece82dab4" {
+		t.Fatal("epoch possession derivation changed")
 	}
 }

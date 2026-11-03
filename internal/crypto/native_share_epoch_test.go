@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -39,6 +40,11 @@ func nativeShareEpochFixture(t *testing.T) (*FreshNativeShareEpoch, transport.Na
 		CommandID: "10000000-0000-4000-8000-000000000007", CommandConnectionID: "command-connection", AuthorityConnectionID: "authority-connection",
 		Deadline: "2027-01-02T03:04:05Z",
 	}
+	verifier, err := fresh.PossessionVerifier(m.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.EpochPossessionVerifier = hex.EncodeToString(verifier)
 	return fresh, m, source, holder, time.Date(2027, 1, 2, 3, 4, 4, 0, time.UTC)
 }
 
@@ -120,6 +126,9 @@ func TestNativeShareEpochSealFailureConsumesAndClears(t *testing.T) {
 		"wrong epoch": func(m *transport.NativeShareEpochMetadata, _ *ed25519.PrivateKey, _ *time.Time) {
 			m.EpochID = m.PreviousEpochID
 		},
+		"wrong verifier": func(m *transport.NativeShareEpochMetadata, _ *ed25519.PrivateKey, _ *time.Time) {
+			m.EpochPossessionVerifier = strings.Repeat("ef", 32)
+		},
 		"invalid source":   func(_ *transport.NativeShareEpochMetadata, source *ed25519.PrivateKey, _ *time.Time) { *source = nil },
 		"invalid metadata": func(m *transport.NativeShareEpochMetadata, _ *ed25519.PrivateKey, _ *time.Time) { m.Version = 2 },
 		"zero time":        func(_ *transport.NativeShareEpochMetadata, _ *ed25519.PrivateKey, now *time.Time) { *now = time.Time{} },
@@ -139,6 +148,9 @@ func TestNativeShareEpochSealFailureConsumesAndClears(t *testing.T) {
 				t.Fatal("accepted invalid seal")
 			}
 			nativeShareEpochAssertCleared(t, owned)
+			if verifier, err := fresh.PossessionVerifier(metadata.NetworkID); err == nil || verifier != nil {
+				t.Fatal("failed seal retained verifier access")
+			}
 			if fresh.secret.key != nil {
 				t.Fatal("failed seal retained owned buffer")
 			}
@@ -227,5 +239,86 @@ func TestNativeShareEpochOpenRejectsWrongHolderAndTampering(t *testing.T) {
 	}
 	if key, err := OpenNativeShareEpoch(p, metadata, wrongSource.Public().(ed25519.PublicKey), holder.Bytes(), now); err == nil || key != nil {
 		t.Fatal("opened package under wrong authority")
+	}
+}
+
+func TestNativeShareEpochPossessionVerifier(t *testing.T) {
+	fresh, metadata, source, _, now := nativeShareEpochFixture(t)
+	original := append([]byte(nil), fresh.secret.key...)
+	defer clearNativeShareEpoch(original)
+	verifier, err := fresh.PossessionVerifier(metadata.NetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kr := &Keyring{NetworkID: string(metadata.NetworkID), Epochs: []KeyEpoch{{ID: string(metadata.EpochID), State: EpochActive, Key: original}}}
+	signer, err := EpochPossessionSigner(kr, string(metadata.EpochID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearNativeShareEpoch(signer)
+	if !bytes.Equal(verifier, signer.Public().(ed25519.PublicKey)) {
+		t.Fatal("fresh verifier differs from ordinary epoch possession derivation")
+	}
+	verifier[0] ^= 1
+	again, err := fresh.PossessionVerifier(metadata.NetworkID)
+	if err != nil || hex.EncodeToString(again) != metadata.EpochPossessionVerifier || !bytes.Equal(fresh.secret.key, original) {
+		t.Fatal("verifier read mutated or consumed fresh material", err)
+	}
+	for _, network := range []string{"", "another-network"} {
+		other, err := fresh.PossessionVerifier(domain.ID(network))
+		if network == "" {
+			if err == nil {
+				t.Fatal("accepted empty network")
+			}
+		} else if err != nil || bytes.Equal(other, again) {
+			t.Fatal("network change retained verifier", err)
+		}
+	}
+	otherEpoch, err := nativeShareEpochPossessionVerifier(original, metadata.NetworkID, metadata.PreviousEpochID)
+	if err != nil || bytes.Equal(otherEpoch, again) {
+		t.Fatal("epoch change retained verifier", err)
+	}
+	if _, err := SealNativeShareEpoch(fresh, metadata, source, now); err != nil {
+		t.Fatal(err)
+	}
+	if verifier, err := fresh.PossessionVerifier(metadata.NetworkID); err == nil || verifier != nil {
+		t.Fatal("consumed epoch retained verifier access")
+	}
+}
+
+func TestNativeShareEpochPossessionVerifierAfterDestroy(t *testing.T) {
+	fresh, metadata, _, _, _ := nativeShareEpochFixture(t)
+	copyOfFresh := *fresh
+	fresh.Destroy()
+	for _, unavailable := range []*FreshNativeShareEpoch{nil, {}, fresh, &copyOfFresh} {
+		if verifier, err := unavailable.PossessionVerifier(metadata.NetworkID); err == nil || verifier != nil {
+			t.Fatal("unavailable epoch returned verifier")
+		}
+	}
+}
+
+func TestNativeShareEpochOpenRejectsAuthenticatedWrongVerifier(t *testing.T) {
+	fresh, metadata, source, holder, now := nativeShareEpochFixture(t)
+	metadata.EpochPossessionVerifier = strings.Repeat("ef", 32)
+	aad, err := metadata.AAD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, ciphertext, err := e2ee.HPKEWrap(holder.PublicKey().Bytes(), []byte(transport.NativeShareEpochInfo), aad, fresh.secret.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := transport.NativeShareEpochPackage{Metadata: metadata, Wrapped: transport.CryptoHPKEWrap{Enc: enc, Ciphertext: ciphertext}}
+	raw, err := p.SignatureBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Signature = ed25519.Sign(source, raw)
+	pub := source.Public().(ed25519.PublicKey)
+	if err := p.Verify(metadata, pub, now); err != nil {
+		t.Fatal("source signature should verify independently of decrypted key", err)
+	}
+	if key, err := OpenNativeShareEpoch(p, metadata, pub, holder.Bytes(), now); err == nil || key != nil {
+		t.Fatal("opened correctly signed and encrypted package with wrong verifier")
 	}
 }

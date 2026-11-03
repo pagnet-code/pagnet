@@ -19,27 +19,29 @@ var errNativeShareEpoch = errors.New("transport: invalid native share epoch pack
 // NativeShareEpochMetadata is independently retained authorization context for
 // one prospective target-network epoch. It grants no installation authority.
 // Connection identifiers are exact opaque identifiers captured by the caller.
+// EpochPossessionVerifier is a 32-byte Ed25519 public key in lowercase hex.
 type NativeShareEpochMetadata struct {
-	Version               int       `json:"version"`
-	OperationID           domain.ID `json:"operationId"`
-	TenantID              domain.ID `json:"tenantId"`
-	NetworkID             domain.ID `json:"networkId"`
-	PreviousEpochID       domain.ID `json:"previousEpochId"`
-	EpochID               domain.ID `json:"epochId"`
-	ProposalRevision      uint64    `json:"proposalRevision,string"`
-	GrantGeneration       uint64    `json:"grantGeneration,string"`
-	BindingDigest         string    `json:"bindingDigest"`
-	HolderID              domain.ID `json:"holderId"`
-	HolderX25519          string    `json:"holderX25519"`
-	CommandID             domain.ID `json:"commandId"`
-	CommandConnectionID   string    `json:"commandConnectionId"`
-	AuthorityConnectionID string    `json:"authorityConnectionId"`
-	Deadline              string    `json:"deadline"`
+	Version                 int       `json:"version"`
+	OperationID             domain.ID `json:"operationId"`
+	TenantID                domain.ID `json:"tenantId"`
+	NetworkID               domain.ID `json:"networkId"`
+	PreviousEpochID         domain.ID `json:"previousEpochId"`
+	EpochID                 domain.ID `json:"epochId"`
+	EpochPossessionVerifier string    `json:"epochPossessionVerifier"`
+	ProposalRevision        uint64    `json:"proposalRevision,string"`
+	GrantGeneration         uint64    `json:"grantGeneration,string"`
+	BindingDigest           string    `json:"bindingDigest"`
+	HolderID                domain.ID `json:"holderId"`
+	HolderX25519            string    `json:"holderX25519"`
+	CommandID               domain.ID `json:"commandId"`
+	CommandConnectionID     string    `json:"commandConnectionId"`
+	AuthorityConnectionID   string    `json:"authorityConnectionId"`
+	Deadline                string    `json:"deadline"`
 }
 
 // AAD has a fixed field order and domain separator; all fields are authenticated.
 func (m NativeShareEpochMetadata) AAD() ([]byte, error) {
-	if m.Version != NativeShareEpochVersion || m.ProposalRevision == 0 || m.GrantGeneration == 0 || m.EpochID == m.PreviousEpochID || !nativeShareBindingHex(m.BindingDigest) || !nativeShareBindingHex(m.HolderX25519) || !nativeShareBindingTime(m.Deadline) || !nativeShareOpaque(m.CommandConnectionID) || !nativeShareOpaque(m.AuthorityConnectionID) {
+	if m.Version != NativeShareEpochVersion || m.ProposalRevision == 0 || m.GrantGeneration == 0 || m.EpochID == m.PreviousEpochID || !nativeShareBindingHex(m.EpochPossessionVerifier) || !nativeShareBindingHex(m.BindingDigest) || !nativeShareBindingHex(m.HolderX25519) || !nativeShareBindingTime(m.Deadline) || !nativeShareOpaque(m.CommandConnectionID) || !nativeShareOpaque(m.AuthorityConnectionID) {
 		return nil, errNativeShareEpoch
 	}
 	for _, id := range []domain.ID{m.OperationID, m.TenantID, m.NetworkID, m.PreviousEpochID, m.EpochID, m.HolderID, m.CommandID} {
@@ -73,7 +75,9 @@ func (p NativeShareEpochPackage) SignatureBytes() ([]byte, error) {
 	return append([]byte("pagnet/native-share-epoch/signature/v1/"), raw...), err
 }
 
-// Verify requires caller-selected authority and the complete expected context.
+// Verify validates the source signature against caller-pinned expected metadata
+// and a trusted source key. It does not prove that EpochPossessionVerifier was
+// derived from the encrypted epoch key.
 // Replay prevention and checking that PreviousEpochID is still committed remain
 // caller duties, as do current authorization and connection liveness checks.
 func (p NativeShareEpochPackage) Verify(expected NativeShareEpochMetadata, trustedSource ed25519.PublicKey, now time.Time) error {
@@ -116,7 +120,7 @@ func strictNativeShareEpochJSON(raw []byte) bool {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	schemas := map[string]map[string]bool{
 		"":         {"metadata": true, "wrapped": true, "signature": true},
-		"metadata": {"version": true, "operationId": true, "tenantId": true, "networkId": true, "previousEpochId": true, "epochId": true, "proposalRevision": true, "grantGeneration": true, "bindingDigest": true, "holderId": true, "holderX25519": true, "commandId": true, "commandConnectionId": true, "authorityConnectionId": true, "deadline": true},
+		"metadata": {"version": true, "operationId": true, "tenantId": true, "networkId": true, "previousEpochId": true, "epochId": true, "epochPossessionVerifier": true, "proposalRevision": true, "grantGeneration": true, "bindingDigest": true, "holderId": true, "holderX25519": true, "commandId": true, "commandConnectionId": true, "authorityConnectionId": true, "deadline": true},
 		"wrapped":  {"enc": true, "ciphertext": true},
 	}
 	var object func(string) bool
