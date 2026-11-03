@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"net/url"
 	"sync"
@@ -29,6 +31,9 @@ type NativeObservationConnection struct {
 	pendingSessions      map[string]chan transport.NativeOriginSessionConfirmedPayload
 	pendingContent       map[string]chan transport.NativeContentStagedPayload
 	pendingObservations  map[string]chan transport.NativeObservationReceiptPayload
+
+	// Captured from this socket's dial offer before the read loop starts.
+	offeredSnapshotSigningPublicKey string
 
 	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
@@ -98,6 +103,21 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 			return ErrNativeObservationConflict
 		}
 	}
+	snapshotSigningKeyNegotiated := false
+	for _, feature := range p.ProtocolFeatures {
+		if feature == transport.HostSnapshotSigningKeyProtocol {
+			snapshotSigningKeyNegotiated = true
+		}
+	}
+	if snapshotSigningKeyNegotiated != (p.SnapshotSigningPublicKey != "") {
+		return ErrNativeObservationConflict
+	}
+	if snapshotSigningKeyNegotiated {
+		key, err := base64.StdEncoding.Strict().DecodeString(p.SnapshotSigningPublicKey)
+		if err != nil || len(key) != ed25519.PublicKeySize || base64.StdEncoding.EncodeToString(key) != p.SnapshotSigningPublicKey || c.offeredSnapshotSigningPublicKey == "" || p.SnapshotSigningPublicKey != c.offeredSnapshotSigningPublicKey {
+			return ErrNativeObservationConflict
+		}
+	}
 	negotiated := false
 	for _, feature := range p.ProtocolFeatures {
 		if feature == transport.NativeObservationReceiptProtocol {
@@ -108,7 +128,7 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		return errors.New("native observation receipts unavailable")
 	}
 	if c.session != nil {
-		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.HostCredentialID != p.HostCredentialID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
+		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.HostCredentialID != p.HostCredentialID || c.session.SnapshotSigningPublicKey != p.SnapshotSigningPublicKey || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
 			return ErrNativeObservationConflict
 		}
 		return nil
