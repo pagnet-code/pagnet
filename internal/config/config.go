@@ -77,6 +77,9 @@ type Daemon struct {
 	// RootsMode is the roots enforcement mode (allow_all by default,
 	// allow_list to confine to AllowedRoots). Empty = allow_all.
 	RootsMode string
+	// HostWSIPv4Only opts the host WebSocket TCP connection into IPv4 only.
+	// Default false; set at startup via PAGNET_HOST_WS_IPV4_ONLY.
+	HostWSIPv4Only bool
 	// HeartbeatInterval for the outbound connection.
 	HeartbeatInterval time.Duration
 	// RuntimeEnv carries extra KEY=VALUE env pairs applied to spawned
@@ -155,6 +158,13 @@ func LoadDaemon(stateDir string) (Daemon, error) {
 		// when the control plane advertises a newer release and the
 		// worker is idle. Opt-out below (env / state file / CLI flag).
 		AutoUpdate: true,
+	}
+	if v := get("PAGNET_HOST_WS_IPV4_ONLY", ""); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return Daemon{}, errors.New("invalid PAGNET_HOST_WS_IPV4_ONLY: use true or false")
+		}
+		cfg.HostWSIPv4Only = enabled
 	}
 	if env := get("PAGNET_RUNTIME_ENV", ""); env != "" {
 		for _, kv := range strings.Split(env, ",") {

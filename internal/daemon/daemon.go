@@ -113,6 +113,8 @@ type Config struct {
 	RootsMode string
 	Version   string
 	Heartbeat time.Duration
+	// HostWSIPv4Only opts only the host WebSocket connection into IPv4.
+	HostWSIPv4Only bool
 	// RuntimeEnv is applied to spawned runtime processes (E2E simulation
 	// knobs live here; a real deployment leaves it empty).
 	RuntimeEnv []string
@@ -1100,7 +1102,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(ctx), hdr)
+	dialer, err := hostWSDialer(d.HostWSIPv4Only)
+	if err != nil {
+		return connectedAt, err
+	}
+	conn, resp, err := dialer.DialContext(ctx, d.wsURL(ctx), hdr)
 	if err != nil {
 		if resp != nil {
 			return connectedAt, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)

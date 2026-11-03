@@ -233,15 +233,16 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	}
 
 	daemonCfg := daemon.Config{
-		ServerURL:    server,
-		Credential:   cfg.Credential,
-		HostID:       cfg.HostID,
-		StateDir:     cfg.StateDir,
-		AllowedRoots: cfg.AllowedRoots,
-		Version:      version,
-		Heartbeat:    cfg.HeartbeatInterval,
-		RuntimeEnv:   cfg.RuntimeEnv,
-		NoScan:       cfg.NoScan,
+		ServerURL:      server,
+		Credential:     cfg.Credential,
+		HostID:         cfg.HostID,
+		StateDir:       cfg.StateDir,
+		AllowedRoots:   cfg.AllowedRoots,
+		Version:        version,
+		Heartbeat:      cfg.HeartbeatInterval,
+		HostWSIPv4Only: cfg.HostWSIPv4Only,
+		RuntimeEnv:     cfg.RuntimeEnv,
+		NoScan:         cfg.NoScan,
 		// The --debug flag ORs with PAGNET_DEBUG / the state file's
 		// debug: field (both loaded into cfg.Debug).
 		Debug: daemonDebug || cfg.Debug,

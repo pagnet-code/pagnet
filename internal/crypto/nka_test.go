@@ -2,6 +2,9 @@ package crypto
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -287,5 +290,121 @@ func TestNKAChallengeIssueWiring(t *testing.T) {
 	}
 	if firstKept {
 		t.Fatal("the oldest challenge survived the cap through IssueChallenge")
+	}
+}
+
+// Failed persistence must not publish an epoch that disk rejected.
+func TestNKAEpochSaveFailureLeavesKeyringUnchanged(t *testing.T) {
+	for _, operation := range []string{"Activate", "Rotate"} {
+		for _, failure := range []string{"state directory", "authority conflict"} {
+			t.Run(operation+"/"+failure, func(t *testing.T) {
+				stateDir := t.TempDir()
+				initial := NewKeyring(testNetworkID)
+				if operation == "Rotate" {
+					if _, err := initial.Activate(testTime()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := SaveKeyring(stateDir, initial); err != nil {
+					t.Fatal(err)
+				}
+				nka, err := NewNKA(stateDir, testTenantID, testNetworkID, testNKAHost)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := nka.Keyring()
+				snapshot := before.clone()
+				if failure == "state directory" {
+					// A regular file blocks MkdirAll even when tests run as root.
+					blocked := filepath.Join(t.TempDir(), "blocked")
+					if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					nka.stateDir = blocked
+				} else {
+					// Another writer advances authority after this NKA loaded.
+					if operation == "Activate" {
+						_, err = initial.Activate(testTime().Add(time.Hour))
+					} else {
+						_, err = initial.Rotate(testTime().Add(time.Hour))
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := SaveKeyring(stateDir, initial); err != nil {
+						t.Fatal(err)
+					}
+				}
+				diskBefore, err := LoadKeyring(stateDir, testNetworkID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var epoch KeyEpoch
+				if operation == "Activate" {
+					epoch, err = nka.Activate(testTime().Add(2 * time.Hour))
+				} else {
+					epoch, err = nka.Rotate(testTime().Add(2 * time.Hour))
+				}
+				if err == nil {
+					t.Fatal("expected save failure")
+				}
+				if !reflect.DeepEqual(epoch, KeyEpoch{}) {
+					t.Fatal("failed operation returned an epoch")
+				}
+				if nka.Keyring() != before || !reflect.DeepEqual(nka.Keyring(), snapshot) {
+					t.Fatal("failed save changed the in-memory keyring")
+				}
+				diskAfter, err := LoadKeyring(stateDir, testNetworkID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(diskBefore, diskAfter) {
+					t.Fatal("failed save changed the persisted keyring")
+				}
+			})
+		}
+	}
+}
+
+func TestNKAEpochChangesPublishAfterSave(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := SaveKeyring(stateDir, NewKeyring(testNetworkID)); err != nil {
+		t.Fatal(err)
+	}
+	nka, err := NewNKA(stateDir, testTenantID, testNetworkID, testNKAHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := nka.Activate(testTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := nka.Activate(testTime().Add(time.Minute))
+	if err != nil || !reflect.DeepEqual(first, again) {
+		t.Fatal("activation was not idempotent")
+	}
+	before := nka.Keyring()
+	second, err := nka.Rotate(testTime().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.Epochs) != 1 || before.Epochs[0].State != EpochActive {
+		t.Fatal("rotation mutated the previous keyring snapshot")
+	}
+	current := nka.Keyring()
+	if len(current.Epochs) != 2 || current.Epochs[0].ID != first.ID || current.Epochs[0].State != EpochRotated || current.Epochs[1].ID != second.ID || current.Epochs[1].State != EpochActive || first.ID == second.ID {
+		t.Fatal("rotation did not retain the old rotated epoch and one new active epoch")
+	}
+	persisted, err := LoadKeyring(stateDir, testNetworkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(current, persisted) {
+		t.Fatal("published keyring differs from persisted keyring")
+	}
+	// Retained keys must also be independent of the previous snapshot.
+	before.Epochs[0].Key[0] ^= 0xff
+	if !reflect.DeepEqual(current, persisted) {
+		t.Fatal("published keyring shares key material with the previous snapshot")
 	}
 }
