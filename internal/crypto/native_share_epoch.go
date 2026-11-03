@@ -51,6 +51,26 @@ func (f *FreshNativeShareEpoch) ID() domain.ID {
 	return f.secret.id
 }
 
+// PossessionVerifier returns a copied verifier for the prospective network epoch.
+// Reading it does not consume fresh; Seal and Destroy make it unavailable.
+func (f *FreshNativeShareEpoch) PossessionVerifier(networkID domain.ID) (ed25519.PublicKey, error) {
+	if f == nil || f.secret == nil {
+		return nil, errNativeShareEpoch
+	}
+	f.secret.mu.Lock()
+	defer f.secret.mu.Unlock()
+	return nativeShareEpochPossessionVerifier(f.secret.key, networkID, f.secret.id)
+}
+
+func nativeShareEpochPossessionVerifier(key []byte, networkID, epochID domain.ID) (ed25519.PublicKey, error) {
+	signer, err := epochPossessionSigner(key, string(networkID), string(epochID))
+	if err != nil {
+		return nil, err
+	}
+	defer clearNativeShareEpoch(signer)
+	return signer.Public().(ed25519.PublicKey), nil
+}
+
 // Destroy clears the owned buffer best-effort. Go and the HPKE implementation
 // may retain internal copies; this is not a guaranteed memory erasure primitive.
 func (f *FreshNativeShareEpoch) Destroy() {
@@ -84,6 +104,10 @@ func SealNativeShareEpoch(fresh *FreshNativeShareEpoch, metadata transport.Nativ
 	aad, err := metadata.AAD()
 	if err != nil {
 		return p, err
+	}
+	verifier, err := nativeShareEpochPossessionVerifier(key, metadata.NetworkID, metadata.EpochID)
+	if err != nil || hex.EncodeToString(verifier) != metadata.EpochPossessionVerifier {
+		return p, errNativeShareEpoch
 	}
 	deadline, _ := time.Parse(time.RFC3339Nano, metadata.Deadline)
 	if now.IsZero() || !now.Before(deadline) {
@@ -142,6 +166,11 @@ func OpenNativeShareEpoch(p transport.NativeShareEpochPackage, expected transpor
 		return nil, err
 	}
 	if len(key) != 32 {
+		clearNativeShareEpoch(key)
+		return nil, errNativeShareEpoch
+	}
+	verifier, err := nativeShareEpochPossessionVerifier(key, expected.NetworkID, expected.EpochID)
+	if err != nil || hex.EncodeToString(verifier) != expected.EpochPossessionVerifier {
 		clearNativeShareEpoch(key)
 		return nil, errNativeShareEpoch
 	}
