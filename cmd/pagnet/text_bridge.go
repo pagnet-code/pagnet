@@ -156,6 +156,9 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if op == "disable" {
+				return textbridge.DisableProfile(cmd.Context(), dir, service)
+			}
 			unlock, err := textbridge.LockProfile(dir)
 			if err != nil {
 				return err
@@ -175,12 +178,6 @@ func textBridgeCmdWithDependencies(deps textBridgeDependencies) *cobra.Command {
 				return err
 			}
 			switch op {
-			case "disable":
-				if err := store.SetEnabled(cmd.Context(), false); err != nil {
-					return err
-				}
-				p.Disabled = true
-				return textbridge.SaveProfile(dir, p)
 			case "resolve":
 				if !p.Disabled || budget.Enabled {
 					return errors.New("disable this service before resolving an unknown provider claim")

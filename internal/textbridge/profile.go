@@ -25,6 +25,7 @@ import (
 type Profile struct {
 	ProjectContract                             string `json:",omitempty"`
 	Role                                        string `json:",omitempty"`
+	FrozenSummaryApprovalID                     string `json:",omitempty"`
 	Service, Server, Credential                 string
 	ProviderOrigin, Model, KeyFile, Fingerprint string
 	Limits                                      ledger.Limits
@@ -99,7 +100,8 @@ func ProviderFingerprint(c provider.Config) string {
 }
 
 // LoadProfile reads a private profile and verifies its service binding.
-// Callers performing mutations must hold LockProfile for the directory.
+// Policy mutation helpers hold LockProfilePolicy across their fresh load and
+// internal save. SaveProfile independently fences immutable selection and revival.
 func LoadProfile(dir, service string) (Profile, error) {
 	var p Profile
 	raw, err := ReadPrivate(filepath.Join(dir, "profile.json"), 32768)
@@ -117,7 +119,7 @@ func LoadProfile(dir, service string) (Profile, error) {
 		p.Role = "sender"
 	}
 	role := p.ServiceRole()
-	if (role != "sender" && role != "responder") || (p.Registration != nil && p.Registration.Role != role) || p.validateProjectContractName() != nil {
+	if (role != "sender" && role != "responder") || (p.Registration != nil && p.Registration.Role != role) || p.validateProjectContractName() != nil || p.validateFrozenSummarySelection() != nil {
 		return p, errors.New("invalid local text bridge role")
 	}
 	if role == "sender" {
@@ -133,9 +135,79 @@ func LoadProfile(dir, service string) (Profile, error) {
 	return p, nil
 }
 
-// SaveProfile durably replaces the local profile. Callers must hold LockProfile.
+// SaveProfile durably replaces the local profile under policy.lock. Callers that
+// also need the lifecycle lock must acquire LockProfile first (run.lock ->
+// policy.lock). Do not call SaveProfile while already holding policy.lock.
 func SaveProfile(dir string, p Profile) error {
+	unlock, err := LockProfilePolicy(context.Background(), dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return saveProfilePolicyLocked(dir, p)
+}
+
+func (p Profile) validateFrozenSummarySelection() error {
+	if p.FrozenSummaryApprovalID != "" && (!frozenSummaryUUID(p.FrozenSummaryApprovalID) || p.ServiceRole() != "responder" || p.ProjectContractName() != SharingProjectContract) {
+		return errors.New("frozen summary selection requires a V2 responder and approval UUID")
+	}
+	return nil
+}
+
+// saveProfilePolicyLocked requires policy.lock, including for first publication.
+func saveProfilePolicyLocked(dir string, p Profile) error {
+	if err := p.validateFrozenSummarySelection(); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "profile.json")); err == nil {
+		raw, err := ReadPrivate(filepath.Join(dir, "profile.json"), 32768)
+		if err != nil {
+			return err
+		}
+		var previous Profile
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.DisallowUnknownFields()
+		if d.Decode(&previous) != nil || d.Decode(new(any)) != io.EOF {
+			return errors.New("invalid saved text bridge profile")
+		}
+		if previous.FrozenSummaryApprovalID != p.FrozenSummaryApprovalID {
+			return errors.New("published frozen summary selection is immutable")
+		}
+		if previous.Disabled && !p.Disabled {
+			return errors.New("disabled text bridge profile cannot be re-enabled")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return SavePrivateJSON(dir, "profile.json", p)
+}
+
+// DisableProfile fences new ledger claims before atomically publishing Disabled.
+// It takes only policy.lock, so it can retire a profile while run.lock is held.
+// If profile persistence fails, the ledger remains disabled (fail closed).
+func DisableProfile(ctx context.Context, dir, service string) error {
+	unlock, err := LockProfilePolicy(ctx, dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	p, err := LoadProfile(dir, service)
+	if err != nil {
+		return err
+	}
+	if p.ServiceRole() != "responder" {
+		return errors.New("live disable requires a responder profile")
+	}
+	store, err := OpenProfileLedger(dir, p)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.SetEnabled(ctx, false); err != nil {
+		return err
+	}
+	p.Disabled = true
+	return saveProfilePolicyLocked(dir, p)
 }
 
 // SavePrivateJSON atomically writes JSON with mode 0600 in a private directory.
@@ -200,7 +272,7 @@ func ProfileDirectory(state, service string) (string, error) {
 
 // ResolveProfile loads a service profile from the current OS user's private state.
 // It does not read the provider key, connect remotely, or lock a running responder.
-// Mutating callers must instead lock ProfileDirectory before LoadProfile.
+// Policy mutation helpers must instead lock ProfileDirectory before LoadProfile.
 func ResolveProfile(state, service string) (string, Profile, error) {
 	dir, err := ProfileDirectory(state, service)
 	if err != nil {
