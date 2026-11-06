@@ -67,7 +67,9 @@ func resolveExternalAuth(stateDir, profileName, network string, grants, targets,
 		if network == "" {
 			return nil, externalbridge.Config{}, sdk.Config{}, "", errors.New("$PAGNET_CREDENTIAL mode requires --network <uuid>")
 		}
-		return nil, externalbridge.Config{Network: network, Grants: grants, MessagingTargets: targets, Events: patterns}, sdk.ConfigFromEnv(), "", nil
+		cfg := sdk.ConfigFromEnv()
+		cfg.DisableMessageReceive = true
+		return nil, externalbridge.Config{Network: network, Grants: grants, MessagingTargets: targets, Events: patterns}, cfg, "", nil
 	}
 	names, err := externalprofile.List(machineStateDir(stateDir))
 	if err != nil {

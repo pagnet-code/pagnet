@@ -64,6 +64,10 @@ func TestResolveExternalAuth(t *testing.T) {
 		t.Fatalf("env mode: cfg=%#v credential=%q expected=%q err=%v", cfg, sdkCfg.Credential, expected, err)
 	}
 
+	if !sdkCfg.DisableMessageReceive {
+		t.Fatal("external env connection accepts inbound messages without a handler")
+	}
+
 	// Saved-profile mode: explicit name, overrides refused, single auto-select,
 	// multiple names refused.
 	t.Setenv(sdk.EnvCredential, "")
@@ -76,6 +80,9 @@ func TestResolveExternalAuth(t *testing.T) {
 	p, cfg, sdkCfg, expected, err := resolveExternalAuth(dir, "solo", "", nil, nil, nil, never)
 	if err != nil || p == nil || p.Principal != "01900000-0000-7000-8000-000000000002" || cfg.Network != "01900000-0000-7000-8000-000000000001" || sdkCfg.Server != "https://app.pagnet.dev" || expected != p.Principal {
 		t.Fatalf("explicit profile: p=%#v cfg=%#v server=%q expected=%q err=%v", p, cfg, sdkCfg.Server, expected, err)
+	}
+	if !sdkCfg.DisableMessageReceive {
+		t.Fatal("external profile connection accepts inbound messages without a handler")
 	}
 	if p.Grants == nil || len(p.Events) != 1 {
 		t.Fatalf("profile policy not preserved: %#v", p)

@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -51,6 +52,16 @@ type Config struct {
 	// rotations and rejects a different auth_ok identity before persistence.
 	ExpectedPrincipalID string
 
+	// DisableMessageReceive opts this endpoint out of inbound message dispatch.
+	// Use it for outbound-only clients that do not register an OnMessage handler.
+	DisableMessageReceive bool
+	// MessageHandler is installed before endpoint registration, so an inbox
+	// replay arriving during Connect cannot race handler setup.
+	MessageHandler func(context.Context, *Message) error
+	// RetryMessageHandlerErrors withholds the message ACK when MessageHandler
+	// returns an error or panics. Use only with a durable, idempotent handler.
+	RetryMessageHandlerErrors bool
+
 	// Server is the control-plane base URL (https://app.pagnet.dev or a
 	// self-hosted origin). Required.
 	Server string
@@ -91,6 +102,12 @@ func ConfigFromEnv() Config {
 // same function (same error style, same PAGNET_INSECURE_REMOTE_HTTP opt-in;
 // the SDK has no CLI flag, so the flag half is false).
 func (c Config) Validate() error {
+	if c.DisableMessageReceive && c.MessageHandler != nil {
+		return fmt.Errorf("sdk: MessageHandler requires message reception")
+	}
+	if c.RetryMessageHandlerErrors && c.MessageHandler == nil {
+		return fmt.Errorf("sdk: RetryMessageHandlerErrors requires MessageHandler before Connect")
+	}
 	if c.ExpectedPrincipalID != "" {
 		if _, err := domain.ParseID(c.ExpectedPrincipalID); err != nil {
 			return fmt.Errorf("sdk: ExpectedPrincipalID must be a principal ID")

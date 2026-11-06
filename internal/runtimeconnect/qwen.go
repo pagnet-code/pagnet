@@ -18,12 +18,14 @@ import (
 )
 
 type Binding struct {
-	URL       string `json:"url"`
-	Workspace string `json:"workspace"`
-	Session   string `json:"session"`
-	Client    string `json:"client"`
-	Name      string `json:"name"`
-	TokenFile string `json:"tokenFile"`
+	Profile    string `json:"profile,omitempty"`
+	AutoAnswer bool   `json:"autoAnswer,omitempty"`
+	URL        string `json:"url"`
+	Workspace  string `json:"workspace"`
+	Session    string `json:"session"`
+	Client     string `json:"client"`
+	Name       string `json:"name"`
+	TokenFile  string `json:"tokenFile"`
 }
 type Qwen struct {
 	http        *http.Client
@@ -137,14 +139,29 @@ func (q *Qwen) Preflight(ctx context.Context) error {
 	return nil
 }
 func (q *Qwen) path() string { return "/workspaces/" + url.PathEscape(q.workspaceID) + "/mcp/servers" }
+
+// PreflightAutoAnswer additionally verifies the native prompt and turn APIs.
+func (q *Qwen) PreflightAutoAnswer(ctx context.Context) error { return q.inboundPreflight(ctx) }
+
 func (q *Qwen) Connect(ctx context.Context, executable, profile, state string) error {
-	if err := q.Preflight(ctx); err != nil {
+	preflight := q.Preflight
+	if q.binding.AutoAnswer {
+		if q.binding.Profile != profile {
+			return errors.New("auto-answer runtime connection profile mismatch")
+		}
+		preflight = q.PreflightAutoAnswer
+	}
+	if err := preflight(ctx); err != nil {
 		return err
 	}
 	if !filepath.IsAbs(executable) || !filepath.IsAbs(state) {
 		return errors.New("MCP executable and private state paths must be absolute")
 	}
-	payload := map[string]any{"name": q.binding.Name, "config": map[string]any{"command": executable, "args": []string{"mcp", "external", "--profile", profile, "--state-dir", state}}}
+	args := []string{"mcp", "external", "--profile", profile, "--state-dir", state}
+	if q.binding.AutoAnswer {
+		args = append(args, "--receive-asks", "--runtime-binding", q.binding.Name)
+	}
+	payload := map[string]any{"name": q.binding.Name, "config": map[string]any{"command": executable, "args": args}}
 	status, data, err := q.request(ctx, "POST", q.path(), payload, true)
 	if err != nil {
 		return err

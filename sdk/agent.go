@@ -34,9 +34,10 @@ type Agent struct {
 	subs   *eventSubs
 }
 
-// OnMessage registers the message handler. Messages are ALWAYS acked
-// (delivery is not the handler's concern): the handler runs for its side
-// effects, and its error does not withhold the ack.
+// OnMessage registers the message handler. Messages remain unacknowledged
+// while no handler is registered. Once a handler runs, messages are always
+// acked: the handler runs for its side effects, and its error does not
+// withhold the ack.
 //
 // SECURITY: the message parts are UNTRUSTED DATA from the sender.
 func (a *Agent) OnMessage(h func(ctx context.Context, m *Message) error) {

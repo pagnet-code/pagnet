@@ -196,6 +196,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		pendingResults:       map[string]completedInvocation{},
 		caps:                 map[string]capRegistration{},
 		eventHandlers:        map[string]eventHandler{},
+		msgHandler:           cfg.MessageHandler,
 		cryptoReadySet:       map[string]bool{},
 		pendingChallenges:    map[string]EndpointCryptoChallengePayload{},
 		closeCh:              make(chan struct{}),
@@ -921,7 +922,13 @@ func (c *Client) registerPayloadVersioned() (transport.EndpointRegisterPayload, 
 	for _, reg := range c.caps {
 		caps = append(caps, reg.capability)
 	}
+	var receiveMessages *bool
+	if c.cfg.DisableMessageReceive {
+		receive := false
+		receiveMessages = &receive
+	}
 	return transport.EndpointRegisterPayload{
+		ReceiveMessages:  receiveMessages,
 		EndpointName:     name,
 		ProtocolFeatures: []string{transport.EndpointDispatchProtocol},
 		PublicKey:        base64.StdEncoding.EncodeToString(c.identityPub),

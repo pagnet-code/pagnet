@@ -201,10 +201,11 @@ func matchEventPattern(pattern, eventType string) bool {
 
 // handleMessageDeliver processes one durable message delivery.
 //
-// Ack semantics (plan D9): the message is ALWAYS acked — delivery is not
-// the handler's concern. The handler runs (if any) for its side effects;
-// its error (or panic) does not withhold the ack. A redelivered message
-// (uncertain ack, reconnect) is re-acked without re-dispatching.
+// Ack semantics (plan D9): a message is acked after a registered handler
+// runs for its side effects; its error (or panic) does not withhold the ack.
+// Without a handler, it stays unacknowledged and eligible for retry. A
+// redelivered handled message (uncertain ack, reconnect) is re-acked without
+// re-dispatching.
 func (c *Client) handleMessageDeliver(env transport.Envelope) {
 	var p transport.EndpointMessageDeliverPayload
 	if err := env.DecodePayload(&p); err != nil {
@@ -216,6 +217,14 @@ func (c *Client) handleMessageDeliver(env transport.Envelope) {
 	// Duplicate: re-ack, no re-dispatch.
 	if c.seenDeliveries.Contains(p.MessageID) {
 		ack()
+		return
+	}
+	// No handler means no delivery: leave duplicate and in-flight state untouched
+	// so a retry can run after handler registration or reconnect.
+	c.handlerMu.RLock()
+	h := c.msgHandler
+	c.handlerMu.RUnlock()
+	if h == nil {
 		return
 	}
 	c.delivMu.Lock()
@@ -250,17 +259,24 @@ func (c *Client) handleMessageDeliver(env transport.Envelope) {
 	m.ThreadID = p.ThreadID
 	m.Kind = p.Kind
 	m.SenderPrincipalID = p.SenderPrincipalID
+	m.RecipientPrincipalID = c.PrincipalID()
 
-	// Run the handler (if any); a panic is contained and does not withhold
-	// the ack (always-ack semantics).
-	c.handlerMu.RLock()
-	h := c.msgHandler
-	c.handlerMu.RUnlock()
-	if h != nil {
-		func() {
-			defer func() { _ = recover() }()
-			_ = h(context.Background(), &m)
+	// The opt-in durable handler withholds ACK on failure so the server can
+	// redeliver after recovery. Legacy OnMessage keeps its established behavior.
+	var handlerErr error
+	func() {
+		defer func() {
+			if recover() != nil {
+				handlerErr = errors.New("sdk: message handler panic")
+			}
 		}()
+		handlerErr = h(context.Background(), &m)
+	}()
+	if c.cfg.RetryMessageHandlerErrors && handlerErr != nil {
+		c.delivMu.Lock()
+		delete(c.inflightDeliveries, p.MessageID)
+		c.delivMu.Unlock()
+		return
 	}
 
 	// Mark seen + ack (always).
