@@ -5,10 +5,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -18,6 +20,12 @@ import (
 )
 
 func TestRuntimeConnectRecordsCleanupAndDisconnectPreservesExternalSession(t *testing.T) {
+	for _, autoAnswer := range []bool{false, true} {
+		t.Run(fmt.Sprint(autoAnswer), func(t *testing.T) { testRuntimeConnectDisconnect(t, autoAnswer) })
+	}
+}
+
+func testRuntimeConnectDisconnect(t *testing.T, autoAnswer bool) {
 	state, workspace := t.TempDir(), t.TempDir()
 	principal, network := domain.NewID().String(), domain.NewID().String()
 	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,6 +39,9 @@ func TestRuntimeConnectRecordsCleanupAndDisconnectPreservesExternalSession(t *te
 	}))
 	defer cp.Close()
 	p := externalprofile.Profile{Version: 1, Principal: principal, Network: network, Server: cp.URL, Credential: "pgn_epd_v1_private"}
+	if autoAnswer {
+		p.AllowedSenders = []string{domain.NewID().String()}
+	}
 	path, _ := externalprofile.Path(state, "work")
 	if err := externalprofile.SaveNew(path, p); err != nil {
 		t.Fatal(err)
@@ -52,7 +63,7 @@ func TestRuntimeConnectRecordsCleanupAndDisconnectPreservesExternalSession(t *te
 		}
 		switch {
 		case r.URL.Path == "/capabilities":
-			json.NewEncoder(w).Encode(map[string]any{"v": 1, "mode": "http-bridge", "features": []string{"mcp_server_runtime_mutation", "workspace_qualified_rest_core"}, "workspaces": []any{map[string]any{"id": "owned-workspace", "cwd": workspace, "trusted": true}}})
+			json.NewEncoder(w).Encode(map[string]any{"v": 1, "mode": "http-bridge", "features": []string{"mcp_server_runtime_mutation", "workspace_qualified_rest_core", "session_prompt", "session_turn_status"}, "workspaces": []any{map[string]any{"id": "owned-workspace", "cwd": workspace, "trusted": true}}})
 		case r.Method == "GET" && r.URL.Path == "/session/live/status":
 			json.NewEncoder(w).Encode(map[string]string{"sessionId": "live", "workspaceCwd": workspace})
 		case r.Method == "POST" && r.URL.Path == "/workspaces/owned-workspace/mcp/servers":
@@ -62,6 +73,16 @@ func TestRuntimeConnectRecordsCleanupAndDisconnectPreservesExternalSession(t *te
 			}
 			json.NewDecoder(r.Body).Decode(&payload)
 			postedName = payload.Name
+			expectedArgs := []string{"mcp", "external", "--profile", "work", "--state-dir", state}
+			if autoAnswer {
+				expectedArgs = append(expectedArgs, "--receive-asks", "--runtime-binding", postedName)
+			}
+			argJSON, _ := json.Marshal(payload.Config["args"])
+			var args []string
+			_ = json.Unmarshal(argJSON, &args)
+			if !reflect.DeepEqual(args, expectedArgs) {
+				t.Errorf("MCP args = %v, want %v", args, expectedArgs)
+			}
 			raw, _ := json.Marshal(payload)
 			if strings.Contains(string(raw), p.Credential) || payload.Config["env"] != nil {
 				t.Error("private profile secret sent to runtime")
@@ -84,12 +105,15 @@ func TestRuntimeConnectRecordsCleanupAndDisconnectPreservesExternalSession(t *te
 	cmd.SetOut(output)
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs([]string{"--state-dir", state, "--profile", "work", "--url", native.URL, "--workspace", workspace, "--session", "live", "--client-id", "registered", "--token-file", tokenFile})
+	if autoAnswer {
+		_ = cmd.Flags().Set("auto-answer", "true")
+	}
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
 	record := filepath.Join(state, "runtime-connections", postedName+".json")
 	var binding runtimeconnect.Binding
-	if err := externalprofile.LoadBinding(record, &binding); err != nil || binding.Name != postedName {
+	if err := externalprofile.LoadBinding(record, &binding); err != nil || binding.Name != postedName || binding.Profile != "work" || binding.AutoAnswer != autoAnswer {
 		t.Fatal("cleanup record missing")
 	}
 	disconnectFails = true

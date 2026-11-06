@@ -15,6 +15,7 @@ import (
 
 func mcpRuntimeConnectCmd() *cobra.Command {
 	var state, profile, origin, workspace, session, clientID, tokenFile, runtime string
+	var autoAnswer bool
 	cmd := &cobra.Command{Use: "runtime-connect", Args: cobra.NoArgs, Short: "Add a private external MCP profile to an authenticated existing Qwen serve workspace", RunE: func(cmd *cobra.Command, _ []string) error {
 		if domain.CanonicalRuntime(runtime) != domain.RuntimeQwenCode {
 			return errors.New("automatic live connection currently supports Qwen serve only; use documented native MCP configuration for other runtimes")
@@ -26,6 +27,9 @@ func mcpRuntimeConnectCmd() *cobra.Command {
 		p, cfg, err := externalProfileConfig(dir, profile)
 		if err != nil {
 			return err
+		}
+		if autoAnswer && len(p.AllowedSenders) == 0 {
+			return errors.New("--auto-answer requires profile allowedSenders; add senders with --allow-from")
 		}
 		if err := verifyExternalProfile(cmd.Context(), p, cfg); err != nil {
 			return err
@@ -51,12 +55,16 @@ func mcpRuntimeConnectCmd() *cobra.Command {
 			return err
 		}
 		name := "pagnet_external_" + strings.ReplaceAll(domain.NewID().String(), "-", "")
-		binding := runtimeconnect.Binding{URL: origin, Workspace: workspace, Session: session, Client: clientID, Name: name, TokenFile: tokenFile}
+		binding := runtimeconnect.Binding{URL: origin, Workspace: workspace, Session: session, Client: clientID, Name: name, TokenFile: tokenFile, Profile: profile, AutoAnswer: autoAnswer}
 		qwen, err := runtimeconnect.NewQwen(binding, token)
 		if err != nil {
 			return err
 		}
-		if err := qwen.Preflight(cmd.Context()); err != nil {
+		preflight := qwen.Preflight
+		if autoAnswer {
+			preflight = qwen.PreflightAutoAnswer
+		}
+		if err := preflight(cmd.Context()); err != nil {
 			return err
 		}
 		executable, err := os.Executable()
@@ -80,6 +88,7 @@ func mcpRuntimeConnectCmd() *cobra.Command {
 		fmt.Fprintf(cmd.OutOrStdout(), "Connected Pagnet MCP tools in Qwen workspace. Connection: %s. Existing session and terminal remain owned by Qwen.\n", name)
 		return nil
 	}}
+	cmd.Flags().BoolVar(&autoAnswer, "auto-answer", false, "relay allowed ASKs into the existing Qwen Serve session and return its final text")
 	cmd.Flags().StringVar(&runtime, "runtime", "qwen-code", "native runtime (Qwen serve currently supported)")
 	cmd.Flags().StringVar(&state, "state-dir", "", "private profile state directory")
 	cmd.Flags().StringVar(&profile, "profile", "", "private external profile name")

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -137,5 +138,64 @@ func TestQwenOriginRejectsDNSRemoteCredentialsAndHeaders(t *testing.T) {
 		if _, err := NewQwen(Binding{URL: origin, Workspace: "/work", Session: "session", Client: "client", Name: "owned"}, "private-token-at-least-16"); err == nil {
 			t.Fatal("accepted unsafe origin")
 		}
+	}
+}
+
+func TestQwenAutoAnswerRequiresPromptFeaturesAndUsesSavedBinding(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing-prompt-feature", true: "supported"}[supported], func(t *testing.T) {
+			workspace := t.TempDir()
+			mutations := 0
+			var gotArgs []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.WriteHeader(401)
+					return
+				}
+				switch {
+				case r.URL.Path == "/capabilities":
+					features := []string{"mcp_server_runtime_mutation", "workspace_qualified_rest_core"}
+					if supported {
+						features = append(features, "session_prompt", "session_turn_status")
+					}
+					json.NewEncoder(w).Encode(map[string]any{"v": 1, "mode": "http-bridge", "features": features, "workspaces": []any{map[string]any{"id": "owned", "cwd": workspace, "trusted": true}}})
+				case r.Method == "GET" && r.URL.Path == "/session/live/status":
+					json.NewEncoder(w).Encode(map[string]string{"sessionId": "live", "workspaceCwd": workspace})
+				case r.Method == "POST" && r.URL.Path == "/workspaces/owned/mcp/servers":
+					mutations++
+					var payload struct{ Config struct{ Args []string } }
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					gotArgs = payload.Config.Args
+					json.NewEncoder(w).Encode(map[string]any{"name": "pagnet_external_test", "toolCount": 4})
+				default:
+					t.Errorf("unexpected runtime action %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
+				}
+			}))
+			defer srv.Close()
+			q, err := NewQwen(Binding{URL: srv.URL, Workspace: workspace, Session: "live", Client: "registered", Name: "pagnet_external_test", Profile: "work", AutoAnswer: true}, "private-test-token-16")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = q.Connect(context.Background(), "/bin/pagnet", "work", workspace)
+			if !supported {
+				if err == nil || mutations != 0 {
+					t.Fatalf("auto-answer mutated unsupported runtime: %v, %d mutations", err, mutations)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"mcp", "external", "--profile", "work", "--state-dir", workspace, "--receive-asks", "--runtime-binding", "pagnet_external_test"}
+			if !reflect.DeepEqual(gotArgs, want) {
+				t.Fatalf("args = %v, want %v", gotArgs, want)
+			}
+			if err := q.Connect(context.Background(), "/bin/pagnet", "foreign", workspace); err == nil || mutations != 1 {
+				t.Fatal("foreign profile binding accepted")
+			}
+		})
 	}
 }

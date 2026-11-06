@@ -28,7 +28,7 @@ func externalProfileConfig(state, name string) (externalprofile.Profile, sdk.Con
 		return p, sdk.Config{}, err
 	}
 	principalState := filepath.Join(state, "external-profiles", name+".state")
-	cfg := sdk.Config{Server: p.Server, Credential: p.Credential, StateDir: principalState}
+	cfg := sdk.Config{Server: p.Server, Credential: p.Credential, StateDir: principalState, DisableMessageReceive: true}
 	// Activation is exchanged only once; reconnect uses the same principal's
 	// authenticated durable keyring, never another profile's credential.
 	if stored, err := sdk.StoredCredential(principalState, p.Principal); err == nil && stored != "" {
@@ -68,7 +68,7 @@ func verifyExternalProfile(ctx context.Context, p externalprofile.Profile, cfg s
 }
 func mcpExternalProfileCmd() *cobra.Command {
 	var state, principal, network, server string
-	var grants, targets, events []string
+	var grants, targets, events, senders []string
 	cmd := &cobra.Command{Use: "external-profile", Short: "Store private local connection settings for independent runtime MCP"}
 	cmd.PersistentFlags().StringVar(&state, "state-dir", "", "private Pagnet state directory")
 	add := &cobra.Command{Use: "add NAME", Args: cobra.ExactArgs(1), Short: "Save a profile; enter its credential at a hidden local prompt", RunE: func(cmd *cobra.Command, args []string) error {
@@ -85,7 +85,7 @@ func mcpExternalProfileCmd() *cobra.Command {
 		if err != nil {
 			return errors.New("cannot read credential")
 		}
-		p := externalprofile.Profile{Version: 1, Principal: principal, Network: network, Server: server, Credential: strings.TrimSpace(string(value)), Grants: grants, MessagingTargets: targets, Events: events}
+		p := externalprofile.Profile{Version: 1, Principal: principal, Network: network, Server: server, Credential: strings.TrimSpace(string(value)), Grants: grants, MessagingTargets: targets, Events: events, AllowedSenders: senders}
 		if err := p.Validate(); err != nil {
 			return err
 		}
@@ -104,6 +104,7 @@ func mcpExternalProfileCmd() *cobra.Command {
 	add.Flags().StringSliceVar(&grants, "allow-invoke", nil, "exact principal/capability grant; discovery only by default")
 	add.Flags().StringSliceVar(&targets, "allow-message", nil, "exact agent UUID allowed for ASK and own replies")
 	add.Flags().StringSliceVar(&events, "allow-events", nil, "event pattern this profile may receive, exact type or single-level wildcard like task.* (repeatable; default no events)")
+	add.Flags().StringSliceVar(&senders, "allow-from", nil, "exact principal UUID allowed to send inbound ASK messages (repeatable)")
 	_ = add.MarkFlagRequired("principal")
 	_ = add.MarkFlagRequired("network")
 	cmd.AddCommand(add)

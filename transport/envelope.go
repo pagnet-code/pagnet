@@ -1250,6 +1250,9 @@ const EndpointInvocationResultMaxBytes = 512 << 10
 
 type EndpointRegisterPayload struct {
 	ProtocolFeatures []string `json:"protocolFeatures,omitempty"`
+	// ReceiveMessages opts out of inbound message dispatch when explicitly false.
+	// Omission preserves legacy endpoint behavior for older SDK clients.
+	ReceiveMessages *bool `json:"receiveMessages,omitempty"`
 	// EndpointName is an operator-friendly name for the endpoint ("" =
 	// none; display only, not identity).
 	EndpointName string              `json:"endpointName,omitempty"`

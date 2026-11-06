@@ -49,6 +49,23 @@ pagnet mcp runtime-connect --profile work \
 
 A literal loopback IP and explicit port are required; remote endpoints, DNS names, redirects and unauthenticated APIs are refused. The integration adds a uniquely named runtime MCP entry with the fixed local `pagnet mcp external --profile` command. It sends no profile credentials or environment values to Qwen's configuration API. Native tools must be confirmed before reporting connection success. The entry is workspace-scoped, so other sessions sharing that Qwen workspace can see its tools; choose an isolated workspace when that access is inappropriate.
 
+By default, this connection exposes outbound MCP tools only. To answer incoming ASKs automatically, create the profile with at least one explicit sender principal and opt in on the connection:
+
+```sh
+pagnet mcp external-profile add work --principal EXTERNAL_AGENT_PRINCIPAL_UUID \
+  --network NETWORK_UUID --allow-from CHATGPT_CONNECTOR_PRINCIPAL_UUID
+pagnet mcp runtime-connect --profile work --auto-answer \
+  --url http://127.0.0.1:4170 --workspace /absolute/workspace \
+  --session EXISTING_SESSION_ID --client-id REGISTERED_CLIENT_ID \
+  --token-file /absolute/private/qwen-operator-token
+```
+
+Repeat `--allow-from` for each permitted sender principal. `EXTERNAL_AGENT_PRINCIPAL_UUID` is the Qwen/Pagnet recipient; send the ASK to that principal. `CHATGPT_CONNECTOR_PRINCIPAL_UUID` is the sender principal shown in Integrations. `--allow-from` grants incoming ASK permission; `--allow-message` controls outbound targets separately. Each profile binds one network and one receiving principal. Before changing an existing profile's policy, disconnect its runtime entry and stop any standalone bridge using it. Update only `allowedSenders` in its private JSON, preserving the principal, credential and SDK state, then run `runtime-connect --auto-answer` again. Do not recreate or delete an active profile or its state directory.
+
+Auto-answer currently supports Qwen Serve only and additionally requires its `session_prompt` and `session_turn_status` capabilities. It cannot attach to an arbitrary TUI. The installed command is exactly `pagnet mcp external --profile work --state-dir ABSOLUTE_STATE_DIR --receive-asks --runtime-binding CONNECTION_NAME`. The bridge loads that exact private connection record, verifies its profile and token file, and starts relaying only after authenticating its active network membership. Saved ASKs and native admission receipts survive bridge restarts. The relay processes one native turn at a time, sends only ASK text into the existing session, and returns its correlated final text as an encrypted reply. It waits for incoming notifications when idle; uncertain admission is retained for operator inspection without automatic resubmission. Relay errors appear on stderr.
+
+This integration grants no Pagnet host control or terminal ownership. Qwen retains its existing tools and permissions; choose the receiving session and sender policy accordingly. Automatic answering is bound to the recorded session, while the MCP entry remains visible to other sessions in the same Qwen workspace.
+
 The command prints a connection record name before attempting mutation, so even a timeout has an explicit cleanup handle:
 
 ```sh
