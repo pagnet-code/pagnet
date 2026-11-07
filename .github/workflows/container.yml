@@ -12,9 +12,10 @@ on:
         type: string
 
 # Serialize the immutable-tag existence checks with publication, including
-# retries. This lane is independent of the signed tarball release workflow.
+# retries, per ref so main pushes cannot replace pending stable releases.
+# Manual stable retries share the corresponding tag's publication lane.
 concurrency:
-  group: client-container-publish
+  group: client-container-publish-${{ inputs.tag || (github.event_name == 'workflow_dispatch' && 'main') || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -85,11 +86,12 @@ jobs:
         run: |
           set -euo pipefail
           tags=()
-          # A SHA tag records the first build of that commit, which may be
-          # a development build before its stable Git tag exists. The stable
-          # version tag is built separately with its exact release stamp.
-          candidates=("sha-$SOURCE_SHA")
-          if [[ -n "$STABLE_TAG" ]]; then candidates+=("$STABLE_TAG"); fi
+          # Keep development SHA tags separate from stable release stamps.
+          if [[ -n "$STABLE_TAG" ]]; then
+            candidates=("$STABLE_TAG")
+          else
+            candidates=("sha-$SOURCE_SHA")
+          fi
           for tag in "${candidates[@]}"; do
             if docker buildx imagetools inspect "$IMAGE:$tag" > /dev/null 2> inspect-error; then
               echo "Preserving existing immutable tag $IMAGE:$tag"
