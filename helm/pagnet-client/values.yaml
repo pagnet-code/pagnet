@@ -3,6 +3,8 @@ image:
   tag: latest
   digest: ""
   pullPolicy: IfNotPresent
+  # Names of pre-created registry credentials when the GHCR package is private.
+  pullSecrets: []
 
 # Required for the first enrollment. No token value is accepted by this chart.
 enrollment:

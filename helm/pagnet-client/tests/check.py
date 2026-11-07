@@ -83,6 +83,12 @@ class ChartChecks(unittest.TestCase):
         self.assertEqual(render("--set-string", "persistence.storageClass=fast")[0]
                          ["spec"]["storageClassName"], "fast")
 
+    def test_private_registry_pull_secret(self):
+        default_pod = render()[1]["spec"]["template"]["spec"]
+        self.assertNotIn("imagePullSecrets", default_pod)
+        pod = render("--set-string", "image.pullSecrets[0]=ghcr-auth")[1]["spec"]["template"]["spec"]
+        self.assertEqual(pod["imagePullSecrets"], [{"name": "ghcr-auth"}])
+
     def test_digest_pins_both_containers(self):
         digest = "sha256:" + "a" * 64
         pod = render("--set-string", f"image.digest={digest}")[1]["spec"]["template"]["spec"]

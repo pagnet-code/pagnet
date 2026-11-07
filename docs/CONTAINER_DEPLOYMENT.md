@@ -6,6 +6,12 @@ Use a Linux cluster and select a published image tag or set `image.digest` to a
 `sha256:` manifest digest. The first install below uses `latest` explicitly;
 production deployments should select a tested release tag.
 
+New GHCR packages may require registry authentication. If the image is private,
+create a Kubernetes image pull Secret in the `pagnet` namespace using a protected
+Docker config file, and pass its name with `--set-string
+image.pullSecrets[0]=ghcr-auth` to the Helm command below. Do not place registry
+tokens in Helm values. Once the package is public, this option can be omitted.
+
 From the repository root, create an external Secret using a file containing
 only the one-time enrollment token, then install:
 
