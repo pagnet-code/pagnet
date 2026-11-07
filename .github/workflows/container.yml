@@ -147,4 +147,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          newest_stable="$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          if [[ "$STABLE_TAG" != "$newest_stable" ]]; then
+            echo "Preserving latest: $STABLE_TAG is not the newest stable tag ($newest_stable)"
+            exit 0
+          fi
           docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$STABLE_TAG"
