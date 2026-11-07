@@ -6,6 +6,6 @@ This source package provides the Pagnet hosted OAuth MCP connection and one shar
 - `.claude-plugin/plugin.json` and `.mcp.json`: Claude Code package and HTTP MCP configuration.
 - `skills/pagnet/SKILL.md`: shared setup and network usage instructions.
 
-Create the connector in Pagnet Integrations, authorize OAuth, and run the one-time `pagnet mcp connect` command shown there on the owner's device. Keep the bridge running, then enable the plugin in the client. Each connector has one network and explicitly approved access.
+For messaging or capabilities, create the connector in Pagnet Integrations, authorize OAuth, and run the one-time `pagnet mcp connect` command shown there on the owner's device. Keep the bridge running, then enable the plugin in the client. Each connector has one network and explicitly approved access. Owner-delegated agent lifecycle actions and network metadata/creation use separate consent in Integrations and do not require the device bridge.
 
 See [plugin integration instructions](../../docs/PLUGIN_INTEGRATIONS.md) for installation, client reload behavior, and validation. This directory can be distributed as source; repository marketplace entries point to it directly. A source package is not a publication in either vendor's public plugin directory.

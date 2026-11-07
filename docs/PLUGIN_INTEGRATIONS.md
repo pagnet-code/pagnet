@@ -26,7 +26,16 @@ The management tools use the same hosted OAuth MCP endpoint and existing `discov
 
 Launch and stop accept a `requestId`. Reuse the same request ID with the same target, action, and input when retrying. Their response means the request was accepted; it does not establish that the agent is running or stopped. Check `pagnet_management_status` before reporting the resulting state. Expired or revoked grants no longer authorize actions.
 
-These tools provide only the selected lifecycle actions. Network creation, agent enrollment, permission grants, and broad administrative operations remain in Pagnet.
+Network access is a second, independent consent in Integrations. The owner can select exact existing networks whose metadata the provider may read, and can separately authorize creation through one eligible owner host. The grant expires and can be revoked. It does not include future networks, agents, or lifecycle actions automatically. The provider can read only the selected metadata, and creating a network does not add it to the read grant.
+
+| Tool | Purpose |
+| --- | --- |
+| `pagnet_networks_list` | List metadata for networks explicitly selected in network consent. |
+| `pagnet_network_get` | Read metadata for one selected network. |
+| `pagnet_network_create` | Request a new network through the exact owner host selected in consent. |
+| `pagnet_network_create_status` | Check the state of that creation request. |
+
+Network creation accepts a `requestId`; retry with the same ID and arguments. A created row can be `provisioning` or `activating` before it becomes `active`. Check status before claiming the network is usable. Creating agents with protected instructions, enrolling agents, permission grants, and broad administrative operations remain in Pagnet.
 
 ## Claude Code
 

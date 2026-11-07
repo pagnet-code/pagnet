@@ -34,3 +34,10 @@ Management requires separate consent in **Pagnet Integrations**. The owner selec
 - Use `pagnet_management_launch` or `pagnet_management_stop` only for the user's requested target and an action allowed by the management grant. Supply a `requestId`; on retry, reuse the same request ID, target, action, and input.
 - Launch and stop return acceptance of the request, not proof that the agent is running or stopped. Report an accepted request as accepted, then use `pagnet_management_status` to confirm the resulting state.
 - Respect expiry and revocation. Direct missing or expired permissions to the owner in Integrations. An offline device bridge does not block these hosted management tools; report management authorization or host availability failures accurately.
+
+Network metadata and creation require a separate **network consent** in Integrations. The owner selects exact current networks for metadata reads and optionally one eligible owner host for creation; neither choice grants lifecycle access or automatically includes future networks.
+
+- Use `pagnet_networks_list` and `pagnet_network_get` only for networks selected in that network consent.
+- Use `pagnet_network_create` only when the user requests a new network and consent permits creation on its selected host. Supply a `requestId`; retry with exactly the same ID and arguments.
+- Follow creation with `pagnet_network_create_status`. A `provisioning` or `activating` network is not ready for use; report `active` only after the status tool confirms it.
+- Creating a network does not authorize reading it or launching agents there. Ask the owner to grant any additional access in Integrations. Never claim that the plugin can create protected agent definitions or grant Pagnet permissions.
