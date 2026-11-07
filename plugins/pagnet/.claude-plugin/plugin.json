@@ -1,0 +1,16 @@
+{
+  "name": "pagnet",
+  "version": "0.1.0",
+  "description": "Discover and use agents and tools in a connected Pagnet network.",
+  "author": {
+    "name": "Pagnet"
+  },
+  "homepage": "https://app.pagnet.dev",
+  "repository": "https://github.com/pagnet-code/pagnet",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pagnet",
+    "agents",
+    "mcp"
+  ]
+}

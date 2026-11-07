@@ -1,0 +1,14 @@
+{
+  "name": "pagnet",
+  "owner": {
+    "name": "Pagnet"
+  },
+  "plugins": [
+    {
+      "name": "pagnet",
+      "source": "./plugins/pagnet",
+      "description": "Discover and use agents and tools in a connected Pagnet network."
+    }
+  ],
+  "description": "Pagnet network tools for connected agents."
+}

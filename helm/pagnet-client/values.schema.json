@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {"type": "string", "minLength": 1},
+        "server": {"type": "string", "minLength": 1},
+        "name": {"type": "string"}
+      },
+      "required": ["existingSecret", "server"]
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^(|sha256:[0-9a-f]{64})$"},
+        "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "existingClaim": {"type": "string"},
+        "size": {"type": "string", "minLength": 1},
+        "storageClass": {"type": ["string", "null"]}
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {"existingClaim": {"type": "string"}}
+    },
+    "resources": {"type": "object"}
+  }
+}

@@ -47,12 +47,13 @@ import (
 // the `serve` subcommand; both write these variables, and only one
 // command runs per invocation.
 var (
-	daemonLocal          bool
-	daemonLocalDirectory string
-	daemonStateDir       string
-	daemonLogLevel       string
-	daemonDebug          bool
-	daemonNoAutoUpdate   bool
+	daemonLocal           bool
+	daemonLocalDirectory  string
+	daemonStateDir        string
+	daemonLogLevel        string
+	daemonDebug           bool
+	daemonNoAutoUpdate    bool
+	daemonRequireEnrolled bool
 	// detach is the root-level -d/--detach flag (see runDetach).
 	detach bool
 )
@@ -88,6 +89,8 @@ func registerDaemonFlags(cmd *cobra.Command) {
 	// It ANDs with PAGNET_AUTO_UPDATE / the state file's `autoUpdate:`.
 	cmd.Flags().BoolVar(&daemonNoAutoUpdate, "no-auto-update", false,
 		"disable worker self-update (default on; also PAGNET_AUTO_UPDATE=0 or state-file autoUpdate: false)")
+	cmd.Flags().BoolVar(&daemonRequireEnrolled, "require-enrolled", false,
+		"refuse to start without a complete stored host enrollment")
 }
 
 // needsEnroll reports whether the host needs (re-)enrollment before the
@@ -144,6 +147,9 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	// exactly once, so it is the trigger for the console handoff (below).
 	firstRun := needsEnroll(cfg)
 	if firstRun {
+		if daemonRequireEnrolled {
+			return errors.New("host enrollment is missing or incomplete; run `pagnet enroll` explicitly before starting serve --require-enrolled")
+		}
 		if err := enrollHostForeground(root, account, "", nil, "", ""); err != nil {
 			return err
 		}
