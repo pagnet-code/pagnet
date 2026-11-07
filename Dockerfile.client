@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=v0.0.0-dev.0+source
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN sh scripts/version.sh --validate "$VERSION" >/dev/null \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+       -ldflags "-s -w -X main.version=$VERSION -X main.defaultServerURL=https://app.pagnet.dev" \
+       -o /out/pagnet ./cmd/pagnet
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates \
+    && addgroup -g 10001 pagnet \
+    && adduser -D -u 10001 -G pagnet -h /home/pagnet pagnet
+COPY --from=build /out/pagnet /usr/local/bin/pagnet
+ENV HOME=/home/pagnet
+WORKDIR /home/pagnet
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/pagnet"]
+CMD ["serve", "--non-interactive", "--no-auto-update"]

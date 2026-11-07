@@ -37,6 +37,9 @@ pagnet -d
 To remove the binary and local state again:
 `curl -fsSL https://app.pagnet.dev/uninstall.sh | bash`.
 
+For Kubernetes client deployments, see [the container deployment guide](docs/CONTAINER_DEPLOYMENT.md).
+For Claude Code, ChatGPT and Codex, see [the Pagnet plugin guide](docs/PLUGIN_INTEGRATIONS.md).
+
 ## Windows clients
 
 The remote CLI, Go SDK and external MCP bridge cross-compile for Windows.

@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pagnet-client.name" . }}
+  labels:
+    {{- include "pagnet-client.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pagnet-client.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pagnet-client.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: enroll
+          image: {{ if .Values.image.digest }}{{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}{{ else }}{{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}{{ end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              umask 077
+              mkdir -p "$HOME"
+              chmod 700 "$HOME"
+              state=/var/lib/pagnet/state
+              config="$state/accounts/default/config.yaml"
+              if [ -e "$config" ] || [ -L "$config" ]; then
+                if [ ! -f "$config" ] || [ ! -s "$config" ]; then
+                  echo 'Existing account config is invalid; refusing enrollment.' >&2
+                  exit 1
+                fi
+                exit 0
+              fi
+              mkdir -p "$state"
+              if [ -n "$(ls -A "$state")" ]; then
+                echo 'State exists without an account config; refusing enrollment.' >&2
+                exit 1
+              fi
+              if [ -z "${PAGNET_ENROLL_TOKEN:-}" ]; then
+                echo 'First enrollment requires the Secret key token.' >&2
+                exit 1
+              fi
+              exec pagnet enroll --non-interactive --state-dir "$state" --account default \
+                --server "$PAGNET_ENROLL_SERVER" --name "$PAGNET_ENROLL_NAME" \
+                --roots /workspace --roots-mode allow_list
+          env:
+            - name: HOME
+              value: /var/lib/pagnet/home
+            - name: PAGNET_ENROLL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "enrollment.existingSecret is required (Secret key: token)" .Values.enrollment.existingSecret | quote }}
+                  key: token
+                  optional: true
+            - name: PAGNET_ENROLL_SERVER
+              value: {{ required "enrollment.server is required" .Values.enrollment.server | quote }}
+            - name: PAGNET_ENROLL_NAME
+              value: {{ default .Release.Name .Values.enrollment.name | quote }}
+            - name: PAGNET_SCAN_WORKSPACES
+              value: "0"
+          securityContext:
+            {{- include "pagnet-client.securityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/pagnet
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: pagnet
+          image: {{ if .Values.image.digest }}{{ printf "%s@%s" .Values.image.repository .Values.image.digest | quote }}{{ else }}{{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}{{ end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["pagnet"]
+          args: ["serve", "--state-dir", "/var/lib/pagnet/state", "--account", "default", "--non-interactive", "--no-auto-update", "--require-enrolled"]
+          env:
+            - name: HOME
+              value: /var/lib/pagnet/home
+            - name: PAGNET_SCAN_WORKSPACES
+              value: "0"
+          securityContext:
+            {{- include "pagnet-client.securityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/pagnet
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ default (include "pagnet-client.name" .) .Values.persistence.existingClaim | quote }}
+        - name: workspace
+          {{- if .Values.workspace.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.workspace.existingClaim | quote }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}

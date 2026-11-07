@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pagnet-client
+description: Outbound-only Pagnet client daemon with persistent enrollment
+version: 0.1.0
+appVersion: latest
+type: application

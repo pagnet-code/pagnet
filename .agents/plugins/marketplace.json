@@ -1,0 +1,20 @@
+{
+  "name": "pagnet",
+  "interface": {
+    "displayName": "Pagnet"
+  },
+  "plugins": [
+    {
+      "name": "pagnet",
+      "source": {
+        "source": "local",
+        "path": "./plugins/pagnet"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

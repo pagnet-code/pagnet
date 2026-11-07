@@ -1,0 +1,24 @@
+image:
+  repository: ghcr.io/pagnet-code/pagnet
+  tag: latest
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# Required for the first enrollment. No token value is accepted by this chart.
+enrollment:
+  existingSecret: ""
+  server: https://app.pagnet.dev
+  # Defaults to the Helm release name.
+  name: ""
+
+persistence:
+  existingClaim: ""
+  size: 1Gi
+  # null uses the cluster's default StorageClass; "" disables dynamic provisioning.
+  storageClass: null
+
+# The workspace is ephemeral unless an existing PVC is selected.
+workspace:
+  existingClaim: ""
+
+resources: {}
