@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,7 +18,7 @@ type inboundFixture struct {
 	trusted               bool
 	sessionWorkspace      string
 	anonymous             bool
-	posts, streams, turns int
+	posts, streams, turns atomic.Int32
 	admissionStatus       int
 	admission             string
 	events                string
@@ -52,7 +53,7 @@ func newInboundFixture(t *testing.T) (*Qwen, *inboundFixture) {
 		case "GET /session/live/status":
 			json.NewEncoder(w).Encode(map[string]any{"sessionId": "live", "workspaceCwd": f.sessionWorkspace})
 		case "POST /session/live/prompt":
-			f.posts++
+			f.posts.Add(1)
 			var payload struct {
 				Prompt         []struct{ Type, Text string }
 				IdempotencyKey string
@@ -72,7 +73,7 @@ func newInboundFixture(t *testing.T) (*Qwen, *inboundFixture) {
 			w.WriteHeader(f.admissionStatus)
 			fmt.Fprint(w, f.admission)
 		case "GET /session/live/events":
-			f.streams++
+			f.streams.Add(1)
 			if r.Header.Get("Last-Event-ID") != f.wantCursor || r.Header.Get("X-Qwen-Event-Epoch") != "epoch" || r.Header.Get("Accept") != "text/event-stream" {
 				t.Error("event receipt cursor or epoch not preserved")
 			}
@@ -87,7 +88,7 @@ func newInboundFixture(t *testing.T) (*Qwen, *inboundFixture) {
 			}
 			fmt.Fprint(w, f.events)
 		case "GET /session/live/turns/live########1":
-			f.turns++
+			f.turns.Add(1)
 			json.NewEncoder(w).Encode(f.turn)
 		default:
 			t.Errorf("unexpected lifecycle operation: %s %s", r.Method, r.URL.Path)
@@ -118,7 +119,7 @@ func TestQwenInboundSSEUsesCallerContextAndFrameCursor(t *testing.T) {
 	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	result, err = q.Prompt(ctx, "ask-stable", "question")
-	if err == nil || !result.Accepted || !result.Uncertain || f.turns != 0 {
+	if err == nil || !result.Accepted || !result.Uncertain || f.turns.Load() != 0 {
 		t.Fatalf("context ignored: result=%+v err=%v", result, err)
 	}
 }
@@ -127,7 +128,7 @@ func TestQwenInboundSSERejectsMismatchedCursors(t *testing.T) {
 	q, f := newInboundFixture(t)
 	f.events = "id: 44\ndata: {\"v\":1,\"id\":43,\"type\":\"turn_complete\",\"data\":{\"promptId\":\"live########1\"}}\n\n"
 	result, err := q.Prompt(context.Background(), "ask-stable", "question")
-	if err == nil || !result.Uncertain || f.turns != 0 {
+	if err == nil || !result.Uncertain || f.turns.Load() != 0 {
 		t.Fatalf("cursor mismatch accepted: %+v %v", result, err)
 	}
 }
@@ -138,11 +139,11 @@ func TestQwenInboundAdmitReturnsReceiptBeforeObservation(t *testing.T) {
 	if err != nil || !result.Accepted || !result.Uncertain || result.PromptID != "live########1" || result.LastEventID != 42 || result.EventEpoch != "epoch" || result.ResultText != "" {
 		t.Fatalf("admission receipt=%+v err=%v", result, err)
 	}
-	if f.posts != 1 || f.streams != 0 || f.turns != 0 {
-		t.Fatalf("admission observed completion: posts=%d streams=%d turns=%d", f.posts, f.streams, f.turns)
+	if f.posts.Load() != 1 || f.streams.Load() != 0 || f.turns.Load() != 0 {
+		t.Fatalf("admission observed completion: posts=%d streams=%d turns=%d", f.posts.Load(), f.streams.Load(), f.turns.Load())
 	}
 	result, err = q.ResumePrompt(context.Background(), result)
-	if err != nil || result.Uncertain || result.ResultText != "native answer" || f.posts != 1 || f.streams != 1 || f.turns != 1 {
+	if err != nil || result.Uncertain || result.ResultText != "native answer" || f.posts.Load() != 1 || f.streams.Load() != 1 || f.turns.Load() != 1 {
 		t.Fatalf("receipt observation=%+v err=%v", result, err)
 	}
 }
@@ -153,8 +154,8 @@ func TestQwenInboundPromptCorrelatesFinalText(t *testing.T) {
 		"data: {\"v\":1,\"id\":44,\"type\":\"session_update\",\"data\":{\"text\":\"not a result\"}}\n\n" +
 		"data: {\"v\":1,\"id\":45,\"type\":\"turn_complete\",\"data\":{\"promptId\":\"live########1\"}}\n\n"
 	result, err := q.Prompt(context.Background(), "ask-stable", "question")
-	if err != nil || !result.Accepted || result.Uncertain || result.ResultText != "native answer" || result.LastEventID != 45 || f.posts != 1 || f.turns != 1 {
-		t.Fatalf("result=%+v err=%v counts=%d/%d", result, err, f.posts, f.turns)
+	if err != nil || !result.Accepted || result.Uncertain || result.ResultText != "native answer" || result.LastEventID != 45 || f.posts.Load() != 1 || f.turns.Load() != 1 {
+		t.Fatalf("result=%+v err=%v counts=%d/%d", result, err, f.posts.Load(), f.turns.Load())
 	}
 }
 
@@ -183,7 +184,7 @@ func TestQwenInboundPreflightAndValidationNeverPost(t *testing.T) {
 			case "long-text":
 				text = strings.Repeat("t", 65537)
 			}
-			if _, err := q.Prompt(context.Background(), id, text); err == nil || f.posts != 0 {
+			if _, err := q.Prompt(context.Background(), id, text); err == nil || f.posts.Load() != 0 {
 				t.Fatal("unsafe prompt was admitted")
 			}
 		})
@@ -209,8 +210,8 @@ func TestQwenInboundUncertainAdmissionNeverRetries(t *testing.T) {
 				f.admissionStatus = 200
 			}
 			result, err := q.Prompt(context.Background(), "ask-stable", "question")
-			if err == nil || f.posts != 1 || f.streams != 0 || result.Uncertain != (scenario != "not-202") {
-				t.Fatalf("result=%+v err=%v posts=%d", result, err, f.posts)
+			if err == nil || f.posts.Load() != 1 || f.streams.Load() != 0 || result.Uncertain != (scenario != "not-202") {
+				t.Fatalf("result=%+v err=%v posts=%d", result, err, f.posts.Load())
 			}
 		})
 	}
@@ -220,17 +221,17 @@ func TestQwenInboundResumeObservesWithoutPosting(t *testing.T) {
 	q, f := newInboundFixture(t)
 	f.events = "data: {\"v\":1,\"id\":43,\"type\":\"turn_complete\",\"data\":{\"promptId\":\"unrelated\"}}\n\n"
 	result, err := q.Prompt(context.Background(), "ask-stable", "question")
-	if err == nil || !result.Accepted || !result.Uncertain || result.PromptID != "live########1" || result.LastEventID != 43 || f.turns != 0 {
+	if err == nil || !result.Accepted || !result.Uncertain || result.PromptID != "live########1" || result.LastEventID != 43 || f.turns.Load() != 0 {
 		t.Fatalf("lost admission: %+v %v", result, err)
 	}
 	f.wantCursor = "43"
 	f.events = "data: {\"v\":1,\"id\":44,\"type\":\"turn_complete\",\"data\":{\"promptId\":\"live########1\"}}\n\n"
 	result, err = q.ResumePrompt(context.Background(), result)
-	if err != nil || result.Uncertain || result.ResultText != "native answer" || f.posts != 1 || f.turns != 1 {
+	if err != nil || result.Uncertain || result.ResultText != "native answer" || f.posts.Load() != 1 || f.turns.Load() != 1 {
 		t.Fatalf("resume=%+v err=%v", result, err)
 	}
 	f.trusted = false
-	if _, err = q.ResumePrompt(context.Background(), result); err == nil || f.streams != 2 {
+	if _, err = q.ResumePrompt(context.Background(), result); err == nil || f.streams.Load() != 2 {
 		t.Fatal("resume ignored revoked workspace trust")
 	}
 }
@@ -261,7 +262,7 @@ func TestQwenInboundResultBoundsAndCorrelation(t *testing.T) {
 			} else if err == nil || !result.Uncertain || result.ResultText != "" || result.LastEventID != 42 {
 				t.Fatalf("unsafe result: %+v err=%v", result, err)
 			}
-			if f.turns != 1 || f.posts != 1 {
+			if f.turns.Load() != 1 || f.posts.Load() != 1 {
 				t.Fatal("retried final result or prompt")
 			}
 		})
@@ -274,7 +275,7 @@ func TestQwenInboundTerminalErrorAndResync(t *testing.T) {
 			q, f := newInboundFixture(t)
 			f.events = fmt.Sprintf("data: {\"v\":1,\"type\":%q,\"data\":{\"promptId\":\"live########1\",\"message\":\"failed\"}}\n\n", event)
 			result, err := q.Prompt(context.Background(), "ask-stable", "question")
-			if err == nil || !result.Accepted || result.Uncertain != (event != "turn_error") || f.turns != 0 {
+			if err == nil || !result.Accepted || result.Uncertain != (event != "turn_error") || f.turns.Load() != 0 {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
 		})
