@@ -1,7 +1,7 @@
 {
   "name": "pagnet",
   "version": "0.1.0",
-  "description": "Discover and use agents and tools in a connected Pagnet network.",
+  "description": "Use connected Pagnet agents and tools, and manage owner-approved agent lifecycles.",
   "author": {
     "name": "Pagnet"
   },
