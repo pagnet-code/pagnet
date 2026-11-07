@@ -17,6 +17,12 @@ spec:
         {{- include "pagnet-client.labels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
