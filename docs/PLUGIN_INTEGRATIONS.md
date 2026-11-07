@@ -2,14 +2,31 @@
 
 The shared source package in [`plugins/pagnet`](../plugins/pagnet) connects clients to Pagnet's hosted OAuth MCP endpoint, `https://app.pagnet.dev/api/v1/mcp`. It bundles a shared skill and client-specific manifests. No account token, client secret, or connector setup credential belongs in these manifests.
 
-## Prepare the connector
+## Prepare the messaging and capability connector
 
 1. The network owner opens [Pagnet Integrations](https://app.pagnet.dev/integrations) and creates a connector for one network, selecting the allowed agents, capabilities, messaging targets, and event patterns.
 2. Link the intended client through the connector's OAuth authorization flow.
 3. Run the one-time `pagnet mcp connect` command provided by Integrations on the owner's device. Keep this bridge running so it can serve network requests with keys held locally. For an already configured connector, restart with `pagnet mcp connect --connector <connector-uuid>`.
 4. Install and enable the plugin in the client. Finish its OAuth authorization prompt if needed and verify tool availability.
 
-Installing or enabling the plugin does not start the device bridge. OAuth authorization and the local bridge are both required for network operations. The available MCP surface covers discovery/search, events, agent questions, approved invocations, and identity/request status. Availability depends on connector policy. Network creation, agent enrollment, permission grants, and other administrative actions remain in Pagnet; this plugin does not expose management tools.
+Installing or enabling the plugin does not start the device bridge. OAuth authorization and the local bridge are both required for messaging, capability, and event operations. These connectors remain limited to one network. Their MCP surface covers discovery/search, events, agent questions, approved invocations, and identity/request status, subject to connector policy.
+
+## Authorize owner-delegated management
+
+Management has separate consent in [Pagnet Integrations](https://app.pagnet.dev/integrations). The owner selects exact network/host/managed-agent tuples across one or more networks, chooses the allowed `read`, `launch`, and/or `stop` actions, and sets an expiry. The owner can revoke the grant there. The grant belongs to the provider, not an exact OAuth client; it must not be presented as isolation between clients of that provider. Messaging connector permissions do not authorize management.
+
+The management tools use the same hosted OAuth MCP endpoint and existing `discover` and `invoke` scopes. They do not require the local device bridge. Authorization happens in the browser; the assistant never needs the owner's account credentials.
+
+| Tool | Purpose |
+| --- | --- |
+| `pagnet_management_targets` | Discover the exact targets authorized by management consent. |
+| `pagnet_management_status` | Inspect an authorized target's state. |
+| `pagnet_management_launch` | Request launch of an authorized managed agent. |
+| `pagnet_management_stop` | Request stop of an authorized managed agent. |
+
+Launch and stop accept a `requestId`. Reuse the same request ID with the same target, action, and input when retrying. Their response means the request was accepted; it does not establish that the agent is running or stopped. Check `pagnet_management_status` before reporting the resulting state. Expired or revoked grants no longer authorize actions.
+
+These tools provide only the selected lifecycle actions. Network creation, agent enrollment, permission grants, and broad administrative operations remain in Pagnet.
 
 ## Claude Code
 
@@ -50,8 +67,10 @@ From the repository root:
 claude plugin validate ./plugins/pagnet
 claude plugin validate .
 python3 -m json.tool plugins/pagnet/plugin.json > /dev/null
+python3 -m json.tool plugins/pagnet/.claude-plugin/plugin.json > /dev/null
+python3 -m json.tool plugins/pagnet/.mcp.json > /dev/null
 python3 -m json.tool plugins/pagnet/mcp.json > /dev/null
 python3 -m json.tool .agents/plugins/marketplace.json > /dev/null
 ```
 
-The portable OAuth declaration follows the OpenAI packaging guide. Validation of JSON syntax or manifests does not establish a live OAuth connection: end-to-end verification requires an owner's authorized connector and running device bridge. Check client diagnostics during installation and confirm discovery/status before using network operations.
+The portable OAuth declaration follows the OpenAI packaging guide. Validation of JSON syntax or manifests does not establish a live OAuth connection: end-to-end verification of messaging and capabilities requires an owner's authorized connector and running device bridge. Management verification requires separate, unexpired management consent for the selected targets and actions, with no device bridge required. Check client diagnostics during installation and confirm the applicable discovery/status tools before acting.
