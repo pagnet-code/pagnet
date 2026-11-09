@@ -3,10 +3,12 @@ package sdk
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,7 +19,10 @@ import (
 var (
 	ErrManagedBrowserStandbyUnsupported  = errors.New("sdk: managed browser standby unsupported")
 	ErrManagedBrowserStandbyUnauthorized = errors.New("sdk: managed browser standby unauthorized")
-	errManagedBrowserStandby             = errors.New("sdk: managed browser standby failed")
+	// ErrManagedBrowserStandbyTransport identifies an interrupted single attempt.
+	// It contains no remote address, credential, or protocol material.
+	ErrManagedBrowserStandbyTransport = errors.New("sdk: managed browser standby transport interrupted")
+	errManagedBrowserStandby          = errors.New("sdk: managed browser standby failed")
 )
 
 // ManagedBrowserStandbyConfig contains one immutable, locally authorized assignment.
@@ -35,6 +40,22 @@ type ManagedBrowserStandbyConfig struct {
 // or failure. It never registers handlers, authorizes execution, or reconnects.
 func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandbyConfig) error {
 	started := time.Now()
+	authority := config.AuthorityDeadline
+	fail := func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return errManagedBrowserStandby
+	}
+	transportFailure := func(err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if authority.After(time.Now()) && managedStandbyTransportError(err) {
+			return ErrManagedBrowserStandbyTransport
+		}
+		return errManagedBrowserStandby
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -94,8 +115,9 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 			case http.StatusUnauthorized:
 				return ErrManagedBrowserStandbyUnauthorized
 			}
+			return errManagedBrowserStandby
 		}
-		return errManagedBrowserStandby
+		return transportFailure(err)
 	}
 	conn.SetReadLimit(transport.MaxManagedBrowserStandbyFrameBytes)
 	stopped := make(chan struct{})
@@ -109,16 +131,10 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 		}
 	}()
 	defer func() { close(stopped); conn.Close(); <-watcherDone }()
-	fail := func() error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return errManagedBrowserStandby
-	}
 	read := func() (transport.ManagedBrowserStandbyFrame, error) {
 		kind, raw, err := conn.ReadMessage()
 		if err != nil {
-			return nil, errManagedBrowserStandby
+			return nil, err
 		}
 		return transport.DecodeManagedBrowserStandbyFrame(kind, raw)
 	}
@@ -127,15 +143,18 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 		if err != nil {
 			return errManagedBrowserStandby
 		}
-		if conn.SetWriteDeadline(deadline) != nil {
-			return errManagedBrowserStandby
+		if err := conn.SetWriteDeadline(deadline); err != nil {
+			return transportFailure(err)
 		}
-		return conn.WriteMessage(websocket.TextMessage, raw)
+		if err := conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+			return transportFailure(err)
+		}
+		return nil
 	}
 	conn.SetReadDeadline(handshakeDeadline)
 	frame, err := read()
 	if err != nil {
-		return fail()
+		return transportFailure(err)
 	}
 	challenge, ok := frame.(*transport.ManagedBrowserStandbyChallenge)
 	if !ok || challenge.Tuple != config.ExpectedTuple {
@@ -148,19 +167,18 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 	session := challenge.ManagedBrowserStandbySession
 	session.Type = "ack"
 	operationStarted := time.Now()
-	if write(transport.ManagedBrowserStandbyAck{ManagedBrowserStandbySession: session, Nonce: challenge.Nonce}, handshakeDeadline) != nil {
-		return fail()
+	if err := write(transport.ManagedBrowserStandbyAck{ManagedBrowserStandbySession: session, Nonce: challenge.Nonce}, handshakeDeadline); err != nil {
+		return err
 	}
 	conn.SetReadDeadline(handshakeDeadline)
 	frame, err = read()
 	if err != nil {
-		return fail()
+		return transportFailure(err)
 	}
 	standby, ok := frame.(*transport.ManagedBrowserStandby)
 	if !ok || standby.SessionID != session.SessionID || standby.SessionGeneration != session.SessionGeneration || !handshakeDeadline.After(time.Now()) {
 		return fail()
 	}
-	authority := config.AuthorityDeadline
 	freshness := func(lease, credential string, validFor int64, start time.Time) time.Time {
 		now := time.Now()
 		for _, raw := range []string{lease, credential} {
@@ -178,6 +196,7 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 	conn.SetReadDeadline(time.Time{})
 	type observation struct {
 		frame      transport.ManagedBrowserStandbyFrame
+		err        error
 		receivedAt time.Time
 	}
 	frames := make(chan observation)
@@ -188,7 +207,7 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 		for {
 			f, e := read()
 			select {
-			case frames <- observation{frame: f, receivedAt: time.Now()}:
+			case frames <- observation{frame: f, err: e, receivedAt: time.Now()}:
 			case <-readerStop:
 				return
 			}
@@ -209,9 +228,21 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-expiry.C:
+			if pending && authority.After(time.Now()) {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return ErrManagedBrowserStandbyTransport
+			}
 			return fail()
 		case <-ticker.C:
 			if !deadline.After(time.Now()) {
+				if pending && authority.After(time.Now()) {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					return ErrManagedBrowserStandbyTransport
+				}
 				return fail()
 			}
 			if pending {
@@ -220,11 +251,14 @@ func ServeManagedBrowserStandby(ctx context.Context, config ManagedBrowserStandb
 			sequence++
 			session.Type = "heartbeat"
 			operationStarted = time.Now()
-			if write(transport.ManagedBrowserStandbyHeartbeat{ManagedBrowserStandbySession: session, Sequence: sequence}, deadline) != nil {
-				return fail()
+			if err := write(transport.ManagedBrowserStandbyHeartbeat{ManagedBrowserStandbySession: session, Sequence: sequence}, deadline); err != nil {
+				return err
 			}
 			pending = true
 		case f := <-frames:
+			if f.err != nil {
+				return transportFailure(f.err)
+			}
 			ack, ok := f.frame.(*transport.ManagedBrowserStandbyHeartbeatAck)
 			if !ok || !pending || f.receivedAt.Before(operationStarted) || ack.SessionID != session.SessionID || ack.SessionGeneration != session.SessionGeneration || ack.Sequence != sequence || !deadline.After(time.Now()) {
 				return fail()
@@ -250,4 +284,26 @@ func standbyEarlier(a, b time.Time) time.Time {
 		return b
 	}
 	return a
+}
+
+// Only recognized transport failures qualify; TLS, HTTP, frame decoding, and
+// protocol errors remain terminal. Callers sanitize the result at each IO site.
+func managedStandbyTransportError(err error) bool {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code == websocket.CloseAbnormalClosure
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return true
+	}
+	for _, interruption := range []error{syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ECONNREFUSED, syscall.EPIPE, syscall.ENETDOWN, syscall.ENETUNREACH, syscall.EHOSTUNREACH, syscall.ETIMEDOUT} {
+		if errors.Is(err, interruption) {
+			return true
+		}
+	}
+	return false
 }
