@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/transport"
@@ -56,6 +57,7 @@ type browserAssignmentController struct {
 type browserAssignmentSupervisor struct {
 	daemon      *Daemon
 	fetch       func(context.Context) (browserAssignmentsSnapshot, error)
+	runBinding  func(context.Context, browserAssignment)
 	wake        chan struct{}
 	retryDelay  func(int) time.Duration
 	mu          sync.Mutex
@@ -71,6 +73,7 @@ type browserAssignmentSupervisor struct {
 
 func newBrowserAssignmentSupervisor(d *Daemon) *browserAssignmentSupervisor {
 	s := &browserAssignmentSupervisor{retryDelay: browserAssignmentRetryDelay, daemon: d, wake: make(chan struct{}, 1), running: map[string]*browserAssignmentController{}}
+	s.runBinding = newBrowserBindingRunner(d, uuid.NewString())
 	client := netpolicy.NewHTTPClient(15*time.Second, d.InsecureRemoteHTTP)
 	s.fetch = func(ctx context.Context) (browserAssignmentsSnapshot, error) {
 		var snapshot browserAssignmentsSnapshot
@@ -158,41 +161,71 @@ func validateBrowserAssignments(snapshot browserAssignmentsSnapshot, hostID stri
 		if _, err := domain.ParseID(a.ID); err != nil {
 			return errors.New("invalid browser assignment ID")
 		}
-		if seen[a.ID] || a.HostID != hostID || a.RuntimeMode != "managed" || a.DesiredRevision < 0 {
+		if seen[a.ID] || a.HostID != hostID || a.RuntimeMode != "managed" || a.DesiredRevision < 1 {
 			return errors.New("invalid browser assignment")
 		}
 		seen[a.ID] = true
+		networks := map[string]bool{}
 		for _, n := range a.Networks {
-			if _, err := domain.ParseID(n.NetworkID); err != nil {
+			if _, err := domain.ParseID(n.NetworkID); err != nil || networks[n.NetworkID] {
 				return errors.New("invalid browser assignment network")
 			}
+			networks[n.NetworkID] = true
 		}
 	}
 	return nil
 }
 
-// Children currently wait only for cancellation, so joining under mu is safe.
-// Runtime children must be detached under mu and joined outside it before they
-// gain callbacks into this supervisor.
-func (s *browserAssignmentSupervisor) stopAll() {
+// Detach under mu, then join without holding it: cancellation and socket
+// revisions remain responsive while a child releases its remote lease.
+func (s *browserAssignmentSupervisor) detachAllLocked() []*browserAssignmentController {
+	stopped := make([]*browserAssignmentController, 0, len(s.running))
 	for id, c := range s.running {
 		c.cancel()
-		<-c.done
+		stopped = append(stopped, c)
 		delete(s.running, id)
 	}
+	return stopped
 }
-func (s *browserAssignmentSupervisor) reconcile(ctx context.Context, snapshot browserAssignmentsSnapshot) {
+func joinBrowserAssignmentControllers(stopped []*browserAssignmentController) {
+	for _, c := range stopped {
+		<-c.done
+	}
+}
+func (s *browserAssignmentSupervisor) stopAll() {
+	s.mu.Lock()
+	stopped := s.detachAllLocked()
+	s.mu.Unlock()
+	joinBrowserAssignmentControllers(stopped)
+}
+
+// reconcileLocked returns with mu held, including while abandoning a snapshot
+// superseded by a socket reconnect during the child join.
+func (s *browserAssignmentSupervisor) reconcileLocked(ctx context.Context, snapshot browserAssignmentsSnapshot, generation uint64) bool {
 	desired := map[string]browserAssignment{}
 	for _, a := range snapshot.Items {
 		desired[a.ID] = a
 	}
+	var stopped []*browserAssignmentController
 	for id, c := range s.running {
 		a, exists := desired[id]
-		if !exists || !reflect.DeepEqual(a, c.assignment) {
+		finished := false
+		select {
+		case <-c.done:
+			finished = true
+		default:
+		}
+		if !exists || finished || !reflect.DeepEqual(a, c.assignment) {
 			c.cancel()
-			<-c.done
+			stopped = append(stopped, c)
 			delete(s.running, id)
 		}
+	}
+	s.mu.Unlock()
+	joinBrowserAssignmentControllers(stopped)
+	s.mu.Lock()
+	if !s.connected || s.generation != generation || ctx.Err() != nil || snapshot.Revision < s.wanted {
+		return false
 	}
 	for id, a := range desired {
 		if s.running[id] != nil {
@@ -201,10 +234,9 @@ func (s *browserAssignmentSupervisor) reconcile(ctx context.Context, snapshot br
 		child, cancel := context.WithCancel(ctx)
 		c := &browserAssignmentController{assignment: a, cancel: cancel, done: make(chan struct{})}
 		s.running[id] = c
-		// Phase one owns lifecycle only. Credential issuance and SDK activation are
-		// deliberately deferred until the managed browser runtime is implemented.
-		go func() { defer close(c.done); <-child.Done() }()
+		go func() { defer close(c.done); s.runBinding(child, c.assignment) }()
 	}
+	return true
 }
 func browserAssignmentRetryDelay(attempt int) time.Duration {
 	delay := time.Second << min(attempt-1, 5)
@@ -244,12 +276,20 @@ func (s *browserAssignmentSupervisor) run(ctx context.Context) {
 			if controllerGeneration != s.generation {
 				stopRetry()
 				failures = 0
-				s.stopAll()
+				stopped := s.detachAllLocked()
 				controllerGeneration = s.generation
+				s.mu.Unlock()
+				joinBrowserAssignmentControllers(stopped)
+				s.mu.Lock()
+				if controllerGeneration != s.generation {
+					s.mu.Unlock()
+					continue
+				}
 			}
 			if !s.connected {
-				s.stopAll()
+				stopped := s.detachAllLocked()
 				s.mu.Unlock()
+				joinBrowserAssignmentControllers(stopped)
 				break
 			}
 			if !s.dirty {
@@ -277,7 +317,10 @@ func (s *browserAssignmentSupervisor) run(ctx context.Context) {
 				err = errors.New("stale browser assignments response")
 			}
 			if err == nil && ctx.Err() == nil {
-				s.reconcile(ctx, snapshot)
+				if !s.reconcileLocked(ctx, snapshot, generation) {
+					s.mu.Unlock()
+					continue
+				}
 				s.applied = snapshot.Revision
 				s.wanted = snapshot.Revision
 				// A notice received during the fetch is covered only because the
