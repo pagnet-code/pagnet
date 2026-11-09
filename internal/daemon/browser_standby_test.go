@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -144,8 +145,18 @@ func TestBrowserStandbyCanceledRecoveryBackoff(t *testing.T) {
 	f.c.serve = func(context.Context, sdk.ManagedBrowserStandbyConfig) error {
 		return sdk.ErrManagedBrowserStandbyTransport
 	}
-	f.c.wait = func(context.Context, time.Duration) bool { f.cancel(); return false }
+	waited := false
+	f.hook = func(r *http.Request) (*http.Response, bool) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/runtime-lease") && f.c.lease.Active {
+			return browserBindingResponse(200, f.c.lease), true
+		}
+		return nil, false
+	}
+	f.c.wait = func(context.Context, time.Duration) bool { waited = true; f.cancel(); return false }
 	f.run()
+	if !waited {
+		t.Fatal("recovery never reached cancellable backoff")
+	}
 	if f.rotations[f.bindings[0].ID] != 1 {
 		t.Fatal("issued replacement after cancellation")
 	}
@@ -290,5 +301,42 @@ func TestBrowserStandbyAmbiguousIssuanceExhaustsRecoveryBudget(t *testing.T) {
 	f.run()
 	if attempts != 3 || children.Load() != 1 || f.generations[f.bindings[0].ID] != 4 || f.acks != 1 {
 		t.Fatalf("ambiguous issuance budget: attempts=%d children=%d generation=%d acks=%d", attempts, children.Load(), f.generations[f.bindings[0].ID], f.acks)
+	}
+}
+
+func TestBrowserStandbyTerminalDuringStatusPreventsRotation(t *testing.T) {
+	for _, result := range []error{sdk.ErrManagedBrowserStandbyUnauthorized, errors.New("protocol or TLS failure")} {
+		t.Run(result.Error(), func(t *testing.T) {
+			f := newBrowserBindingFixture(t, 1)
+			f.c.renewInterval = time.Millisecond
+			fail := make(chan struct{})
+			f.c.serve = func(ctx context.Context, _ sdk.ManagedBrowserStandbyConfig) error {
+				select {
+				case <-fail:
+					return result
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			observed := false
+			f.hook = func(r *http.Request) (*http.Response, bool) {
+				if strings.HasSuffix(r.URL.Path, "/runtime-status") {
+					observed = true
+					close(fail)
+					<-f.c.slots[f.bindings[0].NetworkID].done
+					status := f.status(f.bindings[0])
+					status.CredentialRefreshRequired = true
+					return browserBindingResponse(200, map[string]any{"connectionId": f.a.ID, "desiredRevision": 3, "bindings": []browserBindingStatus{status}}), true
+				}
+				return nil, false
+			}
+			f.run()
+			if !observed || f.rotations[f.bindings[0].ID] != 1 || f.acks != 1 {
+				t.Fatal("terminal result during status fetch allowed replacement issuance")
+			}
+			if !f.released || len(f.c.slots) != 0 {
+				t.Fatal("terminal result cleanup incomplete")
+			}
+		})
 	}
 }

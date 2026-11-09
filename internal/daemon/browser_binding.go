@@ -436,6 +436,21 @@ func (c *browserBindingController) refreshStatus(ctx context.Context, a browserA
 			delete(byID, status.BindingID)
 			if status.CredentialRefreshRequired {
 				if slot := c.slots[b.NetworkID]; slot != nil {
+					if slot.cancel != nil {
+						slot.cancel()
+						<-slot.done
+						slot.cancel = nil
+						result := <-slot.result
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						if !errors.Is(result, context.Canceled) {
+							// A failure racing status fetch must retain its own
+							// recovery policy. Discard this now-stale status.
+							slot.result <- result
+							return c.finishStandbys(ctx, a, base)
+						}
+					}
 					slot.wipe()
 					delete(c.slots, b.NetworkID)
 				}
@@ -680,7 +695,9 @@ func (c *browserBindingController) finishStandbys(ctx context.Context, a browser
 			continue
 		}
 		// Join before revalidation, issuance, replacement, or release.
-		slot.cancel()
+		if slot.cancel != nil {
+			slot.cancel()
+		}
 		<-slot.done
 		// The completed credential no longer constrains fresh authority.
 		clear(slot.secret)
