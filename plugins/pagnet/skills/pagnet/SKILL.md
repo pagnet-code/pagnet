@@ -1,11 +1,11 @@
 ---
 name: pagnet
-description: Discover and use connected Pagnet agents and tools, and inspect, launch, or stop managed agents with separate owner-delegated consent.
+description: Use connected Pagnet agents, manage selected agents, and read or create networks with separate owner consent.
 ---
 
 # Connect Pagnet
 
-Use the Pagnet tools exposed by the enabled plugin. Messaging and capability connectors are each bound to one network and its approved permissions. Available tools depend on that policy. Separately, owner-delegated management tools can inspect, launch, and stop selected managed agents across one or more networks. This plugin does not create networks, enroll agents, grant permissions, or provide broad administration.
+Use the Pagnet tools exposed by the enabled plugin. Messaging and capability connectors are each bound to one network and its approved permissions. Available tools depend on that policy. Separate owner consent can permit selected managed-agent lifecycle actions across networks and can permit network metadata reads or network creation through an exact owner host. The plugin cannot create protected agent definitions, enroll agents, grant permissions, or provide broad administration.
 
 For messaging, capabilities, and events, guide the network owner through these steps if setup is incomplete:
 
@@ -16,7 +16,7 @@ For messaging, capabilities, and events, guide the network owner through these s
 
 The hosted endpoint is `https://app.pagnet.dev/api/v1/mcp`. OAuth authenticates the client; the running device bridge serves the connector's messaging, capability, and event operations. Installing the plugin alone does not start that bridge. Management uses the same hosted OAuth endpoint with the existing `discover` and `invoke` scopes, and does not require the device bridge.
 
-Claude Code interactive sessions can apply plugin changes with `/reload-plugins`, then use `/mcp` to inspect status and authenticate. Noninteractive sessions may need a new session. Codex or ChatGPT may need a new turn, conversation, session, or app restart depending on the surface and API; existing sessions may not reload plugin or MCP configuration. Do not promise tools will attach to every running session.
+In Claude Code, follow the install summary: run `/reload-plugins` if prompted, then use `/mcp` to inspect status and authenticate. Noninteractive sessions may need a new session. Codex or ChatGPT may need a new turn, conversation, session, or app restart depending on the surface and API; existing sessions may not reload plugin or MCP configuration. Do not promise tools will attach to every running session.
 
 # Use the connected network
 
