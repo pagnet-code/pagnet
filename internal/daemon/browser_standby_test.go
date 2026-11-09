@@ -340,3 +340,58 @@ func TestBrowserStandbyTerminalDuringStatusPreventsRotation(t *testing.T) {
 		})
 	}
 }
+
+func TestBrowserStandbyTerminalPreventsReacquire(t *testing.T) {
+	for _, trigger := range []string{"renew_conflict", "deadline"} {
+		for _, result := range []error{sdk.ErrManagedBrowserStandbyUnauthorized, errors.New("protocol or TLS failure")} {
+			t.Run(trigger+"/"+result.Error(), func(t *testing.T) {
+				f := newBrowserBindingFixture(t, 1)
+				f.c.renewInterval = time.Millisecond
+				fail := make(chan struct{})
+				var expired atomic.Bool
+				initialNow := f.now
+				f.c.now = func() time.Time {
+					if expired.Load() {
+						return initialNow.Add(time.Minute)
+					}
+					return initialNow
+				}
+				f.c.serve = func(ctx context.Context, _ sdk.ManagedBrowserStandbyConfig) error {
+					if trigger == "deadline" {
+						expired.Store(true)
+						return result
+					}
+					select {
+					case <-fail:
+						return result
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				claims, conflicts := 0, 0
+				f.hook = func(r *http.Request) (*http.Response, bool) {
+					if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/runtime-lease") {
+						claims++
+					}
+					if strings.HasSuffix(r.URL.Path, "/runtime-lease/renew") {
+						conflicts++
+						close(fail)
+						<-f.c.slots[f.bindings[0].NetworkID].done
+						return browserBindingResponse(http.StatusConflict, nil), true
+					}
+					return nil, false
+				}
+				f.run()
+				if claims != 1 || f.rotations[f.bindings[0].ID] != 1 || f.acks != 1 {
+					t.Fatalf("terminal failure allowed reacquisition: claims=%d issuances=%d acks=%d", claims, f.rotations[f.bindings[0].ID], f.acks)
+				}
+				if trigger == "renew_conflict" && conflicts != 1 {
+					t.Fatal("renewal conflict was not exercised")
+				}
+				if !f.released || len(f.c.slots) != 0 {
+					t.Fatal("terminal reacquisition cleanup incomplete")
+				}
+			})
+		}
+	}
+}

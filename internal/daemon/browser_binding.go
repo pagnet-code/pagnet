@@ -509,6 +509,16 @@ func (c *browserBindingController) runAttempt(ctx context.Context, a browserAssi
 	defer func() {
 		for _, slot := range c.slots {
 			slot.wipe()
+			// A deliberate stop reports context cancellation or expiry. A
+			// queued terminal failure must veto reacquisition even when the
+			// lease request or local cutoff independently requested a retry.
+			select {
+			case result := <-slot.result:
+				if c.reacquire && !errors.Is(result, context.Canceled) && !errors.Is(result, context.DeadlineExceeded) && !errors.Is(result, sdk.ErrManagedBrowserStandbyTransport) {
+					c.reacquire = false
+				}
+			default:
+			}
 		}
 		// Cleanup cannot inherit a canceled assignment or an expired lease deadline.
 		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
