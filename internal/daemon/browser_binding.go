@@ -106,6 +106,7 @@ type browserBindingController struct {
 	standbyUntil                      time.Time
 	recoveries                        map[string]int
 	recoveryUntil                     map[string]time.Time
+	recoveryNetwork                   string
 	slots                             map[string]*browserBindingSlot
 }
 
@@ -320,6 +321,21 @@ func (c *browserBindingController) validStatus(s browserBindingStatus, b browser
 }
 func (c *browserBindingController) rotate(ctx context.Context, a browserAssignment, base string, b browserBindingMetadata) error {
 	for {
+		if network := c.recoveryNetwork; network != "" {
+			attempt := c.recoveries[network]
+			if attempt >= 3 {
+				return errBrowserBinding
+			}
+			until := c.recoveryUntil[network]
+			delay := time.Second << attempt
+			delay += time.Duration(rand.Float64() * float64(delay/4))
+			if delay >= until.Sub(c.now()) || !c.wait(ctx, delay) || !c.now().Before(until) {
+				return errBrowserBinding
+			}
+			// Even an ambiguous issuance consumes one replacement attempt.
+			c.recoveries[network]++
+		}
+
 		req := struct {
 			browserBindingTuple
 			ExpectedCredentialGeneration int64 `json:"expectedCredentialGeneration"`
@@ -683,13 +699,6 @@ func (c *browserBindingController) finishStandbys(ctx context.Context, a browser
 			until = minBrowserBindingTime(c.now().Add(15*time.Second), c.localDeadline())
 			c.recoveryUntil[network] = until
 		}
-		delay := time.Second << c.recoveries[network]
-		delay += time.Duration(rand.Float64() * float64(delay/4))
-		c.recoveries[network]++
-		if delay >= until.Sub(c.now()) || !c.wait(ctx, delay) || !c.now().Before(until) {
-			c.reacquire = false
-			return errBrowserBinding
-		}
 		recoveryCtx, cancel := context.WithDeadline(ctx, until)
 		var lease browserBindingLease
 		err := c.request(recoveryCtx, http.MethodGet, base+"/runtime-lease", nil, &lease)
@@ -709,7 +718,9 @@ func (c *browserBindingController) finishStandbys(ctx context.Context, a browser
 						err = errBrowserBinding
 						break
 					}
+					c.recoveryNetwork = network
 					err = c.rotate(recoveryCtx, a, base, b)
+					c.recoveryNetwork = ""
 					break
 				}
 			}

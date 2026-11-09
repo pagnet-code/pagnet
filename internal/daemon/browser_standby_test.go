@@ -267,3 +267,28 @@ func TestBrowserStandbyRecoveryUsesFreshCredentialDeadline(t *testing.T) {
 		t.Fatal("fresh credential did not use current conservative lease authority")
 	}
 }
+
+func TestBrowserStandbyAmbiguousIssuanceExhaustsRecoveryBudget(t *testing.T) {
+	f := newBrowserBindingFixture(t, 1)
+	var children atomic.Int32
+	f.c.serve = func(context.Context, sdk.ManagedBrowserStandbyConfig) error {
+		children.Add(1)
+		return sdk.ErrManagedBrowserStandbyTransport
+	}
+	attempts := 0
+	f.hook = func(r *http.Request) (*http.Response, bool) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/runtime-lease") && f.c.lease.Active {
+			return browserBindingResponse(200, f.c.lease), true
+		}
+		if strings.HasSuffix(r.URL.Path, "/endpoint-credential") && f.generations[f.bindings[0].ID] > 0 {
+			attempts++
+			f.generations[f.bindings[0].ID]++
+			return browserBindingResponse(503, nil), true
+		}
+		return nil, false
+	}
+	f.run()
+	if attempts != 3 || children.Load() != 1 || f.generations[f.bindings[0].ID] != 4 || f.acks != 1 {
+		t.Fatalf("ambiguous issuance budget: attempts=%d children=%d generation=%d acks=%d", attempts, children.Load(), f.generations[f.bindings[0].ID], f.acks)
+	}
+}
