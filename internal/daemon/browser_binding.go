@@ -666,6 +666,9 @@ func (c *browserBindingController) finishStandbys(ctx context.Context, a browser
 		// Join before revalidation, issuance, replacement, or release.
 		slot.cancel()
 		<-slot.done
+		// The completed credential no longer constrains fresh authority.
+		clear(slot.secret)
+		slot.secret = nil
 		slot.cancel = nil
 		if !errors.Is(result, sdk.ErrManagedBrowserStandbyTransport) {
 			c.reacquire = false

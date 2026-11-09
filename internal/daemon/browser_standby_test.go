@@ -234,3 +234,36 @@ func TestBrowserStandbyDeadlineRollover(t *testing.T) {
 		t.Fatalf("rollover claims/acks: %d/%d", claims, f.acks)
 	}
 }
+
+func TestBrowserStandbyRecoveryUsesFreshCredentialDeadline(t *testing.T) {
+	f := newBrowserBindingFixture(t, 1)
+	initialLeaseCutoff := f.now.Add(30*time.Second - 5*time.Millisecond)
+	configs := make(chan sdk.ManagedBrowserStandbyConfig, 2)
+	var attempts atomic.Int32
+	f.c.serve = func(_ context.Context, config sdk.ManagedBrowserStandbyConfig) error {
+		configs <- config
+		if attempts.Add(1) == 1 {
+			return sdk.ErrManagedBrowserStandbyTransport
+		}
+		return sdk.ErrManagedBrowserStandbyUnauthorized
+	}
+	f.hook = func(r *http.Request) (*http.Response, bool) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/runtime-lease") && f.c.lease.Active {
+			return browserBindingResponse(200, f.c.lease), true
+		}
+		if strings.HasSuffix(r.URL.Path, "/endpoint-credential") && f.generations[f.bindings[0].ID] == 0 {
+			f.generations[f.bindings[0].ID] = 1
+			f.rotations[f.bindings[0].ID] = 1
+			return browserBindingResponse(200, map[string]any{"credentialId": stringIDForStandby(), "credentialGeneration": 1, "credential": "private-test-value", "expiresAt": f.now.Add(500 * time.Millisecond)}), true
+		}
+		return nil, false
+	}
+	f.run()
+	if len(configs) != 2 {
+		t.Fatal("old credential expiry prevented fresh-authority recovery")
+	}
+	old, next := <-configs, <-configs
+	if !next.AuthorityDeadline.After(old.AuthorityDeadline) || !next.AuthorityDeadline.Equal(initialLeaseCutoff) {
+		t.Fatal("fresh credential did not use current conservative lease authority")
+	}
+}
