@@ -186,6 +186,7 @@ type Daemon struct {
 
 	textServices             *textServiceSupervisor
 	sharingBridges           *sharingBridgeSupervisor
+	browserAssignments       *browserAssignmentSupervisor
 	ownerMailboxMu           sync.Mutex
 	ownerMailboxUsed         map[string]time.Time
 	ownerTextConsoleMu       sync.Mutex
@@ -969,6 +970,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	bridgeDone := make(chan struct{})
 	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
 	defer func() { bridgeCancel(); <-bridgeDone }()
+	d.browserAssignments = newBrowserAssignmentSupervisor(d)
+	browserDone := make(chan struct{})
+	go func() { defer close(browserDone); d.browserAssignments.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-browserDone }()
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
 	// fail cleanly (not hang) while the host connection is down.
@@ -1170,6 +1175,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	if d.sharingBridges != nil {
 		defer d.sharingBridges.disconnect()
 	}
+	if d.browserAssignments != nil {
+		d.browserAssignments.admit(d.HostID)
+		defer d.browserAssignments.disconnect()
+	}
 	d.connMu.Lock()
 	d.curConn = conn
 	d.nativeConn = nativeConn
@@ -1333,6 +1342,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			fmt.Fprintln(os.Stderr,
 				"pagnet: this host was unenrolled from the control plane — the daemon is stopping")
 			return connectedAt, ErrUnenrolled
+		}
+		if env.Type == transport.MsgBrowserConnectionsRevision {
+			var notice transport.BrowserConnectionsRevisionPayload
+			if d.browserAssignments != nil && json.Unmarshal(env.Payload, &notice) == nil {
+				d.browserAssignments.notice(notice)
+			}
+			continue
 		}
 		if handled, err := nativeConn.HandleEnvelope(env); handled {
 			if err != nil {
