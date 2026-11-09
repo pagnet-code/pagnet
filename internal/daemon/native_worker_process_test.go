@@ -203,11 +203,23 @@ func TestNativeWorkerReadinessHelperProcess(t *testing.T) {
 		_, _ = os.Stderr.WriteString("private fixture must never appear in diagnostics")
 		os.Exit(23)
 	}
-	delay := 5250 * time.Millisecond
 	if args[0] == "cancel" {
-		delay = 400 * time.Millisecond
+		if err := os.WriteFile(filepath.Join(args[3], "helper-started"), nil, 0600); err != nil {
+			os.Exit(29)
+		}
+		for {
+			if _, err := os.Stat(filepath.Join(args[3], "helper-stop")); err == nil {
+				_ = os.WriteFile(filepath.Join(args[3], "helper-exited"), nil, 0600)
+				os.Exit(0)
+			}
+			if _, err := os.Stat(filepath.Join(args[3], "helper-release")); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	} else {
+		time.Sleep(5250 * time.Millisecond)
 	}
-	time.Sleep(delay)
 	path, err := sessionworker.SocketPath(args[3])
 	if err != nil {
 		os.Exit(26)
@@ -322,10 +334,35 @@ func TestNativeWorkerReadinessNewProcessEarlyExit(t *testing.T) {
 
 func TestNativeWorkerReadinessCancellationLeavesNewProcessAlive(t *testing.T) {
 	r, record, binary := nativeWorkerReadinessProcessFixture(t, "cancel")
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	if err := EnsureNativeWorker(ctx, r, record, binary, nil, ""); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("readiness did not cancel: %v", err)
+	result := make(chan error, 1)
+	go func() {
+		result <- EnsureNativeWorker(ctx, r, record, binary, nil, "")
+	}()
+	for {
+		if _, err := os.Stat(filepath.Join(record.Dir, "helper-started")); err == nil {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("readiness returned before helper started: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("helper did not start: %v", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("readiness did not cancel: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("readiness did not return after cancellation")
+	}
+	if err := os.WriteFile(filepath.Join(record.Dir, "helper-release"), nil, 0600); err != nil {
+		t.Fatal(err)
 	}
 	probe, stop := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stop()
