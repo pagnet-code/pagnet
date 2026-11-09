@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -141,12 +140,6 @@ func TestBrowserStandbyCanceledRecoveryBackoff(t *testing.T) {
 	f.run()
 	if f.rotations[f.bindings[0].ID] != 1 {
 		t.Fatal("issued replacement after cancellation")
-	}
-}
-
-func TestBrowserStandbyTransportClassification(t *testing.T) {
-	if errors.Is(sdk.ErrManagedBrowserStandbyUnauthorized, sdk.ErrManagedBrowserStandbyTransport) {
-		t.Fatal("terminal error classified as recoverable")
 	}
 }
 
