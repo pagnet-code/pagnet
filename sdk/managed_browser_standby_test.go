@@ -2,14 +2,21 @@ package sdk
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -106,7 +113,9 @@ func TestManagedStandbyRejectsEveryTupleMutation(t *testing.T) {
 				}
 			})
 			defer closeServer()
-			managedStandbyFailure(t, config)
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatalf("terminal failure classified as transport: %v", err)
+			}
 		})
 	}
 }
@@ -162,12 +171,14 @@ func TestManagedStandbyRejectsMalformedOrExecutionFrames(t *testing.T) {
 				}
 			})
 			defer closeServer()
-			managedStandbyFailure(t, config)
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatalf("terminal failure classified as transport: %v", err)
+			}
 		})
 	}
 }
 func TestManagedStandbyHTTPFailuresAreSanitizedAndDoNotFallback(t *testing.T) {
-	for _, status := range []int{401, 404, 302, 500} {
+	for _, status := range []int{400, 401, 403, 404, 302, 500} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			config := managedStandbyConfig()
 			var requests atomic.Int32
@@ -180,6 +191,9 @@ func TestManagedStandbyHTTPFailuresAreSanitizedAndDoNotFallback(t *testing.T) {
 			defer server.Close()
 			config.Server = server.URL
 			err := managedStandbyFailure(t, config)
+			if errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatal("HTTP failure classified as transport")
+			}
 			if status == 401 && !errors.Is(err, ErrManagedBrowserStandbyUnauthorized) {
 				t.Fatal("missing unauthorized classification")
 			}
@@ -250,7 +264,9 @@ func TestManagedStandbyValidityStartsBeforeResponse(t *testing.T) {
 				conn.ReadMessage()
 			})
 			defer closeServer()
-			managedStandbyFailure(t, config)
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatalf("terminal failure classified as transport: %v", err)
+			}
 		})
 	}
 }
@@ -277,7 +293,9 @@ func TestManagedStandbyAuthorityCannotBeExtended(t *testing.T) {
 			})
 			defer closeServer()
 			start := time.Now()
-			managedStandbyFailure(t, config)
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatal("expired authority classified as transport")
+			}
 			if time.Since(start) > time.Second {
 				t.Fatal("server extended authority")
 			}
@@ -334,7 +352,7 @@ func TestManagedStandbyHeartbeatOrderingAndDelayedAck(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("got %v", err)
 				}
-			} else if err == nil || errors.Is(err, context.Canceled) {
+			} else if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrManagedBrowserStandbyTransport) {
 				t.Fatalf("accepted invalid heartbeat ack: %v", err)
 			}
 		})
@@ -361,7 +379,9 @@ func TestManagedStandbyRejectsInvalidLocalAuthority(t *testing.T) {
 			case "query":
 				config.Server += "?private=secret"
 			}
-			managedStandbyFailure(t, config)
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatalf("terminal failure classified as transport: %v", err)
+			}
 		})
 	}
 }
@@ -485,8 +505,155 @@ func TestManagedStandbyMissingAckExpires(t *testing.T) {
 	})
 	defer closeServer()
 	start := time.Now()
-	managedStandbyFailure(t, config)
+	if err := managedStandbyFailure(t, config); !errors.Is(err, ErrManagedBrowserStandbyTransport) {
+		t.Fatalf("missing transport classification: %v", err)
+	}
 	if elapsed := time.Since(start); elapsed < 3*time.Second || elapsed > 5*time.Second {
 		t.Fatalf("incorrect freshness expiry: %v", elapsed)
+	}
+}
+
+func TestManagedStandbyTransportWhitelist(t *testing.T) {
+	for _, err := range []error{io.EOF, io.ErrUnexpectedEOF, net.ErrClosed, &net.OpError{Op: "read", Err: os.NewSyscallError("read", syscall.ECONNRESET)}, &net.DNSError{IsTimeout: true}, &websocket.CloseError{Code: 1006}} {
+		if !managedStandbyTransportError(fmt.Errorf("private detail: %w", err)) {
+			t.Errorf("not recognized: %T", err)
+		}
+	}
+	for _, err := range []error{errors.New("private unknown"), context.Canceled, &net.DNSError{IsNotFound: true}, &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, tls.RecordHeaderError{}, websocket.ErrReadLimit, &websocket.CloseError{Code: 1008}, &websocket.CloseError{Code: 1002}, &websocket.CloseError{Code: 1000}} {
+		if managedStandbyTransportError(err) {
+			t.Errorf("terminal error recognized as transport: %T", err)
+		}
+	}
+}
+
+func TestManagedStandbyReadFailures(t *testing.T) {
+	for _, phase := range []string{"challenge", "standby", "heartbeat"} {
+		for _, failure := range []string{"disconnect", "reset", "policy", "protocol", "malformed", "invalid-websocket"} {
+			t.Run(phase+"/"+failure, func(t *testing.T) {
+				config := managedStandbyConfig()
+				var attempts atomic.Int32
+				closeServer := managedStandbyServer(t, &config, func(conn *websocket.Conn) {
+					attempts.Add(1)
+					if phase == "heartbeat" {
+						if !managedStandbyHandshake(t, conn, config, 10000) {
+							return
+						}
+					} else if phase == "standby" {
+						if conn.WriteJSON(managedStandbyChallenge(config)) != nil {
+							return
+						}
+						if _, _, err := conn.ReadMessage(); err != nil {
+							return
+						}
+					}
+					switch failure {
+					case "disconnect":
+						return
+					case "reset":
+						socket := conn.UnderlyingConn().(*net.TCPConn)
+						socket.SetLinger(0)
+						socket.Close()
+					case "policy":
+						conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "pgn_epd_private"))
+					case "protocol":
+						conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1002, "pgn_epd_private"))
+					case "malformed":
+						conn.WriteMessage(websocket.TextMessage, []byte("{"))
+					case "invalid-websocket":
+						conn.UnderlyingConn().Write([]byte{0xc1, 0}) // unexpected RSV1 bit
+					}
+					conn.SetReadDeadline(time.Now().Add(time.Second))
+					conn.ReadMessage()
+				})
+				defer closeServer()
+				err := managedStandbyFailure(t, config)
+				wantTransport := failure == "disconnect" || failure == "reset"
+				if errors.Is(err, ErrManagedBrowserStandbyTransport) != wantTransport {
+					t.Fatalf("incorrect classification: %v", err)
+				}
+				if attempts.Load() != 1 {
+					t.Fatal("retried interrupted attempt")
+				}
+			})
+		}
+	}
+}
+
+func TestManagedStandbyInvalidTLSIsTerminal(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { t.Error("accepted untrusted TLS") }))
+	defer server.Close()
+	config := managedStandbyConfig()
+	config.Server = server.URL
+	if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+		t.Fatal("certificate error classified as transport")
+	}
+}
+
+func TestManagedStandbyDialInterruption(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	listener.Close()
+	config := managedStandbyConfig()
+	config.Server = "http://" + address
+	if err := managedStandbyFailure(t, config); !errors.Is(err, ErrManagedBrowserStandbyTransport) {
+		t.Fatalf("missing transport classification: %v", err)
+	}
+}
+
+func TestManagedStandbyHandshakeTimeout(t *testing.T) {
+	t.Parallel()
+	config := managedStandbyConfig()
+	closeServer := managedStandbyServer(t, &config, func(conn *websocket.Conn) {
+		conn.SetReadDeadline(time.Now().Add(6 * time.Second))
+		conn.ReadMessage()
+	})
+	defer closeServer()
+	if err := managedStandbyFailure(t, config); !errors.Is(err, ErrManagedBrowserStandbyTransport) {
+		t.Fatalf("missing transport classification: %v", err)
+	}
+}
+
+func TestManagedStandbyMissingAckCannotOutliveAuthority(t *testing.T) {
+	for _, source := range []string{"local", "lease", "credential"} {
+		t.Run(source, func(t *testing.T) {
+			t.Parallel()
+			config := managedStandbyConfig()
+			authority := time.Now().Add(3300 * time.Millisecond)
+			if source == "local" {
+				config.AuthorityDeadline = authority
+			}
+			closeServer := managedStandbyServer(t, &config, func(conn *websocket.Conn) {
+				if conn.WriteJSON(managedStandbyChallenge(config)) != nil {
+					return
+				}
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+				standby := managedStandbyFrame(10000)
+				if source == "lease" {
+					standby.LeaseExpiresAt = authority.UTC().Format(time.RFC3339Nano)
+				}
+				if source == "credential" {
+					standby.CredentialExpiresAt = authority.UTC().Format(time.RFC3339Nano)
+				}
+				if conn.WriteJSON(standby) != nil {
+					return
+				}
+				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				var heartbeat transport.ManagedBrowserStandbyHeartbeat
+				if conn.ReadJSON(&heartbeat) != nil || heartbeat.Sequence != 1 {
+					t.Error("missing heartbeat")
+					return
+				}
+				conn.ReadMessage()
+			})
+			defer closeServer()
+			if err := managedStandbyFailure(t, config); errors.Is(err, ErrManagedBrowserStandbyTransport) {
+				t.Fatal("expired authority classified as transport")
+			}
+		})
 	}
 }
