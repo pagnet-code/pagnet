@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "pagnet",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Use connected Pagnet agents and tools, and manage owner-approved agent lifecycles.",
   "author": {
     "name": "Pagnet"
