@@ -2,7 +2,7 @@
 
 The shared source package in [`plugins/pagnet`](../plugins/pagnet) connects clients to Pagnet's hosted OAuth MCP endpoint, `https://app.pagnet.dev/api/v1/mcp`. It bundles a shared skill and client-specific manifests. No account token, client secret, or connector setup credential belongs in these manifests.
 
-## Prepare the messaging and capability connector
+## Current local bridge requirement for messaging and capabilities
 
 1. The network owner opens [Pagnet Integrations](https://app.pagnet.dev/integrations) and creates a connector for one network, selecting the allowed agents, capabilities, messaging targets, and event patterns.
 2. Link the intended client through the connector's OAuth authorization flow.
@@ -56,7 +56,7 @@ The package uses `.claude-plugin/plugin.json` and root `.mcp.json`, with `type: 
 
 ## OpenAI ChatGPT and Codex
 
-The portable package uses root `plugin.json`, root `mcp.json` with `type: "streamable-http"`, and the shared `skills/` directory. OAuth is declared under the MCP server's `extensions.com.openai.auth`; connection endpoints and client registration details are left to discovery.
+The portable package uses root `plugin.json`, root `mcp.json` with `type: "streamable-http"`, and the shared `skills/` directory. OAuth is declared under the MCP server's `extensions.com.openai.auth`; the package selects the provided public PKCE client `pagnet-chatgpt-connector` with `client.mode: "provided"` and `tokenEndpointAuthMethod: "none"`. OAuth endpoints remain available through discovery. No client secret or manual CIMD/DCR registration is required.
 
 The repository catalog is `.agents/plugins/marketplace.json`. From a checkout, register it with:
 
@@ -64,7 +64,7 @@ The repository catalog is `.agents/plugins/marketplace.json`. From a checkout, r
 codex plugin marketplace add .
 ```
 
-Install or enable `pagnet` from the `pagnet` marketplace in a supported client. The ChatGPT desktop app supports local marketplace testing; restart it after adding a local marketplace if the catalog is not visible. Repository catalogs and local source installation are separate from public directory publication, and support varies by surface. For ChatGPT surfaces without local marketplace support, use the custom MCP connection flow with the hosted endpoint and OAuth rather than assuming this directory is already installed.
+Install or enable the single `pagnet` plugin from the `pagnet` marketplace in a supported client, then complete its browser OAuth prompt. The same plugin exposes the tools covered by the owner's separate connector, management, and network consents; additional plugins are not required. Messaging, capability, and event operations still require the local bridge described above. The ChatGPT desktop app supports local marketplace testing; restart it after adding a local marketplace if the catalog is not visible. Repository catalogs and local source installation are separate from public directory publication, and support varies by surface. For ChatGPT surfaces without local marketplace support, use the custom MCP connection flow with the hosted endpoint and OAuth rather than assuming this directory is already installed.
 
 Codex and ChatGPT existing sessions may not reload installed plugin or MCP configuration. Depending on the client and API, a new turn, conversation, session, or app restart may be required. Verify the actual Pagnet tools before continuing; there is no universal hot attachment guarantee. See the official [OpenAI plugin packaging and marketplace guide](https://developers.openai.com/plugins/build/plugins).
 
