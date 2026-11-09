@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"reflect"
 	"strings"
@@ -25,9 +26,16 @@ func TestBrowserStandbyAppliedTupleAndJoin(t *testing.T) {
 		joined.Store(true)
 		return ctx.Err()
 	}
+	var applied struct {
+		CredentialID         string `json:"credentialId"`
+		CredentialGeneration int64  `json:"credentialGeneration"`
+	}
 	polls := 0
 	f.hook = func(r *http.Request) (*http.Response, bool) {
 		if strings.HasSuffix(r.URL.Path, "/apply-ack") {
+			if err := json.NewDecoder(r.Body).Decode(&applied); err != nil {
+				t.Fatal(err)
+			}
 			select {
 			case <-configs:
 				t.Fatal("standby launched before apply acknowledgement")
@@ -51,8 +59,8 @@ func TestBrowserStandbyAppliedTupleAndJoin(t *testing.T) {
 	}
 	config := <-configs
 	b := f.bindings[0]
-	want := transport.ManagedBrowserStandbyTuple{ConnectionID: f.a.ID, BindingID: b.ID, NetworkID: b.NetworkID, PrincipalID: b.PrincipalID, HostID: f.a.HostID, Provider: f.a.Provider, DesiredRevision: 3, LeaseID: "00000000-0000-4000-8000-000000000001", InstanceID: f.c.instanceID, LeaseGeneration: 1, CredentialID: config.ExpectedTuple.CredentialID, CredentialGeneration: 1, PolicyFingerprint: b.PolicyFingerprint}
-	if !reflect.DeepEqual(config.ExpectedTuple, want) || config.ExpectedTuple.CredentialID == "" || config.BindingCredential != "private-test-value" {
+	want := transport.ManagedBrowserStandbyTuple{ConnectionID: f.a.ID, BindingID: b.ID, NetworkID: b.NetworkID, PrincipalID: b.PrincipalID, HostID: f.a.HostID, Provider: f.a.Provider, DesiredRevision: 3, LeaseID: "00000000-0000-4000-8000-000000000001", InstanceID: f.c.instanceID, LeaseGeneration: 1, CredentialID: applied.CredentialID, CredentialGeneration: applied.CredentialGeneration, PolicyFingerprint: b.PolicyFingerprint}
+	if !reflect.DeepEqual(config.ExpectedTuple, want) || config.ExpectedTuple.CredentialID == "" || config.BindingCredential != "private-test-value" || config.Server != f.c.serverURL {
 		t.Fatal("incorrect immutable standby authority")
 	}
 	if !config.AuthorityDeadline.Equal(f.now.Add(30*time.Second - 5*time.Millisecond)) {
