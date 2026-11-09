@@ -15,20 +15,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
+	"github.com/pagnet-code/pagnet/sdk"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
-// These slots are dormant application prerequisites. They never admit execution
+// These slots own control-only standby children. They never admit execution
 // and never leave this controller's memory.
 type browserBindingSlot struct {
+	binding      browserBindingMetadata
 	secret       []byte
 	credentialID string
 	generation   int64
 	expiresAt    time.Time
+	attempted    bool
+	cancel       context.CancelFunc
+	done         chan struct{}
+	result       chan error
 }
 
 func (browserBindingSlot) String() string   { return "[redacted browser binding slot]" }
 func (browserBindingSlot) GoString() string { return "[redacted browser binding slot]" }
-func (s *browserBindingSlot) wipe()         { clear(s.secret); s.secret = nil }
+func (s *browserBindingSlot) wipe() {
+	if s.cancel != nil {
+		s.cancel()
+		<-s.done
+		s.cancel = nil
+	}
+	clear(s.secret)
+	s.secret = nil
+}
 
 type browserBindingLease struct {
 	Generation int64     `json:"generation"`
@@ -84,6 +99,14 @@ type browserBindingController struct {
 	lease                             browserBindingLease
 	authorityUntil                    time.Time
 	reacquire                         bool
+	consumed                          map[string]bool
+	assignmentContext                 context.Context
+	serve                             func(context.Context, sdk.ManagedBrowserStandbyConfig) error
+	wake                              chan struct{}
+	standbyUntil                      time.Time
+	recoveries                        map[string]int
+	recoveryUntil                     map[string]time.Time
+	recoveryNetwork                   string
 	slots                             map[string]*browserBindingSlot
 }
 
@@ -92,7 +115,10 @@ func newBrowserBindingRunner(d *Daemon, instanceID string) func(context.Context,
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return func(ctx context.Context, a browserAssignment) {
 		c := &browserBindingController{client: client, serverURL: d.ServerURL, credential: d.Credential, instanceID: instanceID, now: time.Now, wait: browserBindingWait, retryDelay: time.Second, renewInterval: 10 * time.Second, slots: map[string]*browserBindingSlot{}}
+		c.serve = sdk.ServeManagedBrowserStandby
 		c.runBrowserBinding(ctx, a)
+		// Keep terminal assignments attached until the supervisor changes authority.
+		<-ctx.Done()
 	}
 }
 func browserBindingWait(ctx context.Context, d time.Duration) bool {
@@ -295,6 +321,21 @@ func (c *browserBindingController) validStatus(s browserBindingStatus, b browser
 }
 func (c *browserBindingController) rotate(ctx context.Context, a browserAssignment, base string, b browserBindingMetadata) error {
 	for {
+		if network := c.recoveryNetwork; network != "" {
+			attempt := c.recoveries[network]
+			if attempt >= 3 {
+				return errBrowserBinding
+			}
+			until := c.recoveryUntil[network]
+			delay := time.Second << attempt
+			delay += time.Duration(rand.Float64() * float64(delay/4))
+			if delay >= until.Sub(c.now()) || !c.wait(ctx, delay) || !c.now().Before(until) {
+				return errBrowserBinding
+			}
+			// Even an ambiguous issuance consumes one replacement attempt.
+			c.recoveries[network]++
+		}
+
 		req := struct {
 			browserBindingTuple
 			ExpectedCredentialGeneration int64 `json:"expectedCredentialGeneration"`
@@ -317,7 +358,7 @@ func (c *browserBindingController) rotate(ctx context.Context, a browserAssignme
 			}
 			found := false
 			for _, next := range items {
-				if next.ID == b.ID && next.NetworkID == b.NetworkID && next.PolicyFingerprint == b.PolicyFingerprint {
+				if next.ID == b.ID && next.NetworkID == b.NetworkID && next.PrincipalID == b.PrincipalID && next.PolicyFingerprint == b.PolicyFingerprint {
 					b = next
 					found = true
 				}
@@ -328,7 +369,7 @@ func (c *browserBindingController) rotate(ctx context.Context, a browserAssignme
 			continue
 		}
 		_, idErr := domain.ParseID(out.CredentialID)
-		if idErr != nil || out.CredentialGeneration != b.CredentialGeneration+1 || out.Credential == "" || !out.ExpiresAt.After(c.now()) || out.ExpiresAt.After(c.lease.ExpiresAt) {
+		if idErr != nil || c.consumed[out.CredentialID] || out.CredentialGeneration != b.CredentialGeneration+1 || out.Credential == "" || !out.ExpiresAt.After(c.now()) || out.ExpiresAt.After(c.lease.ExpiresAt) {
 			out.Credential = ""
 			return errBrowserBinding
 		}
@@ -357,7 +398,8 @@ func (c *browserBindingController) rotate(ctx context.Context, a browserAssignme
 			if !c.validStatus(status, b, a) || !status.Acknowledged || status.CredentialRefreshRequired || !status.CredentialExpiresAt.After(c.now()) || status.CredentialExpiresAt.After(c.lease.ExpiresAt) {
 				return errBrowserBinding
 			}
-			slot.expiresAt = status.CredentialExpiresAt
+			slot.expiresAt = minBrowserBindingTime(slot.expiresAt, status.CredentialExpiresAt)
+			c.startStandby(ctx, a, b, slot)
 			return nil
 		}
 	}
@@ -394,6 +436,21 @@ func (c *browserBindingController) refreshStatus(ctx context.Context, a browserA
 			delete(byID, status.BindingID)
 			if status.CredentialRefreshRequired {
 				if slot := c.slots[b.NetworkID]; slot != nil {
+					if slot.cancel != nil {
+						slot.cancel()
+						<-slot.done
+						slot.cancel = nil
+						result := <-slot.result
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						if !errors.Is(result, context.Canceled) {
+							// A failure racing status fetch must retain its own
+							// recovery policy. Discard this now-stale status.
+							slot.result <- result
+							return c.finishStandbys(ctx, a, base)
+						}
+					}
 					slot.wipe()
 					delete(c.slots, b.NetworkID)
 				}
@@ -407,7 +464,7 @@ func (c *browserBindingController) refreshStatus(ctx context.Context, a browserA
 			if slot == nil || len(slot.secret) == 0 {
 				return errBrowserBinding
 			}
-			slot.expiresAt = status.CredentialExpiresAt
+			slot.expiresAt = minBrowserBindingTime(slot.expiresAt, status.CredentialExpiresAt)
 		}
 		if len(refresh) == 0 {
 			if !out.Acknowledged {
@@ -452,6 +509,16 @@ func (c *browserBindingController) runAttempt(ctx context.Context, a browserAssi
 	defer func() {
 		for _, slot := range c.slots {
 			slot.wipe()
+			// A deliberate stop reports context cancellation or expiry. A
+			// queued terminal failure must veto reacquisition even when the
+			// lease request or local cutoff independently requested a retry.
+			select {
+			case result := <-slot.result:
+				if c.reacquire && !errors.Is(result, context.Canceled) && !errors.Is(result, context.DeadlineExceeded) && !errors.Is(result, sdk.ErrManagedBrowserStandbyTransport) {
+					c.reacquire = false
+				}
+			default:
+			}
 		}
 		// Cleanup cannot inherit a canceled assignment or an expired lease deadline.
 		releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -461,8 +528,17 @@ func (c *browserBindingController) runAttempt(ctx context.Context, a browserAssi
 		holder := c.leaseHolder()
 		c.lease.ExpiresAt = time.Time{}
 		c.authorityUntil = time.Time{}
+		c.standbyUntil = time.Time{}
 		_ = c.request(releaseCtx, http.MethodDelete, base+"/runtime-lease", holder, nil)
 	}()
+	c.assignmentContext = ctx
+	c.standbyUntil = c.localDeadline()
+	if deadline, ok := ctx.Deadline(); ok {
+		c.standbyUntil = minBrowserBindingTime(c.standbyUntil, deadline)
+	}
+	c.wake = make(chan struct{}, 1)
+	c.recoveries = map[string]int{}
+	c.recoveryUntil = map[string]time.Time{}
 	items, err := c.reconcile(ctx, a, base)
 	if err != nil {
 		return
@@ -473,7 +549,7 @@ func (c *browserBindingController) runAttempt(ctx context.Context, a browserAssi
 		}
 	}
 	for ctx.Err() == nil {
-		cutoff := c.authorityUntil
+		cutoff := minBrowserBindingTime(c.authorityUntil, c.standbyUntil)
 		for _, slot := range c.slots {
 			if slot.expiresAt.Before(cutoff) {
 				cutoff = slot.expiresAt
@@ -483,8 +559,11 @@ func (c *browserBindingController) runAttempt(ctx context.Context, a browserAssi
 		if cutoff.Sub(c.now()) < delay {
 			delay = cutoff.Sub(c.now())
 		}
-		if delay <= 0 || !c.wait(ctx, delay) || !c.now().Before(cutoff) {
+		if delay <= 0 || !c.waitStandby(ctx, delay) || !c.now().Before(cutoff) {
 			c.reacquire = ctx.Err() == nil
+			return
+		}
+		if err = c.finishStandbys(ctx, a, base); err != nil {
 			return
 		}
 		for {
@@ -522,7 +601,7 @@ func (c *browserBindingController) confirmDeadline(started time.Time) {
 }
 
 func (c *browserBindingController) localDeadline() time.Time {
-	deadline := c.authorityUntil
+	deadline := minBrowserBindingTime(c.authorityUntil, c.standbyUntil)
 	for _, slot := range c.slots {
 		if len(slot.secret) > 0 && (deadline.IsZero() || slot.expiresAt.Before(deadline)) {
 			deadline = slot.expiresAt
@@ -540,6 +619,7 @@ func (c *browserBindingController) runBrowserBinding(ctx context.Context, a brow
 		}
 		c.lease = browserBindingLease{}
 		c.authorityUntil = time.Time{}
+		c.standbyUntil = time.Time{}
 		if !c.wait(ctx, c.retryDelay+time.Duration(rand.Float64()*float64(c.retryDelay))) {
 			return
 		}
@@ -548,3 +628,138 @@ func (c *browserBindingController) runBrowserBinding(ctx context.Context, a brow
 
 func (browserBindingController) String() string   { return "[redacted browser binding controller]" }
 func (browserBindingController) GoString() string { return "[redacted browser binding controller]" }
+
+func minBrowserBindingTime(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
+}
+
+// The controller marks a credential consumed before handing an immutable copy to
+// the SDK. Only this goroutine owns slots, credentials, and recovery decisions.
+func (c *browserBindingController) startStandby(ctx context.Context, a browserAssignment, b browserBindingMetadata, slot *browserBindingSlot) {
+	if c.serve == nil || slot.attempted || ctx.Err() != nil {
+		return
+	}
+	if c.consumed == nil {
+		c.consumed = map[string]bool{}
+	}
+	if c.consumed[slot.credentialID] {
+		return
+	}
+	c.consumed[slot.credentialID] = true
+	slot.attempted = true
+	slot.binding = b
+	config := sdk.ManagedBrowserStandbyConfig{
+		Server: c.serverURL, BindingCredential: string(slot.secret),
+		AuthorityDeadline: minBrowserBindingTime(c.standbyUntil, slot.expiresAt),
+		ExpectedTuple: transport.ManagedBrowserStandbyTuple{
+			ConnectionID: a.ID, HostID: a.HostID, Provider: a.Provider, DesiredRevision: a.DesiredRevision,
+			BindingID: b.ID, NetworkID: b.NetworkID, PrincipalID: b.PrincipalID, PolicyFingerprint: b.PolicyFingerprint,
+			LeaseID: c.lease.LeaseID, InstanceID: c.instanceID, LeaseGeneration: c.lease.Generation,
+			CredentialID: slot.credentialID, CredentialGeneration: slot.generation,
+		},
+	}
+	if c.assignmentContext != nil {
+		ctx = c.assignmentContext
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		config.AuthorityDeadline = minBrowserBindingTime(config.AuthorityDeadline, deadline)
+	}
+	child, cancel := context.WithDeadline(ctx, config.AuthorityDeadline)
+	slot.cancel, slot.done, slot.result = cancel, make(chan struct{}), make(chan error, 1)
+	done, result, wake, serve := slot.done, slot.result, c.wake, c.serve
+	go func() {
+		defer close(done)
+		result <- serve(child, config)
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}()
+}
+
+func (c *browserBindingController) waitStandby(ctx context.Context, delay time.Duration) bool {
+	if c.serve == nil {
+		return c.wait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-c.wake:
+		return ctx.Err() == nil
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
+}
+
+func (c *browserBindingController) finishStandbys(ctx context.Context, a browserAssignment, base string) error {
+	for network, slot := range c.slots {
+		var result error
+		select {
+		case result = <-slot.result:
+		default:
+			continue
+		}
+		// Join before revalidation, issuance, replacement, or release.
+		if slot.cancel != nil {
+			slot.cancel()
+		}
+		<-slot.done
+		// The completed credential no longer constrains fresh authority.
+		clear(slot.secret)
+		slot.secret = nil
+		slot.cancel = nil
+		if !errors.Is(result, sdk.ErrManagedBrowserStandbyTransport) {
+			c.reacquire = false
+			return errBrowserBinding
+		}
+		if c.recoveries[network] >= 3 {
+			c.reacquire = false
+			return errBrowserBinding
+		}
+		until := c.recoveryUntil[network]
+		if until.IsZero() {
+			until = minBrowserBindingTime(c.now().Add(15*time.Second), c.localDeadline())
+			c.recoveryUntil[network] = until
+		}
+		recoveryCtx, cancel := context.WithDeadline(ctx, until)
+		var lease browserBindingLease
+		err := c.request(recoveryCtx, http.MethodGet, base+"/runtime-lease", nil, &lease)
+		if err == nil && (!c.validLease(lease, c.lease.Generation) || lease.LeaseID != c.lease.LeaseID || lease.ExpiresAt.Before(c.standbyUntil) || !c.now().Before(c.localDeadline())) {
+			err = errBrowserBinding
+		}
+		var items []browserBindingMetadata
+		if err == nil {
+			items, err = c.reconcile(recoveryCtx, a, base)
+		}
+		if err == nil {
+			found := false
+			for _, b := range items {
+				if b.NetworkID == network {
+					found = true
+					if b.CredentialGeneration != slot.generation || b.ID != slot.binding.ID || b.PrincipalID != slot.binding.PrincipalID || b.PolicyFingerprint != slot.binding.PolicyFingerprint {
+						err = errBrowserBinding
+						break
+					}
+					c.recoveryNetwork = network
+					err = c.rotate(recoveryCtx, a, base, b)
+					c.recoveryNetwork = ""
+					break
+				}
+			}
+			if !found {
+				err = errBrowserBinding
+			}
+		}
+		cancel()
+		if err != nil {
+			c.reacquire = false
+			return err
+		}
+	}
+	return nil
+}
