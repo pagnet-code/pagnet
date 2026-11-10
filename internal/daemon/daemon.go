@@ -1143,6 +1143,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn := d.nativeConnection(conn)
 	nativeConn.offeredSnapshotSigningPublicKey = snapshotSigningPublicKey
 	defer nativeConn.Close()
+	accountReadiness := newAccountMessagingReadinessConnection(d, conn, nativeConn)
+	defer accountReadiness.close()
 	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
 	defer shareBindings.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
@@ -1355,6 +1357,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				return connectedAt, fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				accountReadiness.admitted()
 				if d.textServices != nil {
 					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
 						d.textServices.admit(session)
@@ -1401,7 +1404,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			// LIVE (E2EE, plan §12): the network's crypto lifecycle state
 			// (status + announced epoch + tenant id). The handler only
 			// updates the in-memory cache — it never blocks the read loop.
-			d.handleNetworkCrypto(env)
+			accountReadiness.networkCrypto(env)
+			continue
+		}
+		if env.Type == transport.MsgAccountMessagingReadinessOffer {
+			accountReadiness.offer(env)
 			continue
 		}
 		if shareBindings.handle(env) {
@@ -1505,10 +1512,20 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 // the failed conn, which unblocks the read loop so the reconnect loop in Run
 // takes over.
 func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
+	return d.writeGuarded(conn, raw, nil)
+}
+
+// writeGuarded checks connection-local evidence after waiting for the shared
+// writer, immediately before I/O. The guard must not hold locks across I/O.
+func (d *Daemon) writeGuarded(conn *websocket.Conn, raw []byte, guard func() bool) error {
 	if conn == nil {
 		return errors.New("no host connection")
 	}
 	d.writeMu.Lock()
+	if guard != nil && !guard() {
+		d.writeMu.Unlock()
+		return nil
+	}
 	// A stalled peer must not stall the command workers (or heartbeats /
 	// the bridge relay): with an unbounded write, one clogged socket can
 	// freeze a per-instance FIFO for minutes — a stop then lands past any
@@ -1518,8 +1535,8 @@ func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
 	err := conn.WriteMessage(websocket.TextMessage, raw)
 	d.writeMu.Unlock()
 	if err != nil {
-		// Released writeMu before invalidating so no writeMu→connMu nesting
-		// (invalidate takes connMu on its own); a concurrent write to the
+		// Release writeMu before connection invalidation and logging;
+		// a concurrent write to the
 		// poisoned conn fails too and invalidates idempotently.
 		d.invalidateCurrentConnection(conn)
 	}
