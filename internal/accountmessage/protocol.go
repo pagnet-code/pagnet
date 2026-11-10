@@ -6,12 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"strconv"
 	"time"
 	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 const MaxTextBytes = 16384
@@ -69,16 +69,12 @@ func validDigest(s string) bool {
 	return e == nil && len(b) == 32 && hex.EncodeToString(b) == s
 }
 func decode(raw []byte, target any) error {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if e := d.Decode(target); e != nil {
-		return e
-	}
-	if d.Decode(new(any)) != io.EOF {
+	if DecodeFrame(raw, target) != nil {
 		return errors.New("invalid account message JSON")
 	}
 	return nil
 }
+
 func (d Descriptor) CanonicalJSON() []byte { return canonical(d) }
 func (d Descriptor) BindingDigest() string { return digest(d) }
 func (d Descriptor) Validate() error {
@@ -172,4 +168,57 @@ func (s Sealed) Reply() any {
 		SealedDigest  string                  `json:"sealedDigest"`
 		Envelope      e2ee.EncryptedPayloadV1 `json:"envelope"`
 	}{s.V, s.MessageID, s.BindingDigest, s.SealedDigest, s.Envelope}
+}
+
+// DecodeFrame rejects invalid UTF-8, unpaired JSON UTF-16 surrogate escapes,
+// duplicate/unknown/case-aliased or missing fields, and oversized frames.
+func DecodeFrame(raw []byte, target any) error {
+	if len(raw) > MaxFrameBytes || !validJSONUnicode(raw) || transport.DecodeOwnerTextConsolePayload(raw, target) != nil {
+		return errors.New("invalid account message frame")
+	}
+	return nil
+}
+func validJSONUnicode(raw []byte) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	inString := false
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '"' {
+			inString = !inString
+			continue
+		}
+		if !inString || raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		n, e := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if e != nil {
+			return false
+		}
+		i += 4
+		if n >= 0xdc00 && n <= 0xdfff {
+			return false
+		}
+		if n >= 0xd800 && n <= 0xdbff {
+			if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+				return false
+			}
+			low, e := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+			if e != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		}
+	}
+	return true
 }

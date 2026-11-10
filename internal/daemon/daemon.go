@@ -23,6 +23,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/accountmessage"
 	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/proc"
@@ -57,6 +58,9 @@ var ErrOutdated = errors.New("control plane requires a newer protocol — update
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
+	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
+	// It enables encrypted staging only, never managed runtime dispatch.
+	AccountMessageSealEnabled bool
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard
@@ -343,7 +347,10 @@ type Daemon struct {
 	curConn                   *websocket.Conn
 	nativeConn                *NativeObservationConnection         // guarded by connMu; exact socket lifetime
 	accountReadiness          *accountMessagingReadinessConnection // guarded by connMu
-	accountReadinessMutations int                                  // guarded by connMu, spans reconnects
+	accountSealMu             sync.Mutex
+	accountSealJournal        *accountmessage.Journal
+	accountSealClosed         bool
+	accountReadinessMutations int // guarded by connMu, spans reconnects
 	// websocket.Conn allows ONE concurrent writer; the heartbeat, command
 	// acks, and bridge relay all share the connection, so writes serialize.
 	writeMu sync.Mutex
@@ -903,6 +910,12 @@ func (d *Daemon) finishQueue(instanceID string) {
 func (d *Daemon) Close() error {
 	var err error
 	d.closeOnce.Do(func() {
+		d.accountSealMu.Lock()
+		d.accountSealClosed = true
+		if d.accountSealJournal != nil {
+			_ = d.accountSealJournal.Close()
+		}
+		d.accountSealMu.Unlock()
 		// Shutdown (abuse addendum Part B §38): stop accepting new
 		// launches, terminate every owned process group (turns AND PTYs)
 		// with a bounded grace, reap, and flush state. The supervisor owns
@@ -1321,9 +1334,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			}
 			return connectedAt, err
 		}
+		if accountReadiness.interceptAccountSeal(raw) {
+			continue
+		}
 		var env transport.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
-			d.Log.Warn("bad envelope from server", "err", err)
+			d.Log.Warn("bad envelope from server")
 			continue
 		}
 		if env.ProtocolVersion > transport.ProtocolVersion {
@@ -1685,6 +1701,11 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // enqueue means at most ONE copy of an un-acked command ever sits in the
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
+	// Reserved plaintext frames never enter generic command persistence, even
+	// when a caller bypasses the socket reader.
+	if env.Type == accountSealRequestType {
+		return
+	}
 	switch env.Type {
 	case textServicesChanged:
 		if d.textServices != nil {
