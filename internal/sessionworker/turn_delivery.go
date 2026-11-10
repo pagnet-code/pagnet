@@ -11,7 +11,7 @@ import (
 // the original accepted operation. Empty legacy sources are never relabelled.
 func ValidNativeInputKind(kind string) bool {
 	switch kind {
-	case "invocation", "task", "ask", "notice", "status", "wake", "user_input":
+	case "account_message", "invocation", "task", "ask", "notice", "status", "wake", "user_input":
 		return true
 	default:
 		return false

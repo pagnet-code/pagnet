@@ -112,7 +112,9 @@ func (j *Journal) initializeTurnSources() error {
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
 	if source.SourceAccountMessage != nil || source.InputKind == "account_message" {
-		return ErrFenced
+		if source.SourceAccountMessage == nil || source.InputKind != "account_message" || j.db == nil {
+			return ErrFenced
+		}
 	}
 	if j.isLocal() && (source.SourceTask != nil || source.SourceInvocation != nil || source.InputKind != "local-native") {
 		return ErrFenced
@@ -127,6 +129,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		return errors.New("native invocation source is missing")
 	}
 	source.SourceInvocation = cloneNativeInvocationSource(source.SourceInvocation)
+	source.SourceAccountMessage = cloneNativeAccountMessageSource(source.SourceAccountMessage)
 	if source.SourceTask != nil && (source.InputKind != "task" || source.SourceCommandID == "" || source.SourceTask.TaskID == "" || source.SourceTask.InputAAD.ObjectType != e2ee.ObjectTypeTask || source.SourceTask.InputAAD.ObjectID != source.SourceTask.TaskID || source.SourceTask.InputAAD.KeyEpochID == "" || source.SourceTask.InputAAD.NativeContent != nil || source.SourceTask.InputAAD.ValidateScope() != nil) {
 		return errors.New("invalid original task source descriptor")
 	}
@@ -148,6 +151,11 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		}
 		if original.Commitment.CommandID != source.SourceCommandID || original.Admission.ID != source.SourceAdmissionID {
 			return ErrConflict
+		}
+	}
+	if source.SourceAccountMessage != nil {
+		if err := j.accountInputForTurn(ctx, tx, source); err != nil {
+			return err
 		}
 	}
 	var previous NativeTurnSource
@@ -360,7 +368,13 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 			return err
 		}
 	}
-	return d.Driver.Submit(ctx, sess, req, events)
+	err := d.Driver.Submit(ctx, sess, req, events)
+	if source.SourceAccountMessage != nil && errors.Is(err, session.ErrEndpointGone) {
+		// The manager normally retries a proven unaccepted endpoint. Account
+		// commands permit only this one submission attempt.
+		return errors.New("account native submission was not accepted")
+	}
+	return err
 }
 
 // Clone before acceptance: caller-owned nested AAD pointers must not change the
@@ -475,4 +489,15 @@ func accountMessageSourceJSON(source *transport.NativeAccountMessageSource) stri
 		return ""
 	}
 	return string(source.CanonicalJSON())
+}
+
+func cloneNativeAccountMessageSource(source *transport.NativeAccountMessageSource) *transport.NativeAccountMessageSource {
+	if source == nil {
+		return nil
+	}
+	var cloned transport.NativeAccountMessageSource
+	if json.Unmarshal(source.CanonicalJSON(), &cloned) != nil {
+		return nil
+	}
+	return &cloned
 }

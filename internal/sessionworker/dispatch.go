@@ -23,9 +23,13 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		return nil, ErrConflict
 	}
 	p := req.NativeDispatch
-	// Account dispatch execution is deliberately unavailable in this contract phase.
-	if p.AccountMessageSource != nil || op.SourceAccountMessage != nil || op.InputKind == "account_message" {
-		return nil, ErrConflict
+	if p.AccountMessageSource != nil || op.SourceAccountMessage != nil || op.InputKind == "account_message" || op.SealedAccountMessage != nil {
+		if req.Kind != "prompt" || validateAccountOperation(op, *p) != nil {
+			return nil, ErrConflict
+		}
+		op.SourceCommandID = p.SourceCommandID
+		op.SourceAdmissionID = p.SourceAdmissionID
+		return MarshalNativeJSON(op)
 	}
 	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) || !transport.ValidNativeSourceUnion(op.SourceTask, op.SourceInvocation, op.SourceAccountMessage) {
 		return nil, ErrConflict
