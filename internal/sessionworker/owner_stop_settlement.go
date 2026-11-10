@@ -125,7 +125,7 @@ func (j *Journal) retainStoppedReceiptTx(ctx context.Context, tx *sql.Tx, o Nati
 	if validateStoppedReceipt(j.scope, e) != nil {
 		return ErrConflict
 	}
-	raw, err := json.Marshal(e)
+	raw, err := MarshalNativeJSON(e)
 	if err != nil {
 		return err
 	}
@@ -245,7 +245,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	}
 	stage = "settlement_write"
 	for _, e := range candidates {
-		raw, marshalErr := json.Marshal(e)
+		raw, marshalErr := MarshalNativeJSON(e)
 		if marshalErr != nil {
 			return marshalErr
 		}

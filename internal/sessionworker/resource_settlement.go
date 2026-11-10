@@ -133,7 +133,7 @@ func (j *Journal) settleResourceObservationTx(ctx context.Context, tx *sql.Tx, o
 	if !quiesced {
 		return ErrConflict
 	}
-	raw, err := json.Marshal(evidence)
+	raw, err := MarshalNativeJSON(evidence)
 	if err != nil {
 		return err
 	}

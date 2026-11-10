@@ -47,7 +47,7 @@ type Envelope struct {
 
 // NewEnvelope wraps a payload in a versioned envelope with a fresh id.
 func NewEnvelope(messageType string, payload any) (Envelope, error) {
-	raw, err := json.Marshal(payload)
+	raw, err := marshalNativeEnvelopePayload(messageType, payload)
 	if err != nil {
 		return Envelope{}, err
 	}

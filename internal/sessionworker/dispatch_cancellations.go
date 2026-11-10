@@ -1,7 +1,6 @@
 package sessionworker
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -269,17 +268,7 @@ func RetireDispatchCancellationsTx(ctx context.Context, tx *sql.Tx, ownershipID 
 	return err
 }
 
-// Preserve legacy record bytes. Account sources require no HTML escaping at
-// the outer record too, so their canonical nested wire survives recovery.
+// Preserve canonical account sources through the enclosing preparation.
 func encodeDispatchCancellationPreparation(record DispatchCancellationPreparation) ([]byte, error) {
-	if record.Proposal.Proof.AccountMessageSource == nil {
-		return json.Marshal(record)
-	}
-	var b bytes.Buffer
-	encoder := json.NewEncoder(&b)
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(record); err != nil {
-		return nil, err
-	}
-	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+	return MarshalNativeJSON(record)
 }

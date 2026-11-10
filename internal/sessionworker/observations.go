@@ -55,7 +55,7 @@ type NativeObservation struct {
 func observationDigest(observation NativeObservation) (string, error) {
 	observation.SourceDigest = ""
 	observation.SourceSequence = 0
-	raw, err := json.Marshal(observation)
+	raw, err := MarshalNativeJSON(observation)
 	if err != nil || len(raw) > maxFrame*3/4 {
 		return "", errors.New("native observation exceeds private frame bound")
 	}
@@ -120,7 +120,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	if err != nil || observation.ID == "" || len(observation.ID) > 256 || observation.NativeGeneration == "" || len(observation.NativeGeneration) > 256 || observation.ObservedAt.IsZero() || len(observation.Origin) > 8192 || !json.Valid(observation.Origin) || digest != observation.SourceDigest {
 		return errors.New("invalid native source observation")
 	}
-	raw, err := json.Marshal(observation)
+	raw, err := MarshalNativeJSON(observation)
 	if err != nil {
 		return err
 	}
@@ -189,7 +189,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	contentBytes := 0
 	for _, transfer := range transfers {
 		for _, fragment := range transfer.Fragments {
-			encoded, marshalErr := json.Marshal(fragment)
+			encoded, marshalErr := MarshalNativeJSON(fragment)
 			if marshalErr != nil {
 				return marshalErr
 			}

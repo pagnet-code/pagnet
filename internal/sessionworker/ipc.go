@@ -98,7 +98,7 @@ type Response struct {
 type IntentExecutor func(Outcome, json.RawMessage)
 
 func writeFrame(w io.Writer, v any) error {
-	b, err := json.Marshal(v)
+	b, err := MarshalNativeJSON(v)
 	if err != nil {
 		return err
 	}

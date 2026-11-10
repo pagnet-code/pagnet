@@ -115,11 +115,11 @@ func (s *State) EnsureHostedSourceFinal(ctx context.Context, instanceID, command
 	if err != nil {
 		return HostedSourceFinalRow{}, err
 	}
-	proofJSON, err := json.Marshal(proof)
+	proofJSON, err := transport.MarshalNativeJSON(proof)
 	if err != nil {
 		return HostedSourceFinalRow{}, err
 	}
-	aadJSON, err := json.Marshal(aad)
+	aadJSON, err := transport.MarshalNativeJSON(aad)
 	if err != nil {
 		return HostedSourceFinalRow{}, err
 	}

@@ -47,7 +47,7 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		if p.TaskSource != nil || p.InvocationSource != nil || ValidateNativeResolveOperation(op) != nil {
 			return nil, ErrConflict
 		}
-		return json.Marshal(op)
+		return MarshalNativeJSON(op)
 	}
 	if op.SourceInvocation != nil {
 		if req.Kind != "prompt" || op.InputKind != "" && op.InputKind != "invocation" {
@@ -69,7 +69,7 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 	if req.Kind == "prompt" && (!ValidNativeInputKind(op.InputKind) || op.Input == "" || len(op.Input) > 128<<10) {
 		return nil, ErrConflict
 	}
-	return json.Marshal(op)
+	return MarshalNativeJSON(op)
 }
 
 func (j *Journal) initializeDispatches() error {
@@ -168,7 +168,7 @@ func (j *Journal) BindDispatchOwnership(ctx context.Context, lease int64, o tran
 	}
 	// Sequence counters are mutable server metadata, never local allocation input.
 	o.LastDispatchSequence, o.RetiredFloor = 0, 0
-	raw, err := json.Marshal(o)
+	raw, err := MarshalNativeJSON(o)
 	if err != nil {
 		return err
 	}
@@ -233,7 +233,7 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 	if p.DispatchSequence <= floor {
 		return 0, false, ErrRetired
 	}
-	raw, err := json.Marshal(p)
+	raw, err := MarshalNativeJSON(p)
 	if err != nil {
 		return 0, false, err
 	}

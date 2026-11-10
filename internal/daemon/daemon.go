@@ -1177,7 +1177,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		if err != nil {
 			return err
 		}
-		raw, err := json.Marshal(env)
+		raw, err := transport.MarshalNativeJSON(env)
 		if err != nil {
 			return err
 		}
@@ -1189,7 +1189,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		if err != nil {
 			return err
 		}
-		raw, err := json.Marshal(env)
+		raw, err := transport.MarshalNativeJSON(env)
 		if err != nil {
 			return err
 		}
@@ -1522,7 +1522,7 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 	if err != nil {
 		return err
 	}
-	raw, err := json.Marshal(env)
+	raw, err := transport.MarshalNativeJSON(env)
 	if err != nil {
 		return err
 	}
