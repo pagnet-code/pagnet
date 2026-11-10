@@ -67,16 +67,17 @@ type NativeOwnershipRetirePayload struct {
 	Retire                     bool                 `json:"retire,omitempty"`
 }
 type NativeDispatchProof struct {
-	InvocationSource    *NativeInvocationSource `json:"invocationSource,omitempty"`
-	TaskSource          *NativeTaskSource       `json:"taskSource,omitempty"`
-	SourceBootID        string                  `json:"sourceBootId"`
-	OwnershipID         string                  `json:"ownershipId"`
-	OwnershipGeneration string                  `json:"ownershipGeneration"`
-	DispatchSequence    int64                   `json:"dispatchSequence"`
-	SourceCommandID     string                  `json:"sourceCommandId"`
-	SourceAdmissionID   string                  `json:"sourceAdmissionId"`
-	SourceRunnerID      string                  `json:"sourceRunnerId"`
-	SourceRunnerEpoch   time.Time               `json:"sourceRunnerEpoch"`
+	AccountMessageSource *NativeAccountMessageSource `json:"accountMessageSource,omitempty"`
+	InvocationSource     *NativeInvocationSource     `json:"invocationSource,omitempty"`
+	TaskSource           *NativeTaskSource           `json:"taskSource,omitempty"`
+	SourceBootID         string                      `json:"sourceBootId"`
+	OwnershipID          string                      `json:"ownershipId"`
+	OwnershipGeneration  string                      `json:"ownershipGeneration"`
+	DispatchSequence     int64                       `json:"dispatchSequence"`
+	SourceCommandID      string                      `json:"sourceCommandId"`
+	SourceAdmissionID    string                      `json:"sourceAdmissionId"`
+	SourceRunnerID       string                      `json:"sourceRunnerId"`
+	SourceRunnerEpoch    time.Time                   `json:"sourceRunnerEpoch"`
 }
 
 type NativeOwnershipRegisteredPayload struct {

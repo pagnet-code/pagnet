@@ -104,6 +104,11 @@ func (a AAD) validateNativeContentBinding() error {
 		if b.SubjectID != expected {
 			return errors.New("native turn subject/source mismatch")
 		}
+	case ObjectTypeBrowserAccountReply:
+		subjectType = ObjectTypeBrowserAccountReply
+		if a.BrowserAccountReply == nil {
+			return errors.New("missing account reply authority")
+		}
 	case "runtime_error":
 		subjectType = "runtime_turn"
 	case "task_progress":
@@ -115,14 +120,18 @@ func (a AAD) validateNativeContentBinding() error {
 	default:
 		return errors.New("invalid native content purpose")
 	}
-	if b.Purpose != "native_turn_output" && b.Purpose != "native_turn_plan" && (b.SourceCommandID != "" || b.SourceAdmissionID != "" || b.LogicalTurnID != "") {
+	if b.Purpose != "native_turn_output" && b.Purpose != "native_turn_plan" && b.Purpose != ObjectTypeBrowserAccountReply && (b.SourceCommandID != "" || b.SourceAdmissionID != "" || b.LogicalTurnID != "") {
 		return errors.New("unexpected native turn authority")
 	}
 	if b.SubjectType != subjectType {
 		return errors.New("native content subject/purpose mismatch")
 	}
 	if b.Ordinal == nil {
-		if a.ObjectType != b.SubjectType || a.ObjectID != b.SubjectID {
+		if b.Purpose == ObjectTypeBrowserAccountReply {
+			if a.BrowserAccountReply == nil || a.ObjectType != ObjectTypeBrowserAccountReply || a.ObjectID != a.BrowserAccountReply.ReplyID {
+				return errors.New("invalid account reply manifest")
+			}
+		} else if a.ObjectType != b.SubjectType || a.ObjectID != b.SubjectID {
 			return errors.New("native content manifest subject mismatch")
 		}
 	} else {

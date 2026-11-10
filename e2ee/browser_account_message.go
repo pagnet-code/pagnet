@@ -38,7 +38,7 @@ func (a AAD) validateBrowserAccountMessageBinding() error {
 		return nil
 	}
 	digest, err := hex.DecodeString(b.BindingDigest)
-	if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != b.BindingDigest || b.SenderKind != BrowserAccountDelegateSenderKind || a.ProtocolVersion != 2 || a.ObjectType != ObjectTypeMessage || a.TenantID == "" || a.NetworkID == "" || a.ObjectID == "" || a.Sender == "" || a.Recipient == "" || a.CreatedAt == "" || a.KeyEpochID == "" || a.ProtectedContext != nil || a.NativeContent != nil {
+	if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != b.BindingDigest || b.SenderKind != BrowserAccountDelegateSenderKind || a.ProtocolVersion != 2 || a.ObjectType != ObjectTypeMessage || a.TenantID == "" || a.NetworkID == "" || a.ObjectID == "" || a.Sender == "" || a.Recipient == "" || a.CreatedAt == "" || a.KeyEpochID == "" || a.ProtectedContext != nil || a.NativeContent != nil || a.BrowserAccountReply != nil {
 		return errors.New("invalid account message AAD")
 	}
 	return nil

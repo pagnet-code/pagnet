@@ -81,6 +81,9 @@ func (j *Journal) initializeDispatchCancellations() error {
 func validCancellationPreparation(scope Scope, r DispatchCancellationPreparation) bool {
 	p := r.Proposal.Proof
 	q := r.Request
+	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) {
+		return false
+	}
 	if r.State != "prepared" && r.State != "finalized" {
 		return false
 	}

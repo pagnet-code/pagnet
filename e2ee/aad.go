@@ -25,6 +25,7 @@ type AAD struct {
 	ProtectedContext      *ProtectedContext             `json:"protected_context,omitempty"`
 	NativeContent         *NativeContentBinding         `json:"native_content,omitempty"`
 	BrowserAccountMessage *BrowserAccountMessageBinding `json:"browser_account_message,omitempty"`
+	BrowserAccountReply   *BrowserAccountReplyBinding   `json:"browser_account_reply,omitempty"`
 }
 
 // CanonicalBytes returns the canonical serialization of the AAD: compact
