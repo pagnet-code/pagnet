@@ -82,7 +82,8 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	emit(session.SessionEvent{Type: session.EventTurnOutput, Output: "diagnostic note must remain transient"})
 	plan := &session.PlanSnapshot{Source: "codex", NativeTurnID: "actual-vendor-turn", Entries: []session.PlanEntry{{Text: "private original plan", Status: "in_progress"}}}
 	emit(session.SessionEvent{Type: session.EventPlanUpdated, Plan: plan})
-	emit(session.SessionEvent{Type: session.EventTurnCompleted})
+	final := &session.FinalOutput{Version: 1, TextBlocks: []string{"  private final answer\n", "", "€\tend  "}}
+	emit(session.SessionEvent{Type: session.EventTurnCompleted, FinalOutput: final})
 	if err = j.Settle(ctx, 1, "completed", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +112,9 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	}
 	if rows[1].OutputContent == nil || rows[3].PlanContent == nil || rows[1].Event.Output != "" || rows[3].Event.Plan != nil {
 		t.Fatal("private task content projection leaked or lost original references")
+	}
+	if rows[4].OutputContent == nil || rows[4].Event.FinalOutput != nil {
+		t.Fatal("terminal final content leaked or lost encrypted reference")
 	}
 	originals := make([][]byte, len(rows))
 	for i, o := range rows {
@@ -158,7 +162,12 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 		if err != nil {
 			t.Fatal(err)
 		}
-		if o.OutputContent != nil {
+		if o.Event.Type == session.EventTurnCompleted {
+			var recovered session.FinalOutput
+			if mime != "application/json" || json.Unmarshal(opened, &recovered) != nil || !reflect.DeepEqual(&recovered, final) {
+				t.Fatal("original final blocks changed")
+			}
+		} else if o.OutputContent != nil {
 			if mime != "text/plain; charset=utf-8" {
 				t.Fatal("original text MIME changed")
 			}
@@ -181,8 +190,19 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 		if err != nil {
 			t.Fatal(err)
 		}
-		if original.Event.Output != "" || original.Event.Plan != nil {
+		if original.Event.Output != "" || original.Event.FinalOutput != nil || original.Event.Plan != nil {
 			t.Fatal("source duplicated full content instead of authenticated complete reference")
+		}
+		if o.Event.Type == session.EventTurnCompleted {
+			original.Event.FinalOutput = final
+			duplicate := o
+			duplicate.Capture, raw, err = sealNativeCapture(owner.captureKey, scope, dir, duplicate, original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = OpenNativeSourceCapture(owner.captureKey, scope, dir, duplicate, raw); err == nil {
+				t.Fatal("duplicate final plaintext alongside encrypted content accepted")
+			}
 		}
 	}
 	if !bytes.Equal(reconstructed.Bytes(), secret) {
@@ -190,7 +210,7 @@ func TestActualProducerTaskTextAndPlanOriginalCipherSurviveRotationReopen(t *tes
 	}
 	for _, name := range []string{"intents.sqlite", "intents.sqlite-wal"} {
 		raw, _ := os.ReadFile(filepath.Join(dir, name))
-		if bytes.Contains(raw, []byte("private original output")) || bytes.Contains(raw, []byte("private original plan")) {
+		if bytes.Contains(raw, []byte("private original output")) || bytes.Contains(raw, []byte("private original plan")) || bytes.Contains(raw, []byte("private final answer")) {
 			t.Fatal("private task body leaked to SQLite")
 		}
 	}

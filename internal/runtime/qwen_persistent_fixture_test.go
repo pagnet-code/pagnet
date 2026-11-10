@@ -21,6 +21,7 @@ package runtime
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -943,4 +944,61 @@ func TestQwenDO_HumanTurnNotOnMachineStream(t *testing.T) {
 	feedLines(t, s, messageStopLine(t, fixtureSID))
 	evs = feedLines(t, s, assistantLine(t, fixtureSID, "test-model", 1, 1, 0))
 	assertEventTypes(t, evs)
+}
+
+func TestQwenDO_FinalOutputPreservesNativeBlocks(t *testing.T) {
+	for _, blocks := range [][]string{{"  final\n", "", "€\tanswer  "}, {""}, nil} {
+		t.Run(fmt.Sprintf("blocks-%d", len(blocks)), func(t *testing.T) {
+			s, _ := newFixtureState(false, "")
+			feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+			s.beginMachineTurn("turn-1", "hello")
+			feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+			feedLines(t, s, streamDeltaLine(t, fixtureSID, "interim text must not become final"))
+			var content []qwenDOContent
+			for _, text := range blocks {
+				content = append(content, qwenDOContent{Type: "text", Text: text})
+			}
+			msg, _ := json.Marshal(qwenDOMessage{Role: "assistant", Content: content})
+			line := marshalLine(t, qwenDOEvent{Type: "assistant", SessionID: fixtureSID, Message: msg})
+			evs := feedLines(t, s, line)
+			assertEventTypes(t, evs, session.EventTurnCompleted)
+			if evs[0].Output != "" {
+				t.Fatal("terminal answer changed transcript semantics")
+			}
+			if blocks == nil {
+				if evs[0].FinalOutput != nil {
+					t.Fatal("missing text invented final output")
+				}
+			} else if evs[0].FinalOutput == nil || evs[0].FinalOutput.Version != 1 || !reflect.DeepEqual(evs[0].FinalOutput.TextBlocks, blocks) {
+				t.Fatal("native final blocks changed")
+			}
+			assertEventTypes(t, feedLines(t, s, line, messageStopLine(t, fixtureSID)))
+		})
+	}
+}
+
+func TestQwenDO_ProviderFailureHasNoFinalOutput(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"))
+	evs := feedLines(t, s, assistantTextLine(t, fixtureSID, "model", "429 Too Many Requests: rate limit exceeded", 1, 1, 0))
+	assertEventTypes(t, evs, session.EventTurnFailed)
+	if evs[0].FinalOutput != nil {
+		t.Fatal("provider failure published a final answer")
+	}
+}
+
+func TestQwenDO_FinalOutputAcrossGroupsDropsToolStep(t *testing.T) {
+	s, _ := newFixtureState(false, "")
+	feedLines(t, s, validHandshakeLine(t, fixtureSID, fixtureCWD))
+	s.beginMachineTurn("turn-1", "hello")
+	feedLines(t, s, userTextLine(t, fixtureSID, "hello"), messageStartLine(t, fixtureSID))
+	feedLines(t, s, assistantTextLine(t, fixtureSID, "model", "interim tool introduction", 1, 1, 0), assistantToolUseLine(t, fixtureSID, "model", 1, 1, 0), messageStopLine(t, fixtureSID), userToolResultLine(t, fixtureSID), messageStartLine(t, fixtureSID))
+	assertEventTypes(t, feedLines(t, s, assistantTextLine(t, fixtureSID, "model", "first\n", 1, 1, 0), assistantTextLine(t, fixtureSID, "model", " second", 1, 1, 0)))
+	evs := feedLines(t, s, messageStopLine(t, fixtureSID))
+	assertEventTypes(t, evs, session.EventTurnCompleted)
+	if evs[0].FinalOutput == nil || !reflect.DeepEqual(evs[0].FinalOutput.TextBlocks, []string{"first\n", " second"}) {
+		t.Fatal("tool step contaminated final native block sequence")
+	}
 }

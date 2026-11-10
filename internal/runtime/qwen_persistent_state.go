@@ -117,10 +117,11 @@ type qwenTurnState struct {
 	// interaction (ask_user_question) stays in flight until the human
 	// answers (the answer is a tool_result user event starting the next
 	// step).
-	messageOpen      bool   // inside message_start..message_stop
-	stepTextFinalize bool   // a text-only assistant finalize in this step
-	stepToolUse      bool   // a tool_use assistant finalize in this step
-	stepFinalText    string // the step's accumulated final text-only answer text
+	messageOpen      bool     // inside message_start..message_stop
+	stepTextFinalize bool     // a text-only assistant finalize in this step
+	stepToolUse      bool     // a tool_use assistant finalize in this step
+	stepFinalBlocks  []string // ordered native text blocks, never stream deltas
+	stepFinalText    string   // the step's accumulated final text-only answer text
 
 	// machine submit correlation (B6)
 	machineTurnID   string
@@ -515,6 +516,7 @@ func (s *qwenTurnState) processUser(ev qwenDOEvent) []session.SessionEvent {
 		if c.Type == "tool_result" {
 			s.stepToolUse = false
 			s.stepFinalText = ""
+			s.stepFinalBlocks = nil
 			return nil
 		}
 	}
@@ -574,6 +576,7 @@ func (s *qwenTurnState) processStreamEvent(ev qwenDOEvent) []session.SessionEven
 		s.stepTextFinalize = false
 		s.stepToolUse = false
 		s.stepFinalText = ""
+		s.stepFinalBlocks = nil
 		return nil
 	case "content_block_delta":
 		// Only text_delta is a transcript chunk. Other delta types
@@ -659,7 +662,11 @@ func (s *qwenTurnState) processAssistant(ev qwenDOEvent) []session.SessionEvent 
 	// later carries a tool_use does not complete (its text is dropped at
 	// the next step boundary).
 	for _, c := range msg.Content {
-		if c.Type == "text" && c.Text != "" {
+		if c.Type == "text" {
+			s.stepFinalBlocks = append(s.stepFinalBlocks, c.Text)
+			if c.Text == "" {
+				continue
+			}
 			if s.stepFinalText == "" {
 				s.stepFinalText = c.Text
 			} else {
@@ -688,7 +695,9 @@ func (s *qwenTurnState) completeStepLocked() []session.SessionEvent {
 	s.stepTextFinalize = false
 	s.stepToolUse = false
 	finalText := s.stepFinalText
+	finalBlocks := s.stepFinalBlocks
 	s.stepFinalText = ""
+	s.stepFinalBlocks = nil
 	if !s.turnActive {
 		return nil
 	}
@@ -714,7 +723,12 @@ func (s *qwenTurnState) completeStepLocked() []session.SessionEvent {
 				RetryAt:     retryAt,
 			}}
 		}
+		var finalOutput *session.FinalOutput
+		if len(finalBlocks) > 0 {
+			finalOutput = &session.FinalOutput{Version: 1, TextBlocks: finalBlocks}
+		}
 		return []session.SessionEvent{{
+			FinalOutput:  finalOutput,
 			Type:         session.EventTurnCompleted,
 			SessionID:    sid,
 			TurnID:       turnID,
@@ -738,6 +752,7 @@ func (s *qwenTurnState) endTurnLocked() {
 	s.inInput, s.inOutput, s.inCached = 0, 0, 0
 	s.inModel = ""
 	s.stepFinalText = ""
+	s.stepFinalBlocks = nil
 }
 
 // --- interaction / permission protocol (doc §6) -----------------------------
