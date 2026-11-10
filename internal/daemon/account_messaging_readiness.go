@@ -24,15 +24,18 @@ type accountMessagingReadinessConnection struct {
 	cancel   context.CancelFunc
 	queue    chan func()
 	// Captured socket writer; injectable for connection-boundary tests.
-	write  func([]byte, func() bool) error
-	lookup func(string) (*InstanceRow, bool, error)
-	mu     sync.Mutex
+	write        func([]byte, func() bool) error
+	lookup       func(string) (*InstanceRow, bool, error)
+	mu           sync.Mutex
+	subscription *accountMessagingReadinessSubscription
+	loadKeyring  func(string) (*crypto.Keyring, error)
 }
 
 func newAccountMessagingReadinessConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection) *accountMessagingReadinessConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &accountMessagingReadinessConnection{d: d, socket: socket, native: native, networks: make(map[string]transport.NetworkCryptoPayload), seen: make(map[string]bool), ctx: ctx, cancel: cancel, queue: make(chan func(), 32), write: func(raw []byte, guard func() bool) error { return d.writeGuarded(socket, raw, guard) }}
 	c.lookup = d.state.GetInstance
+	c.loadKeyring = func(network string) (*crypto.Keyring, error) { return crypto.LoadKeyring(d.StateDir, network) }
 	go c.run()
 	return c
 }
@@ -55,7 +58,12 @@ func (c *accountMessagingReadinessConnection) enqueue(f func()) {
 // Cancellation never waits for filesystem/SQLite calls. A blocked local read
 // may retain this one worker until the OS/database returns; subsequent checks
 // suppress its writes, and it never migrates to a replacement connection.
-func (c *accountMessagingReadinessConnection) close() { c.cancel() }
+func (c *accountMessagingReadinessConnection) close() {
+	c.cancel()
+	if c.subscription != nil {
+		c.subscription.clear()
+	}
+}
 func (c *accountMessagingReadinessConnection) run() {
 	defer func() { c.mu.Lock(); clear(c.networks); c.mu.Unlock(); clear(c.seen) }()
 	for {
@@ -80,6 +88,10 @@ func (c *accountMessagingReadinessConnection) network(env transport.Envelope) {
 	c.handleNetwork(env)
 }
 func (c *accountMessagingReadinessConnection) offer(env transport.Envelope) {
+	if c.subscription != nil {
+		c.subscription.handle(env)
+		return
+	}
 	if len(env.Payload) > transport.AccountMessagingReadinessMaxPayload {
 		return
 	}
@@ -129,10 +141,26 @@ func (c *accountMessagingReadinessConnection) send(typ string, p any, guards ...
 }
 
 func (c *accountMessagingReadinessConnection) handleAdmission() {
-	if _, ok := c.session(); !ok || c.hello {
+	s, ok := c.session()
+	if !ok || c.hello {
 		return
 	}
 	c.hello = true
+	if c.subscription != nil {
+		for _, feature := range s.ProtocolFeatures {
+			if feature == transport.AccountMessagingReadinessSubscriptionProtocol {
+				c.subscription.enabled.Store(true)
+				break
+			}
+		}
+	}
+	if c.subscription != nil && !c.usesSubscription() {
+		return
+	}
+	if c.usesSubscription() {
+		c.send(transport.MsgAccountMessagingReadinessHello, transport.AccountMessagingReadinessSubscriptionHelloPayload{V: 2, Protocol: transport.AccountMessagingReadinessSubscriptionProtocol, Reset: false})
+		return
+	}
 	c.send(transport.MsgAccountMessagingReadinessHello, transport.AccountMessagingReadinessHelloPayload{V: 1, Protocol: transport.AccountMessagingReadinessProtocol})
 }
 
@@ -151,6 +179,12 @@ func (c *accountMessagingReadinessConnection) handleNetwork(env transport.Envelo
 	c.networks[p.NetworkID] = p
 	c.mu.Unlock()
 	if exists && old == p {
+		return
+	}
+	if c.subscription != nil {
+		if c.usesSubscription() {
+			c.localEvidenceChanged()
+		}
 		return
 	}
 	c.enqueue(func() {

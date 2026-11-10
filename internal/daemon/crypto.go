@@ -139,6 +139,8 @@ func (m *cryptoManager) hostPublic(id *crypto.HostIdentity) transport.CryptoHost
 // true; a failed self-test reports selfTestOk=false (a clean ack) so the
 // server can decide, never a half-activated state.
 func (d *Daemon) doCryptoActivate(p transport.CryptoActivatePayload) (any, error) {
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	id, err := d.cryptoManager().hostIdentity()
 	if err != nil {
 		return nil, err
@@ -201,6 +203,8 @@ func (d *Daemon) doCryptoKeyPackage(p transport.CryptoKeyPackagePayload) (any, e
 // target host opens the key package with its X25519 private key and stores
 // the network keyring. A clean ack (no result) signals success.
 func (d *Daemon) doCryptoInstallKeyPackage(p transport.CryptoInstallKeyPackagePayload) (any, error) {
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	id, err := d.cryptoManager().hostIdentity()
 	if err != nil {
 		return nil, err
@@ -263,6 +267,8 @@ func (d *Daemon) doCryptoVerify(p transport.CryptoVerifyPayload) (any, error) {
 // epoch, marking the previous one rotated (retained customer-side to read
 // history). The control plane records only the new epoch id.
 func (d *Daemon) doCryptoRotate(p transport.CryptoRotatePayload) (any, error) {
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if p.PossessionProtocol != "" && p.PossessionProtocol != transport.NetworkEpochPossessionProtocol {
 		return nil, fmt.Errorf("crypto: unsupported possession protocol")
 	}
