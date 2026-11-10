@@ -192,6 +192,8 @@ func (d *Daemon) doNativeForget(conn *websocket.Conn, p transport.ForgetInstance
 	if ok {
 		d.removeWorktree(row)
 	}
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if err = d.state.DeleteInstance(p.InstanceID); err != nil {
 		return err
 	}

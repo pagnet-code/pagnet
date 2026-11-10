@@ -339,9 +339,11 @@ type Daemon struct {
 	sessions *session.Manager
 
 	// Live host connection (for the bridge relay; nil while disconnected).
-	connMu     sync.Mutex
-	curConn    *websocket.Conn
-	nativeConn *NativeObservationConnection // guarded by connMu; exact socket lifetime
+	connMu                    sync.Mutex
+	curConn                   *websocket.Conn
+	nativeConn                *NativeObservationConnection         // guarded by connMu; exact socket lifetime
+	accountReadiness          *accountMessagingReadinessConnection // guarded by connMu
+	accountReadinessMutations int                                  // guarded by connMu, spans reconnects
 	// websocket.Conn allows ONE concurrent writer; the heartbeat, command
 	// acks, and bridge relay all share the connection, so writes serialize.
 	writeMu sync.Mutex
@@ -1143,8 +1145,18 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn := d.nativeConnection(conn)
 	nativeConn.offeredSnapshotSigningPublicKey = snapshotSigningPublicKey
 	defer nativeConn.Close()
-	accountReadiness := newAccountMessagingReadinessConnection(d, conn, nativeConn)
+	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
+	d.connMu.Lock()
+	d.accountReadiness = accountReadiness
+	d.connMu.Unlock()
+	defer func() {
+		d.connMu.Lock()
+		if d.accountReadiness == accountReadiness {
+			d.accountReadiness = nil
+		}
+		d.connMu.Unlock()
+	}()
 	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
 	defer shareBindings.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
@@ -1407,7 +1419,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			accountReadiness.networkCrypto(env)
 			continue
 		}
-		if env.Type == transport.MsgAccountMessagingReadinessOffer {
+		if env.Type == transport.MsgAccountMessagingReadinessOffer || env.Type == transport.MsgAccountMessagingReadinessReset || env.Type == transport.MsgAccountMessagingReadinessSnapshotComplete || env.Type == transport.MsgAccountMessagingReadinessAccepted {
 			accountReadiness.offer(env)
 			continue
 		}
@@ -2821,6 +2833,8 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 	} else {
 		row.AgentMDPath = path
 	}
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if err := d.state.UpsertInstance(row); err != nil {
 		if lock != nil {
 			lock.Unlock()
@@ -3032,7 +3046,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	}
 	d.invalidateBridgeNonce(instanceID)    // S1: the activation's bridge credential dies with the process
 	d.invalidateHostedSideport(instanceID) // the dead activation advertises no sideport
-	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err
 	}
 	_ = d.send(conn, transport.MsgAgentStopped, map[string]any{
@@ -3075,6 +3089,8 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the instance is gone for good
 	d.invalidateHostedSideport(instanceID)
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if err := d.state.DeleteInstance(instanceID); err != nil {
 		return err
 	}
@@ -3112,7 +3128,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	if err := d.state.SetInstanceSession(instanceID, ""); err != nil {
 		return err
 	}
-	if err := d.state.SetInstanceStatus(instanceID, "idle", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(instanceID, "idle", ""); err != nil {
 		return err
 	}
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": instanceID})
@@ -3168,7 +3184,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		// Wake establishes the endpoint; it is not a user prompt. Submitting
 		// a fabricated wake turn consumes provider work and holds the FIFO
 		// ahead of the durable message/task that actually caused this wake.
-		if err := d.state.SetInstanceStatus(instanceID, "waking", ""); err != nil {
+		if err := d.setReadinessInstanceStatus(instanceID, "waking", ""); err != nil {
 			return err
 		}
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": "waking"})
@@ -3185,7 +3201,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 					if errors.Is(err, context.Canceled) {
 						status = row.Status
 					}
-					_ = d.state.SetInstanceStatus(instanceID, status, "")
+					_ = d.setReadinessInstanceStatus(instanceID, status, "")
 				}
 				_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": status})
 				d.reportEndpointStatus(conn, instanceID)
@@ -3284,7 +3300,7 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 		}
 		d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
 		d.invalidateHostedSideport(instanceID)
-		_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
+		_ = d.setReadinessInstanceStatus(instanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": instanceID, "sessionId": row.SessionID,
 			"reason": reason,
@@ -3693,7 +3709,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.turnMu.Unlock()
 	}()
 
-	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
 	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
@@ -3759,7 +3775,7 @@ legacyTurnEvents:
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID,
 				ev.Type == agentruntime.EventSessionResumed)
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 		case agentruntime.EventSessionLost:
 			plans.pending = nil
 			plansClosed = true
@@ -3822,7 +3838,7 @@ legacyTurnEvents:
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case failedKind != "":
@@ -3842,7 +3858,7 @@ legacyTurnEvents:
 		}
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, st, sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case errors.Is(turnErr, context.Canceled):
@@ -3891,7 +3907,7 @@ legacyTurnEvents:
 			"instance", spec.InstanceID, "kind", kind, "error", turnErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+turnErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, turnErr)
 	case turnErr != nil:
@@ -3900,7 +3916,7 @@ legacyTurnEvents:
 			"instance", spec.InstanceID, "error", turnErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", turnErr)
 	case !completed:
@@ -3923,7 +3939,7 @@ legacyTurnEvents:
 		// attach or terminal keeps the instance awake (idle, session
 		// active); hibernation happens when the last one is closed.
 		if d.attached(spec.InstanceID) || d.terminal.active(spec.InstanceID) {
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "idle", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "idle",
 			})
@@ -3939,7 +3955,7 @@ legacyTurnEvents:
 		// token burn: the instance simply waits until a human answers in
 		// the native TUI (attach) and the resolution clears it.
 		if pendingInteraction && !interactionDeferrable {
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", sessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "blocked",
 			})
@@ -3952,7 +3968,7 @@ legacyTurnEvents:
 		// pending interaction is safe to hibernate under — the interaction
 		// is durable and the instance wakes on the next work/resolve.)
 		d.invalidateBridgeNonce(spec.InstanceID) // S1: the turn process (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
 			"reason": "turn_completed",
@@ -3991,7 +4007,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	// (re)activation).
 	sess := d.prepareSession(row, spec)
 
-	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
 	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
@@ -4075,7 +4091,7 @@ turnEvents:
 		case session.EventSessionStarted, session.EventSessionResumed:
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID, ev.Type == session.EventSessionResumed)
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 			// Phase 3 (A5/G8, strengthened): the capture onto the
 			// endpoint's PTY exists from the LAUNCH site (the driver's
 			// PTYAvailable hook adopted the master at registration — its
@@ -4144,7 +4160,7 @@ turnEvents:
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case outcomeTurnFailed:
@@ -4159,7 +4175,7 @@ turnEvents:
 		}
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, st, sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case outcomeTurnInterrupted:
@@ -4178,7 +4194,7 @@ turnEvents:
 			"instance", spec.InstanceID, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "interrupted:the runtime stopped before this turn finished", nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, string(domain.AgentStatusInterrupted), sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, string(domain.AgentStatusInterrupted), sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (interrupted)
 		return fmt.Errorf("turn interrupted: %v", submitErr)
 	case outcomeNoFailureQueued:
@@ -4212,7 +4228,7 @@ turnEvents:
 			"instance", spec.InstanceID, "kind", kind, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+submitErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, submitErr)
 	case outcomeProcessError:
@@ -4222,7 +4238,7 @@ turnEvents:
 			"instance", spec.InstanceID, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+submitErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", submitErr)
 	default: // outcomeCompleted
@@ -4230,7 +4246,7 @@ turnEvents:
 		// idle, not hibernated) — the PID is stable across turns. An
 		// explicit hibernate (a separate operation) stops the endpoint,
 		// preserving the session for a later wake.
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "idle", sessionID)
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 			"instanceId": spec.InstanceID, "status": "idle",
 		})
@@ -4526,7 +4542,7 @@ func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) err
 					if ev.Type == session.EventSessionResumed {
 						persistID = ev.SessionID
 					}
-					_ = d.state.SetInstanceStatus(row.InstanceID, "working", persistID)
+					_ = d.setReadinessInstanceStatus(row.InstanceID, "working", persistID)
 				case session.EventSessionLost:
 					// Surfaced via the error below (invariant F).
 				}
@@ -4541,7 +4557,7 @@ func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) err
 				// Drop the local reference and block until a human explicitly
 				// restarts (cold start). Same handling as the turn path.
 				_ = d.state.SetInstanceSession(row.InstanceID, "")
-				_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
+				_ = d.setReadinessInstanceStatus(row.InstanceID, "blocked", "")
 				d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
 				d.Log.Warn("activation lost the session; instance blocked",
 					"instance", row.InstanceID)
@@ -4565,7 +4581,7 @@ func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) err
 		// clobber its "working". The endpoint view is ensured regardless
 		// (observational + idempotent).
 		if !d.turnInFlight(row.InstanceID) {
-			_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
+			_ = d.setReadinessInstanceStatus(row.InstanceID, "idle", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": row.InstanceID, "status": "idle",
 			})
@@ -4739,7 +4755,7 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	// interactive process is running. A busy instance simply keeps its
 	// turn (process-per-turn) while the PTY runs alongside it.
 	if row.Status == "hibernated" {
-		_ = d.state.SetInstanceStatus(p.InstanceID, "idle", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "idle", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 			"instanceId": p.InstanceID, "status": "idle",
 		})
@@ -4813,7 +4829,7 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 			return d.hibernateInstance(conn, p.InstanceID, "attach_closed")
 		}
 		d.invalidateBridgeNonce(p.InstanceID) // S1: the turn process (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
 			// No PTY is involved (or it is gone): other sessions on this
@@ -4851,7 +4867,7 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 			return d.hibernateInstance(conn, p.InstanceID, "stopped")
 		}
 		d.invalidateBridgeNonce(p.InstanceID) // S1: the PTY (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
 			// The stop endpoint already told its clients "stopped".
