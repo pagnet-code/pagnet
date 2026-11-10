@@ -68,6 +68,16 @@ func (o *SessionOwner) captureOriginalTaskContent(event session.SessionEvent, ob
 		purpose, mime = "native_turn_output", "text/plain; charset=utf-8"
 		plain = []byte(event.Output)
 	case session.EventTurnCompleted, session.EventTurnFailed:
+		if event.Type == session.EventTurnCompleted && event.FinalOutput != nil {
+			purpose, mime = "native_turn_output", "application/json"
+			var err error
+			plain, err = canonicalNativeJSON(event.FinalOutput)
+			if err != nil {
+				observation.SourceContentUnavailable = true
+				return nil
+			}
+			break
+		}
 		if event.Output == "" {
 			return nil
 		}

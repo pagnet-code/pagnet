@@ -221,3 +221,31 @@ func TestAggregatePrivateCaptureBoundAndAcknowledgedReclamation(t *testing.T) {
 		t.Fatal("aggregate bound exceeded")
 	}
 }
+
+func TestFinalOutputEncodedSizeLimitBeforeCapture(t *testing.T) {
+	j, _ := testJournal(t)
+	owner := &SessionOwner{ctx: context.Background(), journal: j, generation: "native-generation"}
+	// JSON escaping exceeds the limit even though the original text does not.
+	final := &session.FinalOutput{Version: 1, TextBlocks: []string{string(bytes.Repeat([]byte{0}, transport.NativeContentMaxPlaintextBytes/4))}}
+	err := owner.nativeEventObserver(j.scope.InstanceID)(session.SessionEvent{Type: session.EventTurnCompleted, SessionID: "native-session", FinalOutput: final})
+	if !errors.Is(err, ErrNativeOutputLimit) {
+		t.Fatal("oversize structured terminal output was not bounded", err)
+	}
+	if sourceCount(t, j, "worker_observations") != 0 {
+		t.Fatal("oversize terminal output entered source journal")
+	}
+}
+
+func TestFinalOutputCaptureEmptyAndFailure(t *testing.T) {
+	owner := &SessionOwner{}
+	source := &NativeTurnSource{SourceTask: &transport.NativeTaskSource{TaskID: "task"}}
+	for _, event := range []session.SessionEvent{
+		{Type: session.EventTurnCompleted},
+		{Type: session.EventTurnFailed, FinalOutput: &session.FinalOutput{Version: 1, TextBlocks: []string{"failure is not an answer"}}},
+	} {
+		observation := NativeObservation{TurnSource: source}
+		if owner.captureOriginalTaskContent(event, &observation) != nil || observation.OutputContent != nil || observation.SourceContentUnavailable {
+			t.Fatal("empty or failed terminal invented final output capture")
+		}
+	}
+}

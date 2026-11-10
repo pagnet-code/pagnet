@@ -106,6 +106,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		// Original private details are captured above; the journal projection is metadata only.
 		event.Plan = nil
 		event.Output = ""
+		event.FinalOutput = nil
 		event.Error = ""
 		var inspection *Inspection
 		if event.Interaction != nil {
@@ -143,6 +144,7 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		captureSource := NativeSourceCapture{OutputStream: stream, Format: NativeSourceCaptureFormat, Event: originalEvent, OriginalNativePayloadContent: observation.OriginalNativePayloadContent, OriginalTurnOutputContent: observation.OutputContent, OriginalTurnPlanContent: observation.PlanContent}
 		if observation.OutputContent != nil {
 			captureSource.Event.Output = ""
+			captureSource.Event.FinalOutput = nil
 		}
 		if observation.PlanContent != nil {
 			captureSource.Event.Plan = nil
@@ -287,7 +289,16 @@ func (o *SessionOwner) nativeCapturedSourceObservers(instanceID string, producer
 		if fenced {
 			return ErrFenced
 		}
-		if (event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed) && len(event.Output) > transport.NativeContentMaxPlaintextBytes {
+		terminalBytes := len(event.Output)
+		if event.FinalOutput != nil {
+			encoded, err := canonicalNativeJSON(event.FinalOutput)
+			if err != nil {
+				return err
+			}
+			terminalBytes += len(encoded)
+			clear(encoded)
+		}
+		if (event.Type == session.EventTurnCompleted || event.Type == session.EventTurnFailed) && terminalBytes > transport.NativeContentMaxPlaintextBytes {
 			source, _, err := o.journal.NativeEventSource(context.WithoutCancel(o.ctx), generation, event)
 			if err != nil {
 				return err

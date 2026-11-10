@@ -604,6 +604,12 @@ func (o *SessionOwner) failPersistence(err error) {
 	o.mu.Unlock()
 }
 func (o *SessionOwner) record(kind string, data any, generation string, origin json.RawMessage) {
+	// Final answers belong only to encrypted native content, including when a
+	// legacy or live-only observer records the session event.
+	if event, ok := data.(session.SessionEvent); ok && event.FinalOutput != nil {
+		event.FinalOutput = nil
+		data = event
+	}
 	raw, err := json.Marshal(data)
 	if err == nil {
 		_, err = o.outputReplay().Append(generation, origin, kind, raw)
