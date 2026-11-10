@@ -26,12 +26,14 @@ var ErrUncertain = errors.New("account message commit uncertain; retry same requ
 
 // Journal never passes plaintext or plaintext digests to SQLite. Failed commits
 // retain the encrypted candidate in memory, so a retry cannot reencrypt it.
-// Durable records are immutable and deliberately have no automatic eviction.
+// Durable records remain immutable until conservative retention collection.
 type Journal struct {
-	mu      sync.Mutex
-	db      *sql.DB
-	pending map[string]Sealed
-	commit  func(*sql.Tx) error
+	mu                      sync.Mutex
+	db                      *sql.DB
+	pending                 map[string]Sealed
+	commit                  func(*sql.Tx) error
+	collectionCursor        string
+	pendingCollectionCursor string
 }
 
 func OpenJournal(dir string) (*Journal, error) {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pagnet-code/pagnet/internal/accountmessage"
 	"github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -24,11 +25,16 @@ type accountMessagingReadinessConnection struct {
 	cancel   context.CancelFunc
 	queue    chan func()
 	// Captured socket writer; injectable for connection-boundary tests.
-	write        func([]byte, func() bool) error
-	lookup       func(string) (*InstanceRow, bool, error)
-	mu           sync.Mutex
-	subscription *accountMessagingReadinessSubscription
-	loadKeyring  func(string) (*crypto.Keyring, error)
+	write          func([]byte, func() bool) error
+	lookup         func(string) (*InstanceRow, bool, error)
+	mu             sync.Mutex
+	subscription   *accountMessagingReadinessSubscription
+	loadKeyring    func(string) (*crypto.Keyring, error)
+	sealJournal    *accountmessage.Journal
+	sealReady      bool
+	sealQueueMu    sync.Mutex
+	sealQueueCount int
+	sealQueueBytes int
 }
 
 func newAccountMessagingReadinessConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection) *accountMessagingReadinessConnection {
@@ -42,16 +48,18 @@ func newAccountMessagingReadinessConnection(d *Daemon, socket *websocket.Conn, n
 
 // Overflow disables this handshake for the socket rather than losing an ordered
 // invalidation and later ACKing against stale network evidence.
-func (c *accountMessagingReadinessConnection) enqueue(f func()) {
+func (c *accountMessagingReadinessConnection) enqueue(f func()) bool {
 	select {
 	case <-c.ctx.Done():
-		return
+		return false
 	default:
 	}
 	select {
 	case c.queue <- f:
+		return true
 	default:
 		c.close()
+		return false
 	}
 }
 
@@ -66,10 +74,18 @@ func (c *accountMessagingReadinessConnection) close() {
 }
 func (c *accountMessagingReadinessConnection) run() {
 	defer func() { c.mu.Lock(); clear(c.networks); c.mu.Unlock(); clear(c.seen) }()
+	collection := time.NewTicker(time.Minute)
+	defer collection.Stop()
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
+		case <-collection.C:
+			if c.sealJournal != nil {
+				if _, err := c.sealJournal.Collect(c.ctx, time.Now()); err != nil {
+					c.sealReady = false
+				}
+			}
 		case f := <-c.queue:
 			select {
 			case <-c.ctx.Done():
@@ -159,6 +175,7 @@ func (c *accountMessagingReadinessConnection) handleAdmission() {
 	}
 	if c.usesSubscription() {
 		c.send(transport.MsgAccountMessagingReadinessHello, transport.AccountMessagingReadinessSubscriptionHelloPayload{V: 2, Protocol: transport.AccountMessagingReadinessSubscriptionProtocol, Reset: false})
+		c.admitAccountSeal(s)
 		return
 	}
 	c.send(transport.MsgAccountMessagingReadinessHello, transport.AccountMessagingReadinessHelloPayload{V: 1, Protocol: transport.AccountMessagingReadinessProtocol})

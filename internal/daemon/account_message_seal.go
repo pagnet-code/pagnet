@@ -11,44 +11,20 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// sealAccountMessage is intentionally not registered with any socket reader.
-// This foundation only stages ciphertext; readiness never grants dispatch.
+// sealAccountMessage only stages ciphertext; readiness never grants dispatch.
 func (c *accountMessagingReadinessConnection) sealAccountMessage(ctx context.Context, j *accountmessage.Journal, raw []byte) (accountmessage.Sealed, error) {
 	r, err := accountmessage.ParseSeal(raw)
 	if err != nil {
 		return accountmessage.Sealed{}, err
 	}
-	a := c.subscription
-	if a == nil || j == nil {
+	if j == nil {
 		return accountmessage.Sealed{}, errors.New("account sealing unavailable")
 	}
+	guard, err := c.accountSealGuard(r.Descriptor)
+	if err != nil {
+		return accountmessage.Sealed{}, err
+	}
 	d := r.Descriptor
-	a.mu.Lock()
-	revision, frame := a.revision, a.frame
-	route, accepted := a.accepted[d.OfferID]
-	a.mu.Unlock()
-	if !accepted || !accountSealRouteMatches(d, frame, route) {
-		return accountmessage.Sealed{}, errors.New("account seal route not accepted")
-	}
-	guard := func() bool {
-		s, ok := c.session()
-		if !ok || s.TenantID != d.TenantID || s.AccountID != d.OwnerUserID || s.HostID != d.HostID || s.RunnerID != d.RunnerID || s.RunnerEpoch.UTC().Format(time.RFC3339Nano) != d.RunnerConnectedAt {
-			return false
-		}
-		now := time.Now()
-		created, _ := time.Parse(time.RFC3339Nano, d.CreatedAt)
-		expires, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
-		if now.Before(created) || !now.Before(expires) || !now.Before(route.ExpiresAt) || !c.usesSubscription() || !c.networkMatches(d.NetworkID, d.TenantID, d.EpochID) || c.d.accountMessagingMutationActive() {
-			return false
-		}
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		current, ok := a.accepted[d.OfferID]
-		return ok && a.revision == revision && a.matches(frame) && a.complete && !c.d.accountMessagingMutationActive() && accountSealRouteMatches(d, frame, current)
-	}
-	if !guard() {
-		return accountmessage.Sealed{}, errors.New("account seal fenced")
-	}
 	row, found, err := c.lookup(d.TargetInstanceID)
 	if err != nil || !found || row.DefinitionID != d.TargetDefinitionID || row.AgentPrincipalID != d.TargetPrincipalID || row.NetworkID != d.NetworkID || (row.Status != "idle" && row.Status != "working") {
 		return accountmessage.Sealed{}, errors.New("account seal target unavailable")
@@ -67,6 +43,40 @@ func (c *accountMessagingReadinessConnection) sealAccountMessage(ctx context.Con
 	}
 	defer clear(key[:])
 	return j.Seal(ctx, r, key, guard)
+}
+
+func (c *accountMessagingReadinessConnection) accountSealGuard(d accountmessage.Descriptor) (func() bool, error) {
+	a := c.subscription
+	if a == nil {
+		return nil, errors.New("account sealing unavailable")
+	}
+	a.mu.Lock()
+	revision, frame := a.revision, a.frame
+	route, accepted := a.accepted[d.OfferID]
+	a.mu.Unlock()
+	if !accepted || !accountSealRouteMatches(d, frame, route) {
+		return nil, errors.New("account seal route not accepted")
+	}
+	guard := func() bool {
+		s, ok := c.session()
+		if !ok || s.TenantID != d.TenantID || s.AccountID != d.OwnerUserID || s.HostID != d.HostID || s.RunnerID != d.RunnerID || s.RunnerEpoch.UTC().Format(time.RFC3339Nano) != d.RunnerConnectedAt {
+			return false
+		}
+		now := time.Now()
+		created, _ := time.Parse(time.RFC3339Nano, d.CreatedAt)
+		expires, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
+		if now.Before(created) || !now.Before(expires) || !now.Before(route.ExpiresAt) || !c.usesSubscription() || !c.networkMatches(d.NetworkID, d.TenantID, d.EpochID) || c.d.accountMessagingMutationActive() {
+			return false
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		current, ok := a.accepted[d.OfferID]
+		return ok && a.revision == revision && a.matches(frame) && a.complete && !c.d.accountMessagingMutationActive() && accountSealRouteMatches(d, frame, current)
+	}
+	if !guard() {
+		return nil, errors.New("account seal fenced")
+	}
+	return guard, nil
 }
 
 func accountSealRouteMatches(d accountmessage.Descriptor, f transport.AccountMessagingReadinessSubscriptionFrame, r transport.AccountMessagingReadinessRoute) bool {
