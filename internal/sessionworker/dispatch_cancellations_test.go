@@ -3,6 +3,7 @@
 package sessionworker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -251,5 +252,68 @@ func TestCancelledOrdinalsRemainContiguousAcrossAdmissionAndReopen(t *testing.T)
 	}
 	if err = j.RetireDispatches(t.Context(), a, 3); !errors.Is(err, ErrConflict) {
 		t.Fatal("uncertain accepted effect crossed cancellation retirement", err)
+	}
+}
+
+func TestAccountMessageCancellationCanonicalPersistence(t *testing.T) {
+	j, dir, a, p := cancellationFixture(t)
+	source := accountMessageContractSource(t, "account_message_source_reply_html_v1.json")
+	p.Proof.AccountMessageSource = &source
+	ctx := context.Background()
+	prepared, err := j.PrepareDispatchCancellation(ctx, a, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRecord := func(j *Journal, state string) {
+		t.Helper()
+		var raw []byte
+		if err := j.db.QueryRow(`SELECT payload FROM worker_dispatch_cancellations WHERE preparation_id=?`, prepared.Request.PreparationID).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(raw, []byte("<>&")) || bytes.Contains(raw, []byte(`\u003c`)) {
+			t.Fatal("canonical account record HTML escaped")
+		}
+		var parsed DispatchCancellationPreparation
+		if err := json.Unmarshal(raw, &parsed); err != nil || parsed.State != state {
+			t.Fatal("account record cannot recover", err)
+		}
+	}
+	assertRecord(j, "prepared")
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(dir, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := lease(t, j)
+	repeated, err := j.PrepareDispatchCancellation(ctx, b, p)
+	if err != nil || !reflect.DeepEqual(prepared, repeated) {
+		t.Fatal("reopen changed account preparation", err)
+	}
+	if err = j.FinalizeDispatchCancellation(ctx, b, cancellationReceipt(prepared)); err != nil {
+		t.Fatal(err)
+	}
+	assertRecord(j, "finalized")
+	if err = j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(dir, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	assertRecord(j, "finalized")
+}
+
+func TestAccountMessageCancellationPreservesLegacyEncoding(t *testing.T) {
+	record := DispatchCancellationPreparation{Proposal: transport.NativeDispatchCancellationProposal{Reason: "legacy <>&"}}
+	expected, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := encodeDispatchCancellationPreparation(record)
+	if err != nil || !bytes.Equal(actual, expected) {
+		t.Fatal("legacy cancellation encoding changed", err)
 	}
 }

@@ -51,20 +51,21 @@ type NativeSpec struct {
 }
 
 type Operation struct {
-	SourceAdmissionID string                            `json:"sourceAdmissionId,omitempty"`
-	SourceCommandID   string                            `json:"sourceCommandId,omitempty"`
-	SourceInvocation  *transport.NativeInvocationSource `json:"sourceInvocation,omitempty"`
-	SourceTask        *transport.NativeTaskSource       `json:"sourceTask,omitempty"`
-	Input             string                            `json:"input,omitempty"`
-	InputKind         string                            `json:"inputKind,omitempty"`
-	NativeGeneration  string                            `json:"nativeGeneration,omitempty"`
-	NativeSessionID   string                            `json:"nativeSessionId,omitempty"`
-	InteractionID     string                            `json:"interactionId,omitempty"`
-	OptionID          string                            `json:"optionId,omitempty"`
-	InspectionProof   string                            `json:"inspectionProof,omitempty"`
-	Data              []byte                            `json:"data,omitempty"`
-	Rows              uint16                            `json:"rows,omitempty"`
-	Cols              uint16                            `json:"cols,omitempty"`
+	SourceAccountMessage *transport.NativeAccountMessageSource `json:"sourceAccountMessage,omitempty"`
+	SourceAdmissionID    string                                `json:"sourceAdmissionId,omitempty"`
+	SourceCommandID      string                                `json:"sourceCommandId,omitempty"`
+	SourceInvocation     *transport.NativeInvocationSource     `json:"sourceInvocation,omitempty"`
+	SourceTask           *transport.NativeTaskSource           `json:"sourceTask,omitempty"`
+	Input                string                                `json:"input,omitempty"`
+	InputKind            string                                `json:"inputKind,omitempty"`
+	NativeGeneration     string                                `json:"nativeGeneration,omitempty"`
+	NativeSessionID      string                                `json:"nativeSessionId,omitempty"`
+	InteractionID        string                                `json:"interactionId,omitempty"`
+	OptionID             string                                `json:"optionId,omitempty"`
+	InspectionProof      string                                `json:"inspectionProof,omitempty"`
+	Data                 []byte                                `json:"data,omitempty"`
+	Rows                 uint16                                `json:"rows,omitempty"`
+	Cols                 uint16                                `json:"cols,omitempty"`
 }
 
 type NativeSnapshot struct {

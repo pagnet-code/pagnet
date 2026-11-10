@@ -1,6 +1,7 @@
 package sessionworker
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -81,6 +82,9 @@ func (j *Journal) initializeDispatchCancellations() error {
 func validCancellationPreparation(scope Scope, r DispatchCancellationPreparation) bool {
 	p := r.Proposal.Proof
 	q := r.Request
+	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) {
+		return false
+	}
 	if r.State != "prepared" && r.State != "finalized" {
 		return false
 	}
@@ -187,7 +191,7 @@ func (j *Journal) PrepareDispatchCancellation(ctx context.Context, lease int64, 
 	if count >= maxCommands {
 		return record, ErrFull
 	}
-	raw, err = json.Marshal(record)
+	raw, err = encodeDispatchCancellationPreparation(record)
 	if err != nil || len(raw) > 16384 {
 		return record, ErrFull
 	}
@@ -228,7 +232,7 @@ func (j *Journal) FinalizeDispatchCancellation(ctx context.Context, lease int64,
 		return err
 	}
 	record.State = "finalized"
-	raw, err = json.Marshal(record)
+	raw, err = encodeDispatchCancellationPreparation(record)
 	if err != nil {
 		return err
 	}
@@ -263,4 +267,19 @@ func RetireDispatchCancellationsTx(ctx context.Context, tx *sql.Tx, ownershipID 
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM worker_dispatch_cancellations WHERE dispatch_sequence<=? AND state='finalized'`, floor)
 	return err
+}
+
+// Preserve legacy record bytes. Account sources require no HTML escaping at
+// the outer record too, so their canonical nested wire survives recovery.
+func encodeDispatchCancellationPreparation(record DispatchCancellationPreparation) ([]byte, error) {
+	if record.Proposal.Proof.AccountMessageSource == nil {
+		return json.Marshal(record)
+	}
+	var b bytes.Buffer
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(record); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
