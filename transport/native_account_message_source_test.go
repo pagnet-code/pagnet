@@ -13,7 +13,12 @@ import (
 
 func accountContractFixture(t *testing.T) (NativeAccountMessageSource, e2ee.AAD, NativeDispatchProof) {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/account_message_source_reply_v1.json")
+	return accountContractFixtureFile(t, "account_message_source_reply_v1.json")
+}
+
+func accountContractFixtureFile(t *testing.T, name string) (NativeAccountMessageSource, e2ee.AAD, NativeDispatchProof) {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,5 +188,86 @@ func TestNativeAccountReplyFragmentsAndBindingRequirements(t *testing.T) {
 		if a.ValidateScope() == nil {
 			t.Fatal("invalid account reply scope accepted", field)
 		}
+	}
+}
+
+func TestNativeAccountCanonicalHTMLVector(t *testing.T) {
+	s, a, p := accountContractFixtureFile(t, "account_message_source_reply_html_v1.json")
+	if err := s.ValidateReplyAAD(a, p); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(s.CanonicalJSON()), "<>&") || !strings.Contains(string(a.CanonicalBytes()), "<>&") {
+		t.Fatal("HTML characters escaped")
+	}
+	for _, raw := range []string{strings.Replace(string(s.CanonicalJSON()), "<", `\u003c`, 1), strings.Replace(string(s.CanonicalJSON()), "{", "{ ", 1), strings.Replace(string(s.CanonicalJSON()), `"v":1,"messageId":`, `"messageId":`, 1)} {
+		var parsed NativeAccountMessageSource
+		if json.Unmarshal([]byte(raw), &parsed) == nil {
+			t.Fatal("noncanonical source accepted")
+		}
+	}
+	// Move the version field after messageId while preserving valid JSON.
+	raw := string(s.CanonicalJSON())
+	raw = strings.Replace(raw, `"v":1,`, "", 1)
+	raw = strings.Replace(raw, `"bindingDigest":`, `"v":1,"bindingDigest":`, 1)
+	var parsed NativeAccountMessageSource
+	if json.Unmarshal([]byte(raw), &parsed) == nil {
+		t.Fatal("reordered source accepted")
+	}
+}
+
+func TestNativeAccountReplyRejectsNoncanonicalOuterAndNativeContent(t *testing.T) {
+	_, a, _ := accountContractFixtureFile(t, "account_message_source_reply_html_v1.json")
+	raw := string(a.CanonicalBytes())
+	for _, changed := range []string{
+		strings.Replace(raw, `"protocol_version":2,`, `"protocol_version":2,"unknown":true,`, 1),
+		strings.Replace(raw, `"protocol_version":2,`, `"protocol_version":2,"protocol_version":2,`, 1),
+		strings.Replace(raw, `"tenant_id":`, `"Tenant_id":`, 1),
+		strings.Replace(raw, `"protocol_version":2,`, `"network_id":"ignored","protocol_version":2,`, 1),
+		strings.Replace(raw, `"native_content":{`, `"native_content":{"unknown":true,`, 1),
+		strings.Replace(raw, `"observation_id":`, `"observation_id":"ignored","observation_id":`, 1),
+		strings.Replace(raw, `"native_generation":`, `"Native_generation":`, 1),
+		strings.Replace(raw, `"fragment_count":1,`, `"fragment_count":1.0,`, 1),
+		strings.Replace(raw, `"content_id":`, `"content_id" :`, 1),
+		strings.Replace(raw, "<", `\u003c`, 1),
+		strings.Replace(raw, "{", "{ ", 1),
+	} {
+		if !json.Valid([]byte(changed)) {
+			t.Fatal("invalid negative JSON fixture")
+		}
+		var parsed e2ee.AAD
+		if json.Unmarshal([]byte(changed), &parsed) == nil {
+			t.Fatal("noncanonical reply AAD accepted", changed)
+		}
+	}
+	// Valid JSON with reordered outer fields and reordered NativeContent fields.
+	for _, field := range []string{`"protocol_version":2,`, `"fragment_count":1,`} {
+		changed := strings.Replace(raw, field, "", 1)
+		if field == `"protocol_version":2,` {
+			changed = strings.Replace(changed, `"network_id":`, field+`"network_id":`, 1)
+		} else {
+			changed = strings.Replace(changed, `"native_generation":`, field+`"native_generation":`, 1)
+		}
+		if !json.Valid([]byte(changed)) {
+			t.Fatal("invalid negative JSON fixture")
+		}
+		var parsed e2ee.AAD
+		if json.Unmarshal([]byte(changed), &parsed) == nil {
+			t.Fatal("reordered reply AAD accepted")
+		}
+	}
+	a.BrowserAccountReply.ReplyID = a.BrowserAccountReply.MessageID
+	a.ObjectID = a.BrowserAccountReply.MessageID
+	if a.ValidateScope() == nil {
+		t.Fatal("reply reused original message identity")
+	}
+}
+
+func TestNativeAccountReplyStrictParsingPreservesLegacyAAD(t *testing.T) {
+	a := e2ee.AAD{NetworkID: "original"}
+	if err := json.Unmarshal([]byte(`null`), &a); err != nil || a.NetworkID != "original" {
+		t.Fatal("legacy null decode changed", err)
+	}
+	if err := json.Unmarshal([]byte(`{"unknown":true,"Network_id":"first","network_id":"last"}`), &a); err != nil || a.NetworkID != "last" {
+		t.Fatal("legacy AAD decoding changed", err)
 	}
 }

@@ -474,6 +474,5 @@ func accountMessageSourceJSON(source *transport.NativeAccountMessageSource) stri
 	if source == nil {
 		return ""
 	}
-	raw, _ := json.Marshal(source)
-	return string(raw)
+	return string(source.CanonicalJSON())
 }

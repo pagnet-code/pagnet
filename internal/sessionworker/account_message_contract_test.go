@@ -13,9 +13,13 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-func accountMessageContractSource(t *testing.T) transport.NativeAccountMessageSource {
+func accountMessageContractSource(t *testing.T, names ...string) transport.NativeAccountMessageSource {
 	t.Helper()
-	raw, err := os.ReadFile("../../transport/testdata/account_message_source_reply_v1.json")
+	name := "account_message_source_reply_v1.json"
+	if len(names) > 0 {
+		name = names[0]
+	}
+	raw, err := os.ReadFile("../../transport/testdata/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}

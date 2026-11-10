@@ -90,7 +90,7 @@ func (a AAD) validateBrowserAccountReplyBinding() error {
 		}
 	}
 	turn, turnErr := strconv.ParseInt(strings.TrimPrefix(b.LogicalTurnID, "pagnet-worker-turn-"), 10, 64)
-	if b.Format != BrowserAccountReplyBindingFormat || b.Delegate.Kind != BrowserAccountDelegateSenderKind || b.DispatchSequence <= 0 || turnErr != nil || turn <= 0 || b.LogicalTurnID != fmt.Sprintf("pagnet-worker-turn-%d", turn) || a.ProtocolVersion != 2 || a.TenantID == "" || a.NetworkID == "" || a.Sender == "" || a.CreatedAt == "" || a.Recipient != b.Delegate.ID || a.KeyEpochID != b.OriginalEpochID || a.ProtectedContext != nil || a.BrowserAccountMessage != nil || a.NativeContent == nil {
+	if b.Format != BrowserAccountReplyBindingFormat || b.ReplyID == b.MessageID || b.Delegate.Kind != BrowserAccountDelegateSenderKind || b.DispatchSequence <= 0 || turnErr != nil || turn <= 0 || b.LogicalTurnID != fmt.Sprintf("pagnet-worker-turn-%d", turn) || a.ProtocolVersion != 2 || a.TenantID == "" || a.NetworkID == "" || a.Sender == "" || a.CreatedAt == "" || a.Recipient != b.Delegate.ID || a.KeyEpochID != b.OriginalEpochID || a.ProtectedContext != nil || a.BrowserAccountMessage != nil || a.NativeContent == nil {
 		return invalid
 	}
 	n := a.NativeContent

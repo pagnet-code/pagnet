@@ -27,8 +27,15 @@ func (s *NativeAccountMessageSource) UnmarshalJSON(raw []byte) error {
 	if err := DecodeOwnerTextConsolePayload(raw, &parsed); err != nil {
 		return err
 	}
-	*s = NativeAccountMessageSource(parsed)
-	return s.Validate()
+	candidate := NativeAccountMessageSource(parsed)
+	if !bytes.Equal(raw, candidate.CanonicalJSON()) {
+		return errors.New("noncanonical account message source")
+	}
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	*s = candidate
+	return nil
 }
 
 func (s NativeAccountMessageSource) Validate() error {
@@ -76,4 +83,16 @@ func (s NativeAccountMessageSource) ValidateReplyAAD(a e2ee.AAD, p NativeDispatc
 	}
 	return nil
 }
-func mustAccountSourceJSON(s NativeAccountMessageSource) []byte { b, _ := json.Marshal(s); return b }
+
+// CanonicalJSON is the authenticated source wire v1 encoding. Callers must use
+// this method rather than json.Marshal, which escapes HTML characters.
+func (s NativeAccountMessageSource) CanonicalJSON() []byte {
+	var b bytes.Buffer
+	encoder := json.NewEncoder(&b)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(s); err != nil {
+		panic("account message source canonical encoding")
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
+}
+func mustAccountSourceJSON(s NativeAccountMessageSource) []byte { return s.CanonicalJSON() }
