@@ -197,7 +197,7 @@ func (j *Journal) projectInvocationRangeTx(ctx context.Context, tx *sql.Tx, key 
 		payload.Terminal = h.Terminal
 	}
 	payload.Proof.ByteLength = len(payload.Data)
-	plain, err := json.Marshal(payload)
+	plain, err := MarshalNativeJSON(payload)
 	if err != nil {
 		return err
 	}

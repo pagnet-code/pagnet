@@ -139,7 +139,7 @@ func invocationPrivateAAD(j *Journal, generation string, sequence int64) []byte 
 	return raw
 }
 func (j *Journal) sealInvocationCheckpoint(key []byte, h invocationStreamCheckpoint) ([]byte, error) {
-	raw, err := json.Marshal(h)
+	raw, err := MarshalNativeJSON(h)
 	if err != nil {
 		return nil, err
 	}
@@ -487,7 +487,7 @@ func (j *Journal) unsubscribeInvocationStream(ctx context.Context, key []byte, l
 }
 func invocationProjectionDigest(p InvocationStreamProjection) string {
 	p.Digest = ""
-	raw, _ := json.Marshal(p)
+	raw, _ := MarshalNativeJSON(p)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

@@ -47,9 +47,9 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 	if ref.Purpose == "native_turn_plan" {
 		attached = observation.PlanContent
 	}
-	expected, _ := json.Marshal(attached)
-	actual, _ := json.Marshal(ref)
-	if attached == nil || string(expected) != string(actual) {
+	expected, expectedErr := MarshalNativeJSON(attached)
+	actual, actualErr := MarshalNativeJSON(ref)
+	if expectedErr != nil || actualErr != nil || attached == nil || string(expected) != string(actual) {
 		return errors.New("encrypted transfer is not attached to exact observation")
 	}
 
@@ -88,7 +88,7 @@ func insertOriginalTransfer(ctx context.Context, tx *sql.Tx, observation NativeO
 	}
 	rows := make([][]byte, len(transfer.Fragments))
 	for i, fragment := range transfer.Fragments {
-		raw, err := json.Marshal(fragment)
+		raw, err := MarshalNativeJSON(fragment)
 		if err != nil || len(raw) > 128<<10 {
 			return errors.New("native encrypted fragment exceeds frame bound")
 		}

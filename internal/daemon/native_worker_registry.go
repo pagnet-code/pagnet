@@ -248,7 +248,7 @@ func (r *NativeWorkerRegistry) Reserve(scope sessionworker.Scope, spec sessionwo
 	if !errors.Is(err, sql.ErrNoRows) {
 		return NativeWorkerRecord{}, err
 	}
-	raw, err := json.Marshal(record)
+	raw, err := marshalNativeWorkerRecord(record)
 	if err != nil || len(raw) > 256<<10 {
 		return NativeWorkerRecord{}, errors.New("native worker registry record exceeds bound")
 	}
@@ -329,7 +329,7 @@ func (r *NativeWorkerRegistry) claimLaunch(record NativeWorkerRecord, boot trans
 		current.LaunchBoot = &boot
 	}
 	current.LaunchState = "launching"
-	raw, err := json.Marshal(current)
+	raw, err := marshalNativeWorkerRecord(current)
 	if err != nil || len(raw) > 256<<10 {
 		return false, errors.New("native worker registry record exceeds bound")
 	}
@@ -363,7 +363,7 @@ func (r *NativeWorkerRegistry) startLaunch(ctx context.Context, record NativeWor
 		// Start proved that no process exists. Clear only this exact claim.
 		current.LaunchBoot = nil
 		current.LaunchState = "reserved"
-		raw, marshalErr := json.Marshal(current)
+		raw, marshalErr := marshalNativeWorkerRecord(current)
 		if marshalErr != nil {
 			return false, errors.Join(err, marshalErr)
 		}
@@ -411,15 +411,15 @@ func (r *NativeWorkerRegistry) BindOwnership(record NativeWorkerRecord, ownershi
 		previous.RetiredFloor = 0
 		next.LastDispatchSequence = 0
 		next.RetiredFloor = 0
-		a, _ := json.Marshal(previous)
-		b, _ := json.Marshal(next)
+		a, _ := marshalNativeWorkerRecord(previous)
+		b, _ := marshalNativeWorkerRecord(next)
 		if string(a) != string(b) {
 			return errors.New("original native ownership receipt cannot be mutated")
 		}
 	}
 	current.OriginalOwnershipID = ownership.ID
 	current.Ownership = &ownership
-	raw, err := json.Marshal(current)
+	raw, err := marshalNativeWorkerRecord(current)
 	if err != nil {
 		return err
 	}

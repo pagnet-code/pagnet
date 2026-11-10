@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/transport"
@@ -19,7 +18,7 @@ func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnec
 		if err != nil {
 			return err
 		}
-		raw, err := json.Marshal(env)
+		raw, err := transport.MarshalNativeJSON(env)
 		if err != nil {
 			return err
 		}

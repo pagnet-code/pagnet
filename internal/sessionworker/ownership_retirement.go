@@ -18,7 +18,7 @@ func (j *Journal) CommitOwnershipRetirement(ctx context.Context, lease int64, pr
 	if proof.DeletionProof != nil && (proof.DeletionProof.StopProof.OwnershipID != proof.ID || proof.DeletionProof.StopProof.OwnershipGeneration != proof.OwnershipGeneration || proof.DeletionProof.StopProof.DispatchSequence <= 0 || proof.DeletionProof.StopProof.DispatchSequence > proof.LastDispatchSequence || proof.DeletionProof.DeleteRequestID == "") {
 		return ErrConflict
 	}
-	raw, err := json.Marshal(proof)
+	raw, err := MarshalNativeJSON(proof)
 	if err != nil {
 		return err
 	}

@@ -132,7 +132,7 @@ func NativeBackendObservation(o NativeObservation) (transport.NativeObservationP
 		}
 		body = p
 	}
-	raw, err := json.Marshal(body)
+	raw, err := MarshalNativeJSON(body)
 	if err != nil || len(raw) > nativeBackendMaxPayload {
 		return transport.NativeObservationPayload{}, ErrFull
 	}

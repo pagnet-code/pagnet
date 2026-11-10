@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
@@ -160,7 +159,7 @@ func (c *NativeObservationConnection) stageWorkerContent(ctx context.Context, o 
 			if f == nil || f.ContentID != ref.ContentID || f.Ordinal != ordinal {
 				return false, ErrNativeObservationConflict
 			}
-			raw, err := json.Marshal(f)
+			raw, err := transport.MarshalNativeJSON(f)
 			if err != nil || len(raw) > 128<<10 {
 				return false, ErrNativeObservationCapacity
 			}
