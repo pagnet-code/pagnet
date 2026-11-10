@@ -48,6 +48,9 @@ func (c ProtectedContext) Validate() error {
 	return nil
 }
 func (a AAD) ValidateScope() error {
+	if err := a.validateBrowserAccountMessageBinding(); err != nil {
+		return err
+	}
 	if err := a.validateNativeContentBinding(); err != nil {
 		return err
 	}
