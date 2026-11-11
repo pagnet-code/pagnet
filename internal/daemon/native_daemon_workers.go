@@ -137,6 +137,7 @@ func (d *Daemon) nativeConfiguration(row *InstanceRow, scope sessionworker.Scope
 		return sessionworker.NativeSpec{}, err
 	}
 	spec := sessionworker.NativeSpec{Runtime: rn, Binary: binary, PrefixArgs: prefix, NativeDirs: dirs, Env: append(append([]string(nil), d.RuntimeEnv...), env...), Workspace: row.Workspace, Model: row.Model, StandingInstructions: standing, MCPExecutable: d.selfExe, NetworkID: row.NetworkID, Kind: row.Kind, TenantID: scope.TenantID, ContextStateDir: d.StateDir, NetworkStateDir: d.StateDir}
+	spec.AccountMessageExecutionEnabled = d.AccountMessageExecutionEnabled && rn == domain.RuntimeQwenCode
 	spec.InitialNativeSessionID = row.SessionID
 	if row.NetworkID != "" {
 		m := d.cryptoManager()
