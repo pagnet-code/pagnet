@@ -61,6 +61,9 @@ type Config struct {
 	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
 	// It enables encrypted staging only, never managed runtime dispatch.
 	AccountMessageSealEnabled bool
+	// AccountMessageExecutionEnabled is a separate native managed-Qwen gate.
+	// Sealing readiness never enables execution. The default is OFF.
+	AccountMessageExecutionEnabled bool
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard

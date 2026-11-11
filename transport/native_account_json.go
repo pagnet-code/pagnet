@@ -222,6 +222,12 @@ func NativeAccountJSONContracts(value any) ([]*NativeAccountMessageSource, []e2e
 				return err
 			}
 			return collect(v.AAD)
+		case AccountMessagePayload:
+			return collect(v.NativeDispatch)
+		case *AccountMessagePayload:
+			if v != nil {
+				return collect(*v)
+			}
 		case *NetworkEventPayload:
 			if v != nil {
 				return collect(*v)
@@ -276,6 +282,8 @@ func collectNativePayload(kind string, raw json.RawMessage, collect func(any) er
 		target = new(RestartAgentPayload)
 	case MsgDeliverNetworkEvent:
 		target = new(NetworkEventPayload)
+	case MsgAccountMessage:
+		target = new(AccountMessagePayload)
 	case MsgAttachTerminal:
 		target = new(TerminalAttachPayload)
 	case MsgTerminalStop:
