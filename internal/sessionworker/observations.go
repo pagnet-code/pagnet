@@ -394,6 +394,10 @@ func (j *Journal) acknowledgeObservation(ctx context.Context, lease int64, id, d
 	if json.Unmarshal(payload, &observation) != nil {
 		return ErrConflict
 	}
+	if (observation.TurnSource != nil && observation.TurnSource.SourceAccountMessage != nil) || (observation.OutputContent != nil && observation.OutputContent.Purpose == "browser_account_reply") {
+		// Generic receipts cannot prove durable account reply delivery.
+		return ErrFenced
+	}
 	observation.SourceSequence = sourceSequence
 	if err = j.settleResourceObservationTx(ctx, tx, observation, receipt, captureKey); err != nil {
 		return err
