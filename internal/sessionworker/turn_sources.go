@@ -205,13 +205,19 @@ func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (N
 
 func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	var task, invocation string
-	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation)
+	var task, invocation, account string
+	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation, &account)
 	if err == nil && task != "" {
 		err = json.Unmarshal([]byte(task), &source.SourceTask)
 	}
 	if err == nil && invocation != "" {
 		err = json.Unmarshal([]byte(invocation), &source.SourceInvocation)
+	}
+	if err == nil && account != "" {
+		err = json.Unmarshal([]byte(account), &source.SourceAccountMessage)
+	}
+	if err == nil && ((source.InputKind == "account_message") != (source.SourceAccountMessage != nil) || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage)) {
+		err = ErrConflict
 	}
 	return source, err
 }

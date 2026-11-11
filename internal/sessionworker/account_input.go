@@ -22,16 +22,22 @@ func validateAccountOperation(op Operation, p transport.NativeDispatchProof) err
 }
 
 func (j *Journal) initializeAccountInputs() error {
+	tx, err := j.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS worker_account_inputs(sequence INTEGER PRIMARY KEY,command_id TEXT NOT NULL UNIQUE,source BLOB NOT NULL,proof BLOB NOT NULL,envelope BLOB NOT NULL)`,
 		`CREATE TRIGGER IF NOT EXISTS worker_account_inputs_no_update BEFORE UPDATE ON worker_account_inputs BEGIN SELECT RAISE(ABORT,'immutable account input'); END`,
-		`CREATE TRIGGER IF NOT EXISTS worker_account_inputs_no_delete BEFORE DELETE ON worker_account_inputs BEGIN SELECT RAISE(ABORT,'immutable account input'); END`,
+		`DROP TRIGGER IF EXISTS worker_account_inputs_no_delete`,
+		`CREATE TRIGGER worker_account_inputs_no_delete BEFORE DELETE ON worker_account_inputs WHEN NOT EXISTS(SELECT 1 FROM worker_dispatches d WHERE d.operation_sequence=OLD.sequence AND d.command_id=OLD.command_id AND d.proof=OLD.proof AND d.state IN ('completed','failed','resource_interrupted','owner_stopped') AND d.dispatch_sequence<=(SELECT retired FROM worker_dispatch_meta WHERE singleton=1) AND d.operation_sequence<=(SELECT retired FROM worker_meta WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM worker_turn_sources t WHERE t.sequence=OLD.sequence) AND NOT EXISTS(SELECT 1 FROM worker_observations o WHERE json_extract(o.payload,'$.turnSource.sequence')=OLD.sequence) AND NOT EXISTS(SELECT 1 FROM worker_output_spools p WHERE p.sequence=OLD.sequence) AND NOT EXISTS(SELECT 1 FROM worker_terminal_reservations r WHERE r.sequence=OLD.sequence) AND NOT EXISTS(SELECT 1 FROM worker_resource_interruptions r WHERE r.sequence=OLD.sequence) AND NOT EXISTS(SELECT 1 FROM worker_resource_settlements r WHERE r.sequence=OLD.sequence AND r.finished=0) AND NOT EXISTS(SELECT 1 FROM worker_terminal_view_commits v WHERE v.operation_sequence=OLD.sequence AND v.committed=0)) BEGIN SELECT RAISE(ABORT,'original account input remains retained'); END`,
 	} {
-		if _, err := j.db.Exec(q); err != nil {
+		if _, err := tx.Exec(q); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func accountInputBytes(op Operation, p transport.NativeDispatchProof) ([]byte, []byte, []byte, error) {
@@ -43,6 +49,9 @@ func accountInputBytes(op Operation, p transport.NativeDispatchProof) ([]byte, [
 		return nil, nil, nil, err
 	}
 	envelope, err := json.Marshal(op.SealedAccountMessage)
+	if err == nil && (len(envelope) > accountmessage.MaxFrameBytes || len(proof) > accountmessage.MaxFrameBytes || len(op.SourceAccountMessage.CanonicalJSON()) > accountmessage.MaxFrameBytes) {
+		err = ErrFull
+	}
 	return op.SourceAccountMessage.CanonicalJSON(), proof, envelope, err
 }
 
@@ -74,6 +83,15 @@ func (j *Journal) admitAccountInput(ctx context.Context, tx *sql.Tx, sequence in
 	now := time.Now()
 	if current == nil || current.Scope != j.scope || current.NetworkID != d.NetworkID || current.Kind != "worker" || current.NativeAdmissionID != p.SourceAdmissionID || current.RunnerID != p.SourceRunnerID || !current.RunnerEpoch.Equal(p.SourceRunnerEpoch) || current.BootID != p.SourceBootID || d.TenantID != j.scope.TenantID || d.OwnerUserID != j.scope.AccountID || d.HostID != j.scope.HostID || d.TargetInstanceID != j.scope.InstanceID || d.RunnerID != p.SourceRunnerID || !connected.Equal(p.SourceRunnerEpoch) || now.Before(created) || !now.Before(expires) {
 		return ErrConflict
+	}
+	// Retain originals until the settled dispatch and its source evidence drain.
+	// Backpressure bounds unresolved storage; safe retirement replenishes it.
+	var retained int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM worker_account_inputs`).Scan(&retained); err != nil {
+		return err
+	}
+	if retained >= maxCommands {
+		return ErrFull
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO worker_account_inputs(sequence,command_id,source,proof,envelope) VALUES(?,?,?,?,?)`, sequence, p.SourceCommandID, source, proof, envelope)
 	return err

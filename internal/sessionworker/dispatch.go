@@ -340,10 +340,16 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_resource_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
+	// The validated acknowledged floor and drained original sources make the
+	// input unnecessary. Delete alongside its dispatch, retaining the durable
+	// retired floor so an old command can never regain execution authority.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_account_inputs WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
 		return err
 	}
 	var ownershipRaw string

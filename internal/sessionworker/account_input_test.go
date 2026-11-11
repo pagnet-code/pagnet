@@ -3,13 +3,17 @@
 package sessionworker
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"github.com/pagnet-code/pagnet/internal/accountmessage"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -150,5 +154,150 @@ func TestAccountInputAdmissionRollsBack(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAccountInputNativeSourceRoundTripAndReopen(t *testing.T) {
+	j, dir := testJournal(t)
+	l := lease(t, j)
+	op, p, current := accountInputFixture(t, j, l)
+	out, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", accountInputPayload(t, op), func() (*Admission, error) { return current, nil }, &p)
+	if err != nil || !run {
+		t.Fatal("admit", run, err)
+	}
+	source := NativeTurnSource{Sequence: out.Sequence, LogicalTurnID: logicalWorkerTurn(out.Sequence), NativeGeneration: "account-generation", NativeSessionID: "account-session", SourceCommandID: p.SourceCommandID, SourceAdmissionID: p.SourceAdmissionID, InputKind: "account_message", SourceAccountMessage: op.SourceAccountMessage}
+	for i := 0; i < 2; i++ {
+		if err := j.BindNativeTurn(t.Context(), source); err != nil {
+			t.Fatal("bind", i, err)
+		}
+	}
+	check := func(j *Journal) {
+		t.Helper()
+		tx, err := j.db.BeginTx(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := readNativeTurn(t.Context(), tx, source.NativeGeneration, source.LogicalTurnID)
+		_ = tx.Rollback()
+		if err != nil || stored.SourceAccountMessage == nil || !bytes.Equal(stored.SourceAccountMessage.CanonicalJSON(), source.SourceAccountMessage.CanonicalJSON()) || stored.SourceCommandID != source.SourceCommandID || stored.SourceAdmissionID != source.SourceAdmissionID {
+			t.Fatal("read lost account source", err)
+		}
+		event, unavailable, err := j.NativeEventSource(t.Context(), source.NativeGeneration, session.SessionEvent{Type: session.EventTurnCompleted, TurnID: source.LogicalTurnID, SessionID: source.NativeSessionID})
+		if err != nil || unavailable || event == nil || event.SourceAccountMessage == nil || !bytes.Equal(event.SourceAccountMessage.CanonicalJSON(), source.SourceAccountMessage.CanonicalJSON()) {
+			t.Fatal("event lost account source", unavailable, err)
+		}
+	}
+	check(j)
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j, err = OpenJournal(dir, testScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	check(j)
+	var state string
+	if err := j.db.QueryRow(`SELECT state FROM worker_intent WHERE sequence=?`, out.Sequence).Scan(&state); err != nil || state != "uncertain" {
+		t.Fatal("recovery state", state, err)
+	}
+}
+
+func TestAccountInputRetirementBoundsRetention(t *testing.T) {
+	j, _ := testJournal(t)
+	l := lease(t, j)
+	op, p, current := accountInputFixture(t, j, l)
+	payload := accountInputPayload(t, op)
+	for n := int64(1); n <= maxCommands+1; n++ {
+		p.DispatchSequence, p.SourceCommandID = n, domain.NewID().String()
+		out, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", payload, func() (*Admission, error) { return current, nil }, &p)
+		if err != nil || !run {
+			t.Fatal("admit", n, run, err)
+		}
+		if err := j.Settle(t.Context(), out.Sequence, "completed", nil); err != nil {
+			t.Fatal(n, err)
+		}
+		if err := j.Acknowledge(t.Context(), l, out.Sequence); err != nil {
+			t.Fatal(n, err)
+		}
+		if err := j.RetireDispatches(t.Context(), l, n); err != nil {
+			t.Fatal("retire", n, err)
+		}
+		var retained int
+		if err := j.db.QueryRow(`SELECT COUNT(*) FROM worker_account_inputs`).Scan(&retained); err != nil || retained != 0 {
+			t.Fatal("retained retired input", n, retained, err)
+		}
+		if _, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", payload, nil, &p); !errors.Is(err, ErrRetired) || run {
+			t.Fatal("retired replay", n, run, err)
+		}
+	}
+}
+
+func TestAccountInputRetainsUncertainAndUnresolvedTurns(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		name := "uncertain"
+		if bound {
+			name = "unresolved-turn"
+		}
+		t.Run(name, func(t *testing.T) {
+			j, _ := testJournal(t)
+			l := lease(t, j)
+			op, p, current := accountInputFixture(t, j, l)
+			out, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", accountInputPayload(t, op), func() (*Admission, error) { return current, nil }, &p)
+			if err != nil || !run {
+				t.Fatal("admit", run, err)
+			}
+			state := "uncertain"
+			if bound {
+				source := NativeTurnSource{Sequence: out.Sequence, LogicalTurnID: logicalWorkerTurn(out.Sequence), NativeGeneration: "unresolved-account", NativeSessionID: "account-session", SourceCommandID: p.SourceCommandID, SourceAdmissionID: p.SourceAdmissionID, InputKind: "account_message", SourceAccountMessage: op.SourceAccountMessage}
+				if err := j.BindNativeTurn(t.Context(), source); err != nil {
+					t.Fatal(err)
+				}
+				state = "completed"
+			}
+			if err := j.Settle(t.Context(), out.Sequence, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := j.Acknowledge(t.Context(), l, out.Sequence); err != nil {
+				t.Fatal(err)
+			}
+			if err := j.RetireDispatches(t.Context(), l, p.DispatchSequence); err == nil {
+				t.Fatal("retired retained input")
+			}
+			if _, err := j.db.Exec(`DELETE FROM worker_account_inputs WHERE sequence=?`, out.Sequence); err == nil {
+				t.Fatal("deleted retained input")
+			}
+			var retained int
+			if err := j.db.QueryRow(`SELECT COUNT(*) FROM worker_account_inputs WHERE sequence=?`, out.Sequence).Scan(&retained); err != nil || retained != 1 {
+				t.Fatal("lost retained input", retained, err)
+			}
+		})
+	}
+}
+
+func TestAccountInputRejectsOversizedEnvelope(t *testing.T) {
+	j, _ := testJournal(t)
+	l := lease(t, j)
+	op, p, current := accountInputFixture(t, j, l)
+	original := op.SourceAccountMessage
+	d := accountmessage.Descriptor(original.Descriptor)
+	envelope, err := e2ee.Encrypt(make([]byte, accountmessage.MaxFrameBytes), [32]byte{1}, d.AAD(d.BindingDigest()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed := accountmessage.Sealed{V: 1, MessageID: d.MessageID, BindingDigest: d.BindingDigest(), Descriptor: d, Envelope: envelope}
+	sealed.SealedDigest = sealed.Digest()
+	source := *original
+	source.SealedDigest = sealed.SealedDigest
+	op.SourceAccountMessage, op.SealedAccountMessage, p.AccountMessageSource = &source, &envelope, &source
+	_, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", accountInputPayload(t, op), func() (*Admission, error) { return current, nil }, &p)
+	if !errors.Is(err, ErrFull) || run {
+		t.Fatal("oversized envelope", run, err)
+	}
+	for _, table := range []string{"worker_account_inputs", "worker_dispatches", "worker_intent"} {
+		var count int
+		if err := j.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil || count != 0 {
+			t.Fatal("partial oversized admission", table, count, err)
+		}
 	}
 }
