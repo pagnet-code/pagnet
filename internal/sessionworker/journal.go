@@ -50,9 +50,9 @@ type Outcome struct {
 	Result          json.RawMessage    `json:"result,omitempty"`
 }
 
-// Journal stores only intent digests and outcomes. Prompt bodies, arbitrary
-// runtime environments, host credentials and native approval secrets are not
-// written into this journal. Every admission is committed before native effect.
+// Journal stores intent digests, outcomes, and sealed account inputs. Plaintext
+// prompt bodies, arbitrary runtime environments, host credentials and native
+// approval secrets are not written here. Admission commits before native effect.
 type Journal struct {
 	gatewayCapability    *gatewayAdmissionCapability
 	localReadiness       *localReadiness
@@ -246,6 +246,9 @@ func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (
 	if err = j.validateSourceDispositions(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeAccountInputs(); err != nil {
+		return fail(err)
+	}
 	if err = j.initializeDispatches(); err != nil {
 		return fail(err)
 	}
@@ -366,6 +369,24 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	if (sequence <= 0 && dispatch == nil) || commandID == "" || len(commandID) > 256 || kind == "" || len(kind) > 64 || len(payload) > 1<<20 || !json.Valid(payload) {
 		return out, false, errors.New("invalid or oversized intent")
 	}
+	var accountOp Operation
+	var accountFields map[string]json.RawMessage
+	_ = json.Unmarshal(payload, &accountFields)
+	accountPayload := string(accountFields["inputKind"]) == `"account_message"` || (len(accountFields["sourceAccountMessage"]) > 0 && string(accountFields["sourceAccountMessage"]) != "null") || (len(accountFields["sealedAccountMessage"]) > 0 && string(accountFields["sealedAccountMessage"]) != "null")
+	if json.Unmarshal(payload, &accountOp) == nil {
+		accountPayload = accountPayload || accountOp.InputKind == "account_message" || accountOp.SourceAccountMessage != nil || accountOp.SealedAccountMessage != nil
+	}
+	if accountPayload || dispatch != nil && dispatch.AccountMessageSource != nil {
+		if dispatch == nil || dispatch.AccountMessageSource == nil || kind != "prompt" {
+			return out, false, ErrConflict
+		}
+		if err = json.Unmarshal(payload, &accountOp); err != nil {
+			return out, false, err
+		}
+		if err = validateAccountOperation(accountOp, *dispatch); err != nil {
+			return out, false, err
+		}
+	}
 	digest := intentDigest(kind, payload)
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -419,6 +440,11 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 				return out, false, err
 			}
 		}
+		if dispatch != nil && dispatch.AccountMessageSource != nil {
+			if err = j.verifyAccountInput(ctx, tx, sequence, accountOp, *dispatch); err != nil {
+				return out, false, err
+			}
+		}
 		return out, false, tx.Commit()
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -444,6 +470,11 @@ func (j *Journal) admitDispatch(ctx context.Context, lease, sequence int64, comm
 	if dispatch != nil {
 		if !newDispatch || out.SourceAdmission == nil || out.SourceAdmission.Scope != j.scope {
 			return out, false, ErrConflict
+		}
+		if dispatch.AccountMessageSource != nil {
+			if err = j.admitAccountInput(ctx, tx, sequence, accountOp, *dispatch, out.SourceAdmission); err != nil {
+				return out, false, err
+			}
 		}
 		original := *out.SourceAdmission
 		original.NativeAdmissionID = dispatch.SourceAdmissionID

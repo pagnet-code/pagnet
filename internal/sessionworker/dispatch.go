@@ -23,9 +23,13 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		return nil, ErrConflict
 	}
 	p := req.NativeDispatch
-	// Account dispatch execution is deliberately unavailable in this contract phase.
-	if p.AccountMessageSource != nil || op.SourceAccountMessage != nil || op.InputKind == "account_message" {
-		return nil, ErrConflict
+	if p.AccountMessageSource != nil || op.SourceAccountMessage != nil || op.InputKind == "account_message" || op.SealedAccountMessage != nil {
+		if req.Kind != "prompt" || validateAccountOperation(op, *p) != nil {
+			return nil, ErrConflict
+		}
+		op.SourceCommandID = p.SourceCommandID
+		op.SourceAdmissionID = p.SourceAdmissionID
+		return MarshalNativeJSON(op)
 	}
 	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) || !transport.ValidNativeSourceUnion(op.SourceTask, op.SourceInvocation, op.SourceAccountMessage) {
 		return nil, ErrConflict
@@ -336,10 +340,16 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_resource_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
+	// The validated acknowledged floor and drained original sources make the
+	// input unnecessary. Delete alongside its dispatch, retaining the durable
+	// retired floor so an old command can never regain execution authority.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_account_inputs WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
 		return err
 	}
 	var ownershipRaw string

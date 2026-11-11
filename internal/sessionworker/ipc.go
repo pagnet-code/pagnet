@@ -333,7 +333,9 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 			var run bool
 			var err error
 			if req.Type == "dispatch" && owner != nil && req.NativeDispatch != nil {
-				if req.Payload, err = prepareDispatchOperation(req); err == nil {
+				if req.NativeDispatch.AccountMessageSource != nil && !owner.accountExecutionEnabled() {
+					err = ErrFenced
+				} else if req.Payload, err = prepareDispatchOperation(req); err == nil {
 					out, run, err = j.admitDispatch(ctx, auth.Lease, req.Sequence, req.CommandID, req.Kind, req.Payload, authorize, req.NativeDispatch)
 				}
 			} else if req.Type == "intent" && req.NativeDispatch == nil {
