@@ -375,10 +375,15 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 		}
 	}
 	err := d.Driver.Submit(ctx, sess, req, events)
-	if source.SourceAccountMessage != nil && errors.Is(err, session.ErrEndpointGone) {
-		// The manager normally retries a proven unaccepted endpoint. Account
-		// commands permit only this one submission attempt.
-		return errors.New("account native submission was not accepted")
+	if source.SourceAccountMessage != nil && err != nil {
+		// No terminal callback is guaranteed after a rejected submission. The
+		// immutable admission remains retained independently of this key pin.
+		o.releaseNativeTaskTurnPin(&source)
+		if errors.Is(err, session.ErrEndpointGone) {
+			// The manager normally retries a proven unaccepted endpoint.
+			// Account commands permit only this one submission attempt.
+			return errors.New("account native submission was not accepted")
+		}
 	}
 	return err
 }

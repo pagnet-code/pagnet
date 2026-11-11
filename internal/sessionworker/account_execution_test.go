@@ -3,6 +3,7 @@
 package sessionworker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -85,11 +86,12 @@ func TestAccountDecryptionRequiresCommittedOriginalCiphertext(t *testing.T) {
 type accountRejectedDriver struct {
 	session.Driver
 	calls int
+	err   error
 }
 
 func (d *accountRejectedDriver) Submit(context.Context, *session.RuntimeSession, session.SubmitRequest, chan<- session.SessionEvent) error {
 	d.calls++
-	return session.ErrEndpointGone
+	return d.err
 }
 func TestAccountNativeSubmitDoesNotTriggerEndpointRetry(t *testing.T) {
 	j, _ := testJournal(t)
@@ -100,11 +102,83 @@ func TestAccountNativeSubmitDoesNotTriggerEndpointRetry(t *testing.T) {
 	if err != nil || !run {
 		t.Fatal(run, err)
 	}
-	driver := &accountRejectedDriver{}
+	driver := &accountRejectedDriver{err: session.ErrEndpointGone}
 	owner := &SessionOwner{journal: j, spec: accountReplySpec(t, op), generation: "account-native", candidateTurnSource: NativeTurnSource{Sequence: out.Sequence, InputKind: "account_message", SourceCommandID: p.SourceCommandID, SourceAdmissionID: p.SourceAdmissionID, SourceAccountMessage: p.AccountMessageSource}}
 	wrapped := &ownedDriver{Driver: driver, owner: owner}
 	err = wrapped.Submit(t.Context(), &session.RuntimeSession{NativeID: "account-session"}, session.SubmitRequest{Kind: session.SubmitPrompt, TurnID: logicalWorkerTurn(out.Sequence), InputKind: "account_message", Input: "transient test plaintext"}, nil)
 	if err == nil || errors.Is(err, session.ErrEndpointGone) || driver.calls != 1 {
 		t.Fatal("account rejected submit eligible for retry", driver.calls, err)
+	}
+}
+
+func TestAccountNativeSubmitReleasesRejectedPinAndRetainsCiphertext(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"busy", session.ErrBusy},
+		{"canceled", context.Canceled},
+		{"deadline", context.DeadlineExceeded},
+		{"endpoint gone", session.ErrEndpointGone},
+		{"other rejection", errors.New("native rejection")},
+		{"accepted", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner, _, source, _, l := accountReplyOwner(t)
+			defer owner.journal.Close()
+			owner.candidateTurnSource = source
+			driver := &accountRejectedDriver{err: tc.err}
+			wrapped := &ownedDriver{Driver: driver, owner: owner}
+			var before, after []byte
+			if err := owner.journal.db.QueryRow(`SELECT envelope FROM worker_account_inputs WHERE sequence=?`, source.Sequence).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			err := wrapped.Submit(t.Context(), &session.RuntimeSession{NativeID: source.NativeSessionID}, session.SubmitRequest{Kind: session.SubmitPrompt, TurnID: source.LogicalTurnID, InputKind: "account_message", Input: "transient test plaintext"}, nil)
+			if driver.calls != 1 {
+				t.Fatal("submission attempt count", driver.calls)
+			}
+			if tc.err == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, available := owner.originalTaskContentPin(&source); !available {
+					t.Fatal("accepted turn lost terminal capture pin")
+				}
+			} else {
+				if err == nil || errors.Is(err, session.ErrEndpointGone) {
+					t.Fatal("rejection lost or became retryable", err)
+				}
+				if tc.err != session.ErrEndpointGone && !errors.Is(err, tc.err) {
+					t.Fatal("rejection changed", err)
+				}
+				if _, available := owner.originalTaskContentPin(&source); available {
+					t.Fatal("rejected turn retained original epoch pin")
+				}
+				owner.mu.Lock()
+				pins := len(owner.taskContentPins)
+				generation := owner.generation
+				owner.mu.Unlock()
+				if pins != 0 || generation != source.NativeGeneration {
+					t.Fatal("rejection retained key or retired live generation", pins, generation)
+				}
+				// Releasing a producer key is not durable retirement of the original
+				// ciphertext, dispatch, or unresolved turn authority.
+				if err = owner.journal.Settle(t.Context(), source.Sequence, "uncertain", nil); err != nil {
+					t.Fatal(err)
+				}
+				if err = owner.journal.Acknowledge(t.Context(), l, source.Sequence); err != nil {
+					t.Fatal(err)
+				}
+				if err = owner.journal.RetireDispatches(t.Context(), l, 1); err == nil {
+					t.Fatal("rejected unresolved turn retired original authority")
+				}
+				if _, err = owner.journal.db.Exec(`DELETE FROM worker_account_inputs WHERE sequence=?`, source.Sequence); err == nil {
+					t.Fatal("rejected unresolved turn deleted ciphertext")
+				}
+			}
+			if err := owner.journal.db.QueryRow(`SELECT envelope FROM worker_account_inputs WHERE sequence=?`, source.Sequence).Scan(&after); err != nil || !bytes.Equal(before, after) {
+				t.Fatal("submission changed retained ciphertext", err)
+			}
+		})
 	}
 }
