@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,5 +80,46 @@ func TestAccountMessageCommandDefaultOff(t *testing.T) {
 	d := &Daemon{}
 	if _, err := d.preflightAccountMessageCommand(nil, accountMessageCommandFixture(t)); err != errAccountMessageCommand {
 		t.Fatalf("default execution gate: %v", err)
+	}
+}
+
+func TestAccountMessageResendRechecksWorkerAfterProcessed(t *testing.T) {
+	d := newTestDaemon(t)
+	const command = "original-account-command"
+	if err := d.state.MarkProcessed(command, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	d.enqueueAccountMessage("instance", command, func() {
+		calls.Add(1)
+		close(started)
+		<-release
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("account command did not reach worker despite processed marker")
+	}
+	d.enqueueAccountMessage("instance", command, func() { calls.Add(1) })
+	close(release)
+	waitUntil(t, "account claim released", 2*time.Second, func() bool {
+		d.seenMu.Lock()
+		_, claimed := d.seen[command]
+		d.seenMu.Unlock()
+		return !claimed
+	})
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("in-flight duplicate reached worker %d times", got)
+	}
+	done := make(chan struct{})
+	d.enqueueAccountMessage("instance", command, func() { calls.Add(1); close(done) })
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("resend did not recheck immutable worker input")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("resend reached worker %d times, want 2", got)
 	}
 }

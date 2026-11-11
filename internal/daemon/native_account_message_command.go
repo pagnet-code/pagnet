@@ -12,6 +12,26 @@ import (
 
 var errAccountMessageCommand = errors.New("account message command unavailable")
 
+// A processed account command must still pass the native worker's immutable
+// input comparison on re-send. The generic processed-command fast path would
+// re-ack an altered payload carrying the same command ID without that check.
+func (d *Daemon) enqueueAccountMessage(instanceID, commandID string, job func()) {
+	d.seenMu.Lock()
+	if d.seen == nil {
+		d.seen = make(map[string]time.Time)
+	}
+	if _, claimed := d.seen[commandID]; claimed {
+		d.seenMu.Unlock()
+		return
+	}
+	d.seen[commandID] = time.Now()
+	d.seenMu.Unlock()
+	release := func() { d.releaseClaim(commandID) }
+	if !d.enqueueInstanceWithCancel(instanceID, func() { defer release(); job() }, release) {
+		release()
+	}
+}
+
 // preflightAccountMessageCommand checks only the original, ciphertext-only
 // command. The independent native worker rechecks its durable ownership and
 // source at admission; this local projection cannot grant replacement work.

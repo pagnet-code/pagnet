@@ -1922,6 +1922,34 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 				return d.doDeliver(conn, p)
 			})
 		})
+	case transport.MsgAccountMessage:
+		var p transport.AccountMessagePayload
+		// This frame is ciphertext only, but still use the bounded strict decoder
+		// so duplicate/aliased fields cannot change the original account proof.
+		if accountmessage.DecodeFrame(env.Payload, &p) != nil || p.CommandID == "" || p.InstanceID == "" {
+			return
+		}
+		d.enqueueAccountMessage(p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error {
+				source, err := d.preflightAccountMessageCommand(conn, p)
+				if err != nil {
+					return err
+				}
+				err = d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "prompt", sessionworker.Operation{
+					SealedAccountMessage: &p.Envelope, SourceAccountMessage: source, InputKind: "account_message",
+				})
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				if err != nil {
+					// The worker may have fsynced the input before its IPC reply was
+					// lost. Keep the original command pending; a resend only reads
+					// the worker's immutable journal and cannot submit again.
+					return errors.Join(ErrDeferred, errAccountMessageCommand)
+				}
+				return nil
+			})
+		})
 
 	case transport.MsgAttachTerminal:
 		var p transport.TerminalAttachPayload
