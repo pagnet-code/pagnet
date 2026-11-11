@@ -21,7 +21,7 @@ func taskPinID(source NativeTurnSource) string {
 	return source.NativeGeneration + "\x00" + source.LogicalTurnID
 }
 func (o *SessionOwner) pinOriginalTaskContent(source NativeTurnSource) {
-	if source.SourceTask == nil && source.SourceInvocation == nil {
+	if source.SourceTask == nil && source.SourceInvocation == nil && source.SourceAccountMessage == nil {
 		return
 	}
 	id := taskPinID(source)
@@ -46,7 +46,13 @@ func (o *SessionOwner) pinOriginalTaskContent(source NativeTurnSource) {
 	}
 	// Failure is retained as an unavailable source capability: a later epoch
 	// must never silently substitute for the original accepted descriptor.
-	pin.key, pin.available = loadOriginalTaskKey(o.spec, aad)
+	if source.SourceAccountMessage != nil {
+		if o.accountExecutionEnabled() {
+			pin.key, pin.available = loadOriginalAccountKey(o.spec, aad)
+		}
+	} else {
+		pin.key, pin.available = loadOriginalTaskKey(o.spec, aad)
+	}
 	o.taskContentPins[id] = pin
 }
 func loadOriginalTaskKey(spec NativeSpec, aad e2ee.AAD) ([32]byte, bool) {
@@ -85,7 +91,7 @@ func loadOriginalTaskKey(spec NativeSpec, aad e2ee.AAD) ([32]byte, bool) {
 	return key, err == nil
 }
 func (o *SessionOwner) originalTaskContentPin(source *NativeTurnSource) ([32]byte, bool) {
-	if source == nil || (source.SourceTask == nil && source.SourceInvocation == nil) {
+	if source == nil || (source.SourceTask == nil && source.SourceInvocation == nil && source.SourceAccountMessage == nil) {
 		return [32]byte{}, false
 	}
 	o.mu.Lock()

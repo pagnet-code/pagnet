@@ -101,7 +101,7 @@ func TestAccountNativeSubmitDoesNotTriggerEndpointRetry(t *testing.T) {
 		t.Fatal(run, err)
 	}
 	driver := &accountRejectedDriver{}
-	owner := &SessionOwner{journal: j, generation: "account-native", candidateTurnSource: NativeTurnSource{Sequence: out.Sequence, InputKind: "account_message", SourceCommandID: p.SourceCommandID, SourceAdmissionID: p.SourceAdmissionID, SourceAccountMessage: p.AccountMessageSource}}
+	owner := &SessionOwner{journal: j, spec: accountReplySpec(t, op), generation: "account-native", candidateTurnSource: NativeTurnSource{Sequence: out.Sequence, InputKind: "account_message", SourceCommandID: p.SourceCommandID, SourceAdmissionID: p.SourceAdmissionID, SourceAccountMessage: p.AccountMessageSource}}
 	wrapped := &ownedDriver{Driver: driver, owner: owner}
 	err = wrapped.Submit(t.Context(), &session.RuntimeSession{NativeID: "account-session"}, session.SubmitRequest{Kind: session.SubmitPrompt, TurnID: logicalWorkerTurn(out.Sequence), InputKind: "account_message", Input: "transient test plaintext"}, nil)
 	if err == nil || errors.Is(err, session.ErrEndpointGone) || driver.calls != 1 {

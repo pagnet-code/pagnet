@@ -37,7 +37,7 @@ func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose
 	var origin struct {
 		ID string `json:"id"`
 	}
-	if source == nil || sourceContentDescriptor(source) == "" || source.NativeGeneration != observation.NativeGeneration || source.NativeSessionID != observation.NativeSessionID || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.SourceCommandID == "" || source.SourceAdmissionID == "" || json.Unmarshal(observation.Origin, &origin) != nil || origin.ID == "" || observation.ObservedAt.IsZero() || (purpose != "native_turn_output" && purpose != "native_turn_plan") {
+	if source == nil || source.SourceAccountMessage != nil || sourceContentDescriptor(source) == "" || source.NativeGeneration != observation.NativeGeneration || source.NativeSessionID != observation.NativeSessionID || source.LogicalTurnID != logicalWorkerTurn(source.Sequence) || source.SourceCommandID == "" || source.SourceAdmissionID == "" || json.Unmarshal(observation.Origin, &origin) != nil || origin.ID == "" || observation.ObservedAt.IsZero() || (purpose != "native_turn_output" && purpose != "native_turn_plan") {
 		return nativecontent.Transfer{}, errors.New("original native turn source binding is incomplete")
 	}
 	aad, valid := sourceContentAAD(source)
@@ -55,6 +55,9 @@ func buildOriginalTurnContent(observation NativeObservation, instanceID, purpose
 
 func (o *SessionOwner) captureOriginalTaskContent(event session.SessionEvent, observation *NativeObservation) *nativecontent.Transfer {
 	source := observation.TurnSource
+	if source != nil && source.SourceAccountMessage != nil {
+		return o.captureOriginalAccountReply(event, observation)
+	}
 	if sourceContentDescriptor(source) == "" {
 		return nil
 	}

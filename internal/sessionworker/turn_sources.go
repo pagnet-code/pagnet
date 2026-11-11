@@ -344,7 +344,7 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	source.NativeSessionID = sess.NativeID
 	source.LogicalTurnID = req.TurnID
 	o.pinOriginalTaskContent(source)
-	if source.SourceTask != nil || source.SourceInvocation != nil {
+	if source.SourceTask != nil || source.SourceInvocation != nil || source.SourceAccountMessage != nil {
 		if _, available := o.originalTaskContentPin(&source); !available {
 			o.releaseNativeTaskTurnPin(&source)
 			return errors.New("original input crypto authority unavailable")

@@ -41,7 +41,7 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 	if observation.Resolution != nil && ref.Purpose == "interaction_answer" {
 		attached = observation.Resolution.DetailContent
 	}
-	if ref.Purpose == "native_turn_output" {
+	if ref.Purpose == "native_turn_output" || ref.Purpose == "browser_account_reply" {
 		attached = observation.OutputContent
 	}
 	if ref.Purpose == "native_turn_plan" {
@@ -66,6 +66,10 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 		if !valid || binding == nil || binding.SourceCommandID != source.SourceCommandID || binding.SourceAdmissionID != source.SourceAdmissionID || binding.LogicalTurnID != source.LogicalTurnID || ref.ManifestAAD.KeyEpochID != aad.KeyEpochID || ref.ManifestAAD.NetworkID != aad.NetworkID || ref.ManifestAAD.TenantID != aad.TenantID || ref.ManifestAAD.Recipient != aad.Recipient || !reflect.DeepEqual(ref.ManifestAAD.ProtectedContext, aad.ProtectedContext) {
 			return errors.New("encrypted turn content differs from accepted original source")
 		}
+	} else if ref.Purpose == "browser_account_reply" {
+		if observation.TurnSource == nil || observation.TurnSource.SourceAccountMessage == nil || ref.ManifestAAD.ValidateScope() != nil {
+			return errors.New("invalid encrypted account reply")
+		}
 	} else if ref.SubjectID != observation.InteractionID || ref.SubjectType != "runtime_interaction" {
 		return errors.New("encrypted interaction content differs from original source")
 	}
@@ -79,6 +83,18 @@ func validateOriginalTransfer(observation NativeObservation, transfer nativecont
 // Called in the observation admission transaction; a partial transfer never
 // becomes visible as a complete original source.
 func insertOriginalTransfer(ctx context.Context, tx *sql.Tx, observation NativeObservation, transfer nativecontent.Transfer) error {
+	if transfer.Reference.Purpose == "browser_account_reply" {
+		if observation.TurnSource == nil {
+			return ErrConflict
+		}
+		p, err := accountReplyProof(ctx, tx, *observation.TurnSource)
+		if err != nil {
+			return err
+		}
+		if err = validateAccountReply(observation, transfer.Reference, p); err != nil {
+			return err
+		}
+	}
 	if err := validateOriginalTransfer(observation, transfer); err != nil {
 		return err
 	}
@@ -201,6 +217,20 @@ func (j *Journal) verifyStoredContent() error {
 		}
 		if ref == nil || ref.ObservationID != b.observation {
 			return errors.New("stored content is not attached to its original source")
+		}
+		if ref.Purpose == "browser_account_reply" && observation.TurnSource != nil && observation.TurnSource.SourceAccountMessage != nil {
+			tx, err := j.db.Begin()
+			if err != nil {
+				return err
+			}
+			p, err := accountReplyProof(context.Background(), tx, *observation.TurnSource)
+			if err == nil {
+				err = validateAccountReply(observation, *ref, p)
+			}
+			tx.Rollback()
+			if err != nil {
+				return err
+			}
 		}
 		fragments, err := j.db.Query(`SELECT ordinal,payload,size FROM worker_content_fragments WHERE observation_id=? AND content_id=? ORDER BY ordinal`, b.observation, b.content)
 		if err != nil {

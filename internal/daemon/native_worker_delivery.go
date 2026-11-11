@@ -87,6 +87,10 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 			return after, ErrNativeObservationConflict
 		}
 		for _, o := range page.Observations {
+			if (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
+				// Account reply receipts are not implemented by this protocol.
+				return after, ErrNativeOriginAdmissionDeferred
+			}
 			var original transport.NativeObservationOrigin
 			if json.Unmarshal(o.Origin, &original) != nil || original.HostID != c.hostID {
 				return after, ErrNativeObservationConflict
