@@ -42,32 +42,33 @@ type handshake struct {
 }
 
 type Request struct {
-	HostedPeer       *HostedPeerVerificationRequest                `json:"hostedPeer,omitempty"`
-	InvocationSource *CloudInvocationSourceRequest                 `json:"invocationSource,omitempty"`
-	InvocationStream *InvocationStreamRequest                      `json:"invocationStream,omitempty"`
-	DeletionProof    *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
-	CancelProposal   *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
-	CancelReceipt    *transport.NativeDispatchCancelledPayload     `json:"cancelReceipt,omitempty"`
-	SourceReceipt    *transport.NativeObservationReceiptPayload    `json:"sourceReceipt,omitempty"`
-	Ownership        *transport.NativeWorkerOwnership              `json:"ownership,omitempty"`
-	NativeDispatch   *transport.NativeDispatchProof                `json:"nativeDispatch,omitempty"`
-	ContentID        string                                        `json:"contentId,omitempty"`
-	ContentOrdinal   int                                           `json:"contentOrdinal,omitempty"`
-	CaptureOffset    int                                           `json:"captureOffset,omitempty"`
-	ReplayGeneration string                                        `json:"replayGeneration,omitempty"`
-	ActivationOrigin *ActivationOrigin                             `json:"activationOrigin,omitempty"`
-	ObservationID    string                                        `json:"observationId,omitempty"`
-	SourceDigest     string                                        `json:"sourceDigest,omitempty"`
-	Admission        *Admission                                    `json:"admission,omitempty"`
-	HostedSideport   *agentbridge.HostedFabricSideport             `json:"hostedSideport,omitempty"`
-	Relay            *BridgeResult                                 `json:"relay,omitempty"`
-	Cursor           int64                                         `json:"cursor,omitempty"`
-	Limit            int                                           `json:"limit,omitempty"`
-	Type             string                                        `json:"type"`
-	Sequence         int64                                         `json:"sequence,omitempty"`
-	CommandID        string                                        `json:"commandId,omitempty"`
-	Kind             string                                        `json:"kind,omitempty"`
-	Payload          json.RawMessage                               `json:"payload,omitempty"`
+	AccountReplyReceipt *transport.NativeAccountReplyReceiptPayload   `json:"accountReplyReceipt,omitempty"`
+	HostedPeer          *HostedPeerVerificationRequest                `json:"hostedPeer,omitempty"`
+	InvocationSource    *CloudInvocationSourceRequest                 `json:"invocationSource,omitempty"`
+	InvocationStream    *InvocationStreamRequest                      `json:"invocationStream,omitempty"`
+	DeletionProof       *transport.NativeOwnershipDeletionProof       `json:"deletionProof,omitempty"`
+	CancelProposal      *transport.NativeDispatchCancellationProposal `json:"cancelProposal,omitempty"`
+	CancelReceipt       *transport.NativeDispatchCancelledPayload     `json:"cancelReceipt,omitempty"`
+	SourceReceipt       *transport.NativeObservationReceiptPayload    `json:"sourceReceipt,omitempty"`
+	Ownership           *transport.NativeWorkerOwnership              `json:"ownership,omitempty"`
+	NativeDispatch      *transport.NativeDispatchProof                `json:"nativeDispatch,omitempty"`
+	ContentID           string                                        `json:"contentId,omitempty"`
+	ContentOrdinal      int                                           `json:"contentOrdinal,omitempty"`
+	CaptureOffset       int                                           `json:"captureOffset,omitempty"`
+	ReplayGeneration    string                                        `json:"replayGeneration,omitempty"`
+	ActivationOrigin    *ActivationOrigin                             `json:"activationOrigin,omitempty"`
+	ObservationID       string                                        `json:"observationId,omitempty"`
+	SourceDigest        string                                        `json:"sourceDigest,omitempty"`
+	Admission           *Admission                                    `json:"admission,omitempty"`
+	HostedSideport      *agentbridge.HostedFabricSideport             `json:"hostedSideport,omitempty"`
+	Relay               *BridgeResult                                 `json:"relay,omitempty"`
+	Cursor              int64                                         `json:"cursor,omitempty"`
+	Limit               int                                           `json:"limit,omitempty"`
+	Type                string                                        `json:"type"`
+	Sequence            int64                                         `json:"sequence,omitempty"`
+	CommandID           string                                        `json:"commandId,omitempty"`
+	Kind                string                                        `json:"kind,omitempty"`
+	Payload             json.RawMessage                               `json:"payload,omitempty"`
 }
 
 type Response struct {
@@ -567,6 +568,16 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		if err == nil {
 			response.Output = &page
 		}
+	case "delivery_observations":
+		var page NativeObservationPage
+		page, err = o.journal.DeliveryObservationsForLease(ctx, lease, req.Limit)
+		if err == nil {
+			response.Observations = page.Observations
+			page.Observations = nil
+			response.ObservationPage = &page
+		}
+	case "account_reply_ack":
+		err = o.journal.AcknowledgeAccountReplyObservation(ctx, lease, req.ObservationID, req.SourceDigest, req.AccountReplyReceipt)
 	case "observations":
 		var page NativeObservationPage
 		page, err = o.journal.ObservationPageForLease(ctx, lease, req.Cursor, req.Limit)

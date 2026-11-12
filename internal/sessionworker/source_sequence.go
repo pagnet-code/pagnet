@@ -26,8 +26,9 @@ func LifecycleSourceType(eventType string) string {
 	}
 }
 
-func (j *Journal) initializeSourceSequences() error {
+func (j *Journal) initializeSourceSequenceTables() error {
 	for _, query := range []string{
+		`CREATE TABLE IF NOT EXISTS worker_account_reply_sequence_protocol(version INTEGER PRIMARY KEY CHECK(version=1))`,
 		`CREATE TABLE IF NOT EXISTS worker_source_sequence_protocol(singleton INTEGER PRIMARY KEY CHECK(singleton=1))`,
 		`CREATE TABLE IF NOT EXISTS worker_source_stream(origin_id TEXT PRIMARY KEY,last_sequence INTEGER NOT NULL CHECK(last_sequence>0))`,
 		`CREATE TABLE IF NOT EXISTS worker_observation_sequence(observation_id TEXT PRIMARY KEY,origin_id TEXT NOT NULL,source_sequence INTEGER NOT NULL CHECK(source_sequence>0),UNIQUE(origin_id,source_sequence))`,
@@ -36,6 +37,10 @@ func (j *Journal) initializeSourceSequences() error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (j *Journal) initializeSourceSequences() error {
 	// The protocol is still inactive. Existing unpublished original rows may be
 	// assigned in capture order exactly once, without touching ciphertext/digest.
 	tx, err := j.db.Begin()
@@ -45,6 +50,10 @@ func (j *Journal) initializeSourceSequences() error {
 	defer tx.Rollback()
 	var initialized int
 	if err = tx.QueryRow(`SELECT COUNT(*) FROM worker_source_sequence_protocol`).Scan(&initialized); err != nil {
+		return err
+	}
+	var accountInitialized int
+	if err = tx.QueryRow(`SELECT COUNT(*) FROM worker_account_reply_sequence_protocol`).Scan(&accountInitialized); err != nil {
 		return err
 	}
 	rows, err := tx.Query(`SELECT payload FROM worker_observations WHERE id NOT IN (SELECT observation_id FROM worker_observation_sequence) ORDER BY sequence`)
@@ -71,7 +80,7 @@ func (j *Journal) initializeSourceSequences() error {
 		return err
 	}
 	for _, o := range pending {
-		if initialized > 0 && NativeSourceType(o) != "" {
+		if (initialized > 0 && NativeSourceType(o) != "") || (accountInitialized > 0 && validAccountReplySequence(context.Background(), tx, o)) {
 			return errors.New("original lifecycle sequence mapping is missing")
 		}
 		if err = allocateSourceSequence(context.Background(), tx, o); err != nil {
@@ -96,7 +105,7 @@ func (j *Journal) initializeSourceSequences() error {
 		var origin struct {
 			ID string `json:"id"`
 		}
-		if json.Unmarshal(raw, &o) != nil || json.Unmarshal(o.Origin, &origin) != nil || origin.ID != id || sequence <= 0 || last < sequence || NativeSourceType(o) == "" {
+		if json.Unmarshal(raw, &o) != nil || json.Unmarshal(o.Origin, &origin) != nil || origin.ID != id || sequence <= 0 || last < sequence || (NativeSourceType(o) == "" && !validAccountReplySequence(context.Background(), tx, o)) {
 			check.Close()
 			return errors.New("original lifecycle sequence binding is corrupt")
 		}
@@ -109,12 +118,17 @@ func (j *Journal) initializeSourceSequences() error {
 	if _, err = tx.Exec(`INSERT OR IGNORE INTO worker_source_sequence_protocol VALUES(1)`); err != nil {
 		return err
 	}
+	if _, err = tx.Exec(`INSERT OR IGNORE INTO worker_account_reply_sequence_protocol VALUES(1)`); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
 func allocateSourceSequence(ctx context.Context, tx *sql.Tx, o NativeObservation) error {
 	if NativeSourceType(o) == "" {
-		return nil
+		if !validAccountReplySequence(ctx, tx, o) {
+			return nil
+		}
 	}
 	var origin struct {
 		ID string `json:"id"`
@@ -144,4 +158,19 @@ func allocateSourceSequence(ctx context.Context, tx *sql.Tx, o NativeObservation
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO worker_observation_sequence VALUES(?,?,?)`, o.ID, origin.ID, last+1)
 	return err
+}
+
+// Sequence eligibility includes only a terminal reply whose immutable original
+// account admission is still retained. A placeholder sequence checks its shape
+// without changing the original observation or digest.
+func validAccountReplySequence(ctx context.Context, tx *sql.Tx, o NativeObservation) bool {
+	if !accountObservation(o) || o.TurnSource == nil || o.OutputContent == nil {
+		return false
+	}
+	o.SourceSequence = 1
+	if _, err := NativeAccountReplyObservation(o); err != nil {
+		return false
+	}
+	proof, err := accountReplyProof(ctx, tx, *o.TurnSource)
+	return err == nil && validateAccountReply(o, *o.OutputContent, proof) == nil
 }

@@ -19,6 +19,9 @@ var ErrNativeSourceUnsupported = errors.New("native original source has no durab
 // capture, re-encrypts an envelope, rewrites source time, or substitutes B's
 // admission for the original A descriptor. Unsupported evidence stays private.
 func NativeBackendObservation(o NativeObservation) (transport.NativeObservationPayload, error) {
+	if accountObservation(o) {
+		return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
+	}
 	var origin transport.NativeObservationOrigin
 	if json.Unmarshal(o.Origin, &origin) != nil || origin.ID == "" || origin.InstanceID == "" || origin.Runtime == "" || origin.NativeGeneration != o.NativeGeneration || o.NativeSessionID == "" || o.ObservedAt.IsZero() {
 		return transport.NativeObservationPayload{}, ErrConflict
@@ -154,4 +157,39 @@ func nativeTokenCount(value *int) *int {
 	}
 	copy := *value
 	return &copy
+}
+
+// NativeAccountReplyObservation projects only an encrypted original terminal reply.
+// Retained admission authority is checked separately inside the ACK transaction.
+func NativeAccountReplyObservation(o NativeObservation) (transport.NativeObservationPayload, error) {
+	var origin transport.NativeObservationOrigin
+	source := o.TurnSource
+	if json.Unmarshal(o.Origin, &origin) != nil || origin.ID == "" || origin.InstanceID == "" || origin.Runtime == "" || origin.NativeGeneration != o.NativeGeneration || source == nil || source.SourceAccountMessage == nil || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage) || source.InputKind != "account_message" || source.Sequence <= 0 || o.SourceSequence <= 0 || o.OutputContent == nil || o.PlanContent != nil || o.ObservedAt.IsZero() || origin.InstanceID != o.OutputContent.InstanceID {
+		return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
+	}
+	ref := *o.OutputContent
+	binding := ref.ManifestAAD.BrowserAccountReply
+	if binding == nil {
+		return transport.NativeObservationPayload{}, ErrNativeSourceUnsupported
+	}
+	proof := transport.NativeDispatchProof{SourceCommandID: binding.SourceCommandID, SourceAdmissionID: binding.SourceAdmissionID, OwnershipID: binding.OwnershipID, OwnershipGeneration: binding.OwnershipGeneration, DispatchSequence: binding.DispatchSequence, AccountMessageSource: source.SourceAccountMessage}
+	if validateAccountReply(o, ref, proof) != nil {
+		return transport.NativeObservationPayload{}, ErrConflict
+	}
+	body := transport.NativeTurnSourcePayload{InstanceID: origin.InstanceID, Runtime: origin.Runtime, NativeGeneration: o.NativeGeneration, SessionID: o.NativeSessionID, SourceSequence: o.SourceSequence, LogicalTurnID: source.LogicalTurnID, NativeTurnSequence: source.Sequence, SourceCommandID: source.SourceCommandID, SourceAdmissionID: source.SourceAdmissionID, InputKind: source.InputKind, OutputContent: o.OutputContent, InputTokens: nativeTokenCount(o.Event.InputTokens), OutputTokens: nativeTokenCount(o.Event.OutputTokens), CachedTokens: nativeTokenCount(o.Event.CachedTokens)}
+	raw, err := MarshalNativeJSON(body)
+	if err != nil || len(raw) > nativeBackendMaxPayload {
+		return transport.NativeObservationPayload{}, ErrFull
+	}
+	digest := sha256.Sum256(raw)
+	wire := transport.NativeObservationPayload{ObservationID: o.ID, OriginID: origin.ID, MessageType: transport.MsgRuntimeTurnCompleted, Digest: hex.EncodeToString(digest[:]), ObservedAt: o.ObservedAt, ExpiresAt: o.ObservedAt.Add(nativeBackendRetryHorizon), Payload: raw}
+	encoded, err := MarshalNativeJSON(wire)
+	if err != nil {
+		return transport.NativeObservationPayload{}, err
+	}
+	return transport.DecodeNativeAccountReplyCommit(encoded, ref)
+}
+
+func accountObservation(o NativeObservation) bool {
+	return (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply")
 }

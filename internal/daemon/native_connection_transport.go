@@ -10,7 +10,7 @@ import (
 // nativeConnection binds all admission and source messages to one socket.
 // Ordinary daemon send may select a newer socket; native provenance cannot.
 func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnection {
-	return NewNativeObservationConnection(d.ServerURL, d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
+	c := NewNativeObservationConnection(d.ServerURL, d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -24,6 +24,8 @@ func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnec
 		}
 		return d.write(conn, raw)
 	})
+	c.accountReplyEnabled = d.AccountReplyDeliveryEnabled && d.nativeRegistry != nil
+	return c
 }
 
 // HandleEnvelope is called only by this socket's read loop. Replies never
@@ -67,6 +69,8 @@ func (c *NativeObservationConnection) HandleEnvelope(env transport.Envelope) (ha
 		if err = env.DecodePayload(&p); err == nil {
 			c.OwnershipDisposition(p)
 		}
+	case transport.MsgAccountReplyStaged, transport.MsgAccountReplyReceipt, transport.MsgAccountReplyRejected:
+		err = c.accountReplyDisposition(env)
 	case transport.MsgNativeContentStaged, transport.MsgNativeContentRejected:
 		var p transport.NativeContentStagedPayload
 		if err = env.DecodePayload(&p); err == nil {
