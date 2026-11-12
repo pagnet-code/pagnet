@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pagnet-code/pagnet/sdk"
@@ -94,16 +95,19 @@ func (f *engineConnection) deliver() {
 }
 
 func TestEngineRunPersistsBeforePrepareAndACK(t *testing.T) {
-	s, _ := openTest(t)
-	defer s.Close()
-	o := reserveTest(t, s)
-	f := &engineConnection{t: t, store: s, operation: o}
-	runCtx, cancel := context.WithTimeout(ctx, time.Second)
-	defer cancel()
-	got, err := Run(runCtx, f, s, binding().PrincipalID, o)
-	if err != nil || got.AskID != o.AskID || got.Phase != Admitted || got.Reply == nil || f.prepares != 1 || f.sends != 1 {
-		t.Fatalf("run: %+v %v prepares=%d sends=%d", got, err, f.prepares, f.sends)
-	}
+	// Keep durable writes from consuming the reply deadline.
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := openTest(t)
+		defer s.Close()
+		o := reserveTest(t, s)
+		f := &engineConnection{t: t, store: s, operation: o}
+		runCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		got, err := Run(runCtx, f, s, binding().PrincipalID, o)
+		if err != nil || got.AskID != o.AskID || got.Phase != Admitted || got.Reply == nil || f.prepares != 1 || f.sends != 1 {
+			t.Fatalf("run: %+v %v prepares=%d sends=%d", got, err, f.prepares, f.sends)
+		}
+	})
 }
 
 func TestEngineReconcilePreparingRequiresCiphertext(t *testing.T) {
