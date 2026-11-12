@@ -259,7 +259,7 @@ func TestLoginCommandModeDefaults(t *testing.T) {
 		{name: "oidc no browser", mode: "oidc", interactive: true, noBrowser: true, wantDevice: true},
 		{name: "oidc headless no browser", mode: "oidc", noBrowser: true, wantDevice: true},
 		{name: "oidc headless requires instructions", mode: "oidc", wantError: "no interactive terminal"},
-		{name: "oidc valid stored credential", mode: "oidc", interactive: true, stored: true},
+		{name: "oidc valid stored credential", mode: "oidc", interactive: true, stored: true, wantDevice: true},
 		{name: "oidc rejects explicit token", mode: "oidc", interactive: true, tokenFlag: true, wantError: "OIDC sign-in does not accept"},
 		{name: "oidc rejects environment token", mode: "oidc", interactive: true, tokenEnv: true, wantError: "OIDC sign-in does not accept"},
 		{name: "accounts keeps explicit token", mode: "accounts", tokenFlag: true},
@@ -364,6 +364,64 @@ func TestLoginCommandModeDefaults(t *testing.T) {
 			}
 			if pasteCalls != wantPaste || browserCalls != wantBrowser {
 				t.Errorf("paste/browser calls = %d/%d, want %d/%d", pasteCalls, browserCalls, wantPaste, wantBrowser)
+			}
+		})
+	}
+}
+
+func TestLoginCommandOIDCReplacesStoredCredentialOnlyAfterSuccess(t *testing.T) {
+	const legacyPAT = "pgn_pat_v1_L3g4cyCred1d_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI"
+	for _, outcome := range []string{"success", "denied", "expired"} {
+		t.Run(outcome, func(t *testing.T) {
+			withFileFallback(t)
+			idp := newStubIdP(t, []string{outcome})
+			srv := newStubPagnetServer(t, idp, "oidc", legacyPAT)
+			t.Setenv("PAGNET_SERVER", "")
+			t.Setenv("PAGNET_TOKEN", "")
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			prevTTY := hasTTYFn
+			t.Cleanup(func() {
+				serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount
+				hasTTYFn = prevTTY
+			})
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			hasTTYFn = func() bool { return false }
+			dir := t.TempDir()
+			accDir := accountConfigDir(dir, accounts.DefaultAccount)
+			if err := saveUserToken(accDir, accounts.DefaultAccount, srv.URL, legacyPAT); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(accDir, "config.yaml")
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := loginCmd()
+			cmd.SetArgs([]string{"--state-dir", dir, "--no-browser"})
+			err = cmd.Execute()
+			wantCredential := legacyPAT
+			if outcome == "success" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCredential = testDeviceCredential
+			} else {
+				if err == nil {
+					t.Fatal("device authorization failure unexpectedly succeeded")
+				}
+				after, readErr := os.ReadFile(configPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(after) != string(before) {
+					t.Error("failed device login changed the stored configuration")
+				}
+			}
+			if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != wantCredential {
+				t.Error("stored credential does not match the device login outcome")
+			}
+			if got := srv.deviceConfigCallCount(); got != 1 {
+				t.Errorf("device-config calls = %d, want 1 despite a valid cached PAT", got)
 			}
 		})
 	}

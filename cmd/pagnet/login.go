@@ -164,17 +164,19 @@ listings, and CI logs.`,
 					break
 				}
 				if status.Mode == "oidc" {
-					// Reuse the shared helper: it validates a stored token
-					// first (idempotent re-login) and runs the sign-in flow
-					// otherwise. It persists the token itself. It takes the
-					// MACHINE state dir (not accDir): it applies
-					// accountConfigDir internally, exactly like the REST
-					// commands' newCLI does.
-					apiToken, err := ensureUserToken(root, account, base, noBrowser, hasTTYFn())
+					if !hasTTYFn() && !noBrowser {
+						return errors.New("no interactive terminal; run `pagnet login` in a terminal (or use `pagnet login --no-browser`)")
+					}
+					// Explicit sign-in always starts a fresh device flow;
+					// keep the existing credential until it succeeds.
+					cred, err := loginOIDCDeviceFlow(base, noBrowser)
 					if err != nil {
 						return err
 					}
-					token = apiToken
+					if err := saveCredential(accDir, account, server, cred.credential, cred.meta()); err != nil {
+						return err
+					}
+					token = cred.credential
 					saved = true
 					fmt.Println("signed in.")
 					break
