@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -484,63 +485,66 @@ drained:
 	}
 }
 func TestSharingOutboundQuotaRestartSchedulesEarliestDeadline(t *testing.T) {
-	m, dir, binding, _ := mailboxFixture(t)
-	ctx := context.Background()
-	_, base, _ := outboundFixture(t)
-	// Insert the later deadline first so row order cannot choose the timer.
-	later, err := m.submitOutbound(ctx, outboundInput())
-	if err != nil {
-		t.Fatal(err)
-	}
-	earlier, err := m.submitOutbound(ctx, outboundInput())
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now()
-	later.RetryAt = now.Add(650 * time.Millisecond)
-	later.Error = "quota_deferred"
-	earlier.RetryAt = now.Add(250 * time.Millisecond)
-	earlier.Error = "quota_deferred"
-	for _, r := range []sharingOutboundRecord{later, earlier} {
-		if err = m.saveOutbound(ctx, r); err != nil {
+	// Keep persistence and reopen latency from consuming the retry deadlines.
+	synctest.Test(t, func(t *testing.T) {
+		m, dir, binding, _ := mailboxFixture(t)
+		ctx := context.Background()
+		_, base, _ := outboundFixture(t)
+		// Insert the later deadline first so row order cannot choose the timer.
+		later, err := m.submitOutbound(ctx, outboundInput())
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	m.db.Close()
-	reopened, err := openSharingMailbox(dir, binding)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.db.Close()
-	w := newSharingOutboundWorker(reopened)
-	ep := &outboundQuotaFake{outboundFake: base, attempts: make(chan outboundQuotaAttempt, 20)}
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() { defer close(done); w.run(runCtx) }()
-	defer func() { cancel(); <-done }()
-	w.setEndpoint(ep)
-	// Repeated event wakes preserve the earliest timer reconstructed from storage.
-	ep.pairReady()
-	ep.pairReady()
-	var first, second outboundQuotaAttempt
-	select {
-	case first = <-ep.attempts:
-	case <-time.After(2 * time.Second):
-		t.Fatal("earliest deadline did not wake worker")
-	}
-	if first.messageID != earlier.MessageID || first.at.Before(earlier.RetryAt) || !first.at.Before(later.RetryAt) {
-		t.Fatalf("wrong earliest retry: %+v", first)
-	}
-	waitOutboundDeferred(t, reopened, earlier.Input.OperationID)
-	ep.pairReady()
-	select {
-	case second = <-ep.attempts:
-	case <-time.After(2 * time.Second):
-		t.Fatal("later deadline did not wake worker")
-	}
-	if second.messageID != later.MessageID || second.at.Before(later.RetryAt) {
-		t.Fatalf("later retry ran before its deadline: %+v", second)
-	}
+		earlier, err := m.submitOutbound(ctx, outboundInput())
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now()
+		later.RetryAt = now.Add(650 * time.Millisecond)
+		later.Error = "quota_deferred"
+		earlier.RetryAt = now.Add(250 * time.Millisecond)
+		earlier.Error = "quota_deferred"
+		for _, r := range []sharingOutboundRecord{later, earlier} {
+			if err = m.saveOutbound(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m.db.Close()
+		reopened, err := openSharingMailbox(dir, binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.db.Close()
+		w := newSharingOutboundWorker(reopened)
+		ep := &outboundQuotaFake{outboundFake: base, attempts: make(chan outboundQuotaAttempt, 20)}
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() { defer close(done); w.run(runCtx) }()
+		defer func() { cancel(); <-done }()
+		w.setEndpoint(ep)
+		// Repeated event wakes preserve the earliest timer reconstructed from storage.
+		ep.pairReady()
+		ep.pairReady()
+		var first, second outboundQuotaAttempt
+		select {
+		case first = <-ep.attempts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("earliest deadline did not wake worker")
+		}
+		if first.messageID != earlier.MessageID || first.at.Before(earlier.RetryAt) || !first.at.Before(later.RetryAt) {
+			t.Fatalf("wrong earliest retry: %+v", first)
+		}
+		waitOutboundDeferred(t, reopened, earlier.Input.OperationID)
+		ep.pairReady()
+		select {
+		case second = <-ep.attempts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("later deadline did not wake worker")
+		}
+		if second.messageID != later.MessageID || second.at.Before(later.RetryAt) {
+			t.Fatalf("later retry ran before its deadline: %+v", second)
+		}
+	})
 }
 
 func TestSharingOutboundRejectsNoncanonicalGrantBeforePersistence(t *testing.T) {
