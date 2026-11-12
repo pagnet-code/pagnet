@@ -3,7 +3,7 @@ package main
 // `pagnet login` — user authentication for REST calls (phase 2 auth
 // architecture + AUTH-3 token-first paste login). Mode-aware:
 //
-//   - paste (interactive, local/oidc servers): hidden-input paste of a
+//   - paste (interactive, local/accounts servers): hidden-input paste of a
 //     Pagnet Token — Account/Access tokens are exchanged once for a
 //     derived client credential (see tokenlogin.go);
 //   - token:  --token <admin token> (validated against /auth/me)
@@ -56,21 +56,26 @@ func loginCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Sign in as a user: store the CLI credential (paste a Pagnet Token, or the server's sign-in mode)",
+		Short: "Sign in as a user and store the CLI credential",
 		Long: `Sign in to the control plane and store the credential every command uses.
 
-Token-first (production) servers: pagnet login prompts for your Pagnet
-Token with echo off — paste an Account Token (pgn_acc_v1_…) or an Access
-Token (pgn_pat_v1_…). An Account/Access Token is exchanged ONCE for a
-revocable derived client credential: only the derived credential is
-stored (OS keyring, 0600 file fallback), never the pasted token itself.
-Press Enter at the prompt to use the server's other sign-in mode instead
-(browser/OIDC, or username/password).
+OIDC servers: pagnet login starts browser sign-in using the device flow.
+Sign in with your email and password in the identity provider's browser page.
+Use --no-browser to print the verification URL without opening a browser.
+--token and PAGNET_TOKEN are not accepted for OIDC sign-in. For operational
+API access, supply the separate PAGNET_CREDENTIAL environment variable.
+
+Local/accounts servers: pagnet login prompts for your Pagnet Token with
+echo off, or press Enter for username/password sign-in. An Account Token
+(pgn_acc_v1_…) or Access Token (pgn_pat_v1_…) is exchanged once for a
+revocable client credential. Only that credential is stored (OS keyring,
+0600 file fallback), never the pasted token itself.
 
 Every sign-in method converges on the same stored credential: the
 account-session client credential the server mints for you.
 
---token / $PAGNET_TOKEN stay available for scripted use but are the less
+In token and local/accounts modes, --token / $PAGNET_TOKEN stay available
+for scripted use but are the less
 safe path: argv and the environment can leak into shell history, process
 listings, and CI logs.`,
 		Args: cobra.NoArgs,
@@ -134,23 +139,17 @@ listings, and CI logs.`,
 				// mode (renamed from "local", which reads like localhost);
 				// "local" stays accepted for servers that predate the
 				// rename.
-				// AUTH-3 token-first paste login (governance §17,
-				// token-first §11/§35): the interactive path is the hidden
-				// paste prompt — the token never lands in argv or shell
-				// history. --token / $PAGNET_TOKEN stay the scripted path
-				// (documented as less safe) and skip the prompt. An empty
-				// paste (Enter) falls through to the mode's existing
-				// sign-in flow (browser/OIDC or username/password).
+				// OIDC human sign-in uses the browser device flow. Operational
+				// credentials belong to a separate API credential path.
+				if status.Mode == "oidc" && (token != "" || userToken != "" || os.Getenv("PAGNET_TOKEN") != "") {
+					return errors.New("OIDC sign-in does not accept --token or PAGNET_TOKEN; remove --token, unset PAGNET_TOKEN, and run `pagnet login` for device login (or `pagnet login --no-browser`); use the separate PAGNET_CREDENTIAL environment variable for operational API access")
+				}
 				pasted := token
 				if pasted == "" {
 					pasted = userToken // $PAGNET_TOKEN (scripted)
 				}
-				if pasted == "" && username == "" && password == "" && hasTTYFn() {
-					if status.Mode == "oidc" {
-						fmt.Fprintln(os.Stderr, "Paste your Pagnet Token, or press Enter to sign in through your browser.")
-					} else {
-						fmt.Fprintln(os.Stderr, "Paste your Pagnet Token, or press Enter for username/password sign-in.")
-					}
+				if status.Mode != "oidc" && pasted == "" && username == "" && password == "" && hasTTYFn() {
+					fmt.Fprintln(os.Stderr, "Paste your Pagnet Token, or press Enter for username/password sign-in.")
 					if pasted, err = askPagnetTokenFn("Paste your Pagnet Token: "); err != nil {
 						return err
 					}
@@ -211,7 +210,7 @@ listings, and CI logs.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet Token (local/oidc modes) — less safe than the paste prompt (shell history / process listings)")
+	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet Token (local/accounts modes; rejected in oidc mode) — may expose credentials in shell history / process listings")
 	cmd.Flags().StringVar(&username, "username", "", "username (local mode)")
 	cmd.Flags().StringVar(&password, "password", "", "password (local mode; prompted when omitted)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "state dir for the stored token (default ~/.pagnet)")

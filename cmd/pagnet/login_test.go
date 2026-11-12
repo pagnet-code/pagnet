@@ -121,6 +121,7 @@ type stubPagnetServer struct {
 
 	mu                sync.Mutex
 	deviceConfigCalls int
+	exchangeCalls     int
 	// validTokens are the bearers /auth/me and the API endpoints accept.
 	validTokens map[string]bool
 	// mintedEnrollToken is what /hosts/enrollment-tokens returns.
@@ -170,6 +171,9 @@ func newStubPagnetServer(t *testing.T, idp *stubIdP, mode string, validTokens ..
 			fmt.Fprintf(w, `{"credential":"%s","user":{"id":"u1","username":"user-1"},"role":"admin","networkScope":"all"}`,
 				testDeviceCredential)
 		case "/" + tokenExchangePath:
+			s.mu.Lock()
+			s.exchangeCalls++
+			s.mu.Unlock()
 			// The paste-login exchange: a pasted root token is exchanged once
 			// for the account-session client credential.
 			fmt.Fprintf(w, `{"credential":"%s","role":"admin","networkScope":"all"}`, testDeviceCredential)
@@ -234,6 +238,135 @@ func withFileFallback(t *testing.T) {
 		return nil, fmt.Errorf("no keyring in tests")
 	}
 	t.Cleanup(func() { openKeyringFn = prev })
+}
+
+// TestLoginCommandModeDefaults exercises the command's mode dispatch rather
+// than calling the device-flow helper directly.
+func TestLoginCommandModeDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		interactive bool
+		noBrowser   bool
+		tokenFlag   bool
+		tokenEnv    bool
+		stored      bool
+		wantDevice  bool
+		wantPaste   bool
+		wantError   string
+	}{
+		{name: "oidc opens browser directly", mode: "oidc", interactive: true, wantDevice: true},
+		{name: "oidc no browser", mode: "oidc", interactive: true, noBrowser: true, wantDevice: true},
+		{name: "oidc headless no browser", mode: "oidc", noBrowser: true, wantDevice: true},
+		{name: "oidc headless requires instructions", mode: "oidc", wantError: "no interactive terminal"},
+		{name: "oidc valid stored credential", mode: "oidc", interactive: true, stored: true},
+		{name: "oidc rejects explicit token", mode: "oidc", interactive: true, tokenFlag: true, wantError: "OIDC sign-in does not accept"},
+		{name: "oidc rejects environment token", mode: "oidc", interactive: true, tokenEnv: true, wantError: "OIDC sign-in does not accept"},
+		{name: "accounts keeps explicit token", mode: "accounts", tokenFlag: true},
+		{name: "accounts keeps environment token", mode: "accounts", tokenEnv: true},
+		{name: "token mode keeps explicit token", mode: "token", tokenFlag: true},
+		{name: "token mode keeps environment token", mode: "token", tokenEnv: true},
+		{name: "local keeps token prompt", mode: "local", interactive: true, wantPaste: true},
+		{name: "accounts keeps token prompt", mode: "accounts", interactive: true, wantPaste: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFileFallback(t)
+			idp := newStubIdP(t, []string{"success"})
+			srv := newStubPagnetServer(t, idp, tc.mode, testDeviceCredential, testAccountToken)
+			t.Setenv("PAGNET_SERVER", "")
+			t.Setenv("PAGNET_TOKEN", "")
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			prevTTY, prevAsk, prevBrowser := hasTTYFn, askPagnetTokenFn, openBrowserFn
+			t.Cleanup(func() {
+				serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount
+				hasTTYFn, askPagnetTokenFn, openBrowserFn = prevTTY, prevAsk, prevBrowser
+			})
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			if tc.tokenEnv {
+				t.Setenv("PAGNET_TOKEN", testAccountToken)
+				userToken = testAccountToken // the root flag default reads PAGNET_TOKEN
+			}
+			hasTTYFn = func() bool { return tc.interactive }
+			pasteCalls, browserCalls := 0, 0
+			askPagnetTokenFn = func(string) (string, error) {
+				pasteCalls++
+				if !tc.wantPaste {
+					return "", fmt.Errorf("unexpected token paste prompt")
+				}
+				return testAccountToken, nil
+			}
+			openBrowserFn = func(string) error { browserCalls++; return nil }
+			dir := t.TempDir()
+			accDir := accountConfigDir(dir, accounts.DefaultAccount)
+			if tc.stored {
+				if err := saveUserToken(accDir, accounts.DefaultAccount, srv.URL, testDeviceCredential); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"--state-dir", dir}
+			if tc.noBrowser {
+				args = append(args, "--no-browser")
+			}
+			if tc.tokenFlag {
+				args = append(args, "--token", testAccountToken)
+			}
+			cmd := loginCmd()
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("want %q guidance, got %v", tc.wantError, err)
+				}
+				if tc.tokenFlag || tc.tokenEnv {
+					for _, want := range []string{"pagnet login", "PAGNET_CREDENTIAL"} {
+						if !strings.Contains(err.Error(), want) {
+							t.Errorf("token rejection missing %q guidance", want)
+						}
+					}
+					if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != "" {
+						t.Error("rejected token was persisted")
+					}
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCredential := testDeviceCredential
+				if tc.mode == "token" {
+					wantCredential = testAccountToken
+				}
+				if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != wantCredential {
+					t.Error("command did not persist the client credential")
+				}
+			}
+			wantExchange := 0
+			if tc.wantError == "" && tc.mode != "token" && (tc.wantPaste || tc.tokenFlag || tc.tokenEnv) {
+				wantExchange = 1
+			}
+			srv.mu.Lock()
+			exchanges := srv.exchangeCalls
+			srv.mu.Unlock()
+			if exchanges != wantExchange {
+				t.Errorf("token exchange calls = %d, want %d", exchanges, wantExchange)
+			}
+			wantDevice, wantPaste, wantBrowser := 0, 0, 0
+			if tc.wantDevice {
+				wantDevice = 1
+				if !tc.noBrowser {
+					wantBrowser = 1
+				}
+			}
+			if tc.wantPaste {
+				wantPaste = 1
+			}
+			if got := srv.deviceConfigCallCount(); got != wantDevice {
+				t.Errorf("device-config calls = %d, want %d", got, wantDevice)
+			}
+			if pasteCalls != wantPaste || browserCalls != wantBrowser {
+				t.Errorf("paste/browser calls = %d/%d, want %d/%d", pasteCalls, browserCalls, wantPaste, wantBrowser)
+			}
+		})
+	}
 }
 
 // --- device flow (PKCE) -------------------------------------------------------
