@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pagnet-code/pagnet/sdk"
@@ -98,42 +99,45 @@ func controllerAwait(t *testing.T, ch <-chan string) string {
 }
 
 func TestControllerMultiplexesStartupAndReserveWithoutPolling(t *testing.T) {
-	s, _ := openTest(t)
-	defer s.Close()
-	o := reserveTest(t, s)
-	f := newControllerEndpoint()
-	c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }})
-	runCtx, cancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	go func() { done <- c.Run(runCtx) }()
-	defer func() { cancel(); <-done }()
-	if id := controllerAwait(t, f.sent); id != o.AskID {
-		t.Fatal("startup recovery changed identity")
-	}
-	added, err := c.Reserve(ctx, project, recipient, "new prompt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id := controllerAwait(t, f.sent); id != added.AskID {
-		t.Fatal("reserve wake lost")
-	}
-	if err := c.Run(ctx); err == nil {
-		t.Fatal("duplicate controller runtime")
-	}
-	r := replyFor(o)
-	if err := f.message(ctx, sdk.SharingProjectMessage{Header: sdk.SharingProjectMessageHeader{Kind: "REPLY", ProjectID: project, ID: r.ReplyID, ThreadID: o.AskID, CorrelationID: &o.AskID, SenderPrincipalID: recipient, RecipientPrincipalID: binding().PrincipalID}, Plaintext: []byte("answer"), Wire: []byte("reply wire")}); err != nil {
-		t.Fatal(err)
-	}
-	got, err := s.Get(ctx, project, o.AskID)
-	if err != nil || got.Reply == nil {
-		t.Fatalf("reply not durable before ACK: %+v %v", got, err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.prepares != 2 || f.sends != 2 || f.statuses != 2 {
-		t.Fatalf("duplicate work or idle polling: prepare=%d send=%d status=%d", f.prepares, f.sends, f.statuses)
-	}
+	// Keep durable store transitions from consuming the send and idle timers.
+	synctest.Test(t, func(t *testing.T) {
+		s, _ := openTest(t)
+		defer s.Close()
+		o := reserveTest(t, s)
+		f := newControllerEndpoint()
+		c := NewController(s, f, binding().PrincipalID, ControllerConfig{Enabled: func(string) bool { return true }})
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- c.Run(runCtx) }()
+		defer func() { cancel(); <-done }()
+		if id := controllerAwait(t, f.sent); id != o.AskID {
+			t.Fatal("startup recovery changed identity")
+		}
+		added, err := c.Reserve(ctx, project, recipient, "new prompt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id := controllerAwait(t, f.sent); id != added.AskID {
+			t.Fatal("reserve wake lost")
+		}
+		if err := c.Run(ctx); err == nil {
+			t.Fatal("duplicate controller runtime")
+		}
+		r := replyFor(o)
+		if err := f.message(ctx, sdk.SharingProjectMessage{Header: sdk.SharingProjectMessageHeader{Kind: "REPLY", ProjectID: project, ID: r.ReplyID, ThreadID: o.AskID, CorrelationID: &o.AskID, SenderPrincipalID: recipient, RecipientPrincipalID: binding().PrincipalID}, Plaintext: []byte("answer"), Wire: []byte("reply wire")}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Get(ctx, project, o.AskID)
+		if err != nil || got.Reply == nil {
+			t.Fatalf("reply not durable before ACK: %+v %v", got, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.prepares != 2 || f.sends != 2 || f.statuses != 2 {
+			t.Fatalf("duplicate work or idle polling: prepare=%d send=%d status=%d", f.prepares, f.sends, f.statuses)
+		}
+	})
 }
 
 func TestControllerReconnectReusesAmbiguousASK(t *testing.T) {
