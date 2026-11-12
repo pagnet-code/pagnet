@@ -20,17 +20,19 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
-	mu                   sync.Mutex
-	availabilityOnce     sync.Once
-	availabilitySequence int64
-	availabilityFailures map[string]string
-	hostID, bootID       string
-	serverURL            string
-	session              *transport.HostSessionPayload
-	pending              map[string]chan transport.NativeOriginRegisteredPayload
-	pendingSessions      map[string]chan transport.NativeOriginSessionConfirmedPayload
-	pendingContent       map[string]chan transport.NativeContentStagedPayload
-	pendingObservations  map[string]chan transport.NativeObservationReceiptPayload
+	mu                    sync.Mutex
+	availabilityOnce      sync.Once
+	availabilitySequence  int64
+	availabilityFailures  map[string]string
+	hostID, bootID        string
+	serverURL             string
+	session               *transport.HostSessionPayload
+	pending               map[string]chan transport.NativeOriginRegisteredPayload
+	pendingSessions       map[string]chan transport.NativeOriginSessionConfirmedPayload
+	pendingContent        map[string]chan transport.NativeContentStagedPayload
+	pendingAccountReplies map[string]chan transport.Envelope
+	accountReplyEnabled   bool
+	pendingObservations   map[string]chan transport.NativeObservationReceiptPayload
 
 	// Captured from this socket's dial offer before the read loop starts.
 	offeredSnapshotSigningPublicKey string

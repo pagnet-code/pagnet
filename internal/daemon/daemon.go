@@ -64,6 +64,8 @@ type Config struct {
 	// AccountMessageExecutionEnabled is a separate native managed-Qwen gate.
 	// Sealing readiness never enables execution. The default is OFF.
 	AccountMessageExecutionEnabled bool
+	// AccountReplyDeliveryEnabled offers encrypted terminal reply delivery. Default OFF.
+	AccountReplyDeliveryEnabled bool
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard
@@ -1106,6 +1108,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
+	}
+	q.Del("native_account_reply")
+	if d.AccountReplyDeliveryEnabled && d.nativeRegistry != nil {
+		q.Set("native_account_reply", transport.NativeAccountReplyProtocol)
 	}
 	q.Del("native_worker_recovery")
 	q.Del("native_worker_prior_launch_boot_recovery")

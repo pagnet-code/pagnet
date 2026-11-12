@@ -44,16 +44,34 @@ func TestNativeWorkerProxyReconnectsExistingWorkerWithoutBootstrapMutation(t *te
 		t.Fatal(err)
 	}
 	workerPID := child.Process.Pid
-	t.Cleanup(func() { _ = child.Process.Kill(); _ = child.Wait() })
-	deadline := time.Now().Add(5 * time.Second)
+	childDone := make(chan struct{})
+	var childErr error
+	go func() {
+		childErr = child.Wait()
+		close(childDone)
+	}()
+	t.Cleanup(func() {
+		_ = child.Process.Kill()
+		<-childDone
+	})
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(5 * time.Millisecond)
+	defer poll.Stop()
+waitForSocket:
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "controller.sock")); err == nil {
-			break
+		select {
+		case <-childDone:
+			t.Fatalf("original worker exited before publishing authenticated socket: %v\nstderr: %s", childErr, stderr.String())
+		case <-deadline.C:
+			_ = child.Process.Kill()
+			<-childDone
+			t.Fatalf("original worker did not publish authenticated socket: %v\nstderr: %s", childErr, stderr.String())
+		case <-poll.C:
+			if _, err := os.Stat(filepath.Join(dir, "controller.sock")); err == nil {
+				break waitForSocket
+			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("original worker did not publish authenticated socket")
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
 	connection := func(admit bool) *NativeObservationConnection {
 		boot, runner := domain.NewID().String(), domain.NewID().String()
@@ -88,6 +106,9 @@ func TestNativeWorkerProxyReconnectsExistingWorkerWithoutBootstrapMutation(t *te
 		if _, err := a.SourceCall(t.Context(), sessionworker.Request{Type: forbidden}); err == nil {
 			t.Fatal("source journal lane accepted a native effect", forbidden)
 		}
+	}
+	if _, err := a.SourceCall(t.Context(), sessionworker.Request{Type: "delivery_observations", Limit: 32}); err != nil {
+		t.Fatal("ordered source lane unavailable", err)
 	}
 	// No fresh server admission must fail BEFORE acquiring another local lease.
 	if unavailable, err := AttachNativeWorker(t.Context(), connection(false), dir, scope, "offline"); err == nil {

@@ -340,6 +340,9 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_resource_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_account_reply_settlements WHERE operation_sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
 		return err
 	}

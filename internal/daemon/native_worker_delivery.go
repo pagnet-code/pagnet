@@ -69,9 +69,22 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 	if err != nil {
 		return after, err
 	}
+	ordered := false
+	if deleteJobID == "" {
+		c.mu.Lock()
+		ordered = c.accountReplyReadyLocked() == nil
+		c.mu.Unlock()
+	}
+	if ordered {
+		after = 0
+	}
 	budget := transport.NativeContentMaxFragmentPage
 	for pages := 0; pages < maxPages; pages++ {
-		page, err := call(ctx, sessionworker.Request{Type: "observations", Limit: 32, Cursor: after})
+		requestType := "observations"
+		if ordered {
+			requestType = "delivery_observations"
+		}
+		page, err := call(ctx, sessionworker.Request{Type: requestType, Limit: 32, Cursor: after})
 		if err != nil {
 			return after, err
 		}
@@ -83,17 +96,28 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 		}
 		cursor := page.ObservationPage
 		// Old worker protocols return no page metadata and remain one-page only.
-		if cursor != nil && (cursor.After != after || cursor.NextCursor < after || (len(page.Observations) > 0 && cursor.NextCursor <= after) || (cursor.More && len(page.Observations) == 0)) {
+		if !ordered && cursor != nil && (cursor.After != after || cursor.NextCursor < after || (len(page.Observations) > 0 && cursor.NextCursor <= after) || (cursor.More && len(page.Observations) == 0)) {
 			return after, ErrNativeObservationConflict
 		}
 		for _, o := range page.Observations {
-			if (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
-				// Account reply receipts are not implemented by this protocol.
-				return after, ErrNativeOriginAdmissionDeferred
-			}
 			var original transport.NativeObservationOrigin
 			if json.Unmarshal(o.Origin, &original) != nil || original.HostID != c.hostID {
 				return after, ErrNativeObservationConflict
+			}
+			if (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
+				if !ordered {
+					// Private starts, failures and unavailable captures consume no
+					// source sequence and cannot obstruct supported sources.
+					if o.SourceSequence == 0 {
+						continue
+					}
+					return after, ErrNativeOriginAdmissionDeferred
+				}
+				ready, err := c.deliverAccountReply(ctx, o, call, &budget)
+				if err != nil || !ready {
+					return after, err
+				}
+				continue
 			}
 			if o.ResourceInterruption != nil {
 				admission, err := c.AuthenticatedNativeHostSession()
@@ -181,7 +205,9 @@ func (c *NativeObservationConnection) drainNativeWorkerSourcesPage(ctx context.C
 		if cursor == nil || !cursor.More {
 			return 0, nil
 		}
-		after = cursor.NextCursor
+		if !ordered {
+			after = cursor.NextCursor
+		}
 	}
 	return after, nil
 }

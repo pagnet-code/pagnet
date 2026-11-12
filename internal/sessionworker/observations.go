@@ -150,6 +150,19 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	// A terminal reply's durable settlement also fences append retries after a
+	// process restart, when the in-memory original producer pin no longer exists.
+	var accountSettledDigest string
+	err = tx.QueryRowContext(ctx, `SELECT source_digest FROM worker_account_reply_settlements WHERE observation_id=?`, observation.ID).Scan(&accountSettledDigest)
+	if err == nil {
+		if accountSettledDigest != digest {
+			return ErrConflict
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	// Only an actually pinned original native producer can retry an ambiguous
 	// COMMIT after ACK. Pins have worker lifetime, and no IPC append API exists.
 	if retry := j.sourceRetries[observation.ID]; retry != nil {
@@ -372,6 +385,13 @@ func (j *Journal) acknowledgeObservation(ctx context.Context, lease int64, id, d
 	var sourceSequence int64
 	err = tx.QueryRowContext(ctx, `SELECT o.digest,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.id=?`, id).Scan(&previous, &payload, &sourceSequence)
 	if errors.Is(err, sql.ErrNoRows) {
+		var accountSettled bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_account_reply_settlements WHERE observation_id=?)`, id).Scan(&accountSettled); err != nil {
+			return err
+		}
+		if accountSettled {
+			return ErrFenced
+		}
 		if err = resourceSettlementReplayTx(ctx, tx, id, digest, receipt); err != nil {
 			return err
 		}

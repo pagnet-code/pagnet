@@ -222,7 +222,7 @@ func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (
 	if err = j.initializeObservations(); err != nil {
 		return fail(err)
 	}
-	if err = j.initializeSourceSequences(); err != nil {
+	if err = j.initializeSourceSequenceTables(); err != nil {
 		return fail(err)
 	}
 	if err = j.initializeCaptures(); err != nil {
@@ -247,6 +247,12 @@ func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (
 		return fail(err)
 	}
 	if err = j.initializeAccountInputs(); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeSourceSequences(); err != nil {
+		return fail(err)
+	}
+	if err = j.initializeAccountReplySettlements(); err != nil {
 		return fail(err)
 	}
 	if err = j.initializeDispatches(); err != nil {
