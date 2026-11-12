@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package daemon
 
 import "github.com/pagnet-code/pagnet/transport"
