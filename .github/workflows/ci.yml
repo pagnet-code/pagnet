@@ -59,7 +59,10 @@ jobs:
       # is opt-in via PAGNET_PROC_STRESS, unset in CI), so the detector's
       # overhead is safe on the runner. The search timing gates are skipped
       # here for the same reason as the non-race step.
-      - run: go test -timeout=20m -count=1 -race -p 2 -skip 'TestSearchPerformanceTargets|TestSearchAdversarialWorstCase' ./...
+      # Split the large sessionworker fixture suite into four sequential
+      # package budgets, preserving every test and per-test timing in JSON.
+      - run: bash scripts/test-race.sh --self-test
+      - run: bash scripts/test-race.sh
       # Search-quality gates (VNEXT E4.3): the swappability conformance gate
       # against the fabric.SearchBackend contract, the committed relevance
       # corpus (>= 50 expert-graded cases), the locked 10k/100k/1M p99
