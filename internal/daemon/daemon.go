@@ -66,6 +66,8 @@ type Config struct {
 	AccountMessageExecutionEnabled bool
 	// AccountReplyDeliveryEnabled offers encrypted terminal reply delivery. Default OFF.
 	AccountReplyDeliveryEnabled bool
+	// AccountReplyReadEnabled enables transient owner-authorized reply reads.
+	AccountReplyReadEnabled bool
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard
@@ -1322,7 +1324,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		// partition with no RST) does, and is closed so the reconnect loop
 		// in Run takes over.
 		_ = conn.SetReadDeadline(time.Now().Add(d.readTimeout))
-		_, raw, err := conn.ReadMessage()
+		raw, err := readHostFrame(conn)
 		if err != nil {
 			if isNetTimeout(err) {
 				// No frame (data or PONG) within readTimeout: the connection
@@ -1343,7 +1345,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			}
 			return connectedAt, err
 		}
-		if accountReadiness.interceptAccountSeal(raw) {
+		if accountReadiness.interceptAccountReplyRead(raw) || accountReadiness.interceptAccountSeal(raw) {
 			continue
 		}
 		var env transport.Envelope
@@ -1453,6 +1455,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		}
 		d.handleCommand(conn, env)
 	}
+}
+
+// Bound allocation before decoding any dedicated or generic host frame.
+func readHostFrame(conn *websocket.Conn) ([]byte, error) {
+	conn.SetReadLimit(transport.NativeContentMaxPageWireBytes)
+	_, raw, err := conn.ReadMessage()
+	return raw, err
 }
 
 // listDirsCap bounds how many subdirectories one listing returns, so a
@@ -1712,7 +1721,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == accountSealRequestType {
+	if env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {

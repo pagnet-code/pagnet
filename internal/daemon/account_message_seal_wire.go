@@ -66,6 +66,10 @@ func (c *accountMessagingReadinessConnection) admitAccountSeal(s transport.HostS
 // JSON string, so duplicate type fields and malformed tails cannot smuggle a
 // plaintext seal frame into another command's persistence path.
 func reservedAccountSeal(raw []byte) bool {
+	return reservedAccountMessageType(raw, accountSealRequestType)
+}
+
+func reservedAccountMessageType(raw []byte, kind string) bool {
 	valid := json.Valid(raw)
 	depth := 0
 	for i := 0; i < len(raw); i++ {
@@ -90,7 +94,7 @@ func reservedAccountSeal(raw []byte) bool {
 			if raw[i] == '"' {
 				var value string
 				if ((!valid && i-start <= 128) || (valid && depth == 1 && i-start <= 26)) && json.Unmarshal(raw[start:i+1], &value) == nil {
-					if !valid && value == accountSealRequestType {
+					if !valid && value == kind {
 						return true
 					}
 					if valid && depth == 1 && strings.EqualFold(value, "type") {
@@ -116,7 +120,7 @@ func reservedAccountSeal(raw []byte) bool {
 							}
 							if raw[end] == '"' {
 								var typ string
-								if end-next <= 128 && json.Unmarshal(raw[next:end+1], &typ) == nil && typ == accountSealRequestType {
+								if end-next <= 128 && json.Unmarshal(raw[next:end+1], &typ) == nil && typ == kind {
 									return true
 								}
 								break

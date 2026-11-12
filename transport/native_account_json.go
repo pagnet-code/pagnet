@@ -75,6 +75,21 @@ func NativeAccountJSONContracts(value any) ([]*NativeAccountMessageSource, []e2e
 				return errors.New("mixed native account source")
 			}
 			sources = append(sources, v.AccountMessageSource)
+		case BrowserAccountReplyReadBeginPayload:
+			if err := collect(v.Reference); err != nil {
+				return err
+			}
+			return collect(v.Proof)
+		case *BrowserAccountReplyReadBeginPayload:
+			if v != nil {
+				return collect(*v)
+			}
+		case BrowserAccountReplyReadFragmentPayload:
+			return collect(v.Fragment)
+		case *BrowserAccountReplyReadFragmentPayload:
+			if v != nil {
+				return collect(*v)
+			}
 		case *NativeDispatchProof:
 			if v != nil {
 				return collect(*v)
@@ -298,6 +313,10 @@ func collectNativePayload(kind string, raw json.RawMessage, collect func(any) er
 		target = new(NativeDispatchCancelledPayload)
 	case MsgNativeContentBegin, MsgAccountReplyBegin:
 		target = new(NativeContentReference)
+	case MsgAccountReplyRead:
+		target = new(BrowserAccountReplyReadBeginPayload)
+	case MsgAccountReplyReadFragment:
+		target = new(BrowserAccountReplyReadFragmentPayload)
 	case MsgNativeContentFragment, MsgAccountReplyFragment:
 		target = new(NativeContentFragment)
 	case MsgNativeOwnershipRegistered:
