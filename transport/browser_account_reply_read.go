@@ -11,6 +11,7 @@ import (
 const BrowserAccountReplyReadProtocol = "browser-account-reply-read-v1"
 const BrowserAccountReplyReadMaxWireBytes = 128 << 10
 const BrowserAccountReplyReadChunkBytes = 32768
+const BrowserAccountReplyReadMaxTextBlocks = 4096
 
 const (
 	MsgAccountReplyRead         = "account.reply.read"

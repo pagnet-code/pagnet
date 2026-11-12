@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/transport"
@@ -45,5 +46,19 @@ func TestAccountReplyReadFinalOutputRejectsMalformed(t *testing.T) {
 	}
 	if _, err := decodeAccountReplyOutput(bytes.Repeat([]byte(" "), transport.NativeContentMaxPlaintextBytes+1)); err == nil {
 		t.Fatal("accepted oversized output")
+	}
+}
+
+func TestAccountReplyReadFinalOutputBlockLimit(t *testing.T) {
+	for _, count := range []int{transport.BrowserAccountReplyReadMaxTextBlocks, transport.BrowserAccountReplyReadMaxTextBlocks + 1} {
+		raw := []byte(`{"version":1,"textBlocks":[` + strings.Repeat(`"",`, count-1) + `""]}`)
+		output, err := decodeAccountReplyOutput(raw)
+		if count == transport.BrowserAccountReplyReadMaxTextBlocks {
+			if err != nil || len(output.TextBlocks) != count {
+				t.Fatal("rejected bounded final text blocks")
+			}
+		} else if err == nil {
+			t.Fatal("accepted too many final text blocks")
+		}
 	}
 }

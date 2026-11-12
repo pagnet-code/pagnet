@@ -50,6 +50,9 @@ func decodeAccountReplyOutput(raw []byte) (session.FinalOutput, error) {
 			}
 			output.TextBlocks = []string{}
 			for d.More() {
+				if len(output.TextBlocks) >= transport.BrowserAccountReplyReadMaxTextBlocks {
+					return session.FinalOutput{}, errAccountReplyOutput
+				}
 				token, err = d.Token()
 				text, ok := token.(string)
 				if err != nil || !ok {
