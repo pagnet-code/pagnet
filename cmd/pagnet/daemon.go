@@ -102,6 +102,38 @@ func needsEnroll(cfg config.Daemon) bool {
 	return cfg.Credential == "" || cfg.HostID == ""
 }
 
+// serveDaemonConfig composes the installed host client on every start, including
+// the updater's idle re-exec of pagnet serve. Embedded daemons retain opt-in gates.
+func serveDaemonConfig(server string, cfg config.Daemon) daemon.Config {
+	return daemon.Config{
+		// These are client capabilities; server negotiation and native worker
+		// authorization still gate account messaging operations.
+		AccountMessageSealEnabled:      true,
+		AccountMessageExecutionEnabled: true,
+		AccountReplyDeliveryEnabled:    true,
+		AccountReplyReadEnabled:        true,
+		ServerURL:                      server,
+		Credential:                     cfg.Credential,
+		HostID:                         cfg.HostID,
+		StateDir:                       cfg.StateDir,
+		AllowedRoots:                   cfg.AllowedRoots,
+		Version:                        version,
+		Heartbeat:                      cfg.HeartbeatInterval,
+		HostWSIPv4Only:                 cfg.HostWSIPv4Only,
+		RuntimeEnv:                     cfg.RuntimeEnv,
+		NoScan:                         cfg.NoScan,
+		// The --debug flag ORs with PAGNET_DEBUG / the state file's
+		// debug: field (both loaded into cfg.Debug).
+		Debug: daemonDebug || cfg.Debug,
+		// The --no-auto-update flag ANDs with PAGNET_AUTO_UPDATE / the
+		// state file's autoUpdate: field (opt-out; default on, P6).
+		AutoUpdate: cfg.AutoUpdate && !daemonNoAutoUpdate,
+		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
+		// non-loopback control plane / release URL).
+		InsecureRemoteHTTP: insecureRemoteHTTP,
+	}
+}
+
 // runDaemon is the `pagnet serve` foreground body: state-dir config,
 // daemon.New, signals, Run.
 func runDaemon(cmd *cobra.Command, _ []string) error {
@@ -238,27 +270,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		log.Info("pagnet serve: no local Fabric installation; serving daemon-only (hosted product unavailable)", "dir", installDir)
 	}
 
-	daemonCfg := daemon.Config{
-		ServerURL:      server,
-		Credential:     cfg.Credential,
-		HostID:         cfg.HostID,
-		StateDir:       cfg.StateDir,
-		AllowedRoots:   cfg.AllowedRoots,
-		Version:        version,
-		Heartbeat:      cfg.HeartbeatInterval,
-		HostWSIPv4Only: cfg.HostWSIPv4Only,
-		RuntimeEnv:     cfg.RuntimeEnv,
-		NoScan:         cfg.NoScan,
-		// The --debug flag ORs with PAGNET_DEBUG / the state file's
-		// debug: field (both loaded into cfg.Debug).
-		Debug: daemonDebug || cfg.Debug,
-		// The --no-auto-update flag ANDs with PAGNET_AUTO_UPDATE / the
-		// state file's autoUpdate: field (opt-out; default on, P6).
-		AutoUpdate: cfg.AutoUpdate && !daemonNoAutoUpdate,
-		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
-		// non-loopback control plane / release URL).
-		InsecureRemoteHTTP: insecureRemoteHTTP,
-	}
+	daemonCfg := serveDaemonConfig(server, cfg)
 	// advertiseGate is assigned post-daemon (the runtime bindings need the
 	// daemon); the closure is fail-closed (never advertises) until then, and
 	// it is called on the connect context once per (re)connect.
