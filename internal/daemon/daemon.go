@@ -1115,6 +1115,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.AccountReplyDeliveryEnabled && d.nativeRegistry != nil {
 		q.Set("native_account_reply", transport.NativeAccountReplyProtocol)
 	}
+	q.Del("browser_account_reply_read")
+	if d.AccountReplyReadEnabled && d.nativeRegistry != nil {
+		q.Set("browser_account_reply_read", transport.BrowserAccountReplyReadProtocol)
+	}
 	q.Del("native_worker_recovery")
 	q.Del("native_worker_prior_launch_boot_recovery")
 	if d.nativeRegistry != nil {

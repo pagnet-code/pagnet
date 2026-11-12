@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -442,6 +443,34 @@ func TestAccountReplyReadReplayExhaustionReconnects(t *testing.T) {
 	}
 	if err := f.c.socket.WriteMessage(1, []byte("{}")); err == nil {
 		t.Fatal("exhausted replay evidence did not close socket for reconnect")
+	}
+}
+
+func TestAccountReplyReadFeatureOfferDefaultOff(t *testing.T) {
+	d := newTestDaemon(t)
+	d.ServerURL = "https://example.test?browser_account_reply_read=untrusted&native_account_reply=untrusted"
+	d.nativeRegistry, _, _ = nativeRegistryFixture(t)
+	for _, enabled := range []bool{false, true} {
+		d.AccountReplyReadEnabled = enabled
+		u, err := url.Parse(d.wsURL(t.Context()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := ""
+		if enabled {
+			want = transport.BrowserAccountReplyReadProtocol
+		}
+		if got := u.Query().Get("browser_account_reply_read"); got != want {
+			t.Fatalf("read feature = %q, want %q", got, want)
+		}
+		if u.Query().Get("native_account_reply") != "" {
+			t.Fatal("read offer enabled reply delivery")
+		}
+	}
+	d.nativeRegistry = nil
+	u, err := url.Parse(d.wsURL(t.Context()))
+	if err != nil || u.Query().Get("browser_account_reply_read") != "" {
+		t.Fatal("offered reply read without local worker composition")
 	}
 }
 
