@@ -190,6 +190,33 @@ func TestAccountSealReservedGenericAndQueueBounds(t *testing.T) {
 		t.Fatal("reserved oversized queue allocation")
 	}
 }
+
+func TestAccountMessageReservedFullyEscapedTypes(t *testing.T) {
+	for _, kind := range []string{accountSealRequestType, transport.MsgAccountReplyRead, transport.MsgAccountReplyReadHello, transport.MsgAccountReplyReadFragment, transport.MsgAccountReplyReadCommit, transport.MsgAccountReplyReadCancel, transport.MsgAccountReplyReadChunk, transport.MsgAccountReplyReadDone, transport.MsgAccountReplyReadError} {
+		var escaped strings.Builder
+		for _, char := range kind {
+			fmt.Fprintf(&escaped, `\u%04x`, char)
+		}
+		valid := []byte(fmt.Sprintf(`{"\u0074\u0079\u0070\u0065":"%s","payload":{"text":"private answer"},"type":"host.launch_agent"}`, escaped.String()))
+		for _, malformed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/malformed=%t", kind, malformed), func(t *testing.T) {
+				raw := valid
+				if malformed {
+					raw = raw[:len(raw)-1]
+				}
+				if !reservedAccountMessageType(raw, kind) {
+					t.Fatal("escaped reserved type reached generic decoding")
+				}
+				if kind != accountSealRequestType {
+					c := &accountMessagingReadinessConnection{}
+					if !c.interceptAccountReplyRead(raw) {
+						t.Fatal("escaped reply type escaped dedicated interception")
+					}
+				}
+			})
+		}
+	}
+}
 func TestAccountSealHelloRequiresOpenAndNegotiatedSocket(t *testing.T) {
 	for _, kind := range []string{"enabled", "disabled", "legacy", "openFailure"} {
 		t.Run(kind, func(t *testing.T) {

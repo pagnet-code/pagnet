@@ -25,16 +25,21 @@ type accountMessagingReadinessConnection struct {
 	cancel   context.CancelFunc
 	queue    chan func()
 	// Captured socket writer; injectable for connection-boundary tests.
-	write          func([]byte, func() bool) error
-	lookup         func(string) (*InstanceRow, bool, error)
-	mu             sync.Mutex
-	subscription   *accountMessagingReadinessSubscription
-	loadKeyring    func(string) (*crypto.Keyring, error)
-	sealJournal    *accountmessage.Journal
-	sealReady      bool
-	sealQueueMu    sync.Mutex
-	sealQueueCount int
-	sealQueueBytes int
+	write           func([]byte, func() bool) error
+	lookup          func(string) (*InstanceRow, bool, error)
+	mu              sync.Mutex
+	subscription    *accountMessagingReadinessSubscription
+	loadKeyring     func(string) (*crypto.Keyring, error)
+	sealJournal     *accountmessage.Journal
+	sealReady       bool
+	sealQueueMu     sync.Mutex
+	sealQueueCount  int
+	sealQueueBytes  int
+	readMu          sync.Mutex
+	reads           map[string]*accountReplyRead
+	readSeen        map[string]bool
+	readWireBytes   int
+	readCipherBytes int64
 }
 
 func newAccountMessagingReadinessConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection) *accountMessagingReadinessConnection {
@@ -68,6 +73,7 @@ func (c *accountMessagingReadinessConnection) enqueue(f func()) bool {
 // suppress its writes, and it never migrates to a replacement connection.
 func (c *accountMessagingReadinessConnection) close() {
 	c.cancel()
+	c.closeAccountReplyReads()
 	if c.subscription != nil {
 		c.subscription.clear()
 	}
@@ -174,6 +180,7 @@ func (c *accountMessagingReadinessConnection) handleAdmission() {
 		return
 	}
 	if c.usesSubscription() {
+		c.admitAccountReplyRead(s)
 		c.send(transport.MsgAccountMessagingReadinessHello, transport.AccountMessagingReadinessSubscriptionHelloPayload{V: 2, Protocol: transport.AccountMessagingReadinessSubscriptionProtocol, Reset: false})
 		c.admitAccountSeal(s)
 		return
