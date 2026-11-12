@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/pagnet-code/pagnet/e2ee"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -237,81 +238,84 @@ func TestAccountReplyDeliverySkipsPrivateRowsAndOrdersOrigins(t *testing.T) {
 }
 
 func TestAccountReplyDeliveryRetirementReplenishesCapacity(t *testing.T) {
-	owner, _, source, _ := deliveryAccountOwner(t)
-	j := owner.journal
-	l := lease(t, j)
-	// Exercise cardinality rather than power-loss behavior. The separate replay
-	// test retains production FULL synchronous writes and an actual reopen.
-	if _, err := j.db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
-		t.Fatal(err)
-	}
-	var rawProof, rawEnvelope []byte
-	if err := j.db.QueryRow(`SELECT proof,envelope FROM worker_account_inputs WHERE sequence=?`, source.Sequence).Scan(&rawProof, &rawEnvelope); err != nil {
-		t.Fatal(err)
-	}
-	var proof transport.NativeDispatchProof
-	var envelope e2ee.EncryptedPayloadV1
-	if json.Unmarshal(rawProof, &proof) != nil || json.Unmarshal(rawEnvelope, &envelope) != nil {
-		t.Fatal("invalid fixture")
-	}
-	op := Operation{InputKind: "account_message", SourceAccountMessage: source.SourceAccountMessage, SealedAccountMessage: &envelope}
-	current := &Admission{Scope: j.scope, Kind: "worker", NetworkID: owner.spec.NetworkID, NativeAdmissionID: proof.SourceAdmissionID, RunnerID: proof.SourceRunnerID, RunnerEpoch: proof.SourceRunnerEpoch, BootID: proof.SourceBootID}
-	for n := int64(1); n <= maxCommands+1; n++ {
-		if n > 1 {
-			proof.DispatchSequence = n
-			proof.SourceCommandID = uuid.NewString()
-			out, run, err := j.admitDispatch(t.Context(), l, 0, proof.SourceCommandID, "prompt", accountInputPayload(t, op), func() (*Admission, error) { return current, nil }, &proof)
-			if err != nil || !run {
-				t.Fatal("admit", n, run, err)
+	// Keep the account input valid while SQLite exercises every capacity slot.
+	synctest.Test(t, func(t *testing.T) {
+		owner, _, source, _ := deliveryAccountOwner(t)
+		j := owner.journal
+		l := lease(t, j)
+		// Exercise cardinality rather than power-loss behavior. The separate replay
+		// test retains production FULL synchronous writes and an actual reopen.
+		if _, err := j.db.Exec(`PRAGMA synchronous=NORMAL`); err != nil {
+			t.Fatal(err)
+		}
+		var rawProof, rawEnvelope []byte
+		if err := j.db.QueryRow(`SELECT proof,envelope FROM worker_account_inputs WHERE sequence=?`, source.Sequence).Scan(&rawProof, &rawEnvelope); err != nil {
+			t.Fatal(err)
+		}
+		var proof transport.NativeDispatchProof
+		var envelope e2ee.EncryptedPayloadV1
+		if json.Unmarshal(rawProof, &proof) != nil || json.Unmarshal(rawEnvelope, &envelope) != nil {
+			t.Fatal("invalid fixture")
+		}
+		op := Operation{InputKind: "account_message", SourceAccountMessage: source.SourceAccountMessage, SealedAccountMessage: &envelope}
+		current := &Admission{Scope: j.scope, Kind: "worker", NetworkID: owner.spec.NetworkID, NativeAdmissionID: proof.SourceAdmissionID, RunnerID: proof.SourceRunnerID, RunnerEpoch: proof.SourceRunnerEpoch, BootID: proof.SourceBootID}
+		for n := int64(1); n <= maxCommands+1; n++ {
+			if n > 1 {
+				proof.DispatchSequence = n
+				proof.SourceCommandID = uuid.NewString()
+				out, run, err := j.admitDispatch(t.Context(), l, 0, proof.SourceCommandID, "prompt", accountInputPayload(t, op), func() (*Admission, error) { return current, nil }, &proof)
+				if err != nil || !run {
+					t.Fatal("admit", n, run, err)
+				}
+				source.Sequence = out.Sequence
+				source.LogicalTurnID = logicalWorkerTurn(out.Sequence)
+				source.SourceCommandID = proof.SourceCommandID
+				source.NativeGeneration = fmt.Sprintf("account-generation-%d", n)
+				if err = j.BindNativeTurn(t.Context(), source); err != nil {
+					t.Fatal(n, err)
+				}
+				owner.generation = source.NativeGeneration
+				owner.origin, _ = json.Marshal(transport.NativeObservationOrigin{ID: uuid.NewString(), TenantID: j.scope.TenantID, HostID: j.scope.HostID, InstanceID: j.scope.InstanceID, Runtime: string(owner.spec.Runtime), NativeGeneration: source.NativeGeneration})
+				owner.pinOriginalTaskContent(source)
 			}
-			source.Sequence = out.Sequence
-			source.LogicalTurnID = logicalWorkerTurn(out.Sequence)
-			source.SourceCommandID = proof.SourceCommandID
-			source.NativeGeneration = fmt.Sprintf("account-generation-%d", n)
-			if err = j.BindNativeTurn(t.Context(), source); err != nil {
+			producer, err := j.registerNativeSource(t.Context(), source.NativeGeneration, owner.origin)
+			if err != nil {
 				t.Fatal(n, err)
 			}
-			owner.generation = source.NativeGeneration
-			owner.origin, _ = json.Marshal(transport.NativeObservationOrigin{ID: uuid.NewString(), TenantID: j.scope.TenantID, HostID: j.scope.HostID, InstanceID: j.scope.InstanceID, Runtime: string(owner.spec.Runtime), NativeGeneration: source.NativeGeneration})
-			owner.pinOriginalTaskContent(source)
+			observe := owner.nativeSourceObserver(j.scope.InstanceID, producer)
+			event := session.SessionEvent{Type: session.EventTurnCompleted, SessionID: source.NativeSessionID, TurnID: source.LogicalTurnID, FinalOutput: &session.FinalOutput{Version: 1, TextBlocks: []string{"terminal-only reply"}}}
+			if err = observe(event); err != nil {
+				t.Fatal(n, err)
+			}
+			page, err := j.DeliveryObservationsForLease(t.Context(), l, 32)
+			if err != nil || len(page.Observations) != 1 {
+				t.Fatal(n, page, err)
+			}
+			o := page.Observations[0]
+			receipt := deliveryReplyReceipt(t, o)
+			if err = j.AcknowledgeAccountReplyObservation(t.Context(), l, o.ID, o.SourceDigest, receipt); err != nil {
+				t.Fatal(n, err)
+			}
+			if err = j.retireNativeSource(t.Context(), producer); err != nil {
+				t.Fatal(n, err)
+			}
+			if err = j.Settle(t.Context(), source.Sequence, "completed", nil); err != nil {
+				t.Fatal(n, err)
+			}
+			if err = j.Acknowledge(t.Context(), l, source.Sequence); err != nil {
+				t.Fatal(n, err)
+			}
+			if err = j.RetireDispatches(t.Context(), l, n); err != nil {
+				t.Fatal("retire", n, err)
+			}
+			if sourceCount(t, j, "worker_account_reply_settlements") != 0 || sourceCount(t, j, "worker_account_inputs") != 0 {
+				t.Fatal("retired account evidence retained", n)
+			}
+			if err = j.AcknowledgeAccountReplyObservation(t.Context(), l, o.ID, o.SourceDigest, receipt); err == nil {
+				t.Fatal("retired ACK replay accepted", n)
+			}
 		}
-		producer, err := j.registerNativeSource(t.Context(), source.NativeGeneration, owner.origin)
-		if err != nil {
-			t.Fatal(n, err)
-		}
-		observe := owner.nativeSourceObserver(j.scope.InstanceID, producer)
-		event := session.SessionEvent{Type: session.EventTurnCompleted, SessionID: source.NativeSessionID, TurnID: source.LogicalTurnID, FinalOutput: &session.FinalOutput{Version: 1, TextBlocks: []string{"terminal-only reply"}}}
-		if err = observe(event); err != nil {
-			t.Fatal(n, err)
-		}
-		page, err := j.DeliveryObservationsForLease(t.Context(), l, 32)
-		if err != nil || len(page.Observations) != 1 {
-			t.Fatal(n, page, err)
-		}
-		o := page.Observations[0]
-		receipt := deliveryReplyReceipt(t, o)
-		if err = j.AcknowledgeAccountReplyObservation(t.Context(), l, o.ID, o.SourceDigest, receipt); err != nil {
-			t.Fatal(n, err)
-		}
-		if err = j.retireNativeSource(t.Context(), producer); err != nil {
-			t.Fatal(n, err)
-		}
-		if err = j.Settle(t.Context(), source.Sequence, "completed", nil); err != nil {
-			t.Fatal(n, err)
-		}
-		if err = j.Acknowledge(t.Context(), l, source.Sequence); err != nil {
-			t.Fatal(n, err)
-		}
-		if err = j.RetireDispatches(t.Context(), l, n); err != nil {
-			t.Fatal("retire", n, err)
-		}
-		if sourceCount(t, j, "worker_account_reply_settlements") != 0 || sourceCount(t, j, "worker_account_inputs") != 0 {
-			t.Fatal("retired account evidence retained", n)
-		}
-		if err = j.AcknowledgeAccountReplyObservation(t.Context(), l, o.ID, o.SourceDigest, receipt); err == nil {
-			t.Fatal("retired ACK replay accepted", n)
-		}
-	}
+	})
 }
 
 func TestAccountReplyDeliveryRetirementRetainsPrivateStart(t *testing.T) {
