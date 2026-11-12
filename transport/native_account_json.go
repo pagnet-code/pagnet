@@ -296,9 +296,9 @@ func collectNativePayload(kind string, raw json.RawMessage, collect func(any) er
 		target = new(NativeDispatchCancelProposedPayload)
 	case MsgNativeDispatchCancelled:
 		target = new(NativeDispatchCancelledPayload)
-	case MsgNativeContentBegin:
+	case MsgNativeContentBegin, MsgAccountReplyBegin:
 		target = new(NativeContentReference)
-	case MsgNativeContentFragment:
+	case MsgNativeContentFragment, MsgAccountReplyFragment:
 		target = new(NativeContentFragment)
 	case MsgNativeOwnershipRegistered:
 		target = new(NativeOwnershipRegisteredPayload)
@@ -312,7 +312,7 @@ func collectNativePayload(kind string, raw json.RawMessage, collect func(any) er
 		target = new(NativeTurnSourcePayload)
 	case MsgFabricHostedInvoked, MsgFabricHostedPublished:
 		target = new(FabricHostedResult)
-	case MsgNativeObservation:
+	case MsgNativeObservation, MsgAccountReplyCommit:
 		target = new(NativeObservationPayload)
 	default:
 		return nil
