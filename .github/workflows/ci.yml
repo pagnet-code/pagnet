@@ -10,29 +10,18 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # This runner shares a 28-core host (vLLM + other org runners + owner
-  # work). Unbounded suites (GOMAXPROCS=28 x 28 parallel test packages)
-  # oversubscribed the host ~28x and starved goroutines in the transpiled
-  # sqlite parser for 19m+ (durable package timeouts on 2026-10-09).
-  # Bounded to 8 procs/binary, 2 packages in parallel = max 16 cores.
+  # Bound concurrency for the correctness suites on GitHub-hosted runners.
   GOMAXPROCS: "8"
 
 jobs:
   go:
-    # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
-    # runner billing is broken, so CI runs on the org's own infrastructure.
-    # SECURITY (public repo): the self-hosted runner never executes FORK-PR
-    # (untrusted) code — same-repo PRs and pushes run, fork PRs skip.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, self-hosted-linux, owl-deploy]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # This persistent runner already retains Go's native caches.
-          # Remote restore collides with existing read-only module files.
-          cache: false
+          cache: true
       - run: go build ./...
       - run: go vet ./...
       # Cross-arch vet: the org has no Mac runner, and plain `go build`

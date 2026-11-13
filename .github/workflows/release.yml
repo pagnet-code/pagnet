@@ -31,19 +31,13 @@ permissions:
   contents: write
 
 env:
-  # This runner shares a 28-core host (vLLM + other org runners + owner
-  # work). Unbounded suites oversubscribed the host ~28x and starved
-  # goroutines in the transpiled sqlite parser for 19m+ (durable package
-  # timeouts on 2026-10-09). Bounded to 8 procs/binary, 2 packages in
-  # parallel = max 16 cores.
+  # Bound concurrency for the correctness suites on GitHub-hosted runners.
   GOMAXPROCS: "8"
 
 jobs:
   release:
     name: build + publish (${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || 'dev' }})
-    # Self-hosted runner (pagnet-code org): the account's GitHub-hosted
-    # runner billing is broken, so CI runs on the org's own infrastructure.
-    runs-on: [self-hosted, self-hosted-linux, owl-deploy]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,9 +51,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # Keep the persistent runner's native Go caches; do not restore
-          # an archive over existing read-only module files.
-          cache: false
+          cache: true
 
       - name: Resolve one SemVer build version
         env:
@@ -144,11 +136,8 @@ jobs:
           ls -1 dist/pagnet-*.tar.gz
           ls -1 dist/pagnet-release-manifest-*.json
 
-      # The publish steps talk to the GitHub REST API directly (curl +
-      # GITHUB_TOKEN, jq) instead of the gh CLI: the shared self-hosted
-      # runner image ships no gh, and a release lane must not depend on a
-      # host tool installed out-of-band — that silent dependency broke the
-      # lane when the runner container was recreated (2026-09-18).
+      # Publish through the GitHub REST API using curl, jq, and the
+      # workflow token, preserving draft resumption and signed asset uploads.
 
       - name: Publish tagged release
         if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.tag != '' }}
