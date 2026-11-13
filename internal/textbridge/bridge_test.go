@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -540,23 +541,37 @@ func (l *transientListFailure) List(ctx context.Context, phases ...ledger.Phase)
 	if l.failures.Add(1) == 1 {
 		return nil, boundaryError
 	}
-	return l.Ledger.List(ctx, phases...)
+	return nil, nil
 }
 func TestPendingListErrorRetriesWithoutNewEvent(t *testing.T) {
-	b, s, _, _, m := setup(t)
-	accept(t, b, m)
-	b.store = &transientListFailure{Ledger: s}
-	ctx, cancel := context.WithCancel(testContext)
-	done := make(chan error, 1)
-	go func() { done <- b.Run(ctx) }()
-	defer func() { cancel(); <-done }()
-	deadline := time.Now().Add(4 * time.Second)
-	for stored(t, s).Phase != ledger.Admitted {
-		if time.Now().After(deadline) {
-			t.Fatal("pending ledger read was not retried")
+	synctest.Test(t, func(t *testing.T) {
+		store := &transientListFailure{}
+		b := New(store, nil, nil, Config{})
+		ctx, cancel := context.WithCancel(testContext)
+		done := make(chan error, 1)
+		go func() { done <- b.Run(ctx) }()
+		defer func() {
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+		}()
+
+		synctest.Wait()
+		if got := store.failures.Load(); got != 1 {
+			t.Fatalf("initial list attempts = %d, want 1", got)
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if got := store.failures.Load(); got != 2 {
+			t.Fatalf("list attempts after backoff = %d, want 2", got)
+		}
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if got := store.failures.Load(); got != 2 {
+			t.Fatalf("idle list attempts = %d, want 2", got)
+		}
+	})
 }
 
 type failedAdmission struct {
