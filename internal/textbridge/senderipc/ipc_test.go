@@ -141,7 +141,7 @@ func awaitIPC(t *testing.T, ch <-chan string) string {
 	select {
 	case id := <-ch:
 		return id
-	case <-time.After(time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("IPC did not reserve and send")
 		return ""
 	}

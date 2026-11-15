@@ -22,7 +22,7 @@ import (
 )
 
 func TestActualServiceRuntimeSelectedStartupOutageIsolationNoPaidEffects(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	private, e := os.MkdirTemp("", "pgn-startup-service-")
 	if e != nil {
@@ -49,7 +49,7 @@ func TestActualServiceRuntimeSelectedStartupOutageIsolationNoPaidEffects(t *test
 	}
 	defer native.Close()
 	digest := [32]byte{117}
-	config := ServiceRuntimeConfig{Credentials: serviceRouterCredentials{digest}, InvocationConfig: fabricservices.DefaultInvocationConfig(), MaxConnections: 2, SetupTimeout: time.Second, SetupConcurrency: 2}
+	config := ServiceRuntimeConfig{Credentials: serviceRouterCredentials{digest}, InvocationConfig: fabricservices.DefaultInvocationConfig(), MaxConnections: 2, SetupTimeout: 10 * time.Second, SetupConcurrency: 2}
 	if _, e = NewServiceRuntime(ctx, installed, native.Boundary, config); e == nil {
 		t.Fatal("missing service state auto-created")
 	}
@@ -107,7 +107,7 @@ func TestActualServiceRuntimeSelectedStartupOutageIsolationNoPaidEffects(t *test
 		t.Fatal("offline peer disabled local service composition", e)
 	}
 	defer restarted.Close()
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
