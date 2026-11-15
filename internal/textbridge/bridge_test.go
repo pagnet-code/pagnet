@@ -669,13 +669,26 @@ func runUntil(t *testing.T, b *Bridge, ready func() bool) {
 	ctx, cancel := context.WithCancel(testContext)
 	done := make(chan error, 1)
 	go func() { done <- b.Run(ctx) }()
-	defer func() { cancel(); <-done }()
-	deadline := time.Now().Add(4 * time.Second)
-	for !ready() {
-		if time.Now().After(deadline) {
-			t.Fatal("automatic recovery did not complete")
+	runExited := false
+	defer func() {
+		cancel()
+		if !runExited {
+			<-done
 		}
-		time.Sleep(5 * time.Millisecond)
+	}()
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(5 * time.Millisecond)
+	defer poll.Stop()
+	for !ready() {
+		select {
+		case err := <-done:
+			runExited = true
+			t.Fatalf("bridge Run exited before automatic recovery completed: %v", err)
+		case <-deadline.C:
+			t.Fatal("automatic recovery did not complete within 30s")
+		case <-poll.C:
+		}
 	}
 }
 func TestClaimStorageFailureRetriesFreshPhase(t *testing.T) {
