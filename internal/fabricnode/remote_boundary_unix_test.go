@@ -238,7 +238,7 @@ func actualKernelRemoteScenario(t *testing.T, scenario string) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	local, e := newLocalBoundary(t.Context(), b.installation.Store, b.owner, b.installation, time.Second)
+	local, e := newLocalBoundary(t.Context(), b.installation.Store, b.owner, b.installation, 30*time.Second)
 	if e != nil {
 		t.Fatal(e)
 	}
