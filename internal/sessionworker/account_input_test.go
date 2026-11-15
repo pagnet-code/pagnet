@@ -19,6 +19,19 @@ import (
 
 func accountInputFixture(t *testing.T, j *Journal, l int64) (Operation, transport.NativeDispatchProof, *Admission) {
 	t.Helper()
+	now := time.Now()
+	return accountInputFixtureWithValidity(t, j, l, now.Add(-time.Second), now.Add(30*time.Second))
+}
+
+func accountInputFixtureWithValidity(t *testing.T, j *Journal, l int64, createdAt, expiresAt time.Time) (Operation, transport.NativeDispatchProof, *Admission) {
+	t.Helper()
+	p := dispatchProof(dispatchOwnership(t, j, l), 1)
+	op, current := accountInputFixtureFromProof(t, j, &p, createdAt, expiresAt)
+	return op, p, current
+}
+
+func accountInputFixtureFromProof(t *testing.T, j *Journal, p *transport.NativeDispatchProof, createdAt, expiresAt time.Time) (Operation, *Admission) {
+	t.Helper()
 	raw, err := os.ReadFile("../accountmessage/testdata/account_message_v1.json")
 	if err != nil {
 		t.Fatal(err)
@@ -29,11 +42,10 @@ func accountInputFixture(t *testing.T, j *Journal, l int64) (Operation, transpor
 	if err = json.Unmarshal(raw, &fixture); err != nil {
 		t.Fatal(err)
 	}
-	p := dispatchProof(dispatchOwnership(t, j, l), 1)
 	d := fixture.Descriptor
 	d.TenantID, d.OwnerUserID, d.HostID, d.TargetInstanceID = j.scope.TenantID, j.scope.AccountID, j.scope.HostID, j.scope.InstanceID
 	d.RunnerID, d.RunnerConnectedAt = p.SourceRunnerID, p.SourceRunnerEpoch.UTC().Format(time.RFC3339Nano)
-	d.CreatedAt, d.ExpiresAt = time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), time.Now().Add(30*time.Second).UTC().Format(time.RFC3339Nano)
+	d.CreatedAt, d.ExpiresAt = createdAt.UTC().Format(time.RFC3339Nano), expiresAt.UTC().Format(time.RFC3339Nano)
 	envelope, err := e2ee.Encrypt([]byte("account input test"), [32]byte{1}, d.AAD(d.BindingDigest()))
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +71,7 @@ func accountInputFixture(t *testing.T, j *Journal, l int64) (Operation, transpor
 	p.AccountMessageSource = &source
 	op := Operation{InputKind: "account_message", SourceAccountMessage: &source, SealedAccountMessage: &envelope}
 	current := &Admission{Scope: j.scope, Kind: "worker", NetworkID: d.NetworkID, NativeAdmissionID: p.SourceAdmissionID, RunnerID: p.SourceRunnerID, RunnerEpoch: p.SourceRunnerEpoch, BootID: p.SourceBootID}
-	return op, p, current
+	return op, current
 }
 
 func accountInputPayload(t *testing.T, op Operation) json.RawMessage {
@@ -108,11 +120,24 @@ func TestAccountInputAdmissionImmutableDuplicateAndRecovery(t *testing.T) {
 }
 
 func TestAccountInputAdmissionRollsBack(t *testing.T) {
-	for _, mutation := range []string{"missing", "runner", "epoch", "boot", "admission", "scope", "sealed", "generic", "intent"} {
+	for _, mutation := range []string{"missing", "runner", "epoch", "boot", "admission", "scope", "sealed", "generic", "intent", "expired", "future-created"} {
 		t.Run(mutation, func(t *testing.T) {
 			j, _ := testJournal(t)
 			l := lease(t, j)
-			op, p, current := accountInputFixture(t, j, l)
+			now := time.Now()
+			createdAt, expiresAt := now.Add(-time.Second), now.Add(30*time.Second)
+			switch mutation {
+			case "expired":
+				createdAt, expiresAt = now.Add(-2*time.Minute), now.Add(-time.Minute)
+			case "future-created":
+				createdAt, expiresAt = now.Add(time.Hour), now.Add(time.Hour+30*time.Second)
+			}
+			op, p, current := accountInputFixtureWithValidity(t, j, l, createdAt, expiresAt)
+			if mutation == "expired" || mutation == "future-created" {
+				if err := validateAccountOperation(op, p); err != nil {
+					t.Fatal("invalid temporal fixture", err)
+				}
+			}
 			switch mutation {
 			case "missing":
 				current = nil
@@ -146,6 +171,9 @@ func TestAccountInputAdmissionRollsBack(t *testing.T) {
 			// rejection receipts. No accepted outcome or partial journal survives.
 			if err == nil || run {
 				t.Fatal("accepted invalid account input")
+			}
+			if (mutation == "expired" || mutation == "future-created") && !errors.Is(err, ErrConflict) {
+				t.Fatal("unexpected temporal rejection", err)
 			}
 			for _, table := range []string{"worker_account_inputs", "worker_dispatches", "worker_intent"} {
 				var n int
@@ -206,10 +234,12 @@ func TestAccountInputNativeSourceRoundTripAndReopen(t *testing.T) {
 func TestAccountInputRetirementBoundsRetention(t *testing.T) {
 	j, _ := testJournal(t)
 	l := lease(t, j)
-	op, p, current := accountInputFixture(t, j, l)
-	payload := accountInputPayload(t, op)
+	p := dispatchProof(dispatchOwnership(t, j, l), 1)
 	for n := int64(1); n <= maxCommands+1; n++ {
 		p.DispatchSequence, p.SourceCommandID = n, domain.NewID().String()
+		now := time.Now()
+		op, current := accountInputFixtureFromProof(t, j, &p, now.Add(-time.Second), now.Add(30*time.Second))
+		payload := accountInputPayload(t, op)
 		out, run, err := j.admitDispatch(t.Context(), l, 0, p.SourceCommandID, "prompt", payload, func() (*Admission, error) { return current, nil }, &p)
 		if err != nil || !run {
 			t.Fatal("admit", n, run, err)
