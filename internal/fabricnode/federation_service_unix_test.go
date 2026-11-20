@@ -36,6 +36,43 @@ func (remoteExtCredentials) Authorization(context.Context, string) (string, erro
 	return "Bearer explicitly-selected-test-provider", nil
 }
 
+type effectStartedBindingProvider struct {
+	BindingProvider
+	t       *testing.T
+	started <-chan struct{}
+}
+
+func (p effectStartedBindingProvider) ResolveBinding(ctx context.Context, caller fabric.ExecutionContext, endpoint fabric.EndpointDescriptor, binding fabric.BindingSummary, offer *fabric.OfferDescriptor) (fabric.EndpointAdapter, [32]byte, error) {
+	adapter, digest, err := p.BindingProvider.ResolveBinding(ctx, caller, endpoint, binding, offer)
+	if err != nil {
+		return adapter, digest, err
+	}
+	return effectStartedAdapter{adapter, p.t, p.started}, digest, nil
+}
+
+type effectStartedAdapter struct {
+	fabric.EndpointAdapter
+	t       *testing.T
+	started <-chan struct{}
+}
+
+func (a effectStartedAdapter) Invoke(ctx context.Context, caller fabric.ExecutionContext, endpoint fabric.EndpointDescriptor, request fabric.InvokeRequest) (fabric.InvocationStream, error) {
+	stream, err := a.EndpointAdapter.Invoke(ctx, caller, endpoint, request)
+	if err != nil {
+		return stream, err
+	}
+	wait, cancel := context.WithTimeout(a.t.Context(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-a.started:
+		return stream, nil
+	case <-wait.Done():
+		stream.Close()
+		a.t.Error("provider effect did not start before capture quota", wait.Err())
+		return nil, wait.Err()
+	}
+}
+
 func exerciseActualRemotePaidFinal(t *testing.T, a, b remoteInstalledPeer, auth *fabricauth.Authority, session *fabricauth.Session, sourceGate *fabricfederation.PeerGate, boundary *RemoteBoundary, exposures *FederationExposures, cfg, sourceCfg federation.Config, scenario string) {
 	t.Helper()
 	ctx := t.Context()
@@ -46,9 +83,12 @@ func exerciseActualRemotePaidFinal(t *testing.T, a, b remoteInstalledPeer, auth 
 	}
 	scope := registry.DescriptorBatchScope{Endpoint: ref, ExpectedEndpointRevision: rev, BindingID: "mcp"}
 	var effects, transforms, sourceHooks, completions atomic.Int32
+	effectStarted := make(chan struct{})
 	provider := sdk.NewServer(&sdk.Implementation{Name: "original-remote-effect", Version: "1"}, nil)
 	provider.AddTool(&sdk.Tool{Name: "compute", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(context.Context, *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
-		effects.Add(1)
+		if effects.Add(1) == 1 && scenario == "capture_quota" {
+			close(effectStarted)
+		}
 		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: "private raw original must never escape"}}}, nil
 	})
 	server := httptest.NewServer(sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return provider }, &sdk.StreamableHTTPOptions{Stateless: true}))
@@ -77,7 +117,13 @@ func exerciseActualRemotePaidFinal(t *testing.T, a, b remoteInstalledPeer, auth 
 	if e != nil {
 		t.Fatal(e)
 	}
-	router, e := NewRouter(map[BindingProtocol]BindingProvider{{Protocol: "mcp.tools", Version: "2026-07-28"}: providerBinding})
+	var bindingProvider BindingProvider = providerBinding
+	if scenario == "capture_quota" {
+		// MCP starts its provider call asynchronously. Reach the accepted effect
+		// before capture can exhaust its budget and close the original stream.
+		bindingProvider = effectStartedBindingProvider{providerBinding, t, effectStarted}
+	}
+	router, e := NewRouter(map[BindingProtocol]BindingProvider{{Protocol: "mcp.tools", Version: "2026-07-28"}: bindingProvider})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -222,8 +268,9 @@ func exerciseActualRemotePaidFinal(t *testing.T, a, b remoteInstalledPeer, auth 
 		if effects.Load() != 1 {
 			t.Fatal("quota test did not reach accepted original paid effect", effects.Load(), e)
 		}
-		if e == nil && started.Association == nil {
-			t.Fatal("quota failure returned apparent success")
+		var failure *fabric.Error
+		if !errors.As(e, &failure) || failure.Code != fabric.CodeTargetUnavailable || failure.Message != "Final output retention budget exhausted" {
+			t.Fatal("quota failure did not report exhausted retention budget", e)
 		}
 		if _, err := runtime.Start(ctx, bundle); err == nil {
 			t.Fatal("quota failure permitted original paid resend")
