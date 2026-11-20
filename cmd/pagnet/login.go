@@ -62,8 +62,10 @@ func loginCmd() *cobra.Command {
 OIDC servers: pagnet login starts browser sign-in using the device flow.
 Sign in with your email and password in the identity provider's browser page.
 Use --no-browser to print the verification URL without opening a browser.
---token and PAGNET_TOKEN are not accepted for OIDC sign-in. For operational
-API access, supply the separate PAGNET_CREDENTIAL environment variable.
+For headless user/API automation, pass a native Pagnet Token with --token or
+PAGNET_TOKEN. Keycloak ID/access tokens are not accepted as Pagnet Tokens.
+PAGNET_ENROLL_TOKEN is a one-time host enrollment token. PAGNET_CREDENTIAL
+is only for agent/service endpoint authentication.
 
 Local/accounts servers: pagnet login prompts for your Pagnet Token with
 echo off, or press Enter for username/password sign-in. An Account Token
@@ -71,13 +73,12 @@ echo off, or press Enter for username/password sign-in. An Account Token
 revocable client credential. Only that credential is stored (OS keyring,
 0600 file fallback), never the pasted token itself.
 
-Every sign-in method converges on the same stored credential: the
-account-session client credential the server mints for you.
+Browser and password sign-in store the account-session credential minted
+by the server. Native token exchange preserves the token's restrictions.
 
-In token and local/accounts modes, --token / $PAGNET_TOKEN stay available
-for scripted use but are the less
-safe path: argv and the environment can leak into shell history, process
-listings, and CI logs.`,
+In every mode, --token / $PAGNET_TOKEN stay available for scripted use,
+but can expose credentials through shell history, process listings, and
+CI logs.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			root := machineStateDir(stateDir)
@@ -139,11 +140,6 @@ listings, and CI logs.`,
 				// mode (renamed from "local", which reads like localhost);
 				// "local" stays accepted for servers that predate the
 				// rename.
-				// OIDC human sign-in uses the browser device flow. Operational
-				// credentials belong to a separate API credential path.
-				if status.Mode == "oidc" && (token != "" || userToken != "" || os.Getenv("PAGNET_TOKEN") != "") {
-					return errors.New("OIDC sign-in does not accept --token or PAGNET_TOKEN; remove --token, unset PAGNET_TOKEN, and run `pagnet login` for device login (or `pagnet login --no-browser`); use the separate PAGNET_CREDENTIAL environment variable for operational API access")
-				}
 				pasted := token
 				if pasted == "" {
 					pasted = userToken // $PAGNET_TOKEN (scripted)
@@ -212,7 +208,7 @@ listings, and CI logs.`,
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or Pagnet Token (local/accounts modes; rejected in oidc mode) — may expose credentials in shell history / process listings")
+	cmd.Flags().StringVar(&token, "token", "", "bearer for scripted login: admin token (token mode) or native Pagnet Token (accounts/oidc modes) — may expose credentials in shell history / process listings")
 	cmd.Flags().StringVar(&username, "username", "", "username (local mode)")
 	cmd.Flags().StringVar(&password, "password", "", "password (local mode; prompted when omitted)")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "state dir for the stored token (default ~/.pagnet)")

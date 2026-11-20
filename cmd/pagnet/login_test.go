@@ -260,8 +260,8 @@ func TestLoginCommandModeDefaults(t *testing.T) {
 		{name: "oidc headless no browser", mode: "oidc", noBrowser: true, wantDevice: true},
 		{name: "oidc headless requires instructions", mode: "oidc", wantError: "no interactive terminal"},
 		{name: "oidc valid stored credential", mode: "oidc", interactive: true, stored: true, wantDevice: true},
-		{name: "oidc rejects explicit token", mode: "oidc", interactive: true, tokenFlag: true, wantError: "OIDC sign-in does not accept"},
-		{name: "oidc rejects environment token", mode: "oidc", interactive: true, tokenEnv: true, wantError: "OIDC sign-in does not accept"},
+		{name: "oidc exchanges explicit native token", mode: "oidc", tokenFlag: true},
+		{name: "oidc exchanges environment native token", mode: "oidc", tokenEnv: true},
 		{name: "accounts keeps explicit token", mode: "accounts", tokenFlag: true},
 		{name: "accounts keeps environment token", mode: "accounts", tokenEnv: true},
 		{name: "token mode keeps explicit token", mode: "token", tokenFlag: true},
@@ -317,16 +317,7 @@ func TestLoginCommandModeDefaults(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
 					t.Fatalf("want %q guidance, got %v", tc.wantError, err)
 				}
-				if tc.tokenFlag || tc.tokenEnv {
-					for _, want := range []string{"pagnet login", "PAGNET_CREDENTIAL"} {
-						if !strings.Contains(err.Error(), want) {
-							t.Errorf("token rejection missing %q guidance", want)
-						}
-					}
-					if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != "" {
-						t.Error("rejected token was persisted")
-					}
-				}
+
 			} else {
 				if err != nil {
 					t.Fatal(err)
@@ -916,5 +907,148 @@ func TestStoredServerURL(t *testing.T) {
 	}
 	if got := storedServerURL(dir); got != "http://127.0.0.1:19999" {
 		t.Fatalf("storedServerURL = %q, want the state config value", got)
+	}
+}
+
+func TestLoginOIDCRejectsInvalidTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		token        string
+		status       int
+		wantError    string
+		wantExchange int
+	}{
+		{name: "Keycloak JWT", token: "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyLTEifQ.", wantError: "unrecognized Pagnet Token"},
+		{name: "arbitrary bearer", token: "opaque-bearer", wantError: "unrecognized Pagnet Token"},
+		{name: "endpoint credential", token: "pgn_epd_v1_endpoint", wantError: "unrecognized Pagnet Token"},
+		{name: "revoked native token", token: testAccountToken, status: http.StatusUnauthorized, wantError: "token login failed", wantExchange: 1},
+		{name: "limited native token", token: testAccessToken, status: http.StatusForbidden, wantError: "token login failed", wantExchange: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFileFallback(t)
+			withNoPromptSeams(t)
+			exchanges := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/auth/setup/status":
+					fmt.Fprint(w, `{"mode":"oidc"}`)
+				case "/" + tokenExchangePath:
+					exchanges++
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, `{"error":{"code":"invalid_credentials","message":"credential rejected"}}`)
+				default:
+					t.Errorf("unexpected auth request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			t.Cleanup(func() { serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount })
+			dir := t.TempDir()
+			cmd := loginCmd()
+			cmd.SetArgs([]string{"--state-dir", dir, "--token", tc.token})
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("want %q, got %v", tc.wantError, err)
+			}
+			if exchanges != tc.wantExchange {
+				t.Errorf("exchange calls = %d, want %d", exchanges, tc.wantExchange)
+			}
+			if got := loadUserToken(accountConfigDir(dir, accounts.DefaultAccount), accounts.DefaultAccount, srv.URL); got != "" {
+				t.Fatal("rejected credential was stored")
+			}
+		})
+	}
+}
+
+func TestEnrollOIDCFirstRunDeviceFlow(t *testing.T) {
+	withFileFallback(t)
+	withNoPromptSeams(t)
+	idp := newStubIdP(t, []string{"success"})
+	srv := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
+	t.Setenv("PAGNET_SERVER", "")
+	t.Setenv("PAGNET_NO_BROWSER", "1")
+	prevServer, prevToken, prevNI, prevTTY := serverURL, userToken, nonInteractive, hasTTYFn
+	serverURL, userToken, nonInteractive = srv.URL, "", false
+	hasTTYFn = func() bool { return true }
+	t.Cleanup(func() {
+		serverURL, userToken, nonInteractive, hasTTYFn = prevServer, prevToken, prevNI, prevTTY
+	})
+	dir := t.TempDir()
+	out := captureStdout(t, func() {
+		if err := enrollHostForeground(dir, "", "test-host", nil, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, idp.ts.URL+"/verify") || !strings.Contains(out, "ABCD-1234") {
+		t.Fatal("first-run enrollment did not print device URL and code")
+	}
+	if srv.deviceConfigCallCount() != 1 || srv.enrollCallCount() != 1 {
+		t.Fatal("first-run enrollment did not sign in and mint the enrollment token once")
+	}
+	cfg, err := config.LoadDaemon(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Credential != "hostcred123" || cfg.HostID != "h1" || loadUserToken(dir, "", srv.URL) != testDeviceCredential {
+		t.Fatal("first-run enrollment did not store host and user credentials")
+	}
+}
+
+func TestLoginOIDCNativeTokenPreservesRestrictions(t *testing.T) {
+	withFileFallback(t)
+	withNoPromptSeams(t)
+	t.Setenv("PAGNET_CREDENTIAL", "pgn_epd_v1_not-user-auth")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/setup/status":
+			fmt.Fprint(w, `{"mode":"oidc"}`)
+		case "/" + tokenExchangePath:
+			var body struct{ Token string }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token != testAccessToken {
+				t.Error("native user token was not sent through the exchange")
+			}
+			fmt.Fprintf(w, `{"credential":"%s","role":"operator","networkScope":"selected","networks":["Production"]}`, testDerivedCred)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+	serverURL, userToken, accountFlag = srv.URL, "", ""
+	t.Cleanup(func() { serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount })
+	dir := t.TempDir()
+	cmd := loginCmd()
+	cmd.SetArgs([]string{"--state-dir", dir, "--token", testAccessToken})
+	out := captureStdout(t, func() {
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "limited access token") || !strings.Contains(out, "Production") {
+		t.Fatal("limited native token login omitted restriction guidance")
+	}
+	accDir := accountConfigDir(dir, accounts.DefaultAccount)
+	fc := stateFile(t, accDir)
+	if fc["credentialRole"] != "operator" || fc["credentialNetworkScope"] != "selected" {
+		t.Fatal("native token restrictions were not stored")
+	}
+	if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != testDerivedCred {
+		t.Fatal("native token exchange did not store only the derived credential")
+	}
+}
+
+func TestLoginHelpCredentialRoles(t *testing.T) {
+	help := loginCmd().Long
+	for _, want := range []string{
+		"headless user/API automation", "native Pagnet Token", "PAGNET_TOKEN",
+		"PAGNET_ENROLL_TOKEN is a one-time host enrollment token",
+		"PAGNET_CREDENTIAL\nis only for agent/service endpoint authentication",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("login help missing %q", want)
+		}
 	}
 }

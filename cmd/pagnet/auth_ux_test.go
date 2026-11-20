@@ -170,6 +170,8 @@ func newStubEnrollAuth(t *testing.T, accepted string) *stubEnrollAuth {
 		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/api/v1/auth/setup/status":
+			fmt.Fprint(w, `{"mode":"accounts","setupRequired":false}`)
 		case "/api/v1/auth/me":
 			// Both the stored delegated token and the derived credential are
 			// live bearers for ordinary calls — only the account-authority

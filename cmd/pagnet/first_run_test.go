@@ -484,3 +484,81 @@ func TestZeroNetworksReminderNoBearer(t *testing.T) {
 		t.Errorf("reminder printed despite no bearer: %q", out)
 	}
 }
+
+func TestAuthenticateUserOIDC(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stored      bool
+		fresh       bool
+		interactive bool
+		noBrowser   bool
+		wantDevice  bool
+		wantError   bool
+	}{
+		{name: "fresh host", interactive: true, wantDevice: true},
+		{name: "headless browser instructions", interactive: true, noBrowser: true, wantDevice: true},
+		{name: "stored credential", stored: true, interactive: true},
+		{name: "replace limited stored credential", stored: true, fresh: true, interactive: true, wantDevice: true},
+		{name: "noninteractive fails fast", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFileFallback(t)
+			idp := newStubIdP(t, []string{"success"})
+			srv := newStubPagnetServer(t, idp, "oidc", testDeviceCredential, testAccessToken)
+			withNoPromptSeams(t)
+			t.Setenv("PAGNET_NO_BROWSER", "0")
+			if tc.noBrowser {
+				t.Setenv("PAGNET_NO_BROWSER", "1")
+			}
+			browserCalls := 0
+			openBrowserFn = func(string) error { browserCalls++; return nil }
+			root := t.TempDir()
+			account := accounts.DefaultAccount
+			accDir := accountConfigDir(root, account)
+			if tc.stored {
+				if err := saveUserToken(accDir, account, srv.URL, testAccessToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var tok string
+			var err error
+			out := captureStdout(t, func() {
+				tok, err = authenticateUserFresh(root, account, srv.URL, tc.interactive, tc.fresh)
+			})
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "--non-interactive") {
+					t.Fatalf("want noninteractive guidance, got %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := testDeviceCredential
+				if tc.stored && !tc.fresh {
+					want = testAccessToken
+				}
+				if tok != want || loadUserToken(accDir, account, srv.URL) != want {
+					t.Fatal("expected credential was not returned and stored for the account")
+				}
+			}
+			wantCalls := 0
+			if tc.wantDevice {
+				wantCalls = 1
+				for _, fragment := range []string{idp.ts.URL + "/verify", "ABCD-1234"} {
+					if !strings.Contains(out, fragment) {
+						t.Errorf("device instructions missing %q", fragment)
+					}
+				}
+			}
+			if got := srv.deviceConfigCallCount(); got != wantCalls {
+				t.Errorf("device config calls = %d, want %d", got, wantCalls)
+			}
+			if tc.noBrowser {
+				wantCalls = 0
+			}
+			if browserCalls != wantCalls {
+				t.Errorf("browser calls = %d, want %d", browserCalls, wantCalls)
+			}
+		})
+	}
+}

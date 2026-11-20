@@ -143,7 +143,7 @@ func newRootCmd() *cobra.Command {
 	// override $PAGNET_SERVER (the stale-dev-control-plane bug).
 	root.PersistentFlags().StringVar(&serverURL, "server", "",
 		"control plane URL (precedence: --server > $PAGNET_SERVER > stored account config > build default)")
-	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/admin bearer token for REST calls (falls back to \"pagnet login\")")
+	root.PersistentFlags().StringVar(&userToken, "token", os.Getenv("PAGNET_TOKEN"), "user/API automation token ($PAGNET_TOKEN; native Pagnet Token for sign-in; falls back to \"pagnet login\")")
 	// --account selects the account context for this invocation (scripts);
 	// empty = the current account.
 	root.PersistentFlags().StringVar(&accountFlag, "account", "", "account context for this invocation (default: the current account)")

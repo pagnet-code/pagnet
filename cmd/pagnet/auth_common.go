@@ -1,9 +1,9 @@
 package main
 
-// The ONE common user-auth function: token-first paste, reused by
-// `pagnet login` and first-run `pagnet serve` / `pagnet -d` / `pagnet
-// enroll`. A valid stored credential is reused without a prompt; otherwise
-// the hidden token-first paste runs (interactive) or the command fails
+// The common first-run user-auth function, reused by
+// `pagnet serve` / `pagnet -d` / `pagnet enroll`. A valid stored credential
+// is reused without a prompt; otherwise OIDC device sign-in or a hidden
+// token paste runs (interactive), or the command fails
 // cleanly (non-interactive — never a browser, never a hang). The raw root
 // token is exchanged once and never persisted.
 //
@@ -39,13 +39,13 @@ const maxAuthReprompts = 2
 const pagnetTokenPath = "Settings → Security → Pagnet Token"
 
 // authenticateUser returns a valid user credential for (account, server):
-// the stored credential when valid (reuse — no prompt), else the token-first
-// paste (interactive), else a clean failure (non-interactive / no TTY).
+// the stored credential when valid, else mode-aware sign-in (interactive),
+// else a clean failure (non-interactive / no TTY).
 func authenticateUser(stateDir, account, server string, interactive bool) (string, error) {
 	return authenticateUserFresh(stateDir, account, server, interactive, false)
 }
 
-// authenticateUserFresh is the shared paste path. fresh ignores the stored
+// authenticateUserFresh is the shared sign-in path. fresh ignores the stored
 // credential: the caller just told the human that what is stored is the wrong
 // class, so reusing it would return the very credential being replaced.
 func authenticateUserFresh(stateDir, account, server string, interactive, fresh bool) (string, error) {
@@ -70,7 +70,23 @@ func authenticateUserFresh(stateDir, account, server string, interactive, fresh 
 	if !interactive {
 		return "", errors.New("not signed in — run `pagnet login` (or pass --token / $PAGNET_TOKEN); --non-interactive never prompts")
 	}
-	// 2. Token-first paste (hidden).
+	// 2. OIDC servers sign in through the browser device flow. Explicit
+	// native tokens take the separate exchange path in userCredentialForServe.
+	mode, err := serverAuthMode(base)
+	if err != nil {
+		return "", fmt.Errorf("cannot reach the control plane at %s: %w", base, err)
+	}
+	if mode == "oidc" {
+		cred, err := loginOIDCDeviceFlow(base, false)
+		if err != nil {
+			return "", err
+		}
+		if err := saveCredential(accDir, account, server, cred.credential, cred.meta()); err != nil {
+			return "", err
+		}
+		return cred.credential, nil
+	}
+	// 3. Token-first paste (hidden) for accounts/token servers.
 	pasted, err := askPagnetTokenFn("Pagnet Token (paste, hidden): ")
 	if err != nil {
 		return "", err
