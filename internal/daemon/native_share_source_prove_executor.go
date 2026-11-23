@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"context"
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
@@ -11,7 +12,7 @@ import (
 
 // NativeShareSourceProveExecutor is a local, closed proof boundary. Its caller
 // supplies the authenticated session snapshot and trusted connection endpoint.
-// No daemon route or source authority is installed by constructing it.
+// Construction grants no source authority.
 type NativeShareSourceProveExecutor struct {
 	store *NativeShareSourceProveStore
 	now   func() time.Time
@@ -51,4 +52,28 @@ func (e *NativeShareSourceProveExecutor) Prove(endpoint string, session transpor
 		return empty, errNativeShareSourceProve
 	}
 	return e.store.prove(request, subject, session.HostCredentialID, session.OwnershipScope, e.now)
+}
+
+// Readiness is bounded so a busy registry cannot stall the socket handshake.
+func (e *NativeShareSourceProveExecutor) nativeShareSourceProveReady() bool {
+	if e == nil || e.store == nil || e.store.holder == nil || e.store.holder.registry == nil || e.now == nil {
+		return false
+	}
+	registry := e.store.holder.registry
+	if registry.db == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	return registry.db.PingContext(ctx) == nil
+}
+
+// Compose only after the daemon has acquired its serve lock and registry.
+func (d *Daemon) initNativeShareSourceProve() {
+	executor, err := NewNativeShareSourceProveExecutor(d.nativeRegistry, time.Now)
+	if err == nil && executor.nativeShareSourceProveReady() {
+		d.nativeSourceProve = executor
+		return
+	}
+	d.Log.Warn("native share source prove unavailable")
 }

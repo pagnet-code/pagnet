@@ -30,6 +30,9 @@ type NativeShareSourceChallengeContext struct {
 	ExpiresAt             string    `json:"expiresAt"`
 }
 
+const NativeShareSourceProveProtocol = "native-share-source-prove-v1"
+const MsgNativeShareSourceProve = "host.native_share_source_prove"
+
 type NativeShareSourceProvePayload struct {
 	NativeShareSourceChallengeContext
 	Challenge CryptoHPKEWrap `json:"challenge"`
