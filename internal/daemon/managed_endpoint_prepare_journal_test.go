@@ -96,6 +96,11 @@ func TestManagedPrepareJournalConcurrentReservationAndTerminal(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			v, e := current.Succeed(command, "https://example.test", managedPrepareScopeOK, ack)
+			// A transition during unlocked verification rejects that attempt;
+			// an exact terminal replay independently verifies the current state.
+			if e != nil {
+				v, e = current.Succeed(command, "https://example.test", managedPrepareScopeOK, ack)
+			}
 			if e != nil {
 				t.Error(e)
 				return
@@ -524,5 +529,192 @@ func TestManagedPrepareJournalVerifierReceivesRetainedCanonicalContext(t *testin
 	}
 	if !called {
 		t.Fatal("scope verifier skipped")
+	}
+}
+
+func TestManagedPrepareJournalKeyStartCrashFence(t *testing.T) {
+	for _, createKey := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before creation", true: "after creation"}[createKey], func(t *testing.T) {
+			j, keys, command, session := managedPrepareJournalFixture(t)
+			if _, err := j.BeginKeyReservation(command, "https://example.test", managedPrepareScopeOK); err == nil {
+				t.Fatal("start created association")
+			}
+			if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+				t.Fatal(err)
+			}
+			v, err := j.BeginKeyReservation(command, "https://example.test", managedPrepareScopeOK)
+			if err != nil || !v.KeyStarted {
+				t.Fatal("missing first grant", err)
+			}
+			if createKey {
+				if _, err := keys.Reserve(command.Subject, "https://example.test", session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root := j.registry.root
+			if err := j.registry.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := OpenNativeWorkerRegistry(filepath.Dir(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			j, err = NewManagedEndpointPrepareJournal(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys, err = NewManagedEndpointKeyStore(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v, err = j.BeginKeyReservation(command, "https://example.test", managedPrepareScopeOK)
+			if err != nil || v.KeyStarted {
+				t.Fatal("regranted after crash", err)
+			}
+			_, err = keys.RecoverReservation(command.Subject, "https://example.test", session)
+			if createKey != (err == nil) {
+				t.Fatal("incorrect crash recovery", err)
+			}
+		})
+	}
+}
+
+func TestManagedPrepareJournalConcurrentKeyStart(t *testing.T) {
+	j, _, command, _ := managedPrepareJournalFixture(t)
+	if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	other, err := NewManagedEndpointPrepareJournal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 16
+	grants := make(chan bool, count)
+	var wg sync.WaitGroup
+	for i := range count {
+		current := j
+		if i%2 == 1 {
+			current = other
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			v, err := current.BeginKeyReservation(command, "https://example.test", managedPrepareScopeOK)
+			grants <- err == nil && v.KeyStarted
+		}()
+	}
+	wg.Wait()
+	close(grants)
+	winners := 0
+	for grant := range grants {
+		if grant {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatal("key start winners", winners)
+	}
+}
+
+func TestManagedPrepareJournalVerifierCanLookupRegistry(t *testing.T) {
+	j, _, command, _ := managedPrepareJournalFixture(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := j.Reserve(command, "https://example.test", func(transport.ManagedEndpointPrepareCommand, string) error {
+			_, _ = j.registry.Lookup(command.Subject.InstanceID.String())
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("verifier deadlocked")
+	}
+}
+
+func TestManagedPrepareJournalRejectsChangesDuringVerification(t *testing.T) {
+	for name, mutation := range map[string]string{
+		"association":  `UPDATE native_managed_endpoint_prepare_commands SET server_url='https://other.test'`,
+		"installation": `UPDATE native_registry_metadata SET value='other' WHERE name='installation_id'`,
+		"marker":       `UPDATE native_managed_endpoint_prepare_commands SET key_started=1`,
+		"deletion":     `DELETE FROM native_managed_endpoint_prepare_commands`,
+		"state":        `UPDATE native_managed_endpoint_prepare_commands SET state='failed',ack=?`,
+		"expiry":       "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			j, _, command, _ := managedPrepareJournalFixture(t)
+			if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+				t.Fatal(err)
+			}
+			verify := func(transport.ManagedEndpointPrepareCommand, string) error {
+				if name == "expiry" {
+					j.now = func() time.Time { return command.Subject.ExpiresAt }
+					return nil
+				}
+				var args []any
+				if name == "state" {
+					ack, err := (transport.ManagedEndpointPrepareFailureACK{ProtocolVersion: transport.ManagedEndpointPrepareProtocol, CommandID: command.CommandID, Error: transport.ManagedEndpointPrepareFailure}).CanonicalBytes()
+					if err != nil {
+						t.Fatal(err)
+					}
+					args = []any{ack}
+				}
+				if _, err := j.registry.db.Exec(mutation, args...); err != nil {
+					t.Fatal(err)
+				}
+				return nil
+			}
+			if _, err := j.BeginKeyReservation(command, "https://example.test", verify); err == nil {
+				t.Fatal("changed snapshot accepted")
+			}
+		})
+	}
+}
+
+func TestManagedPrepareJournalMigratesKeyStartConservatively(t *testing.T) {
+	j, _, command, _ := managedPrepareJournalFixture(t)
+	if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.registry.db.Exec(`ALTER TABLE native_managed_endpoint_prepare_commands DROP COLUMN key_started`); err != nil {
+		t.Fatal(err)
+	}
+	root := j.registry.root
+	if err := j.registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenNativeWorkerRegistry(filepath.Dir(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	j, err = NewManagedEndpointPrepareJournal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker int
+	if err := r.db.QueryRow(`SELECT key_started FROM native_managed_endpoint_prepare_commands WHERE command_id=?`, command.CommandID).Scan(&marker); err != nil || marker != 1 {
+		t.Fatal("unsafe migration", marker, err)
+	}
+	v, err := j.BeginKeyReservation(command, "https://example.test", managedPrepareScopeOK)
+	if err != nil || v.KeyStarted {
+		t.Fatal("migrated regrant", err)
+	}
+	command.CommandID, command.Subject.ID = domain.NewID(), domain.NewID()
+	if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.db.QueryRow(`SELECT key_started FROM native_managed_endpoint_prepare_commands WHERE command_id=?`, command.CommandID).Scan(&marker); err != nil || marker != 0 {
+		t.Fatal("new command already started", marker, err)
 	}
 }

@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -372,5 +373,149 @@ func TestManagedEndpointReservationPrivateKeyNotPublic(t *testing.T) {
 	encoded, _ := json.Marshal(public)
 	if bytes.Contains(encoded, []byte(hex.EncodeToString(record.Private))) || bytes.Contains(encoded, []byte(`"private"`)) {
 		t.Fatal("private export")
+	}
+}
+
+type managedEndpointRecoveryRandomReader struct {
+	reads int
+}
+
+func (r *managedEndpointRecoveryRandomReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, errors.New("unexpected recovery randomness")
+}
+
+func TestManagedEndpointKeyRecoverReservation(t *testing.T) {
+	store, p, session := managedEndpointFixture(t)
+	want, err := store.Reserve(p, "https://example.test", session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRegistry, err := OpenNativeWorkerRegistry(filepath.Dir(store.registry.root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondRegistry.Close()
+	reopened, err := NewManagedEndpointKeyStore(secondRegistry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened.sync = func(*os.File) error { return errors.New("unexpected recovery sync") }
+	random := &managedEndpointRecoveryRandomReader{}
+	originalRandom := rand.Reader
+	rand.Reader = random
+	defer func() { rand.Reader = originalRandom }()
+	got, err := reopened.RecoverReservation(p, "https://EXAMPLE.TEST///", session)
+	if err != nil || got != want {
+		t.Fatal("exact recovery changed reservation", err)
+	}
+	if random.reads != 0 {
+		t.Fatal("recovery generated randomness")
+	}
+}
+
+func TestManagedEndpointKeyRecoveryNeverRepairs(t *testing.T) {
+	for _, failure := range []string{"null", "pending", "missing", "corrupt", "private", "deleted", "unreserved", "namespace", "lock", "unsafe", "symlink", "scope", "session", "expired", "installation"} {
+		t.Run(failure, func(t *testing.T) {
+			store, p, session := managedEndpointFixture(t)
+			if _, err := store.Reserve(p, "https://example.test", session); err != nil {
+				t.Fatal(err)
+			}
+			path := managedEndpointPath(t, store)
+			switch failure {
+			case "null":
+				if _, err := store.registry.db.Exec(`UPDATE native_managed_endpoint_keys SET reservation=NULL`); err != nil {
+					t.Fatal(err)
+				}
+			case "pending":
+				if err := os.WriteFile(strings.TrimSuffix(path, ".json")+".pending", []byte("uncertain"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "missing", "deleted":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if failure == "deleted" {
+					if _, err := store.registry.db.Exec(`DELETE FROM native_managed_endpoint_keys`); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "corrupt":
+				if err := os.WriteFile(path, []byte("{}"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "private":
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var record managedEndpointKeyRecord
+				if err := json.Unmarshal(raw, &record); err != nil {
+					t.Fatal(err)
+				}
+				record.Private = bytes.Repeat([]byte{7}, 32)
+				raw, _ = json.Marshal(record)
+				if err := os.WriteFile(path, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "unreserved":
+				p.ID = domain.NewID()
+				p.EndpointID = domain.NewID()
+			case "namespace":
+				if err := os.RemoveAll(filepath.Dir(path)); err != nil {
+					t.Fatal(err)
+				}
+			case "lock":
+				if err := os.Remove(filepath.Join(filepath.Dir(path), "holder.lock")); err != nil {
+					t.Fatal(err)
+				}
+			case "unsafe":
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Rename(path, path+".real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(path+".real", path); err != nil {
+					t.Fatal(err)
+				}
+			case "scope":
+				p.EndpointID = domain.NewID()
+			case "session":
+				session.HostCredentialID = domain.NewID().String()
+			case "expired":
+				store.now = func() time.Time { return p.ExpiresAt }
+			case "installation":
+				if _, err := store.registry.db.Exec(`UPDATE native_registry_metadata SET value=? WHERE name='installation_id'`, domain.NewID()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var beforeRows, afterRows int
+			if err := store.registry.db.QueryRow(`SELECT count(*) FROM native_managed_endpoint_keys`).Scan(&beforeRows); err != nil {
+				t.Fatal(err)
+			}
+			beforeFiles, err := filepath.Glob(filepath.Join(filepath.Dir(path), "*"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			random := &managedEndpointRecoveryRandomReader{}
+			originalRandom := rand.Reader
+			rand.Reader = random
+			defer func() { rand.Reader = originalRandom }()
+			if _, err := store.RecoverReservation(p, "https://example.test", session); err == nil {
+				t.Fatal("unsafe recovery accepted")
+			}
+			if random.reads != 0 {
+				t.Fatal("failed recovery generated randomness")
+			}
+			if err := store.registry.db.QueryRow(`SELECT count(*) FROM native_managed_endpoint_keys`).Scan(&afterRows); err != nil || afterRows != beforeRows {
+				t.Fatal("recovery changed reservation rows", err)
+			}
+			afterFiles, err := filepath.Glob(filepath.Join(filepath.Dir(path), "*"))
+			if err != nil || strings.Join(beforeFiles, "\n") != strings.Join(afterFiles, "\n") {
+				t.Fatal("recovery changed key files", err)
+			}
+		})
 	}
 }

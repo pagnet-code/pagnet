@@ -69,6 +69,16 @@ type managedEndpointKeyRecord struct {
 // A durable NULL reservation is committed before generating any random key. An
 // interrupted reservation is permanently unavailable, including after file loss.
 func (s *ManagedEndpointKeyStore) Reserve(subject transport.ManagedEndpointBindingIntent, configuredServer string, session transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error) {
+	return s.reserve(subject, configuredServer, session, false)
+}
+
+// RecoverReservation returns only a complete existing reservation for the exact
+// supplied evidence. It never creates, repairs, or replaces retained key state.
+func (s *ManagedEndpointKeyStore) RecoverReservation(subject transport.ManagedEndpointBindingIntent, configuredServer string, session transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error) {
+	return s.reserve(subject, configuredServer, session, true)
+}
+
+func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindingIntent, configuredServer string, session transport.HostSessionPayload, recovery bool) (transport.ManagedEndpointKeyReservation, error) {
 	var empty transport.ManagedEndpointKeyReservation
 	if s == nil || s.registry == nil || s.now == nil || s.sync == nil {
 		return empty, errManagedEndpointKey
@@ -106,12 +116,17 @@ func (s *ManagedEndpointKeyStore) Reserve(subject transport.ManagedEndpointBindi
 		return empty, err
 	}
 	defer root.Close()
-	dir, err := nativeShareHolderChild(root, nativeManagedEndpointKeyNamespace)
+	var dir *os.File
+	if recovery {
+		dir, err = nativeShareHolderExistingChild(root, nativeManagedEndpointKeyNamespace)
+	} else {
+		dir, err = nativeShareHolderChild(root, nativeManagedEndpointKeyNamespace)
+	}
 	if err != nil {
 		return empty, err
 	}
 	defer dir.Close()
-	lock, err := nativeShareHolderLock(dir)
+	lock, err := nativeShareHolderLockMode(dir, !recovery)
 	if err != nil {
 		return empty, err
 	}
@@ -169,8 +184,10 @@ func (s *ManagedEndpointKeyStore) Reserve(subject transport.ManagedEndpointBindi
 		if !bytes.Equal(raw, reserved) || expected != record.Reservation || !s.now().Before(subject.ExpiresAt) {
 			return empty, errManagedEndpointKey
 		}
-		if err = s.sync(dir); err != nil {
-			return empty, err
+		if !recovery {
+			if err = s.sync(dir); err != nil {
+				return empty, err
+			}
 		}
 		if err = exec("COMMIT"); err != nil {
 			return empty, err
@@ -179,6 +196,9 @@ func (s *ManagedEndpointKeyStore) Reserve(subject transport.ManagedEndpointBindi
 	}
 	if file != nil {
 		file.Close()
+	}
+	if recovery {
+		return empty, errManagedEndpointKey
 	}
 	if !errors.Is(err, unix.ENOENT) {
 		return empty, errManagedEndpointKey
