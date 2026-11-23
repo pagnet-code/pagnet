@@ -204,7 +204,7 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	nativeShareBindings nativeShareBindingExecutor // nil until explicitly composed; dormant preview
+	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
 	nativeRegistry      *NativeWorkerRegistry
 	nativeWorkersMu     sync.Mutex
 	nativeConnectLocks  [16]sync.Mutex
@@ -787,6 +787,7 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		}
 		d.nativeRegistry = registry
 	}
+	d.initNativeShareBindings()
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.

@@ -40,7 +40,25 @@ type NativeShareHolderStore struct {
 }
 
 func (s *NativeShareHolderStore) nativeShareBindingReady() bool {
-	return s != nil && s.registry != nil && len(s.signer) == ed25519.PrivateKeySize && s.now != nil
+	return s != nil && s.registry != nil && s.registry.db != nil && len(s.signer) == ed25519.PrivateKeySize && s.now != nil && s.registry.db.Ping() == nil
+}
+
+// Compose only the closed holder lane. Epoch installation, membership and
+// messaging remain separate authority and are not composed here.
+func (d *Daemon) initNativeShareBindings() {
+	if d.nativeRegistry == nil {
+		return
+	}
+	identity, err := d.cryptoManager().hostIdentity()
+	if err == nil {
+		var store *NativeShareHolderStore
+		store, err = NewNativeShareHolderStore(d.nativeRegistry, identity)
+		if err == nil && store.nativeShareBindingReady() {
+			d.nativeShareBindings = store
+			return
+		}
+	}
+	d.Log.Warn("closed native share bindings unavailable")
 }
 
 func (s *NativeShareHolderStore) String() string { return "NativeShareHolderStore{closed}" }
