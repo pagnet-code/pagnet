@@ -40,7 +40,9 @@ type nativeShareSourcePrepareConnection struct {
 
 func newNativeShareSourcePrepareConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection) *nativeShareSourcePrepareConnection {
 	c := &nativeShareSourcePrepareConnection{d: d, socket: socket, native: native, executor: d.nativeSourcePrepare, endpoint: native.serverURL, queue: make(chan nativeShareSourcePrepareAttempt, nativeShareSourcePrepareQueueLimit), done: make(chan struct{})}
-	if c.executor != nil && c.executor.nativeShareSourcePrepareReady() {
+	// Readiness may recover after a transient registry timeout. Keep a consumer
+	// available for every configured executor; admission still checks readiness.
+	if c.executor != nil {
 		go c.run()
 	}
 	return c

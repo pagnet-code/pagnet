@@ -255,3 +255,29 @@ func TestNativeShareSourcePrepareProductionDispatch(t *testing.T) {
 		t.Fatal("closed registry advertised capability", err)
 	}
 }
+
+// A transient readiness failure during connection setup must not strand later
+// admitted commands in a queue without a consumer.
+type sourcePrepareRecoveringExecutor struct {
+	nativeShareSourcePrepareExecutor
+	ready bool
+}
+
+func (e *sourcePrepareRecoveringExecutor) nativeShareSourcePrepareReady() bool { return e.ready }
+
+func TestNativeShareSourcePrepareReadinessRecovery(t *testing.T) {
+	holder, session, request := sourcePrepareLaneFixture(t, transport.NativeShareSourceEnrollmentProtocol)
+	executor, err := NewNativeShareSourcePrepareExecutor(holder.registry, sourcePrepareExecutorNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovering := &sourcePrepareRecoveringExecutor{nativeShareSourcePrepareExecutor: executor}
+	_, lane, peer := sourcePrepareLane(t, recovering, session)
+	recovering.ready = true
+	lane.handle(nativeBindingEnvelope(t, transport.MsgNativeShareSourcePrepare, request))
+	var prepared transport.NativeShareSourcePreparedPayload
+	if err := nativeBindingReadAck(t, peer, request.CommandID, &prepared); err != "" {
+		t.Fatal(err)
+	}
+	sourcePrepareBytes(t, prepared)
+}
