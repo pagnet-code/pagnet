@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -50,6 +52,20 @@ func sameManagedPrepareOwnership(a, b transport.NativeWorkerOwnership) bool {
 	return transport.SameNativeWorkerOwnership(a, b)
 }
 
+// managedPrepareServerOrigin normalizes comparison copies only. Escaped path
+// separators retain their spelling and identity; only literal trailing slashes
+// are ignored. Rebuilding a decoded Path could merge distinct server routes.
+func managedPrepareServerOrigin(value string) string {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	path := strings.TrimRight(u.EscapedPath(), "/")
+	u.Host = strings.ToLower(u.Host)
+	u.Path, u.RawPath = "", ""
+	return u.String() + path
+}
+
 func managedPrepareSessionMatches(s transport.ManagedEndpointBindingIntent, session transport.HostSessionPayload) bool {
 	return session.OwnershipScope == "personal" && s.TenantID.String() == session.TenantID && s.AccountID.String() == session.AccountID && s.HostID.String() == session.HostID && s.HostCredentialID.String() == session.HostCredentialID && s.NativeAdmissionID.String() == session.NativeAdmissionID && s.ConnectionIncarnationID == s.NativeAdmissionID && s.RunnerID.String() == session.RunnerID && s.RunnerConnectedAt.Equal(session.RunnerEpoch) && s.BootID == session.BootID
 }
@@ -61,7 +77,7 @@ func (d *Daemon) verifyManagedEndpointPrepare(ctx context.Context, captured Mana
 	s := command.Subject
 	// Canonicalize comparison copies only: raw URLs remain part of the exact
 	// registry, proxy and owner scope identity.
-	server := textServiceServer(configuredServer)
+	server := managedPrepareServerOrigin(configuredServer)
 	if captured.Socket == nil || captured.Connection == nil || server == "" || !managedPrepareSessionMatches(s, captured.Session) || !time.Now().Before(s.ExpiresAt) {
 		return ErrManagedEndpointPrepareRejected
 	}
@@ -88,7 +104,7 @@ func (d *Daemon) verifyManagedEndpointPrepare(ctx context.Context, captured Mana
 		if err != nil {
 			return nil, nil, transport.NativeWorkerOwnership{}, ErrManagedEndpointPrepareRetryable
 		}
-		if !managedPrepareSessionMatches(s, session) || textServiceServer(captured.Connection.serverURL) != server || captured.Connection.hostID != session.HostID || captured.Connection.bootID != session.BootID {
+		if !managedPrepareSessionMatches(s, session) || managedPrepareServerOrigin(captured.Connection.serverURL) != server || captured.Connection.hostID != session.HostID || captured.Connection.bootID != session.BootID {
 			return nil, nil, transport.NativeWorkerOwnership{}, ErrManagedEndpointPrepareRejected
 		}
 		link.mu.Lock()
@@ -118,7 +134,7 @@ func (d *Daemon) verifyManagedEndpointPrepare(ctx context.Context, captured Mana
 			return nil, nil, ownership, ErrManagedEndpointPrepareRetryable
 		}
 		scope := record.Scope
-		if !ok || row.AgentPrincipalID != s.PrincipalID.String() || row.Runtime != string(domain.RuntimeQwenCode) || row.Profile != record.Profile || record.Spec.Runtime != domain.RuntimeQwenCode || record.Spec.TenantID != scope.TenantID || record.LaunchState != "launched" || scope != p.scope || textServiceServer(scope.ServerURL) != server || scope.TenantID != session.TenantID || scope.AccountID != session.AccountID || scope.HostID != session.HostID || scope.InstanceID != s.InstanceID.String() || scope.Generation != s.OwnershipGeneration || record.ProfileFingerprint != sessionworker.NativeProfileFingerprint(record.Spec) || p.profile != record.ProfileFingerprint || sessionworker.NativeProfileFingerprint(p.bootstrap.Native) != p.profile || ownership.ProfileFingerprint != record.ProfileFingerprint || ownership.Profile != record.Profile || record.Ownership == nil || !sameManagedPrepareOwnership(*record.Ownership, ownership) {
+		if !ok || row.AgentPrincipalID != s.PrincipalID.String() || row.Runtime != string(domain.RuntimeQwenCode) || row.Profile != record.Profile || record.Spec.Runtime != domain.RuntimeQwenCode || record.Spec.TenantID != scope.TenantID || record.LaunchState != "launched" || scope != p.scope || managedPrepareServerOrigin(scope.ServerURL) != server || scope.TenantID != session.TenantID || scope.AccountID != session.AccountID || scope.HostID != session.HostID || scope.InstanceID != s.InstanceID.String() || scope.Generation != s.OwnershipGeneration || record.ProfileFingerprint != sessionworker.NativeProfileFingerprint(record.Spec) || p.profile != record.ProfileFingerprint || sessionworker.NativeProfileFingerprint(p.bootstrap.Native) != p.profile || ownership.ProfileFingerprint != record.ProfileFingerprint || ownership.Profile != record.Profile || record.Ownership == nil || !sameManagedPrepareOwnership(*record.Ownership, ownership) {
 			return nil, nil, ownership, ErrManagedEndpointPrepareRejected
 		}
 		return link, p, ownership, nil
