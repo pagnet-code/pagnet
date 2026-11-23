@@ -3,13 +3,14 @@
 package daemon
 
 import (
+	"context"
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// NativeShareSourcePrepareExecutor is a dormant local boundary for authenticated
+// NativeShareSourcePrepareExecutor is the local boundary for authenticated
 // source enrollment commands. The caller supplies the captured authenticated
 // HostSession and its trusted endpoint, never session evidence from the command.
 // Preparing a holder conveys no source, membership, grant or epoch authority.
@@ -79,4 +80,28 @@ func (e *NativeShareSourcePrepareExecutor) Prepare(endpoint string, session tran
 func (e *NativeShareSourcePrepareExecutor) before(expiry time.Time) bool {
 	now := e.now()
 	return !now.IsZero() && now.Before(expiry)
+}
+
+// Readiness is bounded so a busy registry cannot stall the socket handshake.
+func (e *NativeShareSourcePrepareExecutor) nativeShareSourcePrepareReady() bool {
+	if e == nil || e.store == nil || e.store.holder == nil || e.store.holder.registry == nil || e.now == nil {
+		return false
+	}
+	registry := e.store.holder.registry
+	if registry.db == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	return registry.db.PingContext(ctx) == nil
+}
+
+// Compose only after the daemon has acquired its serve lock and registry.
+func (d *Daemon) initNativeShareSourcePrepare() {
+	executor, err := NewNativeShareSourcePrepareExecutor(d.nativeRegistry, time.Now)
+	if err == nil && executor.nativeShareSourcePrepareReady() {
+		d.nativeSourcePrepare = executor
+		return
+	}
+	d.Log.Warn("native share source prepare unavailable")
 }

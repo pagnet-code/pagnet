@@ -14,6 +14,9 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 )
 
+const NativeShareSourceEnrollmentProtocol = "native-share-source-enrollment-v1"
+const MsgNativeShareSourcePrepare = "host.native_share_source_prepare"
+
 const NativeShareSourceEnrollmentMaxBodyBytes = 16 * 1024
 
 // NativeShareSourceHolderScope is public local provenance, not authorization.
