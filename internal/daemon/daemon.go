@@ -205,6 +205,7 @@ type Daemon struct {
 	ownerTextConsoleHandlers int
 
 	nativeSourcePrepare nativeShareSourcePrepareExecutor
+	nativeSourceProve   nativeShareSourceProveExecutor
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
 	nativeRegistry      *NativeWorkerRegistry
 	nativeWorkersMu     sync.Mutex
@@ -980,6 +981,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// replace a newly persisted identity before the first connection.
 	d.initNativeShareBindings()
 	d.initNativeShareSourcePrepare()
+	d.initNativeShareSourceProve()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
@@ -1113,6 +1115,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
 	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
+	q.Del("native_share_source_prove")
+	if d.nativeSourceProve != nil && d.nativeSourceProve.nativeShareSourceProveReady() {
+		q.Set("native_share_source_prove", transport.NativeShareSourceProveProtocol)
+	}
 	q.Del("native_share_source_enrollment")
 	if d.nativeSourcePrepare != nil && d.nativeSourcePrepare.nativeShareSourcePrepareReady() {
 		q.Set("native_share_source_enrollment", transport.NativeShareSourceEnrollmentProtocol)
@@ -1199,6 +1205,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer shareBindings.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
+	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn)
+	defer sourceProve.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
 		env, err := transport.NewEnvelope(typ, payload)
 		if err != nil {
@@ -1464,6 +1472,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		}
 		if env.Type == transport.MsgAccountMessagingReadinessOffer || env.Type == transport.MsgAccountMessagingReadinessReset || env.Type == transport.MsgAccountMessagingReadinessSnapshotComplete || env.Type == transport.MsgAccountMessagingReadinessAccepted {
 			accountReadiness.offer(env)
+			continue
+		}
+		if sourceProve.handle(env) {
 			continue
 		}
 		if sourcePrepare.handle(env) {
@@ -1740,7 +1751,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+	if env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {
