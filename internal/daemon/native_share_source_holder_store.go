@@ -90,6 +90,7 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS native_registry_metadata(name TEXT PRIMARY KEY,value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS native_managed_endpoint_keys(enrollment_id TEXT PRIMARY KEY,scope TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,request BLOB NOT NULL,reservation BLOB)`,
 		`CREATE TABLE IF NOT EXISTS native_source_holder_enrollments(scope TEXT PRIMARY KEY,installation_id TEXT NOT NULL,descriptor BLOB)`,
 		`CREATE TABLE IF NOT EXISTS native_source_prepare_journal(command_id TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,scope TEXT NOT NULL,request_digest BLOB NOT NULL CHECK(length(request_digest)=32),prepared BLOB)`,
 		`CREATE TABLE IF NOT EXISTS native_source_prove_journal(command_id TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,scope TEXT NOT NULL,request_digest BLOB NOT NULL CHECK(length(request_digest)=32),request BLOB NOT NULL,receipt_digest TEXT)`,
@@ -102,10 +103,13 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 	err = conn.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		var count int
-		if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments)+(SELECT COUNT(*) FROM native_source_prepare_journal)+(SELECT COUNT(*) FROM native_source_prove_journal)`).Scan(&count); err != nil || count != 0 {
+		if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments)+(SELECT COUNT(*) FROM native_source_prepare_journal)+(SELECT COUNT(*) FROM native_source_prove_journal)+(SELECT COUNT(*) FROM native_managed_endpoint_keys)`).Scan(&count); err != nil || count != 0 {
 			return errNativeShareSourceHolder
 		}
 		var stat unix.Stat_t
+		if err = unix.Fstatat(int(root.Fd()), nativeManagedEndpointKeyNamespace, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			return errNativeShareSourceHolder
+		}
 		if err = unix.Fstatat(int(root.Fd()), nativeShareSourceHolderNamespace, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
 			return errNativeShareSourceHolder
 		}
@@ -120,7 +124,7 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 		return errNativeShareSourceHolder
 	}
 	var conflicts int
-	if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prepare_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prove_journal WHERE installation_id<>?)`, id, id, id).Scan(&conflicts); err != nil || conflicts != 0 {
+	if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prepare_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prove_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_keys WHERE installation_id<>?)`, id, id, id, id).Scan(&conflicts); err != nil || conflicts != 0 {
 		return errNativeShareSourceHolder
 	}
 	if _, err = conn.ExecContext(context.Background(), "COMMIT"); err != nil {
