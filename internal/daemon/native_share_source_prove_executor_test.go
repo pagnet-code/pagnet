@@ -238,3 +238,64 @@ func TestNativeShareSourceProveFailedOpenRetainsReservation(t *testing.T) {
 		t.Fatal("uncertain command reused")
 	}
 }
+
+func TestNativeShareSourcePrepareProveCommandCollision(t *testing.T) {
+	for _, first := range []string{"prepare", "prove"} {
+		t.Run(first, func(t *testing.T) {
+			holder, session, prepared, prove, _ := sourceProveFixture(t)
+			prepareExecutor, err := NewNativeShareSourcePrepareExecutor(holder.registry, sourcePrepareExecutorNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proveExecutor, err := NewNativeShareSourceProveExecutor(holder.registry, sourcePrepareExecutorNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint := prepared.Prepare.Enrollment.Subject.ServerURL
+			prepare := prepared.Prepare
+			prepare.CommandID = prove.CommandID
+			prepare.Enrollment.EnrollmentID = domain.NewID()
+			runPrepare := func() ([]byte, error) {
+				reply, err := prepareExecutor.Prepare(endpoint, session, prepare)
+				if err != nil {
+					return nil, err
+				}
+				return reply.CanonicalBytes()
+			}
+			runProve := func() ([]byte, error) {
+				reply, err := proveExecutor.Prove(endpoint, session, prove)
+				if err != nil {
+					return nil, err
+				}
+				return reply.CanonicalBytes()
+			}
+			original, conflict := runPrepare, runProve
+			if first == "prove" {
+				original, conflict = runProve, runPrepare
+			}
+			raw, err := original()
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := sourcePrepareExecutorCounts(t, holder.registry)
+			var proveCount int
+			if err := holder.registry.db.QueryRow(`SELECT COUNT(*) FROM native_source_prove_journal`).Scan(&proveCount); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conflict(); err == nil {
+				t.Fatal("command ID reused across prepare and prove")
+			}
+			if after := sourcePrepareExecutorCounts(t, holder.registry); after != before {
+				t.Fatalf("conflict changed prepare state: before %v, after %v", before, after)
+			}
+			var afterProve int
+			if err := holder.registry.db.QueryRow(`SELECT COUNT(*) FROM native_source_prove_journal`).Scan(&afterProve); err != nil || afterProve != proveCount {
+				t.Fatal("conflict changed prove reservations", err)
+			}
+			retry, err := original()
+			if err != nil || !bytes.Equal(raw, retry) {
+				t.Fatal("conflict changed original exact retry", err)
+			}
+		})
+	}
+}
