@@ -141,6 +141,10 @@ func (s *NativeShareSourcePrepareStore) journal(request transport.NativeShareSou
 	if err = conn.QueryRowContext(ctx, `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&installation); err != nil || installation != string(s.holder.installation) {
 		return nil, errNativeShareSourcePrepare
 	}
+	var collisions int
+	if err = conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_source_prove_journal WHERE command_id=?`, request.CommandID).Scan(&collisions); err != nil || collisions != 0 {
+		return nil, errNativeShareSourcePrepare
+	}
 	var commandID, enrollmentID, enrolledInstallation, enrolledScope string
 	var enrolledDigest, cached []byte
 	err = conn.QueryRowContext(ctx, `SELECT command_id,enrollment_id,installation_id,scope,request_digest,prepared FROM native_source_prepare_journal WHERE command_id=? OR enrollment_id=?`, request.CommandID, request.Enrollment.EnrollmentID).Scan(&commandID, &enrollmentID, &enrolledInstallation, &enrolledScope, &enrolledDigest, &cached)
