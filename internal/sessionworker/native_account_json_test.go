@@ -68,6 +68,7 @@ func TestAccountPersistenceEnclosingRecords(t *testing.T) {
 		Response{Cancellation: &cancellation},
 		Response{ContentFragment: &fragment},
 		Response{Snapshot: &NativeSnapshot{Pending: []Inspection{{DetailContent: &ref}}}},
+		Response{OwnershipVerify: &NativeOwnershipVerifyResult{Snapshot: NativeSnapshot{Pending: []Inspection{{DetailContent: &ref}}}}},
 	}
 	records = append(records,
 		BridgeCall{TurnSource: &turn},

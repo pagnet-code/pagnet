@@ -42,6 +42,7 @@ type handshake struct {
 }
 
 type Request struct {
+	OwnershipVerify     *NativeOwnershipVerifyRequest                 `json:"ownershipVerify,omitempty"`
 	AccountReplyReceipt *transport.NativeAccountReplyReceiptPayload   `json:"accountReplyReceipt,omitempty"`
 	HostedPeer          *HostedPeerVerificationRequest                `json:"hostedPeer,omitempty"`
 	InvocationSource    *CloudInvocationSourceRequest                 `json:"invocationSource,omitempty"`
@@ -72,6 +73,7 @@ type Request struct {
 }
 
 type Response struct {
+	OwnershipVerify        *NativeOwnershipVerifyResult     `json:"ownershipVerify,omitempty"`
 	HostedPeer             *HostedPeerVerificationResult    `json:"hostedPeer,omitempty"`
 	InvocationSource       *CloudInvocationSourceResult     `json:"invocationSource,omitempty"`
 	InvocationState        *InvocationStreamState           `json:"invocationState,omitempty"`
@@ -533,6 +535,13 @@ func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req R
 		}
 	case "worker_retire":
 		err = o.prepareOwnershipRetirement(ctx, lease, req.Ownership)
+	case "ownership_verify":
+		if req.OwnershipVerify == nil {
+			err = ErrConflict
+		} else {
+			response.OwnershipVerify, err = o.journal.verifyOwnershipSnapshot(ctx, lease, *req.OwnershipVerify, o.physicalSnapshot)
+			response.Retryable = errors.Is(err, ErrNativeBusy)
+		}
 	case "ownership_bind":
 		if req.Ownership == nil {
 			err = ErrConflict
