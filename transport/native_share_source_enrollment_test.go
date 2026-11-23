@@ -21,7 +21,7 @@ func nativeShareSourceEnrollmentFixture(t *testing.T) (NativeShareSourcePrepared
 	pub := private.Public().(ed25519.PublicKey)
 	p := NativeShareSourcePreparedPayload{
 		Prepare: NativeShareSourcePreparePayload{CommandID: binding.Prepare.CommandID, Enrollment: NativeShareSourceEnrollment{
-			Version: 1, EnrollmentID: b.BindingID, NetworkID: b.NetworkID, PreviousEpochID: b.ContextID, ProposalID: b.ProposalID, ProposalRevision: b.ProposalRevision, GrantID: b.GrantID, GrantGeneration: b.GrantGeneration, BindingID: b.BindingID, BindingDigest: binding.BindingDigest, SourceInstanceID: b.InstanceID, NativeGeneration: b.NativeGeneration, Subject: s, ConnectedAt: s.RunnerEpoch, HostCredentialID: "host-credential", OwnershipScope: "account", ConnectionID: "connection", AuthorityConnectionID: "authority-connection", ExpiresAt: b.ExpiresAt,
+			Version: 1, EnrollmentID: b.BindingID, NetworkID: b.NetworkID, PreviousEpochID: b.ContextID, ProposalID: b.ProposalID, ProposalRevision: b.ProposalRevision, GrantID: b.GrantID, GrantGeneration: b.GrantGeneration, BindingID: b.BindingID, BindingDigest: binding.BindingDigest, Subject: NativeShareSourceHostSubject{ServerURL: s.ServerURL, TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID, NativeAdmissionID: s.NativeAdmissionID, RunnerID: s.RunnerID, RunnerEpoch: s.RunnerEpoch, BootID: s.BootID}, HostCredentialID: "host-credential", OwnershipScope: "account", ExpiresAt: b.ExpiresAt,
 		}},
 		Descriptor: NativeShareSourceHolderDescriptor{Version: 1, Scope: NativeShareSourceHolderScope{ServerURL: s.ServerURL, TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID}, InstallationID: b.ContextID, HolderID: binding.HolderID, Generation: 1, X25519: binding.HolderX25519, Ed25519: hex.EncodeToString(pub)},
 	}
@@ -44,7 +44,7 @@ func nativeShareSourceEnrollmentFixture(t *testing.T) (NativeShareSourcePrepared
 
 func TestNativeShareSourceEnrollmentRoundTrip(t *testing.T) {
 	p, pub := nativeShareSourceEnrollmentFixture(t)
-	if p.Descriptor.Fingerprint != "e7d77061e8ef6a237cafebea34fcf5e0500fa0d464314d41825047c8ce177d4d" || p.EnrollmentDigest != "9c34ff6a571fd9b92486382d3ae4d93d915787b0446fff853df3d6d4f9f6c611" {
+	if p.Descriptor.Fingerprint != "e7d77061e8ef6a237cafebea34fcf5e0500fa0d464314d41825047c8ce177d4d" || p.EnrollmentDigest != "11d0d490fe210022988bc96c8d1e0371ba55359c1f7e9cab7b1b8119dc1df366" {
 		t.Fatal("ordered transcript vector changed")
 	}
 	for _, prepared := range []bool{false, true} {
@@ -152,7 +152,7 @@ func TestNativeShareSourceEnrollmentStrictDecode(t *testing.T) {
 		"unknown":               bytes.Replace(raw, []byte(`"prepare":`), []byte(`"extra":1,"prepare":`), 1),
 		"duplicate":             bytes.Replace(raw, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1),
 		"alias":                 bytes.Replace(raw, []byte(`"bootId":`), []byte(`"BootId":`), 1),
-		"null":                  bytes.Replace(raw, []byte(`"connectedAt":"`+p.Prepare.Enrollment.ConnectedAt+`"`), []byte(`"connectedAt":null`), 1),
+		"null":                  bytes.Replace(raw, []byte(`"bootId":"`+p.Prepare.Enrollment.Subject.BootID+`"`), []byte(`"bootId":null`), 1),
 		"missing":               bytes.Replace(raw, []byte(`"ownershipScope":"account",`), nil, 1),
 		"number revision":       bytes.Replace(raw, []byte(`"proposalRevision":"1"`), []byte(`"proposalRevision":1`), 1),
 		"leading zero revision": bytes.Replace(raw, []byte(`"proposalRevision":"1"`), []byte(`"proposalRevision":"01"`), 1),
@@ -191,5 +191,76 @@ func TestNativeShareSourceEnrollmentStrictDecode(t *testing.T) {
 	changed.Signature = changed.Signature[:63]
 	if _, err := changed.CanonicalBytes(); err == nil {
 		t.Fatal("accepted short signature")
+	}
+}
+
+func TestNativeShareSourceEnrollmentRejectsRemovedFields(t *testing.T) {
+	p, _ := nativeShareSourceEnrollmentFixture(t)
+	prepare, _ := p.Prepare.CanonicalBytes()
+	prepared, _ := p.CanonicalBytes()
+	for _, name := range []string{"sourceInstanceId", "nativeGeneration", "connectedAt", "connectionId", "authorityConnectionId", "profileFingerprint"} {
+		t.Run(name, func(t *testing.T) {
+			anchor := []byte(`"enrollment":{`)
+			if name == "profileFingerprint" {
+				anchor = []byte(`"subject":{`)
+			}
+			extra := append(bytes.Clone(anchor), []byte(`"`+name+`":"removed",`)...)
+			if _, err := DecodeNativeShareSourcePreparePayload(bytes.Replace(prepare, anchor, extra, 1)); err == nil {
+				t.Fatal("prepare accepted removed field")
+			}
+			if _, err := DecodeNativeShareSourcePreparedPayload(bytes.Replace(prepared, anchor, extra, 1)); err == nil {
+				t.Fatal("prepared accepted removed field")
+			}
+		})
+	}
+}
+
+func TestNativeShareSourceEnrollmentRequiresCapturedHostSession(t *testing.T) {
+	p, pub := nativeShareSourceEnrollmentFixture(t)
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{42}, ed25519.SeedSize))
+	check := func(t *testing.T, changed NativeShareSourcePreparedPayload) {
+		t.Helper()
+		changed.Descriptor.Scope = NativeShareSourceHolderScope{ServerURL: changed.Prepare.Enrollment.Subject.ServerURL, TenantID: changed.Prepare.Enrollment.Subject.TenantID, AccountID: changed.Prepare.Enrollment.Subject.AccountID, HostID: changed.Prepare.Enrollment.Subject.HostID}
+		changed.Descriptor.Fingerprint, _ = changed.Descriptor.DigestFingerprint()
+		var err error
+		changed.EnrollmentDigest, err = changed.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := changed.SignatureBytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		changed.Signature = ed25519.Sign(private, raw)
+		// A valid dedicated-holder signature cannot substitute session evidence for
+		// the independently captured expected request, even with a matching scope.
+		if err := changed.Verify(p.Prepare, changed.Descriptor, pub); err == nil {
+			t.Fatal("accepted substituted authenticated host session")
+		}
+	}
+	subject := reflect.TypeOf(p.Prepare.Enrollment.Subject)
+	for i := 0; i < subject.NumField(); i++ {
+		t.Run(subject.Field(i).Name, func(t *testing.T) {
+			changed := p
+			field := reflect.ValueOf(&changed.Prepare.Enrollment.Subject).Elem().Field(i)
+			switch subject.Field(i).Name {
+			case "ServerURL":
+				field.SetString("https://other.test")
+			case "RunnerEpoch":
+				field.SetString("2026-11-02T09:10:12Z")
+			case "BootID":
+				field.SetString("other-boot")
+			default:
+				field.SetString("10000000-0000-4000-8000-000000000099")
+			}
+			check(t, changed)
+		})
+	}
+	for _, name := range []string{"HostCredentialID", "OwnershipScope"} {
+		t.Run(name, func(t *testing.T) {
+			changed := p
+			reflect.ValueOf(&changed.Prepare.Enrollment).Elem().FieldByName(name).SetString("other")
+			check(t, changed)
+		})
 	}
 }

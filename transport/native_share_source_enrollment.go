@@ -38,28 +38,38 @@ type NativeShareSourceHolderDescriptor struct {
 	Fingerprint    string                       `json:"fingerprint"`
 }
 
-// NativeShareSourceEnrollment binds a source selection to captured session
-// evidence. Expiry, replay, registry and authorization checks remain caller duties.
+// NativeShareSourceHostSubject captures the authenticated host session without
+// selecting a source worker or profile. RunnerEpoch is canonical UTC RFC3339Nano.
+type NativeShareSourceHostSubject struct {
+	ServerURL         string    `json:"serverUrl"`
+	TenantID          domain.ID `json:"tenantId"`
+	AccountID         domain.ID `json:"accountId"`
+	HostID            domain.ID `json:"hostId"`
+	NativeAdmissionID domain.ID `json:"nativeAdmissionId"`
+	RunnerID          domain.ID `json:"runnerId"`
+	RunnerEpoch       string    `json:"runnerEpoch"`
+	BootID            string    `json:"bootId"`
+}
+
+// NativeShareSourceEnrollment binds a host-scoped source holder to captured
+// session evidence. Expiry, replay, registry and live authority checks remain
+// caller duties. Subject, HostCredentialID and OwnershipScope must be derived
+// from the authenticated HostSession snapshot, never requester-supplied evidence.
 type NativeShareSourceEnrollment struct {
-	Version               int                       `json:"version"`
-	EnrollmentID          domain.ID                 `json:"enrollmentId"`
-	NetworkID             domain.ID                 `json:"networkId"`
-	PreviousEpochID       domain.ID                 `json:"previousEpochId"`
-	ProposalID            domain.ID                 `json:"proposalId"`
-	ProposalRevision      uint64                    `json:"proposalRevision,string"`
-	GrantID               domain.ID                 `json:"grantId"`
-	GrantGeneration       uint64                    `json:"grantGeneration,string"`
-	BindingID             domain.ID                 `json:"bindingId"`
-	BindingDigest         string                    `json:"bindingDigest"`
-	SourceInstanceID      domain.ID                 `json:"sourceInstanceId"`
-	NativeGeneration      string                    `json:"nativeGeneration"`
-	Subject               NativeShareBindingSubject `json:"subject"`
-	ConnectedAt           string                    `json:"connectedAt"`
-	HostCredentialID      string                    `json:"hostCredentialId"`
-	OwnershipScope        string                    `json:"ownershipScope"`
-	ConnectionID          string                    `json:"connectionId"`
-	AuthorityConnectionID string                    `json:"authorityConnectionId"`
-	ExpiresAt             string                    `json:"expiresAt"`
+	Version          int                          `json:"version"`
+	EnrollmentID     domain.ID                    `json:"enrollmentId"`
+	NetworkID        domain.ID                    `json:"networkId"`
+	PreviousEpochID  domain.ID                    `json:"previousEpochId"`
+	ProposalID       domain.ID                    `json:"proposalId"`
+	ProposalRevision uint64                       `json:"proposalRevision,string"`
+	GrantID          domain.ID                    `json:"grantId"`
+	GrantGeneration  uint64                       `json:"grantGeneration,string"`
+	BindingID        domain.ID                    `json:"bindingId"`
+	BindingDigest    string                       `json:"bindingDigest"`
+	Subject          NativeShareSourceHostSubject `json:"subject"`
+	HostCredentialID string                       `json:"hostCredentialId"`
+	OwnershipScope   string                       `json:"ownershipScope"`
+	ExpiresAt        string                       `json:"expiresAt"`
 }
 
 type NativeShareSourcePreparePayload struct {
@@ -115,22 +125,31 @@ func (d NativeShareSourceHolderDescriptor) CanonicalBytes() ([]byte, error) {
 	return json.Marshal(d)
 }
 
-func (e NativeShareSourceEnrollment) CanonicalBytes() ([]byte, error) {
-	if e.Version != NativeShareSourceVersion || e.ProposalRevision == 0 || e.GrantGeneration == 0 || !nativeShareBindingHex(e.BindingDigest) || !nativeShareOpaque(e.NativeGeneration) || !nativeShareBindingTime(e.ConnectedAt) || !nativeShareBindingTime(e.ExpiresAt) {
+func (s NativeShareSourceHostSubject) CanonicalBytes() ([]byte, error) {
+	if !nativeShareSourceURL(s.ServerURL) || !nativeShareBindingTime(s.RunnerEpoch) || !nativeShareOpaque(s.BootID) {
 		return nil, errNativeShareSource
 	}
-	for _, id := range []domain.ID{e.EnrollmentID, e.NetworkID, e.PreviousEpochID, e.ProposalID, e.GrantID, e.BindingID, e.SourceInstanceID} {
+	for _, id := range []domain.ID{s.TenantID, s.AccountID, s.HostID, s.NativeAdmissionID, s.RunnerID} {
 		if !nativeShareBindingID(id) {
 			return nil, errNativeShareSource
 		}
 	}
-	for _, s := range []string{e.HostCredentialID, e.OwnershipScope, e.ConnectionID, e.AuthorityConnectionID} {
-		if !nativeShareOpaque(s) {
+	return json.Marshal(s)
+}
+
+func (e NativeShareSourceEnrollment) CanonicalBytes() ([]byte, error) {
+	if e.Version != NativeShareSourceVersion || e.ProposalRevision == 0 || e.GrantGeneration == 0 || !nativeShareBindingHex(e.BindingDigest) || !nativeShareBindingTime(e.ExpiresAt) {
+		return nil, errNativeShareSource
+	}
+	for _, id := range []domain.ID{e.EnrollmentID, e.NetworkID, e.PreviousEpochID, e.ProposalID, e.GrantID, e.BindingID} {
+		if !nativeShareBindingID(id) {
 			return nil, errNativeShareSource
 		}
 	}
-	if !nativeShareSourceURL(e.Subject.ServerURL) {
-		return nil, errNativeShareSource
+	for _, s := range []string{e.HostCredentialID, e.OwnershipScope} {
+		if !nativeShareOpaque(s) {
+			return nil, errNativeShareSource
+		}
 	}
 	if _, err := e.Subject.CanonicalBytes(); err != nil {
 		return nil, err
@@ -196,11 +215,11 @@ func nativeShareSourcePrepareObject(raw []byte) error {
 	if err != nil {
 		return err
 	}
-	e, err := nativeShareSourceObject(fields["enrollment"], "version", "enrollmentId", "networkId", "previousEpochId", "proposalId", "proposalRevision", "grantId", "grantGeneration", "bindingId", "bindingDigest", "sourceInstanceId", "nativeGeneration", "subject", "connectedAt", "hostCredentialId", "ownershipScope", "connectionId", "authorityConnectionId", "expiresAt")
+	e, err := nativeShareSourceObject(fields["enrollment"], "version", "enrollmentId", "networkId", "previousEpochId", "proposalId", "proposalRevision", "grantId", "grantGeneration", "bindingId", "bindingDigest", "subject", "hostCredentialId", "ownershipScope", "expiresAt")
 	if err != nil {
 		return err
 	}
-	if _, err = nativeShareSourceObject(e["subject"], "serverUrl", "tenantId", "accountId", "hostId", "nativeAdmissionId", "runnerId", "runnerEpoch", "bootId", "profileFingerprint"); err != nil {
+	if _, err = nativeShareSourceObject(e["subject"], "serverUrl", "tenantId", "accountId", "hostId", "nativeAdmissionId", "runnerId", "runnerEpoch", "bootId"); err != nil {
 		return err
 	}
 	var enrollment NativeShareSourceEnrollment
@@ -266,7 +285,11 @@ func DecodeNativeShareSourcePreparedPayload(raw []byte) (NativeShareSourcePrepar
 }
 
 // Verify uses a descriptor and dedicated signer retained from an authenticated
-// command acknowledgement. It grants no source, membership or epoch authority.
+// command acknowledgement. The caller must construct expected using the
+// authenticated HostSession snapshot for Subject (including runner epoch and
+// admission), HostCredentialID and OwnershipScope, and recheck live authority.
+// Exact comparison rejects any substituted session evidence in the reply.
+// Verification grants no source, membership or epoch authority.
 func (p NativeShareSourcePreparedPayload) Verify(expected NativeShareSourcePreparePayload, descriptor NativeShareSourceHolderDescriptor, trustedSigner ed25519.PublicKey) error {
 	if _, err := p.CanonicalBytes(); err != nil {
 		return err
