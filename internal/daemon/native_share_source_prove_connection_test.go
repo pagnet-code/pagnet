@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,13 +60,18 @@ func sourceProveRouteRequest(t *testing.T, prepared transport.NativeShareSourceP
 
 func sourceProveLane(t *testing.T, executor nativeShareSourceProveExecutor, session transport.HostSessionPayload) (*Daemon, *nativeShareSourceProveConnection, *websocket.Conn) {
 	t.Helper()
+	return sourceProveLaneWithOffer(t, executor, session, true)
+}
+
+func sourceProveLaneWithOffer(t *testing.T, executor nativeShareSourceProveExecutor, session transport.HostSessionPayload, offered bool) (*Daemon, *nativeShareSourceProveConnection, *websocket.Conn) {
+	t.Helper()
 	socket, peer := nativeBindingSocketPair(t)
 	native := NewNativeObservationConnection("https://example.test", session.HostID, session.BootID, nil)
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}
 	d := &Daemon{nativeSourceProve: executor, curConn: socket, nativeConn: native, writeTimeout: time.Second}
-	c := newNativeShareSourceProveConnection(d, socket, native)
+	c := newNativeShareSourceProveConnection(d, socket, native, offered)
 	t.Cleanup(c.close)
 	return d, c, peer
 }
@@ -163,12 +169,6 @@ func TestNativeShareSourceProveQueueAndSupersession(t *testing.T) {
 			next.EnrollmentID = domain.NewID()
 			c.handle(nativeBindingEnvelope(t, transport.MsgNativeShareSourceProve, next))
 		}
-		overflow := request
-		overflow.CommandID = domain.NewID()
-		c.handle(nativeBindingEnvelope(t, transport.MsgNativeShareSourceProve, overflow))
-		if err := nativeBindingReadAck(t, peer, overflow.CommandID, nil); err == "" {
-			t.Fatal("queue overflow accepted")
-		}
 		if closeNative {
 			c.native.Close()
 		} else {
@@ -251,6 +251,11 @@ func TestNativeShareSourceProveCapabilityOffer(t *testing.T) {
 }
 
 func TestNativeShareSourceProveProductionDispatch(t *testing.T) {
+	t.Run("offered", func(t *testing.T) { sourceProveProductionDispatch(t, true) })
+	t.Run("unoffered recovery", func(t *testing.T) { sourceProveProductionDispatch(t, false) })
+}
+
+func sourceProveProductionDispatch(t *testing.T, offer bool) {
 	_, session, prepare := sourcePrepareLaneFixture(t, transport.NativeShareSourceProveProtocol)
 	peers := make(chan *websocket.Conn, 1)
 	offered := make(chan string, 1)
@@ -285,6 +290,10 @@ func TestNativeShareSourceProveProductionDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := sourceProveRouteRequest(t, prepared)
+	gate := &sourceProveReadinessExecutor{nativeShareSourceProveExecutor: d.nativeSourceProve}
+	gate.ready.Store(offer)
+	d.nativeSourceProve = gate
+	before := sourceProveRouteCounts(t, d.nativeRegistry)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
@@ -298,9 +307,15 @@ func TestNativeShareSourceProveProductionDispatch(t *testing.T) {
 		t.Fatal("daemon did not connect")
 	}
 	defer peer.Close()
-	if got := <-offered; got != transport.NativeShareSourceProveProtocol {
-		t.Fatal("missing prove capability", got)
+	expectedOffer := ""
+	if offer {
+		expectedOffer = transport.NativeShareSourceProveProtocol
 	}
+	if got := <-offered; got != expectedOffer {
+		t.Fatal("incorrect prove capability", got)
+	}
+	// Recovery after dial must not upgrade this socket's immutable offer.
+	gate.ready.Store(true)
 	if err := peer.WriteJSON(nativeBindingEnvelope(t, transport.MsgHostSession, session)); err != nil {
 		t.Fatal(err)
 	}
@@ -324,10 +339,22 @@ func TestNativeShareSourceProveProductionDispatch(t *testing.T) {
 		if err := json.Unmarshal(env.Payload, &ack); err != nil {
 			t.Fatal(err)
 		}
-		if ack.CommandID != request.CommandID || ack.Error != "" {
-			t.Fatal("production prove rejected", ack.Error)
+		if ack.CommandID != request.CommandID {
+			t.Fatal("incorrect command ACK")
 		}
-		sourceProveRouteBytes(t, ack.Result)
+		if offer {
+			if ack.Error != "" {
+				t.Fatal("production prove rejected", ack.Error)
+			}
+			sourceProveRouteBytes(t, ack.Result)
+		} else {
+			if ack.Error == "" || ack.Result.Challenge != nil {
+				t.Fatal("unoffered prove accepted after recovery")
+			}
+			if after := sourceProveRouteCounts(t, d.nativeRegistry); after != before {
+				t.Fatal("unoffered command persisted")
+			}
+		}
 		break
 	}
 	peer.Close()
@@ -346,4 +373,82 @@ func sourceProveRouteCounts(t *testing.T, registry *NativeWorkerRegistry) [4]int
 		t.Fatal(err)
 	}
 	return counts
+}
+
+type sourceProveReadinessExecutor struct {
+	nativeShareSourceProveExecutor
+	ready atomic.Bool
+}
+
+func (e *sourceProveReadinessExecutor) nativeShareSourceProveReady() bool { return e.ready.Load() }
+
+func TestNativeShareSourceProvePendingOutcome(t *testing.T) {
+	for _, reason := range []string{"overflow", "readiness"} {
+		t.Run(reason, func(t *testing.T) {
+			holder, session, request := sourceProveLaneFixture(t, transport.NativeShareSourceProveProtocol)
+			executor, err := NewNativeShareSourceProveExecutor(holder.registry, sourcePrepareExecutorNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			blocked := &sourceProveBlockingExecutor{executor: executor, started: make(chan struct{}, 8), release: make(chan struct{}), finished: make(chan struct{}, 8)}
+			gate := &sourceProveReadinessExecutor{nativeShareSourceProveExecutor: blocked}
+			gate.ready.Store(true)
+			_, lane, peer := sourceProveLane(t, gate, session)
+			env := nativeBindingEnvelope(t, transport.MsgNativeShareSourceProve, request)
+			lane.handle(env)
+			<-blocked.started
+			accepted := 1
+			if reason == "overflow" {
+				for accepted < nativeShareSourceProveQueueLimit {
+					lane.handle(env)
+					accepted++
+				}
+			} else {
+				gate.ready.Store(false)
+			}
+			lane.handle(env)
+			gate.ready.Store(true)
+			close(blocked.release)
+			for i := 0; i < accepted; i++ {
+				var proof transport.NativeShareSourceProvedPayload
+				if err := nativeBindingReadAck(t, peer, request.CommandID, &proof); err != "" {
+					t.Fatal("pending command received premature rejection", err)
+				}
+				sourceProveRouteBytes(t, proof)
+			}
+			peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			if _, _, err := peer.ReadMessage(); err == nil {
+				t.Fatal("suppressed retry emitted another ACK")
+			}
+		})
+	}
+}
+
+func TestNativeShareSourceProveNewCommandOverflowCloses(t *testing.T) {
+	holder, session, request := sourceProveLaneFixture(t, transport.NativeShareSourceProveProtocol)
+	executor, err := NewNativeShareSourceProveExecutor(holder.registry, sourcePrepareExecutorNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := &sourceProveBlockingExecutor{executor: executor, started: make(chan struct{}, 8), release: make(chan struct{}), finished: make(chan struct{}, 8)}
+	_, lane, peer := sourceProveLane(t, blocked, session)
+	env := nativeBindingEnvelope(t, transport.MsgNativeShareSourceProve, request)
+	lane.handle(env)
+	<-blocked.started
+	for i := 1; i < nativeShareSourceProveQueueLimit; i++ {
+		lane.handle(env)
+	}
+	overflow := request
+	overflow.CommandID = domain.NewID()
+	lane.handle(nativeBindingEnvelope(t, transport.MsgNativeShareSourceProve, overflow))
+	close(blocked.release)
+	<-blocked.finished
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := peer.ReadMessage(); err == nil {
+		t.Fatal("overflow emitted an ACK")
+	}
+	var count int
+	if err := holder.registry.db.QueryRow(`SELECT COUNT(*) FROM native_source_prove_journal WHERE command_id=?`, overflow.CommandID).Scan(&count); err != nil || count != 0 {
+		t.Fatal("overflow command persisted", err)
+	}
 }

@@ -1178,7 +1178,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	if err != nil {
 		return connectedAt, err
 	}
-	conn, resp, err := dialer.DialContext(ctx, d.wsURLWithSnapshotSigningKey(ctx, snapshotSigningPublicKey), hdr)
+	dialURL := d.wsURLWithSnapshotSigningKey(ctx, snapshotSigningPublicKey)
+	dialEndpoint, err := url.Parse(dialURL)
+	if err != nil {
+		return connectedAt, err
+	}
+	sourceProveOffered := dialEndpoint.Query().Get("native_share_source_prove") == transport.NativeShareSourceProveProtocol
+	conn, resp, err := dialer.DialContext(ctx, dialURL, hdr)
 	if err != nil {
 		if resp != nil {
 			return connectedAt, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)
@@ -1205,7 +1211,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer shareBindings.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
-	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn)
+	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn, sourceProveOffered)
 	defer sourceProve.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
 		env, err := transport.NewEnvelope(typ, payload)

@@ -26,20 +26,22 @@ type nativeShareSourceProveAttempt struct {
 
 // This bounded lane never sends commands through generic worker persistence.
 type nativeShareSourceProveConnection struct {
-	d        *Daemon
-	socket   *websocket.Conn
-	native   *NativeObservationConnection
-	executor nativeShareSourceProveExecutor
-	endpoint string
-	mu       sync.Mutex
-	stopped  bool
-	pending  int
-	queue    chan nativeShareSourceProveAttempt
-	done     chan struct{}
+	d          *Daemon
+	socket     *websocket.Conn
+	native     *NativeObservationConnection
+	executor   nativeShareSourceProveExecutor
+	endpoint   string
+	offered    bool
+	mu         sync.Mutex
+	stopped    bool
+	pending    int
+	pendingIDs map[domain.ID]int
+	queue      chan nativeShareSourceProveAttempt
+	done       chan struct{}
 }
 
-func newNativeShareSourceProveConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection) *nativeShareSourceProveConnection {
-	c := &nativeShareSourceProveConnection{d: d, socket: socket, native: native, executor: d.nativeSourceProve, endpoint: native.serverURL, queue: make(chan nativeShareSourceProveAttempt, nativeShareSourceProveQueueLimit), done: make(chan struct{})}
+func newNativeShareSourceProveConnection(d *Daemon, socket *websocket.Conn, native *NativeObservationConnection, offered bool) *nativeShareSourceProveConnection {
+	c := &nativeShareSourceProveConnection{d: d, socket: socket, native: native, executor: d.nativeSourceProve, endpoint: native.serverURL, offered: offered, pendingIDs: make(map[domain.ID]int), queue: make(chan nativeShareSourceProveAttempt, nativeShareSourceProveQueueLimit), done: make(chan struct{})}
 	// Readiness may recover after a transient registry timeout. Keep a consumer
 	// available for every configured executor; admission still checks readiness.
 	if c.executor != nil {
@@ -87,23 +89,35 @@ func (c *nativeShareSourceProveConnection) handle(env transport.Envelope) bool {
 			count++
 		}
 	}
-	if err != nil || count != 1 || c.executor == nil || !c.executor.nativeShareSourceProveReady() || !c.active(session) {
-		c.ack(request.CommandID, nil, session)
-		return true
-	}
+	available := err == nil && c.offered && count == 1 && c.executor != nil && c.executor.nativeShareSourceProveReady() && c.active(session)
 	c.mu.Lock()
 	if c.stopped {
 		c.mu.Unlock()
 		return true
 	}
-	if c.pending >= nativeShareSourceProveQueueLimit {
+	if !available {
+		pending := c.pendingIDs[request.CommandID] != 0
 		c.mu.Unlock()
-		c.ack(request.CommandID, nil, session)
+		// The accepted attempt owns its outcome even while readiness changes.
+		if !pending {
+			c.ack(request.CommandID, nil, session)
+		}
+		return true
+	}
+	if c.pending >= nativeShareSourceProveQueueLimit {
+		pending := c.pendingIDs[request.CommandID] != 0
+		c.mu.Unlock()
+		if !pending {
+			// Preserve uncertain outcomes for durable retry on a new connection.
+			c.close()
+			_ = c.socket.Close()
+		}
 		return true
 	}
 	// Keep retries in order, including changed transcripts with the same ID. The
 	// durable executor reuses exact results and rejects changed replays.
 	c.pending++
+	c.pendingIDs[request.CommandID]++
 	c.queue <- nativeShareSourceProveAttempt{request: request, session: session}
 	c.mu.Unlock()
 	return true
@@ -126,6 +140,10 @@ func (c *nativeShareSourceProveConnection) run() {
 			}
 			c.mu.Lock()
 			c.pending--
+			c.pendingIDs[a.request.CommandID]--
+			if c.pendingIDs[a.request.CommandID] == 0 {
+				delete(c.pendingIDs, a.request.CommandID)
+			}
 			c.mu.Unlock()
 		}
 	}
