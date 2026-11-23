@@ -26,9 +26,14 @@ type managedPrepareVerifierFixture struct {
 
 func newManagedPrepareVerifierFixture(t *testing.T) *managedPrepareVerifierFixture {
 	t.Helper()
+	return newManagedPrepareVerifierFixtureForServer(t, "https://example.test")
+}
+
+func newManagedPrepareVerifierFixtureForServer(t *testing.T, server string) *managedPrepareVerifierFixture {
+	t.Helper()
 	keys, subject, session := managedEndpointFixture(t)
 	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol}
-	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: session.TenantID, AccountID: session.AccountID, HostID: session.HostID, InstanceID: subject.InstanceID.String(), Generation: subject.OwnershipGeneration}
+	scope := sessionworker.Scope{ServerURL: server, TenantID: session.TenantID, AccountID: session.AccountID, HostID: session.HostID, InstanceID: subject.InstanceID.String(), Generation: subject.OwnershipGeneration}
 	spec := sessionworker.NativeSpec{Runtime: domain.RuntimeQwenCode, Binary: "/bin/true", MCPExecutable: "/bin/true", Workspace: t.TempDir(), Kind: "worker", TenantID: scope.TenantID, NetworkTenantID: scope.TenantID, NetworkID: domain.NewID().String()}
 	record, err := keys.registry.Reserve(scope, spec, "custom-qwen", "")
 	if err != nil {
@@ -231,5 +236,49 @@ func TestManagedPrepareVerifierCounterDriftAndClosedWorker(t *testing.T) {
 	close(link.proxy.done)
 	if err := f.verify(t.Context(), nil); !errors.Is(err, ErrManagedEndpointPrepareRetryable) {
 		t.Fatal(err)
+	}
+}
+
+func TestManagedPrepareVerifierServerOriginComparisons(t *testing.T) {
+	for _, test := range []struct {
+		name, stored, configured string
+		accepted                 bool
+	}{
+		{"uppercase stored host", "https://EXAMPLE.TEST", "https://example.test", true},
+		{"stored trailing slashes", "https://example.test///", "https://example.test", true},
+		{"configured equivalent", "https://example.test", "https://EXAMPLE.TEST///", true},
+		{"same noncanonical configuration", "https://EXAMPLE.TEST///", "https://EXAMPLE.TEST///", true},
+		{"different host", "https://example.test", "https://other.test", false},
+		{"different scheme", "https://example.test", "http://example.test", false},
+		{"different path", "https://example.test", "https://example.test/other", false},
+		{"different port", "https://example.test", "https://example.test:8443", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newManagedPrepareVerifierFixtureForServer(t, test.stored)
+			before, err := f.d.nativeRegistry.Lookup(f.command.Subject.InstanceID.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			err = f.d.verifyManagedEndpointPrepare(t.Context(), f.captured, test.configured, f.command, func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
+				called = true
+				return &sessionworker.NativeOwnershipVerifyResult{Snapshot: f.snapshot}, nil
+			})
+			if test.accepted {
+				if err != nil || !called {
+					t.Fatalf("equivalent origin rejected: called=%v err=%v", called, err)
+				}
+			} else if !errors.Is(err, ErrManagedEndpointPrepareRejected) || called {
+				t.Fatalf("different origin reached owner: called=%v err=%v", called, err)
+			}
+			after, err := f.d.nativeRegistry.Lookup(f.command.Subject.InstanceID.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := f.d.nativeWorkers[f.command.Subject.InstanceID.String()].proxy
+			if before.Scope != after.Scope || p.scope != before.Scope || f.snapshot.Scope != before.Scope || f.captured.Connection.serverURL != test.stored {
+				t.Fatal("origin comparison modified stored scope identity")
+			}
+		})
 	}
 }
