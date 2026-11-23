@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -79,7 +80,7 @@ func (p ManagedEndpointBindingIntent) CanonicalBytes() ([]byte, error) {
 
 func DecodeManagedEndpointBindingIntent(raw []byte) (ManagedEndpointBindingIntent, error) {
 	var p ManagedEndpointBindingIntent
-	if len(raw) > 16*1024 || !utf8.Valid(raw) {
+	if len(raw) > 16*1024 || !managedEndpointJSONStringsValid(raw) {
 		return p, errManagedEndpointBinding
 	}
 	if _, err := nativeShareSourceObject(raw, "id", "directIntentId", "protocolVersion", "tenantId", "accountId", "ownershipScope", "principalId", "endpointId", "instanceId", "originId", "nativeGeneration", "nativeSessionId", "ownershipId", "ownershipGeneration", "nativeAdmissionId", "connectionIncarnationId", "hostId", "hostCredentialId", "runnerId", "runnerConnectedAt", "bootId", "bindingGeneration", "state", "createdAt", "expiresAt"); err != nil {
@@ -147,7 +148,7 @@ func (p ManagedEndpointKeyReservation) CanonicalBytes() ([]byte, error) {
 
 func DecodeManagedEndpointKeyReservation(raw []byte) (ManagedEndpointKeyReservation, error) {
 	var p ManagedEndpointKeyReservation
-	if len(raw) > 20*1024 || !utf8.Valid(raw) {
+	if len(raw) > 20*1024 || !managedEndpointJSONStringsValid(raw) {
 		return p, errManagedEndpointBinding
 	}
 	fields, err := nativeShareSourceObject(raw, "subject", "serverUrl", "installationId", "keyGeneration", "x25519", "enrollmentDigest")
@@ -176,4 +177,53 @@ func (p ManagedEndpointKeyReservation) VerifySubject(expected ManagedEndpointBin
 		return errManagedEndpointBinding
 	}
 	return nil
+}
+
+// managedEndpointJSONStringsValid rejects malformed Unicode before encoding/json
+// can replace unpaired UTF-16 surrogate escapes with U+FFFD. JSON structure is
+// checked separately by the exact object decoders.
+func managedEndpointJSONStringsValid(raw []byte) bool {
+	if !utf8.Valid(raw) {
+		return false
+	}
+	quoted := false
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '"' {
+			quoted = !quoted
+			continue
+		}
+		if !quoted || raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		value, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if value >= 0xdc00 && value <= 0xdfff {
+			return false
+		}
+		if value < 0xd800 || value > 0xdbff {
+			continue
+		}
+		if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+			return false
+		}
+		low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+		if err != nil || low < 0xdc00 || low > 0xdfff {
+			return false
+		}
+		i += 6
+	}
+	return true
 }

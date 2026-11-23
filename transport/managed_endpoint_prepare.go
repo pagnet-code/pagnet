@@ -2,7 +2,6 @@ package transport
 
 import (
 	"encoding/json"
-	"unicode/utf8"
 
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -114,7 +113,7 @@ func DecodeManagedEndpointPrepareFailureACK(raw []byte, commandID domain.ID) (Ma
 }
 
 func managedEndpointPrepareObject(raw []byte, fields ...string) (map[string]json.RawMessage, error) {
-	if len(raw) > 24*1024 || !utf8.Valid(raw) {
+	if len(raw) > 24*1024 || !managedEndpointJSONStringsValid(raw) {
 		return nil, errManagedEndpointBinding
 	}
 	values, err := nativeShareSourceObject(raw, fields...)

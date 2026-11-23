@@ -165,3 +165,59 @@ func TestManagedEndpointPrepareFailureSanitized(t *testing.T) {
 		t.Fatal("wrong command accepted")
 	}
 }
+
+func TestManagedEndpointWireUnicodeEscapes(t *testing.T) {
+	for _, value := range []string{"�", "😀", `literal\uD800`} {
+		t.Run(value, func(t *testing.T) {
+			command, ack := managedPrepareFixture(t)
+			command.Subject.NativeGeneration = value
+			ack.Reservation.Subject = command.Subject
+			ack.Reservation.EnrollmentDigest, _ = ack.Reservation.Digest()
+			cases := []struct {
+				name   string
+				raw    []byte
+				decode func([]byte) error
+			}{
+				{"binding", mustManagedEndpointCanonical(t, command.Subject), func(raw []byte) error { _, err := DecodeManagedEndpointBindingIntent(raw); return err }},
+				{"reservation", mustManagedEndpointCanonical(t, ack.Reservation), func(raw []byte) error { _, err := DecodeManagedEndpointKeyReservation(raw); return err }},
+				{"command", mustManagedEndpointCanonical(t, command), func(raw []byte) error { _, err := DecodeManagedEndpointPrepareCommand(raw); return err }},
+				{"ack", mustManagedEndpointCanonical(t, ack), func(raw []byte) error { _, err := DecodeManagedEndpointPrepareACK(raw, command); return err }},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					if err := tc.decode(tc.raw); err != nil {
+						t.Fatal("valid literal rejected", err)
+					}
+					if value == "😀" {
+						paired := bytes.ReplaceAll(tc.raw, []byte(value), []byte(`\uD83D\uDE00`))
+						if err := tc.decode(paired); err != nil {
+							t.Fatal("valid surrogate pair rejected", err)
+						}
+					}
+					if value != "�" {
+						return
+					}
+					escapedReplacement := bytes.ReplaceAll(tc.raw, []byte(value), []byte(`\uFFFD`))
+					if err := tc.decode(escapedReplacement); err != nil {
+						t.Fatal("valid replacement escape rejected", err)
+					}
+					for _, escape := range []string{`\uD800`, `\uDC00`, `\uD800\u0041`, `\uDC00\uD800`} {
+						malformed := bytes.ReplaceAll(tc.raw, []byte(value), []byte(escape))
+						if err := tc.decode(malformed); err == nil {
+							t.Fatalf("unpaired surrogate accepted: %s", escape)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func mustManagedEndpointCanonical(t *testing.T, value interface{ CanonicalBytes() ([]byte, error) }) []byte {
+	t.Helper()
+	raw, err := value.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
