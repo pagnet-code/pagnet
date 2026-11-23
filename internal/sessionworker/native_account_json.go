@@ -181,7 +181,7 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 				return collect(*v)
 			}
 		case Request:
-			for _, part := range []any{v.NativeDispatch, v.CancelProposal, v.CancelReceipt, v.Ownership, v.DeletionProof} {
+			for _, part := range []any{v.OwnershipVerify, v.NativeDispatch, v.CancelProposal, v.CancelReceipt, v.Ownership, v.DeletionProof} {
 				if err := collect(part); err != nil {
 					return err
 				}
@@ -198,7 +198,7 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 				return collect(*v)
 			}
 		case Response:
-			for _, part := range []any{v.Cancellation, v.ContentFragment, v.Snapshot, v.Bridge, v.InvocationSource, v.InvocationState, v.InvocationProjection, v.SourceDispositions} {
+			for _, part := range []any{v.OwnershipVerify, v.Cancellation, v.ContentFragment, v.Snapshot, v.Bridge, v.InvocationSource, v.InvocationState, v.InvocationProjection, v.SourceDispositions} {
 				if err := collect(part); err != nil {
 					return err
 				}
@@ -216,6 +216,14 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 		case *Response:
 			if v != nil {
 				return collect(*v)
+			}
+		case *NativeOwnershipVerifyRequest:
+			if v != nil {
+				return collect(v.Ownership)
+			}
+		case *NativeOwnershipVerifyResult:
+			if v != nil {
+				return collect(v.Snapshot)
 			}
 		case NativeSnapshot:
 			for _, i := range v.Pending {
