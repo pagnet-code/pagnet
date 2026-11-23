@@ -164,6 +164,7 @@ func workerCmd() *cobra.Command {
 				RootsMode:        rootsMode,
 				Version:          "pagnet-worker/dev",
 				Heartbeat:        cfg.HeartbeatInterval,
+				HostWSIPv4Only:   cfg.HostWSIPv4Only,
 				RuntimeEnv:       cfg.RuntimeEnv,
 				PrimaryWorkspace: abs,
 				NoScan:           noScanEnabled,

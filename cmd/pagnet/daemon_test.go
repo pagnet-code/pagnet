@@ -2,8 +2,23 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
+
+func TestServeRequireEnrolledFailsBeforeInteractiveEnrollment(t *testing.T) {
+	previousState, previousRequire := daemonStateDir, daemonRequireEnrolled
+	t.Cleanup(func() {
+		daemonStateDir, daemonRequireEnrolled = previousState, previousRequire
+	})
+	cmd := daemonCmd()
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetArgs([]string{"--state-dir", t.TempDir(), "--require-enrolled"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "host enrollment is missing or incomplete") {
+		t.Fatalf("serve --require-enrolled: %v", err)
+	}
+}
 
 func TestDetachArgs(t *testing.T) {
 	cases := []struct {

@@ -26,6 +26,7 @@ type projectTransportFixture struct {
 	loseSend, missingReceipt, failACK bool
 	badDigest                         bool
 	quota                             int
+	quotaLimit                        string
 	requests                          [][]byte
 	cursors                           []string
 }
@@ -119,7 +120,13 @@ func (f *projectTransportFixture) serve(w http.ResponseWriter, r *http.Request) 
 		if f.quota != 0 {
 			w.Header().Set("Retry-After", "5")
 			w.WriteHeader(f.quota)
-			write(map[string]any{"error": "sharing_project_quota_exceeded", "limit": "maxInFlight", "max": 2, "resetAt": time.Now().Add(time.Minute)})
+			body := map[string]any{"error": "sharing_project_quota_exceeded", "limit": "maxInFlight", "max": 2, "resetAt": time.Now().Add(time.Minute)}
+			if f.quotaLimit == "ownerBudget" {
+				body["limit"], body["scope"] = "ownerBudget", "owner"
+				body["resetAt"] = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+				delete(body, "max")
+			}
+			write(body)
 			return
 		}
 		f.wire = append([]byte(nil), req.Wire...)
@@ -255,7 +262,7 @@ func TestSharingProjectTransportQuota(t *testing.T) {
 			f.quota = code
 			_, err = f.clients[0].SendPreparedSharingProjectMessage(context.Background(), f.project, prepared.ID)
 			var quota *SharingProjectMessageQuotaError
-			if !errors.As(err, &quota) || quota.StatusCode != code || quota.Maximum != 2 || quota.RetryAfter != "5" || quota.ResetAt == nil {
+			if !errors.As(err, &quota) || quota.StatusCode != code || quota.Maximum != 2 || quota.RetryAfter != "5" || quota.ResetAt == nil || quota.Error() != "sdk: sharing project message quota maxInFlight exceeded (maximum 2)" {
 				t.Fatalf("quota detail: %v", err)
 			}
 			if f.receipts != 0 {
@@ -265,5 +272,43 @@ func TestSharingProjectTransportQuota(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestSharingProjectTransportOwnerBudget(t *testing.T) {
+	f := newProjectTransportFixture(t)
+	c := f.clients[0]
+	prepared, err := c.PrepareSharingProjectMessage(f.project, f.clients[1].PrincipalID(), "ASK", []byte("owner budget"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.quota, f.quotaLimit = 429, "ownerBudget"
+	_, err = c.SendPreparedSharingProjectMessage(context.Background(), f.project, prepared.ID)
+	var quota *SharingProjectMessageQuotaError
+	reset := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	if !errors.As(err, &quota) || quota.Limit != "ownerBudget" || quota.StatusCode != 429 || quota.Maximum != 0 || quota.RetryAfter != "5" || quota.ResetAt == nil || !quota.ResetAt.Equal(reset) {
+		t.Fatalf("owner budget detail: %v", err)
+	}
+	if quota.Error() != "Sharing owner budget exhausted" {
+		t.Fatalf("owner budget presentation: %q", quota.Error())
+	}
+	if f.receipts != 0 {
+		t.Fatal("owner budget treated as ambiguous send")
+	}
+	retained, err := c.LoadPreparedSharingProjectMessage(f.project, prepared.ID)
+	if err != nil || !bytes.Equal(retained.Wire, prepared.Wire) {
+		t.Fatalf("owner budget changed durable wire: %v", err)
+	}
+	f.quota = 0
+	if _, err := c.SendPreparedSharingProjectMessage(context.Background(), f.project, prepared.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.requests) != 2 {
+		t.Fatalf("got %d attempts, want 2", len(f.requests))
+	}
+	for _, raw := range f.requests {
+		if !bytes.Equal(raw, prepared.Wire) {
+			t.Fatal("owner budget retry changed durable wire")
+		}
 	}
 }

@@ -55,7 +55,7 @@ func TestJevEncryptedNetworkInvocation(t *testing.T) {
 			states[id] = inv.state
 		}
 		fs.mu.Unlock()
-		t.Fatalf("invoke %v; providerCalls%d states%v", err, providerCalls.Load(), states)
+		t.Fatalf("invoke %v; target.Err=%v providerCalls=%d states=%v", err, target.Err(), providerCalls.Load(), states)
 	}
 	raw, _ := json.Marshal(result.Output)
 	var typed jev.Result

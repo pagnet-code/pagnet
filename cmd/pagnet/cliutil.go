@@ -28,8 +28,8 @@ type cliCtx struct {
 	// scopes the user credential (keyring key + account config dir).
 	account string
 	// token is the user/admin bearer for REST calls. NEVER the host
-	// credential (cfg.Credential): host identities are WSS-only and the
-	// REST API rejects them (403 host_identity).
+	// credential (cfg.Credential): host identities use WSS and only a narrow,
+	// allowlisted host REST surface; these user/admin REST calls reject them.
 	token string
 	// principal marks a bearer that is a PRINCIPAL endpoint credential
 	// (pgn_epd_) rather than a human's: the caller acts as an agent or a
@@ -103,6 +103,15 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := authenticateCLI(c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// authenticateCLI resolves the user bearer for an already selected context.
+// Callers with enrollment constraints must verify its server before calling.
+func authenticateCLI(c *cliCtx) error {
 	// Bearer precedence: --token / $PAGNET_TOKEN (the short-circuit — no
 	// auth endpoint is called at all), then the account's stored
 	// credential, else the sign-in flow (interactive) / fail (non-interactive).
@@ -112,11 +121,11 @@ func newCLI(stateDirOverride string) (*cliCtx, error) {
 		c.interactive = interactiveMode()
 		tok, err := ensureUserToken(c.stateDir, c.account, c.base, c.noBrowser, c.interactive)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		c.token = tok
 	}
-	return c, nil
+	return nil
 }
 
 // do performs an authenticated request against the control plane. The

@@ -541,3 +541,28 @@ func TestNativeResourceInterruptionCapabilityRequiredBeforeBackendWrite(t *testi
 		})
 	}
 }
+
+func TestNativeAccountSourcesDeferAllGenericDeliveryAndACK(t *testing.T) {
+	for _, typ := range []string{session.EventTurnStarted, session.EventTurnCompleted, session.EventTurnFailed, session.EventTurnOutput} {
+		t.Run(typ, func(t *testing.T) {
+			writes, acks, reads := 0, 0, 0
+			c, o := deliveryFixture(t, func(context.Context, string, any) error { writes++; return nil })
+			o.Event.Type = typ
+			o.TurnSource = &sessionworker.NativeTurnSource{InputKind: "account_message", SourceAccountMessage: &transport.NativeAccountMessageSource{}}
+			call := func(_ context.Context, r sessionworker.Request) (sessionworker.Response, error) {
+				switch r.Type {
+				case "observations":
+					return sessionworker.Response{Observations: []sessionworker.NativeObservation{o}}, nil
+				case "observation_ack":
+					acks++
+				default:
+					reads++
+				}
+				return sessionworker.Response{}, nil
+			}
+			if err := c.DrainNativeWorkerSources(t.Context(), call); !errors.Is(err, ErrNativeOriginAdmissionDeferred) || writes != 0 || acks != 0 || reads != 0 {
+				t.Fatal("generic delivery drained account source", err, writes, acks, reads)
+			}
+		})
+	}
+}

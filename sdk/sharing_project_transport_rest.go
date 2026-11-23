@@ -40,6 +40,9 @@ type SharingProjectMessageQuotaError struct {
 }
 
 func (e *SharingProjectMessageQuotaError) Error() string {
+	if e.Limit == "ownerBudget" {
+		return "Sharing owner budget exhausted"
+	}
 	return fmt.Sprintf("sdk: sharing project message quota %s exceeded (maximum %d)", e.Limit, e.Maximum)
 }
 func projectTransportError(err error, headers http.Header) error {

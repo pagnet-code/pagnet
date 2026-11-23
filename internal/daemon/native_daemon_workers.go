@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,6 +23,8 @@ import (
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
 )
+
+var errNativeWorkerRecoveryFenced = errors.New("native worker generation is fenced by recovery")
 
 type nativeWorkerLink struct {
 	proxy     *NativeWorkerProxy
@@ -133,6 +137,7 @@ func (d *Daemon) nativeConfiguration(row *InstanceRow, scope sessionworker.Scope
 		return sessionworker.NativeSpec{}, err
 	}
 	spec := sessionworker.NativeSpec{Runtime: rn, Binary: binary, PrefixArgs: prefix, NativeDirs: dirs, Env: append(append([]string(nil), d.RuntimeEnv...), env...), Workspace: row.Workspace, Model: row.Model, StandingInstructions: standing, MCPExecutable: d.selfExe, NetworkID: row.NetworkID, Kind: row.Kind, TenantID: scope.TenantID, ContextStateDir: d.StateDir, NetworkStateDir: d.StateDir}
+	spec.AccountMessageExecutionEnabled = d.AccountMessageExecutionEnabled && rn == domain.RuntimeQwenCode
 	spec.InitialNativeSessionID = row.SessionID
 	if row.NetworkID != "" {
 		m := d.cryptoManager()
@@ -276,10 +281,12 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		return err
 	}
 	if err = EnsureNativeWorker(d.turnCtx, d.nativeRegistry, record, d.selfExe, env, d.composedSideportSocket()); err != nil {
+		d.recordNativeWorkerReadinessFailure(connection, record, err)
 		return err
 	}
 	proxy, err := AttachNativeWorker(d.turnCtx, connection, record.Dir, record.Scope, d.bootID)
 	if err != nil {
+		connection.recordNativeWorkerAttachFailure(record.Scope, err)
 		return err
 	}
 	// Consult the durable marker on every ordinary drain, including reconnects.
@@ -341,6 +348,7 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 		}
 	}()
 	go d.pumpNativeBridge(ctx, link)
+	go d.pumpNativeAdmission(ctx, link)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var nextCancellation time.Time
@@ -350,9 +358,6 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 			return
 		case <-ticker.C:
 		}
-		// The admission gate belongs to this exact authenticated connection. A
-		// disconnect stops forwarding; the independently owned session survives.
-		_ = link.proxy.Reconcile(ctx)
 		_ = link.proxy.DrainSources(ctx)
 		d.reconcileHostedSideport(ctx, link)
 
@@ -368,6 +373,24 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 			link.ownership = *updated
 			link.mu.Unlock()
 		}
+	}
+}
+
+// Admission must keep progressing while source delivery waits for a receipt:
+// a lifecycle observation may need the next live-session confirmation before
+// the server can commit it. Reconcile retains its own serialization gate.
+func (d *Daemon) pumpNativeAdmission(ctx context.Context, link *nativeWorkerLink) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		// This exact authenticated connection owns the admission gate. The
+		// shared pump context cancels it on disconnect; the session survives.
+		_ = link.proxy.Reconcile(ctx)
 	}
 }
 
@@ -436,6 +459,7 @@ func (d *Daemon) pumpNativeBridge(ctx context.Context, link *nativeWorkerLink) {
 
 // nativeRecoveryFailureReporter tracks failures for one recovery connection.
 // Admission can briefly be deferred while a fresh runner epoch prepares.
+// Durable recovery fences are expected regardless of recovery duration.
 func nativeRecoveryFailureReporter(log *slog.Logger, now func() time.Time) func(string, error) {
 	type recoveryFailure struct {
 		fingerprint [sha256.Size]byte
@@ -460,7 +484,7 @@ func nativeRecoveryFailureReporter(log *slog.Logger, now func() time.Time) func(
 			firstSeen = at
 		}
 		level := slog.LevelWarn
-		if errors.Is(err, ErrNativeOriginAdmissionDeferred) && at.Sub(firstSeen) < 5*time.Second {
+		if errors.Is(err, errNativeWorkerRecoveryFenced) || (errors.Is(err, ErrNativeOriginAdmissionDeferred) && at.Sub(firstSeen) < 5*time.Second) {
 			level = slog.LevelDebug
 		}
 		if exists && previous.fingerprint == fingerprint && previous.level == level && at.Sub(previous.loggedAt) < time.Minute {
@@ -469,9 +493,13 @@ func nativeRecoveryFailureReporter(log *slog.Logger, now func() time.Time) func(
 		failures[instanceID] = recoveryFailure{fingerprint: fingerprint, firstSeen: firstSeen, loggedAt: at, level: level}
 		if log != nil {
 			// Arbitrary errors can contain worker paths or configuration. Only
-			// emit known sentinel messages, falling back to the error's type.
+			// emit known safe categories, falling back to the error's type.
 			category := fmt.Sprintf("%T", err)
-			for _, known := range []error{ErrNativeOriginAdmissionDeferred, ErrNativeOriginAdmissionRejected, ErrNativeObservationConflict, ErrNativeSourceUnsupported, context.Canceled, context.DeadlineExceeded, sql.ErrNoRows} {
+			var opErr *net.OpError
+			if errors.As(err, &opErr) && opErr.Op == "dial" && opErr.Net == "unix" && errors.Is(opErr.Err, syscall.ECONNREFUSED) {
+				category = "native worker socket unavailable; explicit lost-worker recovery required"
+			}
+			for _, known := range []error{errNativeWorkerRecoveryFenced, ErrNativeOriginAdmissionDeferred, ErrNativeOriginAdmissionRejected, ErrNativeObservationConflict, ErrNativeSourceUnsupported, context.Canceled, context.DeadlineExceeded, sql.ErrNoRows} {
 				if errors.Is(err, known) {
 					category = known.Error()
 					break

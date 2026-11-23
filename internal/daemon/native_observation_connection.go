@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"net/url"
 	"sync"
@@ -18,14 +20,24 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
-	mu                  sync.Mutex
-	hostID, bootID      string
-	serverURL           string
-	session             *transport.HostSessionPayload
-	pending             map[string]chan transport.NativeOriginRegisteredPayload
-	pendingSessions     map[string]chan transport.NativeOriginSessionConfirmedPayload
-	pendingContent      map[string]chan transport.NativeContentStagedPayload
-	pendingObservations map[string]chan transport.NativeObservationReceiptPayload
+	mu                    sync.Mutex
+	availabilityOnce      sync.Once
+	availabilitySequence  int64
+	availabilityFailures  map[string]string
+	hostID, bootID        string
+	serverURL             string
+	session               *transport.HostSessionPayload
+	pending               map[string]chan transport.NativeOriginRegisteredPayload
+	pendingSessions       map[string]chan transport.NativeOriginSessionConfirmedPayload
+	pendingContent        map[string]chan transport.NativeContentStagedPayload
+	pendingAccountReplies map[string]chan transport.Envelope
+	accountReplyEnabled   bool
+	pendingObservations   map[string]chan transport.NativeObservationReceiptPayload
+
+	// Captured from this socket's dial offer before the read loop starts.
+	offeredSnapshotSigningPublicKey string
+
+	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
 	// their raw reply channel: both the publish/invoke result and the
 	// catalog page reply correlate on the same lane (the typed exchanges
@@ -93,6 +105,21 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 			return ErrNativeObservationConflict
 		}
 	}
+	snapshotSigningKeyNegotiated := false
+	for _, feature := range p.ProtocolFeatures {
+		if feature == transport.HostSnapshotSigningKeyProtocol {
+			snapshotSigningKeyNegotiated = true
+		}
+	}
+	if snapshotSigningKeyNegotiated != (p.SnapshotSigningPublicKey != "") {
+		return ErrNativeObservationConflict
+	}
+	if snapshotSigningKeyNegotiated {
+		key, err := base64.StdEncoding.Strict().DecodeString(p.SnapshotSigningPublicKey)
+		if err != nil || len(key) != ed25519.PublicKeySize || base64.StdEncoding.EncodeToString(key) != p.SnapshotSigningPublicKey || c.offeredSnapshotSigningPublicKey == "" || p.SnapshotSigningPublicKey != c.offeredSnapshotSigningPublicKey {
+			return ErrNativeObservationConflict
+		}
+	}
 	negotiated := false
 	for _, feature := range p.ProtocolFeatures {
 		if feature == transport.NativeObservationReceiptProtocol {
@@ -103,7 +130,7 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		return errors.New("native observation receipts unavailable")
 	}
 	if c.session != nil {
-		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.HostCredentialID != p.HostCredentialID || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
+		if c.session.TenantID != p.TenantID || c.session.AccountID != p.AccountID || c.session.OwnershipScope != p.OwnershipScope || c.session.NativeAdmissionID != p.NativeAdmissionID || c.session.HostCredentialID != p.HostCredentialID || c.session.SnapshotSigningPublicKey != p.SnapshotSigningPublicKey || c.session.RunnerID != p.RunnerID || !c.session.RunnerEpoch.Equal(p.RunnerEpoch) {
 			return ErrNativeObservationConflict
 		}
 		return nil

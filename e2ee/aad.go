@@ -1,5 +1,12 @@
 package e2ee
 
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strings"
+)
+
 // AAD is the associated-data binding for a protected object (plan §11.4).
 // Its canonical serialization (CanonicalBytes) is the GCM associated-data:
 // tampering with ANY bound field makes decryption fail.
@@ -13,17 +20,19 @@ package e2ee
 // CreatedAt is a deterministic RFC3339 UTC string (not a time.Time) so the
 // canonical bytes are stable across implementations.
 type AAD struct {
-	ProtocolVersion  int                   `json:"protocol_version"`
-	TenantID         string                `json:"tenant_id"`
-	NetworkID        string                `json:"network_id"`
-	ObjectType       string                `json:"object_type"`
-	ObjectID         string                `json:"object_id"`
-	Sender           string                `json:"sender"`
-	Recipient        string                `json:"recipient"`
-	CreatedAt        string                `json:"created_at"`
-	KeyEpochID       string                `json:"key_epoch_id"`
-	ProtectedContext *ProtectedContext     `json:"protected_context,omitempty"`
-	NativeContent    *NativeContentBinding `json:"native_content,omitempty"`
+	ProtocolVersion       int                           `json:"protocol_version"`
+	TenantID              string                        `json:"tenant_id"`
+	NetworkID             string                        `json:"network_id"`
+	ObjectType            string                        `json:"object_type"`
+	ObjectID              string                        `json:"object_id"`
+	Sender                string                        `json:"sender"`
+	Recipient             string                        `json:"recipient"`
+	CreatedAt             string                        `json:"created_at"`
+	KeyEpochID            string                        `json:"key_epoch_id"`
+	ProtectedContext      *ProtectedContext             `json:"protected_context,omitempty"`
+	NativeContent         *NativeContentBinding         `json:"native_content,omitempty"`
+	BrowserAccountMessage *BrowserAccountMessageBinding `json:"browser_account_message,omitempty"`
+	BrowserAccountReply   *BrowserAccountReplyBinding   `json:"browser_account_reply,omitempty"`
 }
 
 // CanonicalBytes returns the canonical serialization of the AAD: compact
@@ -39,4 +48,30 @@ func (a AAD) CanonicalBytes() []byte {
 		panic("e2ee: canonical AAD encoding failed: " + err.Error())
 	}
 	return b
+}
+
+// UnmarshalJSON preserves legacy AAD decoding. Reply wire v1 additionally
+// authenticates canonical bytes for the complete AAD, including NativeContent.
+func (a *AAD) UnmarshalJSON(raw []byte) error {
+	type aad AAD
+	parsed := aad(*a)
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return err
+	}
+	candidate := AAD(parsed)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	reply := candidate.ObjectType == ObjectTypeBrowserAccountReply || candidate.NativeContent != nil && candidate.NativeContent.Purpose == ObjectTypeBrowserAccountReply
+	for name := range fields {
+		if strings.EqualFold(name, "browser_account_reply") {
+			reply = true
+		}
+	}
+	if reply && (!bytes.Equal(raw, candidate.CanonicalBytes()) || candidate.BrowserAccountReply == nil || candidate.ValidateScope() != nil) {
+		return errors.New("noncanonical account reply AAD")
+	}
+	*a = candidate
+	return nil
 }

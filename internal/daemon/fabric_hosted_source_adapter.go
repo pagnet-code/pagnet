@@ -106,7 +106,7 @@ func (d *Daemon) ConsumeHostedInvocationFinalOutput(ctx context.Context, profile
 		if err != nil {
 			return err
 		}
-		proofJSON, err := json.Marshal(proof)
+		proofJSON, err := transport.MarshalNativeJSON(proof)
 		if err != nil {
 			return err
 		}
@@ -482,7 +482,7 @@ func (d *Daemon) consumeHostedInvocation(ctx context.Context, profile fabricagen
 			return d.finalizeHostedSourceUnavailable(ctx, instanceID, commandID, "origin_conflict")
 		}
 		if len(sourceJSON) == 0 {
-			if sourceJSON, err = json.Marshal(source); err != nil {
+			if sourceJSON, err = sessionworker.MarshalNativeJSON(source); err != nil {
 				return err
 			}
 		}

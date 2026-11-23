@@ -14,6 +14,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// AcquireWorkerLifetimeLock acquires only the original lifetime lock, without
+// opening a journal or changing command outcomes. The caller must first commit
+// its exact generation fence and hold this lock while validating recovery proof.
+func AcquireWorkerLifetimeLock(dir string) (io.Closer, error) { return acquireOwnership(dir) }
+
 // Hold one exclusive worker owner for the whole process lifetime. Opening the
 // same journal while another worker is live must not turn its admitted work
 // into crash uncertainty or race two native command owners.

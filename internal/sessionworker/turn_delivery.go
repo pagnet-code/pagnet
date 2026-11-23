@@ -11,7 +11,7 @@ import (
 // the original accepted operation. Empty legacy sources are never relabelled.
 func ValidNativeInputKind(kind string) bool {
 	switch kind {
-	case "invocation", "task", "ask", "notice", "status", "wake", "user_input":
+	case "account_message", "invocation", "task", "ask", "notice", "status", "wake", "user_input":
 		return true
 	default:
 		return false
@@ -21,6 +21,9 @@ func ValidNativeInputKind(kind string) bool {
 // NativeSourceType decides eligibility before allocating a durable sequence.
 // A human turn or an unsupported old capture cannot create a stream gap.
 func NativeSourceType(o NativeObservation) string {
+	if (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
+		return ""
+	}
 	if typ := LifecycleSourceType(o.Event.Type); typ != "" {
 		return typ
 	}

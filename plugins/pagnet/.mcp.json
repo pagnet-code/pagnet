@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pagnet": {
+      "type": "http",
+      "url": "https://app.pagnet.dev/api/v1/mcp"
+    }
+  }
+}

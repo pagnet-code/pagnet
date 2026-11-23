@@ -55,7 +55,7 @@ type NativeObservation struct {
 func observationDigest(observation NativeObservation) (string, error) {
 	observation.SourceDigest = ""
 	observation.SourceSequence = 0
-	raw, err := json.Marshal(observation)
+	raw, err := MarshalNativeJSON(observation)
 	if err != nil || len(raw) > maxFrame*3/4 {
 		return "", errors.New("native observation exceeds private frame bound")
 	}
@@ -120,7 +120,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	if err != nil || observation.ID == "" || len(observation.ID) > 256 || observation.NativeGeneration == "" || len(observation.NativeGeneration) > 256 || observation.ObservedAt.IsZero() || len(observation.Origin) > 8192 || !json.Valid(observation.Origin) || digest != observation.SourceDigest {
 		return errors.New("invalid native source observation")
 	}
-	raw, err := json.Marshal(observation)
+	raw, err := MarshalNativeJSON(observation)
 	if err != nil {
 		return err
 	}
@@ -147,6 +147,19 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 		return nil
 	}
 	// QueryRow's missing-row case is the sole authority to create a new entry.
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// A terminal reply's durable settlement also fences append retries after a
+	// process restart, when the in-memory original producer pin no longer exists.
+	var accountSettledDigest string
+	err = tx.QueryRowContext(ctx, `SELECT source_digest FROM worker_account_reply_settlements WHERE observation_id=?`, observation.ID).Scan(&accountSettledDigest)
+	if err == nil {
+		if accountSettledDigest != digest {
+			return ErrConflict
+		}
+		return nil
+	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -189,7 +202,7 @@ func (j *Journal) journalCapturedObservation(ctx context.Context, producer *nati
 	contentBytes := 0
 	for _, transfer := range transfers {
 		for _, fragment := range transfer.Fragments {
-			encoded, marshalErr := json.Marshal(fragment)
+			encoded, marshalErr := MarshalNativeJSON(fragment)
 			if marshalErr != nil {
 				return marshalErr
 			}
@@ -372,6 +385,13 @@ func (j *Journal) acknowledgeObservation(ctx context.Context, lease int64, id, d
 	var sourceSequence int64
 	err = tx.QueryRowContext(ctx, `SELECT o.digest,o.payload,COALESCE(s.source_sequence,0) FROM worker_observations o LEFT JOIN worker_observation_sequence s ON s.observation_id=o.id WHERE o.id=?`, id).Scan(&previous, &payload, &sourceSequence)
 	if errors.Is(err, sql.ErrNoRows) {
+		var accountSettled bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_account_reply_settlements WHERE observation_id=?)`, id).Scan(&accountSettled); err != nil {
+			return err
+		}
+		if accountSettled {
+			return ErrFenced
+		}
 		if err = resourceSettlementReplayTx(ctx, tx, id, digest, receipt); err != nil {
 			return err
 		}
@@ -393,6 +413,10 @@ func (j *Journal) acknowledgeObservation(ctx context.Context, lease int64, id, d
 	var observation NativeObservation
 	if json.Unmarshal(payload, &observation) != nil {
 		return ErrConflict
+	}
+	if (observation.TurnSource != nil && observation.TurnSource.SourceAccountMessage != nil) || (observation.OutputContent != nil && observation.OutputContent.Purpose == "browser_account_reply") {
+		// Generic receipts cannot prove durable account reply delivery.
+		return ErrFenced
 	}
 	observation.SourceSequence = sourceSequence
 	if err = j.settleResourceObservationTx(ctx, tx, observation, receipt, captureKey); err != nil {

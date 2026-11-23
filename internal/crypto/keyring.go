@@ -72,6 +72,19 @@ func NewKeyring(networkID string) *Keyring {
 	return &Keyring{NetworkID: networkID}
 }
 
+// clone returns an independent keyring, including each epoch's key material.
+func (k *Keyring) clone() *Keyring {
+	cloned := *k
+	if k.Epochs != nil {
+		cloned.Epochs = make([]KeyEpoch, len(k.Epochs))
+		copy(cloned.Epochs, k.Epochs)
+		for i := range cloned.Epochs {
+			cloned.Epochs[i].Key = bytes.Clone(k.Epochs[i].Key)
+		}
+	}
+	return &cloned
+}
+
 // All public getters return COPIES of epochs (immutable snapshots); the
 // keyring's slice is the source of truth. This avoids stale-pointer footguns
 // when the slice is reallocated by a later Rotate/Activate.
@@ -99,11 +112,11 @@ func (k *Keyring) Rotate(now time.Time) (KeyEpoch, error) {
 	if idx < 0 {
 		return KeyEpoch{}, fmt.Errorf("crypto: no active epoch to rotate; call Activate first")
 	}
-	k.Epochs[idx].State = EpochRotated
 	epoch, err := mintEpoch(now)
 	if err != nil {
 		return KeyEpoch{}, err
 	}
+	k.Epochs[idx].State = EpochRotated
 	k.Epochs = append(k.Epochs, *epoch)
 	return *epoch, nil
 }

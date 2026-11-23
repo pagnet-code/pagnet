@@ -24,6 +24,8 @@ type NativeWorkerProxy struct {
 	closeOnce                           sync.Once
 	reconcileOnce                       sync.Once
 	reconcileGate                       chan struct{}
+	snapshotMu                          sync.Mutex
+	snapshotAt                          time.Time
 	confirmedMu                         sync.Mutex
 	confirmedGeneration, confirmedStart string
 	confirmedAt                         time.Time
@@ -204,6 +206,9 @@ func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeS
 		_ = p.Close()
 		return sessionworker.NativeSnapshot{}, ErrNativeObservationConflict
 	}
+	p.snapshotMu.Lock()
+	p.snapshotAt = time.Now()
+	p.snapshotMu.Unlock()
 	return *response.Snapshot, nil
 }
 
@@ -212,7 +217,7 @@ func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeS
 // lane cannot submit native intents, resolve an approval, or relay a tool.
 func (p *NativeWorkerProxy) SourceCall(ctx context.Context, request sessionworker.Request) (sessionworker.Response, error) {
 	switch request.Type {
-	case "observations", "content_fragment", "source_capture", "observation_ack", "source_disposition", "source_dispositions":
+	case "observations", "delivery_observations", "content_fragment", "source_capture", "observation_ack", "account_reply_ack", "source_disposition", "source_dispositions":
 		return p.call(ctx, request)
 	default:
 		return sessionworker.Response{}, errors.New("unsupported native source journal request")
@@ -280,5 +285,6 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 	p.confirmedGeneration = snapshot.NativeGeneration
 	p.confirmedStart = snapshot.NativeStartIdentity
 	p.confirmedAt = time.Now()
+	p.connection.retryNativeWorkerObservations(origin.ID)
 	return nil
 }

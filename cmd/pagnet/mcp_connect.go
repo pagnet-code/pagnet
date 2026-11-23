@@ -126,7 +126,8 @@ func mcpConnectCmd() *cobra.Command {
 			if errors.Is(err, sdk.ErrCredentialDead) {
 				return err
 			}
-			fmt.Fprintln(cmd.ErrOrStderr(), "Browser connector reconnecting; gateway requests remain unavailable until the bridge reconnects.")
+			delay = browserBridgeReconnectDelay(delay, err)
+			fmt.Fprintf(cmd.ErrOrStderr(), "Browser connector reconnecting: %v; retry in %s. Gateway requests remain unavailable until the bridge reconnects.\n", browserBridgeDiagnostic(err), delay)
 			timer := time.NewTimer(delay)
 			select {
 			case <-cmd.Context().Done():
@@ -134,9 +135,7 @@ func mcpConnectCmd() *cobra.Command {
 				return nil
 			case <-timer.C:
 			}
-			if delay < 15*time.Second {
-				delay *= 2
-			}
+			delay = min(delay*2, 15*time.Second)
 		}
 	}}
 	cmd.Flags().StringVar(&connector, "connector", "", "connector UUID from Integrations (required)")
@@ -144,4 +143,22 @@ func mcpConnectCmd() *cobra.Command {
 	cmd.Flags().StringVar(&serverURL, "server", "https://app.pagnet.dev", "Pagnet server URL")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "local private state directory")
 	return cmd
+}
+
+// A working session starts recovery at the base delay; short connection flaps
+// retain their backoff so an unhealthy gateway is not hammered.
+func browserBridgeReconnectDelay(delay time.Duration, err error) time.Duration {
+	var failure *sdk.BrowserBridgeError
+	if errors.As(err, &failure) && failure.Healthy {
+		return time.Second
+	}
+	return delay
+}
+
+func browserBridgeDiagnostic(err error) string {
+	var failure *sdk.BrowserBridgeError
+	if errors.As(err, &failure) {
+		return failure.Error()
+	}
+	return "browser bridge unavailable"
 }

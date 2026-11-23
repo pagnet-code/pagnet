@@ -103,13 +103,15 @@ func (n *NKA) Keyring() *Keyring { return n.keyring }
 // Activate creates the first key epoch if the keyring is not yet activated,
 // and persists it. Idempotent.
 func (n *NKA) Activate(now time.Time) (KeyEpoch, error) {
-	epoch, err := n.keyring.Activate(now)
+	next := n.keyring.clone()
+	epoch, err := next.Activate(now)
 	if err != nil {
 		return KeyEpoch{}, err
 	}
-	if err := SaveKeyring(n.stateDir, n.keyring); err != nil {
+	if err := SaveKeyring(n.stateDir, next); err != nil {
 		return KeyEpoch{}, err
 	}
+	n.keyring = next
 	return epoch, nil
 }
 
@@ -117,13 +119,15 @@ func (n *NKA) Activate(now time.Time) (KeyEpoch, error) {
 // persists (plan §11.8). New content uses the new epoch; the old epoch is
 // retained to read history.
 func (n *NKA) Rotate(now time.Time) (KeyEpoch, error) {
-	epoch, err := n.keyring.Rotate(now)
+	next := n.keyring.clone()
+	epoch, err := next.Rotate(now)
 	if err != nil {
 		return KeyEpoch{}, err
 	}
-	if err := SaveKeyring(n.stateDir, n.keyring); err != nil {
+	if err := SaveKeyring(n.stateDir, next); err != nil {
 		return KeyEpoch{}, err
 	}
+	n.keyring = next
 	return epoch, nil
 }
 

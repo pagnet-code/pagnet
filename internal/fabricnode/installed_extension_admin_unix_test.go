@@ -95,9 +95,25 @@ func TestActualInstalledExtensionAdminSocketResumeACKIsolationRestart(t *testing
 		t.Fatal("actual CLI build", err, string(output))
 	}
 	var effects atomic.Int32
+	providerEntries := make(chan int32, 2)
+	awaitProviderEntry := func(want int32) {
+		t.Helper()
+		select {
+		case count := <-providerEntries:
+			if count != want || effects.Load() != want {
+				t.Fatal("unexpected provider entry count", count, effects.Load(), want)
+			}
+		case <-ctx.Done():
+			t.Fatal("waiting for provider entry", ctx.Err())
+		}
+	}
 	official := sdk.NewServer(&sdk.Implementation{Name: "installed extension source", Version: "1"}, nil)
 	official.AddTool(&sdk.Tool{Name: "echo", Description: "Exact approved source", InputSchema: json.RawMessage(`{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}`)}, func(_ context.Context, request *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
-		effects.Add(1)
+		count := effects.Add(1)
+		select {
+		case providerEntries <- count:
+		default:
+		}
 		return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: strings.Repeat("real approved output\n", 5000)}}}, nil
 	})
 	server := httptest.NewServer(sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return official }, &sdk.StreamableHTTPOptions{Stateless: false}))
@@ -191,9 +207,10 @@ func TestActualInstalledExtensionAdminSocketResumeACKIsolationRestart(t *testing
 	extensionSocketSuccess(t, ctx, admin, "continuation.recover", extensionReferenceInput{ID: input.ID}, nil)
 	var resumed ExtensionResumeReceipt
 	extensionSocketSuccess(t, ctx, admin, "continuation.resume", input, &resumed)
-	if !resumed.Fresh || resumed.Handle == "" || effects.Load() != 1 {
+	if !resumed.Fresh || resumed.Handle == "" {
 		t.Fatal("actual fresh private resume", resumed, effects.Load())
 	}
+	awaitProviderEntry(1)
 	var repeated ExtensionResumeReceipt
 	extensionSocketSuccess(t, ctx, admin, "continuation.resume", input, &repeated)
 	if repeated.Fresh || repeated.Handle != resumed.Handle || effects.Load() != 1 {
@@ -276,9 +293,10 @@ func TestActualInstalledExtensionAdminSocketResumeACKIsolationRestart(t *testing
 	}
 	var second ExtensionResumeReceipt
 	extensionSocketSuccess(t, ctx, admin, "continuation.resume", secondInput, &second)
-	if second.Handle == "" || second.Receipt.CapabilityRevision != 2 || effects.Load() != 2 {
+	if second.Handle == "" || second.Receipt.CapabilityRevision != 2 {
 		t.Fatal("current rotated claim", second, effects.Load())
 	}
+	awaitProviderEntry(2)
 	admin.Close()
 	if response := extensionSocketRequest(t, ctx, other, "continuation.stream.page", extensionPageInput{Handle: second.Handle}); response.Error == nil {
 		t.Fatal("disconnected page transferred to new owner")

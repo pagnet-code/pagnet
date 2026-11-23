@@ -47,12 +47,13 @@ import (
 // the `serve` subcommand; both write these variables, and only one
 // command runs per invocation.
 var (
-	daemonLocal          bool
-	daemonLocalDirectory string
-	daemonStateDir       string
-	daemonLogLevel       string
-	daemonDebug          bool
-	daemonNoAutoUpdate   bool
+	daemonLocal           bool
+	daemonLocalDirectory  string
+	daemonStateDir        string
+	daemonLogLevel        string
+	daemonDebug           bool
+	daemonNoAutoUpdate    bool
+	daemonRequireEnrolled bool
 	// detach is the root-level -d/--detach flag (see runDetach).
 	detach bool
 )
@@ -88,6 +89,8 @@ func registerDaemonFlags(cmd *cobra.Command) {
 	// It ANDs with PAGNET_AUTO_UPDATE / the state file's `autoUpdate:`.
 	cmd.Flags().BoolVar(&daemonNoAutoUpdate, "no-auto-update", false,
 		"disable worker self-update (default on; also PAGNET_AUTO_UPDATE=0 or state-file autoUpdate: false)")
+	cmd.Flags().BoolVar(&daemonRequireEnrolled, "require-enrolled", false,
+		"refuse to start without a complete stored host enrollment")
 }
 
 // needsEnroll reports whether the host needs (re-)enrollment before the
@@ -97,6 +100,38 @@ func registerDaemonFlags(cmd *cobra.Command) {
 // not break an enrolled host.
 func needsEnroll(cfg config.Daemon) bool {
 	return cfg.Credential == "" || cfg.HostID == ""
+}
+
+// serveDaemonConfig composes the installed host client on every start, including
+// the updater's idle re-exec of pagnet serve. Embedded daemons retain opt-in gates.
+func serveDaemonConfig(server string, cfg config.Daemon) daemon.Config {
+	return daemon.Config{
+		// These are client capabilities; server negotiation and native worker
+		// authorization still gate account messaging operations.
+		AccountMessageSealEnabled:      true,
+		AccountMessageExecutionEnabled: true,
+		AccountReplyDeliveryEnabled:    true,
+		AccountReplyReadEnabled:        true,
+		ServerURL:                      server,
+		Credential:                     cfg.Credential,
+		HostID:                         cfg.HostID,
+		StateDir:                       cfg.StateDir,
+		AllowedRoots:                   cfg.AllowedRoots,
+		Version:                        version,
+		Heartbeat:                      cfg.HeartbeatInterval,
+		HostWSIPv4Only:                 cfg.HostWSIPv4Only,
+		RuntimeEnv:                     cfg.RuntimeEnv,
+		NoScan:                         cfg.NoScan,
+		// The --debug flag ORs with PAGNET_DEBUG / the state file's
+		// debug: field (both loaded into cfg.Debug).
+		Debug: daemonDebug || cfg.Debug,
+		// The --no-auto-update flag ANDs with PAGNET_AUTO_UPDATE / the
+		// state file's autoUpdate: field (opt-out; default on, P6).
+		AutoUpdate: cfg.AutoUpdate && !daemonNoAutoUpdate,
+		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
+		// non-loopback control plane / release URL).
+		InsecureRemoteHTTP: insecureRemoteHTTP,
+	}
 }
 
 // runDaemon is the `pagnet serve` foreground body: state-dir config,
@@ -144,6 +179,9 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 	// exactly once, so it is the trigger for the console handoff (below).
 	firstRun := needsEnroll(cfg)
 	if firstRun {
+		if daemonRequireEnrolled {
+			return errors.New("host enrollment is missing or incomplete; run `pagnet enroll` explicitly before starting serve --require-enrolled")
+		}
 		if err := enrollHostForeground(root, account, "", nil, "", ""); err != nil {
 			return err
 		}
@@ -232,26 +270,7 @@ func runDaemon(cmd *cobra.Command, _ []string) error {
 		log.Info("pagnet serve: no local Fabric installation; serving daemon-only (hosted product unavailable)", "dir", installDir)
 	}
 
-	daemonCfg := daemon.Config{
-		ServerURL:    server,
-		Credential:   cfg.Credential,
-		HostID:       cfg.HostID,
-		StateDir:     cfg.StateDir,
-		AllowedRoots: cfg.AllowedRoots,
-		Version:      version,
-		Heartbeat:    cfg.HeartbeatInterval,
-		RuntimeEnv:   cfg.RuntimeEnv,
-		NoScan:       cfg.NoScan,
-		// The --debug flag ORs with PAGNET_DEBUG / the state file's
-		// debug: field (both loaded into cfg.Debug).
-		Debug: daemonDebug || cfg.Debug,
-		// The --no-auto-update flag ANDs with PAGNET_AUTO_UPDATE / the
-		// state file's autoUpdate: field (opt-out; default on, P6).
-		AutoUpdate: cfg.AutoUpdate && !daemonNoAutoUpdate,
-		// --insecure-remote-http (dev-only plain-HTTP opt-in for a
-		// non-loopback control plane / release URL).
-		InsecureRemoteHTTP: insecureRemoteHTTP,
-	}
+	daemonCfg := serveDaemonConfig(server, cfg)
 	// advertiseGate is assigned post-daemon (the runtime bindings need the
 	// daemon); the closure is fail-closed (never advertises) until then, and
 	// it is called on the connect context once per (re)connect.

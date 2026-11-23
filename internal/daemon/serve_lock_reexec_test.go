@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,19 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 	}
 	cmd := exec.Command(exe, "-test.run=TestServeLockReexecChildRole", "-test.count=1")
 	cmd.Env = append(os.Environ(), reexecStateDirEnv+"="+dir)
+	// Use a file so the long-lived canary cannot keep output-copy pipes
+	// open and block cmd.Wait after the adopt role exits.
+	childOutput, err := os.CreateTemp(dir, "child-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = childOutput.Close() })
+	cmd.Stdout = childOutput
+	cmd.Stderr = childOutput
+	readChildOutput := func() string {
+		b, _ := os.ReadFile(childOutput.Name())
+		return string(b)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +120,12 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 	//    AFTER the acquire and holds the child's PID).
 	var acquiredPID int
 	for {
+		select {
+		case err := <-done:
+			waited = true
+			t.Fatalf("child exited before acquired marker: %v\n%s", err, readChildOutput())
+		default:
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("timeout: the child never acquired the serve lock")
 		}
@@ -175,8 +195,14 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 	adopted := false
 	for !adopted {
 		select {
+		case err := <-done:
+			waited = true
+			t.Fatalf("child exited before adopted marker: %v\n%s", err, readChildOutput())
 		case <-probeFail:
-			t.Fatal("the re-exec released the serve lock before adoption (probe) — aborting")
+			_ = cmd.Process.Kill()
+			err := <-done
+			waited = true
+			t.Fatalf("the re-exec released the serve lock before adoption (probe): %v\n%s", err, readChildOutput())
 		case <-time.After(5 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
@@ -195,6 +221,16 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 	if adoptedPID != acquiredPID {
 		t.Fatalf("adopted pid %d != acquired pid %d (exec must continue the same process)", adoptedPID, acquiredPID)
 	}
+	// The adopt role stays alive until acknowledged, so this probe
+	// cannot mistake a process-exit close for a dropped lock.
+	if free, err := probeServeLock(dir); err != nil {
+		t.Fatalf("probe adopted lock: %v", err)
+	} else if free {
+		t.Fatal("serve lock was FREE while the adopt role was awaiting acknowledgment")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "acknowledged"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	// 4. Wait for the child to exit (its fd close releases the lock).
 	// The test body is the SOLE consumer of done (see stopProbe above).
@@ -202,7 +238,7 @@ func TestServeLockSurvivesReexec(t *testing.T) {
 	waited = true
 	stopProbeNow()
 	if err != nil {
-		t.Fatalf("child exited with an error: %v", err)
+		t.Fatalf("child exited with an error: %v\n%s", err, readChildOutput())
 	}
 	<-probeDone
 
@@ -279,6 +315,9 @@ func TestServeLockReexecAdoptRole(t *testing.T) {
 		t.Skip("re-exec role: only runs when selected by name with " + reexecStateDirEnv)
 	}
 	d := &Daemon{Config: Config{StateDir: dir}, Log: discardLog()}
+	// Keep the adopted file reachable until the marker handshake completes,
+	// just as Run retains the release closure throughout its lifetime.
+	defer func() { runtime.KeepAlive(d) }()
 	// This MUST take the adoption path: the lock is still held by the
 	// carried fd, so a fresh acquire on a second open file description
 	// would fail with EWOULDBLOCK.
@@ -291,6 +330,12 @@ func TestServeLockReexecAdoptRole(t *testing.T) {
 	// This assertion is what makes that failure DETERMINISTIC.
 	if v := os.Getenv(serveLockFDEnv); v != "" {
 		t.Fatalf("%s still set (value %q) — the carried fd was lost at exec", serveLockFDEnv, v)
+	}
+	runtime.GC()
+	if free, err := probeServeLock(dir); err != nil {
+		t.Fatalf("probe adopted lock after GC: %v", err)
+	} else if free {
+		t.Fatal("serve lock was FREE after adoption and GC")
 	}
 	// CLOEXEC canary: an ordinary child with NO special FD handling. If
 	// the adopt path failed to re-set CLOEXEC, this child inherits the
@@ -306,6 +351,18 @@ func TestServeLockReexecAdoptRole(t *testing.T) {
 	// Announce successful adoption (post-exec PID).
 	if err := os.WriteFile(filepath.Join(dir, "adopted"), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "acknowledged")); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout: the orchestrator never acknowledged adoption")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	// Deliberately NO explicit release: the lock must be dropped by the
 	// process EXIT (fd close), not by LOCK_UN — otherwise the canary

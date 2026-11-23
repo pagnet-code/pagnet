@@ -47,7 +47,7 @@ type Envelope struct {
 
 // NewEnvelope wraps a payload in a versioned envelope with a fresh id.
 func NewEnvelope(messageType string, payload any) (Envelope, error) {
-	raw, err := json.Marshal(payload)
+	raw, err := marshalNativeEnvelopePayload(messageType, payload)
 	if err != nil {
 		return Envelope{}, err
 	}
@@ -668,14 +668,17 @@ type InstanceStatus struct {
 	PID        int    `json:"pid,omitempty"`
 }
 
+const OwnerTextConsoleProtocol = "owner_text_console_v1"
+
 // InventoryPayload reports detected runtimes and workspaces.
 type InventoryPayload struct {
-	OwnerContextProtocol string                       `json:"ownerContextProtocol,omitempty"`
-	HostID               string                       `json:"hostId"`
-	Runtimes             []RuntimeInstallation        `json:"runtimes"`
-	RuntimeProfiles      []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
-	Workspaces           []WorkspaceReport            `json:"workspaces"`
-	AllowedRoots         []string                     `json:"allowedRoots"`
+	OwnerContextProtocol     string                       `json:"ownerContextProtocol,omitempty"`
+	OwnerTextConsoleProtocol string                       `json:"ownerTextConsoleProtocol,omitempty"`
+	HostID                   string                       `json:"hostId"`
+	Runtimes                 []RuntimeInstallation        `json:"runtimes"`
+	RuntimeProfiles          []RuntimeProfileInstallation `json:"runtimeProfiles,omitempty"`
+	Workspaces               []WorkspaceReport            `json:"workspaces"`
+	AllowedRoots             []string                     `json:"allowedRoots"`
 	// Crypto is the host's stable per-host E2EE public identity (plan
 	// §11.5), reported so the control plane knows the host is crypto-capable
 	// and can address it for Private Network activation/enrollment. Public
@@ -1247,6 +1250,9 @@ const EndpointInvocationResultMaxBytes = 512 << 10
 
 type EndpointRegisterPayload struct {
 	ProtocolFeatures []string `json:"protocolFeatures,omitempty"`
+	// ReceiveMessages opts out of inbound message dispatch when explicitly false.
+	// Omission preserves legacy endpoint behavior for older SDK clients.
+	ReceiveMessages *bool `json:"receiveMessages,omitempty"`
 	// EndpointName is an operator-friendly name for the endpoint ("" =
 	// none; display only, not identity).
 	EndpointName string              `json:"endpointName,omitempty"`

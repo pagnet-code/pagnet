@@ -41,7 +41,12 @@ type inventoryFlight struct {
 // instead of running the scan concurrently (which would multiply the probe
 // storm). The flight is cleared once the scan settles, so the next caller
 // gets a fresh scan.
-func (d *Daemon) buildInventoryPayload() transport.InventoryPayload {
+func (d *Daemon) buildInventoryPayload() (payload transport.InventoryPayload) {
+	defer func() {
+		if payload.Crypto != nil && d.ownerTextConsoleReady() {
+			payload.OwnerTextConsoleProtocol = transport.OwnerTextConsoleProtocol
+		}
+	}()
 	d.invMu.Lock()
 	if f := d.invFlight; f != nil {
 		d.invMu.Unlock()
@@ -52,7 +57,7 @@ func (d *Daemon) buildInventoryPayload() transport.InventoryPayload {
 	d.invFlight = f
 	d.invMu.Unlock()
 
-	payload := d.doScanInventory()
+	payload = d.doScanInventory()
 	f.payload = payload
 	close(f.done)
 	d.invMu.Lock()

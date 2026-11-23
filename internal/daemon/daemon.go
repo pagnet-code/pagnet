@@ -23,12 +23,14 @@ import (
 
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/accountmessage"
 	"github.com/pagnet-code/pagnet/internal/localipc"
 	"github.com/pagnet-code/pagnet/internal/netpolicy"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
+	"github.com/pagnet-code/pagnet/internal/textbridge/senderipc"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -56,6 +58,16 @@ var ErrOutdated = errors.New("control plane requires a newer protocol — update
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
+	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
+	// It enables encrypted staging only, never managed runtime dispatch.
+	AccountMessageSealEnabled bool
+	// AccountMessageExecutionEnabled is a separate native managed-Qwen gate.
+	// Sealing readiness never enables execution. The default is OFF.
+	AccountMessageExecutionEnabled bool
+	// AccountReplyDeliveryEnabled offers encrypted terminal reply delivery. Default OFF.
+	AccountReplyDeliveryEnabled bool
+	// AccountReplyReadEnabled enables transient owner-authorized reply reads.
+	AccountReplyReadEnabled bool
 	// HostedOwnerGuard is explicit original-worker composition. When configured,
 	// authenticated worker roots are fenced before link publication/native work.
 	HostedOwnerGuard *HostedOwnerGuard
@@ -112,6 +124,8 @@ type Config struct {
 	RootsMode string
 	Version   string
 	Heartbeat time.Duration
+	// HostWSIPv4Only opts only the host WebSocket connection into IPv4.
+	HostWSIPv4Only bool
 	// RuntimeEnv is applied to spawned runtime processes (E2E simulation
 	// knobs live here; a real deployment leaves it empty).
 	RuntimeEnv []string
@@ -181,14 +195,20 @@ type Daemon struct {
 	Config
 	Log *slog.Logger
 
-	sharingBridges   *sharingBridgeSupervisor
-	ownerMailboxMu   sync.Mutex
-	ownerMailboxUsed map[string]time.Time
+	textServices             *textServiceSupervisor
+	sharingBridges           *sharingBridgeSupervisor
+	browserAssignments       *browserAssignmentSupervisor
+	ownerMailboxMu           sync.Mutex
+	ownerMailboxUsed         map[string]time.Time
+	ownerTextConsoleMu       sync.Mutex
+	ownerTextConsoleUsed     map[string]time.Time
+	ownerTextConsoleHandlers int
 
-	nativeRegistry     *NativeWorkerRegistry
-	nativeWorkersMu    sync.Mutex
-	nativeConnectLocks [16]sync.Mutex
-	nativeWorkers      map[string]*nativeWorkerLink
+	nativeShareBindings nativeShareBindingExecutor // nil until explicitly composed; dormant preview
+	nativeRegistry      *NativeWorkerRegistry
+	nativeWorkersMu     sync.Mutex
+	nativeConnectLocks  [16]sync.Mutex
+	nativeWorkers       map[string]*nativeWorkerLink
 
 	// compositionMu guards Config.HostedFabricSideports and
 	// Config.HostedFabricSideportSocket: composition may happen before OR
@@ -330,9 +350,14 @@ type Daemon struct {
 	sessions *session.Manager
 
 	// Live host connection (for the bridge relay; nil while disconnected).
-	connMu     sync.Mutex
-	curConn    *websocket.Conn
-	nativeConn *NativeObservationConnection // guarded by connMu; exact socket lifetime
+	connMu                    sync.Mutex
+	curConn                   *websocket.Conn
+	nativeConn                *NativeObservationConnection         // guarded by connMu; exact socket lifetime
+	accountReadiness          *accountMessagingReadinessConnection // guarded by connMu
+	accountSealMu             sync.Mutex
+	accountSealJournal        *accountmessage.Journal
+	accountSealClosed         bool
+	accountReadinessMutations int // guarded by connMu, spans reconnects
 	// websocket.Conn allows ONE concurrent writer; the heartbeat, command
 	// acks, and bridge relay all share the connection, so writes serialize.
 	writeMu sync.Mutex
@@ -892,6 +917,12 @@ func (d *Daemon) finishQueue(instanceID string) {
 func (d *Daemon) Close() error {
 	var err error
 	d.closeOnce.Do(func() {
+		d.accountSealMu.Lock()
+		d.accountSealClosed = true
+		if d.accountSealJournal != nil {
+			_ = d.accountSealJournal.Close()
+		}
+		d.accountSealMu.Unlock()
 		// Shutdown (abuse addendum Part B §38): stop accepting new
 		// launches, terminate every owned process group (turns AND PTYs)
 		// with a bounded grace, reap, and flush state. The supervisor owns
@@ -944,10 +975,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer releaseLock()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	defer bridgeCancel()
+	d.textServices = newTextServiceSupervisor(d)
+	if senderipc.Supported() {
+		senderRPC, err := senderipc.Listen(d.StateDir)
+		if err != nil {
+			return err
+		}
+		defer senderRPC.Close()
+		d.textServices.senderIPC = senderRPC
+	}
+	textDone := make(chan struct{})
+	go func() { defer close(textDone); d.textServices.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-textDone }()
 	d.sharingBridges = newSharingBridgeSupervisor(d)
 	bridgeDone := make(chan struct{})
 	go func() { defer close(bridgeDone); d.sharingBridges.run(bridgeCtx) }()
 	defer func() { bridgeCancel(); <-bridgeDone }()
+	d.browserAssignments = newBrowserAssignmentSupervisor(d)
+	browserDone := make(chan struct{})
+	go func() { defer close(browserDone); d.browserAssignments.run(bridgeCtx) }()
+	defer func() { bridgeCancel(); <-browserDone }()
 	// The agent bridge socket is local and independent of the WSS
 	// connection: it is up as soon as the daemon is, and relayed calls
 	// fail cleanly (not hang) while the host connection is down.
@@ -1028,6 +1076,10 @@ func isAuthReject(err error) bool {
 }
 
 func (d *Daemon) wsURL(ctx context.Context) string {
+	return d.wsURLWithSnapshotSigningKey(ctx, "")
+}
+
+func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSigningPublicKey string) string {
 	base := strings.TrimSuffix(d.ServerURL, "/")
 	u, err := url.Parse(base)
 	if err != nil {
@@ -1046,11 +1098,33 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 	q.Set("boot_id", d.bootID)
 	setHostBootIdentity(q, CollectKernelBootEvidence)
 	q.Set("native_observations", transport.NativeObservationReceiptProtocol)
+	q.Del("snapshot_signing_key")
+	q.Del("snapshot_signing_public_key")
+	if snapshotSigningPublicKey != "" {
+		q.Set("snapshot_signing_key", transport.HostSnapshotSigningKeyProtocol)
+		q.Set("snapshot_signing_public_key", snapshotSigningPublicKey)
+	}
 	q.Set("sdk_pair_bridge", sharingBridgeProtocol)
+	q.Set("text_service_bridge", textServiceBridgeProtocol)
 	q.Set("owner_mailbox", transport.OwnerMailboxCapabilityV1)
+	q.Del("native_share_binding")
+	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
+		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
+	}
+	q.Del("native_account_reply")
+	if d.AccountReplyDeliveryEnabled && d.nativeRegistry != nil {
+		q.Set("native_account_reply", transport.NativeAccountReplyProtocol)
+	}
+	q.Del("browser_account_reply_read")
+	if d.AccountReplyReadEnabled && d.nativeRegistry != nil {
+		q.Set("browser_account_reply_read", transport.BrowserAccountReplyReadProtocol)
+	}
 	q.Del("native_worker_recovery")
+	q.Del("native_worker_prior_launch_boot_recovery")
 	if d.nativeRegistry != nil {
+		q.Set("native_worker_availability", transport.NativeWorkerAvailabilityProtocol)
 		q.Set("native_worker_recovery", transport.NativeWorkerRecoveryProtocol)
+		q.Set("native_worker_prior_launch_boot_recovery", transport.NativeWorkerPriorLaunchBootRecoveryProtocol)
 		q.Set("native_ownership", transport.NativeWorkerOwnershipProtocol)
 		q.Set("native_task_content", transport.NativeTaskContentProtocol)
 		q.Set("native_agent_source", transport.NativeAgentSourceProtocol)
@@ -1078,9 +1152,17 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	if err := netpolicy.Check(d.ServerURL, d.InsecureRemoteHTTP); err != nil {
 		return connectedAt, err
 	}
+	snapshotSigningPublicKey, err := d.snapshotSigningPublicKey()
+	if err != nil {
+		return connectedAt, err
+	}
 	hdr := http.Header{}
 	hdr.Set("Authorization", "Bearer "+d.Credential)
-	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, d.wsURL(ctx), hdr)
+	dialer, err := hostWSDialer(d.HostWSIPv4Only)
+	if err != nil {
+		return connectedAt, err
+	}
+	conn, resp, err := dialer.DialContext(ctx, d.wsURLWithSnapshotSigningKey(ctx, snapshotSigningPublicKey), hdr)
 	if err != nil {
 		if resp != nil {
 			return connectedAt, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)
@@ -1089,21 +1171,55 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	}
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
+	nativeConn.offeredSnapshotSigningPublicKey = snapshotSigningPublicKey
 	defer nativeConn.Close()
+	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
+	defer accountReadiness.close()
+	d.connMu.Lock()
+	d.accountReadiness = accountReadiness
+	d.connMu.Unlock()
+	defer func() {
+		d.connMu.Lock()
+		if d.accountReadiness == accountReadiness {
+			d.accountReadiness = nil
+		}
+		d.connMu.Unlock()
+	}()
+	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
+	defer shareBindings.close()
 	ownerMailboxes := newOwnerMailboxConnection(d, nativeConn, func(typ string, payload any) error {
 		env, err := transport.NewEnvelope(typ, payload)
 		if err != nil {
 			return err
 		}
-		raw, err := json.Marshal(env)
+		raw, err := transport.MarshalNativeJSON(env)
 		if err != nil {
 			return err
 		}
 		return d.write(conn, raw)
 	})
 	defer ownerMailboxes.close()
+	ownerTextConsoles := newOwnerTextConsoleConnection(d, nativeConn, func(typ string, payload any) error {
+		env, err := transport.NewEnvelope(typ, payload)
+		if err != nil {
+			return err
+		}
+		raw, err := transport.MarshalNativeJSON(env)
+		if err != nil {
+			return err
+		}
+		return d.write(conn, raw)
+	})
+	defer ownerTextConsoles.close()
+	if d.textServices != nil {
+		defer d.textServices.disconnect()
+	}
 	if d.sharingBridges != nil {
 		defer d.sharingBridges.disconnect()
+	}
+	if d.browserAssignments != nil {
+		d.browserAssignments.admit(d.HostID)
+		defer d.browserAssignments.disconnect()
 	}
 	d.connMu.Lock()
 	d.curConn = conn
@@ -1212,7 +1328,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		// partition with no RST) does, and is closed so the reconnect loop
 		// in Run takes over.
 		_ = conn.SetReadDeadline(time.Now().Add(d.readTimeout))
-		_, raw, err := conn.ReadMessage()
+		raw, err := readHostFrame(conn)
 		if err != nil {
 			if isNetTimeout(err) {
 				// No frame (data or PONG) within readTimeout: the connection
@@ -1233,9 +1349,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			}
 			return connectedAt, err
 		}
+		if accountReadiness.interceptAccountReplyRead(raw) || accountReadiness.interceptAccountSeal(raw) {
+			continue
+		}
 		var env transport.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
-			d.Log.Warn("bad envelope from server", "err", err)
+			d.Log.Warn("bad envelope from server")
 			continue
 		}
 		if env.ProtocolVersion > transport.ProtocolVersion {
@@ -1269,19 +1388,37 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 				"pagnet: this host was unenrolled from the control plane — the daemon is stopping")
 			return connectedAt, ErrUnenrolled
 		}
+		if env.Type == transport.MsgBrowserConnectionsRevision {
+			var notice transport.BrowserConnectionsRevisionPayload
+			if d.browserAssignments != nil && json.Unmarshal(env.Payload, &notice) == nil {
+				d.browserAssignments.notice(notice)
+			}
+			continue
+		}
 		if handled, err := nativeConn.HandleEnvelope(env); handled {
 			if err != nil {
 				return connectedAt, fmt.Errorf("native host protocol: %w", err)
 			}
 			if env.Type == transport.MsgHostSession {
+				accountReadiness.admitted()
+				if d.textServices != nil {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						d.textServices.admit(session)
+					}
+				}
 				if d.sharingBridges != nil {
 					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
 						d.sharingBridges.admit(session)
 					}
 				}
+				nativeConn.availabilityOnce.Do(func() { go d.publishNativeWorkerAvailability(conn, nativeConn) })
 				go d.recoverNativeWorkers(conn, nativeConn)
 				go d.resumeNativeWorkerRecoveryAcks(conn)
 			}
+			continue
+		}
+		if env.Type == transport.MsgOwnerTextConsoleOpen || env.Type == transport.MsgOwnerTextConsoleFrame || env.Type == transport.MsgOwnerTextConsoleClose {
+			ownerTextConsoles.handle(env, len(raw))
 			continue
 		}
 		if env.Type == transport.MsgOwnerMailboxOpen || env.Type == transport.MsgOwnerMailboxClose ||
@@ -1310,11 +1447,25 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			// LIVE (E2EE, plan §12): the network's crypto lifecycle state
 			// (status + announced epoch + tenant id). The handler only
 			// updates the in-memory cache — it never blocks the read loop.
-			d.handleNetworkCrypto(env)
+			accountReadiness.networkCrypto(env)
+			continue
+		}
+		if env.Type == transport.MsgAccountMessagingReadinessOffer || env.Type == transport.MsgAccountMessagingReadinessReset || env.Type == transport.MsgAccountMessagingReadinessSnapshotComplete || env.Type == transport.MsgAccountMessagingReadinessAccepted {
+			accountReadiness.offer(env)
+			continue
+		}
+		if shareBindings.handle(env) {
 			continue
 		}
 		d.handleCommand(conn, env)
 	}
+}
+
+// Bound allocation before decoding any dedicated or generic host frame.
+func readHostFrame(conn *websocket.Conn) ([]byte, error) {
+	conn.SetReadLimit(transport.NativeContentMaxPageWireBytes)
+	_, raw, err := conn.ReadMessage()
+	return raw, err
 }
 
 // listDirsCap bounds how many subdirectories one listing returns, so a
@@ -1393,7 +1544,7 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 	if err != nil {
 		return err
 	}
-	raw, err := json.Marshal(env)
+	raw, err := transport.MarshalNativeJSON(env)
 	if err != nil {
 		return err
 	}
@@ -1411,10 +1562,20 @@ func (d *Daemon) send(conn *websocket.Conn, msgType string, payload any) error {
 // the failed conn, which unblocks the read loop so the reconnect loop in Run
 // takes over.
 func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
+	return d.writeGuarded(conn, raw, nil)
+}
+
+// writeGuarded checks connection-local evidence after waiting for the shared
+// writer, immediately before I/O. The guard must not hold locks across I/O.
+func (d *Daemon) writeGuarded(conn *websocket.Conn, raw []byte, guard func() bool) error {
 	if conn == nil {
 		return errors.New("no host connection")
 	}
 	d.writeMu.Lock()
+	if guard != nil && !guard() {
+		d.writeMu.Unlock()
+		return nil
+	}
 	// A stalled peer must not stall the command workers (or heartbeats /
 	// the bridge relay): with an unbounded write, one clogged socket can
 	// freeze a per-instance FIFO for minutes — a stop then lands past any
@@ -1424,8 +1585,8 @@ func (d *Daemon) write(conn *websocket.Conn, raw []byte) error {
 	err := conn.WriteMessage(websocket.TextMessage, raw)
 	d.writeMu.Unlock()
 	if err != nil {
-		// Released writeMu before invalidating so no writeMu→connMu nesting
-		// (invalidate takes connMu on its own); a concurrent write to the
+		// Release writeMu before connection invalidation and logging;
+		// a concurrent write to the
 		// poisoned conn fails too and invalidates idempotently.
 		d.invalidateCurrentConnection(conn)
 	}
@@ -1562,7 +1723,16 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 // enqueue means at most ONE copy of an un-acked command ever sits in the
 // queue.
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
+	// Reserved plaintext frames never enter generic command persistence, even
+	// when a caller bypasses the socket reader.
+	if env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+		return
+	}
 	switch env.Type {
+	case textServicesChanged:
+		if d.textServices != nil {
+			d.textServices.signal()
+		}
 	case sharingBridgeCommand:
 		var p struct {
 			InstallationID string `json:"installationId"`
@@ -1590,7 +1760,11 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 		}
 		d.enqueueInstance(p.InstanceID, func() {
 			if err := d.handleNativeWorkerRecoveryState(conn, p, CollectKernelBootEvidence); err != nil && d.Log != nil {
-				d.Log.Warn("native worker loss recovery deferred", "instance", p.InstanceID)
+				if errors.Is(err, ErrNativeOriginAdmissionDeferred) {
+					d.Log.Debug("native worker loss recovery waiting", "instance", p.InstanceID, "err", err)
+				} else {
+					d.Log.Warn("native worker loss recovery deferred", "instance", p.InstanceID, "err", err)
+				}
 			}
 		})
 	case transport.MsgNativeOwnershipPrepare:
@@ -1765,6 +1939,34 @@ func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 					return ErrDeferred
 				}
 				return d.doDeliver(conn, p)
+			})
+		})
+	case transport.MsgAccountMessage:
+		var p transport.AccountMessagePayload
+		// This frame is ciphertext only, but still use the bounded strict decoder
+		// so duplicate/aliased fields cannot change the original account proof.
+		if accountmessage.DecodeFrame(env.Payload, &p) != nil || p.CommandID == "" || p.InstanceID == "" {
+			return
+		}
+		d.enqueueAccountMessage(p.InstanceID, p.CommandID, func() {
+			d.guarded(conn, p.CommandID, func() error {
+				source, err := d.preflightAccountMessageCommand(conn, p)
+				if err != nil {
+					return err
+				}
+				err = d.nativeAcceptOperation(conn, p.InstanceID, p.NativeDispatch, "prompt", sessionworker.Operation{
+					SealedAccountMessage: &p.Envelope, SourceAccountMessage: source, InputKind: "account_message",
+				})
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				if err != nil {
+					// The worker may have fsynced the input before its IPC reply was
+					// lost. Keep the original command pending; a resend only reads
+					// the worker's immutable journal and cannot submit again.
+					return errors.Join(ErrDeferred, errAccountMessageCommand)
+				}
+				return nil
 			})
 		})
 
@@ -2702,6 +2904,8 @@ func (d *Daemon) prepareLaunch(p transport.LaunchAgentPayload) (*InstanceRow, st
 	} else {
 		row.AgentMDPath = path
 	}
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if err := d.state.UpsertInstance(row); err != nil {
 		if lock != nil {
 			lock.Unlock()
@@ -2913,7 +3117,7 @@ func (d *Daemon) doStop(conn *websocket.Conn, instanceID string) error {
 	}
 	d.invalidateBridgeNonce(instanceID)    // S1: the activation's bridge credential dies with the process
 	d.invalidateHostedSideport(instanceID) // the dead activation advertises no sideport
-	if err := d.state.SetInstanceStatus(instanceID, "stopped", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(instanceID, "stopped", ""); err != nil {
 		return err
 	}
 	_ = d.send(conn, transport.MsgAgentStopped, map[string]any{
@@ -2956,6 +3160,8 @@ func (d *Daemon) doForget(conn *websocket.Conn, instanceID string) error {
 	}
 	d.invalidateBridgeNonce(instanceID) // S1: the instance is gone for good
 	d.invalidateHostedSideport(instanceID)
+	finishReadinessMutation := d.beginAccountMessagingMutation()
+	defer finishReadinessMutation()
 	if err := d.state.DeleteInstance(instanceID); err != nil {
 		return err
 	}
@@ -2993,7 +3199,7 @@ func (d *Daemon) doRestart(conn *websocket.Conn, instanceID string) error {
 	if err := d.state.SetInstanceSession(instanceID, ""); err != nil {
 		return err
 	}
-	if err := d.state.SetInstanceStatus(instanceID, "idle", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(instanceID, "idle", ""); err != nil {
 		return err
 	}
 	_ = d.send(conn, transport.MsgAgentStarted, map[string]any{"instanceId": instanceID})
@@ -3049,7 +3255,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 		// Wake establishes the endpoint; it is not a user prompt. Submitting
 		// a fabricated wake turn consumes provider work and holds the FIFO
 		// ahead of the durable message/task that actually caused this wake.
-		if err := d.state.SetInstanceStatus(instanceID, "waking", ""); err != nil {
+		if err := d.setReadinessInstanceStatus(instanceID, "waking", ""); err != nil {
 			return err
 		}
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": "waking"})
@@ -3066,7 +3272,7 @@ func (d *Daemon) doWake(conn *websocket.Conn, instanceID, reason string) error {
 					if errors.Is(err, context.Canceled) {
 						status = row.Status
 					}
-					_ = d.state.SetInstanceStatus(instanceID, status, "")
+					_ = d.setReadinessInstanceStatus(instanceID, status, "")
 				}
 				_ = d.send(conn, transport.MsgAgentStatus, map[string]any{"instanceId": instanceID, "status": status})
 				d.reportEndpointStatus(conn, instanceID)
@@ -3159,27 +3365,26 @@ func (d *Daemon) hibernateInstance(conn *websocket.Conn, instanceID, reason stri
 	// Stop the endpoint, PRESERVING the session (invariant F). The driver's
 	// hibernate is synchronous: it runs the TERM → grace → KILL sequence
 	// and waits for the endpoint to be reaped.
+	finalize := func(snapshot session.LifecycleSnapshot) error {
+		if snapshot.Materialised && snapshot.NativeID != "" {
+			row.SessionID = snapshot.NativeID
+		}
+		d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
+		d.invalidateHostedSideport(instanceID)
+		_ = d.setReadinessInstanceStatus(instanceID, "hibernated", row.SessionID)
+		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
+			"instanceId": instanceID, "sessionId": row.SessionID,
+			"reason": reason,
+		})
+		d.reportEndpointStatus(conn, instanceID) // offline (hibernated)
+		d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
+			"instance", instanceID, "session", row.SessionID, "reason", reason)
+		return nil
+	}
 	if sess := d.sessions.GetSession(instanceID); sess != nil {
-		if err := d.sessions.Hibernate(context.Background(), sess); err != nil {
-			return err
-		}
+		return d.sessions.HibernateAndFinalize(context.Background(), sess, finalize)
 	}
-	if materialised, ok := d.sessions.Materialised(instanceID); ok && materialised {
-		if nativeID, ok := d.sessions.NativeID(instanceID); ok && nativeID != "" {
-			row.SessionID = nativeID
-		}
-	}
-	d.invalidateBridgeNonce(instanceID) // S1: the endpoint (and its bridge) is dead
-	d.invalidateHostedSideport(instanceID)
-	_ = d.state.SetInstanceStatus(instanceID, "hibernated", row.SessionID)
-	_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
-		"instanceId": instanceID, "sessionId": row.SessionID,
-		"reason": reason,
-	})
-	d.reportEndpointStatus(conn, instanceID) // offline (hibernated)
-	d.Log.Info("instance hibernated (persistent endpoint stopped, session preserved)",
-		"instance", instanceID, "session", row.SessionID, "reason", reason)
-	return nil
+	return finalize(session.LifecycleSnapshot{})
 }
 
 func (d *Daemon) doDeliver(conn *websocket.Conn, p transport.NetworkEventPayload) error {
@@ -3575,7 +3780,7 @@ func (d *Daemon) runTurn(conn *websocket.Conn, spec agentruntime.TurnSpec) error
 		d.turnMu.Unlock()
 	}()
 
-	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
 	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
@@ -3641,7 +3846,7 @@ legacyTurnEvents:
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID,
 				ev.Type == agentruntime.EventSessionResumed)
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 		case agentruntime.EventSessionLost:
 			plans.pending = nil
 			plansClosed = true
@@ -3704,7 +3909,7 @@ legacyTurnEvents:
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case failedKind != "":
@@ -3724,7 +3929,7 @@ legacyTurnEvents:
 		}
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, st, sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case errors.Is(turnErr, context.Canceled):
@@ -3773,7 +3978,7 @@ legacyTurnEvents:
 			"instance", spec.InstanceID, "kind", kind, "error", turnErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+turnErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, turnErr)
 	case turnErr != nil:
@@ -3782,7 +3987,7 @@ legacyTurnEvents:
 			"instance", spec.InstanceID, "error", turnErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+turnErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", turnErr)
 	case !completed:
@@ -3805,7 +4010,7 @@ legacyTurnEvents:
 		// attach or terminal keeps the instance awake (idle, session
 		// active); hibernation happens when the last one is closed.
 		if d.attached(spec.InstanceID) || d.terminal.active(spec.InstanceID) {
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "idle", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "idle",
 			})
@@ -3821,7 +4026,7 @@ legacyTurnEvents:
 		// token burn: the instance simply waits until a human answers in
 		// the native TUI (attach) and the resolution clears it.
 		if pendingInteraction && !interactionDeferrable {
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", sessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", sessionID)
 			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 				"instanceId": spec.InstanceID, "status": "blocked",
 			})
@@ -3834,7 +4039,7 @@ legacyTurnEvents:
 		// pending interaction is safe to hibernate under — the interaction
 		// is durable and the instance wakes on the next work/resolve.)
 		d.invalidateBridgeNonce(spec.InstanceID) // S1: the turn process (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "hibernated", sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "hibernated", sessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": spec.InstanceID, "sessionId": sessionID,
 			"reason": "turn_completed",
@@ -3873,7 +4078,7 @@ func (d *Daemon) runTurnPersistent(conn *websocket.Conn, spec agentruntime.TurnS
 	// (re)activation).
 	sess := d.prepareSession(row, spec)
 
-	if err := d.state.SetInstanceStatus(spec.InstanceID, "working", ""); err != nil {
+	if err := d.setReadinessInstanceStatus(spec.InstanceID, "working", ""); err != nil {
 		return err
 	}
 	d.reportEndpointStatus(conn, spec.InstanceID) // online (turn in flight)
@@ -3957,7 +4162,7 @@ turnEvents:
 		case session.EventSessionStarted, session.EventSessionResumed:
 			sessionID = ev.SessionID
 			d.reportSession(conn, spec.InstanceID, ev.SessionID, ev.Type == session.EventSessionResumed)
-			_ = d.state.SetInstanceStatus(spec.InstanceID, "working", ev.SessionID)
+			_ = d.setReadinessInstanceStatus(spec.InstanceID, "working", ev.SessionID)
 			// Phase 3 (A5/G8, strengthened): the capture onto the
 			// endpoint's PTY exists from the LAUNCH site (the driver's
 			// PTYAvailable hook adopted the master at registration — its
@@ -4026,7 +4231,7 @@ turnEvents:
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "session_lost:no resumable session", nil)
 		_ = d.state.SetInstanceSession(spec.InstanceID, "")
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "blocked", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "blocked", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (blocked)
 		return fmt.Errorf("session lost: no resumable session (instance blocked)")
 	case outcomeTurnFailed:
@@ -4041,7 +4246,7 @@ turnEvents:
 		}
 		d.Log.Warn("turn failed", "instance", spec.InstanceID,
 			"kind", failedKind, "error", failedErr, "retryAt", failedRetry)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, st, sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, st, sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed/rate_limited/auth_required)
 		return fmt.Errorf("turn failed: %s: %s", failedKind, failedErr)
 	case outcomeTurnInterrupted:
@@ -4060,7 +4265,7 @@ turnEvents:
 			"instance", spec.InstanceID, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "interrupted:the runtime stopped before this turn finished", nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, string(domain.AgentStatusInterrupted), sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, string(domain.AgentStatusInterrupted), sessionID)
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (interrupted)
 		return fmt.Errorf("turn interrupted: %v", submitErr)
 	case outcomeNoFailureQueued:
@@ -4094,7 +4299,7 @@ turnEvents:
 			"instance", spec.InstanceID, "kind", kind, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", kind+":"+submitErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn launch refused: %s: %v", kind, submitErr)
 	case outcomeProcessError:
@@ -4104,7 +4309,7 @@ turnEvents:
 			"instance", spec.InstanceID, "error", submitErr.Error())
 		d.sendTurn(conn, transport.MsgRuntimeTurnFailed, spec, attemptedSession,
 			nil, nil, nil, "", "process_error:"+submitErr.Error(), nil)
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "failed", "")
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "failed", "")
 		d.reportEndpointStatus(conn, spec.InstanceID) // offline (failed)
 		return fmt.Errorf("turn failed: process_error: %v", submitErr)
 	default: // outcomeCompleted
@@ -4112,7 +4317,7 @@ turnEvents:
 		// idle, not hibernated) — the PID is stable across turns. An
 		// explicit hibernate (a separate operation) stops the endpoint,
 		// preserving the session for a later wake.
-		_ = d.state.SetInstanceStatus(spec.InstanceID, "idle", sessionID)
+		_ = d.setReadinessInstanceStatus(spec.InstanceID, "idle", sessionID)
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 			"instanceId": spec.InstanceID, "status": "idle",
 		})
@@ -4387,87 +4592,83 @@ func (d *Daemon) activateSessionIdle(conn *websocket.Conn, row *InstanceRow) err
 	spec := d.turnSpecFor(row, row.SessionID != "", "", "terminal")
 	sess := d.prepareSession(row, spec)
 	events := make(chan session.SessionEvent, 16)
-	_, err := d.sessions.EnsureActive(d.turnCtx, sess, events)
-	// The driver sends the activation events and returns when activation
-	// settles (it does NOT close the channel — the caller owns the
-	// lifecycle). Drain non-blockingly, then close.
-drain:
-	for {
-		select {
-		case ev := <-events:
-			switch ev.Type {
-			case session.EventSessionStarted, session.EventSessionResumed:
-				d.reportSession(conn, row.InstanceID, ev.SessionID,
-					ev.Type == session.EventSessionResumed)
-				// A resumed session is materialised by definition (the
-				// resume gate): persist its id. A cold start is not yet
-				// materialised (no real exchange): keep the status
-				// transition but do NOT persist the minted id (the
-				// Materialised invariant — see the doc above).
-				persistID := ""
-				if ev.Type == session.EventSessionResumed {
-					persistID = ev.SessionID
+	return d.sessions.EnsureActiveAndFinalize(d.turnCtx, sess, events, func(_ *session.RuntimeEndpoint, snapshot session.LifecycleSnapshot, err error) error {
+		// The driver sends the activation events and returns when activation
+		// settles (it does NOT close the channel — the caller owns the
+		// lifecycle). Drain non-blockingly, then close.
+	drain:
+		for {
+			select {
+			case ev := <-events:
+				switch ev.Type {
+				case session.EventSessionStarted, session.EventSessionResumed:
+					d.reportSession(conn, row.InstanceID, ev.SessionID,
+						ev.Type == session.EventSessionResumed)
+					// A resumed session is materialised by definition (the
+					// resume gate): persist its id. A cold start is not yet
+					// materialised (no real exchange): keep the status
+					// transition but do NOT persist the minted id (the
+					// Materialised invariant — see the doc above).
+					persistID := ""
+					if ev.Type == session.EventSessionResumed {
+						persistID = ev.SessionID
+					}
+					_ = d.setReadinessInstanceStatus(row.InstanceID, "working", persistID)
+				case session.EventSessionLost:
+					// Surfaced via the error below (invariant F).
 				}
-				_ = d.state.SetInstanceStatus(row.InstanceID, "working", persistID)
-			case session.EventSessionLost:
-				// Surfaced via the error below (invariant F).
+			default:
+				break drain
 			}
-		default:
-			break drain
 		}
-	}
-	close(events)
-	if err != nil {
-		if errors.Is(err, session.ErrSessionLost) {
-			// The resume failed — do NOT silently start a fresh session.
-			// Drop the local reference and block until a human explicitly
-			// restarts (cold start). Same handling as the turn path.
-			_ = d.state.SetInstanceSession(row.InstanceID, "")
-			_ = d.state.SetInstanceStatus(row.InstanceID, "blocked", "")
-			d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
-			d.Log.Warn("activation lost the session; instance blocked",
-				"instance", row.InstanceID)
-			return fmt.Errorf("session lost: no resumable session (instance blocked)")
+		close(events)
+		if err != nil {
+			if errors.Is(err, session.ErrSessionLost) {
+				// The resume failed — do NOT silently start a fresh session.
+				// Drop the local reference and block until a human explicitly
+				// restarts (cold start). Same handling as the turn path.
+				_ = d.state.SetInstanceSession(row.InstanceID, "")
+				_ = d.setReadinessInstanceStatus(row.InstanceID, "blocked", "")
+				d.reportEndpointStatus(conn, row.InstanceID) // offline (blocked)
+				d.Log.Warn("activation lost the session; instance blocked",
+					"instance", row.InstanceID)
+				return fmt.Errorf("session lost: no resumable session (instance blocked)")
+			}
+			d.Log.Warn("session activation failed", "instance", row.InstanceID,
+				"error", err.Error())
+			return err
 		}
-		d.Log.Warn("session activation failed", "instance", row.InstanceID,
-			"error", err.Error())
-		return err
-	}
-	// Persist the session id on the row only when the session is
-	// MATERIALISED (see the doc above).
-	sessionID := ""
-	if mat, ok := d.sessions.Materialised(row.InstanceID); ok && mat {
-		// Locked read through the Manager (NativeID is mutated by the
-		// Manager and the drivers under its mutex; a direct sess.NativeID
-		// read here would race it).
-		if id, ok := d.sessions.NativeID(row.InstanceID); ok && id != "" {
-			sessionID = id
+		// Persist the session id on the row only when the session is
+		// MATERIALISED (see the doc above).
+		sessionID := ""
+		if snapshot.Materialised {
+			sessionID = snapshot.NativeID
 		}
-	}
-	// Settle the instance to idle — but ONLY if no turn has started while the
-	// activation was settling. This path now runs off the per-instance FIFO
-	// (the launch-time activation is backgrounded, and a concurrent attach
-	// joins it), so a deliver may have begun a turn in the meantime; the
-	// turn owns the status then and an unconditional "idle" write would
-	// clobber its "working". The endpoint view is ensured regardless
-	// (observational + idempotent).
-	if !d.turnInFlight(row.InstanceID) {
-		_ = d.state.SetInstanceStatus(row.InstanceID, "idle", sessionID)
-		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
-			"instanceId": row.InstanceID, "status": "idle",
-		})
-	}
-	d.reportEndpointStatus(conn, row.InstanceID) // online (idle or working)
-	d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
-		"instance", row.InstanceID, "session", sessionID)
-	d.ensureEndpointView(row)
-	// Settle marker (see the settleGens field): the activation is done and
-	// the status write above is final — daemon tests wait on this instead
-	// of polling the ambiguous row status.
-	d.settleMu.Lock()
-	d.settleGens[row.InstanceID]++
-	d.settleMu.Unlock()
-	return nil
+		// Settle the instance to idle — but ONLY if no turn has started while the
+		// activation was settling. This path now runs off the per-instance FIFO
+		// (the launch-time activation is backgrounded, and a concurrent attach
+		// joins it), so a deliver may have begun a turn in the meantime; the
+		// turn owns the status then and an unconditional "idle" write would
+		// clobber its "working". The endpoint view is ensured regardless
+		// (observational + idempotent).
+		if !d.turnInFlight(row.InstanceID) {
+			_ = d.setReadinessInstanceStatus(row.InstanceID, "idle", sessionID)
+			_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
+				"instanceId": row.InstanceID, "status": "idle",
+			})
+		}
+		d.reportEndpointStatus(conn, row.InstanceID) // online (idle or working)
+		d.Log.Info("session-driven endpoint activated (idle, no turn submitted)",
+			"instance", row.InstanceID, "session", sessionID)
+		d.ensureEndpointView(row)
+		// Settle marker (see the settleGens field): the activation is done and
+		// the status write above is final — daemon tests wait on this instead
+		// of polling the ambiguous row status.
+		d.settleMu.Lock()
+		d.settleGens[row.InstanceID]++
+		d.settleMu.Unlock()
+		return nil
+	})
 }
 
 // settleGeneration returns the instance's settle generation (0 when no
@@ -4625,7 +4826,7 @@ func (d *Daemon) doAttach(conn *websocket.Conn, p transport.TerminalAttachPayloa
 	// interactive process is running. A busy instance simply keeps its
 	// turn (process-per-turn) while the PTY runs alongside it.
 	if row.Status == "hibernated" {
-		_ = d.state.SetInstanceStatus(p.InstanceID, "idle", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "idle", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentStatus, map[string]any{
 			"instanceId": p.InstanceID, "status": "idle",
 		})
@@ -4699,7 +4900,7 @@ func (d *Daemon) doDetach(conn *websocket.Conn, p transport.DetachTerminalPayloa
 			return d.hibernateInstance(conn, p.InstanceID, "attach_closed")
 		}
 		d.invalidateBridgeNonce(p.InstanceID) // S1: the turn process (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
 			// No PTY is involved (or it is gone): other sessions on this
@@ -4737,7 +4938,7 @@ func (d *Daemon) doTerminalStop(conn *websocket.Conn, p transport.TerminalStopPa
 			return d.hibernateInstance(conn, p.InstanceID, "stopped")
 		}
 		d.invalidateBridgeNonce(p.InstanceID) // S1: the PTY (and its bridge) is dead
-		_ = d.state.SetInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
+		_ = d.setReadinessInstanceStatus(p.InstanceID, "hibernated", row.SessionID)
 		_ = d.send(conn, transport.MsgAgentHibernated, map[string]any{
 			"instanceId": p.InstanceID, "sessionId": row.SessionID,
 			// The stop endpoint already told its clients "stopped".

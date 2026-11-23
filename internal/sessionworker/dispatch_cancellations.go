@@ -81,6 +81,9 @@ func (j *Journal) initializeDispatchCancellations() error {
 func validCancellationPreparation(scope Scope, r DispatchCancellationPreparation) bool {
 	p := r.Proposal.Proof
 	q := r.Request
+	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) {
+		return false
+	}
 	if r.State != "prepared" && r.State != "finalized" {
 		return false
 	}
@@ -187,7 +190,7 @@ func (j *Journal) PrepareDispatchCancellation(ctx context.Context, lease int64, 
 	if count >= maxCommands {
 		return record, ErrFull
 	}
-	raw, err = json.Marshal(record)
+	raw, err = encodeDispatchCancellationPreparation(record)
 	if err != nil || len(raw) > 16384 {
 		return record, ErrFull
 	}
@@ -228,7 +231,7 @@ func (j *Journal) FinalizeDispatchCancellation(ctx context.Context, lease int64,
 		return err
 	}
 	record.State = "finalized"
-	raw, err = json.Marshal(record)
+	raw, err = encodeDispatchCancellationPreparation(record)
 	if err != nil {
 		return err
 	}
@@ -263,4 +266,9 @@ func RetireDispatchCancellationsTx(ctx context.Context, tx *sql.Tx, ownershipID 
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM worker_dispatch_cancellations WHERE dispatch_sequence<=? AND state='finalized'`, floor)
 	return err
+}
+
+// Preserve canonical account sources through the enclosing preparation.
+func encodeDispatchCancellationPreparation(record DispatchCancellationPreparation) ([]byte, error) {
+	return MarshalNativeJSON(record)
 }

@@ -425,6 +425,13 @@ type SubmitRequest struct {
 // The vocabulary mirrors the existing host-protocol event names (so the
 // daemon translation is 1:1) and adds the busy/idle and identity-changed
 // events the persistent model needs (addendum §31).
+// FinalOutput preserves the native terminal answer independently of transcript
+// deltas. TextBlocks retain native order, boundaries, and exact text.
+type FinalOutput struct {
+	Version    int      `json:"version"`
+	TextBlocks []string `json:"textBlocks"`
+}
+
 type SessionEvent struct {
 	// Plan is a full read-only native checklist snapshot; it never changes task state.
 	Plan *PlanSnapshot
@@ -443,6 +450,8 @@ type SessionEvent struct {
 	TurnID string
 	// Output is a transcript chunk (turn.output).
 	Output string
+	// FinalOutput is an original native answer on a successful terminal event.
+	FinalOutput *FinalOutput `json:",omitempty"`
 	// Model, when the runtime reports it.
 	Model string
 	// Token usage, when the runtime reports it.

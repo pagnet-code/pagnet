@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
@@ -28,7 +27,7 @@ func (p *NativeWorkerProxy) AcceptDispatch(ctx context.Context, o transport.Nati
 	if err := p.BindOwnership(ctx, o); err != nil {
 		return sessionworker.Outcome{}, err
 	}
-	payload, err := json.Marshal(operation)
+	payload, err := sessionworker.MarshalNativeJSON(operation)
 	if err != nil {
 		return sessionworker.Outcome{}, err
 	}

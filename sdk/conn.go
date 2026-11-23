@@ -1,6 +1,7 @@
 package sdk
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,10 @@ func (pc *conn) readLoop() {
 			case <-pc.c.closeCh:
 				return
 			}
+		case ownerTextProjectWakeType:
+			pc.c.handleOwnerTextProjectWake(pc, env)
+		case sharingProjectWakeType:
+			pc.c.handleSharingProjectWake(pc, env)
 		case sharingPairWakeType:
 			pc.c.handleSharingPairWake(pc, env)
 		case transport.MsgEndpointInvocationResultAck:
@@ -96,6 +101,11 @@ func (pc *conn) readLoop() {
 				continue
 			}
 			if err := pc.c.handleCryptoKeyPackage(p); err != nil {
+				var transportErr *enrollmentTransportError
+				if errors.As(err, &transportErr) {
+					_ = pc.ws.Close()
+					return
+				}
 				pc.c.firstErr(fmt.Errorf("sdk: crypto enrollment (key package): %w", err))
 			}
 		case MsgEndpointCryptoChallenge:
@@ -104,6 +114,11 @@ func (pc *conn) readLoop() {
 				continue
 			}
 			if err := pc.c.handleCryptoChallenge(p); err != nil {
+				var transportErr *enrollmentTransportError
+				if errors.As(err, &transportErr) {
+					_ = pc.ws.Close()
+					return
+				}
 				pc.c.firstErr(fmt.Errorf("sdk: crypto enrollment (challenge): %w", err))
 			}
 		case transport.MsgEndpointMessageDeliver,

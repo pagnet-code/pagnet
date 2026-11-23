@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 type sharingMessageFixture struct {
@@ -83,7 +84,13 @@ func (f *sharingMessageFixture) serve(w http.ResponseWriter, r *http.Request) {
 				limit = "maxInFlight"
 			}
 			w.WriteHeader(code)
-			write(map[string]any{"error": "sharing_pair_quota_exceeded", "limit": limit, "max": 2})
+			body := map[string]any{"error": "sharing_pair_quota_exceeded", "limit": limit, "max": 2}
+			if limit == "ownerBudget" {
+				delete(body, "max")
+				body["scope"] = "owner"
+				body["resetAt"] = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+			}
+			write(body)
 			return
 		}
 		wire := body.pairMessageWire
@@ -316,7 +323,7 @@ func TestSharingMessagesQuotaAndReservationFailClosed(t *testing.T) {
 	f.quota = true
 	_, err = i.SendPreparedSharingMessage(ctx, p)
 	var quota *SharingMessageQuotaError
-	if !errors.As(err, &quota) || quota.Limit != "maxInFlight" || quota.Maximum != 2 || quota.RetryAfter != "5" {
+	if !errors.As(err, &quota) || quota.Limit != "maxInFlight" || quota.Maximum != 2 || quota.RetryAfter != "5" || quota.Error() != "sdk: sharing message quota maxInFlight exceeded (maximum 2)" {
 		t.Fatalf("quota not surfaced: %v", err)
 	}
 	handles, err := i.UnresolvedSharingMessages()
@@ -330,6 +337,44 @@ func TestSharingMessagesQuotaAndReservationFailClosed(t *testing.T) {
 	handles, err = i.UnresolvedSharingMessages()
 	if err != nil || len(handles) != 1 {
 		t.Fatalf("revocation deleted record: %v", err)
+	}
+}
+
+func TestSharingMessagesOwnerBudget(t *testing.T) {
+	f, c, _ := sharingMessageClients(t)
+	ctx := context.Background()
+	prepared, err := c.PrepareSharingMessage(ctx, SharingMessageRequest{GrantID: "grant", Parts: []MessagePart{TextPart("owner budget")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := c.kr.loadPairMessage(prepared.state.Binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.quota, f.quotaLimit = true, "ownerBudget"
+	_, err = c.SendPreparedSharingMessage(ctx, prepared)
+	var quota *SharingMessageQuotaError
+	reset := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	if !errors.As(err, &quota) || quota.Limit != "ownerBudget" || quota.StatusCode != 429 || quota.Maximum != 0 || quota.RetryAfter != "5" || quota.ResetAt == nil || !quota.ResetAt.Equal(reset) {
+		t.Fatalf("owner budget detail: %v", err)
+	}
+	if quota.Error() != "Sharing owner budget exhausted" {
+		t.Fatalf("owner budget presentation: %q", quota.Error())
+	}
+	handles, err := c.UnresolvedSharingMessages()
+	if err != nil || len(handles) != 1 || !handles[0].CanRetry() {
+		t.Fatalf("owner budget lost retryable reservation: %v", err)
+	}
+	retained, err := c.kr.loadPairMessage(prepared.state.Binding)
+	if err != nil || !bytes.Equal(retained, wire) {
+		t.Fatalf("owner budget changed durable wire: %v", err)
+	}
+	f.quota = false
+	if _, err := c.SendPreparedSharingMessage(ctx, handles[0]); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(f.canonical[prepared.MessageID], wire) {
+		t.Fatal("owner budget retry changed wire")
 	}
 }
 

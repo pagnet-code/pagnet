@@ -18,12 +18,19 @@ func EpochPossessionSigner(kr *Keyring, epochID string) (ed25519.PrivateKey, err
 	if !ok || (epoch.State != EpochActive && epoch.State != EpochRotated) || len(epoch.Key) != 32 {
 		return nil, errors.New("crypto: requested possession epoch unavailable")
 	}
+	return epochPossessionSigner(epoch.Key, kr.NetworkID, epochID)
+}
+
+func epochPossessionSigner(key []byte, networkID, epochID string) (ed25519.PrivateKey, error) {
+	if len(key) != 32 || networkID == "" || epochID == "" {
+		return nil, errors.New("crypto: invalid possession scope")
+	}
 	info, _ := json.Marshal(struct {
 		Domain    string `json:"domain"`
 		NetworkID string `json:"networkId"`
 		EpochID   string `json:"epochId"`
-	}{"pagnet.network-epoch-possession.seed.v1", kr.NetworkID, epochID})
-	seed, err := hkdf.Key(sha256.New, epoch.Key, nil, string(info), ed25519.SeedSize)
+	}{"pagnet.network-epoch-possession.seed.v1", networkID, epochID})
+	seed, err := hkdf.Key(sha256.New, key, nil, string(info), ed25519.SeedSize)
 	if err != nil {
 		return nil, err
 	}

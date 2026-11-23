@@ -250,6 +250,9 @@ type SharingMessageQuotaError struct {
 }
 
 func (e *SharingMessageQuotaError) Error() string {
+	if e.Limit == "ownerBudget" {
+		return "Sharing owner budget exhausted"
+	}
 	return fmt.Sprintf("sdk: sharing message quota %s exceeded (maximum %d)", e.Limit, e.Maximum)
 }
 func sharingMessageError(err error, headers http.Header) error {

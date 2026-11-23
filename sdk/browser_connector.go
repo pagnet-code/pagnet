@@ -27,12 +27,64 @@ type BrowserBridgePolicy struct {
 	PolicyRevision int64    `json:"policyRevision"`
 }
 
+// BrowserBridgeError reports safe connection diagnostics without server bodies,
+// credentials, or request URLs. Healthy means the validated session received a
+// heartbeat or stayed connected for at least 20 seconds.
+type BrowserBridgeError struct {
+	HTTPStatus int
+	Healthy    bool
+	message    string
+	cause      error
+}
+
+func (e *BrowserBridgeError) Error() string {
+	if e.HTTPStatus != 0 {
+		return fmt.Sprintf("%s (HTTP %d)", e.message, e.HTTPStatus)
+	}
+	return e.message
+}
+
+func (e *BrowserBridgeError) Unwrap() error { return e.cause }
+
+// waitBrowserBridgeEndpoint avoids racing the endpoint supervisor during a
+// reconnect. Bare clients used by transport adapters have no lifecycle to wait on.
+func (c *Client) waitBrowserBridgeEndpoint(ctx context.Context) error {
+	if c.closeCh == nil {
+		return nil
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := c.checkOpen(); err != nil {
+			return err
+		}
+		if c.connected.Load() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.closeCh:
+			return ErrClosed
+		case <-c.Done():
+			if err := c.Err(); err != nil {
+				return err
+			}
+			return ErrClosed
+		case <-ticker.C:
+		}
+	}
+}
+
 // ServeBrowserBridge opens an outbound connection to the configured Pagnet
 // server using this SDK endpoint credential internally; callers never receive
 // that durable secret. The handler receives only MCP JSON, with bounded work.
-func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePolicy, handle func(context.Context, json.RawMessage) (json.RawMessage, error)) error {
+func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePolicy, handle func(context.Context, json.RawMessage) (json.RawMessage, error)) (result error) {
 	if _, err := uuid.Parse(policy.ConnectorID); err != nil {
 		return errors.New("browser bridge connector must be UUID")
+	}
+	if err := c.waitBrowserBridgeEndpoint(ctx); err != nil {
+		return err
 	}
 	u, err := url.Parse(c.cfg.serverBase())
 	if err != nil {
@@ -49,10 +101,15 @@ func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePol
 	headers := http.Header{"Authorization": []string{"Bearer " + c.credential.Load().(string)}}
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, u.String(), headers)
 	if err != nil {
-		if resp != nil && (resp.StatusCode == 401 || resp.StatusCode == 403) {
-			return fmt.Errorf("%w: browser connector unavailable", ErrCredentialDead)
+		failure := &BrowserBridgeError{message: "browser bridge connection failed"}
+		if resp != nil {
+			failure.HTTPStatus = resp.StatusCode
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				failure.cause = ErrCredentialDead
+			}
 		}
-		return errors.New("browser bridge connection failed")
+		return failure
 	}
 	defer conn.Close()
 	bridgeCtx, cancel := context.WithCancel(ctx)
@@ -77,6 +134,13 @@ func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePol
 	if ready.Type != "ready" || ready.ConnectorID != policy.ConnectorID || ready.NetworkID != policy.NetworkID || ready.PolicyRevision != policy.PolicyRevision || !sameBrowserPolicyList(ready.Grants, policy.Grants) || !sameBrowserPolicyList(ready.MessagingTargets, policy.MessagingTargets) || !sameBrowserPolicyList(ready.Events, policy.Events) {
 		return errors.New("browser bridge policy mismatch; reconnect requires explicit setup approval")
 	}
+	established := time.Now()
+	heartbeat := false
+	defer func() {
+		if result != nil {
+			result = &BrowserBridgeError{message: result.Error(), Healthy: heartbeat || time.Since(established) >= 20*time.Second}
+		}
+	}()
 	jobs := make(chan struct {
 		ID   string
 		Body json.RawMessage
@@ -123,6 +187,7 @@ func (c *Client) ServeBrowserBridge(ctx context.Context, policy BrowserBridgePol
 			if write(map[string]any{"type": "pong"}) != nil {
 				return errors.New("browser bridge heartbeat failed")
 			}
+			heartbeat = true
 		case "request":
 			if len(frame.Body) == 0 || len(frame.Body) > 2<<20 || !json.Valid(frame.Body) {
 				return errors.New("invalid browser request")

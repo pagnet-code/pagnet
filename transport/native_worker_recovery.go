@@ -1,5 +1,7 @@
 package transport
 
+const NativeWorkerPriorLaunchBootRecoveryProtocol = "native-worker-prior-launch-boot-recovery-v1"
+
 const NativeWorkerRecoveryProtocol = "native-worker-recovery-v1"
 const MsgNativeWorkerRecoveryState = "native.worker.recovery.state"
 const MsgNativeWorkerRecoveryAck = "native.worker.recovery.ack"
@@ -23,11 +25,17 @@ type NativeWorkerRecoveryState struct {
 	RetiredFloor         int64               `json:"retiredFloor"`
 }
 
+type NativeWorkerRecoveryDeathProof struct {
+	Kind       string             `json:"kind"`
+	LaunchBoot KernelBootEvidence `json:"launchBoot"`
+}
+
 type NativeWorkerRecoveryAck struct {
-	RecoveryID          string             `json:"recoveryId"`
-	InstanceID          string             `json:"instanceId"`
-	OwnershipGeneration string             `json:"ownershipGeneration,omitempty"`
-	Action              string             `json:"action"`
-	LocalPhase          string             `json:"localPhase"`
-	LocalFenceBoot      KernelBootEvidence `json:"localFenceBoot"`
+	DeathProof          *NativeWorkerRecoveryDeathProof `json:"deathProof,omitempty"`
+	RecoveryID          string                          `json:"recoveryId"`
+	InstanceID          string                          `json:"instanceId"`
+	OwnershipGeneration string                          `json:"ownershipGeneration,omitempty"`
+	Action              string                          `json:"action"`
+	LocalPhase          string                          `json:"localPhase"`
+	LocalFenceBoot      KernelBootEvidence              `json:"localFenceBoot"`
 }

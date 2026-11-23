@@ -57,7 +57,7 @@ func validateOwnerStopSettlement(scope Scope, e ownerStopSettlement) error {
 	if err != nil || d.DeleteRequestID == "" || d.StoppedObservationID != o.ID || d.OriginID != wire.OriginID || d.NativeGeneration != o.NativeGeneration || d.NativeSessionID != o.NativeSessionID || d.StoppedDigest != wire.Digest || d.StoppedSourceSequence != o.SourceSequence || d.StoppedDisposition != e.Stopped.Receipt.Disposition || !d.StoppedObservedAt.Equal(wire.ObservedAt) || !d.StoppedExpiresAt.Equal(wire.ExpiresAt) {
 		return ErrConflict
 	}
-	if s.Sequence <= 0 || s.LogicalTurnID != logicalWorkerTurn(s.Sequence) || s.NativeGeneration != o.NativeGeneration || s.NativeSessionID != o.NativeSessionID || !ValidNativeInputKind(s.InputKind) || p.SourceCommandID != s.SourceCommandID || p.SourceAdmissionID != s.SourceAdmissionID || !reflect.DeepEqual(p.TaskSource, s.SourceTask) || !reflect.DeepEqual(p.InvocationSource, s.SourceInvocation) || p.OwnershipGeneration != scope.Generation || p.OwnershipID == "" || d.StopProof.OwnershipID != p.OwnershipID || d.StopProof.OwnershipGeneration != p.OwnershipGeneration || d.StopProof.DispatchSequence <= p.DispatchSequence {
+	if s.Sequence <= 0 || s.LogicalTurnID != logicalWorkerTurn(s.Sequence) || s.NativeGeneration != o.NativeGeneration || s.NativeSessionID != o.NativeSessionID || !ValidNativeInputKind(s.InputKind) || p.SourceCommandID != s.SourceCommandID || p.SourceAdmissionID != s.SourceAdmissionID || !reflect.DeepEqual(p.TaskSource, s.SourceTask) || !reflect.DeepEqual(p.InvocationSource, s.SourceInvocation) || !reflect.DeepEqual(p.AccountMessageSource, s.SourceAccountMessage) || p.OwnershipGeneration != scope.Generation || p.OwnershipID == "" || d.StopProof.OwnershipID != p.OwnershipID || d.StopProof.OwnershipGeneration != p.OwnershipGeneration || d.StopProof.DispatchSequence <= p.DispatchSequence {
 		return ErrConflict
 	}
 	return nil
@@ -125,7 +125,7 @@ func (j *Journal) retainStoppedReceiptTx(ctx context.Context, tx *sql.Tx, o Nati
 	if validateStoppedReceipt(j.scope, e) != nil {
 		return ErrConflict
 	}
-	raw, err := json.Marshal(e)
+	raw, err := MarshalNativeJSON(e)
 	if err != nil {
 		return err
 	}
@@ -245,7 +245,7 @@ func (j *Journal) settleOwnerStoppedTx(ctx context.Context, tx *sql.Tx, d *trans
 	}
 	stage = "settlement_write"
 	for _, e := range candidates {
-		raw, marshalErr := json.Marshal(e)
+		raw, marshalErr := MarshalNativeJSON(e)
 		if marshalErr != nil {
 			return marshalErr
 		}

@@ -19,6 +19,8 @@ func TestNativeDispatchRetirementLostReplyReconcilesOriginalWorkerPrefix(t *test
 	var c *NativeObservationConnection
 	var cloud transport.NativeWorkerOwnership
 	drop, missingEcho := false, false
+	lostReply, cancelLostReply := context.WithCancel(t.Context())
+	defer cancelLostReply()
 	var replayed []int64
 	send := func(_ context.Context, typ string, raw any) error {
 		var reply transport.NativeOwnershipRegisteredPayload
@@ -41,6 +43,7 @@ func TestNativeDispatchRetirementLostReplyReconcilesOriginalWorkerPrefix(t *test
 				reply.UnstartedStop = p.UnstartedStop
 			}
 			if drop {
+				cancelLostReply()
 				return nil
 			}
 		default:
@@ -116,14 +119,16 @@ func TestNativeDispatchRetirementLostReplyReconcilesOriginalWorkerPrefix(t *test
 	}
 	stop(1)
 	drop = true
-	short, done := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	_, e = proxy.SettleDispatches(short, *o)
-	done()
-	if !errors.Is(e, context.DeadlineExceeded) {
+	_, e = proxy.SettleDispatches(lostReply, *o)
+	if !errors.Is(e, context.Canceled) {
 		t.Fatal("lost committed retirement reply authorized local prune", e)
 	}
 	if cloud.RetiredFloor != 1 {
 		t.Fatal("simulated cloud commit absent")
+	}
+	records, e := proxy.call(t.Context(), sessionworker.Request{Type: "dispatches"})
+	if e != nil || len(records.Dispatches) != 1 || records.Dispatches[0].Proof.DispatchSequence != 1 {
+		t.Fatal("lost retirement reply erased retained original record", records.Dispatches, e)
 	}
 	_ = proxy.Close()
 	c.mu.Lock()
@@ -153,7 +158,7 @@ func TestNativeDispatchRetirementLostReplyReconcilesOriginalWorkerPrefix(t *test
 	if _, e = proxy.SettleDispatches(t.Context(), *o); !errors.Is(e, ErrNativeOriginAdmissionDeferred) {
 		t.Fatal("missing committed original stop echo authorized prune", e)
 	}
-	records, e := proxy.call(t.Context(), sessionworker.Request{Type: "dispatches"})
+	records, e = proxy.call(t.Context(), sessionworker.Request{Type: "dispatches"})
 	if e != nil || len(records.Dispatches) != 2 {
 		t.Fatal("lost echo erased retained original records", len(records.Dispatches), e)
 	}

@@ -203,10 +203,13 @@ func TestOwnerMailboxDisconnectAndReconnect(t *testing.T) {
 }
 func TestOwnerMailboxExpiryErasesKeys(t *testing.T) {
 	f := newOwnerMailboxFixture(t)
-	f.descriptor.IssuedAtUnixSeconds = uint64(time.Now().Unix()) - 899
+	now := time.Now()
+	f.descriptor.IssuedAtUnixSeconds = uint64(now.Unix()) - 899
 	f.descriptor.ExpiresAtUnixSeconds = f.descriptor.IssuedAtUnixSeconds + 900
-	f.open(t, f.descriptor)
+	f.c.mu.Lock()
+	f.c.open(f.descriptor, f.p, now)
 	session := f.c.sessions[f.descriptor.SessionID]
+	f.c.mu.Unlock()
 	if session == nil {
 		t.Fatal("missing session")
 	}

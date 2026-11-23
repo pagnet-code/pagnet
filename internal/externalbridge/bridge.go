@@ -36,10 +36,12 @@ type Config struct {
 	Grants           []string
 	MessagingTargets []string
 	Events           []string
+	Inbox            *AskInbox
 }
 
 type Bridge struct {
 	client           Client
+	inbox            *AskInbox
 	network          string
 	grants           map[string]bool
 	messagingTargets map[string]bool
@@ -54,7 +56,7 @@ func New(client Client, cfg Config) (*Bridge, error) {
 	if _, err := uuid.Parse(cfg.Network); err != nil {
 		return nil, errors.New("external MCP: --network must be a network UUID")
 	}
-	b := &Bridge{client: client, network: cfg.Network, grants: map[string]bool{}, messagingTargets: map[string]bool{}, eventPatterns: map[string]bool{}}
+	b := &Bridge{client: client, inbox: cfg.Inbox, network: cfg.Network, grants: map[string]bool{}, messagingTargets: map[string]bool{}, eventPatterns: map[string]bool{}}
 	for _, grant := range cfg.Grants {
 		parts := strings.Split(grant, "/")
 		if len(parts) != 2 || parts[1] == "" || strings.ContainsAny(parts[1], "* \t\r\n") {
@@ -111,6 +113,7 @@ func (b *Bridge) Server() *server.MCPServer {
 			return result(b.InvocationView(ctx, r.GetString("invocationId", "")))
 		})
 	}
+	b.addInboxTools(s)
 	b.addMessagingTools(s)
 	b.addEventTools(s)
 	return s

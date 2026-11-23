@@ -278,7 +278,7 @@ func TestNativeWorkerCanceledEnvironmentPipeClearsOnlyAfterWriter(t *testing.T) 
 		t.Fatal("stalled private pipe did not cancel safely", err)
 	}
 	loaded, err := r.Lookup(s.InstanceID)
-	if err != nil || loaded.LaunchState != "launched" {
+	if err != nil || (loaded.LaunchState != "launching" && loaded.LaunchState != "launched") {
 		t.Fatal("cancellation made original owner replaceable", err)
 	}
 	// The synthetic child exits naturally; the helper never kills uncertain PIDs.
@@ -308,7 +308,7 @@ func TestNativeWorkerFabricSideportInPrivatePipe(t *testing.T) {
 			binary := filepath.Join(t.TempDir(), "sideport-probe")
 			// The probe dumps the private env-fd payload and exits. It never
 			// creates the readiness socket, so EnsureNativeWorker is expected
-			// to time out AFTER the payload has crossed the pipe.
+			// to fail after the probe exits and the payload has crossed the pipe.
 			if err := os.WriteFile(binary, []byte("#!/bin/sh\ncat < /dev/fd/3 > "+marker+"\n"), 0700); err != nil {
 				t.Fatal(err)
 			}

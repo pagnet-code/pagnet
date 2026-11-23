@@ -71,6 +71,9 @@ func TestExternalProfileUsesBoundDurableCredentialForRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !cfg.DisableMessageReceive {
+		t.Fatal("external profile accepts inbound messages without a handler")
+	}
 	if cfg.Credential != "pgn_epd_v1_bound" {
 		t.Fatalf("restart did not use durable credential: %q", cfg.Credential)
 	}

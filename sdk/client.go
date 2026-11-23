@@ -75,6 +75,10 @@ type Client struct {
 	networkTenants sync.Map     // network ID -> immutable, authorized owning tenant
 	credential     atomic.Value // string: current principal credential
 
+	// Installation proof and project snapshots are local to one physical session.
+	ownerTextBindingMu    sync.Mutex
+	ownerTextInstallation *ownerTextInstallationBinding
+
 	// connection
 	connMu    sync.Mutex
 	cur       *conn
@@ -192,6 +196,7 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		pendingResults:       map[string]completedInvocation{},
 		caps:                 map[string]capRegistration{},
 		eventHandlers:        map[string]eventHandler{},
+		msgHandler:           cfg.MessageHandler,
 		cryptoReadySet:       map[string]bool{},
 		pendingChallenges:    map[string]EndpointCryptoChallengePayload{},
 		closeCh:              make(chan struct{}),
@@ -756,6 +761,7 @@ func (c *Client) supervisor() {
 				// one for the same principal.
 				current := c.credential.Load().(string)
 				if stored, kerr := c.kr.CredentialForCredential(current); kerr == nil && stored != "" && stored != current {
+					c.invalidateOwnerTextBinding()
 					c.credential.Store(stored)
 					continue // retry immediately with the durable credential
 				}
@@ -916,7 +922,13 @@ func (c *Client) registerPayloadVersioned() (transport.EndpointRegisterPayload, 
 	for _, reg := range c.caps {
 		caps = append(caps, reg.capability)
 	}
+	var receiveMessages *bool
+	if c.cfg.DisableMessageReceive {
+		receive := false
+		receiveMessages = &receive
+	}
 	return transport.EndpointRegisterPayload{
+		ReceiveMessages:  receiveMessages,
 		EndpointName:     name,
 		ProtocolFeatures: []string{transport.EndpointDispatchProtocol},
 		PublicKey:        base64.StdEncoding.EncodeToString(c.identityPub),
@@ -976,6 +988,7 @@ func (c *Client) handleAuthOK(p transport.EndpointAuthOKPayload) error {
 	if c.cfg.ExpectedPrincipalID != "" && p.PrincipalID != c.cfg.ExpectedPrincipalID {
 		return errors.New("sdk: authenticated principal does not match ExpectedPrincipalID")
 	}
+	c.invalidateOwnerTextBinding()
 	c.principalID.Store(p.PrincipalID)
 	c.endpointID.Store(p.EndpointID)
 	if p.Credential != "" {

@@ -94,10 +94,7 @@ func instanceActionCmd(action, short string) *cobra.Command {
 			if defID == "" {
 				return fmt.Errorf("agent %q not found in this network", args[0])
 			}
-			var insts []struct {
-				ID     string `json:"ID"`
-				Status string `json:"Status"`
-			}
+			var insts []agentInstanceView
 			if err := c.get("/api/v1/networks/"+netID+"/agents/"+defID+"/instances", &insts); err != nil {
 				return err
 			}
@@ -129,33 +126,9 @@ func instanceActionCmd(action, short string) *cobra.Command {
 					iid = best
 				}
 			}
-			// 202 Accepted: the command is dispatched to the host daemon,
-			// so poll for the resulting status instead of trusting a body.
-			if err := c.post("/api/v1/networks/"+netID+"/agents/"+defID+"/instances/"+iid+"/"+action,
-				map[string]any{}, nil); err != nil {
+			status, err := c.performInstanceAction("/api/v1/networks/"+netID+"/agents/"+defID+"/instances/"+iid, action, 30*time.Second, time.Second)
+			if err != nil {
 				return err
-			}
-			settle := stopSettle
-			if action == "restart" {
-				settle = restartSettle
-			}
-			status := "(dispatched)"
-			// A stop queues behind an in-flight turn (per-instance FIFO),
-			// so allow a full turn's worth of time before giving up.
-			deadline := time.Now().Add(30 * time.Second)
-			for time.Now().Before(deadline) {
-				var cur struct {
-					Instance struct {
-						Status string `json:"Status"`
-					} `json:"instance"`
-				}
-				if err := c.get("/api/v1/networks/"+netID+"/agents/"+defID+"/instances/"+iid, &cur); err == nil {
-					if settle[cur.Instance.Status] {
-						status = cur.Instance.Status
-						break
-					}
-				}
-				time.Sleep(time.Second)
 			}
 			fmt.Printf("%s %s: instance %s -> %s\n", action, args[0], iid, status)
 			return nil

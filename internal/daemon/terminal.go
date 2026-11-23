@@ -872,7 +872,7 @@ func (tm *terminalManager) finishExitedPTY(s *ptySession, waitErr error) {
 		return
 	}
 	tm.d.invalidateBridgeNonce(s.instanceID) // S1: the PTY (and its bridge) is dead
-	_ = tm.d.state.SetInstanceStatus(s.instanceID, "hibernated", row.SessionID)
+	_ = tm.d.setReadinessInstanceStatus(s.instanceID, "hibernated", row.SessionID)
 	tm.d.send(nil, transport.MsgAgentHibernated, map[string]any{
 		"instanceId": s.instanceID, "sessionId": row.SessionID,
 		// Viewers of this generation were closed individually above. An

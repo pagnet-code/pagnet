@@ -57,6 +57,8 @@ func newStubTokenServer(t *testing.T) *stubTokenServer {
 	s.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/api/v1/auth/setup/status":
+			fmt.Fprint(w, `{"mode":"accounts","setupRequired":false}`)
 		case "/" + tokenExchangePath:
 			buf, _ := io.ReadAll(r.Body)
 			s.mu.Lock()

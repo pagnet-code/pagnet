@@ -121,6 +121,7 @@ type stubPagnetServer struct {
 
 	mu                sync.Mutex
 	deviceConfigCalls int
+	exchangeCalls     int
 	// validTokens are the bearers /auth/me and the API endpoints accept.
 	validTokens map[string]bool
 	// mintedEnrollToken is what /hosts/enrollment-tokens returns.
@@ -170,6 +171,9 @@ func newStubPagnetServer(t *testing.T, idp *stubIdP, mode string, validTokens ..
 			fmt.Fprintf(w, `{"credential":"%s","user":{"id":"u1","username":"user-1"},"role":"admin","networkScope":"all"}`,
 				testDeviceCredential)
 		case "/" + tokenExchangePath:
+			s.mu.Lock()
+			s.exchangeCalls++
+			s.mu.Unlock()
 			// The paste-login exchange: a pasted root token is exchanged once
 			// for the account-session client credential.
 			fmt.Fprintf(w, `{"credential":"%s","role":"admin","networkScope":"all"}`, testDeviceCredential)
@@ -234,6 +238,184 @@ func withFileFallback(t *testing.T) {
 		return nil, fmt.Errorf("no keyring in tests")
 	}
 	t.Cleanup(func() { openKeyringFn = prev })
+}
+
+// TestLoginCommandModeDefaults exercises the command's mode dispatch rather
+// than calling the device-flow helper directly.
+func TestLoginCommandModeDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		interactive bool
+		noBrowser   bool
+		tokenFlag   bool
+		tokenEnv    bool
+		stored      bool
+		wantDevice  bool
+		wantPaste   bool
+		wantError   string
+	}{
+		{name: "oidc opens browser directly", mode: "oidc", interactive: true, wantDevice: true},
+		{name: "oidc no browser", mode: "oidc", interactive: true, noBrowser: true, wantDevice: true},
+		{name: "oidc headless no browser", mode: "oidc", noBrowser: true, wantDevice: true},
+		{name: "oidc headless requires instructions", mode: "oidc", wantError: "no interactive terminal"},
+		{name: "oidc valid stored credential", mode: "oidc", interactive: true, stored: true, wantDevice: true},
+		{name: "oidc exchanges explicit native token", mode: "oidc", tokenFlag: true},
+		{name: "oidc exchanges environment native token", mode: "oidc", tokenEnv: true},
+		{name: "accounts keeps explicit token", mode: "accounts", tokenFlag: true},
+		{name: "accounts keeps environment token", mode: "accounts", tokenEnv: true},
+		{name: "token mode keeps explicit token", mode: "token", tokenFlag: true},
+		{name: "token mode keeps environment token", mode: "token", tokenEnv: true},
+		{name: "local keeps token prompt", mode: "local", interactive: true, wantPaste: true},
+		{name: "accounts keeps token prompt", mode: "accounts", interactive: true, wantPaste: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFileFallback(t)
+			idp := newStubIdP(t, []string{"success"})
+			srv := newStubPagnetServer(t, idp, tc.mode, testDeviceCredential, testAccountToken)
+			t.Setenv("PAGNET_SERVER", "")
+			t.Setenv("PAGNET_TOKEN", "")
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			prevTTY, prevAsk, prevBrowser := hasTTYFn, askPagnetTokenFn, openBrowserFn
+			t.Cleanup(func() {
+				serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount
+				hasTTYFn, askPagnetTokenFn, openBrowserFn = prevTTY, prevAsk, prevBrowser
+			})
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			if tc.tokenEnv {
+				t.Setenv("PAGNET_TOKEN", testAccountToken)
+				userToken = testAccountToken // the root flag default reads PAGNET_TOKEN
+			}
+			hasTTYFn = func() bool { return tc.interactive }
+			pasteCalls, browserCalls := 0, 0
+			askPagnetTokenFn = func(string) (string, error) {
+				pasteCalls++
+				if !tc.wantPaste {
+					return "", fmt.Errorf("unexpected token paste prompt")
+				}
+				return testAccountToken, nil
+			}
+			openBrowserFn = func(string) error { browserCalls++; return nil }
+			dir := t.TempDir()
+			accDir := accountConfigDir(dir, accounts.DefaultAccount)
+			if tc.stored {
+				if err := saveUserToken(accDir, accounts.DefaultAccount, srv.URL, testDeviceCredential); err != nil {
+					t.Fatal(err)
+				}
+			}
+			args := []string{"--state-dir", dir}
+			if tc.noBrowser {
+				args = append(args, "--no-browser")
+			}
+			if tc.tokenFlag {
+				args = append(args, "--token", testAccountToken)
+			}
+			cmd := loginCmd()
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("want %q guidance, got %v", tc.wantError, err)
+				}
+
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCredential := testDeviceCredential
+				if tc.mode == "token" {
+					wantCredential = testAccountToken
+				}
+				if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != wantCredential {
+					t.Error("command did not persist the client credential")
+				}
+			}
+			wantExchange := 0
+			if tc.wantError == "" && tc.mode != "token" && (tc.wantPaste || tc.tokenFlag || tc.tokenEnv) {
+				wantExchange = 1
+			}
+			srv.mu.Lock()
+			exchanges := srv.exchangeCalls
+			srv.mu.Unlock()
+			if exchanges != wantExchange {
+				t.Errorf("token exchange calls = %d, want %d", exchanges, wantExchange)
+			}
+			wantDevice, wantPaste, wantBrowser := 0, 0, 0
+			if tc.wantDevice {
+				wantDevice = 1
+				if !tc.noBrowser {
+					wantBrowser = 1
+				}
+			}
+			if tc.wantPaste {
+				wantPaste = 1
+			}
+			if got := srv.deviceConfigCallCount(); got != wantDevice {
+				t.Errorf("device-config calls = %d, want %d", got, wantDevice)
+			}
+			if pasteCalls != wantPaste || browserCalls != wantBrowser {
+				t.Errorf("paste/browser calls = %d/%d, want %d/%d", pasteCalls, browserCalls, wantPaste, wantBrowser)
+			}
+		})
+	}
+}
+
+func TestLoginCommandOIDCReplacesStoredCredentialOnlyAfterSuccess(t *testing.T) {
+	const legacyPAT = "pgn_pat_v1_L3g4cyCred1d_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI"
+	for _, outcome := range []string{"success", "denied", "expired"} {
+		t.Run(outcome, func(t *testing.T) {
+			withFileFallback(t)
+			idp := newStubIdP(t, []string{outcome})
+			srv := newStubPagnetServer(t, idp, "oidc", legacyPAT)
+			t.Setenv("PAGNET_SERVER", "")
+			t.Setenv("PAGNET_TOKEN", "")
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			prevTTY := hasTTYFn
+			t.Cleanup(func() {
+				serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount
+				hasTTYFn = prevTTY
+			})
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			hasTTYFn = func() bool { return false }
+			dir := t.TempDir()
+			accDir := accountConfigDir(dir, accounts.DefaultAccount)
+			if err := saveUserToken(accDir, accounts.DefaultAccount, srv.URL, legacyPAT); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(accDir, "config.yaml")
+			before, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := loginCmd()
+			cmd.SetArgs([]string{"--state-dir", dir, "--no-browser"})
+			err = cmd.Execute()
+			wantCredential := legacyPAT
+			if outcome == "success" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCredential = testDeviceCredential
+			} else {
+				if err == nil {
+					t.Fatal("device authorization failure unexpectedly succeeded")
+				}
+				after, readErr := os.ReadFile(configPath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if string(after) != string(before) {
+					t.Error("failed device login changed the stored configuration")
+				}
+			}
+			if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != wantCredential {
+				t.Error("stored credential does not match the device login outcome")
+			}
+			if got := srv.deviceConfigCallCount(); got != 1 {
+				t.Errorf("device-config calls = %d, want 1 despite a valid cached PAT", got)
+			}
+		})
+	}
 }
 
 // --- device flow (PKCE) -------------------------------------------------------
@@ -725,5 +907,148 @@ func TestStoredServerURL(t *testing.T) {
 	}
 	if got := storedServerURL(dir); got != "http://127.0.0.1:19999" {
 		t.Fatalf("storedServerURL = %q, want the state config value", got)
+	}
+}
+
+func TestLoginOIDCRejectsInvalidTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		token        string
+		status       int
+		wantError    string
+		wantExchange int
+	}{
+		{name: "Keycloak JWT", token: "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyLTEifQ.", wantError: "unrecognized Pagnet Token"},
+		{name: "arbitrary bearer", token: "opaque-bearer", wantError: "unrecognized Pagnet Token"},
+		{name: "endpoint credential", token: "pgn_epd_v1_endpoint", wantError: "unrecognized Pagnet Token"},
+		{name: "revoked native token", token: testAccountToken, status: http.StatusUnauthorized, wantError: "token login failed", wantExchange: 1},
+		{name: "limited native token", token: testAccessToken, status: http.StatusForbidden, wantError: "token login failed", wantExchange: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFileFallback(t)
+			withNoPromptSeams(t)
+			exchanges := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/auth/setup/status":
+					fmt.Fprint(w, `{"mode":"oidc"}`)
+				case "/" + tokenExchangePath:
+					exchanges++
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, `{"error":{"code":"invalid_credentials","message":"credential rejected"}}`)
+				default:
+					t.Errorf("unexpected auth request: %s", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+			serverURL, userToken, accountFlag = srv.URL, "", ""
+			t.Cleanup(func() { serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount })
+			dir := t.TempDir()
+			cmd := loginCmd()
+			cmd.SetArgs([]string{"--state-dir", dir, "--token", tc.token})
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("want %q, got %v", tc.wantError, err)
+			}
+			if exchanges != tc.wantExchange {
+				t.Errorf("exchange calls = %d, want %d", exchanges, tc.wantExchange)
+			}
+			if got := loadUserToken(accountConfigDir(dir, accounts.DefaultAccount), accounts.DefaultAccount, srv.URL); got != "" {
+				t.Fatal("rejected credential was stored")
+			}
+		})
+	}
+}
+
+func TestEnrollOIDCFirstRunDeviceFlow(t *testing.T) {
+	withFileFallback(t)
+	withNoPromptSeams(t)
+	idp := newStubIdP(t, []string{"success"})
+	srv := newStubPagnetServer(t, idp, "oidc", testDeviceCredential)
+	t.Setenv("PAGNET_SERVER", "")
+	t.Setenv("PAGNET_NO_BROWSER", "1")
+	prevServer, prevToken, prevNI, prevTTY := serverURL, userToken, nonInteractive, hasTTYFn
+	serverURL, userToken, nonInteractive = srv.URL, "", false
+	hasTTYFn = func() bool { return true }
+	t.Cleanup(func() {
+		serverURL, userToken, nonInteractive, hasTTYFn = prevServer, prevToken, prevNI, prevTTY
+	})
+	dir := t.TempDir()
+	out := captureStdout(t, func() {
+		if err := enrollHostForeground(dir, "", "test-host", nil, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, idp.ts.URL+"/verify") || !strings.Contains(out, "ABCD-1234") {
+		t.Fatal("first-run enrollment did not print device URL and code")
+	}
+	if srv.deviceConfigCallCount() != 1 || srv.enrollCallCount() != 1 {
+		t.Fatal("first-run enrollment did not sign in and mint the enrollment token once")
+	}
+	cfg, err := config.LoadDaemon(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Credential != "hostcred123" || cfg.HostID != "h1" || loadUserToken(dir, "", srv.URL) != testDeviceCredential {
+		t.Fatal("first-run enrollment did not store host and user credentials")
+	}
+}
+
+func TestLoginOIDCNativeTokenPreservesRestrictions(t *testing.T) {
+	withFileFallback(t)
+	withNoPromptSeams(t)
+	t.Setenv("PAGNET_CREDENTIAL", "pgn_epd_v1_not-user-auth")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/setup/status":
+			fmt.Fprint(w, `{"mode":"oidc"}`)
+		case "/" + tokenExchangePath:
+			var body struct{ Token string }
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token != testAccessToken {
+				t.Error("native user token was not sent through the exchange")
+			}
+			fmt.Fprintf(w, `{"credential":"%s","role":"operator","networkScope":"selected","networks":["Production"]}`, testDerivedCred)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	prevServer, prevToken, prevAccount := serverURL, userToken, accountFlag
+	serverURL, userToken, accountFlag = srv.URL, "", ""
+	t.Cleanup(func() { serverURL, userToken, accountFlag = prevServer, prevToken, prevAccount })
+	dir := t.TempDir()
+	cmd := loginCmd()
+	cmd.SetArgs([]string{"--state-dir", dir, "--token", testAccessToken})
+	out := captureStdout(t, func() {
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "limited access token") || !strings.Contains(out, "Production") {
+		t.Fatal("limited native token login omitted restriction guidance")
+	}
+	accDir := accountConfigDir(dir, accounts.DefaultAccount)
+	fc := stateFile(t, accDir)
+	if fc["credentialRole"] != "operator" || fc["credentialNetworkScope"] != "selected" {
+		t.Fatal("native token restrictions were not stored")
+	}
+	if got := loadUserToken(accDir, accounts.DefaultAccount, srv.URL); got != testDerivedCred {
+		t.Fatal("native token exchange did not store only the derived credential")
+	}
+}
+
+func TestLoginHelpCredentialRoles(t *testing.T) {
+	help := loginCmd().Long
+	for _, want := range []string{
+		"headless user/API automation", "native Pagnet Token", "PAGNET_TOKEN",
+		"PAGNET_ENROLL_TOKEN is a one-time host enrollment token",
+		"PAGNET_CREDENTIAL\nis only for agent/service endpoint authentication",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("login help missing %q", want)
+		}
 	}
 }

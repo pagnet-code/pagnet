@@ -349,6 +349,33 @@ func (m *Manager) EnsureActive(ctx context.Context, sess *RuntimeSession, events
 	return m.ensureActive(ctx, sess, events, false)
 }
 
+// LifecycleSnapshot contains settled native identity while the caller holds
+// the per-instance activation lock.
+type LifecycleSnapshot struct {
+	NativeID     string
+	Materialised bool
+}
+
+func (m *Manager) lifecycleSnapshotLocked(sess *RuntimeSession) LifecycleSnapshot {
+	m.refreshNativeMaterialisation(sess.InstanceID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return LifecycleSnapshot{NativeID: sess.NativeID, Materialised: sess.Materialised}
+}
+
+// EnsureActiveAndFinalize keeps activation and its caller-owned publication in
+// one per-instance critical section. finalize runs even when activation fails,
+// without m.mu held. It must not start another lifecycle operation or call
+// NativeID or RestoreNativeState: those methods reacquire the activation lock.
+func (m *Manager) EnsureActiveAndFinalize(ctx context.Context, sess *RuntimeSession, events chan<- SessionEvent, finalize func(*RuntimeEndpoint, LifecycleSnapshot, error) error) error {
+	lock := m.activationLock(sess.InstanceID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	endpoint, err := m.ensureActiveLocked(ctx, sess, events, false, false)
+	return finalize(endpoint, m.lifecycleSnapshotLocked(sess), err)
+}
+
 // StartFresh deliberately starts a new logical native conversation after an
 // explicit stop. It is never an automatic fallback for a missing resume. The
 // caller must stop and join the original native reader before requesting this.
@@ -721,6 +748,14 @@ func (m *Manager) settleInterrupted(sess *RuntimeSession) {
 // concurrently with an in-flight activation for the same instance (the
 // state read below then reflects the settled activation).
 func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
+	return m.HibernateAndFinalize(ctx, sess, nil)
+}
+
+// HibernateAndFinalize publishes a successful hibernation before another
+// activation can begin. finalize runs without m.mu held. It must not start
+// another lifecycle operation or call NativeID or RestoreNativeState: those
+// methods reacquire the activation lock.
+func (m *Manager) HibernateAndFinalize(ctx context.Context, sess *RuntimeSession, finalize func(LifecycleSnapshot) error) error {
 	// Submit owns this lock before activation, closing the idle window between
 	// EnsureActive and StateBusy. Do not wait for a turn and then kill its
 	// endpoint: the caller must observe refusal while work is in flight.
@@ -734,6 +769,17 @@ func (m *Manager) Hibernate(ctx context.Context, sess *RuntimeSession) error {
 	lock.Lock()
 	defer lock.Unlock()
 
+	if err := m.hibernateLocked(ctx, sess); err != nil {
+		return err
+	}
+	if finalize != nil {
+		return finalize(m.lifecycleSnapshotLocked(sess))
+	}
+	return nil
+}
+
+// hibernateLocked requires the prompt and activation locks.
+func (m *Manager) hibernateLocked(ctx context.Context, sess *RuntimeSession) error {
 	m.mu.Lock()
 	st := sess.State
 	pending := len(sess.PendingInteractions) > 0

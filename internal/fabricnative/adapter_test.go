@@ -25,12 +25,14 @@ import (
 	"github.com/pagnet-code/pagnet/fabric/node"
 	"github.com/pagnet-code/pagnet/fabric/registry"
 	"github.com/pagnet-code/pagnet/internal/nativeauthority"
+	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 )
 
 type adapterFixtureFence struct {
 	managedFixtureFence
 	controls, reads *atomic.Int64
+	pagesCompleted  chan struct{}
 }
 
 func (p adapterFixtureFence) WithNativeSourceRead(_ context.Context, f identity.NativeSourceReadFacts, next func() error) error {
@@ -40,7 +42,14 @@ func (p adapterFixtureFence) WithNativeSourceRead(_ context.Context, f identity.
 	if f.Caller != f.Admission.OriginalCaller || f.Caller.Ref != "spiffe://managed/owner" || f.Caller.Issuer != "managed.fixture" {
 		return fabric.NewError(fabric.CodeUnauthenticated, "fixture source caller differs")
 	}
-	return next()
+	err := next()
+	if f.Operation == identity.NativeSourcePage {
+		select {
+		case p.pagesCompleted <- struct{}{}:
+		default:
+		}
+	}
+	return err
 }
 func (adapterFixtureFence) WithNativeCancellation(_ context.Context, f identity.NativeCancellationFacts, next func() error) error {
 	if f.Caller != f.Admission.OriginalCaller {
@@ -84,6 +93,7 @@ type adapterRig struct {
 	workspace       string
 	ctx             context.Context
 	controls, reads *atomic.Int64
+	pagesCompleted  chan struct{}
 }
 
 func actualAdapterRig(t *testing.T, pressure ...bool) *adapterRig {
@@ -140,7 +150,8 @@ func actualAdapterRigWithProfile(t *testing.T, inputProfile string, pressure ...
 		t.Fatal(err)
 	}
 	controls, reads := &atomic.Int64{}, &atomic.Int64{}
-	authority, err := identity.New(store, adapterFixtureFence{controls: controls, reads: reads})
+	pagesCompleted := make(chan struct{}, 1)
+	authority, err := identity.New(store, adapterFixtureFence{controls: controls, reads: reads, pagesCompleted: pagesCompleted})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +240,7 @@ func actualAdapterRigWithProfile(t *testing.T, inputProfile string, pressure ...
 	if e != nil {
 		t.Fatal(e)
 	}
-	return &adapterRig{adapter, resolver, store, authority, owner, descriptor, workspace, ctx, controls, reads}
+	return &adapterRig{adapter, resolver, store, authority, owner, descriptor, workspace, ctx, controls, reads, pagesCompleted}
 }
 
 type adapterAuthenticator struct{ principal fabric.Principal }
@@ -559,24 +570,6 @@ func TestActualNativeAdapterQuietReadinessDoesNotPollAndCancelIsIndependent(t *t
 	if e != nil || frame.Kind != fabric.FrameStart {
 		t.Fatal("No native Start", e)
 	}
-	next := make(chan error, 1)
-	go func() {
-		frame, e := result.Stream.Next(r.ctx)
-		if e == nil {
-			e = errors.New("Quiet native unexpectedly produced a frame " + string(frame.Kind))
-		}
-		next <- e
-	}()
-	// Actual parser commits permission state once, then blocks without output.
-	// This is the same stream readiness boundary as a long silent model turn.
-	time.Sleep(250 * time.Millisecond)
-	before := r.reads.Load()
-	// Cross the 5s private-handshake deadline: it must not truncate the
-	// distinct 30s readiness wait into repeated source SQL acquisitions.
-	time.Sleep(6 * time.Second)
-	if after := r.reads.Load(); after != before {
-		t.Fatal("Quiet source repeatedly acquired root SQL", before, after)
-	}
 	saved, _, e := r.adapter.config.Checkpoints.Load(r.ctx, r.owner.PrincipalView(), "adapter-quiet-notification")
 	if e != nil {
 		t.Fatal(e)
@@ -586,6 +579,58 @@ func TestActualNativeAdapterQuietReadinessDoesNotPollAndCancelIsIndependent(t *t
 		t.Fatal(e)
 	}
 	h := r.resolver.handle
+	// Permission state can become visible before its observation commits and
+	// pulses readiness. Wait for the durable event for this exact invocation.
+	for committed := false; !committed; {
+		response, err := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "observations", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Limit: 32})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, observation := range response.Observations {
+			source := observation.TurnSource
+			if observation.Event.Type == session.EventInteractionStarted && source != nil && source.Sequence == reservation.Sequence && source.SourceAdmissionID == saved.Admission.ID {
+				committed = true
+				break
+			}
+		}
+		if !committed {
+			select {
+			case <-r.ctx.Done():
+				t.Fatal("Native permission observation did not commit", r.ctx.Err())
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	// Discard the completed page from the first Next before observing the
+	// second pull's page. No pull is running while this signal is drained.
+	select {
+	case <-r.pagesCompleted:
+	default:
+	}
+	next := make(chan error, 1)
+	go func() {
+		frame, e := result.Stream.Next(r.ctx)
+		if e == nil {
+			e = errors.New("Quiet native unexpectedly produced a frame " + string(frame.Kind))
+		}
+		next <- e
+	}()
+	// Snapshot only after the second pull's source page has returned, so its
+	// legitimate SQL acquisition is outside the quiet interval.
+	select {
+	case <-r.pagesCompleted:
+	case err := <-next:
+		t.Fatal("Quiet native pull returned before waiting", err)
+	case <-r.ctx.Done():
+		t.Fatal("Quiet source page did not complete", r.ctx.Err())
+	}
+	before := r.reads.Load()
+	// Cross the 5s private-handshake deadline: it must not truncate the
+	// distinct 30s readiness wait into repeated source SQL acquisitions.
+	time.Sleep(6 * time.Second)
+	if after := r.reads.Load(); after != before {
+		t.Fatal("Quiet source repeatedly acquired root SQL", before, after)
+	}
 	response, e := h.Client.Call(r.ctx, sessionworker.LocalRequest{Type: "stream_page", Control: &nativeauthority.LocalControl{CurrentController: h.Current, CurrentBinding: h.Binding}, Sequence: reservation.Sequence, Cursor: 0, Limit: 1})
 	if e != nil || response.Readiness == nil {
 		t.Fatal("No quiet token", e)

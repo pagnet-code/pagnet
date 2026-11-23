@@ -23,7 +23,15 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		return nil, ErrConflict
 	}
 	p := req.NativeDispatch
-	if p.TaskSource != nil && p.InvocationSource != nil || op.SourceTask != nil && op.SourceInvocation != nil {
+	if p.AccountMessageSource != nil || op.SourceAccountMessage != nil || op.InputKind == "account_message" || op.SealedAccountMessage != nil {
+		if req.Kind != "prompt" || validateAccountOperation(op, *p) != nil {
+			return nil, ErrConflict
+		}
+		op.SourceCommandID = p.SourceCommandID
+		op.SourceAdmissionID = p.SourceAdmissionID
+		return MarshalNativeJSON(op)
+	}
+	if !transport.ValidNativeSourceUnion(p.TaskSource, p.InvocationSource, p.AccountMessageSource) || !transport.ValidNativeSourceUnion(op.SourceTask, op.SourceInvocation, op.SourceAccountMessage) {
 		return nil, ErrConflict
 	}
 	if p.InvocationSource != nil && p.InvocationSource.Validate() != nil {
@@ -43,7 +51,7 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 		if p.TaskSource != nil || p.InvocationSource != nil || ValidateNativeResolveOperation(op) != nil {
 			return nil, ErrConflict
 		}
-		return json.Marshal(op)
+		return MarshalNativeJSON(op)
 	}
 	if op.SourceInvocation != nil {
 		if req.Kind != "prompt" || op.InputKind != "" && op.InputKind != "invocation" {
@@ -65,7 +73,7 @@ func prepareDispatchOperation(req Request) (json.RawMessage, error) {
 	if req.Kind == "prompt" && (!ValidNativeInputKind(op.InputKind) || op.Input == "" || len(op.Input) > 128<<10) {
 		return nil, ErrConflict
 	}
-	return json.Marshal(op)
+	return MarshalNativeJSON(op)
 }
 
 func (j *Journal) initializeDispatches() error {
@@ -164,7 +172,7 @@ func (j *Journal) BindDispatchOwnership(ctx context.Context, lease int64, o tran
 	}
 	// Sequence counters are mutable server metadata, never local allocation input.
 	o.LastDispatchSequence, o.RetiredFloor = 0, 0
-	raw, err := json.Marshal(o)
+	raw, err := MarshalNativeJSON(o)
 	if err != nil {
 		return err
 	}
@@ -229,7 +237,7 @@ func (j *Journal) prepareDispatchTx(ctx context.Context, tx *sql.Tx, next, reque
 	if p.DispatchSequence <= floor {
 		return 0, false, ErrRetired
 	}
-	raw, err := json.Marshal(p)
+	raw, err := MarshalNativeJSON(p)
 	if err != nil {
 		return 0, false, err
 	}
@@ -332,10 +340,19 @@ func (j *Journal) RetireDispatches(ctx context.Context, lease, floor int64) erro
 	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_resource_settlements WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_account_reply_settlements WHERE operation_sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE worker_dispatch_meta SET retired=? WHERE singleton=1`, floor); err != nil {
+		return err
+	}
+	// The validated acknowledged floor and drained original sources make the
+	// input unnecessary. Delete alongside its dispatch, retaining the durable
+	// retired floor so an old command can never regain execution authority.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_account_inputs WHERE sequence IN (SELECT operation_sequence FROM worker_dispatches WHERE dispatch_sequence<=?)`, floor); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM worker_dispatches WHERE dispatch_sequence<=?`, floor); err != nil {
 		return err
 	}
 	var ownershipRaw string

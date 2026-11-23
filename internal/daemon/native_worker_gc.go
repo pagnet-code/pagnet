@@ -67,7 +67,7 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 		return nativeWorkerGC{}, ErrNativeObservationConflict
 	}
 	proposed := nativeWorkerGC{CommandID: p.CommandID, DeleteRequestID: p.DeleteRequestID, Ownership: *p.NativeOwnership, Phase: "waiting"}
-	raw, err := json.Marshal(proposed)
+	raw, err := marshalNativeWorkerRecord(proposed)
 	if err != nil {
 		return proposed, err
 	}
@@ -129,7 +129,7 @@ func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase str
 	} else if proof != nil {
 		return gc, ErrNativeObservationConflict
 	}
-	previous, _ := json.Marshal(gc)
+	previous, _ := marshalNativeWorkerRecord(gc)
 	next := gc
 	next.Phase = phase
 	if len(deletionProof) == 1 {
@@ -138,7 +138,7 @@ func (r *NativeWorkerRegistry) advanceGC(id string, gc nativeWorkerGC, phase str
 	if proof != nil {
 		next.Ownership = *proof
 	}
-	raw, err := json.Marshal(next)
+	raw, err := marshalNativeWorkerRecord(next)
 	if err != nil {
 		return gc, err
 	}

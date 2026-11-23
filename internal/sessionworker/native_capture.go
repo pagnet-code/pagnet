@@ -353,7 +353,7 @@ func OpenNativeSourceCapture(key []byte, scope Scope, directory string, observat
 			return NativeSourceCapture{}, errors.New("original task content reference differs from captured source")
 		}
 	}
-	if source.OriginalTurnOutputContent != nil && source.Event.Output != "" {
+	if source.OriginalTurnOutputContent != nil && (source.Event.Output != "" || source.Event.FinalOutput != nil) {
 		return NativeSourceCapture{}, errors.New("original task output duplicated instead of exact encrypted reference")
 	}
 	if source.OriginalTurnPlanContent != nil && source.Event.Plan != nil {

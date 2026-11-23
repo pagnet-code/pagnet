@@ -30,6 +30,9 @@ func (*NativeWorkerRegistry) Owns(string) bool               { return true }
 func (*NativeWorkerRegistry) Lookup(string) (NativeWorkerRecord, error) {
 	return NativeWorkerRecord{}, errNativeWorkerPlatform
 }
+func (*NativeWorkerRegistry) list(bool) ([]NativeWorkerRecord, error) {
+	return nil, errNativeWorkerPlatform
+}
 func (*NativeWorkerRegistry) List() ([]NativeWorkerRecord, error) {
 	return nil, errNativeWorkerPlatform
 }
@@ -72,4 +75,8 @@ func (*NativeWorkerRegistry) pendingCollectedRecoveries() ([]NativeWorkerRecover
 func (*NativeWorkerRegistry) confirmRecoveryCleaned(string) error { return errNativeWorkerPlatform }
 func (*NativeWorkerRegistry) collectRecovery(NativeWorkerRecovery) error {
 	return errNativeWorkerPlatform
+}
+
+func (*NativeWorkerRegistry) preparePriorLaunchBootProof(record NativeWorkerRecovery, _ string, _ func() (transport.KernelBootEvidence, error)) (NativeWorkerRecovery, error) {
+	return record, errNativeWorkerPlatform
 }

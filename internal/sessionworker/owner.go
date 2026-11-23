@@ -28,11 +28,12 @@ import (
 // NativeSpec contains immutable host-local configuration. Env is memory-only:
 // it is never encoded into the intent/output journal or sent to controllers.
 type NativeSpec struct {
-	InputBindingProfile    string `json:"inputBindingProfile,omitempty"`
-	Runtime                domain.RuntimeName
-	Binary                 string
-	PrefixArgs, NativeDirs []string
-	Env                    []string `json:"-"`
+	AccountMessageExecutionEnabled bool   `json:"accountMessageExecutionEnabled,omitempty"`
+	InputBindingProfile            string `json:"inputBindingProfile,omitempty"`
+	Runtime                        domain.RuntimeName
+	Binary                         string
+	PrefixArgs, NativeDirs         []string
+	Env                            []string `json:"-"`
 	// CredentialEnvKeys are explicitly selected memory-only credential slots.
 	// Names are profile metadata; their values never enter a local bootstrap.
 	CredentialEnvKeys                        []string `json:",omitempty"`
@@ -51,20 +52,22 @@ type NativeSpec struct {
 }
 
 type Operation struct {
-	SourceAdmissionID string                            `json:"sourceAdmissionId,omitempty"`
-	SourceCommandID   string                            `json:"sourceCommandId,omitempty"`
-	SourceInvocation  *transport.NativeInvocationSource `json:"sourceInvocation,omitempty"`
-	SourceTask        *transport.NativeTaskSource       `json:"sourceTask,omitempty"`
-	Input             string                            `json:"input,omitempty"`
-	InputKind         string                            `json:"inputKind,omitempty"`
-	NativeGeneration  string                            `json:"nativeGeneration,omitempty"`
-	NativeSessionID   string                            `json:"nativeSessionId,omitempty"`
-	InteractionID     string                            `json:"interactionId,omitempty"`
-	OptionID          string                            `json:"optionId,omitempty"`
-	InspectionProof   string                            `json:"inspectionProof,omitempty"`
-	Data              []byte                            `json:"data,omitempty"`
-	Rows              uint16                            `json:"rows,omitempty"`
-	Cols              uint16                            `json:"cols,omitempty"`
+	SealedAccountMessage *e2ee.EncryptedPayloadV1              `json:"sealedAccountMessage,omitempty"`
+	SourceAccountMessage *transport.NativeAccountMessageSource `json:"sourceAccountMessage,omitempty"`
+	SourceAdmissionID    string                                `json:"sourceAdmissionId,omitempty"`
+	SourceCommandID      string                                `json:"sourceCommandId,omitempty"`
+	SourceInvocation     *transport.NativeInvocationSource     `json:"sourceInvocation,omitempty"`
+	SourceTask           *transport.NativeTaskSource           `json:"sourceTask,omitempty"`
+	Input                string                                `json:"input,omitempty"`
+	InputKind            string                                `json:"inputKind,omitempty"`
+	NativeGeneration     string                                `json:"nativeGeneration,omitempty"`
+	NativeSessionID      string                                `json:"nativeSessionId,omitempty"`
+	InteractionID        string                                `json:"interactionId,omitempty"`
+	OptionID             string                                `json:"optionId,omitempty"`
+	InspectionProof      string                                `json:"inspectionProof,omitempty"`
+	Data                 []byte                                `json:"data,omitempty"`
+	Rows                 uint16                                `json:"rows,omitempty"`
+	Cols                 uint16                                `json:"cols,omitempty"`
 }
 
 type NativeSnapshot struct {
@@ -368,7 +371,7 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 			o.candidateAdmission = out.SourceAdmission
 			o.candidateLocalSource = out.LocalSource
 			o.candidateCommandID = op.SourceCommandID
-			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind, SourceTask: cloneNativeTaskSource(op.SourceTask), SourceInvocation: cloneNativeInvocationSource(op.SourceInvocation)}
+			o.candidateTurnSource = NativeTurnSource{Sequence: out.Sequence, SourceCommandID: op.SourceCommandID, SourceAdmissionID: op.SourceAdmissionID, InputKind: op.InputKind, SourceTask: cloneNativeTaskSource(op.SourceTask), SourceInvocation: cloneNativeInvocationSource(op.SourceInvocation), SourceAccountMessage: cloneNativeAccountMessageSource(op.SourceAccountMessage)}
 			fatal := o.fatal
 			if fatal == nil {
 				fatal = o.observationBlocked
@@ -393,11 +396,17 @@ func (o *SessionOwner) Execute(out Outcome, payload json.RawMessage) {
 				close(events)
 
 			} else {
-				if op.Input == "" || len(op.Input) > 128<<10 {
+				if op.SourceAccountMessage != nil {
+					op.Input, err = o.decryptAccountInput(operation.ctx, out, op)
+				}
+				if err != nil || op.Input == "" || len(op.Input) > 128<<10 {
 					close(events)
-					err = errors.New("invalid or oversized prompt")
+					if err == nil {
+						err = errors.New("invalid or oversized prompt")
+					}
 				} else {
 					result, err = o.manager.Submit(operation.ctx, o.sess, session.SubmitRequest{TurnID: logicalWorkerTurn(out.Sequence), Input: op.Input, InputKind: op.InputKind, Kind: session.SubmitPrompt}, events)
+					op.Input = ""
 				}
 			}
 			<-drained
@@ -604,6 +613,12 @@ func (o *SessionOwner) failPersistence(err error) {
 	o.mu.Unlock()
 }
 func (o *SessionOwner) record(kind string, data any, generation string, origin json.RawMessage) {
+	// Final answers belong only to encrypted native content, including when a
+	// legacy or live-only observer records the session event.
+	if event, ok := data.(session.SessionEvent); ok && event.FinalOutput != nil {
+		event.FinalOutput = nil
+		data = event
+	}
 	raw, err := json.Marshal(data)
 	if err == nil {
 		_, err = o.outputReplay().Append(generation, origin, kind, raw)

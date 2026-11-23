@@ -15,15 +15,16 @@ import (
 )
 
 type NativeTurnSource struct {
-	SourceInvocation  *transport.NativeInvocationSource `json:"sourceInvocation,omitempty"`
-	SourceTask        *transport.NativeTaskSource       `json:"sourceTask,omitempty"`
-	InputKind         string                            `json:"inputKind,omitempty"`
-	Sequence          int64                             `json:"sequence"`
-	LogicalTurnID     string                            `json:"logicalTurnId"`
-	NativeGeneration  string                            `json:"nativeGeneration"`
-	NativeSessionID   string                            `json:"nativeSessionId"`
-	SourceCommandID   string                            `json:"sourceCommandId,omitempty"`
-	SourceAdmissionID string                            `json:"sourceAdmissionId,omitempty"`
+	SourceAccountMessage *transport.NativeAccountMessageSource `json:"sourceAccountMessage,omitempty"`
+	SourceInvocation     *transport.NativeInvocationSource     `json:"sourceInvocation,omitempty"`
+	SourceTask           *transport.NativeTaskSource           `json:"sourceTask,omitempty"`
+	InputKind            string                                `json:"inputKind,omitempty"`
+	Sequence             int64                                 `json:"sequence"`
+	LogicalTurnID        string                                `json:"logicalTurnId"`
+	NativeGeneration     string                                `json:"nativeGeneration"`
+	NativeSessionID      string                                `json:"nativeSessionId"`
+	SourceCommandID      string                                `json:"sourceCommandId,omitempty"`
+	SourceAdmissionID    string                                `json:"sourceAdmissionId,omitempty"`
 }
 
 func logicalWorkerTurn(sequence int64) string { return fmt.Sprintf("pagnet-worker-turn-%d", sequence) }
@@ -110,10 +111,15 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
+	if source.SourceAccountMessage != nil || source.InputKind == "account_message" {
+		if source.SourceAccountMessage == nil || source.InputKind != "account_message" || j.db == nil {
+			return ErrFenced
+		}
+	}
 	if j.isLocal() && (source.SourceTask != nil || source.SourceInvocation != nil || source.InputKind != "local-native") {
 		return ErrFenced
 	}
-	if source.SourceTask != nil && source.SourceInvocation != nil {
+	if !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage) {
 		return errors.New("native turn has conflicting source authorities")
 	}
 	if source.SourceInvocation != nil && (source.InputKind != "invocation" || source.SourceCommandID == "" || source.SourceAdmissionID == "" || source.SourceInvocation.Validate() != nil) {
@@ -123,6 +129,7 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		return errors.New("native invocation source is missing")
 	}
 	source.SourceInvocation = cloneNativeInvocationSource(source.SourceInvocation)
+	source.SourceAccountMessage = cloneNativeAccountMessageSource(source.SourceAccountMessage)
 	if source.SourceTask != nil && (source.InputKind != "task" || source.SourceCommandID == "" || source.SourceTask.TaskID == "" || source.SourceTask.InputAAD.ObjectType != e2ee.ObjectTypeTask || source.SourceTask.InputAAD.ObjectID != source.SourceTask.TaskID || source.SourceTask.InputAAD.KeyEpochID == "" || source.SourceTask.InputAAD.NativeContent != nil || source.SourceTask.InputAAD.ValidateScope() != nil) {
 		return errors.New("invalid original task source descriptor")
 	}
@@ -144,6 +151,11 @@ func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) e
 		}
 		if original.Commitment.CommandID != source.SourceCommandID || original.Admission.ID != source.SourceAdmissionID {
 			return ErrConflict
+		}
+	}
+	if source.SourceAccountMessage != nil {
+		if err := j.accountInputForTurn(ctx, tx, source); err != nil {
+			return err
 		}
 	}
 	var previous NativeTurnSource
@@ -193,13 +205,19 @@ func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (N
 
 func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	var task, invocation string
-	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation)
+	var task, invocation, account string
+	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation, &account)
 	if err == nil && task != "" {
 		err = json.Unmarshal([]byte(task), &source.SourceTask)
 	}
 	if err == nil && invocation != "" {
 		err = json.Unmarshal([]byte(invocation), &source.SourceInvocation)
+	}
+	if err == nil && account != "" {
+		err = json.Unmarshal([]byte(account), &source.SourceAccountMessage)
+	}
+	if err == nil && ((source.InputKind == "account_message") != (source.SourceAccountMessage != nil) || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage)) {
+		err = ErrConflict
 	}
 	return source, err
 }
@@ -326,7 +344,7 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 	source.NativeSessionID = sess.NativeID
 	source.LogicalTurnID = req.TurnID
 	o.pinOriginalTaskContent(source)
-	if source.SourceTask != nil || source.SourceInvocation != nil {
+	if source.SourceTask != nil || source.SourceInvocation != nil || source.SourceAccountMessage != nil {
 		if _, available := o.originalTaskContentPin(&source); !available {
 			o.releaseNativeTaskTurnPin(&source)
 			return errors.New("original input crypto authority unavailable")
@@ -356,7 +374,18 @@ func (d *ownedDriver) Submit(ctx context.Context, sess *session.RuntimeSession, 
 			return err
 		}
 	}
-	return d.Driver.Submit(ctx, sess, req, events)
+	err := d.Driver.Submit(ctx, sess, req, events)
+	if source.SourceAccountMessage != nil && err != nil {
+		// No terminal callback is guaranteed after a rejected submission. The
+		// immutable admission remains retained independently of this key pin.
+		o.releaseNativeTaskTurnPin(&source)
+		if errors.Is(err, session.ErrEndpointGone) {
+			// The manager normally retries a proven unaccepted endpoint.
+			// Account commands permit only this one submission attempt.
+			return errors.New("account native submission was not accepted")
+		}
+	}
+	return err
 }
 
 // Clone before acceptance: caller-owned nested AAD pointers must not change the
@@ -435,8 +464,11 @@ func invocationSourceJSON(source *transport.NativeInvocationSource) string {
 // The source kind and full accepted descriptor remain part of a key pin. A
 // completed task cannot become an invocation merely by changing input labels.
 func sourceContentDescriptor(source *NativeTurnSource) string {
-	if source == nil || source.SourceTask != nil && source.SourceInvocation != nil {
+	if source == nil || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage) {
 		return ""
+	}
+	if source.SourceAccountMessage != nil && source.InputKind == "account_message" {
+		return "account_message:" + accountMessageSourceJSON(source.SourceAccountMessage)
 	}
 	if source.SourceInvocation != nil && source.InputKind == "invocation" && source.SourceInvocation.Validate() == nil {
 		return "invocation:" + invocationSourceJSON(source.SourceInvocation)
@@ -450,6 +482,9 @@ func sourceContentAAD(source *NativeTurnSource) (e2ee.AAD, bool) {
 	if sourceContentDescriptor(source) == "" || source.SourceTask != nil && source.InputKind != "task" {
 		return e2ee.AAD{}, false
 	}
+	if source.SourceAccountMessage != nil {
+		return source.SourceAccountMessage.InputAAD, true
+	}
 	if source.SourceInvocation != nil {
 		return source.SourceInvocation.InputAAD, true
 	}
@@ -458,4 +493,22 @@ func sourceContentAAD(source *NativeTurnSource) (e2ee.AAD, bool) {
 		return e2ee.AAD{}, false
 	}
 	return aad, true
+}
+
+func accountMessageSourceJSON(source *transport.NativeAccountMessageSource) string {
+	if source == nil {
+		return ""
+	}
+	return string(source.CanonicalJSON())
+}
+
+func cloneNativeAccountMessageSource(source *transport.NativeAccountMessageSource) *transport.NativeAccountMessageSource {
+	if source == nil {
+		return nil
+	}
+	var cloned transport.NativeAccountMessageSource
+	if json.Unmarshal(source.CanonicalJSON(), &cloned) != nil {
+		return nil
+	}
+	return &cloned
 }
