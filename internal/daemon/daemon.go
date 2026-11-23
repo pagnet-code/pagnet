@@ -206,6 +206,9 @@ type Daemon struct {
 
 	nativeSourcePrepare nativeShareSourcePrepareExecutor
 	nativeSourceProve   nativeShareSourceProveExecutor
+	managedEndpointKeys interface {
+		Reserve(transport.ManagedEndpointBindingIntent, string, transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error)
+	}
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
 	nativeRegistry      *NativeWorkerRegistry
 	nativeWorkersMu     sync.Mutex
@@ -982,6 +985,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.initNativeShareBindings()
 	d.initNativeShareSourcePrepare()
 	d.initNativeShareSourceProve()
+	d.initManagedEndpointKeys()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
