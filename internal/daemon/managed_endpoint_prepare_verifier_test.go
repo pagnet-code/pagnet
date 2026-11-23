@@ -253,6 +253,10 @@ func TestManagedPrepareVerifierServerOriginComparisons(t *testing.T) {
 		{"escaped trailing slash vs literal slash", "https://example.test/a%2F", "https://example.test/a/", false},
 		{"same escaped path", "https://EXAMPLE.TEST/a%2Fb/", "https://example.test/a%2Fb", true},
 		{"same literal path", "https://EXAMPLE.TEST/a/b///", "https://example.test/a/b", true},
+		{"empty fragment delimiter", "https://example.test", "https://example.test#", false},
+		{"uppercase IPv6 zone", "https://example.test", "https://[fe80::1%25ETH0]", false},
+		{"lowercase IPv6 zone", "https://example.test", "https://[fe80::1%25eth0]", false},
+		{"unscoped IPv6", "https://[2001:DB8::1]///", "https://[2001:db8::1]", true},
 		{"different host", "https://example.test", "https://other.test", false},
 		{"different scheme", "https://example.test", "http://example.test", false},
 		{"different path", "https://example.test", "https://example.test/other", false},
@@ -283,6 +287,16 @@ func TestManagedPrepareVerifierServerOriginComparisons(t *testing.T) {
 			p := f.d.nativeWorkers[f.command.Subject.InstanceID.String()].proxy
 			if before.Scope != after.Scope || p.scope != before.Scope || f.snapshot.Scope != before.Scope || f.captured.Connection.serverURL != test.stored {
 				t.Fatal("origin comparison modified stored scope identity")
+			}
+		})
+	}
+}
+
+func TestManagedPrepareVerifierRejectsUnsafeStoredOrigins(t *testing.T) {
+	for _, server := range []string{"https://example.test#", "https://[fe80::1%25ETH0]", "https://[fe80::1%25eth0]"} {
+		t.Run(server, func(t *testing.T) {
+			if got := managedPrepareServerOrigin(server); got != "" {
+				t.Fatalf("unsafe origin accepted as %q", got)
 			}
 		})
 	}

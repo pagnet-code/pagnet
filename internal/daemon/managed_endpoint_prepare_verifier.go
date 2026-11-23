@@ -55,9 +55,10 @@ func sameManagedPrepareOwnership(a, b transport.NativeWorkerOwnership) bool {
 // managedPrepareServerOrigin normalizes comparison copies only. Escaped path
 // separators retain their spelling and identity; only literal trailing slashes
 // are ignored. Rebuilding a decoded Path could merge distinct server routes.
+// Fragments and scoped IPv6 hosts are excluded before host case normalization.
 func managedPrepareServerOrigin(value string) string {
 	u, err := url.Parse(strings.TrimSpace(value))
-	if err != nil || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+	if err != nil || strings.Contains(value, "#") || strings.Contains(u.Hostname(), "%") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return ""
 	}
 	path := strings.TrimRight(u.EscapedPath(), "/")
