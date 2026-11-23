@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -46,6 +47,14 @@ func TestDarwinPolicyRejectsInvalidGrants(t *testing.T) {
 	alias := filepath.Join(base, "alias")
 	file := filepath.Join(base, "file")
 	dangling := filepath.Join(base, "dangling")
+	deviceAlias := filepath.Join(base, "null")
+	fifo := filepath.Join(base, "fifo")
+	if err := os.Symlink("/dev/null", deviceAlias); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(secret, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +74,11 @@ func TestDarwinPolicyRejectsInvalidGrants(t *testing.T) {
 		"trimmed path":            {RW: []string{" " + base}},
 		"missing RW":              {RW: []string{filepath.Join(base, "missing")}},
 		"file RW":                 {RW: []string{file}},
+		"directory Dev":           {Dev: []string{base}},
+		"broad dev":               {Dev: []string{"/dev"}},
+		"symlink Dev":             {Dev: []string{deviceAlias}},
+		"fifo Dev":                {Dev: []string{fifo}},
+		"denied device":           {Dev: []string{"/dev/null"}, Denied: []string{"/dev/null"}},
 		"file Dev":                {Dev: []string{file}},
 		"file socket":             {Sockets: []string{file}},
 		"missing socket":          {Sockets: []string{filepath.Join(base, "missing.sock")}},
@@ -98,7 +112,75 @@ func TestDarwinPolicyOptionalSupportAndExactFile(t *testing.T) {
 }
 
 func darwinSmokeSpec(rw, ro string) *Spec {
-	return &Spec{RW: []string{rw}, RO: []string{ro, "/bin", "/usr/bin", "/usr/lib", "/System"}, Dev: []string{"/dev"}}
+	return &Spec{RW: []string{rw}, RO: []string{ro, "/bin", "/usr/bin", "/usr/lib", "/System"}, Dev: SystemDev()}
+}
+
+func TestDarwinPolicyExactDevices(t *testing.T) {
+	want := []string{"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"}
+	if !reflect.DeepEqual(SystemDev(), want) {
+		t.Fatalf("unexpected default devices: %q", SystemDev())
+	}
+	policy, err := GenerateDarwinPolicy(&Spec{Dev: SystemDev()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range want {
+		st, err := os.Lstat(path)
+		if err != nil || st.Mode()&os.ModeCharDevice == 0 {
+			t.Fatalf("default device %s is not a character device: %v", path, err)
+		}
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, param := range policy.Parameters {
+			key, value, _ := strings.Cut(param, "=")
+			if value == resolved && strings.Contains(policy.Profile, `(allow file-read* file-write-data (literal (param "`+key+`")))`) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing exact read/data-write grant for %s", path)
+		}
+	}
+	if strings.Count(policy.Profile, "(allow file-read* file-write-data ") != len(want) {
+		t.Fatal("unexpected device grant count")
+	}
+	for _, forbidden := range []string{"subpath", "process-exec", "file-ioctl", "mach-", "pseudo-tty", "file-write*"} {
+		if strings.Contains(policy.Profile, forbidden) {
+			t.Fatalf("unexpected device permission: %s", forbidden)
+		}
+	}
+}
+
+func TestDarwinSeatbeltDevices(t *testing.T) {
+	// Prove ptmx is available before testing that Seatbelt denies its open.
+	// This allocates a fresh PTY and never reads a user's existing terminal.
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("unsandboxed ptmx control: %v", err)
+	}
+	if err := ptmx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Entropy is discarded; opening ptmx creates no connection to a user's tty.
+	script := `set -e
+printf device >/dev/null
+/bin/dd if=/dev/null of=/dev/null bs=1 count=1
+/bin/dd if=/dev/zero of=/dev/null bs=1 count=1
+/bin/dd if=/dev/random of=/dev/null bs=1 count=1
+/bin/dd if=/dev/urandom of=/dev/null bs=1 count=1
+if (exec 3<>/dev/ptmx); then exit 20; fi
+`
+	spec := darwinSmokeSpec("", "")
+	args, err := DarwinWrapperArgs(spec, "/bin/sh", []string{"-c", script})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("/usr/bin/sandbox-exec", args...).CombinedOutput(); err != nil {
+		t.Fatalf("device smoke: %v\n%s", err, out)
+	}
 }
 
 func TestDarwinSeatbeltFilesystem(t *testing.T) {
@@ -106,8 +188,7 @@ func TestDarwinSeatbeltFilesystem(t *testing.T) {
 	rw := filepath.Join(base, "rw \"\\\n雪")
 	ro := filepath.Join(base, "ro")
 	secret := filepath.Join(base, "secret")
-	dev := filepath.Join(base, "dev")
-	for _, dir := range []string{rw, ro, secret, dev} {
+	for _, dir := range []string{rw, ro, secret} {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -141,15 +222,11 @@ if /bin/echo denied > "$1/escape/new"; then exit 15; fi
 if /bin/ln "$3/data" "$1/leak"; then
   if /bin/cat "$1/leak" >/dev/null; then exit 16; fi
 fi
-/bin/echo device > "$4/data"
-if /bin/echo denied > "$4/new"; then exit 18; fi
-if /bin/rm "$4/data"; then exit 19; fi
 /bin/mkdir "$1/dir"
 /bin/rm "$1/new"
 `
 	spec := darwinSmokeSpec(rw, ro)
-	spec.Dev = append(spec.Dev, dev)
-	args, err := DarwinWrapperArgs(spec, "/bin/sh", []string{"-c", script, "probe", rw, ro, secret, dev})
+	args, err := DarwinWrapperArgs(spec, "/bin/sh", []string{"-c", script, "probe", rw, ro, secret})
 	if err != nil {
 		t.Fatal(err)
 	}

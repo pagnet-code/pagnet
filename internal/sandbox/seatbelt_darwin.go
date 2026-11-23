@@ -24,9 +24,9 @@ type DarwinPolicy struct {
 // it. Only the explicit Darwin wrapper applies it; supervisor launches remain
 // unchanged until production runtime probes pass.
 // RW directories get read/write/execute; RO directories or regular files get
-// read/execute; Dev directories get read, data-write and execute, without node
-// creation/removal. Ordinary outbound IP networking and process creation are
-// allowed; Unix connections are limited to the exact listed sockets. No Mach,
+// read/execute; Dev exact character devices get read and data-write, without
+// execute, ioctl, node creation or removal. Ordinary outbound IP networking
+// and process creation are allowed; Unix connections are limited to the exact listed sockets. No Mach,
 // inbound network or general IPC permissions are implied. Read-only sysctls
 // cover Go page-size initialization and the exact OS-information names denied
 // during the isolated Qwen Node startup probe. The sole
@@ -103,8 +103,7 @@ func GenerateDarwinPolicy(spec *Spec) (DarwinPolicy, error) {
 		operations string
 		mandatory  bool
 	}{{s.RW, "RW", "file-read* file-write* file-link process-exec", true},
-		{s.RO, "RO", "file-read* process-exec", false},
-		{s.Dev, "Dev", "file-read* file-write-data process-exec", false}} {
+		{s.RO, "RO", "file-read* process-exec", false}} {
 		for _, p := range group.paths {
 			st, err := os.Stat(p)
 			if err != nil {
@@ -135,6 +134,30 @@ func GenerateDarwinPolicy(spec *Spec) (DarwinPolicy, error) {
 			addTraversalMetadata(p)
 			addTraversalMetadata(resolved)
 		}
+	}
+	for _, p := range s.Dev {
+		st, err := os.Lstat(p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // Optional support devices may be absent.
+			}
+			return DarwinPolicy{}, fmt.Errorf("sandbox: Dev path %q: %w", p, err)
+		}
+		if st.Mode()&os.ModeCharDevice == 0 {
+			return DarwinPolicy{}, fmt.Errorf("sandbox: Dev path %q is not a character device", p)
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return DarwinPolicy{}, fmt.Errorf("sandbox: canonical device %q: %w", p, err)
+		}
+		for _, dn := range append(append([]string{}, s.Denied...), denied...) {
+			if darwinPathWithin(dn, p) || darwinPathWithin(dn, resolved) {
+				return DarwinPolicy{}, fmt.Errorf("sandbox: denied path %q is equal to or beneath Dev grant %q", dn, p)
+			}
+		}
+		add("file-read* file-write-data", "literal", resolved)
+		addTraversalMetadata(p)
+		addTraversalMetadata(resolved)
 	}
 	if len(s.Sockets) != 0 {
 		policy.Profile += "(allow system-socket (socket-domain AF_UNIX))\n"

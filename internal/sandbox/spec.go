@@ -89,15 +89,13 @@ type Spec struct {
 	// authenticates process ancestry and nonce, and private control listeners
 	// must authenticate their own authority independently.
 	Sockets []string
-	// Dev: device subtrees granted read+write+truncate (DAC-gated) — /dev.
-	// Runtimes and their shell commands must WRITE /dev/null (the universal
-	// output sink: `> /dev/null`, `2>/dev/null` — bash opens it
-	// O_WRONLY|O_CREAT|O_TRUNC, so the grant carries the TRUNCATE bit) and
-	// READ /dev/urandom, /dev/zero, /dev/tty. The current policy uses a
-	// /dev subtree grant. Device access remains subject to the OS user/group
-	// permissions; this is not a denylist of every device interface. This
-	// policy does not handle IOCTL_DEV (added in ABI5), so device ioctls
-	// remain possible where device/DAC permissions allow them.
+	// Dev: device grants with platform-specific semantics. Linux grants
+	// read+write+truncate on device subtrees (normally /dev), subject to DAC.
+	// Shell redirection to /dev/null needs write+truncate. Linux does not
+	// handle IOCTL_DEV, so device ioctls remain possible where DAC permits.
+	// Darwin accepts only exact character-device paths and grants read and
+	// data-write, without execute or ioctl access. SystemDev selects only
+	// /dev/null, /dev/zero, /dev/random and /dev/urandom on Darwin.
 	Dev []string
 }
 
@@ -268,9 +266,8 @@ func Home() string {
 // by some runtimes) but not other processes' /proc/<pid> — so one same-UID
 // runtime cannot read another's /proc/<pid>/environ (provider auth).
 //
-// /dev is NOT here: it is a Spec.Dev grant (read+write+truncate, DAC-gated)
-// because runtimes and their shell commands must WRITE /dev/null — see
-// SystemDev.
+// Device access is supplied separately by Spec.Dev because runtimes and
+// their shell commands must write /dev/null — see SystemDev.
 func SystemRO() []string {
 	if runtime.GOOS == "darwin" {
 		// dyld/frameworks live under /System. /private/var/select/sh is the
@@ -284,11 +281,14 @@ func SystemRO() []string {
 	}
 }
 
-// SystemDev returns the device subtrees every sandboxed launch gets
-// read+write+truncate on (Spec.Dev). See the Spec.Dev doc for the rationale
-// (this policy grants the /dev subtree; actual device access remains
-// bounded by OS user/group permissions, and device IOCTL is not handled).
+// SystemDev returns the default device grants (Spec.Dev). Linux grants the
+// /dev subtree with read+write+truncate, subject to DAC. Darwin grants only the
+// exact null, zero and entropy character devices with read and data-write;
+// it does not grant device execution, ioctls or other /dev paths.
 func SystemDev() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"}
+	}
 	return []string{"/dev"}
 }
 
