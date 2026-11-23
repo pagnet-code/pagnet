@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -425,8 +426,9 @@ func TestManagedPrepareJournalSuccessBytesImmutable(t *testing.T) {
 	original := managedPrepareSuccess(t, keys, command, session)
 	// Independently valid evidence with a different public key still cannot replace
 	// an already committed result for the same full command.
-	otherKeys, _, _ := managedEndpointFixture(t)
-	alternate := managedPrepareSuccess(t, otherKeys, command, session)
+	alternate := managedPrepareMutateACK(t, original, command, func(reservation *transport.ManagedEndpointKeyReservation) {
+		reservation.X25519 = strings.Repeat("a", 64)
+	})
 	if bytes.Equal(original, alternate) {
 		t.Fatal("independent keys matched")
 	}
@@ -439,5 +441,88 @@ func TestManagedPrepareJournalSuccessBytesImmutable(t *testing.T) {
 	replay, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK)
 	if err != nil || !bytes.Equal(replay.ACK, original) {
 		t.Fatal("changed original ACK", err)
+	}
+}
+
+func managedPrepareMutateACK(t *testing.T, raw []byte, command transport.ManagedEndpointPrepareCommand, mutate func(*transport.ManagedEndpointKeyReservation)) []byte {
+	t.Helper()
+	ack, err := transport.DecodeManagedEndpointPrepareACK(raw, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(&ack.Reservation)
+	ack.Reservation.EnrollmentDigest, err = ack.Reservation.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := ack.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.DecodeManagedEndpointPrepareACK(changed, command); err != nil {
+		t.Fatal("fixture must be valid command-bound evidence", err)
+	}
+	return changed
+}
+
+func TestManagedPrepareJournalSuccessRequiresRetainedCustodyScope(t *testing.T) {
+	for name, mutate := range map[string]func(*transport.ManagedEndpointKeyReservation){
+		"origin":       func(r *transport.ManagedEndpointKeyReservation) { r.ServerURL = "https://other.test" },
+		"installation": func(r *transport.ManagedEndpointKeyReservation) { r.InstallationID = domain.NewID() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			j, keys, command, session := managedPrepareJournalFixture(t)
+			if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+				t.Fatal(err)
+			}
+			original := managedPrepareSuccess(t, keys, command, session)
+			wrongScope := managedPrepareMutateACK(t, original, command, mutate)
+			if _, err := j.Succeed(command, "https://example.test", managedPrepareScopeOK, wrongScope); err == nil {
+				t.Fatal("first success accepted wrong custody scope")
+			}
+			reserved, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK)
+			if err != nil || reserved.State != "reserved" || reserved.ACK != nil {
+				t.Fatal("rejection changed reservation", err)
+			}
+			if _, err := j.Succeed(command, "https://example.test", managedPrepareScopeOK, original); err != nil {
+				t.Fatal(err)
+			}
+			// A valid wire ACK transplanted into the durable row must also fail
+			// replay's local custody checks, rather than reaching a caller.
+			if _, err := j.registry.db.Exec(`UPDATE native_managed_endpoint_prepare_commands SET ack=? WHERE command_id=?`, wrongScope, command.CommandID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err == nil {
+				t.Fatal("replayed wrong custody scope")
+			}
+		})
+	}
+}
+
+func TestManagedPrepareJournalVerifierReceivesRetainedCanonicalContext(t *testing.T) {
+	j, _, command, _ := managedPrepareJournalFixture(t)
+	if _, err := j.Reserve(command, "https://example.test", managedPrepareScopeOK); err != nil {
+		t.Fatal(err)
+	}
+	request, err := command.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry := command
+	retry.Subject.ExpiresAt = retry.Subject.ExpiresAt.In(time.FixedZone("retry-offset", 3600))
+	called := false
+	verify := func(retained transport.ManagedEndpointPrepareCommand, server string) error {
+		called = true
+		canonical, err := retained.CanonicalBytes()
+		if err != nil || !bytes.Equal(canonical, request) || server != "https://example.test" || retained.Subject.ExpiresAt.Location() != time.UTC {
+			t.Fatal("verifier did not receive retained canonical context", err)
+		}
+		return nil
+	}
+	if _, err := j.Reserve(retry, "https://EXAMPLE.TEST///", verify); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("scope verifier skipped")
 	}
 }

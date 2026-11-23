@@ -147,19 +147,17 @@ func (s *ManagedEndpointPrepareJournal) apply(command transport.ManagedEndpointP
 	if err = conn.QueryRowContext(ctx, `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&installation); err != nil || installation != string(s.installation) {
 		return empty, errManagedEndpointPrepareJournal
 	}
-	// This callback is an explicit caller obligation, never retained authorization.
-	if err = verify(command, server); err != nil {
-		return empty, errManagedEndpointPrepareJournal
-	}
-	if !s.now().Before(command.Subject.ExpiresAt) {
-		return empty, errManagedEndpointPrepareJournal
-	}
 	var enrollment, storedInstallation, storedServer, storedExpiry, state string
 	var storedRequest, storedDigest, storedACK []byte
 	err = conn.QueryRowContext(ctx, `SELECT enrollment_id,installation_id,server_url,request,request_digest,expires_at,state,ack FROM native_managed_endpoint_prepare_commands WHERE command_id=?`, command.CommandID).Scan(&enrollment, &storedInstallation, &storedServer, &storedRequest, &storedDigest, &storedExpiry, &state, &storedACK)
 	created := false
 	if errors.Is(err, sql.ErrNoRows) {
 		if terminal != "" {
+			return empty, errManagedEndpointPrepareJournal
+		}
+		// A new association has no retained transcript yet; verify its canonical
+		// context before the first durable reservation.
+		if verify(command, server) != nil || !s.now().Before(command.Subject.ExpiresAt) {
 			return empty, errManagedEndpointPrepareJournal
 		}
 		if _, err = conn.ExecContext(ctx, `INSERT INTO native_managed_endpoint_prepare_commands(command_id,enrollment_id,installation_id,server_url,request,request_digest,expires_at,state,ack) VALUES(?,?,?,?,?,?,?,'reserved',NULL)`, command.CommandID, command.Subject.ID, s.installation, server, request, digest[:], expiry); err != nil {
@@ -173,18 +171,22 @@ func (s *ManagedEndpointPrepareJournal) apply(command transport.ManagedEndpointP
 		if enrollment != string(command.Subject.ID) || storedInstallation != string(s.installation) || storedServer != server || storedExpiry != expiry || !bytes.Equal(storedRequest, request) || !bytes.Equal(storedDigest, digest[:]) {
 			return empty, errManagedEndpointPrepareJournal
 		}
+		// Existing operations verify the retained canonical context, after its
+		// immutable association has been checked against the caller's request.
+		command, err = transport.DecodeManagedEndpointPrepareCommand(storedRequest)
+		if err != nil || verify(command, storedServer) != nil || !s.now().Before(command.Subject.ExpiresAt) {
+			return empty, errManagedEndpointPrepareJournal
+		}
+		if terminal == "succeeded" && !managedEndpointPrepareSuccessForScope(ack, command, storedServer, domain.ID(storedInstallation)) {
+			return empty, errManagedEndpointPrepareJournal
+		}
 		switch state {
 		case "reserved":
 			if storedACK != nil {
 				return empty, errManagedEndpointPrepareJournal
 			}
 		case "succeeded":
-			decoded, e := transport.DecodeManagedEndpointPrepareACK(storedACK, command)
-			if e != nil {
-				return empty, errManagedEndpointPrepareJournal
-			}
-			canonical, e := decoded.CanonicalBytes()
-			if e != nil || !bytes.Equal(canonical, storedACK) {
+			if !managedEndpointPrepareSuccessForScope(storedACK, command, storedServer, domain.ID(storedInstallation)) {
 				return empty, errManagedEndpointPrepareJournal
 			}
 		case "failed":
@@ -216,4 +218,15 @@ func (s *ManagedEndpointPrepareJournal) apply(command transport.ManagedEndpointP
 		return empty, err
 	}
 	return ManagedEndpointPrepareResult{State: state, ACK: bytes.Clone(storedACK), Created: created}, nil
+}
+
+// The wire decoder binds the command subject; custody provenance is additionally
+// bound here to the journal's retained local installation and configured server.
+func managedEndpointPrepareSuccessForScope(raw []byte, command transport.ManagedEndpointPrepareCommand, server string, installation domain.ID) bool {
+	decoded, err := transport.DecodeManagedEndpointPrepareACK(raw, command)
+	if err != nil || decoded.Reservation.ServerURL != server || decoded.Reservation.InstallationID != installation {
+		return false
+	}
+	canonical, err := decoded.CanonicalBytes()
+	return err == nil && bytes.Equal(canonical, raw)
 }
