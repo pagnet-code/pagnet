@@ -3,6 +3,9 @@
 package sandbox
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -12,6 +15,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/creack/pty"
 )
 
 func TestDarwinPolicyParameters(t *testing.T) {
@@ -178,9 +184,101 @@ if (exec 3<>/dev/ptmx); then exit 20; fi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("/usr/bin/sandbox-exec", args...).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "/usr/bin/sandbox-exec", args...).CombinedOutput(); err != nil {
 		t.Fatalf("device smoke: %v\n%s", err, out)
 	}
+}
+
+func TestDarwinSeatbeltDeviceFilePermission(t *testing.T) {
+	// Allocate and retain our own PTY in the parent. The probe only opens its
+	// slave pathname: it never allocates a PTY, performs an ioctl, or accesses
+	// the user's terminal. Retaining both ends keeps the pathname alive.
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	path, err := filepath.EvalSymlinks(slave.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperArgs := []string{"-test.run=^TestDarwinDeviceOpenProbe$"}
+	spec := darwinSmokeSpec("", "")
+	spec.RW = nil
+	spec.RO = append(spec.RO, exe)
+	args, err := DarwinWrapperArgs(spec, exe, helperArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalArgs := append([]string(nil), args...)
+	// Seatbelt can independently mediate opening a PTY via pseudo-tty. Allow
+	// that operation in BOTH test profiles so the sole permission difference
+	// is the exact slave file grant below. Production policy is unchanged;
+	// TestDarwinSeatbeltDevices separately checks the combined ptmx denial.
+	args[1] += "(allow pseudo-tty)\n"
+	grantedArgs := append([]string(nil), args...)
+	grantedArgs[1] += "(allow file-read* file-write-data (literal (param \"PTY_SLAVE\")))\n"
+	args = append([]string{"-D", "PTY_SLAVE=" + path}, args...)
+	grantedArgs = append([]string{"-D", "PTY_SLAVE=" + path}, grantedArgs...)
+	for _, tc := range []struct {
+		name    string
+		command string
+		args    []string
+		denied  bool
+	}{
+		{"unsandboxed control", exe, helperArgs, false},
+		{"normal policy denial", "/usr/bin/sandbox-exec", normalArgs, true},
+		{"unlisted slave file denial", "/usr/bin/sandbox-exec", args, true},
+		{"exact slave grant control", "/usr/bin/sandbox-exec", grantedArgs, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, tc.command, tc.args...)
+			cmd.Env = append(os.Environ(), "PAGNET_SEATBELT_DEVICE_PROBE="+path)
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("device probe timed out: %v\n%s", ctx.Err(), out)
+			}
+			if tc.denied {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 42 || !strings.HasPrefix(string(out), "device-open-denied:") {
+					t.Fatalf("expected file permission denial, got %v\n%s", err, out)
+				}
+			} else if err != nil || string(out) != "device-open-ok\n" {
+				t.Fatalf("device open control: %v\n%s", err, out)
+			}
+		})
+	}
+}
+
+func TestDarwinDeviceOpenProbe(t *testing.T) {
+	path := os.Getenv("PAGNET_SEATBELT_DEVICE_PROBE")
+	if path == "" {
+		t.Skip("subprocess probe")
+	}
+	fd, err := syscall.Open(path, syscall.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
+			fmt.Printf("device-open-denied: %v\n", err)
+			os.Exit(42)
+		}
+		fmt.Printf("device-open-error: %v\n", err)
+		os.Exit(43)
+	}
+	if err := syscall.Close(fd); err != nil {
+		fmt.Printf("device-close-error: %v\n", err)
+		os.Exit(44)
+	}
+	fmt.Println("device-open-ok")
+	os.Exit(0)
 }
 
 func TestDarwinSeatbeltFilesystem(t *testing.T) {
