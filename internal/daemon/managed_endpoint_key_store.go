@@ -61,13 +61,6 @@ type managedEndpointKeyRecord struct {
 	Private     []byte                                  `json:"private"`
 }
 
-func managedEndpointReservationDigest(p transport.ManagedEndpointKeyReservation) string {
-	p.EnrollmentDigest = ""
-	raw, _ := json.Marshal(p)
-	sum := sha256.Sum256(append([]byte("pagnet/closed-managed-endpoint-key/v1/"), raw...))
-	return hex.EncodeToString(sum[:])
-}
-
 // Reserve compares supplied evidence and binds the exact server intent to the
 // configured control-plane origin and captured host session. It does not itself
 // authenticate server provenance, the live socket, or the P principal/endpoint/
@@ -206,7 +199,10 @@ func (s *ManagedEndpointKeyStore) Reserve(subject transport.ManagedEndpointBindi
 	private := key.Bytes()
 	defer clear(private)
 	reservation := transport.ManagedEndpointKeyReservation{Subject: subject, ServerURL: server, InstallationID: s.installation, KeyGeneration: 1, X25519: hex.EncodeToString(key.PublicKey().Bytes())}
-	reservation.EnrollmentDigest = managedEndpointReservationDigest(reservation)
+	reservation.EnrollmentDigest, err = reservation.Digest()
+	if err != nil {
+		return empty, errManagedEndpointKey
+	}
 	raw, err := json.Marshal(managedEndpointKeyRecord{Reservation: reservation, Private: private})
 	if err != nil {
 		return empty, err
@@ -281,7 +277,7 @@ func loadManagedEndpointKey(file *os.File) (managedEndpointKeyRecord, error) {
 		return r, errManagedEndpointKey
 	}
 	p := r.Reservation
-	if _, err = p.Subject.CanonicalBytes(); err != nil || p.KeyGeneration != 1 || !nativeShareEpochStageID(p.InstallationID) || p.ServerURL == "" || textServiceServer(p.ServerURL) != p.ServerURL || p.EnrollmentDigest != managedEndpointReservationDigest(p) {
+	if _, err = p.CanonicalBytes(); err != nil {
 		return r, errManagedEndpointKey
 	}
 	key, err := ecdh.X25519().NewPrivateKey(r.Private)
