@@ -19,6 +19,8 @@ import (
 	"sync"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/crypto"
+	"github.com/pagnet-code/pagnet/transport"
 	"golang.org/x/sys/unix"
 )
 
@@ -167,16 +169,39 @@ func (s *NativeShareSourceHolderStore) Ensure(scope NativeShareSourceHolderScope
 }
 
 // NativeShareSourceHolderKeyUse exposes cryptographic operations, never private
-// bytes. A retained capability fails after its callback returns. Shared secrets
-// belong to the caller and must be cleared by the caller when no longer needed.
+// bytes. A retained capability fails after its callback returns. Returned shared
+// secrets and challenges must be cleared by the caller when no longer needed.
 type NativeShareSourceHolderKeyUse interface {
 	Sign([]byte) ([]byte, error)
 	SharedSecret([]byte) ([]byte, error)
+	OpenEnrollmentChallenge(transport.NativeShareSourceProvePayload) ([]byte, error)
 }
 
 type nativeShareSourceHolderKeyUse struct {
-	mu    sync.Mutex
-	x, ed []byte
+	mu          sync.Mutex
+	x, ed       []byte
+	fingerprint string
+}
+
+func (k *nativeShareSourceHolderKeyUse) OpenEnrollmentChallenge(p transport.NativeShareSourceProvePayload) ([]byte, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if len(k.x) != 32 {
+		return nil, errNativeShareSourceHolder
+	}
+	if _, err := p.CanonicalBytes(); err != nil || p.DescriptorFingerprint != k.fingerprint {
+		return nil, errNativeShareSourceHolder
+	}
+	aad, err := p.ChallengeAAD()
+	if err != nil {
+		return nil, errNativeShareSourceHolder
+	}
+	plain, err := crypto.OpenKey(k.x, p.Challenge.Enc, []byte(transport.NativeShareSourceChallengeInfo), aad, p.Challenge.Ciphertext)
+	if err != nil || len(plain) != 32 {
+		clear(plain)
+		return nil, errNativeShareSourceHolder
+	}
+	return plain, nil
 }
 
 func (k *nativeShareSourceHolderKeyUse) Sign(message []byte) ([]byte, error) {
@@ -305,7 +330,7 @@ func (s *NativeShareSourceHolderStore) access(scope NativeShareSourceHolderScope
 			return empty, err
 		}
 		if use != nil {
-			keys := &nativeShareSourceHolderKeyUse{x: bytes.Clone(record.X25519Private), ed: bytes.Clone(record.Ed25519Private)}
+			keys := &nativeShareSourceHolderKeyUse{x: bytes.Clone(record.X25519Private), ed: bytes.Clone(record.Ed25519Private), fingerprint: d.Fingerprint}
 			defer keys.close()
 			if err = use(keys); err != nil {
 				return empty, err
