@@ -1127,6 +1127,9 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.nativeSourcePrepare != nil && d.nativeSourcePrepare.nativeShareSourcePrepareReady() {
 		q.Set("native_share_source_enrollment", transport.NativeShareSourceEnrollmentProtocol)
 	}
+	// Closed Prepare has no composed ingress/verifier yet. Never inherit an
+	// offer from the configured URL, including duplicate query values.
+	q.Del("managed_endpoint_prepare")
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
@@ -1198,6 +1201,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer conn.Close()
 	nativeConn := d.nativeConnection(conn)
 	nativeConn.offeredSnapshotSigningPublicKey = snapshotSigningPublicKey
+	nativeConn.offeredManagedEndpointPrepare = dialEndpoint.Query().Get("managed_endpoint_prepare") == transport.ManagedEndpointPrepareProtocol
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
@@ -1761,7 +1765,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+	if env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {
