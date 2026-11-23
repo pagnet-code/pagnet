@@ -12,10 +12,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/domain"
+	"github.com/pagnet-code/pagnet/internal/crypto"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 func sourceHolderFixture(t *testing.T) (*NativeShareSourceHolderStore, NativeShareSourceHolderScope) {
@@ -122,6 +125,7 @@ func TestNativeShareSourceHolderKeyCapabilityLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	challenge, _ := sourceHolderChallenge(t, d)
 	peer, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +194,9 @@ func TestNativeShareSourceHolderKeyCapabilityLifetime(t *testing.T) {
 			if _, err := retained.SharedSecret(peer.PublicKey().Bytes()); err == nil {
 				t.Fatal("retained key agreement remained usable")
 			}
+			if plain, err := retained.OpenEnrollmentChallenge(challenge); err != errNativeShareSourceHolder || plain != nil {
+				t.Fatal("retained challenge opener remained usable")
+			}
 		})
 	}
 	wrong := d
@@ -202,6 +209,119 @@ func TestNativeShareSourceHolderKeyCapabilityLifetime(t *testing.T) {
 	fresh.HostID = domain.NewID()
 	if err := store.WithKeys(fresh, d, func(NativeShareSourceHolderKeyUse) error { called = true; return nil }); err == nil || called {
 		t.Fatal("WithKeys enrolled missing scope")
+	}
+}
+
+func sourceHolderChallenge(t *testing.T, d NativeShareSourceHolderDescriptor) (transport.NativeShareSourceProvePayload, []byte) {
+	t.Helper()
+	p := transport.NativeShareSourceProvePayload{NativeShareSourceChallengeContext: transport.NativeShareSourceChallengeContext{
+		Version: transport.NativeShareSourceVersion, EnrollmentID: domain.NewID(), CommandID: domain.NewID(),
+		EnrollmentDigest: strings.Repeat("ab", 32), DescriptorFingerprint: d.Fingerprint,
+		ChallengeID: domain.NewID(), ExpiresAt: "2027-01-02T03:04:05Z",
+	}}
+	public, err := hex.DecodeString(d.X25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aad, err := p.ChallengeAAD()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := make([]byte, 32)
+	if _, err := rand.Read(plain); err != nil {
+		t.Fatal(err)
+	}
+	p.Challenge.Enc, p.Challenge.Ciphertext, err = crypto.WrapKey(public, []byte(transport.NativeShareSourceChallengeInfo), aad, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, plain
+}
+
+func TestNativeShareSourceHolderOpenEnrollmentChallenge(t *testing.T) {
+	store, scope := sourceHolderFixture(t)
+	d, err := store.Ensure(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := sourceHolderPath(t, store, scope)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(before)
+	_, name, err := nativeShareSourceHolderScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enrolledBefore []byte
+	if err := store.registry.db.QueryRow(`SELECT descriptor FROM native_source_holder_enrollments WHERE scope=?`, name).Scan(&enrolledBefore); err != nil {
+		t.Fatal(err)
+	}
+	p, want := sourceHolderChallenge(t, d)
+	defer clear(want)
+	if err := store.WithKeys(scope, d, func(keys NativeShareSourceHolderKeyUse) error {
+		plain, err := keys.OpenEnrollmentChallenge(p)
+		if err != nil || !bytes.Equal(plain, want) {
+			t.Fatal("challenge did not open", err)
+		}
+		clear(plain)
+		for _, mutation := range []string{"fingerprint", "aad", "info", "ciphertext", "enc", "enc-length", "ciphertext-length", "version", "plaintext-length"} {
+			t.Run(mutation, func(t *testing.T) {
+				changed := p
+				changed.Challenge.Enc = bytes.Clone(p.Challenge.Enc)
+				changed.Challenge.Ciphertext = bytes.Clone(p.Challenge.Ciphertext)
+				switch mutation {
+				case "fingerprint":
+					other := d
+					other.Fingerprint = strings.Repeat("cd", 32)
+					changed, _ = sourceHolderChallenge(t, other)
+				case "aad":
+					changed.CommandID = domain.NewID()
+				case "info", "plaintext-length":
+					public, _ := hex.DecodeString(d.X25519)
+					aad, _ := changed.ChallengeAAD()
+					info, plaintext := []byte(transport.NativeShareSourceChallengeInfo), want
+					if mutation == "info" {
+						info = []byte("wrong info")
+					} else {
+						plaintext = want[:31]
+					}
+					changed.Challenge.Enc, changed.Challenge.Ciphertext, err = crypto.WrapKey(public, info, aad, plaintext)
+					if err != nil {
+						t.Fatal(err)
+					}
+				case "ciphertext":
+					changed.Challenge.Ciphertext[0] ^= 1
+				case "enc":
+					clear(changed.Challenge.Enc)
+				case "enc-length":
+					changed.Challenge.Enc = changed.Challenge.Enc[:31]
+				case "ciphertext-length":
+					changed.Challenge.Ciphertext = changed.Challenge.Ciphertext[:47]
+				case "version":
+					changed.Version++
+				}
+				if plain, err := keys.OpenEnrollmentChallenge(changed); err != errNativeShareSourceHolder || plain != nil {
+					t.Fatal("invalid challenge accepted or non-fixed error returned")
+				}
+			})
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(after)
+	var enrolledAfter []byte
+	if err := store.registry.db.QueryRow(`SELECT descriptor FROM native_source_holder_enrollments WHERE scope=?`, name).Scan(&enrolledAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) || !bytes.Equal(enrolledBefore, enrolledAfter) {
+		t.Fatal("opening a challenge mutated the holder record or enrollment")
 	}
 }
 
