@@ -36,6 +36,7 @@ type NativeObservationConnection struct {
 
 	// Captured from this socket's dial offer before the read loop starts.
 	offeredSnapshotSigningPublicKey string
+	offeredManagedEndpointPrepare   bool
 
 	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
@@ -104,6 +105,15 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		if err != nil || id.String() != p.HostCredentialID {
 			return ErrNativeObservationConflict
 		}
+	}
+	managedPrepareFeatures := 0
+	for _, feature := range p.ProtocolFeatures {
+		if feature == transport.ManagedEndpointPrepareProtocol {
+			managedPrepareFeatures++
+		}
+	}
+	if managedPrepareFeatures > 1 || (managedPrepareFeatures == 1 && !c.offeredManagedEndpointPrepare) {
+		return ErrNativeObservationConflict
 	}
 	snapshotSigningKeyNegotiated := false
 	for _, feature := range p.ProtocolFeatures {
