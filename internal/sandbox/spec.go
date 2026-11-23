@@ -14,8 +14,9 @@
 // supervisor's root-PID tracking and the S1 bridge process-tree binding keep
 // working). Managed Linux runtimes require Landlock ABI3 or newer and fail
 // closed when the sandbox cannot be applied. On
-// platforms without Landlock (darwin) the launch is NOT sandboxed and the
-// platform is reported as non-isolated (owner-scoped dev machines).
+// Darwin, managed launches remain non-isolated (owner-scoped dev machines).
+// The explicit hidden sandbox-exec command uses Seatbelt on Darwin; supervisor
+// integration remains gated on production runtime probes.
 //
 // The allowlist is per-instance and built by the daemon/driver layer from
 // what it already knows (NewSpec). Coarse system read + tight per-instance
@@ -38,6 +39,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -87,15 +89,13 @@ type Spec struct {
 	// authenticates process ancestry and nonce, and private control listeners
 	// must authenticate their own authority independently.
 	Sockets []string
-	// Dev: device subtrees granted read+write+truncate (DAC-gated) — /dev.
-	// Runtimes and their shell commands must WRITE /dev/null (the universal
-	// output sink: `> /dev/null`, `2>/dev/null` — bash opens it
-	// O_WRONLY|O_CREAT|O_TRUNC, so the grant carries the TRUNCATE bit) and
-	// READ /dev/urandom, /dev/zero, /dev/tty. The current policy uses a
-	// /dev subtree grant. Device access remains subject to the OS user/group
-	// permissions; this is not a denylist of every device interface. This
-	// policy does not handle IOCTL_DEV (added in ABI5), so device ioctls
-	// remain possible where device/DAC permissions allow them.
+	// Dev: device grants with platform-specific semantics. Linux grants
+	// read+write+truncate on device subtrees (normally /dev), subject to DAC.
+	// Shell redirection to /dev/null needs write+truncate. Linux does not
+	// handle IOCTL_DEV, so device ioctls remain possible where DAC permits.
+	// Darwin accepts only exact character-device paths and grants read and
+	// data-write, without execute or ioctl access. SystemDev selects only
+	// /dev/null, /dev/zero, /dev/random and /dev/urandom on Darwin.
 	Dev []string
 }
 
@@ -266,21 +266,29 @@ func Home() string {
 // by some runtimes) but not other processes' /proc/<pid> — so one same-UID
 // runtime cannot read another's /proc/<pid>/environ (provider auth).
 //
-// /dev is NOT here: it is a Spec.Dev grant (read+write+truncate, DAC-gated)
-// because runtimes and their shell commands must WRITE /dev/null — see
-// SystemDev.
+// Device access is supplied separately by Spec.Dev because runtimes and
+// their shell commands must write /dev/null — see SystemDev.
 func SystemRO() []string {
+	if runtime.GOOS == "darwin" {
+		// dyld/frameworks live under /System. /private/var/select/sh is the
+		// system shell selector, normally a symlink to /bin/bash; granting
+		// this exact file avoids exposing the rest of /private/var.
+		return []string{"/usr", "/bin", "/sbin", "/etc", "/opt", "/System", "/private/var/select/sh"}
+	}
 	return []string{
 		"/usr", "/bin", "/lib", "/lib64", "/sbin", "/etc", "/opt",
 		"/proc/self",
 	}
 }
 
-// SystemDev returns the device subtrees every sandboxed launch gets
-// read+write+truncate on (Spec.Dev). See the Spec.Dev doc for the rationale
-// (this policy grants the /dev subtree; actual device access remains
-// bounded by OS user/group permissions, and device IOCTL is not handled).
+// SystemDev returns the default device grants (Spec.Dev). Linux grants the
+// /dev subtree with read+write+truncate, subject to DAC. Darwin grants only the
+// exact null, zero and entropy character devices with read and data-write;
+// it does not grant device execution, ioctls or other /dev paths.
 func SystemDev() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{"/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"}
+	}
 	return []string{"/dev"}
 }
 
@@ -293,7 +301,8 @@ func SystemDev() []string {
 // network call the runtime makes dies (observed: codex model requests
 // fail with "workspace routing discovery failed"). A regular
 // /etc/resolv.conf (non-systemd resolvers) is already covered by /etc:
-// no extra grant. Best-effort: an unreadable /etc/resolv.conf yields no
+// no extra grant. Darwin grants the exact resolved file, never /var/run.
+// Best-effort: an unreadable /etc/resolv.conf yields no
 // grant (the regular-file case is already covered; a machine whose
 // resolver config is unreadable by the user cannot do DNS at all).
 // Safe: the grant sits ON TOP of DAC — the resolved target dir
@@ -303,6 +312,11 @@ func ResolvRO() []string {
 	target, err := filepath.EvalSymlinks("/etc/resolv.conf")
 	if err != nil {
 		return nil
+	}
+	if runtime.GOOS == "darwin" {
+		// macOS links resolv.conf into /private/var/run. Only the exact
+		// configuration file is needed; its parent holds unrelated sockets.
+		return []string{target}
 	}
 	if strings.HasPrefix(target, "/etc/") {
 		return nil // the /etc grant already covers the resolved target

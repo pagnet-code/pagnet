@@ -17,6 +17,14 @@ The repository already supplies the following foundations:
 - [Private owner contexts](OWNER_CONTENT_CONTEXTS.md) protect personal representative permission details independently of network membership. [Bridge process binding](BRIDGE_PROCESS_BINDING.md) documents kernel process authentication and the separate filesystem boundary.
 - [Federation transport](../fabric/federation/README.md) provides tested cryptographic components and explicitly identifies missing product integration. It is not evidence of a deployed entry-door service.
 
+### Next managed-agent boundary
+
+The [managed project v1 implementation RFC](MANAGED_PROJECT_V1.md) specifies the proposed first increment: exactly two personal owners, fixed selected managed agents and dedicated project adapters. It remains unshipped and subject to the documented platform security gates.
+
+Managed agents cannot be added to a foreign owner's ordinary network as a shortcut. The current user authorization model gives a network-owning account broad authority over that network, while a managed session is bound to one home network and a host-local runtime. The first managed sharing contract must therefore bind an exact selected managed principal to an owner-controlled adapter identity, keep both owners' consent and the adapter binding immutable, and use a separate encrypted conversation scope. Discovery must return only that roster. Project communication must not grant ordinary network membership, host launch, tasks, invocation, artifact access, or filesystem authority. Queued messages must be rechecked against live consent before local delivery. Automatic delivery to a managed runtime is gated on a verified owner-selected execution profile; where that profile is unavailable, messages remain in an owner-readable quarantined inbox. The existing v2 SDK project contract and its service-only eligibility remain unchanged.
+
+The Darwin Seatbelt wrapper in this branch is experimental and requires explicit invocation; managed supervisor launches do not use it. It does not activate managed-project delivery, foreign managed-agent execution or ordinary foreign network membership. Managed sharing remains disabled until the RFC's platform/runtime enforcement and coordinated release gates pass.
+
 The general API baseline is a 1 MiB body cap on `/api/v1` and a shared per-IP create limiter of 120 requests per minute. That limiter is process-local; it is not durable multi-replica admission or a per-principal, per-grant or per-network usage policy. Neither general control supplies sharing budgets. Pair v1 additionally enforces its six accepted limits through aggregate durable admission. Project v2 also has accepted per-project limits; this does not provide a general shared-network or runtime budget. The cross-account owner budget requires the coordinated deployment above; broader directional and runtime controls below remain future requirements.
 
 ## What can be set up today
