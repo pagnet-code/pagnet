@@ -4,11 +4,13 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	hostcrypto "github.com/pagnet-code/pagnet/internal/crypto"
 	"github.com/pagnet-code/pagnet/transport"
@@ -25,6 +27,27 @@ func assertNativeShareBindingOffer(t *testing.T, d *Daemon, want string) {
 	}
 }
 
+func TestNativeShareBindingReadinessBoundedWhenRegistryBusy(t *testing.T) {
+	store, _, _, _ := nativeShareStoreFixture(t)
+	conn, err := store.registry.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if store.nativeShareBindingReady() {
+		t.Fatal("busy registry advertised binding capability")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("readiness blocked websocket handshake for %s", elapsed)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !store.nativeShareBindingReady() {
+		t.Fatal("released registry did not advertise capability")
+	}
+}
+
 func TestNativeShareBindingProductionCompositionAndRestart(t *testing.T) {
 	fixture, identity, request, session := nativeShareStoreFixture(t)
 	stateDir := privateDaemonStateDir(t)
@@ -35,20 +58,28 @@ func TestNativeShareBindingProductionCompositionAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	newDaemon := func() *Daemon {
+	newDaemon := func() (*Daemon, func()) {
 		d, err := New(Config{StateDir: stateDir, ServerURL: original.Scope.ServerURL}, slog.New(slog.DiscardHandler))
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = d.Close() })
+		if d.nativeShareBindings != nil {
+			t.Fatal("constructor composed binding before serve lock")
+		}
+		release, err := d.acquireServeLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.initNativeShareBindings()
 		store, ok := d.nativeShareBindings.(*NativeShareHolderStore)
 		if !ok || store.registry != d.nativeRegistry {
 			t.Fatal("production executor does not use authoritative registry")
 		}
 		assertNativeShareBindingOffer(t, d, transport.NativeShareBindingProtocol)
-		return d
+		return d, release
 	}
-	d := newDaemon()
+	d, release := newDaemon()
 	reserved, err := d.nativeRegistry.Reserve(original.Scope, original.Spec, original.Profile, original.OriginalOwnershipID)
 	if err != nil {
 		t.Fatal(err)
@@ -71,8 +102,10 @@ func TestNativeShareBindingProductionCompositionAndRestart(t *testing.T) {
 		t.Fatal("closed binding changed original worker authority", err)
 	}
 	d.Close()
+	release()
 	assertNativeShareBindingOffer(t, d, "")
-	restarted := newDaemon()
+	restarted, releaseRestart := newDaemon()
+	defer releaseRestart()
 	retry, err := restarted.nativeShareBindings.Prepare(request, restarted.ServerURL, session)
 	if err != nil {
 		t.Fatal(err)
@@ -81,6 +114,53 @@ func TestNativeShareBindingProductionCompositionAndRestart(t *testing.T) {
 	retryJSON, _ := json.Marshal(retry)
 	if !bytes.Equal(firstJSON, retryJSON) {
 		t.Fatal("production restart changed durable closed binding")
+	}
+}
+
+func TestNativeShareBindingIdentityCreatedOnlyUnderServeLock(t *testing.T) {
+	stateDir := privateDaemonStateDir(t)
+	newDaemon := func() *Daemon {
+		d, err := New(Config{StateDir: stateDir, ServerURL: "https://example.test"}, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = d.Close() })
+		return d
+	}
+	first, contender := newDaemon(), newDaemon()
+	if _, err := os.Stat(hostcrypto.HostPath(stateDir)); !os.IsNotExist(err) {
+		t.Fatalf("constructor created host identity before serve lock: %v", err)
+	}
+	if first.cryptoManager().identity != nil || contender.cryptoManager().identity != nil || first.nativeShareBindings != nil || contender.nativeShareBindings != nil {
+		t.Fatal("constructor cached an identity or holder before serve lock")
+	}
+	release, err := first.acquireServeLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.initNativeShareBindings()
+	if _, err := contender.acquireServeLock(); err == nil {
+		release()
+		t.Fatal("contender acquired live serve lock")
+	}
+	if contender.nativeShareBindings != nil || contender.cryptoManager().identity != nil {
+		t.Fatal("contender composed holder before owning serve lock")
+	}
+	firstStore, ok := first.nativeShareBindings.(*NativeShareHolderStore)
+	if !ok {
+		t.Fatal("owner did not compose holder")
+	}
+	first.Close()
+	release()
+	release, err = contender.acquireServeLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	contender.initNativeShareBindings()
+	secondStore, ok := contender.nativeShareBindings.(*NativeShareHolderStore)
+	if !ok || !bytes.Equal(firstStore.signer, secondStore.signer) {
+		t.Fatal("restarted owner did not reuse stable host signer")
 	}
 }
 

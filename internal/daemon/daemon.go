@@ -787,7 +787,6 @@ func newDaemon(cfg Config, log *slog.Logger, selfExeResolver func() (string, err
 		}
 		d.nativeRegistry = registry
 	}
-	d.initNativeShareBindings()
 	// Crash/restart reconciliation (§39): a hard crash may have left a
 	// turn process tree alive. Verify ownership (start-identity, never a
 	// bare PID) and reclaim proven-ours groups; PID reuse is never killed.
@@ -975,6 +974,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	defer releaseLock()
+	// The holder signer is the stable host identity. Construct it only while
+	// this daemon owns the state directory, so a competing constructor cannot
+	// replace a newly persisted identity before the first connection.
+	d.initNativeShareBindings()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
