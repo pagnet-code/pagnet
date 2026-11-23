@@ -13,7 +13,7 @@ import (
 
 // pendingDirectChannel is local-only. Descriptor binds parent grant/generation,
 // S/P principals and endpoints, epoch and all policy. Publication retains the
-// source's exact randomized HPKE bytes; P leaves it empty. No key is enrolled in
+// source's exact randomized HPKE bytes in both roles. No key is enrolled in
 // the network keyring, including when Active becomes true.
 type pendingDirectChannel struct {
 	ChannelID         string            `json:"channel_id"`
@@ -33,7 +33,7 @@ type pendingDirectChannelFile struct {
 }
 
 func pendingDirectChannelFor(m *directMaterial, publication []byte) (pendingDirectChannel, error) {
-	if m == nil {
+	if m == nil || m.publicationHash == ([32]byte{}) || m.publicationHash != sha256.Sum256(publication) {
 		return pendingDirectChannel{}, errDirect
 	}
 	raw, _ := json.Marshal(m.descriptor)
@@ -63,19 +63,15 @@ func (r pendingDirectChannel) validate() error {
 	if err != nil || r.Outbox == nil {
 		return errDirect
 	}
-	if r.Role == "S" {
-		var p directPackage
-		if directCanonical(r.Publication, &p, 8192) != nil || !bytes.Equal(p.Descriptor, r.Descriptor) {
-			return errDirect
-		}
-		if _, err := directBinary(p.Enc, 32); err != nil {
-			return err
-		}
-		if _, err := directBinary(p.Ciphertext, 48); err != nil {
-			return err
-		}
-	} else if len(r.Publication) != 0 {
+	var p directPackage
+	if directCanonical(r.Publication, &p, 8192) != nil || !bytes.Equal(p.Descriptor, r.Descriptor) {
 		return errDirect
+	}
+	if _, err := directBinary(p.Enc, 32); err != nil {
+		return err
+	}
+	if _, err := directBinary(p.Ciphertext, 48); err != nil {
+		return err
 	}
 	for id, wire := range r.Outbox {
 		if err := r.validateOutgoing(m, id, wire); err != nil {
@@ -152,7 +148,7 @@ func (k *keyring) storePendingDirectChannel(r pendingDirectChannel) (pendingDire
 		if err != nil {
 			return pendingDirectChannel{}, err
 		}
-		if !bytes.Equal(old.Descriptor, r.Descriptor) || old.DescriptorHash != r.DescriptorHash || old.Role != r.Role || old.SourceFingerprint != r.SourceFingerprint || old.PeerFingerprint != r.PeerFingerprint || (r.Role == "P" && !bytes.Equal(old.ChannelKey, r.ChannelKey)) {
+		if !bytes.Equal(old.Descriptor, r.Descriptor) || old.DescriptorHash != r.DescriptorHash || old.Role != r.Role || old.SourceFingerprint != r.SourceFingerprint || old.PeerFingerprint != r.PeerFingerprint || (r.Role == "P" && (!bytes.Equal(old.ChannelKey, r.ChannelKey) || !bytes.Equal(old.Publication, r.Publication))) {
 			return pendingDirectChannel{}, errors.New("sdk: pending direct channel binding conflict")
 		}
 		return old, nil
@@ -236,6 +232,10 @@ func (k *keyring) writePendingDirectChannel(r pendingDirectChannel, key []byte) 
 
 // storeDirectOutgoing must return successfully before the first send. The same
 // message ID can only retry identical complete wire bytes; no plaintext is kept.
+// This check is not an anti-rollback anchor: replacing a valid older record can
+// erase an outbox entry. The caller must preserve the message ID on retry and
+// submit to a server retaining immutable exact wire bytes for that ID. A remote
+// byte conflict is terminal; it must never be retried as a new message/ID.
 func (k *keyring) storeDirectOutgoing(id string, wire []byte) ([]byte, error) {
 	if !validDirectChannelID(id) {
 		return nil, errDirect
@@ -287,11 +287,15 @@ func (k *keyring) storeDirectOutgoing(id string, wire []byte) ([]byte, error) {
 
 // directAuthoritativeStatus is a caller-verified authoritative status contract.
 // This module performs no server call. Publication and possession alone do not
-// satisfy this contract: ACTIVE must bind this exact complete descriptor.
+// satisfy this contract: ACTIVE must bind this exact complete descriptor and
+// source publication. The caller obtains this digest from authenticated current
+// server status, whose immutable publication is the freshness anchor. A local
+// ACTIVE marker is historical evidence only, not protection against rollback.
 type directAuthoritativeStatus struct {
-	State      string
-	ChannelID  string
-	Descriptor []byte
+	State           string
+	ChannelID       string
+	Descriptor      []byte
+	PublicationHash [32]byte
 }
 
 func (k *keyring) markDirectChannelActive(status directAuthoritativeStatus) error {
@@ -307,7 +311,7 @@ func (k *keyring) markDirectChannelActive(status directAuthoritativeStatus) erro
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(r.Descriptor, status.Descriptor) {
+	if !bytes.Equal(r.Descriptor, status.Descriptor) || status.PublicationHash != sha256.Sum256(r.Publication) {
 		return errors.New("sdk: active direct channel binding conflict")
 	}
 	_, key, err := k.readPendingDirectChannelIndex()

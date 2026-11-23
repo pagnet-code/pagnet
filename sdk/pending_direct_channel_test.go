@@ -38,7 +38,7 @@ func storeJournal(t *testing.T, k *keyring, r pendingDirectChannel) pendingDirec
 }
 func activateJournal(t *testing.T, k *keyring, r pendingDirectChannel) {
 	t.Helper()
-	if err := k.markDirectChannelActive(directAuthoritativeStatus{"ACTIVE", r.ChannelID, r.Descriptor}); err != nil {
+	if err := k.markDirectChannelActive(directAuthoritativeStatus{"ACTIVE", r.ChannelID, r.Descriptor, sha256.Sum256(r.Publication)}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -63,7 +63,7 @@ func TestPendingDirectRestartRetryAndNoEnrollment(t *testing.T) {
 	if !reflect.DeepEqual(got, r) {
 		t.Fatal("retry replaced original material")
 	}
-	for _, status := range []directAuthoritativeStatus{{"PENDING", r.ChannelID, r.Descriptor}, {"ACTIVE", directB64(make([]byte, 32)), r.Descriptor}, {"ACTIVE", r.ChannelID, append(append([]byte(nil), r.Descriptor...), ' ')}} {
+	for _, status := range []directAuthoritativeStatus{{"PENDING", r.ChannelID, r.Descriptor, sha256.Sum256(r.Publication)}, {"ACTIVE", directB64(make([]byte, 32)), r.Descriptor, sha256.Sum256(r.Publication)}, {"ACTIVE", r.ChannelID, append(append([]byte(nil), r.Descriptor...), ' '), sha256.Sum256(r.Publication)}, {"ACTIVE", r.ChannelID, r.Descriptor, [32]byte{}}} {
 		if reopened.markDirectChannelActive(status) == nil {
 			t.Fatal("inexact ACTIVE accepted")
 		}
@@ -99,7 +99,7 @@ func TestPendingDirectBindingConflicts(t *testing.T) {
 	if _, err := k.storePendingDirectChannel(changed); err == nil {
 		t.Fatal("changed complete binding accepted")
 	}
-	peer, err := pendingDirectChannelFor(p, nil)
+	peer, err := pendingDirectChannelFor(p, r.Publication)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestDirectJournalOutboxASKAndREPLY(t *testing.T) {
 		t.Run(role, func(t *testing.T) {
 			m, pub, wire := s, publication, ask
 			if role == "P" {
-				m, pub, wire = p, nil, reply
+				m, pub, wire = p, publication, reply
 			}
 			k, _ := newKeyring(t.TempDir())
 			r, err := pendingDirectChannelFor(m, pub)
@@ -387,5 +387,173 @@ func TestDirectJournalConcurrentOutbox(t *testing.T) {
 	got, err := k.loadPendingDirectChannel(r.ChannelID)
 	if err != nil || len(got.Outbox) != count {
 		t.Fatalf("lost outbox writes: %d %v", len(got.Outbox), err)
+	}
+}
+
+func TestPendingDirectPeerRequiresAcceptedPublication(t *testing.T) {
+	s, p, publication, _ := directMaterials(t)
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			m := s
+			if role == "P" {
+				m = p
+			}
+			if _, err := pendingDirectChannelFor(m, publication); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pendingDirectChannelFor(m, nil); err == nil {
+				t.Fatal("missing accepted publication allowed")
+			}
+			var pkg directPackage
+			json.Unmarshal(publication, &pkg)
+			pkg.Ciphertext = directB64(bytes.Repeat([]byte{7}, 48))
+			changed, _ := json.Marshal(pkg)
+			if _, err := pendingDirectChannelFor(m, changed); err == nil {
+				t.Fatal("unopened publication allowed")
+			}
+			uninstalled, err := directMaterialFor(m.descriptor, pkg.Descriptor, m.key[:], role)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pendingDirectChannelFor(uninstalled, publication); err == nil {
+				t.Fatal("uninstalled material accepted")
+			}
+		})
+	}
+}
+
+func TestPendingDirectActiveRequiresExactAuthoritativePublication(t *testing.T) {
+	s, p, publication, _ := directMaterials(t)
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			m := s
+			if role == "P" {
+				m = p
+			}
+			k, _ := newKeyring(t.TempDir())
+			r, err := pendingDirectChannelFor(m, publication)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storeJournal(t, k, r)
+			status := directAuthoritativeStatus{"ACTIVE", r.ChannelID, r.Descriptor, sha256.Sum256([]byte("different exact publication"))}
+			if err := k.markDirectChannelActive(status); err == nil {
+				t.Fatal("wrong publication digest activated")
+			}
+			got, err := k.loadPendingDirectChannel(r.ChannelID)
+			if err != nil || got.Active {
+				t.Fatalf("wrong publication changed marker: %v", err)
+			}
+			status.PublicationHash = sha256.Sum256(publication)
+			if err := k.markDirectChannelActive(status); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(filepath.Join(k.pendingDirectChannelDir(r.ChannelID), "record.json")); err != nil {
+				t.Fatal(err)
+			}
+			if err := (&keyring{root: k.root}).markDirectChannelActive(status); err == nil {
+				t.Fatal("missing local material activated")
+			}
+		})
+	}
+}
+
+func TestPendingDirectRolledBackReservationNeedsAuthoritativePublication(t *testing.T) {
+	k, _ := newKeyring(t.TempDir())
+	d, raw, private, _, now := directFixture(t)
+	unlock, err := k.lockPendingDirectChannels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	indexPath := filepath.Join(k.root, "pending-direct-channels", "index.json")
+	oldIndex, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, publication, err := directPrepare(raw, d, private, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := pendingDirectChannelFor(m, publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeJournal(t, k, original)
+	authoritative := directAuthoritativeStatus{"ACTIVE", original.ChannelID, original.Descriptor, sha256.Sum256(publication)}
+	// Replay a valid older authenticated index and remove its child. Local MACs
+	// cannot distinguish this from first reservation, so remote status must anchor
+	// the original publication before the regenerated candidate can become active.
+	if err := os.WriteFile(indexPath, oldIndex, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(k.pendingDirectChannelDir(original.ChannelID)); err != nil {
+		t.Fatal(err)
+	}
+	replacementMaterial, replacementPublication, err := directPrepare(raw, d, private, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := pendingDirectChannelFor(replacementMaterial, replacementPublication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &keyring{root: k.root}
+	got := storeJournal(t, restarted, replacement)
+	if bytes.Equal(got.Publication, publication) {
+		t.Fatal("fixture did not generate different material")
+	}
+	if err := restarted.markDirectChannelActive(authoritative); err == nil {
+		t.Fatal("regenerated publication activated against old authoritative status")
+	}
+	got, err = restarted.loadPendingDirectChannel(original.ChannelID)
+	if err != nil || got.Active {
+		t.Fatalf("replacement became active: %v", err)
+	}
+}
+
+func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
+	k, r, s, _, _ := journalFixture(t)
+	_, _, _, now := directMaterials(t)
+	storeJournal(t, k, r)
+	activateJournal(t, k, r)
+	path := filepath.Join(k.pendingDirectChannelDir(r.ChannelID), "record.json")
+	oldRecord, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := s.seal("ASK", "same-message-id", "root", nil, []byte("original"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedWire, err := k.storeDirectOutgoing(r.ChannelID, wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model the remote immutable wire contract. The remote identity stays the
+	// same across local rollback; byte disagreement is terminal, never a new ID.
+	remoteRetry := func(id string, candidate []byte) error {
+		if id != "same-message-id" || !bytes.Equal(retainedWire, candidate) {
+			return errors.New("remote immutable wire conflict")
+		}
+		return nil
+	}
+	if err := os.WriteFile(path, oldRecord, 0600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &keyring{root: k.root}
+	changed, err := s.seal("ASK", "same-message-id", "root", nil, []byte("changed after rollback"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := restarted.storeDirectOutgoing(r.ChannelID, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := remoteRetry("same-message-id", local); err == nil {
+		t.Fatal("rollback retry treated as a new send")
+	}
+	if err := remoteRetry("same-message-id", wire); err != nil {
+		t.Fatal("exact remote retry rejected")
 	}
 }

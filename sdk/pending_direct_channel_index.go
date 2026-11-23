@@ -35,9 +35,13 @@ func readPrivateDirectChannelFile(path string) ([]byte, error) {
 
 // All callers hold the parent process lock. The MAC detects partial corruption
 // and rewrites while the authentication key is retained. It does not protect
-// against an attacker replacing the entire local store. Complete store deletion
-// is indistinguishable from first use. Remote immutable publication enforcement
-// is outside this local-only journal.
+// against replacement with valid older files: selective record rollback can
+// erase outbox entries, and rolling back the index then deleting a channel can
+// allow different material to be generated. The server must retain immutable
+// exact publication and message wire bytes; authoritative publication status
+// detects material disagreement, and message-ID conflicts must be terminal.
+// Complete store deletion is also indistinguishable from first use. This module
+// supplies no local monotonic freshness guarantee against arbitrary file replay.
 func (k *keyring) initPendingDirectChannelStore() error {
 	dir := filepath.Join(k.root, "pending-direct-channels")
 	err := os.Mkdir(dir, 0700)

@@ -114,10 +114,11 @@ type directPackage struct {
 // directMaterial is local-only and must never be serialized to N. Only
 // readinessKey() is suitable for server publication, alongside directPackage.
 type directMaterial struct {
-	descriptor directDescriptor
-	hash       [32]byte
-	key        [32]byte
-	role       string
+	descriptor      directDescriptor
+	hash            [32]byte
+	key             [32]byte
+	role            string
+	publicationHash [32]byte // set only after preparing or accepting the exact HPKE publication
 }
 
 func directMaterialFor(d directDescriptor, raw, key []byte, role string) (*directMaterial, error) {
@@ -148,6 +149,9 @@ func directPrepare(raw []byte, expected directDescriptor, private []byte, now ti
 		return nil, nil, err
 	}
 	wire, err := json.Marshal(directPackage{append(json.RawMessage(nil), raw...), directB64(enc), directB64(ct)})
+	if err == nil {
+		m.publicationHash = sha256.Sum256(wire)
+	}
 	return m, wire, err
 }
 func directAccept(wire []byte, expected directDescriptor, private []byte, now time.Time) (*directMaterial, error) {
@@ -171,7 +175,12 @@ func directAccept(wire []byte, expected directDescriptor, private []byte, now ti
 	if err != nil {
 		return nil, err
 	}
-	return directMaterialFor(d, p.Descriptor, key, "P")
+	m, err := directMaterialFor(d, p.Descriptor, key, "P")
+	if err != nil {
+		return nil, err
+	}
+	m.publicationHash = sha256.Sum256(wire)
+	return m, nil
 }
 func (m *directMaterial) derive(purpose string) ([]byte, error) {
 	return hkdf.Key(sha256.New, m.key[:], m.hash[:], directDomain+"/"+purpose, 32)
