@@ -40,7 +40,33 @@ type NativeShareHolderStore struct {
 }
 
 func (s *NativeShareHolderStore) nativeShareBindingReady() bool {
-	return s != nil && s.registry != nil && len(s.signer) == ed25519.PrivateKeySize && s.now != nil
+	if s == nil || s.registry == nil || s.registry.db == nil || len(s.signer) != ed25519.PrivateKeySize || s.now == nil {
+		return false
+	}
+	// The registry has one connection. A transaction may hold it while the
+	// websocket handshake advertises capabilities; never stall that handshake
+	// indefinitely waiting for a readiness probe.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	return s.registry.db.PingContext(ctx) == nil
+}
+
+// Compose only the closed holder lane. Epoch installation, membership and
+// messaging remain separate authority and are not composed here.
+func (d *Daemon) initNativeShareBindings() {
+	if d.nativeRegistry == nil {
+		return
+	}
+	identity, err := d.cryptoManager().hostIdentity()
+	if err == nil {
+		var store *NativeShareHolderStore
+		store, err = NewNativeShareHolderStore(d.nativeRegistry, identity)
+		if err == nil && store.nativeShareBindingReady() {
+			d.nativeShareBindings = store
+			return
+		}
+	}
+	d.Log.Warn("closed native share bindings unavailable")
 }
 
 func (s *NativeShareHolderStore) String() string { return "NativeShareHolderStore{closed}" }

@@ -19,8 +19,8 @@ const nativeShareBindingPayloadLimit = 16 << 10
 const nativeShareBindingQueueLimit = 8
 const nativeShareBindingError = "native share binding unavailable"
 
-// Deliberately uncomposed in production. The executor must be a ready holder
-// store; this interface keeps the dormant socket lane portable to remote CLIs.
+// The executor must be a ready closed holder store; this interface keeps the
+// socket lane portable to remote CLIs without native storage support.
 type nativeShareBindingExecutor interface {
 	nativeShareBindingReady() bool
 	Prepare(transport.NativeShareBindingPreparePayload, string, transport.HostSessionPayload) (transport.NativeShareBindingPreparedPayload, error)

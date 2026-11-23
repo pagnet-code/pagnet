@@ -204,7 +204,7 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	nativeShareBindings nativeShareBindingExecutor // nil until explicitly composed; dormant preview
+	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
 	nativeRegistry      *NativeWorkerRegistry
 	nativeWorkersMu     sync.Mutex
 	nativeConnectLocks  [16]sync.Mutex
@@ -974,6 +974,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	defer releaseLock()
+	// The holder signer is the stable host identity. Construct it only while
+	// this daemon owns the state directory, so a competing constructor cannot
+	// replace a newly persisted identity before the first connection.
+	d.initNativeShareBindings()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
