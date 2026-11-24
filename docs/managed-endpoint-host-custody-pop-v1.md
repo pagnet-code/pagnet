@@ -42,9 +42,14 @@ For canonical challenge bytes C:
 
 The proof contains the protocol, suite, challenge ID, lowercase hex T and
 lowercase hex confirmation. X25519 is used for DH only. No signatures are used.
-The server can derive the same Z with its ephemeral private key and reserved host
-public key, then compare the exact challenge ID, transcript hash and confirmation
-in constant time. It must consume the challenge atomically to prevent replay.
+The server derives the same Z with its ephemeral private key and reserved host
+public key. `DeriveManagedEndpointPoPVerifier` returns the transcript hash and
+SHA256(`pagnet/managed-endpoint-host-custody-pop/verifier/v1/` || T || Confirmation),
+where T and Confirmation are decoded 32-byte values. The server discards the
+ephemeral private key before delivery. `DecodeManagedEndpointPoPProofVerifier`
+strictly decodes the proof and derives its verifier. The caller checks the exact
+challenge ID and transcript hash, compares verifier digests in constant time,
+and consumes the challenge atomically to prevent replay.
 
 Decoders accept bounded exact canonical JSON only. They reject unknown, missing
 or duplicate fields, trailing data, malformed Unicode, alternate numeric/time
