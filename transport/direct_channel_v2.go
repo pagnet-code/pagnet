@@ -17,9 +17,12 @@ import (
 )
 
 const (
-	DirectChannelDomainV2                     = "pagnet/direct_ask_reply_v2"
-	DirectChannelSuiteV2                      = "X25519-HKDF-SHA256-AES-256-GCM-Auth"
-	DirectChannelCountingVersionV2            = "canonical_encrypted_wire_bytes_utc_minute_day_ask_reply_each_v1"
+	DirectChannelDomainV2 = "pagnet/direct_ask_reply_v2"
+	DirectChannelSuiteV2  = "X25519-HKDF-SHA256-AES-256-GCM-Auth"
+	// DirectChannelCountingVersionV2 preserves the original counting contract and default.
+	DirectChannelCountingVersionV2 = "canonical_encrypted_wire_bytes_utc_minute_day_ask_reply_each_v1"
+	// DirectChannelCountingVersionReservedV2 is the opt-in, non-live reply-reservation contract.
+	DirectChannelCountingVersionReservedV2    = "canonical_encrypted_wire_bytes_utc_minute_day_ask_reply_reserved_v2"
 	DirectChannelReadinessProtocolV2          = "direct_channel_readiness_v2"
 	DirectChannelDescriptorMaxBytesV2         = 8192
 	DirectChannelPublicationMaxBytesV2        = 12288
@@ -155,6 +158,22 @@ func (p DirectChannelEndpointV2) valid() bool {
 func (l DirectChannelLimitsV2) valid() bool {
 	return l.MaxMessageWireBytes >= 1024 && l.MaxMessageWireBytes <= 65536 && l.MaxMessagesPerMinute >= 1 && l.MaxMessagesPerMinute <= 10 && l.MaxMessagesPerDay >= 1 && l.MaxMessagesPerDay <= 200 && l.MaxWireBytesPerDay >= l.MaxMessageWireBytes && l.MaxWireBytesPerDay <= 8388608 && l.MaxInFlight >= 1 && l.MaxInFlight <= 2 && l.MaxTurnsPerThread >= 1 && l.MaxTurnsPerThread <= 16
 }
+
+// validForCounting applies the selected contract to both pair and grant limits.
+// Division avoids overflowing when checking the capacity for two maximum wires.
+func (l DirectChannelLimitsV2) validForCounting(version string) bool {
+	if !l.valid() {
+		return false
+	}
+	switch version {
+	case DirectChannelCountingVersionV2:
+		return true
+	case DirectChannelCountingVersionReservedV2:
+		return l.MaxMessagesPerMinute >= 2 && l.MaxMessagesPerDay >= 2 && l.MaxMessageWireBytes <= l.MaxWireBytesPerDay/2
+	default:
+		return false
+	}
+}
 func (l DirectChannelLimitsV2) within(g DirectChannelLimitsV2) bool {
 	return l.MaxMessageWireBytes <= g.MaxMessageWireBytes && l.MaxMessagesPerMinute <= g.MaxMessagesPerMinute && l.MaxMessagesPerDay <= g.MaxMessagesPerDay && l.MaxWireBytesPerDay <= g.MaxWireBytesPerDay && l.MaxInFlight <= g.MaxInFlight && l.MaxTurnsPerThread <= g.MaxTurnsPerThread
 }
@@ -166,7 +185,7 @@ func ValidateDirectChannelDescriptorV2(d DirectChannelDescriptorV2, now time.Tim
 	expiry, ok := directV2Time(d.ExpiresAt)
 	budgetExpiry, bok := directV2Time(d.Budget.ExpiresAt)
 	epoch, err := uuid.Parse(d.EpochID)
-	if d.Domain != DirectChannelDomainV2 || d.Suite != DirectChannelSuiteV2 || !directV2ID(d.ParentGrantID) || !directV2Decimal(d.GrantGeneration) || !directV2Decimal(d.ChannelGeneration) || !directV2ID(d.DirectIntentID) || !directV2ID(d.NetworkID) || !directV2Digest(d.AuthorizationDigest) || !d.S.valid() || !d.P.valid() || d.S.PrincipalID == d.P.PrincipalID || d.S.EndpointID == d.P.EndpointID || d.S.PublicKey == d.P.PublicKey || err != nil || !directV2ID(d.EpochID) || epoch.Version() != 7 || epoch.Variant() != uuid.RFC4122 || !ok || !bok || !expiry.After(now) || expiry.After(budgetExpiry) || !directV2ID(d.Budget.AgreementID) || (!directV2Decimal(d.Budget.AcceptedRevision) || d.Budget.AcceptedRevision == "1") || !directV2Digest(d.Budget.TermsDigest) || d.Budget.CountingVersion != DirectChannelCountingVersionV2 || !d.Limits.valid() || !d.Budget.GrantLimits.valid() || !d.Limits.within(d.Budget.GrantLimits) {
+	if d.Domain != DirectChannelDomainV2 || d.Suite != DirectChannelSuiteV2 || !directV2ID(d.ParentGrantID) || !directV2Decimal(d.GrantGeneration) || !directV2Decimal(d.ChannelGeneration) || !directV2ID(d.DirectIntentID) || !directV2ID(d.NetworkID) || !directV2Digest(d.AuthorizationDigest) || !d.S.valid() || !d.P.valid() || d.S.PrincipalID == d.P.PrincipalID || d.S.EndpointID == d.P.EndpointID || d.S.PublicKey == d.P.PublicKey || err != nil || !directV2ID(d.EpochID) || epoch.Version() != 7 || epoch.Variant() != uuid.RFC4122 || !ok || !bok || !expiry.After(now) || expiry.After(budgetExpiry) || !directV2ID(d.Budget.AgreementID) || (!directV2Decimal(d.Budget.AcceptedRevision) || d.Budget.AcceptedRevision == "1") || !directV2Digest(d.Budget.TermsDigest) || !d.Limits.validForCounting(d.Budget.CountingVersion) || !d.Budget.GrantLimits.validForCounting(d.Budget.CountingVersion) || !d.Limits.within(d.Budget.GrantLimits) {
 		return errDirectChannelV2
 	}
 	return nil
