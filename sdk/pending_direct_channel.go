@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/pagnet-code/pagnet/transport"
 )
 
-// pendingDirectChannel is local-only. Descriptor binds parent grant/generation,
-// S/P principals and endpoints, epoch and all policy. Publication retains the
-// source's exact randomized HPKE bytes in both roles. No key is enrolled in
+// pendingDirectChannel is local-only. Descriptor binds both generations, intent,
+// S/P endpoint credentials and evidence, epoch and accepted budget. Publication
+// retains the source's exact randomized HPKE bytes in both roles. No key is enrolled in
 // the network keyring, including when Active becomes true.
 type pendingDirectChannel struct {
 	ChannelID         string            `json:"channel_id"`
@@ -45,7 +47,7 @@ func pendingDirectChannelFor(m *directMaterial, publication []byte) (pendingDire
 
 func (r pendingDirectChannel) material() (*directMaterial, error) {
 	var d directDescriptor
-	if directCanonical(r.Descriptor, &d, 4096) != nil {
+	if directCanonical(r.Descriptor, &d, transport.DirectChannelDescriptorMaxBytesV2) != nil {
 		return nil, errDirect
 	}
 	if _, err := directValidate(r.Descriptor, d, time.Time{}); err != nil {
@@ -56,22 +58,31 @@ func (r pendingDirectChannel) material() (*directMaterial, error) {
 	if r.ChannelID != directChannelID(d) || r.DescriptorHash != sha256.Sum256(r.Descriptor) || r.SourceFingerprint != sha256.Sum256(s) || r.PeerFingerprint != sha256.Sum256(p) {
 		return nil, errDirect
 	}
-	return directMaterialFor(d, r.Descriptor, r.ChannelKey, r.Role)
+	// Restore publication identity only after validating its canonical V2 bytes
+	// and exact descriptor binding. The authenticated record retains the root.
+	publication, err := transport.DecodeDirectChannelPublicationV2(r.Publication)
+	if err != nil {
+		return nil, errDirect
+	}
+	raw, err := publication.Descriptor.CanonicalBytes()
+	if err != nil || !bytes.Equal(raw, r.Descriptor) {
+		return nil, errDirect
+	}
+	m, err := directMaterialFor(d, r.Descriptor, r.ChannelKey, r.Role)
+	if err != nil {
+		return nil, err
+	}
+	m.publicationHash = sha256.Sum256(r.Publication)
+	return m, nil
 }
 func (r pendingDirectChannel) validate() error {
 	m, err := r.material()
-	if err != nil || r.Outbox == nil {
+	if err != nil {
 		return errDirect
 	}
-	var p directPackage
-	if directCanonical(r.Publication, &p, 8192) != nil || !bytes.Equal(p.Descriptor, r.Descriptor) {
+	defer clear(m.key[:])
+	if r.Outbox == nil {
 		return errDirect
-	}
-	if _, err := directBinary(p.Enc, 32); err != nil {
-		return err
-	}
-	if _, err := directBinary(p.Ciphertext, 48); err != nil {
-		return err
 	}
 	for id, wire := range r.Outbox {
 		if err := r.validateOutgoing(m, id, wire); err != nil {
@@ -115,7 +126,8 @@ func (r pendingDirectChannel) validateOutgoing(m *directMaterial, id string, wir
 	nonce, _ := directBinary(w.Nonce, 12)
 	ct, _ := directBinary(w.Ciphertext, -1)
 	aad, _ := json.Marshal(h)
-	_, err = aead.Open(nil, nonce, ct, aad)
+	plaintext, err := aead.Open(nil, nonce, ct, aad)
+	clear(plaintext)
 	return err
 }
 func (k *keyring) pendingDirectChannelDir(id string) string {
@@ -256,6 +268,7 @@ func (k *keyring) storeDirectOutgoing(id string, wire []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer clear(m.key[:])
 	var w directWire
 	if directCanonical(wire, &w, m.descriptor.Limits.MaxMessageWireBytes) != nil {
 		return nil, errDirect

@@ -89,12 +89,12 @@ func TestPendingDirectBindingConflicts(t *testing.T) {
 	changed := r
 	var d directDescriptor
 	json.Unmarshal(changed.Descriptor, &d)
-	d.Limits.MaxAsksPerDay++ // Channel ID intentionally excludes policy.
+	d.Limits.MaxMessagesPerDay-- // Channel ID intentionally excludes policy.
 	changed.Descriptor, _ = json.Marshal(d)
 	changed.DescriptorHash = sha256.Sum256(changed.Descriptor)
 	var pkg directPackage
 	json.Unmarshal(changed.Publication, &pkg)
-	pkg.Descriptor = changed.Descriptor
+	pkg.Descriptor = d
 	changed.Publication, _ = json.Marshal(pkg)
 	if _, err := k.storePendingDirectChannel(changed); err == nil {
 		t.Fatal("changed complete binding accepted")
@@ -411,7 +411,7 @@ func TestPendingDirectPeerRequiresAcceptedPublication(t *testing.T) {
 			if _, err := pendingDirectChannelFor(m, changed); err == nil {
 				t.Fatal("unopened publication allowed")
 			}
-			uninstalled, err := directMaterialFor(m.descriptor, pkg.Descriptor, m.key[:], role)
+			uninstalled, err := directMaterialFor(m.descriptor, rDescriptorBytes(t, pkg.Descriptor), m.key[:], role)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -555,5 +555,157 @@ func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
 	}
 	if err := remoteRetry("same-message-id", wire); err != nil {
 		t.Fatal("exact remote retry rejected")
+	}
+}
+
+func rDescriptorBytes(t *testing.T, d directDescriptor) []byte {
+	t.Helper()
+	raw, err := d.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestPendingDirectReadinessReloadExactPublication(t *testing.T) {
+	s, p, publication, now := directMaterials(t)
+	for _, m := range []*directMaterial{s, p} {
+		t.Run(m.role, func(t *testing.T) {
+			k, err := newKeyring(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := pendingDirectChannelFor(m, publication)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storeJournal(t, k, r)
+			challenge := directReadinessChallenge(m, now)
+			raw, err := challenge.CanonicalBytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, err := m.readinessProof(raw, challenge.CredentialID, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := (&keyring{root: k.root}).loadPendingDirectChannel(r.ChannelID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := got.material()
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof, err := restored.readinessProof(raw, challenge.CredentialID, now)
+			if err != nil || !bytes.Equal(proof, original) || restored.publicationHash != m.publicationHash || !bytes.Equal(got.Publication, publication) {
+				t.Fatalf("exact publication readiness reload: %v", err)
+			}
+			// Canonical publication alone is insufficient when its descriptor differs.
+			changed := got
+			var pkg directPackage
+			if err := json.Unmarshal(changed.Publication, &pkg); err != nil {
+				t.Fatal(err)
+			}
+			pkg.Descriptor.Limits.MaxMessagesPerDay--
+			changed.Publication, _ = json.Marshal(pkg)
+			if _, err := changed.material(); err == nil {
+				t.Fatal("restored publication hash for inexact descriptor")
+			}
+			changed = got
+			changed.Publication = append(append([]byte(nil), changed.Publication...), ' ')
+			if _, err := changed.material(); err == nil {
+				t.Fatal("restored noncanonical publication")
+			}
+			changed = got
+			changed.Publication = nil
+			if _, err := changed.material(); err == nil {
+				t.Fatal("restored absent publication")
+			}
+		})
+	}
+}
+
+func TestPendingDirectV1ReservedRecordRemainsUntouched(t *testing.T) {
+	k, r, s, _, _ := journalFixture(t)
+	// Install a correctly MACed historical record under its V1 reservation.
+	// The disk record/index format is retained; the descriptor is genuinely V1.
+	legacy := r
+	legacy.Descriptor = directLegacyDescriptor(t, s.descriptor)
+	legacy.DescriptorHash = sha256.Sum256(legacy.Descriptor)
+	var identity struct {
+		Domain        string          `json:"domain"`
+		ParentGrantID string          `json:"parentGrantId"`
+		Generation    string          `json:"generation"`
+		S             json.RawMessage `json:"s"`
+		P             json.RawMessage `json:"p"`
+		EpochID       string          `json:"epochId"`
+	}
+	if err := json.Unmarshal(legacy.Descriptor, &identity); err != nil {
+		t.Fatal(err)
+	}
+	identity.Domain = "pagnet/direct_ask_reply_v1/channel-id"
+	identityRaw, _ := json.Marshal(identity)
+	identityHash := sha256.Sum256(identityRaw)
+	legacy.ChannelID = directB64(identityHash[:])
+	unlock, err := k.lockPendingDirectChannels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, key, err := k.readPendingDirectChannelIndex()
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	index[legacy.ChannelID] = true
+	if err := k.writePendingDirectChannelIndex(index, key); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(k.pendingDirectChannelDir(legacy.ChannelID), 0700); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+
+	var pub struct {
+		Descriptor json.RawMessage `json:"descriptor"`
+		Enc        string          `json:"enc"`
+		Ciphertext string          `json:"ciphertext"`
+	}
+	if err := json.Unmarshal(r.Publication, &pub); err != nil {
+		t.Fatal(err)
+	}
+	pub.Descriptor = legacy.Descriptor
+	legacy.Publication, _ = json.Marshal(pub)
+	if err := k.writePendingDirectChannel(legacy, key); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{filepath.Join(k.pendingDirectChannelDir(legacy.ChannelID), "record.json"), filepath.Join(k.root, "pending-direct-channels", "index.json"), filepath.Join(k.root, "pending-direct-channels", "auth.key")}
+	before := make(map[string][]byte)
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = raw
+	}
+	restarted := &keyring{root: k.root}
+	if _, err := restarted.loadPendingDirectChannel(legacy.ChannelID); err == nil {
+		t.Fatal("loaded V1 reserved record")
+	}
+	candidate := r
+	candidate.ChannelID = legacy.ChannelID
+	if _, err := restarted.storePendingDirectChannel(candidate); err == nil {
+		t.Fatal("regenerated V1 reservation with V2 material")
+	}
+	if _, err := restarted.storePendingDirectChannel(legacy); err == nil {
+		t.Fatal("rewrote V1 reserved record")
+	}
+	for _, path := range paths {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(after, before[path]) {
+			t.Fatalf("legacy disk data changed at %s: %v", path, err)
+		}
 	}
 }
