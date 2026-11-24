@@ -11,45 +11,21 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
-const directDomain = "pagnet/direct_ask_reply_v1"
+const directDomain = transport.DirectChannelDomainV2
 
 var errDirect = errors.New("sdk: invalid direct channel context or wire")
 
-// These pure internal types deliberately have no transport or persistence hooks.
-// Struct field order is the canonical JSON order; decoders require byte equality
-// with re-encoding, rejecting duplicate/unknown fields and alternate encodings.
-type directParty struct {
-	TenantID    string `json:"tenantId"`
-	PrincipalID string `json:"principalId"`
-	EndpointID  string `json:"endpointId"`
-	PublicKey   string `json:"publicKey"`
-}
-type directLimits struct {
-	MaxMessageWireBytes int `json:"maxMessageWireBytes"`
-	MaxAsksPerMinute    int `json:"maxAsksPerMinute"`
-	MaxAsksPerDay       int `json:"maxAsksPerDay"`
-	MaxWireBytesPerDay  int `json:"maxWireBytesPerDay"`
-	MaxInFlight         int `json:"maxInFlight"`
-}
-type directDescriptor struct {
-	Domain        string       `json:"domain"`
-	Suite         string       `json:"suite"`
-	ParentGrantID string       `json:"parentGrantId"`
-	Generation    string       `json:"generation"`
-	NetworkID     string       `json:"networkId"`
-	S             directParty  `json:"s"`
-	P             directParty  `json:"p"`
-	EpochID       string       `json:"epochId"`
-	ExpiresAt     string       `json:"expiresAt"`
-	Limits        directLimits `json:"limits"`
-}
+// Use the transport contract without exposing a public SDK direct-channel API.
+type directParty = transport.DirectChannelEndpointV2
+type directLimits = transport.DirectChannelLimitsV2
+type directDescriptor = transport.DirectChannelDescriptorV2
+type directPackage = transport.DirectChannelPublicationV2
 
 func directCanonical(raw []byte, value any, max int) error {
 	if len(raw) == 0 || len(raw) > max || json.Unmarshal(raw, value) != nil {
@@ -69,56 +45,29 @@ func directBinary(s string, size int) ([]byte, error) {
 	return b, nil
 }
 func directB64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-func directPartyValid(p directParty) bool {
-	_, err := directBinary(p.PublicKey, 32)
-	return err == nil && validPairPathID(p.TenantID) && validPairPathID(p.PrincipalID) && validPairPathID(p.EndpointID)
-}
 func directValidate(raw []byte, expected directDescriptor, now time.Time) (directDescriptor, error) {
-	var d directDescriptor
-	if directCanonical(raw, &d, 4096) != nil {
-		return d, errDirect
-	}
-	trusted, _ := json.Marshal(expected)
-	generation, err := strconv.ParseUint(d.Generation, 10, 64)
-	epoch, eerr := uuid.Parse(d.EpochID)
-	expiry, terr := time.Parse(time.RFC3339Nano, d.ExpiresAt)
-	l := d.Limits
-	if !bytes.Equal(raw, trusted) || d.Domain != directDomain || d.Suite != pairSuite || err != nil || generation == 0 || strconv.FormatUint(generation, 10) != d.Generation || eerr != nil || epoch.Version() != 7 || epoch.String() != d.EpochID || terr != nil || expiry.UTC().Format(time.RFC3339Nano) != d.ExpiresAt || !expiry.After(now) || !validPairPathID(d.ParentGrantID) || !validPairPathID(d.NetworkID) || !directPartyValid(d.S) || !directPartyValid(d.P) || d.S.PrincipalID == d.P.PrincipalID || d.S.PublicKey == d.P.PublicKey || l.MaxMessageWireBytes < 1024 || l.MaxMessageWireBytes > 65536 || l.MaxAsksPerMinute < 1 || l.MaxAsksPerMinute > 10 || l.MaxAsksPerDay < 1 || l.MaxAsksPerDay > 200 || l.MaxWireBytesPerDay < l.MaxMessageWireBytes || l.MaxWireBytesPerDay > 8388608 || l.MaxInFlight < 1 || l.MaxInFlight > 2 {
-		return d, errDirect
+	d, err := transport.DecodeDirectChannelDescriptorV2(raw)
+	trusted, terr := expected.CanonicalBytes()
+	if err != nil || terr != nil || !bytes.Equal(raw, trusted) || transport.ValidateDirectChannelDescriptorV2(d, now) != nil {
+		return directDescriptor{}, errDirect
 	}
 	return d, nil
 }
 
-// Channel identity excludes mutable policy fields, but every cryptographic
-// operation additionally binds the hash of the complete immutable descriptor.
 func directChannelID(d directDescriptor) string {
-	identity := struct {
-		Domain        string      `json:"domain"`
-		ParentGrantID string      `json:"parentGrantId"`
-		Generation    string      `json:"generation"`
-		S             directParty `json:"s"`
-		P             directParty `json:"p"`
-		EpochID       string      `json:"epochId"`
-	}{directDomain + "/channel-id", d.ParentGrantID, d.Generation, d.S, d.P, d.EpochID}
-	raw, _ := json.Marshal(identity)
-	hash := sha256.Sum256(raw)
-	return directB64(hash[:])
+	id, _ := transport.DirectChannelIDV2(d)
+	return id
 }
 
-type directPackage struct {
-	Descriptor json.RawMessage `json:"descriptor"`
-	Enc        string          `json:"enc"`
-	Ciphertext string          `json:"ciphertext"`
-}
-
-// directMaterial is local-only and must never be serialized to N. Only
-// readinessKey() is suitable for server publication, alongside directPackage.
+// directMaterial is local-only and must never be serialized to N. The derived
+// readiness key is suitable for the readiness verifier; the root
+// and traffic keys stay local.
 type directMaterial struct {
 	descriptor      directDescriptor
 	hash            [32]byte
 	key             [32]byte
 	role            string
-	publicationHash [32]byte // set only after preparing or accepting the exact HPKE publication
+	publicationHash [32]byte // set only after preparing, accepting, or validating the stored exact publication
 }
 
 func directMaterialFor(d directDescriptor, raw, key []byte, role string) (*directMaterial, error) {
@@ -140,26 +89,36 @@ func directPrepare(raw []byte, expected directDescriptor, private []byte, now ti
 		return nil, nil, errDirect
 	}
 	key := make([]byte, 32)
+	defer clear(key)
 	if _, err = rand.Read(key); err != nil {
 		return nil, nil, err
 	}
-	m, _ := directMaterialFor(d, raw, key, "S")
-	enc, ct, err := e2ee.HPKEWrapAuth(recipient, private, []byte(directDomain+"/epoch-wrap"), m.hash[:], key)
+	hash := sha256.Sum256(raw)
+	enc, ct, err := e2ee.HPKEWrapAuth(recipient, private, []byte(directDomain+"/epoch-wrap"), hash[:], key)
 	if err != nil {
 		return nil, nil, err
 	}
-	wire, err := json.Marshal(directPackage{append(json.RawMessage(nil), raw...), directB64(enc), directB64(ct)})
-	if err == nil {
-		m.publicationHash = sha256.Sum256(wire)
+	wire, err := (directPackage{Descriptor: d, Enc: directB64(enc), Ciphertext: directB64(ct)}).CanonicalBytes()
+	if err != nil {
+		return nil, nil, err
 	}
-	return m, wire, err
+	m, err := directMaterialFor(d, raw, key, "S")
+	if err != nil {
+		return nil, nil, err
+	}
+	m.publicationHash = sha256.Sum256(wire)
+	return m, wire, nil
 }
 func directAccept(wire []byte, expected directDescriptor, private []byte, now time.Time) (*directMaterial, error) {
-	var p directPackage
-	if directCanonical(wire, &p, 8192) != nil {
+	p, err := transport.DecodeDirectChannelPublicationV2(wire)
+	if err != nil {
 		return nil, errDirect
 	}
-	d, err := directValidate(p.Descriptor, expected, now)
+	raw, err := p.Descriptor.CanonicalBytes()
+	if err != nil {
+		return nil, errDirect
+	}
+	d, err := directValidate(raw, expected, now)
 	if err != nil {
 		return nil, err
 	}
@@ -170,12 +129,13 @@ func directAccept(wire []byte, expected directDescriptor, private []byte, now ti
 	if !pairPrivateMatches(private, pub) || eerr != nil || cerr != nil {
 		return nil, errDirect
 	}
-	hash := sha256.Sum256(p.Descriptor)
+	hash := sha256.Sum256(raw)
 	key, err := e2ee.HPKEUnwrapAuth(private, sender, enc, []byte(directDomain+"/epoch-wrap"), hash[:], ct)
+	defer clear(key)
 	if err != nil {
 		return nil, err
 	}
-	m, err := directMaterialFor(d, p.Descriptor, key, "P")
+	m, err := directMaterialFor(d, raw, key, "P")
 	if err != nil {
 		return nil, err
 	}
@@ -187,31 +147,11 @@ func (m *directMaterial) derive(purpose string) ([]byte, error) {
 }
 func (m *directMaterial) readinessKey() ([]byte, error) { return m.derive("readiness") }
 
-type directProofTranscript struct {
-	Domain         string `json:"domain"`
-	ChallengeID    string `json:"challengeId"`
-	Role           string `json:"role"`
-	PrincipalID    string `json:"principalId"`
-	EndpointID     string `json:"endpointId"`
-	CredentialID   string `json:"credentialId"`
-	ChannelID      string `json:"channelId"`
-	ParentGrantID  string `json:"parentGrantId"`
-	Generation     string `json:"generation"`
-	DescriptorHash string `json:"descriptorHash"`
-	EpochID        string `json:"epochId"`
-	Nonce          string `json:"nonce"`
-}
-type directChallenge struct {
-	ID         string
-	Transcript []byte
-	ExpiresAt  time.Time
-}
-
-// CredentialID must come from the caller's authenticated credential metadata.
-// No interpretation of credential IDs or server challenge issuance occurs here.
-func (m *directMaterial) readinessProof(challenge directChallenge, credentialID string, now time.Time) ([]byte, error) {
-	var t directProofTranscript
-	if directCanonical(challenge.Transcript, &t, 4096) != nil {
+// CredentialID comes from authenticated local credential metadata. This helper
+// only proves possession; challenge issuance and replay consumption are external.
+func (m *directMaterial) readinessProof(raw []byte, credentialID string, now time.Time) ([]byte, error) {
+	challenge, err := transport.DecodeDirectChannelReadinessChallengeV2(raw)
+	if err != nil || m.publicationHash == ([32]byte{}) || challenge.Role != m.role {
 		return nil, errDirect
 	}
 	d := m.descriptor
@@ -219,18 +159,22 @@ func (m *directMaterial) readinessProof(challenge directChallenge, credentialID 
 	if m.role == "P" {
 		party = d.P
 	}
-	_, err := directBinary(t.Nonce, 32)
-	expiry, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
-	if err != nil || !expiry.After(now) || !challenge.ExpiresAt.After(now) || !validPairPathID(challenge.ID) || !validPairPathID(credentialID) || t.Domain != directDomain+"/proof" || t.ChallengeID != challenge.ID || t.Role != m.role || t.PrincipalID != party.PrincipalID || t.EndpointID != party.EndpointID || t.CredentialID != credentialID || t.ChannelID != directChannelID(d) || t.ParentGrantID != d.ParentGrantID || t.Generation != d.Generation || t.DescriptorHash != directB64(m.hash[:]) || t.EpochID != d.EpochID {
+	issued, _ := time.Parse(time.RFC3339Nano, challenge.IssuedAt)
+	expiry, _ := time.Parse(time.RFC3339Nano, challenge.ExpiresAt)
+	descriptorExpiry, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
+	if transport.ValidateDirectChannelDescriptorV2(d, now) != nil || now.Before(issued) || !expiry.After(now) || expiry.After(descriptorExpiry) || credentialID != party.CredentialID || challenge.CredentialID != credentialID || challenge.PrincipalID != party.PrincipalID || challenge.EndpointID != party.EndpointID || challenge.ChannelID != directChannelID(d) || challenge.ParentGrantID != d.ParentGrantID || challenge.GrantGeneration != d.GrantGeneration || challenge.ChannelGeneration != d.ChannelGeneration || challenge.DirectIntentID != d.DirectIntentID || challenge.DescriptorHash != directB64(m.hash[:]) || challenge.PublicationHash != directB64(m.publicationHash[:]) || challenge.EpochID != d.EpochID {
 		return nil, errDirect
 	}
 	key, err := m.readinessKey()
+	defer clear(key)
 	if err != nil {
 		return nil, err
 	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write(challenge.Transcript)
-	return mac.Sum(nil), nil
+	mac.Write(raw)
+	transcriptHash := sha256.Sum256(raw)
+	proof := transport.DirectChannelReadinessProofV2{ProtocolVersion: transport.DirectChannelReadinessProtocolV2, ChallengeID: challenge.ChallengeID, TranscriptHash: directB64(transcriptHash[:]), Confirmation: directB64(mac.Sum(nil))}
+	return proof.CanonicalBytes()
 }
 
 type directHeader struct {
@@ -289,6 +233,7 @@ func directWireBinary(w directWire) error {
 }
 func (m *directMaterial) aead(kind string) (cipher.AEAD, error) {
 	key, err := m.derive(kind)
+	defer clear(key)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +256,9 @@ func (m *directMaterial) seal(kind, id, root string, ask, plaintext []byte, now 
 		return nil, err
 	}
 	if kind == "REPLY" {
-		if _, err = m.open("ASK", h.AskID, root, nil, ask, now); err != nil {
+		askPlaintext, err := m.open("ASK", h.AskID, root, nil, ask, now)
+		clear(askPlaintext)
+		if err != nil {
 			return nil, err
 		}
 	}

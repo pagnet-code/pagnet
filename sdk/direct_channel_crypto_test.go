@@ -3,6 +3,7 @@ package sdk
 import (
 	"bytes"
 	"crypto/ecdh"
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 func directFixture(t *testing.T) (directDescriptor, []byte, []byte, []byte, time.Time) {
@@ -29,7 +32,9 @@ func directFixture(t *testing.T) (directDescriptor, []byte, []byte, []byte, time
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 11, 23, 0, 0, 0, 0, time.UTC)
-	d := directDescriptor{directDomain, pairSuite, "parent", "9007199254740993", "network", directParty{"tenant-s", "principal-s", "endpoint-s", directB64(s.PublicKey().Bytes())}, directParty{"tenant-p", "principal-p", "endpoint-p", directB64(p.PublicKey().Bytes())}, epoch.String(), now.Add(time.Hour).Format(time.RFC3339Nano), directLimits{4096, 2, 10, 65536, 2}}
+	limits := directLimits{MaxMessageWireBytes: 4096, MaxMessagesPerMinute: 2, MaxMessagesPerDay: 10, MaxWireBytesPerDay: 65536, MaxInFlight: 2, MaxTurnsPerThread: 4}
+	expiry := now.Add(time.Hour).Format(time.RFC3339Nano)
+	d := directDescriptor{Domain: directDomain, Suite: pairSuite, ParentGrantID: uuid.NewString(), GrantGeneration: "9007199254740993", ChannelGeneration: "2", DirectIntentID: uuid.NewString(), NetworkID: uuid.NewString(), AuthorizationDigest: strings.Repeat("a", 64), S: directParty{TenantID: uuid.NewString(), PrincipalID: uuid.NewString(), EndpointID: uuid.NewString(), PublicKey: directB64(s.PublicKey().Bytes()), CredentialID: uuid.NewString(), KeyEvidenceDigest: strings.Repeat("b", 64)}, P: directParty{TenantID: uuid.NewString(), PrincipalID: uuid.NewString(), EndpointID: uuid.NewString(), PublicKey: directB64(p.PublicKey().Bytes()), CredentialID: uuid.NewString(), KeyEvidenceDigest: strings.Repeat("c", 64)}, EpochID: epoch.String(), ExpiresAt: expiry, Budget: transport.DirectChannelBudgetV2{AgreementID: uuid.NewString(), AcceptedRevision: "2", TermsDigest: strings.Repeat("d", 64), ExpiresAt: expiry, CountingVersion: transport.DirectChannelCountingVersionV2, GrantLimits: limits}, Limits: limits}
 	raw, _ := json.Marshal(d)
 	return d, raw, s.Bytes(), p.Bytes(), now
 }
@@ -111,9 +116,9 @@ func TestDirectDescriptorStrictness(t *testing.T) {
 		"generation-number": []byte(strings.Replace(string(raw), `"9007199254740993"`, `9007199254740993`, 1)),
 	}
 	for name, mutate := range map[string]func(*directDescriptor){
-		"generation-zero":         func(d *directDescriptor) { d.Generation = "0" },
-		"generation-leading-zero": func(d *directDescriptor) { d.Generation = "01" },
-		"generation-overflow":     func(d *directDescriptor) { d.Generation = "18446744073709551616" },
+		"generation-zero":         func(d *directDescriptor) { d.GrantGeneration = "0" },
+		"generation-leading-zero": func(d *directDescriptor) { d.GrantGeneration = "01" },
+		"generation-overflow":     func(d *directDescriptor) { d.GrantGeneration = "18446744073709551616" },
 		"public-padding":          func(d *directDescriptor) { d.S.PublicKey += "=" },
 		"public-ambiguous":        func(d *directDescriptor) { d.S.PublicKey = d.S.PublicKey[:42] + "B" },
 		"domain":                  func(d *directDescriptor) { d.Domain = "pagnet/sdk-pair" },
@@ -143,7 +148,16 @@ func TestDirectDescriptorStrictness(t *testing.T) {
 	if _, err := directValidate(raw, other, now); err == nil {
 		t.Fatal("untrusted descriptor accepted")
 	}
-	for _, mutate := range []func(*directDescriptor){func(d *directDescriptor) { d.ParentGrantID = "other" }, func(d *directDescriptor) { d.Generation = "2" }, func(d *directDescriptor) { d.S.EndpointID = "other" }, func(d *directDescriptor) { d.P.PublicKey = d.S.PublicKey }, func(d *directDescriptor) { d.EpochID = "other" }} {
+	otherD, _, _, _, _ := directFixture(t)
+	for _, mutate := range []func(*directDescriptor){
+		func(d *directDescriptor) { d.ParentGrantID = uuid.NewString() },
+		func(d *directDescriptor) { d.GrantGeneration = "2" },
+		func(d *directDescriptor) { d.ChannelGeneration = "3" },
+		func(d *directDescriptor) { d.DirectIntentID = uuid.NewString() },
+		func(d *directDescriptor) { d.S.EndpointID = uuid.NewString() },
+		func(d *directDescriptor) { d.P.PublicKey = otherD.P.PublicKey },
+		func(d *directDescriptor) { id, _ := uuid.NewV7(); d.EpochID = id.String() },
+	} {
 		other = d
 		mutate(&other)
 		if directChannelID(other) == directChannelID(d) {
@@ -157,7 +171,7 @@ func TestDirectPackageAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, wrong, _, _ := directFixture(t)
+	wrongD, _, wrong, _, _ := directFixture(t)
 	if _, _, err = directPrepare(raw, d, wrong, now); err == nil {
 		t.Fatal("wrong sender private accepted")
 	}
@@ -182,14 +196,14 @@ func TestDirectPackageAuthentication(t *testing.T) {
 				id, _ := uuid.NewV7()
 				expected.EpochID = id.String()
 			case "sender":
-				expected.S.PublicKey = directB64(wrong)
+				expected.S.PublicKey = wrongD.S.PublicKey
 			case "recipient":
-				expected.P.PublicKey = directB64(wrong)
+				expected.P.PublicKey = wrongD.S.PublicKey
 			case "network":
-				expected.NetworkID = "other"
+				expected.NetworkID = uuid.NewString()
 			}
 			if field == "epoch" || field == "sender" || field == "recipient" || field == "network" {
-				pkg.Descriptor, _ = json.Marshal(expected)
+				pkg.Descriptor = expected
 			}
 			mutated, _ := json.Marshal(pkg)
 			if _, err := directAccept(mutated, expected, p, now); err == nil {
@@ -294,70 +308,287 @@ func TestDirectMessageContextAndTamper(t *testing.T) {
 		t.Fatal("wrong epoch accepted")
 	}
 }
+func directReadinessChallenge(m *directMaterial, now time.Time) transport.DirectChannelReadinessChallengeV2 {
+	d := m.descriptor
+	party := d.S
+	if m.role == "P" {
+		party = d.P
+	}
+	return transport.DirectChannelReadinessChallengeV2{Domain: directDomain + "/proof", ChallengeID: uuid.NewString(), Role: m.role, PrincipalID: party.PrincipalID, EndpointID: party.EndpointID, CredentialID: party.CredentialID, ChannelID: directChannelID(d), ParentGrantID: d.ParentGrantID, GrantGeneration: d.GrantGeneration, ChannelGeneration: d.ChannelGeneration, DirectIntentID: d.DirectIntentID, DescriptorHash: directB64(m.hash[:]), PublicationHash: directB64(m.publicationHash[:]), EpochID: d.EpochID, Nonce: directB64(make([]byte, 32)), IssuedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)}
+}
 func TestDirectReadinessProof(t *testing.T) {
-	s, p, _, now := directMaterials(t)
+	s, p, publication, now := directMaterials(t)
+	pub, err := transport.DecodeDirectChannelPublicationV2(publication)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, m := range []*directMaterial{s, p} {
 		t.Run(m.role, func(t *testing.T) {
-			d := m.descriptor
-			party := d.S
-			if m.role == "P" {
-				party = d.P
+			challenge := directReadinessChallenge(m, now)
+			raw, err := challenge.CanonicalBytes()
+			if err != nil {
+				t.Fatal(err)
 			}
-			transcript := directProofTranscript{directDomain + "/proof", "challenge", m.role, party.PrincipalID, party.EndpointID, "credential", directChannelID(d), d.ParentGrantID, d.Generation, directB64(m.hash[:]), d.EpochID, directB64(make([]byte, 32))}
-			raw, _ := json.Marshal(transcript)
-			challenge := directChallenge{"challenge", raw, now.Add(time.Minute)}
-			proof, err := m.readinessProof(challenge, "credential", now)
+			proof, err := m.readinessProof(raw, challenge.CredentialID, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := transport.DecodeDirectChannelReadinessProofV2(proof)
 			if err != nil {
 				t.Fatal(err)
 			}
 			key, _ := m.readinessKey()
 			mac := hmac.New(sha256.New, key)
 			mac.Write(raw)
-			if !hmac.Equal(proof, mac.Sum(nil)) {
+			if decoded.Confirmation != directB64(mac.Sum(nil)) {
 				t.Fatal("MAC mismatch")
 			}
-			for _, field := range []string{"role", "principal", "endpoint", "credential", "channel", "parent", "generation", "descriptor", "epoch", "nonce", "id", "domain"} {
-				t.Run(field, func(t *testing.T) {
-					mutated := transcript
-					switch field {
-					case "role":
-						mutated.Role = "N"
-					case "principal":
-						mutated.PrincipalID = "other"
-					case "endpoint":
-						mutated.EndpointID = "other"
-					case "credential":
-						mutated.CredentialID = "other"
-					case "channel":
-						mutated.ChannelID = "other"
-					case "parent":
-						mutated.ParentGrantID = "other"
-					case "generation":
-						mutated.Generation = "2"
-					case "descriptor":
-						mutated.DescriptorHash = "other"
-					case "epoch":
-						mutated.EpochID = "other"
-					case "nonce":
-						mutated.Nonce += "="
-					case "id":
-						mutated.ChallengeID = "other"
-					case "domain":
-						mutated.Domain = "pagnet/sdk-pair/proof/v1"
+			if err := transport.VerifyDirectChannelReadinessProofV2(pub, challenge, decoded, key, now); err != nil {
+				t.Fatal(err)
+			}
+			retry, err := m.readinessProof(raw, challenge.CredentialID, now)
+			if err != nil || !bytes.Equal(proof, retry) {
+				t.Fatal("same challenge retry changed proof")
+			}
+			for name, mutate := range map[string]func(*transport.DirectChannelReadinessChallengeV2){
+				"role": func(c *transport.DirectChannelReadinessChallengeV2) {
+					if c.Role == "S" {
+						c.Role = "P"
+					} else {
+						c.Role = "S"
 					}
-					c := challenge
-					c.Transcript, _ = json.Marshal(mutated)
-					if _, err := m.readinessProof(c, "credential", now); err == nil {
+				},
+				"principal":  func(c *transport.DirectChannelReadinessChallengeV2) { c.PrincipalID = uuid.NewString() },
+				"endpoint":   func(c *transport.DirectChannelReadinessChallengeV2) { c.EndpointID = uuid.NewString() },
+				"credential": func(c *transport.DirectChannelReadinessChallengeV2) { c.CredentialID = uuid.NewString() },
+				"channel": func(c *transport.DirectChannelReadinessChallengeV2) {
+					c.ChannelID = directB64(bytes.Repeat([]byte{1}, 32))
+				},
+				"parent":             func(c *transport.DirectChannelReadinessChallengeV2) { c.ParentGrantID = uuid.NewString() },
+				"grant-generation":   func(c *transport.DirectChannelReadinessChallengeV2) { c.GrantGeneration = "2" },
+				"channel-generation": func(c *transport.DirectChannelReadinessChallengeV2) { c.ChannelGeneration = "3" },
+				"intent":             func(c *transport.DirectChannelReadinessChallengeV2) { c.DirectIntentID = uuid.NewString() },
+				"descriptor": func(c *transport.DirectChannelReadinessChallengeV2) {
+					c.DescriptorHash = directB64(bytes.Repeat([]byte{1}, 32))
+				},
+				"publication": func(c *transport.DirectChannelReadinessChallengeV2) {
+					c.PublicationHash = directB64(bytes.Repeat([]byte{1}, 32))
+				},
+				"epoch":  func(c *transport.DirectChannelReadinessChallengeV2) { id, _ := uuid.NewV7(); c.EpochID = id.String() },
+				"nonce":  func(c *transport.DirectChannelReadinessChallengeV2) { c.Nonce += "=" },
+				"domain": func(c *transport.DirectChannelReadinessChallengeV2) { c.Domain = "pagnet/direct_ask_reply_v1/proof" },
+				"future": func(c *transport.DirectChannelReadinessChallengeV2) {
+					c.IssuedAt = now.Add(time.Second).Format(time.RFC3339Nano)
+				},
+				"expired": func(c *transport.DirectChannelReadinessChallengeV2) { c.ExpiresAt = now.Format(time.RFC3339Nano) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					changed := challenge
+					mutate(&changed)
+					raw, _ := json.Marshal(changed)
+					if _, err := m.readinessProof(raw, challenge.CredentialID, now); err == nil {
 						t.Fatal("accepted")
 					}
 				})
 			}
-			if _, err = m.readinessProof(challenge, "wrong", now); err == nil {
+			if _, err = m.readinessProof(raw, uuid.NewString(), now); err == nil {
 				t.Fatal("wrong credential metadata accepted")
 			}
-			if _, err = m.readinessProof(challenge, "credential", now.Add(time.Minute)); err == nil {
+			if _, err = m.readinessProof(raw, challenge.CredentialID, now.Add(time.Minute)); err == nil {
 				t.Fatal("expired challenge accepted")
 			}
+			// A changed nonce is a distinct challenge and must not validate the old proof.
+			changed := challenge
+			changed.Nonce = directB64(bytes.Repeat([]byte{1}, 32))
+			if transport.VerifyDirectChannelReadinessProofV2(pub, changed, decoded, key, now) == nil {
+				t.Fatal("proof replayed against changed nonce")
+			}
 		})
+	}
+}
+
+// Keep a genuine legacy descriptor shape to ensure V2 never treats V1 as a
+// descriptor with omitted zero-valued V2 bindings.
+func directLegacyDescriptor(t *testing.T, d directDescriptor) []byte {
+	t.Helper()
+	type party struct {
+		TenantID    string `json:"tenantId"`
+		PrincipalID string `json:"principalId"`
+		EndpointID  string `json:"endpointId"`
+		PublicKey   string `json:"publicKey"`
+	}
+	legacyParty := func(p directParty) party { return party{p.TenantID, p.PrincipalID, p.EndpointID, p.PublicKey} }
+	legacy := struct {
+		Domain        string `json:"domain"`
+		Suite         string `json:"suite"`
+		ParentGrantID string `json:"parentGrantId"`
+		Generation    string `json:"generation"`
+		NetworkID     string `json:"networkId"`
+		S             party  `json:"s"`
+		P             party  `json:"p"`
+		EpochID       string `json:"epochId"`
+		ExpiresAt     string `json:"expiresAt"`
+		Limits        struct {
+			MaxMessageWireBytes int `json:"maxMessageWireBytes"`
+			MaxAsksPerMinute    int `json:"maxAsksPerMinute"`
+			MaxAsksPerDay       int `json:"maxAsksPerDay"`
+			MaxWireBytesPerDay  int `json:"maxWireBytesPerDay"`
+			MaxInFlight         int `json:"maxInFlight"`
+		} `json:"limits"`
+	}{Domain: "pagnet/direct_ask_reply_v1", Suite: d.Suite, ParentGrantID: d.ParentGrantID, Generation: d.GrantGeneration, NetworkID: d.NetworkID, S: legacyParty(d.S), P: legacyParty(d.P), EpochID: d.EpochID, ExpiresAt: d.ExpiresAt}
+	legacy.Limits.MaxMessageWireBytes = d.Limits.MaxMessageWireBytes
+	legacy.Limits.MaxAsksPerMinute = d.Limits.MaxMessagesPerMinute
+	legacy.Limits.MaxAsksPerDay = d.Limits.MaxMessagesPerDay
+	legacy.Limits.MaxWireBytesPerDay = d.Limits.MaxWireBytesPerDay
+	legacy.Limits.MaxInFlight = d.Limits.MaxInFlight
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestDirectV1FailsClosed(t *testing.T) {
+	d, raw, s, p, now := directFixture(t)
+	legacy := directLegacyDescriptor(t, d)
+	if _, _, err := directPrepare(legacy, d, s, now); err == nil {
+		t.Fatal("prepared V1")
+	}
+	if _, err := transport.DecodeDirectChannelDescriptorV2(legacy); err == nil {
+		t.Fatal("decoded V1 descriptor")
+	}
+	_, publication, err := directPrepare(raw, d, s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old struct {
+		Descriptor json.RawMessage `json:"descriptor"`
+		Enc        string          `json:"enc"`
+		Ciphertext string          `json:"ciphertext"`
+	}
+	if err := json.Unmarshal(publication, &old); err != nil {
+		t.Fatal(err)
+	}
+	old.Descriptor = legacy
+	publication, _ = json.Marshal(old)
+	if _, err := directAccept(publication, d, p, now); err == nil {
+		t.Fatal("accepted V1 publication")
+	}
+	if _, err := transport.DecodeDirectChannelPublicationV2(publication); err == nil {
+		t.Fatal("decoded V1 publication")
+	}
+}
+
+func TestDirectV2DescriptorBinding(t *testing.T) {
+	d, raw, s, p, now := directFixture(t)
+	_, publication, err := directPrepare(raw, d, s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, otherS, otherP, _ := directFixture(t)
+	for name, mutate := range map[string]func(*directDescriptor){
+		"source-key":         func(d *directDescriptor) { d.S.PublicKey = other.S.PublicKey },
+		"target-key":         func(d *directDescriptor) { d.P.PublicKey = other.P.PublicKey },
+		"swapped-roles":      func(d *directDescriptor) { d.S, d.P = d.P, d.S },
+		"source-endpoint":    func(d *directDescriptor) { d.S.EndpointID = uuid.NewString() },
+		"target-endpoint":    func(d *directDescriptor) { d.P.EndpointID = uuid.NewString() },
+		"source-credential":  func(d *directDescriptor) { d.S.CredentialID = uuid.NewString() },
+		"target-credential":  func(d *directDescriptor) { d.P.CredentialID = uuid.NewString() },
+		"source-evidence":    func(d *directDescriptor) { d.S.KeyEvidenceDigest = strings.Repeat("e", 64) },
+		"target-evidence":    func(d *directDescriptor) { d.P.KeyEvidenceDigest = strings.Repeat("e", 64) },
+		"grant-generation":   func(d *directDescriptor) { d.GrantGeneration = "2" },
+		"channel-generation": func(d *directDescriptor) { d.ChannelGeneration = "3" },
+		"direct-intent":      func(d *directDescriptor) { d.DirectIntentID = uuid.NewString() },
+		"authorization":      func(d *directDescriptor) { d.AuthorizationDigest = strings.Repeat("e", 64) },
+		"budget-id":          func(d *directDescriptor) { d.Budget.AgreementID = uuid.NewString() },
+		"budget-revision":    func(d *directDescriptor) { d.Budget.AcceptedRevision = "3" },
+		"budget-digest":      func(d *directDescriptor) { d.Budget.TermsDigest = strings.Repeat("e", 64) },
+		"budget-expiry":      func(d *directDescriptor) { d.Budget.ExpiresAt = now.Add(2 * time.Hour).Format(time.RFC3339Nano) },
+		"budget-counting":    func(d *directDescriptor) { d.Budget.CountingVersion = "ask_only_v1" },
+		"grant-limits":       func(d *directDescriptor) { d.Budget.GrantLimits.MaxTurnsPerThread++ },
+		"channel-limits":     func(d *directDescriptor) { d.Limits.MaxMessagesPerDay-- },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := d
+			mutate(&changed)
+			changedRaw, _ := json.Marshal(changed)
+			// Even structurally valid replacements must match the authenticated selection.
+			if _, _, err := directPrepare(changedRaw, d, s, now); err == nil {
+				t.Fatal("prepared unpinned descriptor")
+			}
+			pkg, err := transport.DecodeDirectChannelPublicationV2(publication)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkg.Descriptor = changed
+			wire, _ := json.Marshal(pkg)
+			private := p
+			if name == "target-key" {
+				private = otherP
+			}
+			if name == "swapped-roles" {
+				private = s
+			}
+			if _, err := directAccept(wire, changed, private, now); err == nil {
+				t.Fatal("accepted rewritten HPKE context")
+			}
+		})
+	}
+	// A correctly authenticated sibling endpoint publication is still rejected
+	// when the caller pins the originally selected endpoint.
+	sibling := d
+	sibling.S.PublicKey = other.S.PublicKey
+	sibling.S.EndpointID = other.S.EndpointID
+	sibling.S.CredentialID = other.S.CredentialID
+	siblingRaw, _ := sibling.CanonicalBytes()
+	_, wire, err := directPrepare(siblingRaw, sibling, otherS, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := directAccept(wire, d, p, now); err == nil {
+		t.Fatal("source sibling substitution accepted")
+	}
+}
+
+func TestDirectV2CryptoDomainsAndFreshRoot(t *testing.T) {
+	d, raw, s, p, now := directFixture(t)
+	m, publication, err := directPrepare(raw, d, s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, secondPublication, err := directPrepare(raw, d, s, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.key == second.key || bytes.Equal(publication, secondPublication) || bytes.Equal(m.key[:], s) || bytes.Equal(m.key[:], p) {
+		t.Fatal("root is not fresh pairwise material")
+	}
+	pkg, err := transport.DecodeDirectChannelPublicationV2(publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender, _ := directBinary(d.S.PublicKey, 32)
+	enc, _ := directBinary(pkg.Enc, 32)
+	ct, _ := directBinary(pkg.Ciphertext, 48)
+	hash := sha256.Sum256(raw)
+	root, err := e2ee.HPKEUnwrapAuth(p, sender, enc, []byte("pagnet/direct_ask_reply_v2/epoch-wrap"), hash[:], ct)
+	if err != nil || !bytes.Equal(root, m.key[:]) {
+		t.Fatalf("V2 HPKE contract: %v", err)
+	}
+	if _, err := e2ee.HPKEUnwrapAuth(p, sender, enc, []byte("pagnet/direct_ask_reply_v1/epoch-wrap"), hash[:], ct); err == nil {
+		t.Fatal("V1 HPKE domain accepted")
+	}
+	if _, err := e2ee.HPKEUnwrapAuth(p, sender, enc, []byte("pagnet/direct_ask_reply_v2/epoch-wrap"), []byte(directB64(hash[:])), ct); err == nil {
+		t.Fatal("text descriptor hash AAD accepted")
+	}
+	for _, purpose := range []string{"readiness", "ASK", "REPLY"} {
+		expected, err := hkdf.Key(sha256.New, root, hash[:], "pagnet/direct_ask_reply_v2/"+purpose, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual, err := m.derive(purpose)
+		if err != nil || !bytes.Equal(expected, actual) {
+			t.Fatalf("V2 HKDF %s: %v", purpose, err)
+		}
 	}
 }

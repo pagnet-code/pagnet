@@ -1,6 +1,12 @@
-# Direct ASK/REPLY wire crypto v1
+# Direct ASK/REPLY wire crypto v1 (legacy reference)
 
-This is an internal, pure Go contract in `direct_channel_crypto.go`. It does not
+This document preserves the historical V1 contract only. The private SDK now
+uses the [V2 contract](direct-channel-wire-v2.md); V1 is not a fallback or a
+migration input. V2 decoders reject V1 publications, descriptors, messages and
+pending records. Existing V1 disk records remain untouched: rejection must not
+rewrite, delete, regenerate or silently upgrade them.
+
+The following describes the former internal, pure Go contract. It does not
 activate a channel, call the network, access the keyring, persist keys, or provide
 an SDK public API. N means the network identified by `networkId`; N has no public
 key field and receives no content key. S initiates ASK; P returns REPLY.
