@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -99,16 +98,8 @@ func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindi
 		Server  string                                 `json:"serverUrl"`
 		Subject transport.ManagedEndpointBindingIntent `json:"subject"`
 	}{server, subject})
-	// Key custody scope excludes enrollment identity, so another enrollment cannot
-	// replace a reserved key for the same exact endpoint incarnation/generation.
-	scopeRaw, _ := json.Marshal(struct {
-		Installation                                              domain.ID
-		Server                                                    string
-		Tenant, Account, Principal, Instance, Endpoint, Admission domain.ID
-		Generation                                                uint64
-	}{s.installation, server, subject.TenantID, subject.AccountID, subject.PrincipalID, subject.InstanceID, subject.EndpointID, subject.NativeAdmissionID, 1})
-	scopeSum := sha256.Sum256(scopeRaw)
-	name := hex.EncodeToString(scopeSum[:])
+	name := managedEndpointKeyScope(s.installation, server, subject)
+	identity := managedEndpointSlotIdentity(s.installation, server, subject)
 	s.registry.mu.Lock()
 	defer s.registry.mu.Unlock()
 	root, err := nativeShareHolderDirectory(s.registry.root)
@@ -158,50 +149,113 @@ func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindi
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return empty, err
 	}
+	if exists && (storedScope != name || storedInstallation != installation || !bytes.Equal(storedRequest, request) || len(reserved) == 0) {
+		return empty, errManagedEndpointKey
+	}
+	if recovery && !exists {
+		return empty, errManagedEndpointKey
+	}
+	var slotInstallation, public, anchor string
+	var slotIdentity []byte
+	var generation, format int
+	var slotPublic sql.NullString
+	err = conn.QueryRowContext(context.Background(), `SELECT installation_id,identity,key_generation,file_format,legacy_enrollment_id,x25519 FROM native_managed_endpoint_key_slots WHERE scope=?`, name).Scan(&slotInstallation, &slotIdentity, &generation, &format, &anchor, &slotPublic)
+	slotExists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return empty, err
+	}
+	if exists && !slotExists {
+		return empty, errManagedEndpointKey
+	}
+	if slotExists && (slotInstallation != installation || !bytes.Equal(slotIdentity, identity) || generation != 1 || !slotPublic.Valid) {
+		return empty, errManagedEndpointKey
+	}
 	var stat unix.Stat_t
 	if err = unix.Fstatat(int(dir.Fd()), name+".pending", &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
 		return empty, errManagedEndpointKey
 	}
-	file, err := nativeShareHolderOpen(dir, name+".json", false)
-	if exists {
-		if file != nil {
-			defer file.Close()
-		}
-		if err != nil || storedScope != name || storedInstallation != installation || !bytes.Equal(storedRequest, request) || len(reserved) == 0 {
+	file, fileErr := nativeShareHolderOpen(dir, name+".json", false)
+	if slotExists {
+		if fileErr != nil {
 			return empty, errManagedEndpointKey
 		}
-		record, err := loadManagedEndpointKey(file)
-		if err != nil {
-			return empty, err
-		}
-		defer clear(record.Private)
-		raw, _ := json.Marshal(record.Reservation)
-		expected := record.Reservation
-		expected.Subject = subject
-		expected.ServerURL = server
-		expected.InstallationID = s.installation
-		expected.KeyGeneration = 1
-		if !bytes.Equal(raw, reserved) || expected != record.Reservation || !s.now().Before(subject.ExpiresAt) {
-			return empty, errManagedEndpointKey
-		}
-		if !recovery {
-			if err = s.sync(dir); err != nil {
+		defer file.Close()
+		if format == 1 {
+			// The file's first enrollment is an immutable anchor. Its expiry is
+			// irrelevant to custody; only the requested enrollment must be live.
+			var anchorScope, anchorInstallation string
+			var anchorRequest, anchorReserved []byte
+			if err = conn.QueryRowContext(context.Background(), `SELECT scope,installation_id,request,reservation FROM native_managed_endpoint_keys WHERE enrollment_id=?`, anchor).Scan(&anchorScope, &anchorInstallation, &anchorRequest, &anchorReserved); err != nil || anchorScope != name || anchorInstallation != installation {
+				return empty, errManagedEndpointKey
+			}
+			anchorSubject, anchorServer, err := validateManagedEndpointRequest(anchorRequest)
+			if err != nil || anchorSubject.ID.String() != anchor || !bytes.Equal(managedEndpointSlotIdentity(s.installation, anchorServer, anchorSubject), identity) {
+				return empty, errManagedEndpointKey
+			}
+			record, err := loadManagedEndpointKey(file)
+			if err != nil {
 				return empty, err
 			}
+			defer clear(record.Private)
+			raw, _ := record.Reservation.CanonicalBytes()
+			if !bytes.Equal(raw, anchorReserved) || record.Reservation.Subject != anchorSubject || record.Reservation.ServerURL != anchorServer || record.Reservation.InstallationID != s.installation {
+				return empty, errManagedEndpointKey
+			}
+			public = record.Reservation.X25519
+		} else if format == 2 && anchor == "" {
+			public, err = loadManagedEndpointSlotKey(file, identity)
+			if err != nil {
+				return empty, err
+			}
+		} else {
+			return empty, errManagedEndpointKey
+		}
+		if !s.now().Before(subject.ExpiresAt) || public != slotPublic.String {
+			return empty, errManagedEndpointKey
+		}
+		reservation := transport.ManagedEndpointKeyReservation{Subject: subject, ServerURL: server, InstallationID: s.installation, KeyGeneration: 1, X25519: public}
+		reservation.EnrollmentDigest, err = reservation.Digest()
+		if err != nil {
+			return empty, errManagedEndpointKey
+		}
+		raw, _ := reservation.CanonicalBytes()
+		if exists {
+			if !bytes.Equal(raw, reserved) {
+				return empty, errManagedEndpointKey
+			}
+			if err = exec("COMMIT"); err != nil {
+				return empty, err
+			}
+			return reservation, nil
+		}
+		if err = exec(`INSERT INTO native_managed_endpoint_keys(enrollment_id,scope,installation_id,request,reservation) VALUES(?,?,?,?,NULL)`, subject.ID, name, installation, request); err != nil {
+			return empty, err
 		}
 		if err = exec("COMMIT"); err != nil {
 			return empty, err
 		}
-		return record.Reservation, nil
+		if !s.now().Before(subject.ExpiresAt) {
+			return empty, errManagedEndpointKey
+		}
+		if err = exec("BEGIN IMMEDIATE"); err != nil {
+			return empty, err
+		}
+		if err = s.completeManagedEndpointReference(conn, subject.ID, name, installation, request, raw, identity, public); err != nil {
+			return empty, err
+		}
+		if err = exec("COMMIT"); err != nil {
+			return empty, err
+		}
+		return reservation, nil
 	}
 	if file != nil {
 		file.Close()
 	}
-	if recovery {
+	if recovery || !errors.Is(fileErr, unix.ENOENT) {
 		return empty, errManagedEndpointKey
 	}
-	if !errors.Is(err, unix.ENOENT) {
-		return empty, errManagedEndpointKey
+	if err = exec(`INSERT INTO native_managed_endpoint_key_slots(scope,installation_id,identity,key_generation,file_format,legacy_enrollment_id,x25519) VALUES(?,?,?,1,2,'',NULL)`, name, installation, identity); err != nil {
+		return empty, err
 	}
 	if err = exec(`INSERT INTO native_managed_endpoint_keys(enrollment_id,scope,installation_id,request,reservation) VALUES(?,?,?,?,NULL)`, subject.ID, name, installation, request); err != nil {
 		return empty, errManagedEndpointKey
@@ -223,7 +277,7 @@ func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindi
 	if err != nil {
 		return empty, errManagedEndpointKey
 	}
-	raw, err := json.Marshal(managedEndpointKeyRecord{Reservation: reservation, Private: private})
+	raw, err := json.Marshal(managedEndpointSlotKeyRecord{Version: 2, Identity: identity, X25519: reservation.X25519, Private: private})
 	if err != nil {
 		return empty, err
 	}
@@ -257,13 +311,16 @@ func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindi
 	if err = exec("BEGIN IMMEDIATE"); err != nil {
 		return empty, err
 	}
-	public, _ := json.Marshal(reservation)
-	result, err := conn.ExecContext(context.Background(), `UPDATE native_managed_endpoint_keys SET reservation=? WHERE enrollment_id=? AND scope=? AND installation_id=? AND request=? AND reservation IS NULL AND EXISTS(SELECT 1 FROM native_registry_metadata WHERE name='installation_id' AND value=?)`, public, subject.ID, name, installation, request, installation)
+	publicRaw, _ := json.Marshal(reservation)
+	result, err := conn.ExecContext(context.Background(), `UPDATE native_managed_endpoint_key_slots SET x25519=? WHERE scope=? AND installation_id=? AND identity=? AND key_generation=1 AND file_format=2 AND legacy_enrollment_id='' AND x25519 IS NULL AND EXISTS(SELECT 1 FROM native_registry_metadata WHERE name='installation_id' AND value=?)`, reservation.X25519, name, installation, identity, installation)
 	if err != nil {
 		return empty, err
 	}
 	if n, err := result.RowsAffected(); err != nil || n != 1 {
 		return empty, errManagedEndpointKey
+	}
+	if err = s.completeManagedEndpointReference(conn, subject.ID, name, installation, request, publicRaw, identity, reservation.X25519); err != nil {
+		return empty, err
 	}
 	if err = exec("COMMIT"); err != nil {
 		return empty, err
@@ -293,6 +350,7 @@ func loadManagedEndpointKey(file *os.File) (managedEndpointKeyRecord, error) {
 		return r, errManagedEndpointKey
 	}
 	encoded, err := json.Marshal(r)
+	defer clear(encoded)
 	if err != nil || !bytes.Equal(encoded, raw) {
 		return r, errManagedEndpointKey
 	}
