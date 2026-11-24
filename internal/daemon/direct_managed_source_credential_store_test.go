@@ -468,7 +468,7 @@ func TestDirectSourceCredentialAttemptBeforeSecretAndExpiry(t *testing.T) {
 }
 
 func TestDirectSourceCredentialPublicationFenceThroughTransaction(t *testing.T) {
-	for _, failure := range []string{"none", "publication", "update"} {
+	for _, failure := range []string{"none", "publication", "update", "panic"} {
 		t.Run(failure, func(t *testing.T) {
 			keys, p, session := directSourceCredentialFixture(t)
 			if failure == "update" {
@@ -492,6 +492,9 @@ func TestDirectSourceCredentialPublicationFenceThroughTransaction(t *testing.T) 
 				case <-revoked:
 					return errors.New("revocation completed before publication")
 				default:
+				}
+				if failure == "panic" {
+					panic("interrupted publication")
 				}
 				if failure == "publication" {
 					return errors.New("interrupted publication")
@@ -535,9 +538,18 @@ func TestDirectSourceCredentialPublicationFenceThroughTransaction(t *testing.T) 
 					authority.Unlock()
 				}, nil
 			}
-			_, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, fence)
-			if (err != nil) != (failure != "none") {
-				t.Fatalf("install error: %v", err)
+			var err error
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				_, err = keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, fence)
+			}()
+			if failure == "panic" {
+				if recovered != "interrupted publication" {
+					t.Fatalf("publication panic: %v", recovered)
+				}
+			} else if recovered != nil || (err != nil) != (failure != "none") {
+				t.Fatalf("install error: %v; panic: %v", err, recovered)
 			}
 			if releases != 1 || syncs == 0 || releaseErr != nil {
 				t.Fatalf("release count=%d syncs=%d transaction=%v", releases, syncs, releaseErr)
@@ -585,5 +597,39 @@ func TestDirectSourceCredentialPublicationFenceAcquisitionFailsClosed(t *testing
 				t.Fatal("failed acquisition installed credential", err)
 			}
 		})
+	}
+}
+
+func TestDirectSourceCredentialPublicationFenceRollbackErrorClosesBeforeRelease(t *testing.T) {
+	keys, p, session := directSourceCredentialFixture(t)
+	releases := 0
+	var releaseErr error
+	fence := func(conn *sql.Conn, _ transport.DirectManagedSourceCredentialIssue, _ string, _ transport.HostSessionPayload) (func(), error) {
+		// End the transaction early to inject a failure in the helper's ROLLBACK.
+		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+			return nil, err
+		}
+		return func() {
+			releases++
+			if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); !errors.Is(err, sql.ErrConnDone) {
+				releaseErr = errors.New("connection not closed before guard release")
+				return
+			}
+			fresh, err := keys.registry.db.Conn(context.Background())
+			if err != nil {
+				releaseErr = err
+				return
+			}
+			defer fresh.Close()
+			if _, releaseErr = fresh.ExecContext(context.Background(), "BEGIN IMMEDIATE"); releaseErr == nil {
+				_, releaseErr = fresh.ExecContext(context.Background(), "ROLLBACK")
+			}
+		}, errors.New("interrupted acquisition")
+	}
+	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, fence); err == nil {
+		t.Fatal("accepted interrupted acquisition")
+	}
+	if releases != 1 || releaseErr != nil {
+		t.Fatalf("releases=%d transaction=%v", releases, releaseErr)
 	}
 }
