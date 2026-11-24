@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -272,6 +273,40 @@ func TestManagedPoPStoreConcurrentRetry(t *testing.T) {
 		if errs[i] != nil || !bytes.Equal(proofs[0], proofs[i]) {
 			t.Fatal("concurrent retry", errs[i])
 		}
+	}
+}
+
+func TestManagedPoPStoreRejectsNilAuthenticatedScope(t *testing.T) {
+	keys, p, session, private := managedPoPStoreFixture(t, false)
+	clear(private)
+	state, err := OpenState(filepath.Join(t.TempDir(), "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	serveLock, err := os.CreateTemp(t.TempDir(), "serve.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serveLock.Close()
+	for _, missing := range []string{"both", "socket", "connection"} {
+		t.Run(missing, func(t *testing.T) {
+			captured := ManagedEndpointPrepareScope{Session: session}
+			if missing == "socket" {
+				captured.Connection = NewNativeObservationConnection("https://example.test", session.HostID, session.BootID, nil)
+			}
+			if missing == "connection" {
+				captured.Socket = &websocket.Conn{}
+			}
+			d := &Daemon{Config: Config{ServerURL: "https://example.test"}, nativeRegistry: keys.registry, state: state, serveLockFile: serveLock, curConn: captured.Socket, nativeConn: captured.Connection}
+			if _, err := keys.ConfirmPoP(t.Context(), d, captured, "https://example.test", p); !errors.Is(err, errManagedEndpointKey) {
+				t.Fatal("missing authenticated scope accepted", err)
+			}
+		})
+	}
+	var count int
+	if err := keys.registry.db.QueryRow(`SELECT COUNT(*) FROM native_managed_endpoint_pop_challenges`).Scan(&count); err != nil || count != 0 {
+		t.Fatal("missing scope created association", count, err)
 	}
 }
 

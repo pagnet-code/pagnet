@@ -88,10 +88,10 @@ func loadManagedEndpointSlotRecord(file *os.File, identity []byte) (record manag
 		}
 	}()
 	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
+	defer clear(raw)
 	if err != nil {
 		return record, err
 	}
-	defer clear(raw)
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if len(raw) > nativeShareHolderMaxBytes || decoder.Decode(&record) != nil || decoder.Decode(new(any)) != io.EOF {

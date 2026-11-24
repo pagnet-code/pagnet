@@ -337,10 +337,10 @@ func loadManagedEndpointKey(file *os.File) (managedEndpointKeyRecord, error) {
 		}
 	}()
 	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
+	defer clear(raw)
 	if err != nil {
 		return r, err
 	}
-	defer clear(raw)
 	if len(raw) > nativeShareHolderMaxBytes {
 		return r, errManagedEndpointKey
 	}
