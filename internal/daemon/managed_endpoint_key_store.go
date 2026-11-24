@@ -26,7 +26,7 @@ const nativeManagedEndpointKeyNamespace = "closed-managed-endpoint-keys"
 var errManagedEndpointKey = errors.New("closed managed endpoint key unavailable, unsafe or conflicting")
 
 // ManagedEndpointKeyStore retains dedicated private X25519 keys locally. It has
-// no export, activation, credential, challenge, or transport handler. A future
+// no export, activation, credential, or transport handler. A future
 // negotiated ingress must authenticate server provenance, the live socket/session
 // and local worker ownership before Reserve, and revalidate them before key use
 // or publication.
