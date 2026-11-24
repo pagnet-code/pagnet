@@ -111,7 +111,7 @@ func directV2Decimal(s string) bool {
 }
 func directV2Time(s string) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339Nano, s)
-	return t, err == nil && t.UTC().Format(time.RFC3339Nano) == s
+	return t, err == nil && t.Year() >= 1 && t.Year() <= 9999 && t.UTC().Format(time.RFC3339Nano) == s
 }
 func directV2Binary(s string, size int) ([]byte, bool) {
 	b, err := base64.RawURLEncoding.Strict().DecodeString(s)
@@ -166,7 +166,7 @@ func ValidateDirectChannelDescriptorV2(d DirectChannelDescriptorV2, now time.Tim
 	expiry, ok := directV2Time(d.ExpiresAt)
 	budgetExpiry, bok := directV2Time(d.Budget.ExpiresAt)
 	epoch, err := uuid.Parse(d.EpochID)
-	if d.Domain != DirectChannelDomainV2 || d.Suite != DirectChannelSuiteV2 || !directV2ID(d.ParentGrantID) || !directV2Decimal(d.GrantGeneration) || !directV2Decimal(d.ChannelGeneration) || !directV2ID(d.DirectIntentID) || !directV2ID(d.NetworkID) || !directV2Digest(d.AuthorizationDigest) || !d.S.valid() || !d.P.valid() || d.S.PrincipalID == d.P.PrincipalID || d.S.EndpointID == d.P.EndpointID || d.S.PublicKey == d.P.PublicKey || err != nil || !directV2ID(d.EpochID) || epoch.Version() != 7 || !ok || !bok || !expiry.After(now) || expiry.After(budgetExpiry) || !directV2ID(d.Budget.AgreementID) || (!directV2Decimal(d.Budget.AcceptedRevision) || d.Budget.AcceptedRevision == "1") || !directV2Digest(d.Budget.TermsDigest) || d.Budget.CountingVersion != DirectChannelCountingVersionV2 || !d.Limits.valid() || !d.Budget.GrantLimits.valid() || !d.Limits.within(d.Budget.GrantLimits) {
+	if d.Domain != DirectChannelDomainV2 || d.Suite != DirectChannelSuiteV2 || !directV2ID(d.ParentGrantID) || !directV2Decimal(d.GrantGeneration) || !directV2Decimal(d.ChannelGeneration) || !directV2ID(d.DirectIntentID) || !directV2ID(d.NetworkID) || !directV2Digest(d.AuthorizationDigest) || !d.S.valid() || !d.P.valid() || d.S.PrincipalID == d.P.PrincipalID || d.S.EndpointID == d.P.EndpointID || d.S.PublicKey == d.P.PublicKey || err != nil || !directV2ID(d.EpochID) || epoch.Version() != 7 || epoch.Variant() != uuid.RFC4122 || !ok || !bok || !expiry.After(now) || expiry.After(budgetExpiry) || !directV2ID(d.Budget.AgreementID) || (!directV2Decimal(d.Budget.AcceptedRevision) || d.Budget.AcceptedRevision == "1") || !directV2Digest(d.Budget.TermsDigest) || d.Budget.CountingVersion != DirectChannelCountingVersionV2 || !d.Limits.valid() || !d.Budget.GrantLimits.valid() || !d.Limits.within(d.Budget.GrantLimits) {
 		return errDirectChannelV2
 	}
 	return nil
@@ -262,7 +262,7 @@ func (c DirectChannelReadinessChallengeV2) CanonicalBytes() ([]byte, error) {
 	issued, iok := directV2Time(c.IssuedAt)
 	expiry, eok := directV2Time(c.ExpiresAt)
 	epoch, err := uuid.Parse(c.EpochID)
-	if c.Domain != DirectChannelDomainV2+"/proof" || !directV2ID(c.ChallengeID) || (c.Role != "S" && c.Role != "P") || !directV2ID(c.PrincipalID) || !directV2ID(c.EndpointID) || !directV2ID(c.CredentialID) || !directV2ID(c.ParentGrantID) || !directV2Decimal(c.GrantGeneration) || !directV2Decimal(c.ChannelGeneration) || !directV2ID(c.DirectIntentID) || !directV2ID(c.EpochID) || err != nil || epoch.Version() != 7 || !iok || !eok || !expiry.After(issued) || expiry.After(issued.Add(5*time.Minute)) {
+	if c.Domain != DirectChannelDomainV2+"/proof" || !directV2ID(c.ChallengeID) || (c.Role != "S" && c.Role != "P") || !directV2ID(c.PrincipalID) || !directV2ID(c.EndpointID) || !directV2ID(c.CredentialID) || !directV2ID(c.ParentGrantID) || !directV2Decimal(c.GrantGeneration) || !directV2Decimal(c.ChannelGeneration) || !directV2ID(c.DirectIntentID) || !directV2ID(c.EpochID) || err != nil || epoch.Version() != 7 || epoch.Variant() != uuid.RFC4122 || !iok || !eok || !expiry.After(issued) || expiry.After(issued.Add(5*time.Minute)) {
 		return nil, errDirectChannelV2
 	}
 	for _, s := range []string{c.ChannelID, c.DescriptorHash, c.PublicationHash, c.Nonce} {

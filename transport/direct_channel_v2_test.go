@@ -353,3 +353,48 @@ func TestDirectChannelV2ChallengeBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDirectChannelV2TimeYearAndEpochVariant(t *testing.T) {
+	for _, timestamp := range []string{"0001-01-01T00:00:00Z", "9999-12-31T23:59:59.999999999Z"} {
+		if _, ok := directV2Time(timestamp); !ok {
+			t.Fatalf("rejected year boundary %q", timestamp)
+		}
+	}
+	if _, ok := directV2Time("0000-01-01T00:00:00Z"); ok {
+		t.Fatal("accepted year zero")
+	}
+	p, c, _, _, _ := directV2TestFixture(t)
+	for _, epoch := range []string{"01900000-0000-7000-0000-000000000001", "01900000-0000-7000-c000-000000000001", "01900000-0000-7000-e000-000000000001"} {
+		t.Run(epoch, func(t *testing.T) {
+			d := p.Descriptor
+			d.EpochID = epoch
+			if _, err := d.CanonicalBytes(); err == nil {
+				t.Fatal("accepted descriptor epoch with non-RFC4122 variant")
+			}
+			challenge := c
+			challenge.EpochID = epoch
+			if _, err := challenge.CanonicalBytes(); err == nil {
+				t.Fatal("accepted challenge epoch with non-RFC4122 variant")
+			}
+		})
+	}
+	for _, field := range []string{"ExpiresAt", "BudgetExpiresAt"} {
+		d := p.Descriptor
+		if field == "ExpiresAt" {
+			d.ExpiresAt = "0000-01-01T00:00:00Z"
+		} else {
+			d.Budget.ExpiresAt = "0000-01-01T00:00:00Z"
+			d.ExpiresAt = d.Budget.ExpiresAt
+		}
+		// A pre-year-zero clock ensures rejection comes from timestamp validation.
+		if err := ValidateDirectChannelDescriptorV2(d, time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)); err == nil {
+			t.Fatalf("accepted descriptor year zero in %s", field)
+		}
+	}
+	challenge := c
+	challenge.IssuedAt = "0000-01-01T00:00:00Z"
+	challenge.ExpiresAt = "0000-01-01T00:05:00Z"
+	if _, err := challenge.CanonicalBytes(); err == nil {
+		t.Fatal("accepted challenge year zero")
+	}
+}
