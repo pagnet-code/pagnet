@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"reflect"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
@@ -15,12 +16,36 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+// directManagedSourceCredentialPublicationLane serializes cancellation with local
+// publication. Cancellation completes only after any acquired publication guard
+// has released custody following the registry COMMIT or ROLLBACK.
+type directManagedSourceCredentialPublicationLane struct {
+	mu   sync.Mutex
+	done chan struct{}
+}
+
+func newDirectManagedSourceCredentialPublicationLane() *directManagedSourceCredentialPublicationLane {
+	return &directManagedSourceCredentialPublicationLane{done: make(chan struct{})}
+}
+
+func (lane *directManagedSourceCredentialPublicationLane) cancel() {
+	lane.mu.Lock()
+	defer lane.mu.Unlock()
+	select {
+	case <-lane.done:
+	default:
+		close(lane.done)
+	}
+}
+
 // directManagedSourceCredentialPublicationFence pins local authority only. The
 // caller obtains token through the full verifier, including worker IPC, before
-// entering store locks. This does not authenticate remote consent or budgets.
-func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, laneDone <-chan struct{}) DirectManagedSourceCredentialPublicationFence {
+// entering store locks. The lane mutex is acquired last, after native.mu, and
+// released first after transaction completion. This does not authenticate remote
+// consent or budgets.
+func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane) DirectManagedSourceCredentialPublicationFence {
 	return func(registryConn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, session transport.HostSessionPayload) (release func(), err error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || laneDone == nil {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if _, err := issue.CanonicalBytes(); err != nil {
@@ -120,7 +145,7 @@ func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWork
 		for _, lock := range []interface {
 			TryLock() bool
 			Unlock()
-		}{&d.connMu, &captured.Connection.mu} {
+		}{&d.connMu, &captured.Connection.mu, &lane.mu} {
 			if !lock.TryLock() {
 				return release, ErrManagedEndpointPrepareRetryable
 			}
@@ -144,7 +169,7 @@ func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWork
 				return release, ErrManagedEndpointPrepareRejected
 			}
 		}
-		for _, done := range []<-chan struct{}{p.done, native.closed, laneDone} {
+		for _, done := range []<-chan struct{}{p.done, native.closed, lane.done} {
 			select {
 			case <-done:
 				return release, ErrManagedEndpointPrepareRetryable

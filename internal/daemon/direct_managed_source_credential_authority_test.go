@@ -59,10 +59,10 @@ func sourceCredentialAuthorityFixture(t *testing.T) (*DirectManagedSourceKeyStor
 }
 
 func TestSourceCredentialAuthorityRejectsMutations(t *testing.T) {
-	for _, mutation := range []string{"principal", "profile", "launch", "recovery", "gc", "link", "ownership", "session", "feature", "offer", "opt-in", "token", "cancel", "contention", "state writer", "state pool", "future"} {
+	for _, mutation := range []string{"principal", "profile", "launch", "recovery", "gc", "link", "ownership", "session", "feature", "offer", "opt-in", "token", "cancel", "contention", "state writer", "state pool", "future", "lane contention"} {
 		t.Run(mutation, func(t *testing.T) {
 			keys, issue, d, token, captured := sourceCredentialAuthorityFixture(t)
-			done := make(chan struct{})
+			lane := newDirectManagedSourceCredentialPublicationLane()
 			var err error
 			switch mutation {
 			case "principal":
@@ -91,7 +91,7 @@ func TestSourceCredentialAuthorityRejectsMutations(t *testing.T) {
 			case "token":
 				token.subject.NativeSessionID += "changed"
 			case "cancel":
-				close(done)
+				lane.cancel()
 			case "future":
 				issue.IssuedAt = time.Now().Add(time.Minute)
 			case "state writer":
@@ -111,6 +111,9 @@ func TestSourceCredentialAuthorityRejectsMutations(t *testing.T) {
 					t.Fatal(blockErr)
 				}
 				defer blocker.Close()
+			case "lane contention":
+				lane.mu.Lock()
+				defer lane.mu.Unlock()
 			case "contention":
 				d.connMu.Lock()
 				defer d.connMu.Unlock()
@@ -118,7 +121,7 @@ func TestSourceCredentialAuthorityRejectsMutations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = keys.InstallCredential(issue, "https://example.test", captured.Session, directSourceCredentialScopeOK, d.directManagedSourceCredentialPublicationFence(token, captured, done))
+			_, err = keys.InstallCredential(issue, "https://example.test", captured.Session, directSourceCredentialScopeOK, d.directManagedSourceCredentialPublicationFence(token, captured, lane))
 			if err == nil {
 				t.Fatal("changed authority published")
 			}
@@ -134,9 +137,11 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 	for _, mode := range []string{"commit", "rollback", "panic"} {
 		t.Run(mode, func(t *testing.T) {
 			keys, issue, d, token, captured := sourceCredentialAuthorityFixture(t)
-			fence := d.directManagedSourceCredentialPublicationFence(token, captured, make(chan struct{}))
+			lane := newDirectManagedSourceCredentialPublicationLane()
+			fence := d.directManagedSourceCredentialPublicationFence(token, captured, lane)
 			entered := false
 			mutationDone := make(chan string, 1)
+			cancelStarted, cancelDone := make(chan struct{}), make(chan struct{})
 			func() {
 				defer func() {
 					if r := recover(); r != nil && mode != "panic" {
@@ -150,6 +155,23 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 						return err
 					}
 					entered = true
+					go func() {
+						close(cancelStarted)
+						lane.cancel()
+						close(cancelDone)
+					}()
+					<-cancelStarted
+					select {
+					case <-cancelDone:
+						t.Error("cancellation completed during transaction")
+					default:
+					}
+					select {
+					case <-lane.done:
+						t.Error("cancellation revoked acquired publication")
+					default:
+					}
+
 					if _, err := conn.ExecContext(context.Background(), `UPDATE native_workers SET launch_state='launching' WHERE instance_id=?`, token.instanceID); err != nil {
 						return err
 					}
@@ -176,7 +198,7 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 					for _, lock := range []interface {
 						TryLock() bool
 						Unlock()
-					}{&d.nativeWorkersMu, &token.link.mu, &token.proxy.publicationMu, &d.connMu, &captured.Connection.mu} {
+					}{&d.nativeWorkersMu, &token.link.mu, &token.proxy.publicationMu, &d.connMu, &captured.Connection.mu, &lane.mu} {
 						if lock.TryLock() {
 							lock.Unlock()
 							t.Error("publication mutation not fenced")
@@ -207,6 +229,7 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 			if !entered {
 				t.Fatal("guard never acquired")
 			}
+			<-cancelDone
 			wantLaunch := "launched"
 			if mode == "commit" {
 				wantLaunch = "launching"
@@ -214,7 +237,7 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 			if launch := <-mutationDone; launch != wantLaunch {
 				t.Fatalf("mutation observed %q, want transaction result %q", launch, wantLaunch)
 			}
-			for _, lock := range []*sync.Mutex{&d.nativeWorkersMu, &token.link.mu, &d.connMu, &captured.Connection.mu} {
+			for _, lock := range []*sync.Mutex{&d.nativeWorkersMu, &token.link.mu, &d.connMu, &captured.Connection.mu, &lane.mu} {
 				if !lock.TryLock() {
 					t.Fatal("lock leaked")
 				}
@@ -231,5 +254,26 @@ func TestSourceCredentialAuthorityHoldsUntilTransactionCompletion(t *testing.T) 
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestSourceCredentialAuthorityCompletedCancellationRejectsAcquisition(t *testing.T) {
+	keys, issue, d, token, captured := sourceCredentialAuthorityFixture(t)
+	lane := newDirectManagedSourceCredentialPublicationLane()
+	fence := d.directManagedSourceCredentialPublicationFence(token, captured, lane)
+	acquire := func() error {
+		return keys.withKeyLockedScoped(false, func(conn *sql.Conn, _ *os.File, release *func()) error {
+			var err error
+			*release, err = fence(conn, issue, "https://example.test", captured.Session)
+			return err
+		})
+	}
+	if err := acquire(); err != nil {
+		t.Fatal(err)
+	}
+	lane.cancel()
+	lane.cancel()
+	if err := acquire(); !errors.Is(err, ErrManagedEndpointPrepareRetryable) {
+		t.Fatalf("completed cancellation returned %v", err)
 	}
 }
