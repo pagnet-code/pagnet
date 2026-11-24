@@ -61,10 +61,7 @@ func managedPrepareServerOrigin(value string) string {
 	if err != nil || strings.Contains(value, "#") || strings.Contains(u.Hostname(), "%") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return ""
 	}
-	path := strings.TrimRight(u.EscapedPath(), "/")
-	u.Host = strings.ToLower(u.Host)
-	u.Path, u.RawPath = "", ""
-	return u.String() + path
+	return textServiceServer(value)
 }
 
 func managedPrepareSessionMatches(s transport.ManagedEndpointBindingIntent, session transport.HostSessionPayload) bool {

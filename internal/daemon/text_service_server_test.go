@@ -85,10 +85,16 @@ func TestTextServiceServerChangedCustodyScopesRejectBeforeWrites(t *testing.T) {
 				if _, err := keys.Reserve(command.Subject, endpoint, session); err == nil {
 					t.Fatal("changed key scope accepted")
 				}
+				if _, err := keys.RecoverReservation(command.Subject, endpoint, session); err == nil {
+					t.Fatal("changed key recovery scope accepted")
+				}
 				called := false
 				verify := func(transport.ManagedEndpointPrepareCommand, string) error { called = true; return nil }
 				if _, err := journal.Reserve(command, endpoint, verify); err == nil {
 					t.Fatal("changed journal scope accepted")
+				}
+				if _, err := journal.BeginKeyReservation(command, endpoint, verify); err == nil {
+					t.Fatal("changed journal key reservation scope accepted")
 				}
 				if _, err := journal.Fail(command, endpoint, verify); err == nil {
 					t.Fatal("changed journal terminal scope accepted")

@@ -293,10 +293,21 @@ func TestManagedPrepareVerifierServerOriginComparisons(t *testing.T) {
 }
 
 func TestManagedPrepareVerifierRejectsUnsafeStoredOrigins(t *testing.T) {
-	for _, server := range []string{"https://example.test#", "https://[fe80::1%25ETH0]", "https://[fe80::1%25eth0]"} {
+	for _, server := range []string{"https://example.test?", "https://example.test#", "https://example.test?query=value", "https://example.test#fragment", "https://user@example.test", "https://[fe80::1%25ETH0]", "https://[fe80::1%25eth0]", "https://example.test/%zz", "ftp://example.test", "/relative"} {
 		t.Run(server, func(t *testing.T) {
 			if got := managedPrepareServerOrigin(server); got != "" {
 				t.Fatalf("unsafe origin accepted as %q", got)
+			}
+		})
+	}
+}
+
+func TestManagedPrepareServerOriginMatchesTextServiceServer(t *testing.T) {
+	for _, server := range []string{" https://EXAMPLE.TEST/a%2Fb/// ", "https://example.test/a%2F", "https://example.test/%61/", "https://example.test/a%2fb///", "https://example.test/a/b///", "https://EXAMPLE.TEST///", "HTTP://EXAMPLE.TEST/path/", "https://example.test/a b/"} {
+		t.Run(server, func(t *testing.T) {
+			want := textServiceServer(server)
+			if got := managedPrepareServerOrigin(server); want == "" || got != want {
+				t.Fatalf("managed prepare origin = %q, want text service origin %q", got, want)
 			}
 		})
 	}
