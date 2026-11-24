@@ -108,9 +108,11 @@ func (p ManagedEndpointPoPChallenge) CanonicalBytes() ([]byte, error) {
 	p.IssuedAt = p.IssuedAt.UTC()
 	p.ExpiresAt = p.ExpiresAt.UTC()
 	auth, _ := p.Authorization.CanonicalBytes()
-	if json.Unmarshal(auth, &p.Authorization) != nil {
+	var authorization DirectAuthorizationSnapshotV1
+	if json.Unmarshal(auth, &authorization) != nil {
 		return nil, errManagedEndpointBinding
 	}
+	p.Authorization = authorization
 	return json.Marshal(p)
 }
 
