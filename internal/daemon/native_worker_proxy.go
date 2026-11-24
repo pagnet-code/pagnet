@@ -21,6 +21,7 @@ type NativeWorkerProxy struct {
 	profile                             string
 	bootstrap                           sessionworker.Bootstrap
 	done                                chan struct{}
+	publicationMu                       sync.RWMutex
 	closeOnce                           sync.Once
 	reconcileOnce                       sync.Once
 	reconcileGate                       chan struct{}
@@ -80,8 +81,12 @@ func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnec
 func (p *NativeWorkerProxy) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
+		p.publicationMu.Lock()
 		close(p.done)
-		err = p.controller.Close()
+		p.publicationMu.Unlock()
+		if p.controller != nil {
+			err = p.controller.Close()
+		}
 	})
 	return err
 }

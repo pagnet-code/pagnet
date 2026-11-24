@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,13 +19,14 @@ import (
 type managedPrepareLaneExecutor struct {
 	available        bool
 	publicationError error
+	token            *nativeWorkerPublicationToken
 	started          chan transport.ManagedEndpointPrepareCommand
 	release          chan struct{}
 	finished         chan struct{}
 }
 
-func (e *managedPrepareLaneExecutor) verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) error {
-	return e.publicationError
+func (e *managedPrepareLaneExecutor) verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) (*nativeWorkerPublicationToken, error) {
+	return e.token, e.publicationError
 }
 func (e *managedPrepareLaneExecutor) ready() bool { return e.available }
 func (e *managedPrepareLaneExecutor) prepare(_ context.Context, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, command transport.ManagedEndpointPrepareCommand) ([]byte, error) {
@@ -60,6 +62,16 @@ func managedPrepareLaneFixture(t *testing.T, feature bool) (*Daemon, *managedEnd
 
 func managedPrepareLaneFailure(t *testing.T, peer *websocket.Conn, command transport.ManagedEndpointPrepareCommand) {
 	t.Helper()
+	result := managedPrepareLaneReply(t, peer, command, transport.ManagedEndpointPrepareFailure)
+	if _, err := transport.DecodeManagedEndpointPrepareFailureACK(result, command.CommandID); err != nil {
+		t.Fatalf("reply was not a closed failure ACK: %s: %v", result, err)
+	}
+}
+
+// Match the server's strict host.command_ack payload contract before decoding
+// the canonical prepare ACK carried in result.
+func managedPrepareLaneReply(t *testing.T, peer *websocket.Conn, command transport.ManagedEndpointPrepareCommand, errorCode string) json.RawMessage {
+	t.Helper()
 	peer.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var env transport.Envelope
 	if err := peer.ReadJSON(&env); err != nil {
@@ -68,8 +80,67 @@ func managedPrepareLaneFailure(t *testing.T, peer *websocket.Conn, command trans
 	if env.Type != transport.MsgCommandAck {
 		t.Fatalf("unexpected reply type %s", env.Type)
 	}
-	if _, err := transport.DecodeManagedEndpointPrepareFailureACK(env.Payload, command.CommandID); err != nil {
-		t.Fatalf("reply was not a closed failure ACK: %s: %v", env.Payload, err)
+	var outer struct {
+		CommandID domain.ID       `json:"commandId"`
+		Error     string          `json:"error"`
+		Result    json.RawMessage `json:"result"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(env.Payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&outer); err != nil {
+		t.Fatalf("reply violated server ACK envelope: %s: %v", env.Payload, err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(env.Payload, &fields); err != nil || len(fields) != 3 {
+		t.Fatalf("reply must contain exactly commandId, error, result: %s", env.Payload)
+	}
+	for _, key := range []string{"commandId", "error", "result"} {
+		if _, ok := fields[key]; !ok {
+			t.Fatalf("reply missing server ACK key %q: %s", key, env.Payload)
+		}
+	}
+	if outer.CommandID != command.CommandID || outer.Error != errorCode {
+		t.Fatalf("unexpected outer ACK: %s", env.Payload)
+	}
+	return outer.Result
+}
+
+func TestManagedEndpointPrepareLaneACKEnvelopeCompatibility(t *testing.T) {
+	for _, success := range []bool{false, true} {
+		t.Run(map[bool]string{false: "failure", true: "success"}[success], func(t *testing.T) {
+			_, lane, peer, _, command := managedPrepareLaneFixture(t, true)
+			session, err := lane.native.AuthenticatedNativeHostSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical := managedPrepareFailure(command)
+			errorCode := transport.ManagedEndpointPrepareFailure
+			if success {
+				keys, subject, keySession := managedEndpointFixture(t)
+				command.Subject = subject
+				canonical = managedPrepareSuccess(t, keys, command, keySession)
+				errorCode = ""
+			}
+			if success {
+				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+				link := &nativeWorkerLink{conn: lane.socket, proxy: p}
+				lane.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
+				lane.executor.(*managedPrepareLaneExecutor).token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}
+			}
+			original := bytes.Clone(canonical)
+			lane.ack(canonical, session, command)
+			result := managedPrepareLaneReply(t, peer, command, errorCode)
+			if !bytes.Equal(result, original) || !bytes.Equal(canonical, original) {
+				t.Fatal("wire envelope changed canonical ACK bytes")
+			}
+			if success {
+				if _, err := transport.DecodeManagedEndpointPrepareACK(result, command); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := transport.DecodeManagedEndpointPrepareFailureACK(result, command.CommandID); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
