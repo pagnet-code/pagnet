@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -254,6 +255,15 @@ func (s *DirectManagedSourceKeyStore) reserve(command transport.DirectManagedSou
 
 // Lock order is registry mutex, dedicated namespace flock, SQLite reservation.
 func (s *DirectManagedSourceKeyStore) withKeyLocked(create bool, fn func(*sql.Conn, *os.File) error) error {
+	return s.withKeyLockedScoped(create, func(conn *sql.Conn, dir *os.File, _ *func()) error {
+		return fn(conn, dir)
+	})
+}
+
+// withKeyLockedScoped owns registered custody through transaction completion,
+// including panic unwinding. A failed ROLLBACK discards and closes the connection
+// before release so an unfinished transaction cannot return to the pool.
+func (s *DirectManagedSourceKeyStore) withKeyLockedScoped(create bool, fn func(*sql.Conn, *os.File, *func()) error) error {
 	s.registry.mu.Lock()
 	defer s.registry.mu.Unlock()
 	root, err := nativeShareHolderDirectory(s.registry.root)
@@ -284,10 +294,23 @@ func (s *DirectManagedSourceKeyStore) withKeyLocked(create bool, fn func(*sql.Co
 	if _, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
-	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
-	if err = fn(conn, dir); err != nil {
+	var release func()
+	committed := false
+	defer func() {
+		if !committed {
+			if _, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK"); rollbackErr != nil {
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+				_ = conn.Close()
+			}
+		}
+		if release != nil {
+			release()
+		}
+	}()
+	if err = fn(conn, dir, &release); err != nil {
 		return err
 	}
 	_, err = conn.ExecContext(context.Background(), "COMMIT")
+	committed = err == nil
 	return err
 }
