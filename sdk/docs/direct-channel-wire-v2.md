@@ -71,11 +71,44 @@ greater than every corresponding grant limit.
 
 Both grant and channel limits require message wire bytes 1024–65536, messages per
 minute 1–10, messages per day 1–200, wire bytes per day at least the message limit
-and at most 8388608, in flight 1–2, and turns per thread 1–16. Counting version is
+and at most 8388608, in flight 1–2, and turns per thread 1–16. The original counting version is
 `canonical_encrypted_wire_bytes_utc_minute_day_ask_reply_each_v1`: ASK and REPLY
 each count as a message and each contributes its complete canonical encrypted
 wire bytes, using UTC minute/day windows. These are not ASK-only quotas.
 Enforcement and authoritative budget availability require server/store state.
+
+### Opt-in reserved-reply counting v2 (non-live)
+
+`canonical_encrypted_wire_bytes_utc_minute_day_ask_reply_reserved_v2` is an
+explicit alternative counting contract in the same descriptor shape. The original
+counting constant and default remain unchanged. Existing accepted terms and
+canonical descriptors keep their exact bytes; selecting this version requires
+explicit acceptance of its exact terms and counting version. Both pair and grant
+limits require messages per minute and day of at least 2, and wire bytes per day
+of at least twice their own `maxMessageWireBytes`. All other bounds above remain
+unchanged, and every pair field must be at most its corresponding grant field.
+There are exactly the same six limits; no reservation setting is added.
+
+The following are normative protocol semantics for a future authoritative
+admission implementation. This SDK unit implements structural validation and
+cryptographic binding only; it provides no admission, counters, activation or
+route. ASK and REPLY each count separately as one message and their complete
+canonical encrypted wire bytes. Windows are UTC minutes and days. A turn is
+consumed on ASK admission; `maxInFlight` counts pending ASKs.
+
+At database ASK admission time `admittedAt`, the reply deadline is the earliest
+of `admittedAt + 60 seconds`, channel expiry, agreement expiry and grant expiry.
+The reply window is half-open `[admittedAt, replyDeadline)`. ASK admission reserves
+one REPLY message in every UTC minute and UTC day intersecting that window, and
+`pair.maxMessageWireBytes` in every intersecting UTC day, against both pair and
+grant scopes. At most two minute buckets and two day buckets intersect this
+window. The ASK's actual message and wire-byte charges are separate from these
+holds. On REPLY admission within the window, convert the current bucket's
+reservation to the actual REPLY charge and release all remaining holds. Cancel,
+expiry and revocation release holds only; they do not refund actual ASK charges
+or turns. A REPLY at the deadline is outside the window. Authoritative expiry,
+reservation, conversion and release require server/store state outside these
+pure helpers.
 
 `channelId` is base64url(SHA256(canonical JSON of the ordered fields `domain`,
 `parentGrantId`, `grantGeneration`, `channelGeneration`, `directIntentId`, `s`,
