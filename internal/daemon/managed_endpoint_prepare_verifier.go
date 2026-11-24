@@ -175,28 +175,7 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 	if !time.Now().Before(s.ExpiresAt) {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
-	return &nativeWorkerPublicationToken{instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership}, nil
-}
-
-// nativeManagedSubject contains only the shared local ownership identity.
-type nativeManagedSubject struct {
-	TenantID                domain.ID
-	AccountID               domain.ID
-	HostID                  domain.ID
-	HostCredentialID        domain.ID
-	NativeAdmissionID       domain.ID
-	ConnectionIncarnationID domain.ID
-	RunnerID                domain.ID
-	RunnerConnectedAt       time.Time
-	BootID                  string
-	InstanceID              domain.ID
-	OwnershipID             domain.ID
-	OwnershipGeneration     string
-	PrincipalID             domain.ID
-	NativeGeneration        string
-	NativeSessionID         string
-	OriginID                domain.ID
-	ExpiresAt               time.Time
+	return &nativeWorkerPublicationToken{instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership, subject: s}, nil
 }
 
 func nativeManagedSubjectFromEndpoint(s transport.ManagedEndpointBindingIntent) nativeManagedSubject {

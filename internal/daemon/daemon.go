@@ -66,6 +66,8 @@ type Config struct {
 	DirectManagedSourcePrepareEnabled bool
 	// DirectManagedSourcePoPEnabled opts into closed source custody proofs. Default OFF.
 	DirectManagedSourcePoPEnabled bool
+	// DirectManagedSourceCredentialEnabled opts into local credential publication. Default OFF.
+	DirectManagedSourceCredentialEnabled bool
 	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
 	// It enables encrypted staging only, never managed runtime dispatch.
 	AccountMessageSealEnabled bool
