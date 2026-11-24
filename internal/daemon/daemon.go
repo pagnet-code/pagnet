@@ -1132,7 +1132,7 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.nativeSourcePrepare != nil && d.nativeSourcePrepare.nativeShareSourcePrepareReady() {
 		q.Set("native_share_source_enrollment", transport.NativeShareSourceEnrollmentProtocol)
 	}
-	// Never inherit an offer from the configured URL.
+	// Never inherit an offer from the configured URL, including duplicate values.
 	q.Del("managed_endpoint_prepare")
 	if d.managedEndpointPrepareReady() {
 		q.Set("managed_endpoint_prepare", transport.ManagedEndpointPrepareProtocol)
