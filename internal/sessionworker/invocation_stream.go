@@ -237,7 +237,11 @@ func (j *Journal) beginInvocationStream(ctx context.Context, key []byte, source 
 	if err = j.writeInvocationCheckpoint(ctx, tx, key, h); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	j.pulseLocalReady()
+	return nil
 }
 
 // Mirrors the ORIGINAL ciphertext ordinal in its existing FULL transaction.

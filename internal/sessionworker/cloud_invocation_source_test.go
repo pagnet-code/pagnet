@@ -57,9 +57,38 @@ func TestCloudInvocationSourceOriginalIndexedLookupNotificationAndRestart(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("source commit did not notify")
 	}
+	bound, e := j.cloudInvocationSource(t.Context(), current, request)
+	if e != nil || bound.Source != nil || !bound.Ready.valid() || bound.State != "admitted" {
+		t.Fatal("bound source published before stream checkpoint", bound, e)
+	}
+	go func() { token, _ := j.cloudReadiness.wait(t.Context(), bound.Ready); wake <- token }()
+	captureKey := make([]byte, 32)
+	if e = j.beginInvocationStream(t.Context(), captureKey, source, json.RawMessage(`{}`), [32]byte{}); e != nil {
+		t.Fatal(e)
+	}
+	select {
+	case token := <-wake:
+		if token == bound.Ready || !token.valid() {
+			t.Fatal("stream checkpoint commit missed notification", token)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream checkpoint commit did not notify")
+	}
 	found, e := j.cloudInvocationSource(t.Context(), current, request)
 	if e != nil || !reflect.DeepEqual(found.Source, &source) {
 		t.Fatal("original source relabelled", found, e)
+	}
+	streamRequest := InvocationStreamRequest{Source: invocationIdentity(*found.Source)}
+	subscription, e := j.subscribeInvocationStream(t.Context(), captureKey, current, streamRequest)
+	if e != nil {
+		t.Fatal("published source was not immediately subscribable", e)
+	}
+	streamRequest.SubscriptionID = subscription.ID
+	if e = j.unsubscribeInvocationStream(t.Context(), captureKey, current, streamRequest); e != nil {
+		t.Fatal(e)
+	}
+	if found, e = j.cloudInvocationSource(t.Context(), current, request); e != nil || !reflect.DeepEqual(found.Source, &source) {
+		t.Fatal("closed checkpoint lost retained source", found, e)
 	}
 	changed := request
 	changed.Invocation.InputAAD.KeyEpochID = "new-key"
@@ -199,6 +228,9 @@ func TestCloudRepresentativeSourceKeepsOriginalAccountAndSelectedNetworkDistinct
 			if e = j.BindNativeTurn(t.Context(), source); e != nil {
 				t.Fatal(e)
 			}
+			if e = j.beginInvocationStream(t.Context(), make([]byte, 32), source, json.RawMessage(`{}`), [32]byte{}); e != nil {
+				t.Fatal(e)
+			}
 			got, e := j.cloudInvocationSource(t.Context(), current, CloudInvocationSourceRequest{1, command, admission, inv})
 			if kind == "worker" {
 				if !errors.Is(e, ErrConflict) {
@@ -210,5 +242,47 @@ func TestCloudRepresentativeSourceKeepsOriginalAccountAndSelectedNetworkDistinct
 				t.Fatal("representative original account was relabelled to selected network", got, e)
 			}
 		})
+	}
+}
+
+func TestCloudInvocationSourceTerminalWithoutCheckpointIsUnavailable(t *testing.T) {
+	scope := testScope()
+	scope.TenantID = uuid.NewString()
+	scope.HostID = uuid.NewString()
+	scope.InstanceID = uuid.NewString()
+	dir := filepath.Join(t.TempDir(), "worker")
+	j, e := OpenJournal(dir, scope)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer func() { _ = j.Close() }()
+	current := lease(t, j)
+	network := uuid.NewString()
+	cmd, admission := uuid.NewString(), uuid.NewString()
+	inv := transport.NativeInvocationSource{InvocationID: "stable-original-invocation", InputAAD: e2ee.AAD{ProtocolVersion: transport.ProtocolVersion, TenantID: scope.TenantID, NetworkID: network, ObjectType: e2ee.ObjectTypeInvocationInput, ObjectID: "stable-original-invocation", KeyEpochID: "original-key"}}
+	grant := &Admission{NativeAdmissionID: admission, Scope: scope, TenantID: scope.TenantID, NetworkID: network, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
+	op := Operation{Input: "real original input", InputKind: "invocation", SourceCommandID: cmd, SourceAdmissionID: admission, SourceInvocation: &inv}
+	raw, _ := json.Marshal(op)
+	if _, run, e := j.admit(t.Context(), current, 1, cmd, "prompt", raw, func() (*Admission, error) { return grant, nil }); e != nil || !run {
+		t.Fatal("original admission", run, e)
+	}
+	request := CloudInvocationSourceRequest{1, cmd, admission, inv}
+	source := NativeTurnSource{Sequence: 1, LogicalTurnID: logicalWorkerTurn(1), NativeGeneration: "original-generation", NativeSessionID: "original-session", SourceCommandID: cmd, SourceAdmissionID: admission, InputKind: "invocation", SourceInvocation: &inv}
+	if e = j.BindNativeTurn(t.Context(), source); e != nil {
+		t.Fatal(e)
+	}
+	pending, e := j.cloudInvocationSource(t.Context(), current, request)
+	if e != nil || pending.Source != nil || !pending.Ready.valid() {
+		t.Fatal("missing checkpoint was not pending", pending, e)
+	}
+	if e = j.Settle(t.Context(), 1, "completed", json.RawMessage(`{}`)); e != nil {
+		t.Fatal(e)
+	}
+	token, e := j.cloudReadiness.wait(t.Context(), pending.Ready)
+	if e != nil || token == pending.Ready {
+		t.Fatal("terminal outcome missed notification", token, e)
+	}
+	if result, e := j.cloudInvocationSource(t.Context(), current, request); e == nil || result != nil {
+		t.Fatal("terminal missing checkpoint remained pending", result, e)
 	}
 }
