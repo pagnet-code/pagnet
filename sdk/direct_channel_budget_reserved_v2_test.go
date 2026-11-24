@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/transport"
@@ -45,7 +46,11 @@ func TestDirectReservedCountingRoundTrip(t *testing.T) {
 		} else {
 			invalid.Limits.MaxMessagesPerMinute = 1
 		}
-		if _, err := directValidate(raw, invalid, now); err == nil {
+		rawBad, err := json.Marshal(invalid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := directValidate(rawBad, invalid, now); err == nil {
 			t.Fatal("accepted invalid expected reserved limits")
 		}
 	}
