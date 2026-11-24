@@ -6,6 +6,7 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -76,8 +77,16 @@ func TestManagedEndpointPoPGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	proofRaw, _ := proof.CanonicalBytes()
+	transcriptHash, verifierDigest, err := DeriveManagedEndpointPoPVerifier(challenge, server, challenge.IssuedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedProof, proofDigest, err := DecodeManagedEndpointPoPProofVerifier(proofRaw)
+	if err != nil || decodedProof.ChallengeID != challenge.ChallengeID || decodedProof.TranscriptHash != transcriptHash || subtle.ConstantTimeCompare([]byte(proofDigest), []byte(verifierDigest)) != 1 {
+		t.Fatalf("verifier mismatch: %v", err)
+	}
 	snapshot, _ := challenge.Authorization.CanonicalBytes()
-	for name, got := range map[string][]byte{"challenge.json": raw, "proof.json": proofRaw, "authorization.json": snapshot} {
+	for name, got := range map[string][]byte{"challenge.json": raw, "proof.json": proofRaw, "authorization.json": snapshot, "verifier_digest.txt": []byte(verifierDigest)} {
 		path := filepath.Join("testdata", "managed_endpoint_pop_v1", name)
 		if os.Getenv("UPDATE_MANAGED_POP_GOLDEN") == "1" {
 			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -123,6 +132,13 @@ func TestManagedEndpointPoPGolden(t *testing.T) {
 	mac.Write(transcript)
 	if hex.EncodeToString(mac.Sum(nil)) != proof.HostConfirmation {
 		t.Fatal("server confirmation mismatch")
+	}
+	verifier := sha256.New()
+	verifier.Write([]byte("pagnet/managed-endpoint-host-custody-pop/verifier/v1/"))
+	verifier.Write(transcript)
+	verifier.Write(mac.Sum(nil))
+	if hex.EncodeToString(verifier.Sum(nil)) != verifierDigest {
+		t.Fatal("server verifier digest mismatch")
 	}
 	for _, purpose := range []string{"pagnet/sdk-pair/readiness/v1", managedEndpointPoPConfirm} {
 		other, _ := hkdf.Key(sha256.New, shared, nonce, purpose+string(transcript), 32)
@@ -257,6 +273,7 @@ func TestManagedEndpointPoPStrictJSON(t *testing.T) {
 		{"challenge", challenge, func(b []byte) bool { _, e := DecodeManagedEndpointPoPChallenge(b); return e == nil }},
 		{"snapshot", snapshot, func(b []byte) bool { _, e := DecodeDirectAuthorizationSnapshotV1(b); return e == nil }},
 		{"proof", proofRaw, func(b []byte) bool { _, e := DecodeManagedEndpointPoPProof(b); return e == nil }},
+		{"proof-verifier", proofRaw, func(b []byte) bool { _, _, e := DecodeManagedEndpointPoPProofVerifier(b); return e == nil }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var obj map[string]json.RawMessage
@@ -386,5 +403,105 @@ func TestManagedEndpointPoPRFC7748(t *testing.T) {
 	}
 	if hex.EncodeToString(shared) != "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742" {
 		t.Fatal("RFC7748 vector mismatch")
+	}
+}
+
+func TestManagedEndpointPoPVerifierRejects(t *testing.T) {
+	p, _, server := managedPoPFixture(t)
+	for name, key := range map[string][]byte{
+		"nil":       nil,
+		"short":     make([]byte, 31),
+		"long":      make([]byte, 33),
+		"different": bytes.Repeat([]byte{7}, 32),
+	} {
+		t.Run(name, func(t *testing.T) {
+			transcript, digest, err := DeriveManagedEndpointPoPVerifier(p, key, p.IssuedAt)
+			if err == nil || transcript != "" || digest != "" {
+				t.Fatal("accepted invalid server private key")
+			}
+		})
+	}
+	for _, now := range []time.Time{p.IssuedAt.Add(-time.Nanosecond), p.ExpiresAt, p.ExpiresAt.Add(time.Second)} {
+		if _, _, err := DeriveManagedEndpointPoPVerifier(p, server, now); err == nil {
+			t.Fatal("accepted invalid time")
+		}
+	}
+	for name, key := range map[string]string{
+		"zero":        strings.Repeat("00", 32),
+		"one":         "01" + strings.Repeat("00", 31),
+		"low-order":   "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+		"low-order-2": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+		"p-minus-one": "ec" + strings.Repeat("ff", 30) + "7f",
+		"p":           "ed" + strings.Repeat("ff", 30) + "7f",
+		"high-bit":    strings.Repeat("ff", 32),
+	} {
+		t.Run("host-"+name, func(t *testing.T) {
+			q := p
+			q.ACK.Reservation.X25519 = key
+			q.ACK.Reservation.EnrollmentDigest, _ = q.ACK.Reservation.Digest()
+			q.Receipt, _ = NewManagedEndpointPrepareReceiptReference(q.ACK)
+			if _, err := q.CanonicalBytes(); err != nil {
+				t.Fatalf("invalid test transcript: %v", err)
+			}
+			if _, _, err := DeriveManagedEndpointPoPVerifier(q, server, p.IssuedAt); err == nil {
+				t.Fatal("accepted invalid host public key")
+			}
+		})
+	}
+	for name, mutate := range map[string]func(*ManagedEndpointPoPChallenge){
+		"receipt":       func(q *ManagedEndpointPoPChallenge) { q.Receipt.ReceiptDigest = strings.Repeat("ab", 32) },
+		"authorization": func(q *ManagedEndpointPoPChallenge) { q.AuthorizationDigest = strings.Repeat("ab", 32) },
+		"server-public": func(q *ManagedEndpointPoPChallenge) { q.ServerEphemeralX25519 = q.ACK.Reservation.X25519 },
+		"expiry":        func(q *ManagedEndpointPoPChallenge) { q.ExpiresAt = q.IssuedAt.Add(6 * time.Minute) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			q := p
+			mutate(&q)
+			if _, _, err := DeriveManagedEndpointPoPVerifier(q, server, p.IssuedAt); err == nil {
+				t.Fatal("accepted invalid challenge")
+			}
+		})
+	}
+}
+
+func TestManagedEndpointPoPVerifierTamper(t *testing.T) {
+	p, host, server := managedPoPFixture(t)
+	proof, err := ConfirmManagedEndpointHostCustody(p, host, p.IssuedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcript, digest, err := DeriveManagedEndpointPoPVerifier(p, server, p.IssuedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*ManagedEndpointPoPProof){
+		"challenge":    func(q *ManagedEndpointPoPProof) { q.ChallengeID = p.Authorization.ProposalID },
+		"transcript":   func(q *ManagedEndpointPoPProof) { q.TranscriptHash = strings.Repeat("ab", 32) },
+		"confirmation": func(q *ManagedEndpointPoPProof) { q.HostConfirmation = strings.Repeat("ab", 32) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			q := proof
+			mutate(&q)
+			raw, _ := q.CanonicalBytes()
+			parsed, got, err := DecodeManagedEndpointPoPProofVerifier(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parsed.ChallengeID == p.ChallengeID && parsed.TranscriptHash == transcript && subtle.ConstantTimeCompare([]byte(got), []byte(digest)) == 1 {
+				t.Fatal("accepted tampered proof")
+			}
+		})
+	}
+	q := p
+	q.Nonce = strings.Repeat("cd", 32)
+	changedTranscript, changedDigest, err := DeriveManagedEndpointPoPVerifier(q, server, p.IssuedAt)
+	if err != nil || changedTranscript == transcript || changedDigest == digest {
+		t.Fatalf("unchanged tampered transcript verifier: %v", err)
+	}
+	confirmation, _ := hex.DecodeString(proof.HostConfirmation)
+	transcriptBytes, _ := hex.DecodeString(transcript)
+	plain := sha256.Sum256(append(transcriptBytes, confirmation...))
+	if hex.EncodeToString(plain[:]) == digest {
+		t.Fatal("missing verifier purpose separation")
 	}
 }

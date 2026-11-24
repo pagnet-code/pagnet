@@ -18,6 +18,7 @@ const (
 	ManagedEndpointPoPSuite    = "X25519-HKDF-SHA256-HMAC-SHA256"
 	managedEndpointPoPKDF      = "pagnet/managed-endpoint-host-custody-pop/kdf/v1/"
 	managedEndpointPoPConfirm  = "pagnet/managed-endpoint-host-custody-pop/host-confirm/v1/"
+	managedEndpointPoPVerifier = "pagnet/managed-endpoint-host-custody-pop/verifier/v1/"
 )
 
 // ManagedEndpointPrepareReceiptReference identifies the canonical complete ACK;
@@ -202,6 +203,66 @@ func ConfirmManagedEndpointHostCustody(p ManagedEndpointPoPChallenge, hostPrivat
 		return ManagedEndpointPoPProof{}, err
 	}
 	return ManagedEndpointPoPProof{ManagedEndpointPoPProtocol, ManagedEndpointPoPSuite, p.ChallengeID, hex.EncodeToString(transcript), hex.EncodeToString(confirmation)}, nil
+}
+
+// DeriveManagedEndpointPoPVerifier derives the expected transcript hash and
+// verifier digest for a live challenge. It returns lowercase SHA256 hex digests,
+// never the host confirmation, shared secret, or derived key. The challenge must
+// be authenticated and compared with independently retained state by the caller.
+// The caller owns serverPrivate and must wipe it when no longer needed; internal
+// copies made by Go's crypto implementation are not guaranteed to be zeroized.
+func DeriveManagedEndpointPoPVerifier(p ManagedEndpointPoPChallenge, serverPrivate []byte, now time.Time) (transcriptHash string, verifierDigest string, err error) {
+	transcript, err := p.transcriptHash(now)
+	if err != nil {
+		return "", "", err
+	}
+	private, err := ecdh.X25519().NewPrivateKey(serverPrivate)
+	if err != nil || hex.EncodeToString(private.PublicKey().Bytes()) != p.ServerEphemeralX25519 {
+		return "", "", errManagedEndpointBinding
+	}
+	publicBytes, _ := hex.DecodeString(p.ACK.Reservation.X25519)
+	if !managedEndpointCanonicalX25519(publicBytes) {
+		return "", "", errManagedEndpointBinding
+	}
+	public, err := ecdh.X25519().NewPublicKey(publicBytes)
+	if err != nil {
+		return "", "", errManagedEndpointBinding
+	}
+	shared, err := private.ECDH(public)
+	if err != nil {
+		return "", "", errManagedEndpointBinding
+	}
+	defer clear(shared)
+	confirmation, err := managedEndpointPoPConfirmation(shared, p.Nonce, transcript)
+	if err != nil {
+		return "", "", err
+	}
+	defer clear(confirmation)
+	return hex.EncodeToString(transcript), managedEndpointPoPVerifierDigest(transcript, confirmation), nil
+}
+
+// DecodeManagedEndpointPoPProofVerifier strictly decodes a canonical proof and
+// derives its verifier digest. This does not authenticate the proof. The caller
+// must match its ChallengeID and TranscriptHash with retained challenge state and
+// compare the returned digest with DeriveManagedEndpointPoPVerifier's digest in
+// constant time, for example with crypto/subtle.ConstantTimeCompare.
+func DecodeManagedEndpointPoPProofVerifier(raw []byte) (ManagedEndpointPoPProof, string, error) {
+	proof, err := DecodeManagedEndpointPoPProof(raw)
+	if err != nil {
+		return ManagedEndpointPoPProof{}, "", err
+	}
+	transcript, _ := hex.DecodeString(proof.TranscriptHash)
+	confirmation, _ := hex.DecodeString(proof.HostConfirmation)
+	defer clear(confirmation)
+	return proof, managedEndpointPoPVerifierDigest(transcript, confirmation), nil
+}
+
+func managedEndpointPoPVerifierDigest(transcript, confirmation []byte) string {
+	hash := sha256.New()
+	hash.Write([]byte(managedEndpointPoPVerifier))
+	hash.Write(transcript)
+	hash.Write(confirmation)
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func managedEndpointPoPConfirmation(shared []byte, nonce string, transcript []byte) ([]byte, error) {
