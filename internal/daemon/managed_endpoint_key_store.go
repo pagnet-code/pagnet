@@ -92,7 +92,7 @@ func (s *ManagedEndpointKeyStore) reserve(subject transport.ManagedEndpointBindi
 		return empty, errManagedEndpointKey
 	}
 	server := textServiceServer(configuredServer)
-	if server == "" || subject.TenantID.String() != session.TenantID || subject.AccountID.String() != session.AccountID || subject.OwnershipScope != session.OwnershipScope || subject.HostID.String() != session.HostID || subject.HostCredentialID.String() != session.HostCredentialID || subject.NativeAdmissionID.String() != session.NativeAdmissionID || subject.RunnerID.String() != session.RunnerID || !subject.RunnerConnectedAt.Equal(session.RunnerEpoch) || subject.BootID != session.BootID || !s.now().Before(subject.ExpiresAt) {
+	if server == "" || legacyTextServiceServer(configuredServer) != server || subject.TenantID.String() != session.TenantID || subject.AccountID.String() != session.AccountID || subject.OwnershipScope != session.OwnershipScope || subject.HostID.String() != session.HostID || subject.HostCredentialID.String() != session.HostCredentialID || subject.NativeAdmissionID.String() != session.NativeAdmissionID || subject.RunnerID.String() != session.RunnerID || !subject.RunnerConnectedAt.Equal(session.RunnerEpoch) || subject.BootID != session.BootID || !s.now().Before(subject.ExpiresAt) {
 		return empty, errManagedEndpointKey
 	}
 	request, _ := json.Marshal(struct {

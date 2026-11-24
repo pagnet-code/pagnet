@@ -210,7 +210,7 @@ func (s *ManagedEndpointPrepareJournal) apply(command transport.ManagedEndpointP
 	}
 	command, err = transport.DecodeManagedEndpointPrepareCommand(request)
 	server := textServiceServer(configuredServer)
-	if err != nil || server == "" {
+	if err != nil || server == "" || legacyTextServiceServer(configuredServer) != server {
 		return empty, errManagedEndpointPrepareJournal
 	}
 	digest := sha256.Sum256(request)
