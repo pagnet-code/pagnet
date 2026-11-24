@@ -14,8 +14,10 @@ import (
 )
 
 const (
+	MsgManagedEndpointPoP      = "host.managed_endpoint_pop"
 	ManagedEndpointPoPProtocol = "managed_endpoint_host_custody_pop_v1"
 	ManagedEndpointPoPSuite    = "X25519-HKDF-SHA256-HMAC-SHA256"
+	ManagedEndpointPoPFailure  = "managed_endpoint_pop_failed"
 	managedEndpointPoPKDF      = "pagnet/managed-endpoint-host-custody-pop/kdf/v1/"
 	managedEndpointPoPConfirm  = "pagnet/managed-endpoint-host-custody-pop/host-confirm/v1/"
 	managedEndpointPoPVerifier = "pagnet/managed-endpoint-host-custody-pop/verifier/v1/"
@@ -52,7 +54,8 @@ func NewManagedEndpointPrepareReceiptReference(ack ManagedEndpointPrepareACK) (M
 	return ManagedEndpointPrepareReceiptReference{ack.Reservation.Subject.ID, ack.CommandID, managedEndpointDigest("", raw)}, nil
 }
 
-// ManagedEndpointPoPChallenge binds complete Prepare evidence and immutable
+// ManagedEndpointPoPChallenge is the MsgManagedEndpointPoP payload. It binds
+// complete Prepare evidence and immutable
 // consent. The reservation includes the configured origin, installation key and
 // complete binding subject/host incarnation. The server generates a fresh
 // challenge ID, 32-byte nonce and ephemeral key for every challenge. This pure
@@ -174,6 +177,29 @@ func DecodeManagedEndpointPoPProof(raw []byte) (ManagedEndpointPoPProof, error) 
 	var p ManagedEndpointPoPProof
 	if !managedEndpointCanonicalDecode(raw, &p, 1024) {
 		return ManagedEndpointPoPProof{}, errManagedEndpointBinding
+	}
+	return p, nil
+}
+
+// ManagedEndpointPoPFailureACK carries only the fixed failure code and challenge
+// identity; diagnostic details must not enter the wire acknowledgment.
+type ManagedEndpointPoPFailureACK struct {
+	ProtocolVersion string    `json:"protocolVersion"`
+	ChallengeID     domain.ID `json:"challengeId"`
+	Error           string    `json:"error"`
+}
+
+func (p ManagedEndpointPoPFailureACK) CanonicalBytes() ([]byte, error) {
+	if p.ProtocolVersion != ManagedEndpointPoPProtocol || !nativeShareBindingID(p.ChallengeID) || p.Error != ManagedEndpointPoPFailure {
+		return nil, errManagedEndpointBinding
+	}
+	return json.Marshal(p)
+}
+
+func DecodeManagedEndpointPoPFailureACK(raw []byte, challengeID domain.ID) (ManagedEndpointPoPFailureACK, error) {
+	var p ManagedEndpointPoPFailureACK
+	if !managedEndpointCanonicalDecode(raw, &p, 1024) || p.ChallengeID != challengeID {
+		return ManagedEndpointPoPFailureACK{}, errManagedEndpointBinding
 	}
 	return p, nil
 }

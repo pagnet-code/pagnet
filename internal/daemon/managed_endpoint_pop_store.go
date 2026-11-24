@@ -38,6 +38,7 @@ func (s *ManagedEndpointKeyStore) confirmPoP(challenge transport.ManagedEndpoint
 		return nil, errManagedEndpointKey
 	}
 	raw, err := challenge.CanonicalBytes()
+	defer clear(raw)
 	if err != nil || len(raw) > 65536 {
 		return nil, errManagedEndpointKey
 	}
