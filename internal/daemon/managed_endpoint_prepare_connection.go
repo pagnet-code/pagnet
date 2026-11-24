@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -142,7 +143,16 @@ func managedPrepareFailure(request transport.ManagedEndpointPrepareCommand) []by
 }
 
 func (c *managedEndpointPrepareConnection) ack(payload []byte, session transport.HostSessionPayload, command transport.ManagedEndpointPrepareCommand) {
-	env, err := transport.NewEnvelope(transport.MsgCommandAck, json.RawMessage(payload))
+	_, ackErr := transport.DecodeManagedEndpointPrepareACK(payload, command)
+	errorCode := ""
+	if ackErr != nil {
+		errorCode = transport.ManagedEndpointPrepareFailure
+	}
+	env, err := transport.NewEnvelope(transport.MsgCommandAck, struct {
+		CommandID domain.ID       `json:"commandId"`
+		Error     string          `json:"error"`
+		Result    json.RawMessage `json:"result"`
+	}{CommandID: command.CommandID, Error: errorCode, Result: json.RawMessage(payload)})
 	if err != nil {
 		return
 	}
@@ -155,7 +165,7 @@ func (c *managedEndpointPrepareConnection) ack(payload []byte, session transport
 	// Serialize before checking ownership so a writer waiting behind another
 	// frame cannot reply after supersession. Keep ownership fenced through write.
 	c.d.writeMu.Lock()
-	if _, err := transport.DecodeManagedEndpointPrepareACK(payload, command); err == nil {
+	if ackErr == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := c.executor.verifyPublication(ctx, c.socket, c.native, session, c.endpoint, command)
 		cancel()
