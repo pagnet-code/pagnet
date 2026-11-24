@@ -99,6 +99,38 @@ type sharingPairEpoch struct {
 	Ciphertext     []byte `json:"ciphertext"`
 }
 
+// A challenge replaces the server's connection proof, so enrollment attempts
+// for one grant must not overlap, including coordinator and explicit calls.
+func (c *Client) lockSharingEnrollment(ctx context.Context, grant string) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.sharingEnrollmentMu.Lock()
+		if done, exists := c.sharingEnrollments[grant]; exists {
+			c.sharingEnrollmentMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-done:
+				continue
+			}
+		}
+		if c.sharingEnrollments == nil {
+			c.sharingEnrollments = make(map[string]chan struct{})
+		}
+		done := make(chan struct{})
+		c.sharingEnrollments[grant] = done
+		c.sharingEnrollmentMu.Unlock()
+		return func() {
+			c.sharingEnrollmentMu.Lock()
+			delete(c.sharingEnrollments, grant)
+			close(done)
+			c.sharingEnrollmentMu.Unlock()
+		}, nil
+	}
+}
+
 // EnrollSharingPair explicitly advances one enrollment attempt. Pending results
 // require a later explicit call; this operation never polls for the peer.
 func (c *Client) EnrollSharingPair(ctx context.Context, grantID string) (SharingPairEnrollment, error) {
@@ -106,6 +138,11 @@ func (c *Client) EnrollSharingPair(ctx context.Context, grantID string) (Sharing
 	if !validPairPathID(grantID) {
 		return result, errors.New("sdk: invalid sharing grant ID")
 	}
+	unlock, err := c.lockSharingEnrollment(ctx, grantID)
+	if err != nil {
+		return result, err
+	}
+	defer unlock()
 	if !c.connected.Load() || c.endpointID.Load() == "" || c.principalID.Load() == "" {
 		return result, errors.New("sdk: sharing enrollment requires a connected endpoint")
 	}
@@ -115,7 +152,7 @@ func (c *Client) EnrollSharingPair(ctx context.Context, grantID string) (Sharing
 	}
 	endpoint, principal, connection := c.endpointID.Load(), c.principalID.Load(), c.connGeneration.Load()
 	sameConnection := func() bool {
-		return c.connected.Load() && c.endpointID.Load() == endpoint && c.connGeneration.Load() == connection
+		return c.connected.Load() && c.principalID.Load() == principal && c.endpointID.Load() == endpoint && c.connGeneration.Load() == connection
 	}
 	var status SharingPairStatus
 	cursor := ""
@@ -152,6 +189,26 @@ func (c *Client) EnrollSharingPair(ctx context.Context, grantID string) (Sharing
 	if err := getStatus(); err != nil {
 		return result, err
 	}
+	if status.GrantID != grantID || status.Generation != generation || (principal != status.IssuerPrincipalID && principal != status.RecipientPrincipalID) {
+		return result, errors.New("sdk: sharing status binding mismatch")
+	}
+	c.cryptoMu.Lock()
+	ready := connection > 0 && c.sharingReady[status.NetworkID] == connection
+	c.cryptoMu.Unlock()
+	if ready && status.State == "active" && status.ActivationEpoch != nil {
+		// Read fresh status and validate the durable descriptor, pins and epoch
+		// key exactly as message admission does before retaining this proof.
+		session, sessionErr := c.sharingMessageSession(ctx, grantID)
+		if sessionErr != nil {
+			return result, sessionErr
+		}
+		if !sameConnection() || session.principal != principal || session.endpoint != endpoint || session.connection != connection || session.status.Generation != generation || *session.status.ActivationEpoch != *status.ActivationEpoch {
+			return result, errors.New("sdk: sharing enrollment binding changed")
+		}
+		result = pairEnrollment(session.status)
+		result.Pending = false
+		return result, nil
+	}
 	if err := c.rest.do(ctx, http.MethodPost, base+"/pin", request, &status); err != nil {
 		return result, err
 	}
@@ -174,7 +231,7 @@ func (c *Client) EnrollSharingPair(ctx context.Context, grantID string) (Sharing
 		return result, nil
 	}
 	var epoch sharingPairEpoch
-	err := c.rest.do(ctx, http.MethodGet, base+"/epoch"+query, nil, &epoch)
+	err = c.rest.do(ctx, http.MethodGet, base+"/epoch"+query, nil, &epoch)
 	if err != nil {
 		var re *restError
 		if !errors.As(err, &re) || re.status != http.StatusNotFound {

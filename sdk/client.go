@@ -127,6 +127,10 @@ type Client struct {
 	sharingMu          sync.Mutex
 	sharingCoordinator *sharingCoordinator
 
+	// Explicit and coordinator enrollment share a per-grant lock.
+	sharingEnrollmentMu sync.Mutex
+	sharingEnrollments  map[string]chan struct{}
+
 	// cached identity (tenant id for AADs, memberships for agents)
 	identityMu sync.Mutex
 	identity   *Identity
