@@ -140,12 +140,13 @@ func (e *localManagedEndpointPrepare) confirmPoP(ctx context.Context, socket *we
 	return e.keys.ConfirmPoP(ctx, e.d, ManagedEndpointPrepareScope{Socket: socket, Connection: native, Session: session}, endpoint, challenge)
 }
 
-func (e *localManagedEndpointPrepare) verifyPoPPublication(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, challenge transport.ManagedEndpointPoPChallenge) error {
-	if err := e.verifyPublication(ctx, socket, native, session, endpoint, challenge.Prepare); err != nil {
-		return err
+func (e *localManagedEndpointPrepare) verifyPoPPublication(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, challenge transport.ManagedEndpointPoPChallenge) (*nativeWorkerPublicationToken, error) {
+	token, err := e.verifyPublication(ctx, socket, native, session, endpoint, challenge.Prepare)
+	if err != nil {
+		return nil, err
 	}
 	if e.keys.now().Before(challenge.IssuedAt) || !e.keys.now().Before(challenge.ExpiresAt) {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
-	return nil
+	return token, nil
 }

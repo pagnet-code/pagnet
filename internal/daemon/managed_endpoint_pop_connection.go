@@ -16,7 +16,7 @@ const managedEndpointPoPQueueLimit = 8
 
 type managedEndpointPoPExecutor interface {
 	ready() bool
-	verifyPoPPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPoPChallenge) error
+	verifyPoPPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPoPChallenge) (*nativeWorkerPublicationToken, error)
 	confirmPoP(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPoPChallenge) ([]byte, error)
 }
 
@@ -184,12 +184,29 @@ func (c *managedEndpointPoPConnection) ack(payload []byte, session transport.Hos
 			return
 		}
 		ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
-		err := c.executor.verifyPoPPublication(ctx, c.socket, c.native, session, c.endpoint, command)
+		token, verifyErr := c.executor.verifyPoPPublication(ctx, c.socket, c.native, session, c.endpoint, command)
 		cancel()
-		if err != nil {
+		if verifyErr != nil {
 			c.d.writeMu.Unlock()
 			return
 		}
+		expires := command.ExpiresAt
+		if command.Prepare.Subject.ExpiresAt.Before(expires) {
+			expires = command.Prepare.Subject.ExpiresAt
+		}
+		wrote := false
+		err = c.d.publishNativeWorker(token, ManagedEndpointPrepareScope{Socket: c.socket, Connection: c.native, Session: session}, c.done, expires, func(deadline time.Time) error {
+			wrote = true
+			if err := c.socket.SetWriteDeadline(deadline); err != nil {
+				return err
+			}
+			return c.socket.WriteMessage(websocket.TextMessage, raw)
+		})
+		c.d.writeMu.Unlock()
+		if wrote && err != nil {
+			c.d.invalidateCurrentConnection(c.socket)
+		}
+		return
 	}
 	c.d.connMu.Lock()
 	c.native.mu.Lock()

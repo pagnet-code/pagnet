@@ -18,17 +18,22 @@ import (
 )
 
 type managedPoPLaneExecutor struct {
-	available        bool
-	publicationError error
-	started          chan transport.ManagedEndpointPoPChallenge
-	release          chan struct{}
-	finished         chan struct{}
-	canceled         chan struct{}
-	result           []byte
+	available         bool
+	publicationError  error
+	token             *nativeWorkerPublicationToken
+	beforePublication func()
+	started           chan transport.ManagedEndpointPoPChallenge
+	release           chan struct{}
+	finished          chan struct{}
+	canceled          chan struct{}
+	result            []byte
 }
 
-func (e *managedPoPLaneExecutor) verifyPoPPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPoPChallenge) error {
-	return e.publicationError
+func (e *managedPoPLaneExecutor) verifyPoPPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPoPChallenge) (*nativeWorkerPublicationToken, error) {
+	if e.beforePublication != nil {
+		e.beforePublication()
+	}
+	return e.token, e.publicationError
 }
 func (e *managedPoPLaneExecutor) ready() bool { return e.available }
 func (e *managedPoPLaneExecutor) confirmPoP(ctx context.Context, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, command transport.ManagedEndpointPoPChallenge) ([]byte, error) {
@@ -72,6 +77,10 @@ func managedPoPLaneFixture(t *testing.T, feature bool) (*Daemon, *managedEndpoin
 	}
 	executor := &managedPoPLaneExecutor{available: true, started: make(chan transport.ManagedEndpointPoPChallenge, 16), result: proof}
 	d := &Daemon{Config: Config{ManagedEndpointPrepareEnabled: true, ManagedEndpointPoPEnabled: true}, managedEndpointPrepare: &managedPrepareLaneExecutor{available: true}, managedEndpointPoP: executor, curConn: socket, nativeConn: native, writeTimeout: time.Second}
+	proxy := &NativeWorkerProxy{connection: native, done: make(chan struct{})}
+	link := &nativeWorkerLink{conn: socket, proxy: proxy}
+	d.nativeWorkers = map[string]*nativeWorkerLink{challenge.Prepare.Subject.InstanceID.String(): link}
+	executor.token = &nativeWorkerPublicationToken{instanceID: challenge.Prepare.Subject.InstanceID.String(), link: link, proxy: proxy}
 	lane := newManagedEndpointPoPConnection(d, socket, native)
 	t.Cleanup(lane.close)
 	return d, lane, peer, executor, challenge
@@ -491,5 +500,60 @@ func TestManagedEndpointPoPLaneStartupReadiness(t *testing.T) {
 	}
 	if d.managedEndpointPoPReady() {
 		t.Fatal("ready with closed serve lock")
+	}
+}
+
+func TestManagedEndpointPoPLaneVerifiedWorkerPublication(t *testing.T) {
+	for _, mutation := range []string{"unchanged", "worker replacement", "ownership mutation", "proxy close"} {
+		t.Run(mutation, func(t *testing.T) {
+			d, lane, peer, executor, command := managedPoPLaneFixture(t, true)
+			session, err := lane.native.AuthenticatedNativeHostSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor.beforePublication = func() {
+				token := executor.token
+				switch mutation {
+				case "worker replacement":
+					d.nativeWorkersMu.Lock()
+					d.nativeWorkers[token.instanceID] = &nativeWorkerLink{conn: lane.socket, proxy: token.proxy, ownership: token.ownership}
+					d.nativeWorkersMu.Unlock()
+				case "ownership mutation":
+					token.link.mu.Lock()
+					token.link.ownership.State = "retired"
+					token.link.mu.Unlock()
+				case "proxy close":
+					if err := token.proxy.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			lane.ack(executor.result, session, command)
+			// ACK publication has completed synchronously. Closing its socket
+			// makes absence observable without waiting for a scheduling timeout.
+			if err := lane.socket.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+			var env transport.Envelope
+			err = peer.ReadJSON(&env)
+			if mutation != "unchanged" {
+				if err == nil {
+					t.Fatal("stale verified worker published proof")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var outer struct {
+				CommandID domain.ID       `json:"commandId"`
+				Error     string          `json:"error"`
+				Result    json.RawMessage `json:"result"`
+			}
+			if env.Type != transport.MsgCommandAck || json.Unmarshal(env.Payload, &outer) != nil || outer.CommandID != command.ChallengeID || outer.Error != "" || !bytes.Equal(outer.Result, executor.result) {
+				t.Fatalf("unchanged verified worker did not publish exact proof: %s", env.Payload)
+			}
+		})
 	}
 }

@@ -28,7 +28,8 @@ func (s *ManagedEndpointKeyStore) ConfirmPoP(ctx context.Context, d *Daemon, cap
 	}
 	e := &localManagedEndpointPrepare{d: d, keys: s, journal: j}
 	verify := func(command transport.ManagedEndpointPrepareCommand, server string) error {
-		return e.verifyPublication(ctx, captured.Socket, captured.Connection, captured.Session, server, command)
+		_, err := e.verifyPublication(ctx, captured.Socket, captured.Connection, captured.Session, server, command)
+		return err
 	}
 	return s.confirmPoP(challenge, configuredServer, captured.Session, verify)
 }
