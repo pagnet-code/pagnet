@@ -72,28 +72,42 @@ type managedEndpointSlotKeyRecord struct {
 }
 
 func loadManagedEndpointSlotKey(file *os.File, identity []byte) (string, error) {
-	var record managedEndpointSlotKeyRecord
-	defer func() { clear(record.Private) }()
-	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
+	record, err := loadManagedEndpointSlotRecord(file, identity)
+	defer clear(record.Private)
 	if err != nil {
 		return "", err
 	}
+	return record.X25519, nil
+}
+
+func loadManagedEndpointSlotRecord(file *os.File, identity []byte) (record managedEndpointSlotKeyRecord, err error) {
+	valid := false
+	defer func() {
+		if !valid {
+			clear(record.Private)
+		}
+	}()
+	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
 	defer clear(raw)
+	if err != nil {
+		return record, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if len(raw) > nativeShareHolderMaxBytes || decoder.Decode(&record) != nil || decoder.Decode(new(any)) != io.EOF {
-		return "", errManagedEndpointKey
+		return record, errManagedEndpointKey
 	}
 	encoded, _ := json.Marshal(record)
 	defer clear(encoded)
 	if !bytes.Equal(raw, encoded) || record.Version != 2 || !bytes.Equal(record.Identity, identity) {
-		return "", errManagedEndpointKey
+		return record, errManagedEndpointKey
 	}
 	key, err := ecdh.X25519().NewPrivateKey(record.Private)
 	if err != nil || record.X25519 != hex.EncodeToString(key.PublicKey().Bytes()) {
-		return "", errManagedEndpointKey
+		return record, errManagedEndpointKey
 	}
-	return record.X25519, nil
+	valid = true
+	return record, nil
 }
 
 func (s *ManagedEndpointKeyStore) completeManagedEndpointReference(conn *sql.Conn, id domain.ID, scope, installation string, request, reservation, identity []byte, public string) error {

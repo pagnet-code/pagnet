@@ -26,7 +26,7 @@ const nativeManagedEndpointKeyNamespace = "closed-managed-endpoint-keys"
 var errManagedEndpointKey = errors.New("closed managed endpoint key unavailable, unsafe or conflicting")
 
 // ManagedEndpointKeyStore retains dedicated private X25519 keys locally. It has
-// no export, activation, credential, challenge, or transport handler. A future
+// no export, activation, credential, or transport handler. A future
 // negotiated ingress must authenticate server provenance, the live socket/session
 // and local worker ownership before Reserve, and revalidate them before key use
 // or publication.
@@ -337,10 +337,10 @@ func loadManagedEndpointKey(file *os.File) (managedEndpointKeyRecord, error) {
 		}
 	}()
 	raw, err := io.ReadAll(io.LimitReader(file, nativeShareHolderMaxBytes+1))
+	defer clear(raw)
 	if err != nil {
 		return r, err
 	}
-	defer clear(raw)
 	if len(raw) > nativeShareHolderMaxBytes {
 		return r, errManagedEndpointKey
 	}

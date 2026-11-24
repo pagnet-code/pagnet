@@ -27,7 +27,11 @@ func (d *Daemon) initManagedEndpointPrepare() {
 	}
 	journal, err := d.newManagedEndpointPrepareJournal()
 	if err == nil {
-		d.managedEndpointPrepare = &localManagedEndpointPrepare{d: d, keys: keys, journal: journal}
+		executor := &localManagedEndpointPrepare{d: d, keys: keys, journal: journal}
+		d.managedEndpointPrepare = executor
+		if d.ManagedEndpointPoPEnabled {
+			d.managedEndpointPoP = executor
+		}
 	}
 }
 
@@ -128,4 +132,21 @@ func (e *localManagedEndpointPrepare) execute(session transport.HostSessionPaylo
 		return nil, err
 	}
 	return result.ACK, nil
+}
+
+func (e *localManagedEndpointPrepare) confirmPoP(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, challenge transport.ManagedEndpointPoPChallenge) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return e.keys.ConfirmPoP(ctx, e.d, ManagedEndpointPrepareScope{Socket: socket, Connection: native, Session: session}, endpoint, challenge)
+}
+
+func (e *localManagedEndpointPrepare) verifyPoPPublication(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, challenge transport.ManagedEndpointPoPChallenge) (*nativeWorkerPublicationToken, error) {
+	token, err := e.verifyPublication(ctx, socket, native, session, endpoint, challenge.Prepare)
+	if err != nil {
+		return nil, err
+	}
+	if e.keys.now().Before(challenge.IssuedAt) || !e.keys.now().Before(challenge.ExpiresAt) {
+		return nil, ErrManagedEndpointPrepareRetryable
+	}
+	return token, nil
 }
