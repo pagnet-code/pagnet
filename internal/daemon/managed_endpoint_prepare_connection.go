@@ -16,7 +16,7 @@ const managedEndpointPrepareQueueLimit = 8
 
 type managedEndpointPrepareExecutor interface {
 	ready() bool
-	verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) error
+	verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) (*nativeWorkerPublicationToken, error)
 	prepare(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) ([]byte, error)
 }
 
@@ -167,14 +167,27 @@ func (c *managedEndpointPrepareConnection) ack(payload []byte, session transport
 	c.d.writeMu.Lock()
 	if ackErr == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := c.executor.verifyPublication(ctx, c.socket, c.native, session, c.endpoint, command)
+		token, verifyErr := c.executor.verifyPublication(ctx, c.socket, c.native, session, c.endpoint, command)
 		cancel()
-		if err != nil {
+		if verifyErr != nil {
 			c.d.writeMu.Unlock()
 			return
 		}
-
+		wrote := false
+		err = c.d.publishNativeWorker(token, ManagedEndpointPrepareScope{Socket: c.socket, Connection: c.native, Session: session}, c.done, command.Subject.ExpiresAt, func(deadline time.Time) error {
+			wrote = true
+			if err := c.socket.SetWriteDeadline(deadline); err != nil {
+				return err
+			}
+			return c.socket.WriteMessage(websocket.TextMessage, raw)
+		})
+		c.d.writeMu.Unlock()
+		if wrote && err != nil {
+			c.d.invalidateCurrentConnection(c.socket)
+		}
+		return
 	}
+
 	c.d.connMu.Lock()
 	c.native.mu.Lock()
 	if c.d.curConn != c.socket || c.d.nativeConn != c.native || c.native.session == nil || !reflect.DeepEqual(*c.native.session, session) {

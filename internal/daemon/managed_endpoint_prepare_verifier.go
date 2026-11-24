@@ -11,45 +11,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/proc"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-var (
-	ErrManagedEndpointPrepareRejected  = errors.New("managed endpoint prepare authority mismatch")
-	ErrManagedEndpointPrepareRetryable = errors.New("managed endpoint prepare authority unavailable")
-)
-
-// ManagedEndpointPrepareScope must be captured from the authenticated host.session
-// on this exact socket. It conveys no authority when supplied by a wire command.
-type ManagedEndpointPrepareScope struct {
-	Socket     *websocket.Conn
-	Connection *NativeObservationConnection
-	Session    transport.HostSessionPayload
-}
-
 // VerifyManagedEndpointPrepare checks closed server evidence against fresh local
 // ownership. EndpointID is authenticated server subject data: State has no local
 // endpoint mapping, so successful verification does not prove such a mapping.
 // This method neither reserves keys nor admits native execution.
 func (d *Daemon) VerifyManagedEndpointPrepare(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, command transport.ManagedEndpointPrepareCommand) error {
-	return d.verifyManagedEndpointPrepare(ctx, captured, configuredServer, command, func(ctx context.Context, p *NativeWorkerProxy, ownership transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
+	_, err := d.managedEndpointPreparePublicationToken(ctx, captured, configuredServer, command)
+	return err
+}
+
+func (d *Daemon) managedEndpointPreparePublicationToken(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, command transport.ManagedEndpointPrepareCommand) (*nativeWorkerPublicationToken, error) {
+	return d.verifyManagedEndpointPrepareToken(ctx, captured, configuredServer, command, func(ctx context.Context, p *NativeWorkerProxy, ownership transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
 		response, err := p.call(ctx, sessionworker.Request{Type: "ownership_verify", OwnershipVerify: &sessionworker.NativeOwnershipVerifyRequest{Ownership: ownership}})
 		if err != nil {
 			return nil, err
 		}
 		return response.OwnershipVerify, nil
 	})
-}
-
-// Dispatch counters can advance without changing the immutable owner binding.
-func sameManagedPrepareOwnership(a, b transport.NativeWorkerOwnership) bool {
-	a.LastDispatchSequence, a.RetiredFloor = 0, 0
-	b.LastDispatchSequence, b.RetiredFloor = 0, 0
-	return transport.SameNativeWorkerOwnership(a, b)
 }
 
 // managedPrepareServerOrigin normalizes comparison copies only. Escaped path
@@ -69,22 +53,27 @@ func managedPrepareSessionMatches(s transport.ManagedEndpointBindingIntent, sess
 }
 
 func (d *Daemon) verifyManagedEndpointPrepare(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, command transport.ManagedEndpointPrepareCommand, verify func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error)) error {
+	_, err := d.verifyManagedEndpointPrepareToken(ctx, captured, configuredServer, command, verify)
+	return err
+}
+
+func (d *Daemon) verifyManagedEndpointPrepareToken(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, command transport.ManagedEndpointPrepareCommand, verify func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error)) (*nativeWorkerPublicationToken, error) {
 	if _, err := command.CanonicalBytes(); err != nil {
-		return ErrManagedEndpointPrepareRejected
+		return nil, ErrManagedEndpointPrepareRejected
 	}
 	s := command.Subject
 	// Canonicalize comparison copies only: raw URLs remain part of the exact
 	// registry, proxy and owner scope identity.
 	server := managedPrepareServerOrigin(configuredServer)
 	if captured.Socket == nil || captured.Connection == nil || server == "" || !managedPrepareSessionMatches(s, captured.Session) || !time.Now().Before(s.ExpiresAt) {
-		return ErrManagedEndpointPrepareRejected
+		return nil, ErrManagedEndpointPrepareRejected
 	}
 	if d.state == nil || d.nativeRegistry == nil {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
-	// Lock order: briefly copy the link under nativeWorkersMu, then ownership under
-	// link.mu. Never nest these locks, or hold either across IPC or disk access.
-	// Registry/state reads and socket admission checks run with neither lock held.
+	// Verification copies map/link state without holding locks across IPC or disk.
+	// The returned token must be rechecked under the publication fence before a
+	// success frame is written; verification alone does not reserve ownership.
 	selectLink := func() (*nativeWorkerLink, *NativeWorkerProxy, transport.NativeWorkerOwnership, error) {
 		d.nativeWorkersMu.Lock()
 		link := d.nativeWorkers[s.InstanceID.String()]
@@ -139,43 +128,43 @@ func (d *Daemon) verifyManagedEndpointPrepare(ctx context.Context, captured Mana
 	}
 	link, p, ownership, err := selectLink()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	result, err := verify(ctx, p, ownership)
 	if err != nil {
 		// Owner RPC errors arrive as public wire strings through proxy.call.
 		// Only its explicit ownership conflict is terminal; lost IPC is retryable.
 		if errors.Is(err, ErrManagedEndpointPrepareRejected) || errors.Is(err, sessionworker.ErrConflict) || err.Error() == sessionworker.ErrConflict.Error() {
-			return ErrManagedEndpointPrepareRejected
+			return nil, ErrManagedEndpointPrepareRejected
 		}
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
 	if result == nil {
-		return ErrManagedEndpointPrepareRejected
+		return nil, ErrManagedEndpointPrepareRejected
 	}
 	snapshot := result.Snapshot
 	actualStart, identityErr := proc.StartIdentity(snapshot.PID)
 	var origin transport.NativeObservationOrigin
 	if identityErr != nil || actualStart != snapshot.NativeStartIdentity || snapshot.Scope != p.scope || snapshot.IdentityPending || snapshot.ActualRuntime != domain.RuntimeQwenCode || snapshot.ProfileFingerprint != p.profile || snapshot.PID <= 0 || snapshot.NativeStartIdentity == "" || snapshot.NativeGeneration != s.NativeGeneration || snapshot.NativeSessionID != s.NativeSessionID || json.Unmarshal(snapshot.Origin, &origin) != nil || origin.ID != s.OriginID.String() || origin.TenantID != s.TenantID.String() || origin.HostID != s.HostID.String() || origin.InstanceID != s.InstanceID.String() || origin.Runtime != string(domain.RuntimeQwenCode) || origin.NativeGeneration != s.NativeGeneration || (origin.NativeSessionID != "" && origin.NativeSessionID != s.NativeSessionID) {
-		return ErrManagedEndpointPrepareRejected
+		return nil, ErrManagedEndpointPrepareRejected
 	}
 	// Origin admission may belong to an earlier socket while the native session
 	// survives reconnect. Only current host.session authority is pinned above.
 	after, proxy, fresh, err := selectLink()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if after != link || proxy != p || !sameManagedPrepareOwnership(fresh, ownership) {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
 	d.nativeWorkersMu.Lock()
 	current := d.nativeWorkers[s.InstanceID.String()]
 	d.nativeWorkersMu.Unlock()
 	if current != link {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
 	if !time.Now().Before(s.ExpiresAt) {
-		return ErrManagedEndpointPrepareRejected
+		return nil, ErrManagedEndpointPrepareRejected
 	}
-	return nil
+	return &nativeWorkerPublicationToken{instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership}, nil
 }

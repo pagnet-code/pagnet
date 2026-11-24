@@ -47,9 +47,9 @@ func (e *localManagedEndpointPrepare) ready() bool {
 	return err == nil && journal.installation == e.journal.installation
 }
 
-func (e *localManagedEndpointPrepare) verifyPublication(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, command transport.ManagedEndpointPrepareCommand) error {
+func (e *localManagedEndpointPrepare) verifyPublication(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, command transport.ManagedEndpointPrepareCommand) (*nativeWorkerPublicationToken, error) {
 	if !e.ready() {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
 	active := func() bool {
 		e.d.connMu.Lock()
@@ -61,15 +61,16 @@ func (e *localManagedEndpointPrepare) verifyPublication(ctx context.Context, soc
 		return err == nil && reflect.DeepEqual(current, session)
 	}
 	if !active() {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
-	if err := e.d.VerifyManagedEndpointPrepare(ctx, ManagedEndpointPrepareScope{Socket: socket, Connection: native, Session: session}, endpoint, command); err != nil {
-		return err
+	token, err := e.d.managedEndpointPreparePublicationToken(ctx, ManagedEndpointPrepareScope{Socket: socket, Connection: native, Session: session}, endpoint, command)
+	if err != nil {
+		return nil, err
 	}
 	if !active() {
-		return ErrManagedEndpointPrepareRetryable
+		return nil, ErrManagedEndpointPrepareRetryable
 	}
-	return nil
+	return token, nil
 }
 
 func (e *localManagedEndpointPrepare) prepare(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint string, command transport.ManagedEndpointPrepareCommand) ([]byte, error) {
@@ -80,7 +81,8 @@ func (e *localManagedEndpointPrepare) prepare(ctx context.Context, socket *webso
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	verify := func(retained transport.ManagedEndpointPrepareCommand, server string) error {
-		return e.verifyPublication(ctx, socket, native, session, server, retained)
+		_, err := e.verifyPublication(ctx, socket, native, session, server, retained)
+		return err
 	}
 	return e.execute(session, endpoint, command, verify)
 }

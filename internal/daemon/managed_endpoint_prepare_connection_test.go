@@ -19,13 +19,14 @@ import (
 type managedPrepareLaneExecutor struct {
 	available        bool
 	publicationError error
+	token            *nativeWorkerPublicationToken
 	started          chan transport.ManagedEndpointPrepareCommand
 	release          chan struct{}
 	finished         chan struct{}
 }
 
-func (e *managedPrepareLaneExecutor) verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) error {
-	return e.publicationError
+func (e *managedPrepareLaneExecutor) verifyPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.ManagedEndpointPrepareCommand) (*nativeWorkerPublicationToken, error) {
+	return e.token, e.publicationError
 }
 func (e *managedPrepareLaneExecutor) ready() bool { return e.available }
 func (e *managedPrepareLaneExecutor) prepare(_ context.Context, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, command transport.ManagedEndpointPrepareCommand) ([]byte, error) {
@@ -119,6 +120,12 @@ func TestManagedEndpointPrepareLaneACKEnvelopeCompatibility(t *testing.T) {
 				command.Subject = subject
 				canonical = managedPrepareSuccess(t, keys, command, keySession)
 				errorCode = ""
+			}
+			if success {
+				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+				link := &nativeWorkerLink{conn: lane.socket, proxy: p}
+				lane.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
+				lane.executor.(*managedPrepareLaneExecutor).token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}
 			}
 			original := bytes.Clone(canonical)
 			lane.ack(canonical, session, command)
