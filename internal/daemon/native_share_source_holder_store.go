@@ -100,6 +100,34 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 			return err
 		}
 	}
+	// Old commands may already have attempted key creation. Never grant them a
+	// fresh attempt when adding the durable start fence.
+	rows, err := conn.QueryContext(context.Background(), `PRAGMA table_info(native_managed_endpoint_prepare_commands)`)
+	if err != nil {
+		return err
+	}
+	hasKeyStarted := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			break
+		}
+		hasKeyStarted = hasKeyStarted || name == "key_started"
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !hasKeyStarted {
+		if _, err = conn.ExecContext(context.Background(), `ALTER TABLE native_managed_endpoint_prepare_commands ADD COLUMN key_started INTEGER NOT NULL DEFAULT 1 CHECK(key_started IN(0,1))`); err != nil {
+			return err
+		}
+	}
 	var id string
 	err = conn.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
