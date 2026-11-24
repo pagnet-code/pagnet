@@ -85,8 +85,19 @@ func (j *Journal) cloudInvocationSource(ctx context.Context, lease int64, r Clou
 	if e = rows.Close(); e != nil {
 		return nil, e
 	}
+	// A bound turn precedes stream initialization. Publish its source only once
+	// the matching checkpoint is committed in this same read snapshot.
+	if result.Source != nil {
+		var ready bool
+		if e = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_invocation_streams WHERE sequence=? AND native_generation=?)`, result.Source.Sequence, result.Source.NativeGeneration).Scan(&ready); e != nil {
+			return nil, e
+		}
+		if !ready {
+			result.Source = nil
+		}
+	}
 	if result.Source == nil && state != "admitted" {
-		return nil, errors.New("original invocation completed without retained native source")
+		return nil, errors.New("original invocation completed without retained native source or stream checkpoint")
 	}
 	if e = tx.Commit(); e != nil {
 		return nil, e
