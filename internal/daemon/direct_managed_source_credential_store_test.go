@@ -4,13 +4,16 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +25,10 @@ import (
 
 func directSourceCredentialScopeOK(transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) error {
 	return nil
+}
+
+func directSourceCredentialFenceOK(*sql.Conn, transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) (func(), error) {
+	return func() {}, nil
 }
 
 func directSourceCredentialFixture(t *testing.T) (*DirectManagedSourceKeyStore, transport.DirectManagedSourceCredentialIssue, transport.HostSessionPayload) {
@@ -57,11 +64,11 @@ func directSourceCredentialPath(keys *DirectManagedSourceKeyStore, p transport.D
 
 func TestDirectSourceCredentialReplayRestartAndIsolation(t *testing.T) {
 	keys, p, session := directSourceCredentialFixture(t)
-	first, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK)
+	first, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK)
+	second, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK)
 	if err != nil || !bytes.Equal(first, second) {
 		t.Fatal("replay changed ACK", err)
 	}
@@ -98,7 +105,7 @@ func TestDirectSourceCredentialReplayRestartAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := directSourceIssue(t, keys, pop, session)
-	otherACK, err := keys.InstallCredential(other, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK)
+	otherACK, err := keys.InstallCredential(other, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK)
 	if err != nil || bytes.Equal(first, otherACK) || directSourceCredentialPath(keys, p) == directSourceCredentialPath(keys, other) {
 		t.Fatal("sources not isolated", err)
 	}
@@ -141,7 +148,7 @@ func TestDirectSourceCredentialRejectsChangedAuthorityAndEvidence(t *testing.T) 
 			case "nil":
 				verify = nil
 			case "changed-issue", "changed-id":
-				if _, err = keys.InstallCredential(p, server, session, verify, directSourceCredentialScopeOK); err != nil {
+				if _, err = keys.InstallCredential(p, server, session, verify, directSourceCredentialFenceOK); err != nil {
 					t.Fatal(err)
 				}
 				if kind == "changed-id" {
@@ -155,7 +162,7 @@ func TestDirectSourceCredentialRejectsChangedAuthorityAndEvidence(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := keys.InstallCredential(p, server, session, verify, directSourceCredentialScopeOK); err == nil {
+			if _, err := keys.InstallCredential(p, server, session, verify, directSourceCredentialFenceOK); err == nil {
 				t.Fatal("accepted invalid issue")
 			}
 		})
@@ -166,7 +173,7 @@ func TestDirectSourceCredentialCompletedFileFailsClosed(t *testing.T) {
 	for _, kind := range []string{"missing", "corrupt", "symlink", "mode", "pending", "linked-pending", "key-missing", "key-corrupt"} {
 		t.Run(kind, func(t *testing.T) {
 			keys, p, session := directSourceCredentialFixture(t)
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err != nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err != nil {
 				t.Fatal(err)
 			}
 			path := directSourceCredentialPath(keys, p)
@@ -194,7 +201,7 @@ func TestDirectSourceCredentialCompletedFileFailsClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err == nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err == nil {
 				t.Fatal("regenerated completed secret")
 			}
 			if _, err := keys.CredentialEvidence(p, "https://example.test", session, directSourceCredentialScopeOK); err == nil {
@@ -217,7 +224,7 @@ func TestDirectSourceCredentialInterruptedPublication(t *testing.T) {
 				}
 				return syncFile(f)
 			}
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err == nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err == nil {
 				t.Fatal("missing interruption")
 			}
 			var state string
@@ -225,7 +232,7 @@ func TestDirectSourceCredentialInterruptedPublication(t *testing.T) {
 				t.Fatal("attempt not committed", err)
 			}
 			keys.sync = syncFile
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err != nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err != nil {
 				t.Fatal("exact recovery failed", err)
 			}
 		})
@@ -244,7 +251,7 @@ func TestDirectSourceCredentialRevalidatesAfterContentionAndBeforeACK(t *testing
 				}
 				return nil
 			}
-			if _, err := keys.InstallCredential(p, "https://example.test", session, verify, directSourceCredentialScopeOK); err == nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, verify, directSourceCredentialFenceOK); err == nil {
 				t.Fatal("revoked authority returned ACK")
 			}
 		})
@@ -281,7 +288,9 @@ func TestDirectSourceCredentialAuthorityRevokedDuringLock(t *testing.T) {
 				return nil
 			}
 			go func() {
-				_, err := keys.InstallCredential(p, "https://example.test", session, verify, check)
+				_, err := keys.InstallCredential(p, "https://example.test", session, verify, func(_ *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, host transport.HostSessionPayload) (func(), error) {
+					return func() {}, check(issue, server, host)
+				})
 				done <- err
 			}()
 			select {
@@ -339,7 +348,7 @@ func TestDirectSourceCredentialInterruptedLinkedPublication(t *testing.T) {
 				}
 				return errors.New("interrupted after link")
 			}
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err == nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err == nil {
 				t.Fatal("missing interruption")
 			}
 			keys.sync = syncFile
@@ -379,7 +388,7 @@ func TestDirectSourceCredentialInterruptedLinkedPublication(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK)
+			_, err = keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK)
 			if kind != "exact" {
 				if err == nil {
 					t.Fatal("accepted unsafe linked pair")
@@ -409,7 +418,7 @@ func TestDirectSourceCredentialInstallationMetadataFence(t *testing.T) {
 	for _, missing := range []bool{false, true} {
 		t.Run(map[bool]string{true: "missing", false: "mismatch"}[missing], func(t *testing.T) {
 			keys, p, session := directSourceCredentialFixture(t)
-			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err != nil {
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err != nil {
 				t.Fatal(err)
 			}
 			query := `UPDATE native_direct_managed_source_credentials SET installation_id='wrong'`
@@ -436,7 +445,7 @@ func TestDirectSourceCredentialAttemptBeforeSecretAndExpiry(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := keys.InstallCredential(p, "https://example.test", session, verify, directSourceCredentialScopeOK); err == nil {
+	if _, err := keys.InstallCredential(p, "https://example.test", session, verify, directSourceCredentialFenceOK); err == nil {
 		t.Fatal("missing interruption")
 	}
 	if _, err := os.Lstat(directSourceCredentialPath(keys, p)); !errors.Is(err, os.ErrNotExist) {
@@ -446,14 +455,135 @@ func TestDirectSourceCredentialAttemptBeforeSecretAndExpiry(t *testing.T) {
 	if err := keys.registry.db.QueryRow(`SELECT state FROM native_direct_managed_source_credentials`).Scan(&state); err != nil || state != "attempted" {
 		t.Fatal("missing durable attempt", err)
 	}
-	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err != nil {
+	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err != nil {
 		t.Fatal("validated attempt failed recovery", err)
 	}
 	keys.now = func() time.Time { return p.CredentialExpiresAt }
-	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialScopeOK); err == nil {
+	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK); err == nil {
 		t.Fatal("expired replay")
 	}
 	if _, err := keys.CredentialEvidence(p, "https://example.test", session, directSourceCredentialScopeOK); err == nil {
 		t.Fatal("expired evidence")
+	}
+}
+
+func TestDirectSourceCredentialPublicationFenceThroughTransaction(t *testing.T) {
+	for _, failure := range []string{"none", "publication", "update"} {
+		t.Run(failure, func(t *testing.T) {
+			keys, p, session := directSourceCredentialFixture(t)
+			if failure == "update" {
+				if _, err := keys.registry.db.Exec(`CREATE TRIGGER reject_credential_install BEFORE UPDATE ON native_direct_managed_source_credentials BEGIN SELECT RAISE(ABORT, 'interrupted update'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var authority sync.Mutex
+			attempted := make(chan struct{})
+			revoked := make(chan struct{})
+			var releases, syncs int
+			var releaseErr error
+			syncFile := keys.sync
+			keys.sync = func(file *os.File) error {
+				syncs++
+				if authority.TryLock() {
+					authority.Unlock()
+					return errors.New("publication escaped authority guard")
+				}
+				select {
+				case <-revoked:
+					return errors.New("revocation completed before publication")
+				default:
+				}
+				if failure == "publication" {
+					return errors.New("interrupted publication")
+				}
+				return syncFile(file)
+			}
+			fence := func(conn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, host transport.HostSessionPayload) (func(), error) {
+				// This must be the already-reserved connection, not a fresh transaction.
+				if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err == nil {
+					return nil, errors.New("fence received unreserved connection")
+				}
+				authority.Lock()
+				go func() {
+					close(attempted)
+					authority.Lock()
+					close(revoked)
+					authority.Unlock()
+				}()
+				<-attempted
+				return func() {
+					releases++
+					// A new transaction can start only after the final install transaction
+					// really ended. Inspect its committed or rolled-back result before
+					// allowing the waiting revocation to proceed.
+					_, releaseErr = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE")
+					if releaseErr == nil {
+						var state string
+						releaseErr = conn.QueryRowContext(context.Background(), `SELECT state FROM native_direct_managed_source_credentials WHERE credential_id=?`, p.CredentialID).Scan(&state)
+						want := "attempted"
+						if failure == "none" {
+							want = "installed"
+						}
+						if releaseErr == nil && state != want {
+							releaseErr = errors.New("guard released before transaction result")
+						}
+						_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+						if releaseErr == nil {
+							releaseErr = rollbackErr
+						}
+					}
+					authority.Unlock()
+				}, nil
+			}
+			_, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, fence)
+			if (err != nil) != (failure != "none") {
+				t.Fatalf("install error: %v", err)
+			}
+			if releases != 1 || syncs == 0 || releaseErr != nil {
+				t.Fatalf("release count=%d syncs=%d transaction=%v", releases, syncs, releaseErr)
+			}
+			select {
+			case <-revoked:
+			case <-time.After(10 * time.Second):
+				t.Fatal("revocation remained blocked after transaction")
+			}
+		})
+	}
+}
+
+func TestDirectSourceCredentialPublicationFenceAcquisitionFailsClosed(t *testing.T) {
+	for _, kind := range []string{"error", "error-with-release", "nil-release"} {
+		t.Run(kind, func(t *testing.T) {
+			keys, p, session := directSourceCredentialFixture(t)
+			releases := 0
+			fence := func(*sql.Conn, transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) (func(), error) {
+				if kind == "nil-release" {
+					return nil, nil
+				}
+				if kind == "error-with-release" {
+					return func() { releases++ }, errors.New("revoked")
+				}
+				return nil, errors.New("revoked")
+			}
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOK, fence); err == nil {
+				t.Fatal("accepted failed fence acquisition")
+			}
+			want := 0
+			if kind == "error-with-release" {
+				want = 1
+			}
+			if releases != want {
+				t.Fatalf("releases=%d, want %d", releases, want)
+			}
+			for _, path := range []string{directSourceCredentialPath(keys, p), strings.TrimSuffix(directSourceCredentialPath(keys, p), ".json") + ".pending"} {
+				if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("published after failed acquisition", err)
+				}
+			}
+			var state string
+			if err := keys.registry.db.QueryRow(`SELECT state FROM native_direct_managed_source_credentials WHERE credential_id=?`, p.CredentialID).Scan(&state); err != nil || state != "attempted" {
+				t.Fatal("failed acquisition installed credential", err)
+			}
+		})
 	}
 }

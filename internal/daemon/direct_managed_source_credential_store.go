@@ -22,11 +22,14 @@ import (
 // outside all locks, including on replay and after every blocking acquisition.
 type DirectManagedSourceCredentialScopeCheck func(transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) error
 
-// DirectManagedSourceCredentialPublicationFence checks current authority while
-// the final key lock and SQLite reservation are held. It must not acquire
-// registry, namespace or key locks, or call remote services. Callers must supply
-// a check compatible with those locks; the richer scope verifier stays outside.
-type DirectManagedSourceCredentialPublicationFence func(transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) error
+// DirectManagedSourceCredentialPublicationFence acquires current authority while
+// the final key lock and SQLite reservation are held. It receives that reserved
+// connection and must return a non-nil release on success. The store calls release
+// exactly once after COMMIT or ROLLBACK, including when publication fails. It also
+// releases any non-nil release returned with an error. Acquisition must fail fast
+// and must not acquire registry, namespace or key locks, or call remote services.
+// The richer scope verifier stays outside these locks.
+type DirectManagedSourceCredentialPublicationFence func(*sql.Conn, transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) (func(), error)
 
 // DirectManagedSourceCredentialEvidence is public, closed installation evidence.
 // It grants no channel or activation authority and contains no credential bytes.
@@ -174,40 +177,46 @@ func (s *DirectManagedSourceKeyStore) InstallCredential(issue transport.DirectMa
 	if err != nil {
 		return nil, err
 	}
-	err = s.withKeyLocked(false, func(conn *sql.Conn, dir *os.File) error {
+	err = s.withKeyLockedScoped(false, func(conn *sql.Conn, dir *os.File) (func(), error) {
 		if err := s.validateCredentialEvidence(conn, p, server); err != nil {
-			return err
+			return nil, err
 		}
 		row, exists, err := s.credentialRow(conn, p, raw)
 		if err != nil || !exists {
-			return errDirectManagedSourceKey
+			return nil, errDirectManagedSourceKey
 		}
 		retained, err := s.loadPoPKey(conn, dir, p.PoP.ACK.Reservation, p.PoP.Prepare)
 		defer clear(retained)
 		if err != nil || !bytes.Equal(private, retained) {
-			return errDirectManagedSourceKey
+			return nil, errDirectManagedSourceKey
 		}
 		if row.State == "installed" && (row.CredentialHash != hash || !bytes.Equal(row.ACK, canonical)) {
-			return errDirectManagedSourceKey
+			return nil, errDirectManagedSourceKey
 		}
 		name := directManagedSourceKeyScope(s.installation, server, p.PoP.Prepare.Subject) + ".credential"
-		if err := fence(p, server, session); err != nil {
-			return err
-		}
-		if err := s.publishCredential(dir, name, record, row.State == "installed"); err != nil {
-			return err
-		}
-		if !s.credentialValid(p) {
-			return errDirectManagedSourceKey
-		}
-		result, err := conn.ExecContext(context.Background(), `UPDATE native_direct_managed_source_credentials SET state='installed',credential_hash=?,ack=? WHERE credential_id=? AND issue=? AND installation_id=? AND (state='attempted' OR (state='installed' AND credential_hash=? AND ack=?))`, hash, canonical, p.CredentialID, raw, s.installation, hash, canonical)
+		release, err := fence(conn, p, server, session)
 		if err != nil {
-			return err
+			return release, err
 		}
-		if n, err := result.RowsAffected(); err != nil || n != 1 {
-			return errDirectManagedSourceKey
+		if release == nil {
+			return nil, errDirectManagedSourceKey
 		}
-		return nil
+		return release, func() error {
+			if err := s.publishCredential(dir, name, record, row.State == "installed"); err != nil {
+				return err
+			}
+			if !s.credentialValid(p) {
+				return errDirectManagedSourceKey
+			}
+			result, err := conn.ExecContext(context.Background(), `UPDATE native_direct_managed_source_credentials SET state='installed',credential_hash=?,ack=? WHERE credential_id=? AND issue=? AND installation_id=? AND (state='attempted' OR (state='installed' AND credential_hash=? AND ack=?))`, hash, canonical, p.CredentialID, raw, s.installation, hash, canonical)
+			if err != nil {
+				return err
+			}
+			if n, err := result.RowsAffected(); err != nil || n != 1 {
+				return errDirectManagedSourceKey
+			}
+			return nil
+		}()
 	})
 	if err != nil {
 		return nil, err
