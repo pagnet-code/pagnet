@@ -35,9 +35,11 @@ type NativeObservationConnection struct {
 	pendingObservations   map[string]chan transport.NativeObservationReceiptPayload
 
 	// Captured from this socket's dial offer before the read loop starts.
-	offeredSnapshotSigningPublicKey string
-	offeredManagedEndpointPrepare   bool
-	offeredManagedEndpointPoP       bool
+	offeredSnapshotSigningPublicKey   string
+	offeredManagedEndpointPrepare     bool
+	offeredManagedEndpointPoP         bool
+	offeredDirectManagedSourcePrepare bool
+	offeredDirectManagedSourcePoP     bool
 
 	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
@@ -123,6 +125,18 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		}
 	}
 	if managedPoPFeatures > 1 || (managedPoPFeatures == 1 && (!c.offeredManagedEndpointPoP || managedPrepareFeatures != 1)) {
+		return ErrNativeObservationConflict
+	}
+	sourcePrepareFeatures, sourcePoPFeatures := 0, 0
+	for _, feature := range p.ProtocolFeatures {
+		if feature == transport.DirectManagedSourcePrepareProtocol {
+			sourcePrepareFeatures++
+		}
+		if feature == transport.DirectManagedSourcePoPProtocol {
+			sourcePoPFeatures++
+		}
+	}
+	if sourcePrepareFeatures > 1 || (sourcePrepareFeatures == 1 && !c.offeredDirectManagedSourcePrepare) || sourcePoPFeatures > 1 || (sourcePoPFeatures == 1 && (!c.offeredDirectManagedSourcePoP || sourcePrepareFeatures != 1)) {
 		return ErrNativeObservationConflict
 	}
 	snapshotSigningKeyNegotiated := false

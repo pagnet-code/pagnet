@@ -49,6 +49,10 @@ func managedPrepareServerOrigin(value string) string {
 }
 
 func managedPrepareSessionMatches(s transport.ManagedEndpointBindingIntent, session transport.HostSessionPayload) bool {
+	return nativeManagedSessionMatches(nativeManagedSubjectFromEndpoint(s), session)
+}
+
+func nativeManagedSessionMatches(s nativeManagedSubject, session transport.HostSessionPayload) bool {
 	return session.OwnershipScope == "personal" && s.TenantID.String() == session.TenantID && s.AccountID.String() == session.AccountID && s.HostID.String() == session.HostID && s.HostCredentialID.String() == session.HostCredentialID && s.NativeAdmissionID.String() == session.NativeAdmissionID && s.ConnectionIncarnationID == s.NativeAdmissionID && s.RunnerID.String() == session.RunnerID && s.RunnerConnectedAt.Equal(session.RunnerEpoch) && s.BootID == session.BootID
 }
 
@@ -61,11 +65,16 @@ func (d *Daemon) verifyManagedEndpointPrepareToken(ctx context.Context, captured
 	if _, err := command.CanonicalBytes(); err != nil {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
-	s := command.Subject
+	return d.verifyNativeManagedSubjectToken(ctx, captured, configuredServer, nativeManagedSubjectFromEndpoint(command.Subject), verify)
+}
+
+// verifyNativeManagedSubjectToken authenticates the exact selected native instance,
+// principal and worker independently of the role-specific wire protocol.
+func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, s nativeManagedSubject, verify func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error)) (*nativeWorkerPublicationToken, error) {
 	// Canonicalize comparison copies only: raw URLs remain part of the exact
 	// registry, proxy and owner scope identity.
 	server := managedPrepareServerOrigin(configuredServer)
-	if captured.Socket == nil || captured.Connection == nil || server == "" || !managedPrepareSessionMatches(s, captured.Session) || !time.Now().Before(s.ExpiresAt) {
+	if captured.Socket == nil || captured.Connection == nil || server == "" || !nativeManagedSessionMatches(s, captured.Session) || !time.Now().Before(s.ExpiresAt) {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	if d.state == nil || d.nativeRegistry == nil {
@@ -91,7 +100,7 @@ func (d *Daemon) verifyManagedEndpointPrepareToken(ctx context.Context, captured
 		if err != nil {
 			return nil, nil, transport.NativeWorkerOwnership{}, ErrManagedEndpointPrepareRetryable
 		}
-		if !managedPrepareSessionMatches(s, session) || managedPrepareServerOrigin(captured.Connection.serverURL) != server || captured.Connection.hostID != session.HostID || captured.Connection.bootID != session.BootID {
+		if !nativeManagedSessionMatches(s, session) || managedPrepareServerOrigin(captured.Connection.serverURL) != server || captured.Connection.hostID != session.HostID || captured.Connection.bootID != session.BootID {
 			return nil, nil, transport.NativeWorkerOwnership{}, ErrManagedEndpointPrepareRejected
 		}
 		link.mu.Lock()
@@ -167,4 +176,33 @@ func (d *Daemon) verifyManagedEndpointPrepareToken(ctx context.Context, captured
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	return &nativeWorkerPublicationToken{instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership}, nil
+}
+
+// nativeManagedSubject contains only the shared local ownership identity.
+type nativeManagedSubject struct {
+	TenantID                domain.ID
+	AccountID               domain.ID
+	HostID                  domain.ID
+	HostCredentialID        domain.ID
+	NativeAdmissionID       domain.ID
+	ConnectionIncarnationID domain.ID
+	RunnerID                domain.ID
+	RunnerConnectedAt       time.Time
+	BootID                  string
+	InstanceID              domain.ID
+	OwnershipID             domain.ID
+	OwnershipGeneration     string
+	PrincipalID             domain.ID
+	NativeGeneration        string
+	NativeSessionID         string
+	OriginID                domain.ID
+	ExpiresAt               time.Time
+}
+
+func nativeManagedSubjectFromEndpoint(s transport.ManagedEndpointBindingIntent) nativeManagedSubject {
+	return nativeManagedSubject{TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID, HostCredentialID: s.HostCredentialID, NativeAdmissionID: s.NativeAdmissionID, ConnectionIncarnationID: s.ConnectionIncarnationID, RunnerID: s.RunnerID, RunnerConnectedAt: s.RunnerConnectedAt, BootID: s.BootID, InstanceID: s.InstanceID, OwnershipID: s.OwnershipID, OwnershipGeneration: s.OwnershipGeneration, PrincipalID: s.PrincipalID, NativeGeneration: s.NativeGeneration, NativeSessionID: s.NativeSessionID, OriginID: s.OriginID, ExpiresAt: s.ExpiresAt}
+}
+
+func nativeManagedSubjectFromSource(s transport.DirectManagedSourceBindingV1) nativeManagedSubject {
+	return nativeManagedSubject{TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID, HostCredentialID: s.HostCredentialID, NativeAdmissionID: s.NativeAdmissionID, ConnectionIncarnationID: s.ConnectionIncarnationID, RunnerID: s.RunnerID, RunnerConnectedAt: s.RunnerConnectedAt, BootID: s.BootID, InstanceID: s.InstanceID, OwnershipID: s.OwnershipID, OwnershipGeneration: s.OwnershipGeneration, PrincipalID: s.PrincipalID, NativeGeneration: s.NativeGeneration, NativeSessionID: s.NativeSessionID, OriginID: s.OriginID, ExpiresAt: s.ExpiresAt}
 }

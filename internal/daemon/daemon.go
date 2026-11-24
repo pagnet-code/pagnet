@@ -62,6 +62,10 @@ type Config struct {
 	ManagedEndpointPrepareEnabled bool
 	// ManagedEndpointPoPEnabled opts into closed host custody proofs. Default OFF.
 	ManagedEndpointPoPEnabled bool
+	// DirectManagedSourcePrepareEnabled opts into closed source key preparation. Default OFF.
+	DirectManagedSourcePrepareEnabled bool
+	// DirectManagedSourcePoPEnabled opts into closed source custody proofs. Default OFF.
+	DirectManagedSourcePoPEnabled bool
 	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
 	// It enables encrypted staging only, never managed runtime dispatch.
 	AccountMessageSealEnabled bool
@@ -208,12 +212,15 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	managedEndpointPoP       managedEndpointPoPExecutor
-	managedEndpointPrepare   managedEndpointPrepareExecutor
-	managedEndpointPrepareMu sync.Mutex
-	nativeSourcePrepare      nativeShareSourcePrepareExecutor
-	nativeSourceProve        nativeShareSourceProveExecutor
-	managedEndpointKeys      interface {
+	managedEndpointPoP           managedEndpointPoPExecutor
+	managedEndpointPrepare       managedEndpointPrepareExecutor
+	managedEndpointPrepareMu     sync.Mutex
+	directManagedSourcePrepare   directManagedSourcePrepareExecutor
+	directManagedSourcePoP       directManagedSourcePoPExecutor
+	directManagedSourcePrepareMu sync.Mutex
+	nativeSourcePrepare          nativeShareSourcePrepareExecutor
+	nativeSourceProve            nativeShareSourceProveExecutor
+	managedEndpointKeys          interface {
 		Reserve(transport.ManagedEndpointBindingIntent, string, transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error)
 	}
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
@@ -994,6 +1001,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.initNativeShareSourceProve()
 	d.initManagedEndpointKeys()
 	d.initManagedEndpointPrepare()
+	d.initDirectManagedSourcePrepare()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
@@ -1144,6 +1152,14 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.managedEndpointPoPReady() {
 		q.Set("managed_endpoint_pop", transport.ManagedEndpointPoPProtocol)
 	}
+	q.Del("direct_managed_source_prepare")
+	if d.directManagedSourcePrepareReady() {
+		q.Set("direct_managed_source_prepare", transport.DirectManagedSourcePrepareProtocol)
+	}
+	q.Del("direct_managed_source_pop")
+	if d.directManagedSourcePoPReady() {
+		q.Set("direct_managed_source_pop", transport.DirectManagedSourcePoPProtocol)
+	}
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
@@ -1218,6 +1234,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn.offeredManagedEndpointPrepare = dialEndpoint.Query().Get("managed_endpoint_prepare") == transport.ManagedEndpointPrepareProtocol
 	popOffers := dialEndpoint.Query()["managed_endpoint_pop"]
 	nativeConn.offeredManagedEndpointPoP = len(popOffers) == 1 && popOffers[0] == transport.ManagedEndpointPoPProtocol
+	sourcePrepareOffers := dialEndpoint.Query()["direct_managed_source_prepare"]
+	nativeConn.offeredDirectManagedSourcePrepare = len(sourcePrepareOffers) == 1 && sourcePrepareOffers[0] == transport.DirectManagedSourcePrepareProtocol
+	sourcePoPOffers := dialEndpoint.Query()["direct_managed_source_pop"]
+	nativeConn.offeredDirectManagedSourcePoP = len(sourcePoPOffers) == 1 && sourcePoPOffers[0] == transport.DirectManagedSourcePoPProtocol
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
@@ -1237,6 +1257,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer managedPrepare.close()
 	managedPoP := newManagedEndpointPoPConnection(d, conn, nativeConn)
 	defer managedPoP.close()
+	directSourcePrepare := newDirectManagedSourcePrepareConnection(d, conn, nativeConn)
+	defer directSourcePrepare.close()
+	directSourcePoP := newDirectManagedSourcePoPConnection(d, conn, nativeConn)
+	defer directSourcePoP.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
 	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn, sourceProveOffered)
@@ -1509,6 +1533,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			continue
 		}
 		if sourceProve.handle(env) {
+			continue
+		}
+		if directSourcePoP.handle(env) {
+			continue
+		}
+		if directSourcePrepare.handle(env) {
 			continue
 		}
 		if managedPoP.handle(env) {
@@ -1791,7 +1821,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+	if env.Type == transport.MsgDirectManagedSourcePrepare || env.Type == transport.MsgDirectManagedSourcePoP || env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {
