@@ -34,6 +34,9 @@ func (d *Daemon) initDirectManagedSourcePrepare() {
 		d.directManagedSourcePrepare = executor
 		if d.DirectManagedSourcePoPEnabled {
 			d.directManagedSourcePoP = executor
+			if d.DirectManagedSourceCredentialEnabled {
+				d.directManagedSourceCredential = executor
+			}
 		}
 	}
 }

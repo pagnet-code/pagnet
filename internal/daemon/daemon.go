@@ -214,15 +214,16 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	managedEndpointPoP           managedEndpointPoPExecutor
-	managedEndpointPrepare       managedEndpointPrepareExecutor
-	managedEndpointPrepareMu     sync.Mutex
-	directManagedSourcePrepare   directManagedSourcePrepareExecutor
-	directManagedSourcePoP       directManagedSourcePoPExecutor
-	directManagedSourcePrepareMu sync.Mutex
-	nativeSourcePrepare          nativeShareSourcePrepareExecutor
-	nativeSourceProve            nativeShareSourceProveExecutor
-	managedEndpointKeys          interface {
+	managedEndpointPoP            managedEndpointPoPExecutor
+	managedEndpointPrepare        managedEndpointPrepareExecutor
+	managedEndpointPrepareMu      sync.Mutex
+	directManagedSourcePrepare    directManagedSourcePrepareExecutor
+	directManagedSourcePoP        directManagedSourcePoPExecutor
+	directManagedSourceCredential directManagedSourceCredentialExecutor
+	directManagedSourcePrepareMu  sync.Mutex
+	nativeSourcePrepare           nativeShareSourcePrepareExecutor
+	nativeSourceProve             nativeShareSourceProveExecutor
+	managedEndpointKeys           interface {
 		Reserve(transport.ManagedEndpointBindingIntent, string, transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error)
 	}
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
@@ -1162,6 +1163,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.directManagedSourcePoPReady() {
 		q.Set("direct_managed_source_pop", transport.DirectManagedSourcePoPProtocol)
 	}
+	q.Del("direct_managed_source_credential")
+	if d.directManagedSourceCredentialReady() {
+		q.Set("direct_managed_source_credential", transport.DirectManagedSourceCredentialProtocol)
+	}
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
@@ -1240,6 +1245,10 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn.offeredDirectManagedSourcePrepare = len(sourcePrepareOffers) == 1 && sourcePrepareOffers[0] == transport.DirectManagedSourcePrepareProtocol
 	sourcePoPOffers := dialEndpoint.Query()["direct_managed_source_pop"]
 	nativeConn.offeredDirectManagedSourcePoP = len(sourcePoPOffers) == 1 && sourcePoPOffers[0] == transport.DirectManagedSourcePoPProtocol
+	credentialOffers := dialEndpoint.Query()["direct_managed_source_credential"]
+	if len(credentialOffers) == 1 && credentialOffers[0] == transport.DirectManagedSourceCredentialProtocol {
+		nativeConn.offeredDirectManagedSourceCredential = credentialOffers[0]
+	}
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
@@ -1263,6 +1272,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer directSourcePrepare.close()
 	directSourcePoP := newDirectManagedSourcePoPConnection(d, conn, nativeConn)
 	defer directSourcePoP.close()
+	directSourceCredential := newDirectManagedSourceCredentialConnection(d, conn, nativeConn)
+	defer directSourceCredential.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
 	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn, sourceProveOffered)
@@ -1535,6 +1546,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			continue
 		}
 		if sourceProve.handle(env) {
+			continue
+		}
+		if directSourceCredential.handle(env) {
 			continue
 		}
 		if directSourcePoP.handle(env) {
@@ -1823,7 +1837,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == transport.MsgDirectManagedSourcePrepare || env.Type == transport.MsgDirectManagedSourcePoP || env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+	if env.Type == transport.MsgDirectManagedSourceCredential || env.Type == transport.MsgDirectManagedSourcePrepare || env.Type == transport.MsgDirectManagedSourcePoP || env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {
