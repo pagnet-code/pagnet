@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,6 +155,38 @@ func TestManagedEndpointPoPGolden(t *testing.T) {
 	otherMAC.Write(transcript)
 	if hmac.Equal(mac.Sum(nil), otherMAC.Sum(nil)) {
 		t.Fatal("confirmation domain separation")
+	}
+}
+
+func TestManagedEndpointPoPChallengeCanonicalConcurrent(t *testing.T) {
+	challenge, host, server := managedPoPFixture(t)
+	defer clear(host)
+	defer clear(server)
+	before, err := json.Marshal(challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := challenge.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				got, err := challenge.CanonicalBytes()
+				if err != nil || !bytes.Equal(got, want) {
+					t.Error("concurrent canonicalization changed challenge", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	after, err := json.Marshal(challenge)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("canonicalization mutated caller challenge", err)
 	}
 }
 
