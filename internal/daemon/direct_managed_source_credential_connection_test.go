@@ -18,6 +18,7 @@ import (
 
 type directSourceCredentialLaneExecutor struct {
 	available bool
+	install   func(transport.DirectManagedSourceCredentialIssue) ([]byte, error)
 	started   chan transport.DirectManagedSourceCredentialIssue
 	canceled  chan struct{}
 	release   chan struct{}
@@ -29,6 +30,9 @@ type directSourceCredentialLaneExecutor struct {
 func (e *directSourceCredentialLaneExecutor) ready() bool { return e.available }
 func (e *directSourceCredentialLaneExecutor) installCredential(ctx context.Context, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, issue transport.DirectManagedSourceCredentialIssue, _ *directManagedSourceCredentialPublicationLane) ([]byte, error) {
 	e.started <- issue
+	if e.install != nil {
+		return e.install(issue)
+	}
 	if e.finished != nil {
 		defer close(e.finished)
 	}
@@ -42,7 +46,10 @@ func (e *directSourceCredentialLaneExecutor) installCredential(ctx context.Conte
 	}
 	return append([]byte(nil), e.result...), e.err
 }
-func (e *directSourceCredentialLaneExecutor) publishCredentialACK(ctx context.Context, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, _ transport.DirectManagedSourceCredentialIssue, lane *directManagedSourceCredentialPublicationLane, _ []byte, write func() error) error {
+func (e *directSourceCredentialLaneExecutor) verifyCredentialPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.DirectManagedSourceCredentialIssue) (*nativeWorkerPublicationToken, error) {
+	return nil, nil
+}
+func (e *directSourceCredentialLaneExecutor) publishCredentialACK(ctx context.Context, _ *nativeWorkerPublicationToken, _ *websocket.Conn, _ *NativeObservationConnection, _ transport.HostSessionPayload, _ string, _ transport.DirectManagedSourceCredentialIssue, lane *directManagedSourceCredentialPublicationLane, _ []byte, write func() error) error {
 	lane.mu.Lock()
 	defer lane.mu.Unlock()
 	select {
@@ -147,48 +154,40 @@ func TestDirectManagedSourceCredentialLaneCapability(t *testing.T) {
 }
 
 func TestDirectManagedSourceCredentialLaneExactACK(t *testing.T) {
-	for _, failure := range []bool{false, true} {
-		t.Run(map[bool]string{false: "success", true: "failure"}[failure], func(t *testing.T) {
-			d, lane, peer, executor, issue := directSourceCredentialLaneFixture(t)
-			expected := append([]byte(nil), executor.result...)
-			wantError := ""
-			if failure {
-				executor.err = errors.Join(ErrManagedEndpointPrepareRejected, errors.New("private executor diagnostic"))
-				expected = directManagedSourceCredentialFailure(issue)
-				wantError = transport.DirectManagedSourceCredentialInstallFailure
-			}
-			env := nativeBindingEnvelope(t, transport.MsgDirectManagedSourceCredential, issue)
-			// Reserved plaintext bypasses generic persistence even without state.
-			d.handleCommand(nil, env)
-			select {
-			case <-executor.started:
-				t.Fatal("generic command reached executor")
-			default:
-			}
-			if lane.handle(transport.Envelope{Type: "unrelated"}) {
-				t.Fatal("consumed unrelated command")
-			}
-			if !lane.handle(env) {
-				t.Fatal("credential command escaped dedicated lane")
-			}
-			_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
-			var reply transport.Envelope
-			if err := peer.ReadJSON(&reply); err != nil {
-				t.Fatal(err)
-			}
-			var outer struct {
-				CommandID domain.ID       `json:"commandId"`
-				Error     string          `json:"error"`
-				Result    json.RawMessage `json:"result"`
-			}
-			var fields map[string]json.RawMessage
-			if reply.Type != transport.MsgCommandAck || json.Unmarshal(reply.Payload, &outer) != nil || json.Unmarshal(reply.Payload, &fields) != nil || len(fields) != 3 || outer.CommandID != issue.CredentialID || outer.Error != wantError || !bytes.Equal(outer.Result, expected) {
-				t.Fatal("credential ACK did not retain exact result and canonical outer fields")
-			}
-			if bytes.Contains(reply.Payload, []byte("private executor diagnostic")) {
-				t.Fatal("private diagnostic escaped")
-			}
-		})
+	d, lane, peer, executor, issue := directSourceCredentialLaneFixture(t)
+	expected := append([]byte(nil), executor.result...)
+	wantError := ""
+
+	env := nativeBindingEnvelope(t, transport.MsgDirectManagedSourceCredential, issue)
+	// Reserved plaintext bypasses generic persistence even without state.
+	d.handleCommand(nil, env)
+	select {
+	case <-executor.started:
+		t.Fatal("generic command reached executor")
+	default:
+	}
+	if lane.handle(transport.Envelope{Type: "unrelated"}) {
+		t.Fatal("consumed unrelated command")
+	}
+	if !lane.handle(env) {
+		t.Fatal("credential command escaped dedicated lane")
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var reply transport.Envelope
+	if err := peer.ReadJSON(&reply); err != nil {
+		t.Fatal(err)
+	}
+	var outer struct {
+		CommandID domain.ID       `json:"commandId"`
+		Error     string          `json:"error"`
+		Result    json.RawMessage `json:"result"`
+	}
+	var fields map[string]json.RawMessage
+	if reply.Type != transport.MsgCommandAck || json.Unmarshal(reply.Payload, &outer) != nil || json.Unmarshal(reply.Payload, &fields) != nil || len(fields) != 3 || outer.CommandID != issue.CredentialID || outer.Error != wantError || !bytes.Equal(outer.Result, expected) {
+		t.Fatal("credential ACK did not retain exact result and canonical outer fields")
+	}
+	if bytes.Contains(reply.Payload, []byte("private executor diagnostic")) {
+		t.Fatal("private diagnostic escaped")
 	}
 }
 
@@ -280,10 +279,16 @@ func TestDirectManagedSourceCredentialLaneQueueSaturation(t *testing.T) {
 }
 
 func TestDirectManagedSourceCredentialLanePrivateFailureCloses(t *testing.T) {
-	for _, reason := range []string{"private", "retryable"} {
+	for _, reason := range []string{"private", "retryable", "rejected", "key"} {
 		t.Run(reason, func(t *testing.T) {
 			_, lane, peer, executor, issue := directSourceCredentialLaneFixture(t)
 			executor.err = errors.New("private executor diagnostic")
+			if reason == "rejected" {
+				executor.err = errors.Join(ErrManagedEndpointPrepareRejected, executor.err)
+			}
+			if reason == "key" {
+				executor.err = errDirectManagedSourceKey
+			}
 			if reason == "retryable" {
 				executor.err = errors.Join(ErrManagedEndpointPrepareRetryable, executor.err)
 			}
@@ -296,4 +301,50 @@ func TestDirectManagedSourceCredentialLanePrivateFailureCloses(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDirectManagedSourceCredentialLaneMissingEvidenceRetry(t *testing.T) {
+	keys, issue, session := directSourceCredentialFixture(t)
+	if _, err := keys.registry.db.Exec(`CREATE TEMP TABLE saved_pop AS SELECT * FROM native_direct_managed_source_pop_challenges`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := keys.registry.db.Exec(`DELETE FROM native_direct_managed_source_pop_challenges`); err != nil {
+		t.Fatal(err)
+	}
+	attempt := func(expectSuccess bool) {
+		d, lane, peer, executor, _ := directSourceCredentialLaneFixture(t)
+		executor.install = func(retained transport.DirectManagedSourceCredentialIssue) ([]byte, error) {
+			return keys.InstallCredential(retained, "https://example.test", session, directSourceCredentialScopeOK, directSourceCredentialFenceOK)
+		}
+		d.handleCommand(nil, nativeBindingEnvelope(t, transport.MsgDirectManagedSourceCredential, issue))
+		lane.handle(nativeBindingEnvelope(t, transport.MsgDirectManagedSourceCredential, issue))
+		_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var env transport.Envelope
+		err := peer.ReadJSON(&env)
+		if !expectSuccess {
+			if err == nil {
+				t.Fatal("missing evidence emitted a failure ACK")
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var outer struct {
+			Result json.RawMessage `json:"result"`
+			Error  string          `json:"error"`
+		}
+		if env.Type != transport.MsgCommandAck || json.Unmarshal(env.Payload, &outer) != nil || outer.Error != "" {
+			t.Fatal("retry did not return success")
+		}
+		ack, err := transport.DecodeDirectManagedSourceCredentialACK(outer.Result)
+		if err != nil || ack.CredentialID != issue.CredentialID {
+			t.Fatal("retry changed exact issue")
+		}
+	}
+	attempt(false)
+	if _, err := keys.registry.db.Exec(`INSERT INTO native_direct_managed_source_pop_challenges SELECT * FROM saved_pop`); err != nil {
+		t.Fatal(err)
+	}
+	attempt(true)
 }

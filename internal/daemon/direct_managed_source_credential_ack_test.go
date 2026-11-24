@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ func TestSourceCredentialACKGuardWriteAndReplay(t *testing.T) {
 	go func() {
 		d.writeMu.Lock()
 		defer d.writeMu.Unlock()
-		finished <- e.publishCredentialACKWithToken(token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, lane, ack, func() error { close(entered); <-release; return nil })
+		finished <- e.publishCredentialACKWithToken(context.Background(), token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, lane, ack, func() error { close(entered); <-release; return nil })
 	}()
 	select {
 	case <-entered:
@@ -70,7 +71,7 @@ func TestSourceCredentialACKGuardWriteAndReplay(t *testing.T) {
 	if err != nil || !bytes.Equal(replay, ack) {
 		t.Fatalf("replay changed ACK: %v", err)
 	}
-	if err := e.publishCredentialACKWithToken(token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, fresh, replay, func() error { return errors.New("disconnected") }); err == nil {
+	if err := e.publishCredentialACKWithToken(context.Background(), token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, fresh, replay, func() error { return errors.New("disconnected") }); err == nil {
 		t.Fatal("lost socket succeeded")
 	}
 	restart, err := NewDirectManagedSourceKeyStore(keys.registry)
@@ -111,10 +112,15 @@ func TestSourceCredentialACKRejectsWrongIssueAndACK(t *testing.T) {
 			}
 			e := &localDirectManagedSourcePrepare{d: d, keys: keys}
 			wrote := false
-			err = e.publishCredentialACKWithToken(token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, lane, ack, func() error { wrote = true; return nil })
+			err = e.publishCredentialACKWithToken(context.Background(), token, captured.Socket, captured.Connection, captured.Session, "https://example.test", issue, lane, ack, func() error { wrote = true; return nil })
 			if err == nil || wrote {
 				t.Fatal("invalid authority reached socket")
 			}
 		})
 	}
+}
+
+func directManagedSourceCredentialFailure(request transport.DirectManagedSourceCredentialIssue) []byte {
+	raw, _ := (transport.DirectManagedSourceCredentialFailureACK{ProtocolVersion: transport.DirectManagedSourceCredentialProtocol, CredentialID: request.CredentialID, Error: transport.DirectManagedSourceCredentialInstallFailure}).CanonicalBytes()
+	return raw
 }

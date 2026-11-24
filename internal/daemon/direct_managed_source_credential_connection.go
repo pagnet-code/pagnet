@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"sync"
 	"time"
@@ -18,7 +17,8 @@ const directManagedSourceCredentialQueueLimit = 8
 type directManagedSourceCredentialExecutor interface {
 	ready() bool
 	installCredential(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.DirectManagedSourceCredentialIssue, *directManagedSourceCredentialPublicationLane) ([]byte, error)
-	publishCredentialACK(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.DirectManagedSourceCredentialIssue, *directManagedSourceCredentialPublicationLane, []byte, func() error) error
+	verifyCredentialPublication(context.Context, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.DirectManagedSourceCredentialIssue) (*nativeWorkerPublicationToken, error)
+	publishCredentialACK(context.Context, *nativeWorkerPublicationToken, *websocket.Conn, *NativeObservationConnection, transport.HostSessionPayload, string, transport.DirectManagedSourceCredentialIssue, *directManagedSourceCredentialPublicationLane, []byte, func() error) error
 }
 
 func (d *Daemon) directManagedSourceCredentialReady() bool {
@@ -128,13 +128,10 @@ func (c *directManagedSourceCredentialConnection) run() {
 				if err == nil {
 					c.ack(result, a.session, a.request)
 				} else {
-					if errors.Is(err, ErrManagedEndpointPrepareRejected) || errors.Is(err, errDirectManagedSourceKey) {
-						c.ack(directManagedSourceCredentialFailure(a.request), a.session, a.request)
-					} else {
-						c.close()
-						_ = c.socket.Close()
-					}
+					c.close()
+					_ = c.socket.Close()
 				}
+
 				clear(result)
 			}
 			c.mu.Lock()
@@ -145,23 +142,21 @@ func (c *directManagedSourceCredentialConnection) run() {
 }
 
 // No generic send/ACK helper: those may retarget and/or persist command results.
-func directManagedSourceCredentialFailure(request transport.DirectManagedSourceCredentialIssue) []byte {
-	raw, _ := (transport.DirectManagedSourceCredentialFailureACK{ProtocolVersion: transport.DirectManagedSourceCredentialProtocol, CredentialID: request.CredentialID, Error: transport.DirectManagedSourceCredentialInstallFailure}).CanonicalBytes()
-	return raw
-}
 
 func (c *directManagedSourceCredentialConnection) ack(payload []byte, session transport.HostSessionPayload, command transport.DirectManagedSourceCredentialIssue) {
-	ackError := transport.DirectManagedSourceCredentialInstallFailure
-	if ack, err := transport.DecodeDirectManagedSourceCredentialACK(payload); err == nil && ack.CredentialID == command.CredentialID {
-		ackError = ""
-	} else if failure, err := transport.DecodeDirectManagedSourceCredentialFailureACK(payload); err != nil || failure.CredentialID != command.CredentialID {
+	// The store has no durable terminal failure state. Only retained installed
+	// success may be acknowledged; every other outcome remains retryable.
+	ack, decodeErr := transport.DecodeDirectManagedSourceCredentialACK(payload)
+	if decodeErr != nil || ack.CredentialID != command.CredentialID {
+		c.close()
+		_ = c.socket.Close()
 		return
 	}
 	outer := struct {
 		CommandID domain.ID       `json:"commandId"`
 		Error     string          `json:"error"`
 		Result    json.RawMessage `json:"result"`
-	}{command.CredentialID, ackError, json.RawMessage(payload)}
+	}{command.CredentialID, "", json.RawMessage(payload)}
 	env, err := transport.NewEnvelope(transport.MsgCommandAck, outer)
 	if err != nil {
 		return
@@ -172,13 +167,19 @@ func (c *directManagedSourceCredentialConnection) ack(payload []byte, session tr
 		return
 	}
 	defer clear(raw)
-	// Serialize before checking ownership so a writer waiting behind another
-	// frame cannot reply after supersession. Keep ownership fenced through write.
-	c.d.writeMu.Lock()
-	defer c.d.writeMu.Unlock()
+	// Preverification is advisory. Locked publication rechecks exact authority
+	// after the writer is acquired, without any blocking verifier or readiness call.
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
-	err = c.executor.publishCredentialACK(ctx, c.socket, c.native, session, c.endpoint, command, c.publication, payload, func() error {
+	token, err := c.executor.verifyCredentialPublication(ctx, c.socket, c.native, session, c.endpoint, command)
+	if err != nil {
+		c.close()
+		_ = c.socket.Close()
+		return
+	}
+	c.d.writeMu.Lock()
+	defer c.d.writeMu.Unlock()
+	err = c.executor.publishCredentialACK(ctx, token, c.socket, c.native, session, c.endpoint, command, c.publication, payload, func() error {
 		deadline := time.Now().Add(c.d.writeTimeout)
 		if c.d.writeTimeout <= 0 {
 			deadline = time.Now().Add(10 * time.Second)
