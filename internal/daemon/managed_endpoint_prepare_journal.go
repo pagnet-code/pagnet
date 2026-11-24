@@ -68,7 +68,6 @@ func NewManagedEndpointPrepareJournal(r *NativeWorkerRegistry) (*ManagedEndpoint
 	return &ManagedEndpointPrepareJournal{registry: r, installation: domain.ID(id), now: time.Now}, nil
 }
 
-// newManagedEndpointPrepareJournal is deliberately unconnected to ingress.
 // Composition requires the same live serve lock as the other closed stores.
 func (d *Daemon) newManagedEndpointPrepareJournal() (*ManagedEndpointPrepareJournal, error) {
 	if d.serveLockFile == nil || d.nativeRegistry == nil {
@@ -211,7 +210,7 @@ func (s *ManagedEndpointPrepareJournal) apply(command transport.ManagedEndpointP
 	}
 	command, err = transport.DecodeManagedEndpointPrepareCommand(request)
 	server := textServiceServer(configuredServer)
-	if err != nil || server == "" {
+	if err != nil || server == "" || legacyTextServiceServer(configuredServer) != server {
 		return empty, errManagedEndpointPrepareJournal
 	}
 	digest := sha256.Sum256(request)

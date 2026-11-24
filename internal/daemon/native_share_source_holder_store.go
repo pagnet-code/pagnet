@@ -179,7 +179,11 @@ func NewNativeShareSourceHolderStore(registry *NativeWorkerRegistry) (*NativeSha
 }
 
 func nativeShareSourceHolderScope(scope NativeShareSourceHolderScope) (NativeShareSourceHolderScope, string, error) {
-	scope.ServerURL = textServiceServer(scope.ServerURL)
+	server := textServiceServer(scope.ServerURL)
+	if server == "" || legacyTextServiceServer(scope.ServerURL) != server {
+		return scope, "", errNativeShareSourceHolder
+	}
+	scope.ServerURL = server
 	if scope.ServerURL == "" || !nativeShareEpochStageID(scope.TenantID) || !nativeShareEpochStageID(scope.AccountID) || !nativeShareEpochStageID(scope.HostID) {
 		return scope, "", errNativeShareSourceHolder
 	}

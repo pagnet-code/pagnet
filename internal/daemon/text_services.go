@@ -84,6 +84,23 @@ func textServiceServer(s string) string {
 		return ""
 	}
 	u.Host = strings.ToLower(u.Host)
+	escapedPath := strings.TrimRight(u.EscapedPath(), "/")
+	path, e := url.PathUnescape(escapedPath)
+	if e != nil {
+		return ""
+	}
+	u.Path, u.RawPath = path, escapedPath
+	return u.String()
+}
+
+// legacyTextServiceServer is used only to detect custody scopes whose spelling
+// changed. Such scopes require explicit recovery rather than key replacement.
+func legacyTextServiceServer(s string) string {
+	u, e := url.Parse(strings.TrimSpace(s))
+	if e != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	u.Host = strings.ToLower(u.Host)
 	u.Path = strings.TrimRight(u.Path, "/")
 	return u.String()
 }
