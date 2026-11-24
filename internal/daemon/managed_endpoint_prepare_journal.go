@@ -68,7 +68,6 @@ func NewManagedEndpointPrepareJournal(r *NativeWorkerRegistry) (*ManagedEndpoint
 	return &ManagedEndpointPrepareJournal{registry: r, installation: domain.ID(id), now: time.Now}, nil
 }
 
-// newManagedEndpointPrepareJournal is deliberately unconnected to ingress.
 // Composition requires the same live serve lock as the other closed stores.
 func (d *Daemon) newManagedEndpointPrepareJournal() (*ManagedEndpointPrepareJournal, error) {
 	if d.serveLockFile == nil || d.nativeRegistry == nil {

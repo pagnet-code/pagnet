@@ -58,6 +58,8 @@ var ErrOutdated = errors.New("control plane requires a newer protocol — update
 
 // Config is the daemon configuration (plain data, safe to pass by value).
 type Config struct {
+	// ManagedEndpointPrepareEnabled opts into closed key preparation. Default OFF.
+	ManagedEndpointPrepareEnabled bool
 	// AccountMessageSealEnabled is an explicit composition gate; default OFF.
 	// It enables encrypted staging only, never managed runtime dispatch.
 	AccountMessageSealEnabled bool
@@ -204,9 +206,11 @@ type Daemon struct {
 	ownerTextConsoleUsed     map[string]time.Time
 	ownerTextConsoleHandlers int
 
-	nativeSourcePrepare nativeShareSourcePrepareExecutor
-	nativeSourceProve   nativeShareSourceProveExecutor
-	managedEndpointKeys interface {
+	managedEndpointPrepare   managedEndpointPrepareExecutor
+	managedEndpointPrepareMu sync.Mutex
+	nativeSourcePrepare      nativeShareSourcePrepareExecutor
+	nativeSourceProve        nativeShareSourceProveExecutor
+	managedEndpointKeys      interface {
 		Reserve(transport.ManagedEndpointBindingIntent, string, transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error)
 	}
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
@@ -986,6 +990,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.initNativeShareSourcePrepare()
 	d.initNativeShareSourceProve()
 	d.initManagedEndpointKeys()
+	d.initManagedEndpointPrepare()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
@@ -1127,9 +1132,11 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.nativeSourcePrepare != nil && d.nativeSourcePrepare.nativeShareSourcePrepareReady() {
 		q.Set("native_share_source_enrollment", transport.NativeShareSourceEnrollmentProtocol)
 	}
-	// Closed Prepare has no composed ingress/verifier yet. Never inherit an
-	// offer from the configured URL, including duplicate query values.
+	// Never inherit an offer from the configured URL.
 	q.Del("managed_endpoint_prepare")
+	if d.managedEndpointPrepareReady() {
+		q.Set("managed_endpoint_prepare", transport.ManagedEndpointPrepareProtocol)
+	}
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
@@ -1217,6 +1224,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	}()
 	shareBindings := newNativeShareBindingConnection(d, conn, nativeConn)
 	defer shareBindings.close()
+	managedPrepare := newManagedEndpointPrepareConnection(d, conn, nativeConn)
+	defer managedPrepare.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
 	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn, sourceProveOffered)
@@ -1489,6 +1498,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			continue
 		}
 		if sourceProve.handle(env) {
+			continue
+		}
+		if managedPrepare.handle(env) {
 			continue
 		}
 		if sourcePrepare.handle(env) {
