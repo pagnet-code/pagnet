@@ -94,6 +94,9 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 		`CREATE TABLE IF NOT EXISTS native_managed_endpoint_pop_challenges(challenge_id TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL UNIQUE,direct_intent_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,request BLOB NOT NULL CHECK(length(request)<=65536),request_digest BLOB NOT NULL CHECK(length(request_digest)=32),proof BLOB CHECK(length(proof)<=1024))`,
 		`CREATE TABLE IF NOT EXISTS native_managed_endpoint_key_slots(scope TEXT PRIMARY KEY,installation_id TEXT NOT NULL,identity BLOB NOT NULL,key_generation INTEGER NOT NULL CHECK(key_generation=1),file_format INTEGER NOT NULL CHECK(file_format IN(1,2)),legacy_enrollment_id TEXT NOT NULL,x25519 TEXT)`,
 		`CREATE TABLE IF NOT EXISTS native_managed_endpoint_keys(enrollment_id TEXT PRIMARY KEY,scope TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,request BLOB NOT NULL,reservation BLOB)`,
+		`CREATE TABLE IF NOT EXISTS native_direct_managed_source_keys(binding_id TEXT PRIMARY KEY,scope TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,request BLOB NOT NULL CHECK(length(request)<=24576),reservation BLOB CHECK(length(reservation)<=24576))`,
+		`CREATE TABLE IF NOT EXISTS native_direct_managed_source_prepare_commands(command_id TEXT PRIMARY KEY,binding_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,server_url TEXT NOT NULL,request BLOB NOT NULL CHECK(length(request)<=24576),request_digest BLOB NOT NULL CHECK(length(request_digest)=32),expires_at TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('reserved','succeeded','failed')),ack BLOB CHECK(length(ack)<=24576),key_started INTEGER NOT NULL DEFAULT 0 CHECK(key_started IN(0,1)),CHECK((state='reserved' AND ack IS NULL) OR (state IN ('succeeded','failed') AND ack IS NOT NULL)))`,
+		`CREATE TABLE IF NOT EXISTS native_direct_managed_source_pop_challenges(challenge_id TEXT PRIMARY KEY,binding_id TEXT NOT NULL UNIQUE,direct_intent_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,request BLOB NOT NULL CHECK(length(request)<=65536),request_digest BLOB NOT NULL CHECK(length(request_digest)=32),proof BLOB CHECK(length(proof)<=1024))`,
 		`CREATE TABLE IF NOT EXISTS native_source_holder_enrollments(scope TEXT PRIMARY KEY,installation_id TEXT NOT NULL,descriptor BLOB)`,
 		`CREATE TABLE IF NOT EXISTS native_source_prepare_journal(command_id TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,scope TEXT NOT NULL,request_digest BLOB NOT NULL CHECK(length(request_digest)=32),prepared BLOB)`,
 		`CREATE TABLE IF NOT EXISTS native_source_prove_journal(command_id TEXT PRIMARY KEY,enrollment_id TEXT NOT NULL UNIQUE,installation_id TEXT NOT NULL,scope TEXT NOT NULL,request_digest BLOB NOT NULL CHECK(length(request_digest)=32),request BLOB NOT NULL,receipt_digest TEXT)`,
@@ -134,7 +137,7 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 	err = conn.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		var count int
-		if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments)+(SELECT COUNT(*) FROM native_source_prepare_journal)+(SELECT COUNT(*) FROM native_source_prove_journal)+(SELECT COUNT(*) FROM native_managed_endpoint_key_slots)+(SELECT COUNT(*) FROM native_managed_endpoint_keys)+(SELECT COUNT(*) FROM native_managed_endpoint_prepare_commands)+(SELECT COUNT(*) FROM native_managed_endpoint_pop_challenges)`).Scan(&count); err != nil || count != 0 {
+		if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments)+(SELECT COUNT(*) FROM native_source_prepare_journal)+(SELECT COUNT(*) FROM native_source_prove_journal)+(SELECT COUNT(*) FROM native_managed_endpoint_key_slots)+(SELECT COUNT(*) FROM native_managed_endpoint_keys)+(SELECT COUNT(*) FROM native_managed_endpoint_prepare_commands)+(SELECT COUNT(*) FROM native_managed_endpoint_pop_challenges)+(SELECT COUNT(*) FROM native_direct_managed_source_keys)+(SELECT COUNT(*) FROM native_direct_managed_source_prepare_commands)+(SELECT COUNT(*) FROM native_direct_managed_source_pop_challenges)`).Scan(&count); err != nil || count != 0 {
 			return errNativeShareSourceHolder
 		}
 		var stat unix.Stat_t
@@ -143,6 +146,11 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 		}
 		if err = unix.Fstatat(int(root.Fd()), nativeManagedEndpointKeyNamespace, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
 			return errNativeShareSourceHolder
+		}
+		for _, namespace := range []string{nativeDirectManagedSourceKeyNamespace, directManagedSourcePrepareJournalNamespace} {
+			if err = unix.Fstatat(int(root.Fd()), namespace, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+				return errNativeShareSourceHolder
+			}
 		}
 		if err = unix.Fstatat(int(root.Fd()), nativeShareSourceHolderNamespace, &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
 			return errNativeShareSourceHolder
@@ -158,7 +166,7 @@ func (r *NativeWorkerRegistry) initSourceHolderInstallation() error {
 		return errNativeShareSourceHolder
 	}
 	var conflicts int
-	if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prepare_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prove_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_key_slots WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_keys WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_prepare_commands WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_pop_challenges WHERE installation_id<>?)`, id, id, id, id, id, id, id).Scan(&conflicts); err != nil || conflicts != 0 {
+	if err = conn.QueryRowContext(context.Background(), `SELECT (SELECT COUNT(*) FROM native_source_holder_enrollments WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prepare_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_source_prove_journal WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_key_slots WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_keys WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_prepare_commands WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_managed_endpoint_pop_challenges WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_direct_managed_source_keys WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_direct_managed_source_prepare_commands WHERE installation_id<>?)+(SELECT COUNT(*) FROM native_direct_managed_source_pop_challenges WHERE installation_id<>?)`, id, id, id, id, id, id, id, id, id, id).Scan(&conflicts); err != nil || conflicts != 0 {
 		return errNativeShareSourceHolder
 	}
 	if err = migrateManagedEndpointKeySlots(conn); err != nil {
