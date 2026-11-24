@@ -262,7 +262,7 @@ func TestManagedEndpointKeyCorruptionAndInterruptedReservation(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					var record managedEndpointKeyRecord
+					var record managedEndpointSlotKeyRecord
 					if json.Unmarshal(raw, &record) != nil {
 						t.Fatal("decode")
 					}
@@ -366,7 +366,7 @@ func TestManagedEndpointReservationPrivateKeyNotPublic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var record managedEndpointKeyRecord
+	var record managedEndpointSlotKeyRecord
 	if json.Unmarshal(raw, &record) != nil {
 		t.Fatal("decode")
 	}
@@ -449,7 +449,7 @@ func TestManagedEndpointKeyRecoveryNeverRepairs(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				var record managedEndpointKeyRecord
+				var record managedEndpointSlotKeyRecord
 				if err := json.Unmarshal(raw, &record); err != nil {
 					t.Fatal(err)
 				}
