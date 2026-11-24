@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -36,6 +37,7 @@ type nativeWorkerPublicationToken struct {
 	link       *nativeWorkerLink
 	proxy      *NativeWorkerProxy
 	ownership  transport.NativeWorkerOwnership
+	subject    nativeManagedSubject
 }
 
 // publishNativeWorker holds the current worker and connection authority through
@@ -75,4 +77,25 @@ func (d *Daemon) publishNativeWorker(token *nativeWorkerPublicationToken, captur
 		deadline = expires
 	}
 	return write(deadline)
+}
+
+// nativeManagedSubject contains only the shared local ownership identity.
+type nativeManagedSubject struct {
+	TenantID                domain.ID
+	AccountID               domain.ID
+	HostID                  domain.ID
+	HostCredentialID        domain.ID
+	NativeAdmissionID       domain.ID
+	ConnectionIncarnationID domain.ID
+	RunnerID                domain.ID
+	RunnerConnectedAt       time.Time
+	BootID                  string
+	InstanceID              domain.ID
+	OwnershipID             domain.ID
+	OwnershipGeneration     string
+	PrincipalID             domain.ID
+	NativeGeneration        string
+	NativeSessionID         string
+	OriginID                domain.ID
+	ExpiresAt               time.Time
 }

@@ -35,11 +35,12 @@ type NativeObservationConnection struct {
 	pendingObservations   map[string]chan transport.NativeObservationReceiptPayload
 
 	// Captured from this socket's dial offer before the read loop starts.
-	offeredSnapshotSigningPublicKey   string
-	offeredManagedEndpointPrepare     bool
-	offeredManagedEndpointPoP         bool
-	offeredDirectManagedSourcePrepare bool
-	offeredDirectManagedSourcePoP     bool
+	offeredSnapshotSigningPublicKey      string
+	offeredManagedEndpointPrepare        bool
+	offeredManagedEndpointPoP            bool
+	offeredDirectManagedSourcePrepare    bool
+	offeredDirectManagedSourcePoP        bool
+	offeredDirectManagedSourceCredential string
 
 	pendingObservationRetries map[string]nativeObservationRetry
 	// pendingHostedFabric carries the in-flight FabricHosted* request ids to
