@@ -1,0 +1,1 @@
+{"protocolVersion":"managed_endpoint_host_custody_pop_v1","suite":"X25519-HKDF-SHA256-HMAC-SHA256","challengeId":"10000000-0000-4000-8000-00000000001a","transcriptHash":"6ad55b81792ddbc0773d65c0e8a94b7c4c2676d06681db8c342275a43dfa783b","hostConfirmation":"c08c8ff260f376053c204e2e09e54df7b43bff601f6b5eba5105a81f099634bb"}
