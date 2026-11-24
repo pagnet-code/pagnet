@@ -22,6 +22,12 @@ import (
 // outside all locks, including on replay and after every blocking acquisition.
 type DirectManagedSourceCredentialScopeCheck func(transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) error
 
+// DirectManagedSourceCredentialPublicationFence checks current authority while
+// the final key lock and SQLite reservation are held. It must not acquire
+// registry, namespace or key locks, or call remote services. Callers must supply
+// a check compatible with those locks; the richer scope verifier stays outside.
+type DirectManagedSourceCredentialPublicationFence func(transport.DirectManagedSourceCredentialIssue, string, transport.HostSessionPayload) error
+
 // DirectManagedSourceCredentialEvidence is public, closed installation evidence.
 // It grants no channel or activation authority and contains no credential bytes.
 type DirectManagedSourceCredentialEvidence struct {
@@ -106,7 +112,10 @@ func (s *DirectManagedSourceKeyStore) credentialRow(conn *sql.Conn, p transport.
 // restrictive secret file. Interrupted exact attempts may recover only after
 // validating independent successful Prepare, PoP and live authority again.
 // Installed missing or damaged secrets fail closed and are never regenerated.
-func (s *DirectManagedSourceKeyStore) InstallCredential(issue transport.DirectManagedSourceCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheck) ([]byte, error) {
+func (s *DirectManagedSourceKeyStore) InstallCredential(issue transport.DirectManagedSourceCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheck, fence DirectManagedSourceCredentialPublicationFence) ([]byte, error) {
+	if fence == nil {
+		return nil, errDirectManagedSourceKey
+	}
 	p, server, raw, err := s.credentialInput(issue, configuredServer, session, verify)
 	if err != nil {
 		return nil, err
@@ -182,6 +191,9 @@ func (s *DirectManagedSourceKeyStore) InstallCredential(issue transport.DirectMa
 			return errDirectManagedSourceKey
 		}
 		name := directManagedSourceKeyScope(s.installation, server, p.PoP.Prepare.Subject) + ".credential"
+		if err := fence(p, server, session); err != nil {
+			return err
+		}
 		if err := s.publishCredential(dir, name, record, row.State == "installed"); err != nil {
 			return err
 		}
@@ -229,6 +241,14 @@ func (s *DirectManagedSourceKeyStore) publishCredential(dir *os.File, name strin
 		return nil
 	}
 	err := compare(".json", !installed)
+	if err != nil && !installed && !errors.Is(err, unix.ENOENT) {
+		// Only an exact attempted installation may repair the two-link window
+		// between publication and removal of its pending name.
+		if err := recoverDirectManagedSourceCredentialLinks(dir, name, raw); err != nil {
+			return err
+		}
+		err = compare(".json", true)
+	}
 	if err == nil {
 		var stat unix.Stat_t
 		if err := unix.Fstatat(int(dir.Fd()), name+".pending", &stat, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
@@ -273,6 +293,50 @@ func (s *DirectManagedSourceKeyStore) publishCredential(dir *os.File, name strin
 		return err
 	}
 	return s.sync(dir)
+}
+
+// recoverDirectManagedSourceCredentialLinks accepts only the exact two names of
+// one private inode and exact canonical record. Completed installations never
+// enter this recovery path. All ordinary reads retain the single-link rule.
+func recoverDirectManagedSourceCredentialLinks(dir *os.File, name string, raw []byte) error {
+	open := func(suffix string) (*os.File, unix.Stat_t, error) {
+		var stat unix.Stat_t
+		fd, err := unix.Openat(int(dir.Fd()), name+suffix, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
+		if err != nil {
+			return nil, stat, err
+		}
+		file := os.NewFile(uintptr(fd), name+suffix)
+		if err = unix.Fstat(fd, &stat); err != nil || uint32(stat.Mode)&unix.S_IFMT != unix.S_IFREG || uint32(stat.Mode)&07777 != 0600 || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 2 {
+			file.Close()
+			return nil, stat, errDirectManagedSourceKey
+		}
+		return file, stat, nil
+	}
+	published, first, err := open(".json")
+	if err != nil {
+		return errDirectManagedSourceKey
+	}
+	defer published.Close()
+	pending, second, err := open(".pending")
+	if err != nil {
+		return errDirectManagedSourceKey
+	}
+	defer pending.Close()
+	if first.Dev != second.Dev || first.Ino != second.Ino {
+		return errDirectManagedSourceKey
+	}
+	retained, err := io.ReadAll(io.LimitReader(published, 4097))
+	defer clear(retained)
+	if err != nil || len(retained) > 4096 || !bytes.Equal(retained, raw) {
+		return errDirectManagedSourceKey
+	}
+	for _, suffix := range []string{".json", ".pending"} {
+		var current unix.Stat_t
+		if err := unix.Fstatat(int(dir.Fd()), name+suffix, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil || current.Dev != first.Dev || current.Ino != first.Ino || current.Nlink != 2 || current.Mode != first.Mode || current.Uid != first.Uid {
+			return errDirectManagedSourceKey
+		}
+	}
+	return unix.Unlinkat(int(dir.Fd()), name+".pending", 0)
 }
 
 // CredentialEvidence verifies custody and completed installation through exact
