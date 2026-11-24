@@ -406,7 +406,7 @@ func TestDirectManagedSourceCredentialDomainSeparation(t *testing.T) {
 	if hmac.Equal(credential, install) {
 		t.Fatal("credential and installation keys collide")
 	}
-	for _, purpose := range []string{"pagnet/managed-direct-credential/credential-secret/v1/", "pagnet/managed-direct-credential/install-key/v1/", "pagnet/direct-managed-source-host-custody-pop/key/v1/", "pagnet/sdk-pair/readiness/v1", "credential-secret/v1/", "install-key/v1/"} {
+	for _, purpose := range []string{"pagnet/managed-direct-credential/credential-secret/v1/", "pagnet/managed-direct-credential/install-key/v1/", "pagnet/direct-managed-source-host-custody-pop/kdf/v1/", "pagnet/sdk-pair/readiness/v1", "credential-secret/v1/", "install-key/v1/"} {
 		other := derive(purpose)
 		if hmac.Equal(other, credential) || hmac.Equal(other, install) {
 			t.Fatal("KDF domain separation")
@@ -420,7 +420,7 @@ func TestDirectManagedSourceCredentialDomainSeparation(t *testing.T) {
 		return h.Sum(nil)
 	}
 	confirmation := mac(install, "pagnet/direct-managed-source-credential/host-install/v1/")
-	for _, prefix := range []string{"host-install/v1/", "pagnet/direct-managed-source-credential/install-key/v1/", "pagnet/direct-managed-source-host-custody-pop/confirm/v1/"} {
+	for _, prefix := range []string{"host-install/v1/", "pagnet/direct-managed-source-credential/install-key/v1/", "pagnet/direct-managed-source-host-custody-pop/host-confirm/v1/"} {
 		if hmac.Equal(confirmation, mac(install, prefix)) {
 			t.Fatal("confirmation domain separation")
 		}
