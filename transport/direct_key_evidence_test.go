@@ -2,8 +2,6 @@ package transport
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -22,12 +20,21 @@ func directKeyEvidenceFixture(t *testing.T, role string) DirectKeyEvidenceTransc
 		party = d.P
 		protocols = []string{ManagedEndpointBindingProtocol, ManagedEndpointPrepareProtocol, ManagedEndpointPoPProtocol, ManagedDirectCredentialProtocol}
 	}
+
+	binding, err := os.ReadFile(filepath.Join("testdata", "direct_key_evidence_v1", role, "binding.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingHash, err := DirectKeyEvidenceBindingTranscriptHashV1(role, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return DirectKeyEvidenceTranscriptV1{
 		Domain: DirectKeyEvidenceDomainV1, Role: role, BindingProtocol: protocols[0], PrepareProtocol: protocols[1], PoPProtocol: protocols[2], CredentialProtocol: protocols[3],
 		NetworkID: d.NetworkID, DirectIntentID: d.DirectIntentID, ProposalID: directV2TestID(20), ProposalVersion: "3", ParentGrantID: d.ParentGrantID, GrantGeneration: d.GrantGeneration, ChannelGeneration: d.ChannelGeneration, AuthorizationDigest: d.AuthorizationDigest,
 		SourcePrincipalID: d.S.PrincipalID, TargetPrincipalID: d.P.PrincipalID, SourceAuthorityGeneration: directV2TestID(21), SourceMembershipAuthorityGeneration: directV2TestID(22), TargetAuthorityGeneration: directV2TestID(23),
 		Party:   DirectKeyEvidencePartyV1{party.TenantID, party.PrincipalID, party.EndpointID, party.CredentialID, party.PublicKey},
-		Binding: DirectKeyEvidenceBindingV1{directV2TestID(24), "1", strings.Repeat("ab", 32)}, Reservation: DirectKeyEvidenceReservationV1{directV2TestID(25), "1", strings.Repeat("bc", 32)},
+		Binding: DirectKeyEvidenceBindingV1{directV2TestID(24), "1", bindingHash}, Reservation: DirectKeyEvidenceReservationV1{directV2TestID(25), "1", strings.Repeat("bc", 32)},
 		Evidence: DirectKeyEvidenceDigestsV1{strings.Repeat("01", 32), strings.Repeat("02", 32), strings.Repeat("03", 32), strings.Repeat("04", 32), strings.Repeat("05", 32), strings.Repeat("06", 32)}, Budget: d.Budget, Limits: d.Limits, EffectiveExpiresAt: d.ExpiresAt,
 	}
 }
@@ -63,64 +70,68 @@ func TestDirectKeyEvidenceGolden(t *testing.T) {
 }
 
 func TestDirectKeyEvidenceEveryFieldBound(t *testing.T) {
-	p := directKeyEvidenceFixture(t, "S")
-	raw, _ := p.CanonicalBytes()
-	digest, _ := p.Digest()
-	// Mutating each leaf must either fail validation or change the commitment.
-	var visit func(reflect.Value, string)
-	visit = func(v reflect.Value, path string) {
-		for i := 0; i < v.NumField(); i++ {
-			f := v.Field(i)
-			name := path + v.Type().Field(i).Name
-			if f.Kind() == reflect.Struct {
-				visit(f, name+".")
-				continue
-			}
-			old := reflect.New(f.Type()).Elem()
-			old.Set(f)
-			switch f.Kind() {
-			case reflect.String:
-				value := f.String()
-				switch {
-				case directV2ID(value):
-					if strings.HasSuffix(value, "ff") {
-						value = value[:len(value)-2] + "fe"
-					} else {
-						value = value[:len(value)-2] + "ff"
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			p := directKeyEvidenceFixture(t, role)
+			raw, _ := p.CanonicalBytes()
+			digest, _ := p.Digest()
+			// Mutating each leaf must either fail validation or change the commitment.
+			var visit func(reflect.Value, string)
+			visit = func(v reflect.Value, path string) {
+				for i := 0; i < v.NumField(); i++ {
+					f := v.Field(i)
+					name := path + v.Type().Field(i).Name
+					if f.Kind() == reflect.Struct {
+						visit(f, name+".")
+						continue
 					}
-				case directV2Digest(value):
-					if value[0] == 'f' {
-						value = "e" + value[1:]
-					} else {
-						value = "f" + value[1:]
+					old := reflect.New(f.Type()).Elem()
+					old.Set(f)
+					switch f.Kind() {
+					case reflect.String:
+						value := f.String()
+						switch {
+						case directV2ID(value):
+							if strings.HasSuffix(value, "ff") {
+								value = value[:len(value)-2] + "fe"
+							} else {
+								value = value[:len(value)-2] + "ff"
+							}
+						case directV2Digest(value):
+							if value[0] == 'f' {
+								value = "e" + value[1:]
+							} else {
+								value = "f" + value[1:]
+							}
+						case directV2Decimal(value):
+							n, _ := strconv.ParseUint(value, 10, 64)
+							value = strconv.FormatUint(n+1, 10)
+						case strings.HasSuffix(value, "Z"):
+							value = "2030-01-01T01:30:00Z"
+						case name == "Party.PublicKey":
+							value = directV2TestPoint(12)
+						default:
+							value += "x"
+						}
+						f.SetString(value)
+					case reflect.Int:
+						f.SetInt(f.Int() + 1)
+					default:
+						t.Fatal("unhandled field", name)
 					}
-				case directV2Decimal(value):
-					n, _ := strconv.ParseUint(value, 10, 64)
-					value = strconv.FormatUint(n+1, 10)
-				case strings.HasSuffix(value, "Z"):
-					value = "2030-01-01T01:30:00Z"
-				case name == "Party.PublicKey":
-					value = directV2TestPoint(12)
-				default:
-					value += "x"
-				}
-				f.SetString(value)
-			case reflect.Int:
-				f.SetInt(f.Int() + 1)
-			default:
-				t.Fatal("unhandled field", name)
-			}
-			mutated, err := p.CanonicalBytes()
-			if err == nil {
-				next, _ := p.Digest()
-				if bytes.Equal(raw, mutated) || digest == next {
-					t.Fatal("unbound", name)
+					mutated, err := p.CanonicalBytes()
+					if err == nil {
+						next, _ := p.Digest()
+						if bytes.Equal(raw, mutated) || digest == next {
+							t.Fatal("unbound", name)
+						}
+					}
+					f.Set(old)
 				}
 			}
-			f.Set(old)
-		}
+			visit(reflect.ValueOf(&p).Elem(), "")
+		})
 	}
-	visit(reflect.ValueOf(&p).Elem(), "")
 }
 
 func TestDirectKeyEvidenceRejectsMalformed(t *testing.T) {
@@ -186,34 +197,49 @@ func TestDirectKeyEvidenceCounting(t *testing.T) {
 }
 
 func TestDirectKeyEvidenceBindingHash(t *testing.T) {
-	source, _, _ := directManagedSourceFixture(t)
-	sraw, err := source.Prepare.Subject.CanonicalBytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	party := managedBindingFixture()
-	praw, err := party.CanonicalBytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for role, raw := range map[string][]byte{"S": sraw, "P": praw} {
-		got, err := DirectKeyEvidenceBindingTranscriptHashV1(role, raw)
-		sum := sha256.Sum256(append([]byte("pagnet/direct-key-evidence/binding/v1/"), raw...))
-		if err != nil || got != hex.EncodeToString(sum[:]) {
-			t.Fatal("hash", err)
-		}
-		if _, err := DirectKeyEvidenceBindingTranscriptHashV1(role, append(raw, ' ')); err == nil {
-			t.Fatal("noncanonical binding")
-		}
-		other := "P"
-		if role == "P" {
-			other = "S"
-		}
-		if _, err := DirectKeyEvidenceBindingTranscriptHashV1(other, raw); err == nil {
-			t.Fatal("wrong role")
-		}
-	}
-	if _, err := DirectKeyEvidenceBindingTranscriptHashV1("", sraw); err == nil {
-		t.Fatal("missing role")
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			dir := filepath.Join("testdata", "direct_key_evidence_v1", role)
+			raw, err := os.ReadFile(filepath.Join(dir, "binding.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := os.ReadFile(filepath.Join(dir, "binding_hash.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := DirectKeyEvidenceBindingTranscriptHashV1(role, raw)
+			if err != nil || got != string(want) {
+				t.Fatal("binding hash changed", err)
+			}
+			transcript := directKeyEvidenceFixture(t, role)
+			if transcript.Binding.BindingTranscriptHash != got {
+				t.Fatal("binding hash not committed in transcript")
+			}
+			for name, bad := range map[string][]byte{
+				"leading":  append([]byte(" "), raw...),
+				"interior": bytes.Replace(raw, []byte(`,"directIntentId"`), []byte(`, "directIntentId"`), 1),
+				"trailing": append(append([]byte(nil), raw...), ' '),
+			} {
+				t.Run(name, func(t *testing.T) {
+					if bytes.Equal(raw, bad) {
+						t.Fatal("whitespace mutation did not change binding")
+					}
+					if _, err := DirectKeyEvidenceBindingTranscriptHashV1(role, bad); err == nil {
+						t.Fatal("noncanonical binding")
+					}
+				})
+			}
+			other := "P"
+			if role == "P" {
+				other = "S"
+			}
+			if _, err := DirectKeyEvidenceBindingTranscriptHashV1(other, raw); err == nil {
+				t.Fatal("wrong role")
+			}
+			if _, err := DirectKeyEvidenceBindingTranscriptHashV1("", raw); err == nil {
+				t.Fatal("missing role")
+			}
+		})
 	}
 }
