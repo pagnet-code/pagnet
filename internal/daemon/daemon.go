@@ -1123,6 +1123,9 @@ func (d *Daemon) wsURL(ctx context.Context) string {
 }
 
 func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSigningPublicKey string) string {
+	// Retry target custody construction for every connection after transient
+	// startup failures. Existing custody and native workers are retained.
+	d.initManagedDirectCredential()
 	base := strings.TrimSuffix(d.ServerURL, "/")
 	u, err := url.Parse(base)
 	if err != nil {

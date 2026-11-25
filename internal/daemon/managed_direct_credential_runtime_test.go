@@ -5,7 +5,10 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
@@ -148,5 +151,100 @@ func TestManagedCredentialLaneInvalidACK(t *testing.T) {
 				t.Fatal("invalid ACK published")
 			}
 		})
+	}
+}
+
+func TestManagedCredentialRuntimeStartupRecovery(t *testing.T) {
+	_, _, d, _, _ := managedCredentialAuthorityFixture(t)
+	registry := d.nativeRegistry
+	d.nativeRegistry = nil
+	d.ManagedEndpointPrepareEnabled = true
+	d.ManagedEndpointPoPEnabled = true
+	d.ManagedDirectCredentialEnabled = true
+	prepare := &managedPrepareLaneExecutor{available: false}
+	pop := &managedPoPLaneExecutor{available: false}
+	d.managedEndpointPrepare = prepare
+	d.managedEndpointPoP = pop
+	offer := func() []string {
+		t.Helper()
+		endpoint, err := url.Parse(d.wsURL(context.Background()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return endpoint.Query()["managed_direct_credential"]
+	}
+	// A failed startup construction must be retried on the next connection.
+	if got := offer(); len(got) != 0 || d.managedDirectCredential != nil {
+		t.Fatal("failed startup offered custody", got)
+	}
+	d.nativeRegistry = registry
+	if got := offer(); len(got) != 0 || d.managedDirectCredential == nil {
+		t.Fatal("unready executor was not retained", got)
+	}
+	retained := d.managedDirectCredential
+	lock, err := os.CreateTemp(t.TempDir(), "serve.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	d.serveLockFile = lock
+	prepare.available = true
+	pop.available = true
+	for attempt := 0; attempt < 2; attempt++ {
+		got := offer()
+		if len(got) != 1 || got[0] != transport.ManagedDirectCredentialProtocol {
+			t.Fatal("healthy reconnect did not offer exact custody", got)
+		}
+		if d.managedDirectCredential != retained {
+			t.Fatal("reconnect replaced retained custody")
+		}
+	}
+}
+
+func TestManagedCredentialRuntimeReconnectRecoversOffer(t *testing.T) {
+	offers := make(chan []string, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offers <- r.URL.Query()["managed_direct_credential"]
+		http.Error(w, "retry connection", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	d := newTestDaemon(t)
+	d.ServerURL = server.URL
+	d.ManagedEndpointPrepareEnabled = true
+	d.ManagedEndpointPoPEnabled = true
+	d.ManagedDirectCredentialEnabled = true
+	prepare := &managedPrepareLaneExecutor{available: false}
+	pop := &managedPoPLaneExecutor{available: false}
+	d.managedEndpointPrepare = prepare
+	d.managedEndpointPoP = pop
+	reconnect := func() []string {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		if _, err := d.connectAndRun(ctx); err == nil {
+			t.Fatal("test server should reject upgrade")
+		}
+		select {
+		case got := <-offers:
+			return got
+		default:
+			t.Fatal("connection did not reach server")
+			return nil
+		}
+	}
+	if got := reconnect(); len(got) != 0 || d.managedDirectCredential == nil {
+		t.Fatal("unready connection did not retain dormant custody", got)
+	}
+	retained := d.managedDirectCredential
+	release, err := d.acquireServeLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	prepare.available = true
+	pop.available = true
+	got := reconnect()
+	if len(got) != 1 || got[0] != transport.ManagedDirectCredentialProtocol || d.managedDirectCredential != retained {
+		t.Fatal("healthy reconnect did not offer retained custody", got)
 	}
 }

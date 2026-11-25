@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -199,9 +200,31 @@ sleep 3600
 	d := &Daemon{state: state, nativeRegistry: registry, serveLockFile: serveLock, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: link}, curConn: socket, nativeConn: native, writeTimeout: time.Second}
 	d.Config = configured.Config
 
-	executor, err := newLocalManagedDirectCredential(d)
-	if err != nil || !executor.ready() {
-		t.Fatal("executor readiness", err)
+	// Construct during transient startup unavailability, retaining the original
+	// real ownership IPC worker. Reconnect URL construction retries initialization
+	// and offers only after dependency and executor readiness recover.
+	d.serveLockFile = nil
+	d.initManagedDirectCredential()
+	executor, ok := d.managedDirectCredential.(*localManagedDirectCredential)
+	if !ok || executor.ready() {
+		t.Fatal("unready startup custody was not retained")
+	}
+	reconnectOffer := func() []string {
+		t.Helper()
+		endpoint, err := url.Parse(d.wsURL(ctx))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return endpoint.Query()["managed_direct_credential"]
+	}
+	if got := reconnectOffer(); len(got) != 0 {
+		t.Fatal("unready startup offered credential", got)
+	}
+	d.serveLockFile = serveLock
+	d.managedEndpointPrepare = executor.localManagedEndpointPrepare
+	d.managedEndpointPoP = executor.localManagedEndpointPrepare
+	if got := reconnectOffer(); len(got) != 1 || got[0] != transport.ManagedDirectCredentialProtocol || d.managedDirectCredential != executor {
+		t.Fatal("healthy reconnect failed to retain and offer custody", got)
 	}
 	prepareRaw, err := executor.prepare(ctx, socket, native, session, scope.ServerURL, command)
 	if err != nil {
