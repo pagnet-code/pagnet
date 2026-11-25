@@ -2,7 +2,8 @@
 
 This is the private SDK contract for `directPrepare`, `directAccept`, local
 `directMaterial`, readiness and durable pending-channel persistence. The shared
-canonical transport contract is `transport/direct_channel_v2.go`. These helpers
+canonical transport contracts are `transport/direct_channel_v2.go` and
+`transport/direct_channel_message_v2.go`. These helpers
 do not expose a public SDK send or proof API, make HTTP calls, or activate a
 channel on a server. S initiates ASK; P returns REPLY. N identifies the network;
 N has no public key and receives no content root or traffic key.
@@ -137,14 +138,34 @@ and the literal info strings `pagnet/direct_ask_reply_v2/readiness`,
 `pagnet/direct_ask_reply_v2/ASK`, and `pagnet/direct_ask_reply_v2/REPLY` to derive
 independent 32-byte keys.
 
-Messages use AES-256-GCM with a fresh random 12-byte nonce, the full canonical
-header as AAD and a 16-byte tag. They bind the V2 domain, channel and descriptor
-hash, immutable message/root IDs and exact endpoint parties. REPLY additionally
-binds the original ASK ID and SHA256 of its complete canonical wire. Opening a
+Messages have the ordered outer fields `header`, `nonce`, `ciphertext`. The
+header fields, in order, are `version` (the integer 2), `domain`
+(`pagnet/direct_ask_reply_v2/message`), `kind`, `channelId`, `descriptorHash`,
+`epochId`, `messageId`, `rootId`, `senderRole`, `parentMessageId`,
+`parentWireHash`, `askId`, `askWireHash`. Every field is required, including
+empty link strings. Channel and hash fields are canonical base64url SHA256;
+message and root IDs are canonical nonzero UUIDs and epoch is UUIDv7. Complete
+canonical wires are capped at 65536 bytes and at the descriptor's message cap.
+The compact header omits endpoint objects; exact channel, descriptor hash and
+epoch bind those immutable identities through the descriptor.
+
+An initial ASK has sender role S, `rootId == messageId`, and no links. A
+continuation ASK has role S, inherits the thread root, and links `parentMessageId`
+and `parentWireHash` to the preceding REPLY's ID and complete canonical wire
+SHA256. ASKs have empty ask links. A REPLY has role P, no parent links, and
+`askId` plus `askWireHash` bind the exact original ASK wire; its message ID is
+distinct from that ASK. The shared validators check structure and descriptor
+binding only. Thread ancestry, replay detection and admission require state.
+
+Messages use AES-256-GCM with a fresh random 12-byte nonce, the complete canonical
+header as AAD and a 16-byte tag. The existing HKDF traffic key domains remain
+unchanged. Opening validates and authenticates the received header. Opening a
 REPLY requires the exact original ASK wire; P authenticates that ASK before
-sealing the reply. Local role, descriptor expiry and message wire limits are
-enforced. Replay detection, immutable server IDs, cancellation, revocation and
-terminal-reply policy require state outside these helpers.
+sealing the reply. `seal` creates initial ASKs only; `sealContinuationAsk`
+authenticates the parent REPLY against its ASK before inheriting the root and
+linking the new ASK. Temporary decrypted parent content is cleared. Local role,
+descriptor expiry and complete wire limits are enforced. Cancellation, revocation
+and terminal-reply policy require state outside these private helpers.
 
 ## Durable retry and reload
 
@@ -166,6 +187,10 @@ is insufficient. Readiness requires this validated exact publication binding.
 Persist a complete authenticated outgoing wire before its first send. Reusing a
 message ID permits only identical complete stored bytes; preserve its original
 nonce, ciphertext and linkage on every retry. Store ciphertext, not plaintext.
+Reload and outgoing storage use the shared strict V2 decoder, descriptor binding,
+writer role, message ID and AEAD authentication. Pre-versioned message wires in
+an outbox fail closed without rewriting, deleting, regenerating or resealing the
+record. Existing valid V2 pending records with empty outboxes remain compatible.
 A remote byte conflict is terminal and must never be retried under a new ID.
 Local authenticated files do not provide an anti-rollback anchor; authoritative
 status must bind the exact descriptor and publication hash before local active

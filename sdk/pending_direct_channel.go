@@ -95,8 +95,8 @@ func (r pendingDirectChannel) validate() error {
 // validateOutgoing accepts only a complete authenticated ciphertext for our role.
 // Plaintext is neither an input to the journal nor part of its persisted format.
 func (r pendingDirectChannel) validateOutgoing(m *directMaterial, id string, wire []byte) error {
-	var w directWire
-	if directCanonical(wire, &w, m.descriptor.Limits.MaxMessageWireBytes) != nil || directWireBinary(w) != nil {
+	w, err := transport.DecodeDirectChannelMessageV2(wire)
+	if err != nil || transport.ValidateDirectChannelMessageForDescriptorV2(w, m.descriptor) != nil {
 		return errDirect
 	}
 	h := w.Header
@@ -104,20 +104,8 @@ func (r pendingDirectChannel) validateOutgoing(m *directMaterial, id string, wir
 	if r.Role == "P" {
 		kind = "REPLY"
 	}
-	if h.Domain != directDomain+"/message" || h.Kind != kind || h.ChannelID != r.ChannelID || h.DescriptorHash != directB64(r.DescriptorHash[:]) || h.MessageID != id || !validPairPathID(id) || !validPairPathID(h.RootID) {
+	if h.Kind != kind || h.SenderRole != r.Role || h.MessageID != id {
 		return errDirect
-	}
-	if kind == "ASK" {
-		if h.From != m.descriptor.S || h.To != m.descriptor.P || h.AskID != "" || h.AskWireHash != "" {
-			return errDirect
-		}
-	} else {
-		if h.From != m.descriptor.P || h.To != m.descriptor.S || !validPairPathID(h.AskID) {
-			return errDirect
-		}
-		if _, err := directBinary(h.AskWireHash, 32); err != nil {
-			return err
-		}
 	}
 	aead, err := m.aead(kind)
 	if err != nil {
@@ -125,7 +113,7 @@ func (r pendingDirectChannel) validateOutgoing(m *directMaterial, id string, wir
 	}
 	nonce, _ := directBinary(w.Nonce, 12)
 	ct, _ := directBinary(w.Ciphertext, -1)
-	aad, _ := json.Marshal(h)
+	aad, _ := h.CanonicalBytes()
 	plaintext, err := aead.Open(nil, nonce, ct, aad)
 	clear(plaintext)
 	return err
@@ -269,8 +257,8 @@ func (k *keyring) storeDirectOutgoing(id string, wire []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer clear(m.key[:])
-	var w directWire
-	if directCanonical(wire, &w, m.descriptor.Limits.MaxMessageWireBytes) != nil {
+	w, err := transport.DecodeDirectChannelMessageV2(wire)
+	if err != nil {
 		return nil, errDirect
 	}
 	messageID := w.Header.MessageID

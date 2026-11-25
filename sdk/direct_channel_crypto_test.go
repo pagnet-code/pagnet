@@ -17,6 +17,13 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
+const (
+	directTestAskID         = "11111111-1111-4111-8111-111111111111"
+	directTestSecondAskID   = "22222222-2222-4222-8222-222222222222"
+	directTestReplyID       = "33333333-3333-4333-8333-333333333333"
+	directTestSecondReplyID = "44444444-4444-4444-8444-444444444444"
+)
+
 func directFixture(t *testing.T) (directDescriptor, []byte, []byte, []byte, time.Time) {
 	t.Helper()
 	s, err := ecdh.X25519().GenerateKey(rand.Reader)
@@ -62,28 +69,28 @@ func TestDirectRoundTripAndSeparation(t *testing.T) {
 	if bytes.Equal(readiness, askKey) || bytes.Equal(askKey, replyKey) || bytes.Equal(readiness, replyKey) {
 		t.Fatal("key domains overlap")
 	}
-	ask, err := s.seal("ASK", "ask-1", "root", nil, []byte("question"), now)
+	ask, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("question"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, err := p.open("ASK", "ask-1", "root", nil, ask, now)
+	plaintext, err := p.open("ASK", directTestAskID, directTestAskID, nil, ask, now)
 	if err != nil || string(plaintext) != "question" {
 		t.Fatalf("ASK: %s %v", plaintext, err)
 	}
-	reply, err := p.seal("REPLY", "reply-1", "root", ask, []byte("answer"), now)
+	reply, err := p.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("answer"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, err = s.open("REPLY", "reply-1", "root", ask, reply, now)
+	plaintext, err = s.open("REPLY", directTestReplyID, directTestAskID, ask, reply, now)
 	if err != nil || string(plaintext) != "answer" {
 		t.Fatalf("REPLY: %s %v", plaintext, err)
 	}
 	// A stateless parser can reopen an identical delivery. Admission/deduplication
 	// is intentionally outside this cryptographic layer.
-	if _, err = p.open("ASK", "ask-1", "root", nil, ask, now); err != nil {
+	if _, err = p.open("ASK", directTestAskID, directTestAskID, nil, ask, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = p.open("ASK", "ask-2", "root", nil, ask, now); err == nil {
+	if _, err = p.open("ASK", directTestSecondAskID, directTestAskID, nil, ask, now); err == nil {
 		t.Fatal("replay under another ID accepted")
 	}
 	serializedMaterial, err := json.Marshal(s)
@@ -214,15 +221,15 @@ func TestDirectPackageAuthentication(t *testing.T) {
 }
 func TestDirectMessageContextAndTamper(t *testing.T) {
 	s, p, _, now := directMaterials(t)
-	ask, err := s.seal("ASK", "ask", "root", nil, []byte("question"), now)
+	ask, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("question"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply, err := p.seal("REPLY", "reply", "root", ask, []byte("answer"), now)
+	reply, err := p.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("answer"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"kind", "channel", "descriptor", "id", "root", "from", "to", "ask-id", "ask-hash", "nonce", "ciphertext", "padding", "duplicate", "unknown"} {
+	for _, name := range []string{"kind", "channel", "descriptor", "id", "root", "role", "epoch", "ask-id", "ask-hash", "nonce", "ciphertext", "padding", "duplicate", "unknown"} {
 		t.Run(name, func(t *testing.T) {
 			var w directWire
 			json.Unmarshal(reply, &w)
@@ -237,10 +244,10 @@ func TestDirectMessageContextAndTamper(t *testing.T) {
 				w.Header.MessageID = "other"
 			case "root":
 				w.Header.RootID = "other"
-			case "from":
-				w.Header.From = s.descriptor.S
-			case "to":
-				w.Header.To = s.descriptor.P
+			case "role":
+				w.Header.SenderRole = "S"
+			case "epoch":
+				w.Header.EpochID = "other"
 			case "ask-id":
 				w.Header.AskID = "other"
 			case "ask-hash":
@@ -263,32 +270,53 @@ func TestDirectMessageContextAndTamper(t *testing.T) {
 			if name == "unknown" {
 				mutated = append(mutated[:len(mutated)-1], []byte(`,"extra":1}`)...)
 			}
-			if _, err := s.open("REPLY", "reply", "root", ask, mutated, now); err == nil {
+			if _, err := s.open("REPLY", directTestReplyID, directTestAskID, ask, mutated, now); err == nil {
 				t.Fatal("accepted")
 			}
 		})
 	}
-	secondAsk, err := s.seal("ASK", "ask", "root", nil, []byte("different question"), now)
+	secondAsk, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("different question"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.open("REPLY", "reply", "root", secondAsk, reply, now); err == nil {
+	if _, err = s.open("REPLY", directTestReplyID, directTestAskID, secondAsk, reply, now); err == nil {
 		t.Fatal("reply replayed against different ASK wire")
 	}
 	for name, run := range map[string]func() error{
-		"wrong sender role":     func() error { _, e := p.seal("ASK", "ask", "root", nil, nil, now); return e },
-		"wrong recipient role":  func() error { _, e := s.open("ASK", "ask", "root", nil, ask, now); return e },
-		"wrong reply role":      func() error { _, e := s.seal("REPLY", "reply", "root", ask, nil, now); return e },
-		"wrong reply recipient": func() error { _, e := p.open("REPLY", "reply", "root", ask, reply, now); return e },
-		"expired":               func() error { _, e := p.open("ASK", "ask", "root", nil, ask, now.Add(2*time.Hour)); return e },
-		"root replay":           func() error { _, e := p.open("ASK", "ask", "other", nil, ask, now); return e },
+		"wrong sender role": func() error {
+			_, e := p.seal("ASK", directTestAskID, directTestAskID, nil, nil, now)
+			return e
+		},
+		"wrong recipient role": func() error {
+			_, e := s.open("ASK", directTestAskID, directTestAskID, nil, ask, now)
+			return e
+		},
+		"wrong reply role": func() error {
+			_, e := s.seal("REPLY", directTestReplyID, directTestAskID, ask, nil, now)
+			return e
+		},
+		"wrong reply recipient": func() error {
+			_, e := p.open("REPLY", directTestReplyID, directTestAskID, ask, reply, now)
+			return e
+		},
+		"expired": func() error {
+			_, e := p.open("ASK", directTestAskID, directTestAskID, nil, ask, now.Add(2*time.Hour))
+			return e
+		},
+		"root replay": func() error {
+			_, e := p.open("ASK", directTestAskID, "other", nil, ask, now)
+			return e
+		},
 		"corrupt ask": func() error {
 			bad := append([]byte(nil), ask...)
 			bad[len(bad)-3] ^= 1
-			_, e := p.seal("REPLY", "reply", "root", bad, nil, now)
+			_, e := p.seal("REPLY", directTestReplyID, directTestAskID, bad, nil, now)
 			return e
 		},
-		"oversize": func() error { _, e := s.seal("ASK", "ask", "root", nil, make([]byte, 4096), now); return e },
+		"oversize": func() error {
+			_, e := s.seal("ASK", directTestAskID, directTestAskID, nil, make([]byte, 4096), now)
+			return e
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if run() == nil {
@@ -298,13 +326,13 @@ func TestDirectMessageContextAndTamper(t *testing.T) {
 	}
 	other := *p
 	other.key[0] ^= 1
-	if _, err = other.open("ASK", "ask", "root", nil, ask, now); err == nil {
+	if _, err = other.open("ASK", directTestAskID, directTestAskID, nil, ask, now); err == nil {
 		t.Fatal("wrong key accepted")
 	}
 	other = *p
 	id, _ := uuid.NewV7()
 	other.descriptor.EpochID = id.String()
-	if _, err = other.open("ASK", "ask", "root", nil, ask, now); err == nil {
+	if _, err = other.open("ASK", directTestAskID, directTestAskID, nil, ask, now); err == nil {
 		t.Fatal("wrong epoch accepted")
 	}
 }
@@ -590,5 +618,108 @@ func TestDirectV2CryptoDomainsAndFreshRoot(t *testing.T) {
 		if err != nil || !bytes.Equal(expected, actual) {
 			t.Fatalf("V2 HKDF %s: %v", purpose, err)
 		}
+	}
+}
+
+func TestDirectCompactContinuationAndCap(t *testing.T) {
+	s, p, _, now := directMaterials(t)
+	const root = "11111111-1111-4111-8111-111111111111"
+	const replyID = "22222222-2222-4222-8222-222222222222"
+	const nextID = "33333333-3333-4333-8333-333333333333"
+	const lastID = "44444444-4444-4444-8444-444444444444"
+	ask, err := s.seal("ASK", root, root, nil, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ask) > 1024 {
+		t.Fatalf("empty ASK is %d bytes", len(ask))
+	}
+	reply, err := p.seal("REPLY", replyID, root, ask, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reply) > 1024 {
+		t.Fatalf("empty REPLY is %d bytes", len(reply))
+	}
+	next, err := s.sealContinuationAsk(nextID, ask, reply, []byte("next question"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := transport.DecodeDirectChannelMessageV2(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentHash := sha256.Sum256(reply)
+	if w.Header.RootID != root || w.Header.ParentMessageID != replyID || w.Header.ParentWireHash != directB64(parentHash[:]) {
+		t.Fatal("continuation links")
+	}
+	plain, err := p.open("ASK", nextID, root, nil, next, now)
+	if err != nil || string(plain) != "next question" {
+		t.Fatalf("continuation open: %v", err)
+	}
+	final, err := p.seal("REPLY", lastID, root, next, []byte("last answer"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err = s.open("REPLY", lastID, root, next, final, now)
+	if err != nil || string(plain) != "last answer" {
+		t.Fatalf("continuation reply: %v", err)
+	}
+	if _, err := s.seal("ASK", nextID, root, nil, nil, now); err == nil {
+		t.Fatal("initial ASK inherited a root")
+	}
+	for _, which := range []string{"ask", "reply"} {
+		badAsk, badReply := append([]byte(nil), ask...), append([]byte(nil), reply...)
+		if which == "ask" {
+			badAsk[len(badAsk)-3] ^= 1
+		} else {
+			badReply[len(badReply)-3] ^= 1
+		}
+		if _, err := s.sealContinuationAsk(nextID, badAsk, badReply, nil, now); err == nil {
+			t.Fatalf("tampered parent %s", which)
+		}
+	}
+	// A structurally valid changed parent hash must fail GCM authentication.
+	w.Header.ParentWireHash = directB64(bytes.Repeat([]byte{1}, 32))
+	changed, _ := w.CanonicalBytes()
+	if _, err := p.open("ASK", nextID, root, nil, changed, now); err == nil {
+		t.Fatal("parent hash missing from AAD")
+	}
+	// Exercise the complete-wire boundary with the original authenticated descriptor.
+	// Base64 expands in steps, so choose the descriptor cap to match a real wire.
+	d, _, source, peer, now := directFixture(t)
+	d.Limits.MaxMessageWireBytes = 1024
+	d.Budget.GrantLimits.MaxMessageWireBytes = 1024
+	raw, _ := d.CanonicalBytes()
+	s, publication, err := directPrepare(raw, d, source, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err = directAccept(publication, d, peer, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exact []byte
+	for n := 0; n < 1024; n++ {
+		candidate, err := s.seal("ASK", root, root, nil, make([]byte, n), now)
+		if err != nil {
+			break
+		}
+		if len(candidate) == 1024 {
+			exact = candidate
+			break
+		}
+	}
+	if exact == nil {
+		t.Fatal("could not construct exact 1024-byte wire")
+	}
+	if _, err := p.open("ASK", root, root, nil, exact, now); err != nil {
+		t.Fatal(err)
+	}
+	var boundary directWire
+	json.Unmarshal(exact, &boundary)
+	ct, _ := directBinary(boundary.Ciphertext, -1)
+	if _, err := s.seal("ASK", root, root, nil, make([]byte, len(ct)-16+1), now); err == nil {
+		t.Fatal("over-cap wire accepted")
 	}
 }
