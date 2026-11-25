@@ -653,7 +653,7 @@ func TestDirectCompactContinuationAndCap(t *testing.T) {
 	if w.Header.RootID != root || w.Header.ParentMessageID != replyID || w.Header.ParentWireHash != directB64(parentHash[:]) {
 		t.Fatal("continuation links")
 	}
-	plain, err := p.open("ASK", nextID, root, nil, next, now)
+	plain, err := p.openContinuationAsk(nextID, root, ask, reply, next, now)
 	if err != nil || string(plain) != "next question" {
 		t.Fatalf("continuation open: %v", err)
 	}
@@ -721,5 +721,94 @@ func TestDirectCompactContinuationAndCap(t *testing.T) {
 	ct, _ := directBinary(boundary.Ciphertext, -1)
 	if _, err := s.seal("ASK", root, root, nil, make([]byte, len(ct)-16+1), now); err == nil {
 		t.Fatal("over-cap wire accepted")
+	}
+}
+
+func TestDirectPreparationAndSealHeaderGuards(t *testing.T) {
+	s, p, _, now := directMaterials(t)
+	h, err := s.prepareHeader("ASK", directTestAskID, directTestAskID, nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.prepareHeader("ASK", directTestAskID, directTestAskID, nil, now)
+	if err != nil || again != h {
+		t.Fatal("preparation changed header")
+	}
+	for name, run := range map[string]func() error{
+		"wrong role": func() error { _, err := p.sealHeader(h, nil, nil, nil, now); return err },
+		"zero time":  func() error { _, err := s.sealHeader(h, nil, nil, nil, time.Time{}); return err },
+		"expiry":     func() error { _, err := s.sealHeader(h, nil, nil, nil, now.Add(2*time.Hour)); return err },
+		"wrong channel": func() error {
+			changed := h
+			changed.ChannelID = directB64(bytes.Repeat([]byte{8}, 32))
+			_, err := s.sealHeader(changed, nil, nil, nil, now)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if run() == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	ask, err := s.sealHeader(h, nil, nil, []byte("question"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := p.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("answer"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.sealContinuationAsk(directTestSecondAskID, ask, reply, []byte("next"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.open("ASK", directTestSecondAskID, directTestAskID, nil, next, now); err == nil {
+		t.Fatal("accepted continuation without parents")
+	}
+	for name, wires := range map[string][][]byte{
+		"missing ask": {nil, reply}, "missing reply": {ask, nil}, "swapped": {reply, ask},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := p.openContinuationAsk(directTestSecondAskID, directTestAskID, wires[0], wires[1], next, now); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+	wrongAsk, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("different exact wire"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.openContinuationAsk(directTestSecondAskID, directTestAskID, wrongAsk, reply, next, now); err == nil {
+		t.Fatal("accepted substituted ASK wire")
+	}
+
+	// Even a correctly authenticated ciphertext cannot invent predecessor links.
+	forged, err := transport.DecodeDirectChannelMessageV2(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged.Header.ParentWireHash = directB64(bytes.Repeat([]byte{9}, 32))
+	aad, _ := forged.Header.CanonicalBytes()
+	aead, err := s.aead("ASK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, aead.NonceSize())
+	forged.Nonce = directB64(nonce)
+	forged.Ciphertext = directB64(aead.Seal(nil, nonce, []byte("forged ancestry"), aad))
+	forgedWire, err := forged.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.openContinuationAsk(directTestSecondAskID, directTestAskID, ask, reply, forgedWire, now); err == nil {
+		t.Fatal("accepted AEAD-authenticated false predecessor")
+	}
+	if _, err := s.sealHeader(forged.Header, ask, reply, nil, now); err == nil {
+		t.Fatal("sealed false predecessor")
+	}
+	plaintext, err := p.openContinuationAsk(directTestSecondAskID, directTestAskID, ask, reply, next, now)
+	if err != nil || string(plaintext) != "next" {
+		t.Fatal("continuation", err)
 	}
 }

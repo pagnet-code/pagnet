@@ -215,25 +215,57 @@ func (m *directMaterial) aead(kind string) (cipher.AEAD, error) {
 	}
 	return cipher.NewGCM(block)
 }
-func (m *directMaterial) seal(kind, id, root string, ask, plaintext []byte, now time.Time) ([]byte, error) {
-	if (kind == "ASK" && m.role != "S") || (kind == "REPLY" && m.role != "P") || transport.ValidateDirectChannelDescriptorV2(m.descriptor, now) != nil {
-		return nil, errDirect
+
+// prepareHeader validates deterministic inputs before a caller reserves the
+// message ID. It performs no encryption and consumes no randomness.
+func (m *directMaterial) prepareHeader(kind, id, root string, ask []byte, now time.Time) (directHeader, error) {
+	if now.IsZero() || (kind == "ASK" && m.role != "S") || (kind == "REPLY" && m.role != "P") || transport.ValidateDirectChannelDescriptorV2(m.descriptor, now) != nil {
+		return directHeader{}, errDirect
 	}
 	h, err := m.header(kind, id, root, ask)
 	if err != nil {
-		return nil, err
+		return directHeader{}, err
 	}
 	if kind == "REPLY" {
-		temporary, err := m.open("ASK", h.AskID, h.RootID, nil, ask, now)
+		// The receive path validates continuation ancestry. Preparation still
+		// authenticates the exact ASK ciphertext named by the reply header.
+		a, err := transport.DecodeDirectChannelMessageV2(ask)
+		if err != nil {
+			return directHeader{}, errDirect
+		}
+		temporary, err := m.decrypt(a)
 		clear(temporary)
 		if err != nil {
-			return nil, err
+			return directHeader{}, err
 		}
 	}
-	return m.sealHeader(h, plaintext)
+	return h, nil
 }
 
-func (m *directMaterial) sealHeader(h directHeader, plaintext []byte) ([]byte, error) {
+func (m *directMaterial) seal(kind, id, root string, ask, plaintext []byte, now time.Time) ([]byte, error) {
+	h, err := m.prepareHeader(kind, id, root, ask, now)
+	if err != nil {
+		return nil, err
+	}
+	return m.sealHeader(h, ask, nil, plaintext, now)
+}
+
+// sealHeader revalidates the complete deterministic preparation, including role,
+// time and predecessor evidence. A caller cannot bypass preparation by forging h.
+func (m *directMaterial) sealHeader(h directHeader, ask, reply, plaintext []byte, now time.Time) ([]byte, error) {
+	var expected directHeader
+	var err error
+	if h.Kind == "ASK" && h.ParentMessageID != "" {
+		expected, err = m.prepareContinuationHeader(h.MessageID, ask, reply, now)
+	} else {
+		if len(reply) != 0 {
+			return nil, errDirect
+		}
+		expected, err = m.prepareHeader(h.Kind, h.MessageID, h.RootID, ask, now)
+	}
+	if err != nil || expected != h {
+		return nil, errDirect
+	}
 	aad, err := h.CanonicalBytes()
 	if err != nil {
 		return nil, errDirect
@@ -254,32 +286,72 @@ func (m *directMaterial) sealHeader(h directHeader, plaintext []byte) ([]byte, e
 	return w.CanonicalBytes()
 }
 
-// sealContinuationAsk binds a new turn to an authenticated exact parent reply.
-func (m *directMaterial) sealContinuationAsk(id string, parentAskWire, parentReplyWire, plaintext []byte, now time.Time) ([]byte, error) {
+func (m *directMaterial) prepareContinuationHeader(id string, parentAskWire, parentReplyWire []byte, now time.Time) (directHeader, error) {
 	if m.role != "S" {
-		return nil, errDirect
+		return directHeader{}, errDirect
 	}
 	parent, err := transport.DecodeDirectChannelMessageV2(parentReplyWire)
 	if err != nil {
-		return nil, errDirect
+		return directHeader{}, errDirect
 	}
 	temporary, err := m.open("REPLY", parent.Header.MessageID, parent.Header.RootID, parentAskWire, parentReplyWire, now)
 	clear(temporary)
 	if err != nil {
-		return nil, err
+		return directHeader{}, err
+	}
+	if id == parent.Header.MessageID || id == parent.Header.AskID {
+		return directHeader{}, errDirect
 	}
 	hash, err := transport.DirectChannelMessageHashV2(parent)
 	if err != nil {
-		return nil, errDirect
+		return directHeader{}, errDirect
 	}
 	h := directHeader{Version: 2, Domain: directDomain + "/message", Kind: "ASK", ChannelID: directChannelID(m.descriptor), DescriptorHash: directB64(m.hash[:]), EpochID: m.descriptor.EpochID, MessageID: id, RootID: parent.Header.RootID, SenderRole: "S", ParentMessageID: parent.Header.MessageID, ParentWireHash: hash}
-	return m.sealHeader(h, plaintext)
+	if _, err := h.CanonicalBytes(); err != nil {
+		return directHeader{}, errDirect
+	}
+	return h, nil
+}
+
+// sealContinuationAsk binds a new turn to an authenticated exact parent reply.
+func (m *directMaterial) sealContinuationAsk(id string, parentAskWire, parentReplyWire, plaintext []byte, now time.Time) ([]byte, error) {
+	h, err := m.prepareContinuationHeader(id, parentAskWire, parentReplyWire, now)
+	if err != nil {
+		return nil, err
+	}
+	return m.sealHeader(h, parentAskWire, parentReplyWire, plaintext, now)
+}
+
+// openContinuationAsk requires exact predecessor wires, even though an AEAD
+// could authenticate a header containing arbitrary predecessor claims.
+func (m *directMaterial) openContinuationAsk(id, root string, parentAskWire, parentReplyWire, wire []byte, now time.Time) ([]byte, error) {
+	if now.IsZero() || m.role != "P" || transport.ValidateDirectChannelDescriptorV2(m.descriptor, now) != nil {
+		return nil, errDirect
+	}
+	ask, aerr := transport.DecodeDirectChannelMessageV2(parentAskWire)
+	reply, rerr := transport.DecodeDirectChannelMessageV2(parentReplyWire)
+	w, err := transport.DecodeDirectChannelMessageV2(wire)
+	if aerr != nil || rerr != nil || err != nil || transport.ValidateDirectChannelMessageForDescriptorV2(ask, m.descriptor) != nil || transport.ValidateDirectChannelMessageForDescriptorV2(reply, m.descriptor) != nil || transport.ValidateDirectChannelMessageForDescriptorV2(w, m.descriptor) != nil || transport.ValidateDirectChannelReplyToV2(reply, ask) != nil {
+		return nil, errDirect
+	}
+	hash, _ := transport.DirectChannelMessageHashV2(reply)
+	if w.Header.Kind != "ASK" || w.Header.MessageID != id || w.Header.RootID != root || root != reply.Header.RootID || w.Header.ParentMessageID != reply.Header.MessageID || w.Header.ParentWireHash != hash || id == ask.Header.MessageID || id == reply.Header.MessageID {
+		return nil, errDirect
+	}
+	for _, predecessor := range []directWire{ask, reply} {
+		temporary, err := m.decrypt(predecessor)
+		clear(temporary)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return m.decrypt(w)
 }
 
 // open requires caller-pinned IDs and the exact ASK for a REPLY. Replay and
 // thread admission remain external to this private cryptographic helper.
 func (m *directMaterial) open(kind, id, root string, ask, wire []byte, now time.Time) ([]byte, error) {
-	if (kind == "ASK" && m.role != "P") || (kind == "REPLY" && m.role != "S") || transport.ValidateDirectChannelDescriptorV2(m.descriptor, now) != nil {
+	if now.IsZero() || (kind == "ASK" && m.role != "P") || (kind == "REPLY" && m.role != "S") || transport.ValidateDirectChannelDescriptorV2(m.descriptor, now) != nil {
 		return nil, errDirect
 	}
 	w, err := transport.DecodeDirectChannelMessageV2(wire)
@@ -291,10 +363,19 @@ func (m *directMaterial) open(kind, id, root string, ask, wire []byte, now time.
 		if err != nil || transport.ValidateDirectChannelMessageForDescriptorV2(a, m.descriptor) != nil || transport.ValidateDirectChannelReplyToV2(w, a) != nil {
 			return nil, errDirect
 		}
-	} else if kind != "ASK" || len(ask) != 0 {
+		temporary, err := m.decrypt(a)
+		clear(temporary)
+		if err != nil {
+			return nil, err
+		}
+	} else if kind != "ASK" || len(ask) != 0 || w.Header.ParentMessageID != "" {
 		return nil, errDirect
 	}
-	aead, err := m.aead(kind)
+	return m.decrypt(w)
+}
+
+func (m *directMaterial) decrypt(w directWire) ([]byte, error) {
+	aead, err := m.aead(w.Header.Kind)
 	if err != nil {
 		return nil, err
 	}

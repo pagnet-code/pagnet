@@ -43,7 +43,9 @@ const (
 // keyring is the SDK's local key material store (sdk-internal; the public
 // surface is Connect/Config only).
 type keyring struct {
-	root string // <StateDir>/principals
+	root                      string             // <StateDir>/principals
+	directMessageSyncDir      func(string) error // private V2 sender journal durability injection
+	directMessageBeforeRename func()             // optional subprocess crash injection
 
 	pendingDirectChannelSyncDir func(string) error // optional direct-channel durability fault injection
 	pendingPairSyncDir          func(string) error // optional fault injection for pending-store durability tests
