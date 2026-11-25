@@ -17,16 +17,24 @@ import (
 // Unlike installation custody, ACK custody never waits for another registry or
 // namespace owner while the caller holds the global socket writer.
 func (s *DirectManagedSourceKeyStore) withCredentialACKReserved(ctx context.Context, fn func(*sql.Conn, *os.File, *func()) error) error {
-	if ctx.Err() != nil || !s.registry.mu.TryLock() {
+	return withDirectManagedSourceCredentialACKReserved(ctx, s.registry, nativeDirectManagedSourceKeyNamespace, fn)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) withCredentialACKReserved(ctx context.Context, fn func(*sql.Conn, *os.File, *func()) error) error {
+	return withDirectManagedSourceCredentialACKReserved(ctx, s.registry, nativeDirectManagedSourceKeyNamespaceV2, fn)
+}
+
+func withDirectManagedSourceCredentialACKReserved(ctx context.Context, registry *NativeWorkerRegistry, namespace string, fn func(*sql.Conn, *os.File, *func()) error) error {
+	if ctx.Err() != nil || !registry.mu.TryLock() {
 		return ErrManagedEndpointPrepareRetryable
 	}
-	defer s.registry.mu.Unlock()
-	root, err := nativeShareHolderDirectory(s.registry.root)
+	defer registry.mu.Unlock()
+	root, err := nativeShareHolderDirectory(registry.root)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	dir, err := nativeShareHolderExistingChild(root, nativeDirectManagedSourceKeyNamespace)
+	dir, err := nativeShareHolderExistingChild(root, namespace)
 	if err != nil {
 		return err
 	}
@@ -44,7 +52,7 @@ func (s *DirectManagedSourceKeyStore) withCredentialACKReserved(ctx context.Cont
 		return ErrManagedEndpointPrepareRetryable
 	}
 	acquireCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
-	conn, err := s.registry.db.Conn(acquireCtx)
+	conn, err := registry.db.Conn(acquireCtx)
 	cancel()
 	if err != nil {
 		return ErrManagedEndpointPrepareRetryable

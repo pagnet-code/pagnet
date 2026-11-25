@@ -226,9 +226,10 @@ type Daemon struct {
 	managedEndpointKeys           interface {
 		Reserve(transport.ManagedEndpointBindingIntent, string, transport.HostSessionPayload) (transport.ManagedEndpointKeyReservation, error)
 	}
-	directManagedSourcePrepareV2   directManagedSourcePrepareExecutorV2
-	directManagedSourcePoPV2       directManagedSourcePoPExecutorV2
-	directManagedSourcePrepareMuV2 sync.Mutex
+	directManagedSourcePrepareV2    directManagedSourcePrepareExecutorV2
+	directManagedSourcePoPV2        directManagedSourcePoPExecutorV2
+	directManagedSourceCredentialV2 directManagedSourceCredentialExecutorV2
+	directManagedSourcePrepareMuV2  sync.Mutex
 
 	nativeShareBindings nativeShareBindingExecutor // closed holders only; no membership or execution authority
 	nativeRegistry      *NativeWorkerRegistry
