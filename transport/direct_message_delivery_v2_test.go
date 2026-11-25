@@ -161,3 +161,42 @@ func TestDirectInboxV2Bounds(t *testing.T) {
 		t.Fatal("empty page", err)
 	}
 }
+
+func TestDirectInboxV2PreflightCanonicalKeys(t *testing.T) {
+	d, _ := directDeliveryFixture(t)
+	binding := d.Admission.Binding
+	page := DirectInboxPageV2{Version: 2, Domain: DirectChannelDomainV2 + "/delivery/inbox-page", Context: binding.Context, Recipient: binding.Recipient, Deliveries: []DirectDeliveryV2{}}
+	raw, err := page.CanonicalBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directInboxPreflight(raw); err != nil {
+		t.Fatal("valid empty page", err)
+	}
+	items := "[" + strings.Repeat("{},", DirectInboxPageMaxItemsV2) + "{}]"
+	for name, replacement := range map[string]string{
+		"canonical overflow":     `"deliveries":` + items,
+		"capitalized":            `"Deliveries":` + items,
+		"uppercase":              `"DELIVERIES":` + items,
+		"duplicate":              `"deliveries":[],"deliveries":` + items,
+		"duplicate case variant": `"deliveries":[],"Deliveries":` + items,
+		"unknown":                `"unknown":[],"deliveries":[]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := bytes.Replace(raw, []byte(`"deliveries":[]`), []byte(replacement), 1)
+			if directInboxPreflight(changed) == nil {
+				t.Fatal("preflight accepted noncanonical keys")
+			}
+			if _, err := DecodeDirectInboxPageV2(changed); err == nil {
+				t.Fatal("decoded noncanonical keys")
+			}
+		})
+	}
+	// Case aliases and duplicate keys are invalid even below the item limit.
+	for _, replacement := range []string{`"Deliveries":[]`, `"DELIVERIES":[]`, `"deliveries":[],"deliveries":[]`} {
+		changed := bytes.Replace(raw, []byte(`"deliveries":[]`), []byte(replacement), 1)
+		if directInboxPreflight(changed) == nil {
+			t.Fatal("preflight accepted", replacement)
+		}
+	}
+}

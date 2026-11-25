@@ -246,42 +246,73 @@ func directInboxPreflight(raw []byte) error {
 		return errDirectChannelV2
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	depth, items, arrayDepth := 0, 0, 0
-	deliveries := false
-	for {
-		tok, err := decoder.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errDirectChannelV2
+	}
+	// Canonical top-level keys are required in declaration order. In particular,
+	// reject the case-insensitive aliases accepted by encoding/json, and reject
+	// duplicate keys before the deliveries slice can be allocated.
+	for _, expected := range []string{"version", "domain", "context", "recipient", "deliveries", "nextCursor"} {
+		key, err := decoder.Token()
+		if err != nil || key != expected {
 			return errDirectChannelV2
 		}
-		if key, ok := tok.(string); ok && depth == 1 && key == "deliveries" {
-			deliveries = true
+		if expected != "deliveries" {
+			if directInboxSkipValue(decoder) != nil {
+				return errDirectChannelV2
+			}
 			continue
 		}
-		if _, ok := tok.(json.Delim); !ok && arrayDepth > 0 && depth == arrayDepth {
+		token, err := decoder.Token()
+		if err != nil || token != json.Delim('[') {
+			return errDirectChannelV2
+		}
+		items := 0
+		for decoder.More() {
 			items++
-			if items > DirectInboxPageMaxItemsV2 {
+			if items > DirectInboxPageMaxItemsV2 || directInboxSkipValue(decoder) != nil {
 				return errDirectChannelV2
 			}
 		}
-		if delim, ok := tok.(json.Delim); ok {
-			if delim == '{' || delim == '[' {
+		token, err = decoder.Token()
+		if err != nil || token != json.Delim(']') {
+			return errDirectChannelV2
+		}
+	}
+	token, err = decoder.Token()
+	if err != nil || token != json.Delim('}') {
+		return errDirectChannelV2
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return errDirectChannelV2
+	}
+	return nil
+}
+
+// Scan one JSON value without allocating a decoded slice or object.
+func directInboxSkipValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return errDirectChannelV2
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if delimiter != '{' && delimiter != '[' {
+		return errDirectChannelV2
+	}
+	depth := 1
+	for depth > 0 {
+		token, err = decoder.Token()
+		if err != nil {
+			return errDirectChannelV2
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			if delimiter == '{' || delimiter == '[' {
 				depth++
-				if deliveries && delim == '[' && depth == 2 {
-					arrayDepth = depth
-					deliveries = false
-				} else if arrayDepth > 0 && depth == arrayDepth+1 {
-					items++
-					if items > DirectInboxPageMaxItemsV2 {
-						return errDirectChannelV2
-					}
-				}
 			} else {
-				if depth == arrayDepth {
-					arrayDepth = 0
-				}
 				depth--
 			}
 		}
