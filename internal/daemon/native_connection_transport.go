@@ -10,11 +10,7 @@ import (
 // nativeConnection binds all admission and source messages to one socket.
 // Ordinary daemon send may select a newer socket; native provenance cannot.
 func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnection {
-	serverURL := d.ServerURL
-	if d.DirectManagedSourceV2Enabled {
-		serverURL = directManagedSourceV2ServerOrigin(serverURL)
-	}
-	c := NewNativeObservationConnection(serverURL, d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
+	c := NewNativeObservationConnection(d.nativeServerURL(), d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -30,6 +26,15 @@ func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnec
 	})
 	c.accountReplyEnabled = d.AccountReplyDeliveryEnabled && d.nativeRegistry != nil
 	return c
+}
+
+// nativeServerURL supplies the same trusted identity to admission and new
+// worker reservations. Existing persisted scopes are never rewritten.
+func (d *Daemon) nativeServerURL() string {
+	if d.DirectManagedSourceV2Enabled {
+		return directManagedSourceV2ServerOrigin(d.ServerURL)
+	}
+	return d.ServerURL
 }
 
 // HandleEnvelope is called only by this socket's read loop. Replies never

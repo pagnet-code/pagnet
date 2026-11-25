@@ -63,7 +63,9 @@ sleep 3600
 		t.Fatal(err)
 	}
 	defer registry.Close()
-	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: session.TenantID, AccountID: session.AccountID, HostID: session.HostID, InstanceID: command.Subject.InstanceID.String(), Generation: command.Subject.OwnershipGeneration}
+	configuredServer := "https://example.test?direct_managed_source_prepare=old&direct_managed_source_prepare=untrusted&direct_managed_source_pop=old&direct_managed_source_credential=old"
+	configured := &Daemon{Config: Config{ServerURL: configuredServer, DirectManagedSourceV2Enabled: true}}
+	scope := sessionworker.Scope{ServerURL: configured.nativeServerURL(), TenantID: session.TenantID, AccountID: session.AccountID, HostID: session.HostID, InstanceID: command.Subject.InstanceID.String(), Generation: command.Subject.OwnershipGeneration}
 	workspace := filepath.Join(root, "workspace")
 	if err := os.Mkdir(workspace, 0700); err != nil {
 		t.Fatal(err)
@@ -192,7 +194,7 @@ sleep 3600
 	defer serveLock.Close()
 	link := &nativeWorkerLink{conn: socket, proxy: proxy, ownership: ownership}
 	d := &Daemon{state: state, nativeRegistry: registry, serveLockFile: serveLock, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: link}, curConn: socket, nativeConn: native, writeTimeout: time.Second}
-	d.Config = Config{ServerURL: scope.ServerURL, DirectManagedSourceV2Enabled: true}
+	d.Config = configured.Config
 	d.sessions = sessioncore.NewManager()
 	d.sessions.RegisterDriver(agentruntime.NewQwenPersistent(""))
 	d.initDirectManagedSourceV2()

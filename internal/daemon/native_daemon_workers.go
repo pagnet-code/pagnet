@@ -174,6 +174,10 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 	if d.nativeRegistry == nil {
 		return ErrNativeSourceUnsupported
 	}
+	serverURL := d.nativeServerURL()
+	if d.DirectManagedSourceV2Enabled && (serverURL == "" || serverURL != connection.serverURL) {
+		return ErrNativeObservationConflict
+	}
 	record, err := d.nativeRegistry.Lookup(p.InstanceID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -230,7 +234,7 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 			generation = p.Ownership.OwnershipGeneration
 			previous = p.Ownership.ID
 		}
-		scope := sessionworker.Scope{ServerURL: d.ServerURL, TenantID: session.TenantID, AccountID: session.AccountID, HostID: d.HostID, InstanceID: p.InstanceID, Generation: generation}
+		scope := sessionworker.Scope{ServerURL: serverURL, TenantID: session.TenantID, AccountID: session.AccountID, HostID: d.HostID, InstanceID: p.InstanceID, Generation: generation}
 		spec, err := d.nativeConfiguration(row, scope)
 		if err != nil {
 			return err
@@ -244,6 +248,12 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 }
 
 func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObservationConnection, record NativeWorkerRecord) error {
+	if d.DirectManagedSourceV2Enabled {
+		serverURL := d.nativeServerURL()
+		if serverURL == "" || connection == nil || connection.serverURL != serverURL || record.Scope.ServerURL != serverURL {
+			return ErrNativeObservationConflict
+		}
+	}
 	if err := d.nativeRegistry.checkRecoveryFence(record.Scope.InstanceID, record.Scope.Generation); err != nil {
 		return err
 	}

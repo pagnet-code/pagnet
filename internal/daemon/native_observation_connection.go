@@ -111,6 +111,21 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 			return ErrNativeObservationConflict
 		}
 	}
+	if c.session != nil {
+		if len(c.session.ProtocolFeatures) != len(p.ProtocolFeatures) {
+			return ErrNativeObservationConflict
+		}
+		features := make(map[string]int, len(c.session.ProtocolFeatures))
+		for _, feature := range c.session.ProtocolFeatures {
+			features[feature]++
+		}
+		for _, feature := range p.ProtocolFeatures {
+			if features[feature] == 0 {
+				return ErrNativeObservationConflict
+			}
+			features[feature]--
+		}
+	}
 	if !c.validDirectManagedSourceSelection(p.ProtocolFeatures) {
 		return ErrNativeObservationConflict
 	}
