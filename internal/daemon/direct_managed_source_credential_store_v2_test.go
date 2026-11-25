@@ -736,3 +736,160 @@ func TestDirectSourceCredentialSecretAndACKIntegrityV2(t *testing.T) {
 		t.Fatal("changed retained ACK accepted")
 	}
 }
+
+func TestDirectSourceCredentialAttemptedRecoveryAfterRestartV2(t *testing.T) {
+	for _, window := range []string{"attempt-only", "pending", "two-links", "published"} {
+		t.Run(window, func(t *testing.T) {
+			keys, p, session := directSourceCredentialFixtureV2(t)
+			verify := DirectManagedSourceCredentialScopeCheckV2(directSourceCredentialScopeOKV2)
+			path := directSourceCredentialPathV2(keys, p)
+			pending := strings.TrimSuffix(path, ".json") + ".pending"
+			if window == "attempt-only" {
+				calls := 0
+				verify = func(transport.DirectManagedSourceCredentialIssueV2, string, transport.HostSessionPayload) error {
+					calls++
+					if calls == 2 {
+						return errors.New("crash after attempt")
+					}
+					return nil
+				}
+			} else {
+				syncFile := keys.sync
+				calls := 0
+				keys.sync = func(file *os.File) error {
+					calls++
+					if err := syncFile(file); err != nil {
+						return err
+					}
+					if window == "two-links" && calls == 1 {
+						if err := os.Link(pending, path); err != nil {
+							return err
+						}
+					}
+					if (window != "published" && calls == 1) || calls == 2 {
+						return errors.New("crash during publication")
+					}
+					return nil
+				}
+			}
+			if _, err := keys.InstallCredential(p, "https://example.test", session, verify, directSourceCredentialFenceOKV2); err == nil {
+				t.Fatal("missing interruption")
+			}
+			var state string
+			if err := keys.registry.db.QueryRow(`SELECT state FROM native_direct_managed_source_v2_credentials WHERE credential_id=?`, p.CredentialID).Scan(&state); err != nil || state != "attempted" {
+				t.Fatal("attempt not committed", err)
+			}
+			// Check the modeled crash window before discarding the original store.
+			for name, want := range map[string]bool{path: window == "published" || window == "two-links", pending: window == "pending" || window == "two-links"} {
+				_, err := os.Lstat(name)
+				if (err == nil) != want || (err != nil && !errors.Is(err, os.ErrNotExist)) {
+					t.Fatal("unexpected publication window", err)
+				}
+			}
+			root := filepath.Dir(keys.registry.root)
+			if err := keys.registry.Close(); err != nil {
+				t.Fatal(err)
+			}
+			registry, err := OpenNativeWorkerRegistry(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer registry.Close()
+			reopened, err := NewDirectManagedSourceKeyStoreV2(registry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reopened.now = func() time.Time { return p.PoP.ExpiresAt.Add(time.Second) }
+			ack, err := reopened.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOKV2, directSourceCredentialFenceOKV2)
+			if err != nil {
+				t.Fatal("restart failed exact attempted recovery", err)
+			}
+			evidence, err := reopened.CredentialEvidence(p, "https://example.test", session, directSourceCredentialScopeOKV2)
+			if err != nil || evidence.State != "installed" || !bytes.Equal(ack, evidence.ACK) {
+				t.Fatal("restart recovery lost completed evidence", err)
+			}
+			if _, err := os.Lstat(pending); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("restart recovery retained pending publication", err)
+			}
+		})
+	}
+}
+
+func TestDirectSourceCredentialUseClockBoundariesV2(t *testing.T) {
+	keys, p, _ := directSourceCredentialFixtureV2(t)
+	deadline := p.IssuedAt.Add(time.Hour)
+	for _, bound := range []string{"credential", "authorization", "budget"} {
+		t.Run(bound, func(t *testing.T) {
+			// Canonical issues require credential expiry <= both other deadlines.
+			// Isolate each clock guard here so one guard cannot mask another.
+			issue := p
+			issue.CredentialExpiresAt = deadline.Add(time.Hour)
+			issue.PoP.Prepare.Subject.AuthorizationExpiresAt = deadline.Add(time.Hour)
+			issue.BudgetExpiresAt = deadline.Add(time.Hour)
+			switch bound {
+			case "credential":
+				issue.CredentialExpiresAt = deadline
+			case "authorization":
+				issue.PoP.Prepare.Subject.AuthorizationExpiresAt = deadline
+			case "budget":
+				issue.BudgetExpiresAt = deadline
+			}
+			for _, offset := range []time.Duration{-time.Nanosecond, 0, time.Nanosecond} {
+				keys.now = func() time.Time { return deadline.Add(offset) }
+				if got, want := keys.credentialUseValid(issue), offset < 0; got != want {
+					t.Fatalf("offset %v: usable=%v, want %v", offset, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDirectSourceCredentialPublicUseExpiryBoundariesV2(t *testing.T) {
+	for _, bound := range []string{"credential", "authorization", "budget"} {
+		t.Run(bound, func(t *testing.T) {
+			keys, p, session := directSourceCredentialFixtureV2(t)
+			deadline := p.CredentialExpiresAt
+			switch bound {
+			case "credential":
+				deadline = p.InstallExpiresAt.Add(time.Minute)
+				p.CredentialExpiresAt = deadline
+			case "authorization":
+				p.BudgetExpiresAt = deadline.Add(time.Hour)
+			case "budget":
+				deadline = p.InstallExpiresAt.Add(time.Minute)
+				p.BudgetExpiresAt, p.CredentialExpiresAt = deadline, deadline
+			}
+			keys.now = func() time.Time { return p.IssuedAt }
+			if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOKV2, directSourceCredentialFenceOKV2); err != nil {
+				t.Fatal(err)
+			}
+			for _, offset := range []time.Duration{-time.Nanosecond, 0, time.Nanosecond} {
+				keys.now = func() time.Time { return deadline.Add(offset) }
+				_, err := keys.CredentialEvidence(p, "https://example.test", session, directSourceCredentialScopeOKV2)
+				if (err == nil) != (offset < 0) {
+					t.Fatalf("offset %v: unexpected evidence result: %v", offset, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDirectSourceCredentialRejectsPreIssueClockV2(t *testing.T) {
+	keys, p, session := directSourceCredentialFixtureV2(t)
+	keys.now = func() time.Time { return p.IssuedAt.Add(-time.Nanosecond) }
+	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOKV2, directSourceCredentialFenceOKV2); err == nil {
+		t.Fatal("installed before issue time")
+	}
+	var count int
+	if err := keys.registry.db.QueryRow(`SELECT COUNT(*) FROM native_direct_managed_source_v2_credentials`).Scan(&count); err != nil || count != 0 {
+		t.Fatal("pre-issue clock committed an attempt", err)
+	}
+	keys.now = func() time.Time { return p.IssuedAt }
+	if _, err := keys.InstallCredential(p, "https://example.test", session, directSourceCredentialScopeOKV2, directSourceCredentialFenceOKV2); err != nil {
+		t.Fatal("issue-time installation failed", err)
+	}
+	keys.now = func() time.Time { return p.IssuedAt.Add(-time.Nanosecond) }
+	if _, err := keys.CredentialEvidence(p, "https://example.test", session, directSourceCredentialScopeOKV2); err == nil {
+		t.Fatal("returned evidence before issue time")
+	}
+}
