@@ -185,3 +185,7 @@ func nativeManagedSubjectFromEndpoint(s transport.ManagedEndpointBindingIntent) 
 func nativeManagedSubjectFromSource(s transport.DirectManagedSourceBindingV1) nativeManagedSubject {
 	return nativeManagedSubject{TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID, HostCredentialID: s.HostCredentialID, NativeAdmissionID: s.NativeAdmissionID, ConnectionIncarnationID: s.ConnectionIncarnationID, RunnerID: s.RunnerID, RunnerConnectedAt: s.RunnerConnectedAt, BootID: s.BootID, InstanceID: s.InstanceID, OwnershipID: s.OwnershipID, OwnershipGeneration: s.OwnershipGeneration, PrincipalID: s.PrincipalID, NativeGeneration: s.NativeGeneration, NativeSessionID: s.NativeSessionID, OriginID: s.OriginID, ExpiresAt: s.ExpiresAt}
 }
+
+func nativeManagedSubjectFromSourceV2(s transport.DirectManagedSourceBindingV2) nativeManagedSubject {
+	return nativeManagedSubject{TenantID: s.TenantID, AccountID: s.AccountID, HostID: s.HostID, HostCredentialID: s.HostCredentialID, NativeAdmissionID: s.NativeAdmissionID, ConnectionIncarnationID: s.ConnectionIncarnationID, RunnerID: s.RunnerID, RunnerConnectedAt: s.RunnerConnectedAt, BootID: s.BootID, InstanceID: s.InstanceID, OwnershipID: s.OwnershipID, OwnershipGeneration: s.OwnershipGeneration, PrincipalID: s.PrincipalID, NativeGeneration: s.NativeGeneration, NativeSessionID: s.NativeSessionID, OriginID: s.OriginID, ExpiresAt: s.EnrollmentExpiresAt}
+}
