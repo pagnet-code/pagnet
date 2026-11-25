@@ -27,15 +27,15 @@ func TestDirectReservedCountingRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ask, err := sm.seal("ASK", "reserved-ask", "root", nil, []byte("question"), now)
+	ask, err := sm.seal("ASK", directTestAskID, directTestAskID, nil, []byte("question"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply, err := pm.seal("REPLY", "reserved-reply", "root", ask, []byte("answer"), now)
+	reply, err := pm.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("answer"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plaintext, err := sm.open("REPLY", "reserved-reply", "root", ask, reply, now)
+	plaintext, err := sm.open("REPLY", directTestReplyID, directTestAskID, ask, reply, now)
 	if err != nil || !bytes.Equal(plaintext, []byte("answer")) {
 		t.Fatalf("reply round trip: %v", err)
 	}

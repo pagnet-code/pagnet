@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/pagnet-code/pagnet/transport"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -272,11 +273,11 @@ func TestPendingDirectConcurrentWrites(t *testing.T) {
 }
 func TestDirectJournalOutboxASKAndREPLY(t *testing.T) {
 	s, p, publication, now := directMaterials(t)
-	ask, err := s.seal("ASK", "ask-1", "root", nil, []byte("secret question"), now)
+	ask, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("secret question"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply, err := p.seal("REPLY", "reply-1", "root", ask, []byte("secret answer"), now)
+	reply, err := p.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("secret answer"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,9 +308,9 @@ func TestDirectJournalOutboxASKAndREPLY(t *testing.T) {
 			}
 			var changed []byte
 			if role == "S" {
-				changed, err = s.seal("ASK", "ask-1", "root", nil, []byte("different question"), now)
+				changed, err = s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("different question"), now)
 			} else {
-				changed, err = p.seal("REPLY", "reply-1", "root", ask, []byte("different answer"), now)
+				changed, err = p.seal("REPLY", directTestReplyID, directTestAskID, ask, []byte("different answer"), now)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -329,9 +330,9 @@ func TestDirectJournalOutboxASKAndREPLY(t *testing.T) {
 			// Crash after rename, before fsync must recover exact original wire.
 			var next []byte
 			if role == "S" {
-				next, err = s.seal("ASK", "ask-2", "root", nil, []byte("another"), now)
+				next, err = s.seal("ASK", directTestSecondAskID, directTestSecondAskID, nil, []byte("another"), now)
 			} else {
-				next, err = p.seal("REPLY", "reply-2", "root", ask, []byte("another"), now)
+				next, err = p.seal("REPLY", directTestSecondReplyID, directTestAskID, ask, []byte("another"), now)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -370,7 +371,8 @@ func TestDirectJournalConcurrentOutbox(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			wire, err := s.seal("ASK", fmt.Sprintf("ask-%d", i), "root", nil, []byte("secret"), now)
+			id := fmt.Sprintf("%08x-1111-4111-8111-111111111111", i+1)
+			wire, err := s.seal("ASK", id, id, nil, []byte("secret"), now)
 			if err == nil {
 				_, err = (&keyring{root: k.root}).storeDirectOutgoing(r.ChannelID, wire)
 			}
@@ -522,7 +524,7 @@ func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire, err := s.seal("ASK", "same-message-id", "root", nil, []byte("original"), now)
+	wire, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("original"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +535,7 @@ func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
 	// Model the remote immutable wire contract. The remote identity stays the
 	// same across local rollback; byte disagreement is terminal, never a new ID.
 	remoteRetry := func(id string, candidate []byte) error {
-		if id != "same-message-id" || !bytes.Equal(retainedWire, candidate) {
+		if id != directTestAskID || !bytes.Equal(retainedWire, candidate) {
 			return errors.New("remote immutable wire conflict")
 		}
 		return nil
@@ -542,7 +544,7 @@ func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted := &keyring{root: k.root}
-	changed, err := s.seal("ASK", "same-message-id", "root", nil, []byte("changed after rollback"), now)
+	changed, err := s.seal("ASK", directTestAskID, directTestAskID, nil, []byte("changed after rollback"), now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,10 +552,10 @@ func TestDirectJournalRecordRollbackRequiresRemoteWireConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := remoteRetry("same-message-id", local); err == nil {
+	if err := remoteRetry(directTestAskID, local); err == nil {
 		t.Fatal("rollback retry treated as a new send")
 	}
-	if err := remoteRetry("same-message-id", wire); err != nil {
+	if err := remoteRetry(directTestAskID, wire); err != nil {
 		t.Fatal("exact remote retry rejected")
 	}
 }
@@ -707,5 +709,104 @@ func TestPendingDirectV1ReservedRecordRemainsUntouched(t *testing.T) {
 		if err != nil || !bytes.Equal(after, before[path]) {
 			t.Fatalf("legacy disk data changed at %s: %v", path, err)
 		}
+	}
+}
+
+func TestDirectJournalRejectsIncompatibleOutboxWithoutMutation(t *testing.T) {
+	for _, mode := range []string{"unversioned", "wrong-role", "message-id", "ciphertext"} {
+		t.Run(mode, func(t *testing.T) {
+			k, r, s, _, _ := journalFixture(t)
+			_, _, _, now := directMaterials(t)
+			const id = "11111111-1111-4111-8111-111111111111"
+			wire, err := s.seal("ASK", id, id, nil, nil, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storeJournal(t, k, r)
+			activateJournal(t, k, r)
+			stored, err := k.loadPendingDirectChannel(r.ChannelID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, err := transport.DecodeDirectChannelMessageV2(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "unversioned":
+				// Retain the exact pre-versioned shape, including embedded endpoints.
+				old := struct {
+					Header struct {
+						Domain         string      `json:"domain"`
+						Kind           string      `json:"kind"`
+						ChannelID      string      `json:"channelId"`
+						DescriptorHash string      `json:"descriptorHash"`
+						MessageID      string      `json:"messageId"`
+						RootID         string      `json:"rootId"`
+						From           directParty `json:"from"`
+						To             directParty `json:"to"`
+						AskID          string      `json:"askId"`
+						AskWireHash    string      `json:"askWireHash"`
+					} `json:"header"`
+					Nonce      string `json:"nonce"`
+					Ciphertext string `json:"ciphertext"`
+				}{}
+				old.Header.Domain, old.Header.Kind = w.Header.Domain, w.Header.Kind
+				old.Header.ChannelID, old.Header.DescriptorHash = w.Header.ChannelID, w.Header.DescriptorHash
+				old.Header.MessageID, old.Header.RootID = id, id
+				old.Header.From, old.Header.To = s.descriptor.S, s.descriptor.P
+				old.Nonce = w.Nonce
+				aead, err := s.aead("ASK")
+				if err != nil {
+					t.Fatal(err)
+				}
+				nonce, _ := directBinary(old.Nonce, 12)
+				aad, _ := json.Marshal(old.Header)
+				old.Ciphertext = directB64(aead.Seal(nil, nonce, nil, aad))
+				wire, _ = json.Marshal(old)
+			case "wrong-role":
+				w.Header.SenderRole = "P"
+				wire, _ = json.Marshal(w)
+			case "message-id":
+				w.Header.MessageID = "22222222-2222-4222-8222-222222222222"
+				w.Header.RootID = w.Header.MessageID
+				wire, _ = json.Marshal(w)
+			case "ciphertext":
+				ct, _ := directBinary(w.Ciphertext, -1)
+				ct[0] ^= 1
+				w.Ciphertext = directB64(ct)
+				wire, _ = w.CanonicalBytes()
+			}
+			if _, err := k.storeDirectOutgoing(r.ChannelID, wire); err == nil {
+				t.Fatal("invalid outgoing wire stored")
+			}
+			stored.Outbox[id] = wire
+			_, key, err := k.readPendingDirectChannelIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := k.writePendingDirectChannel(stored, key); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(k.pendingDirectChannelDir(r.ChannelID), "record.json")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted := &keyring{root: k.root}
+			if _, err := restarted.loadPendingDirectChannel(r.ChannelID); err == nil {
+				t.Fatal("invalid outbox reloaded")
+			}
+			if _, err := restarted.storeDirectOutgoing(r.ChannelID, wire); err == nil {
+				t.Fatal("invalid outbox retried")
+			}
+			if _, err := restarted.storePendingDirectChannel(r); err == nil {
+				t.Fatal("invalid record regenerated")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("incompatible pending record changed")
+			}
+		})
 	}
 }
