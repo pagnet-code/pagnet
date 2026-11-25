@@ -160,7 +160,7 @@ func (s *DirectManagedSourceKeyStoreV2) reserve(command transport.DirectManagedS
 	}
 	command, err = transport.DecodeDirectManagedSourcePrepareCommandV2(request)
 	server := managedPrepareServerOrigin(configuredServer)
-	if err != nil || server == "" || legacyTextServiceServer(configuredServer) != server || !directManagedSourceSessionMatchesV2(command.Subject, session) || !directManagedSourceInitialBindingV2(command.Subject) || !s.now().Before(command.Subject.EnrollmentExpiresAt) {
+	if err != nil || server == "" || len(server) > 2048 || legacyTextServiceServer(configuredServer) != server || !directManagedSourceSessionMatchesV2(command.Subject, session) || !directManagedSourceInitialBindingV2(command.Subject) || !s.now().Before(command.Subject.EnrollmentExpiresAt) {
 		return empty, errDirectManagedSourceKeyV2
 	}
 	if !recovery && !grant.consume(request, s.installation, server) {

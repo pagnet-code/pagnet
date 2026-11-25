@@ -4,10 +4,13 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -374,5 +377,103 @@ func TestDirectSourceV2CustodyGrantRequiresLiveFence(t *testing.T) {
 	var count int
 	if err := keys.registry.db.QueryRow(`SELECT COUNT(*) FROM native_direct_managed_source_v2_keys`).Scan(&count); err != nil || count != 0 {
 		t.Fatal("failed command created custody", err)
+	}
+}
+
+func TestDirectSourceV2CustodyOriginSizeBoundary(t *testing.T) {
+	keys, j, c, session := directSourceStoreFixtureV2(t)
+	prefix := "https://example.test/"
+	server := prefix + strings.Repeat("a", 2048-len(prefix))
+	oversized := server + "a"
+	if len(textServiceServer(server)) != 2048 || len(managedPrepareServerOrigin(oversized)) != 2049 {
+		t.Fatal("invalid boundary fixture")
+	}
+	verified := 0
+	verify := func(transport.DirectManagedSourcePrepareCommandV2, string, transport.HostSessionPayload) error {
+		verified++
+		return nil
+	}
+	if _, err := j.Reserve(c, oversized, session, verify); err == nil {
+		t.Fatal("oversized journal origin accepted")
+	}
+	if verified != 0 {
+		t.Fatal("oversized origin reached verification")
+	}
+	var count int
+	if err := keys.registry.db.QueryRow(`SELECT COUNT(*) FROM native_direct_managed_source_v2_prepare_commands`).Scan(&count); err != nil || count != 0 {
+		t.Fatal("oversized origin persisted command", err)
+	}
+	if _, err := os.Stat(filepath.Join(keys.registry.root, directManagedSourcePrepareJournalNamespaceV2)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("oversized journal origin created namespace", err)
+	}
+	if _, err := j.Reserve(c, server, session, directSourceScopeOKV2); err != nil {
+		t.Fatal("2048-byte origin rejected", err)
+	}
+	started, err := j.BeginKeyReservation(c, server, session, directSourceScopeOKV2)
+	if err != nil || !started.KeyStarted {
+		t.Fatal("boundary grant failed", err)
+	}
+	if _, err = keys.Reserve(c, oversized, session, verify, started.keyCreationGrant); err == nil {
+		t.Fatal("oversized key origin accepted")
+	}
+	if verified != 0 || started.keyCreationGrant.consumed {
+		t.Fatal("oversized origin consumed grant or reached verification")
+	}
+	if err = keys.registry.db.QueryRow(`SELECT COUNT(*) FROM native_direct_managed_source_v2_keys`).Scan(&count); err != nil || count != 0 {
+		t.Fatal("oversized origin persisted attempt", err)
+	}
+	if _, err = os.Stat(filepath.Join(keys.registry.root, nativeDirectManagedSourceKeyNamespaceV2)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("oversized key origin created namespace", err)
+	}
+	reservation, err := keys.Reserve(c, server, session, directSourceScopeOKV2, started.keyCreationGrant)
+	if err != nil || reservation.ServerURL != server {
+		t.Fatal("boundary origin failed custody reservation", err)
+	}
+	if _, err = keys.RecoverReservation(c, oversized, session, verify); err == nil || verified != 0 {
+		t.Fatal("oversized recovery origin reached custody")
+	}
+	// The SQL boundary also protects callers that bypass journal validation.
+	if _, err = keys.registry.db.Exec(`UPDATE native_direct_managed_source_v2_prepare_commands SET server_url=?`, oversized); err == nil {
+		t.Fatal("SQL accepted oversized origin")
+	}
+}
+
+func TestDirectSourceV2JournalDiscardsConnectionAfterRollbackFailure(t *testing.T) {
+	_, j, _, _ := directSourceStoreFixtureV2(t)
+	j.registry.db.SetMaxOpenConns(1)
+	var original any
+	injected := errors.New("injected operation failure")
+	err := j.withLocked(func(conn *sql.Conn) error {
+		if err := conn.Raw(func(raw any) error { original = raw; return nil }); err != nil {
+			return err
+		}
+		// End the transaction to force the cleanup ROLLBACK to fail. The
+		// connection must be discarded even when cleanup cannot know its state.
+		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+			return err
+		}
+		return injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatal("operation error changed", err)
+	}
+	conn, err := j.registry.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err = conn.Raw(func(raw any) error {
+		if original == raw {
+			return errors.New("unsafe connection returned to pool")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal("replacement connection unusable", err)
+	}
+	if _, err = conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
 	}
 }

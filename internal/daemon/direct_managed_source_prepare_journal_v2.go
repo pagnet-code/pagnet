@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -186,11 +187,20 @@ func (s *DirectManagedSourcePrepareJournalV2) withLocked(fn func(*sql.Conn) erro
 	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "ROLLBACK") }()
+	committed := false
+	defer func() {
+		if !committed {
+			if _, rollbackErr := conn.ExecContext(ctx, "ROLLBACK"); rollbackErr != nil {
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+				_ = conn.Close()
+			}
+		}
+	}()
 	if err = fn(conn); err != nil {
 		return err
 	}
 	_, err = conn.ExecContext(ctx, "COMMIT")
+	committed = err == nil
 	return err
 }
 
@@ -205,7 +215,7 @@ func (s *DirectManagedSourcePrepareJournalV2) apply(command transport.DirectMana
 	}
 	command, err = transport.DecodeDirectManagedSourcePrepareCommandV2(request)
 	server := textServiceServer(configuredServer)
-	if err != nil || server == "" || legacyTextServiceServer(configuredServer) != server || !directManagedSourceSessionMatchesV2(command.Subject, session) || !directManagedSourceInitialBindingV2(command.Subject) {
+	if err != nil || server == "" || len(server) > 2048 || legacyTextServiceServer(configuredServer) != server || !directManagedSourceSessionMatchesV2(command.Subject, session) || !directManagedSourceInitialBindingV2(command.Subject) {
 		return empty, errDirectManagedSourcePrepareJournalV2
 	}
 	digest := sha256.Sum256(request)
