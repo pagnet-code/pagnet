@@ -4,6 +4,18 @@
 and pure credential derivation only. It does not install, persist, activate,
 authorize, or dispatch credentials and defines no daemon or server routes.
 
+The dormant daemon custody store in
+`internal/daemon/managed_direct_credential_store.go` installs credentials only
+through explicit scope verification and a final publication fence. It requires
+locally retained successful Prepare and exact PoP proof evidence, commits an
+immutable attempt, and writes a restrictive credential file in the existing
+`closed-managed-endpoint-keys` namespace before committing public installation
+evidence. Credential filenames bind the installation, canonical server origin,
+enrollment, direct intent and credential ID; target keys may be shared by
+enrollments. Exact interrupted attempts may recover during the original install
+window. Missing or damaged installed files fail closed. No runtime offer,
+dispatch, executor, route or activation is connected to this store.
+
 The issue binds the complete canonical managed endpoint host-custody PoP
 challenge, a receipt containing its challenge ID, transcript hash and plain
 SHA256 of the canonical proof, the channel generation, and an accepted budget
