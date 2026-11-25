@@ -43,6 +43,7 @@ type directManagedSourceCredentialProtocolVariant uint8
 const (
 	directManagedSourceCredentialProtocolV1 directManagedSourceCredentialProtocolVariant = iota + 1
 	directManagedSourceCredentialProtocolV2
+	managedDirectCredentialProtocolV1
 )
 
 // directManagedSourceCredentialPublicationFence pins local authority only. The
@@ -80,6 +81,9 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 				return false
 			}
 			required = []string{transport.DirectManagedSourcePrepareProtocol, transport.DirectManagedSourcePoPProtocol, transport.DirectManagedSourceCredentialProtocol}
+		case managedDirectCredentialProtocolV1:
+			// Dormant target executor: no credential offer or runtime negotiation.
+			required = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol}
 		case directManagedSourceCredentialProtocolV2:
 			required = []string{transport.DirectManagedSourcePrepareProtocolV2, transport.DirectManagedSourcePoPProtocolV2, transport.DirectManagedSourceCredentialProtocolV2}
 		default:
