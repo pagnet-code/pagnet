@@ -62,7 +62,7 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 		return err
 	}
 	serverURL := d.nativeServerURL()
-	if d.DirectManagedSourceV2Enabled && (serverURL == "" || serverURL != c.serverURL) {
+	if (d.DirectManagedSourceV2Enabled || d.ManagedDirectCredentialEnabled) && (serverURL == "" || serverURL != c.serverURL) {
 		return ErrNativeObservationConflict
 	}
 	expected, err := nativeRecoveryIdentity(p)

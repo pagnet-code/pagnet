@@ -15,6 +15,7 @@ import (
 )
 
 const (
+	MsgManagedDirectCredential            = "host.managed_direct_credential"
 	ManagedDirectCredentialProtocol       = "managed_direct_credential_v1"
 	ManagedDirectCredentialSuite          = "X25519-HKDF-SHA256-HMAC-SHA256"
 	ManagedDirectCredentialInstallFailure = "managed_direct_credential_install_failed"

@@ -55,7 +55,7 @@ sleep 3600
 	}
 	_, subject, session := managedEndpointFixture(t)
 	command := transport.ManagedEndpointPrepareCommand{ProtocolVersion: transport.ManagedEndpointPrepareProtocol, CommandID: domain.NewID(), Subject: subject}
-	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol}
+	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol, transport.ManagedEndpointPrepareProtocol, transport.ManagedEndpointPoPProtocol, transport.ManagedDirectCredentialProtocol}
 	if err := os.Mkdir(filepath.Join(root, "daemon"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ sleep 3600
 	}
 	defer registry.Close()
 	configuredServer := "https://example.test"
-	configured := &Daemon{Config: Config{ServerURL: configuredServer}}
+	configured := &Daemon{Config: Config{ServerURL: configuredServer, ManagedEndpointPrepareEnabled: true, ManagedEndpointPoPEnabled: true, ManagedDirectCredentialEnabled: true}}
 	scope := sessionworker.Scope{ServerURL: configured.nativeServerURL(), TenantID: session.TenantID, AccountID: session.AccountID, HostID: session.HostID, InstanceID: command.Subject.InstanceID.String(), Generation: command.Subject.OwnershipGeneration}
 	workspace := filepath.Join(root, "workspace")
 	if err := os.Mkdir(workspace, 0700); err != nil {
@@ -106,7 +106,7 @@ sleep 3600
 			t.Error("original worker failed to stop")
 		}
 	}()
-	socket, _ := nativeBindingSocketPair(t)
+	socket, peer := nativeBindingSocketPair(t)
 	var native *NativeObservationConnection
 	native = NewNativeObservationConnection(scope.ServerURL, scope.HostID, session.BootID, func(_ context.Context, typ string, payload any) error {
 		if typ == transport.MsgNativeOriginSession {
@@ -123,6 +123,9 @@ sleep 3600
 		return nil
 	})
 	defer native.Close()
+	native.offeredManagedEndpointPrepare = true
+	native.offeredManagedEndpointPoP = true
+	native.offeredManagedDirectCredential = true
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}
@@ -248,16 +251,38 @@ sleep 3600
 		t.Fatal(err)
 	}
 	issueRaw, _ := issue.CanonicalBytes()
-	ack, err := executor.executeCredential(ctx, socket, native, session, scope.ServerURL, "host.managed_direct_credential", issueRaw, newDirectManagedSourceCredentialPublicationLane())
-	if err != nil {
-		t.Fatal(err)
+	d.managedEndpointPrepare = executor.localManagedEndpointPrepare
+	d.managedEndpointPoP = executor.localManagedEndpointPrepare
+	d.managedDirectCredential = executor
+	connection := newManagedDirectCredentialConnection(d, socket, native, &managedDirectCredentialNegotiation{socket: socket, native: native, session: session})
+	if connection == nil {
+		t.Fatal("target runtime negotiation")
 	}
-	if _, err := transport.DecodeManagedDirectCredentialACK(ack); err != nil {
-		t.Fatal("success ACK", err)
-	}
-	replay, err := executor.installCredential(ctx, socket, native, session, scope.ServerURL, issue, newDirectManagedSourceCredentialPublicationLane())
-	if err != nil || !bytes.Equal(ack, replay) {
-		t.Fatal("replay", err)
+	defer connection.close()
+	var ack []byte
+	for attempt := 0; attempt < 2; attempt++ {
+		connection.handle(nativeBindingEnvelope(t, transport.MsgManagedDirectCredential, issue))
+		_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var envelope transport.Envelope
+		if err := peer.ReadJSON(&envelope); err != nil {
+			t.Fatal("runtime ACK", err)
+		}
+		var outer struct {
+			CommandID domain.ID       `json:"commandId"`
+			Error     string          `json:"error"`
+			Result    json.RawMessage `json:"result"`
+		}
+		if envelope.Type != transport.MsgCommandAck || json.Unmarshal(envelope.Payload, &outer) != nil || outer.CommandID != issue.CredentialID || outer.Error != "" {
+			t.Fatal("runtime ACK envelope")
+		}
+		if _, err := transport.DecodeManagedDirectCredentialACK(outer.Result); err != nil {
+			t.Fatal(err)
+		}
+		if attempt == 0 {
+			ack = append([]byte(nil), outer.Result...)
+		} else if !bytes.Equal(ack, outer.Result) {
+			t.Fatal("server redelivery changed retained ACK")
+		}
 	}
 	verify := func(retained transport.ManagedDirectCredentialIssue, server string, host transport.HostSessionPayload) error {
 		_, err := executor.verifyCredentialPublication(ctx, socket, native, host, server, retained)

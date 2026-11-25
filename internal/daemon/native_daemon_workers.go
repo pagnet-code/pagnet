@@ -175,7 +175,7 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 		return ErrNativeSourceUnsupported
 	}
 	serverURL := d.nativeServerURL()
-	if d.DirectManagedSourceV2Enabled && (serverURL == "" || serverURL != connection.serverURL) {
+	if (d.DirectManagedSourceV2Enabled || d.ManagedDirectCredentialEnabled) && (serverURL == "" || serverURL != connection.serverURL) {
 		return ErrNativeObservationConflict
 	}
 	record, err := d.nativeRegistry.Lookup(p.InstanceID)
@@ -248,7 +248,7 @@ func (d *Daemon) prepareNativeOwnership(conn *websocket.Conn, p transport.Native
 }
 
 func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObservationConnection, record NativeWorkerRecord) error {
-	if d.DirectManagedSourceV2Enabled {
+	if d.DirectManagedSourceV2Enabled || d.ManagedDirectCredentialEnabled {
 		serverURL := d.nativeServerURL()
 		if serverURL == "" || connection == nil || connection.serverURL != serverURL || record.Scope.ServerURL != serverURL {
 			return ErrNativeObservationConflict

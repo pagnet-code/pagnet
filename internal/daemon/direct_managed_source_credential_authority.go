@@ -82,8 +82,15 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 			}
 			required = []string{transport.DirectManagedSourcePrepareProtocol, transport.DirectManagedSourcePoPProtocol, transport.DirectManagedSourceCredentialProtocol}
 		case managedDirectCredentialProtocolV1:
-			// Dormant target executor: no credential offer or runtime negotiation.
+			// Dormant custody remains usable without attaching a transport. Runtime
+			// publication additionally requires the exact authenticated target suite.
 			required = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol}
+			if d.ManagedDirectCredentialEnabled || native.offeredManagedDirectCredential {
+				if !d.ManagedDirectCredentialEnabled || !d.ManagedEndpointPrepareEnabled || !d.ManagedEndpointPoPEnabled || !native.offeredManagedEndpointPrepare || !native.offeredManagedEndpointPoP || !native.offeredManagedDirectCredential {
+					return false
+				}
+				required = append(required, transport.ManagedEndpointPrepareProtocol, transport.ManagedEndpointPoPProtocol, transport.ManagedDirectCredentialProtocol)
+			}
 		case directManagedSourceCredentialProtocolV2:
 			required = []string{transport.DirectManagedSourcePrepareProtocolV2, transport.DirectManagedSourcePoPProtocolV2, transport.DirectManagedSourceCredentialProtocolV2}
 		default:

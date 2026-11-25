@@ -62,6 +62,8 @@ type Config struct {
 	ManagedEndpointPrepareEnabled bool
 	// ManagedEndpointPoPEnabled opts into closed host custody proofs. Default OFF.
 	ManagedEndpointPoPEnabled bool
+	// ManagedDirectCredentialEnabled opts into target V1 credential custody. Default OFF.
+	ManagedDirectCredentialEnabled bool
 	// DirectManagedSourceV2Enabled offers the complete V2 source suite. Default OFF.
 	DirectManagedSourceV2Enabled bool
 	// DirectManagedSourcePrepareEnabled opts into closed source key preparation. Default OFF.
@@ -217,6 +219,7 @@ type Daemon struct {
 	ownerTextConsoleHandlers int
 
 	managedEndpointPoP            managedEndpointPoPExecutor
+	managedDirectCredential       managedDirectCredentialExecutor
 	managedEndpointPrepare        managedEndpointPrepareExecutor
 	managedEndpointPrepareMu      sync.Mutex
 	directManagedSourcePrepare    directManagedSourcePrepareExecutor
@@ -1011,6 +1014,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.initNativeShareSourceProve()
 	d.initManagedEndpointKeys()
 	d.initManagedEndpointPrepare()
+	d.initManagedDirectCredential()
 	d.initDirectManagedSourcePrepare()
 	d.initDirectManagedSourceV2()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
@@ -1163,6 +1167,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.managedEndpointPoPReady() {
 		q.Set("managed_endpoint_pop", transport.ManagedEndpointPoPProtocol)
 	}
+	q.Del("managed_direct_credential")
+	if d.managedDirectCredentialReady() {
+		q.Set("managed_direct_credential", transport.ManagedDirectCredentialProtocol)
+	}
 	if d.DirectManagedSourceV2Enabled {
 		for _, key := range directManagedSourceQueryKeys {
 			q.Del(key)
@@ -1260,6 +1268,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn.offeredManagedEndpointPrepare = dialEndpoint.Query().Get("managed_endpoint_prepare") == transport.ManagedEndpointPrepareProtocol
 	popOffers := dialEndpoint.Query()["managed_endpoint_pop"]
 	nativeConn.offeredManagedEndpointPoP = len(popOffers) == 1 && popOffers[0] == transport.ManagedEndpointPoPProtocol
+	credentialOffers := dialEndpoint.Query()["managed_direct_credential"]
+	nativeConn.offeredManagedDirectCredential = len(credentialOffers) == 1 && credentialOffers[0] == transport.ManagedDirectCredentialProtocol
 	nativeConn.captureDirectManagedSourceOffers(dialEndpoint.Query())
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
@@ -1280,6 +1290,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer managedPrepare.close()
 	managedPoP := newManagedEndpointPoPConnection(d, conn, nativeConn)
 	defer managedPoP.close()
+	var managedCredential *managedDirectCredentialConnection
+	defer func() { managedCredential.close() }()
 	directSourcePrepare := newDirectManagedSourcePrepareConnection(d, conn, nativeConn)
 	defer directSourcePrepare.close()
 	directSourcePoP := newDirectManagedSourcePoPConnection(d, conn, nativeConn)
@@ -1506,6 +1518,11 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			}
 			if env.Type == transport.MsgHostSession {
 				accountReadiness.admitted()
+				if managedCredential == nil && d.ManagedDirectCredentialEnabled {
+					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
+						managedCredential = newManagedDirectCredentialConnection(d, conn, nativeConn, &managedDirectCredentialNegotiation{socket: conn, native: nativeConn, session: session})
+					}
+				}
 				if directSourceDispatch.v2 == nil {
 					directSourceDispatch.v2, directSourceDispatch.closeV2 = d.directManagedSourceV2Handlers(conn, nativeConn)
 				}
@@ -1566,6 +1583,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			continue
 		}
 		if directSourceDispatch.handle(env) {
+			continue
+		}
+		if env.Type == transport.MsgManagedDirectCredential && managedCredential == nil {
+			return connectedAt, ErrNativeObservationConflict
+		}
+		if managedCredential.handle(env) {
 			continue
 		}
 		if managedPoP.handle(env) {
@@ -1848,7 +1871,7 @@ func (d *Daemon) sendHeartbeat(conn *websocket.Conn) {
 func (d *Daemon) handleCommand(conn *websocket.Conn, env transport.Envelope) {
 	// Reserved plaintext frames never enter generic command persistence, even
 	// when a caller bypasses the socket reader.
-	if env.Type == transport.MsgDirectManagedSourceCredential || env.Type == transport.MsgDirectManagedSourcePrepare || env.Type == transport.MsgDirectManagedSourcePoP || env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
+	if env.Type == transport.MsgManagedDirectCredential || env.Type == transport.MsgDirectManagedSourceCredential || env.Type == transport.MsgDirectManagedSourcePrepare || env.Type == transport.MsgDirectManagedSourcePoP || env.Type == transport.MsgManagedEndpointPoP || env.Type == transport.MsgManagedEndpointPrepare || env.Type == transport.MsgNativeShareSourceProve || env.Type == transport.MsgNativeShareSourcePrepare || env.Type == accountSealRequestType || strings.HasPrefix(env.Type, "account.reply.read") {
 		return
 	}
 	switch env.Type {

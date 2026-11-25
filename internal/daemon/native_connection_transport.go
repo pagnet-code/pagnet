@@ -31,6 +31,9 @@ func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnec
 // nativeServerURL supplies the same trusted identity to admission and new
 // worker reservations. Existing persisted scopes are never rewritten.
 func (d *Daemon) nativeServerURL() string {
+	if d.ManagedDirectCredentialEnabled {
+		return managedDirectCredentialServerOrigin(d.ServerURL)
+	}
 	if d.DirectManagedSourceV2Enabled {
 		return directManagedSourceV2ServerOrigin(d.ServerURL)
 	}

@@ -19,7 +19,7 @@ import (
 // session. It has no transport dispatch or key allocation path. Worker IPC runs
 // outside store locks, including on retries and immediately before publication.
 func (s *ManagedEndpointKeyStore) ConfirmPoP(ctx context.Context, d *Daemon, captured ManagedEndpointPrepareScope, configuredServer string, challenge transport.ManagedEndpointPoPChallenge) ([]byte, error) {
-	if s == nil || d == nil || captured.Socket == nil || captured.Connection == nil || s.registry != d.nativeRegistry || managedPrepareServerOrigin(configuredServer) == "" || managedPrepareServerOrigin(configuredServer) != managedPrepareServerOrigin(d.ServerURL) {
+	if s == nil || d == nil || captured.Socket == nil || captured.Connection == nil || s.registry != d.nativeRegistry || managedPrepareServerOrigin(configuredServer) == "" || managedPrepareServerOrigin(configuredServer) != managedPrepareServerOrigin(d.nativeServerURL()) {
 		return nil, errManagedEndpointKey
 	}
 	j, err := d.newManagedEndpointPrepareJournal()

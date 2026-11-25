@@ -13,8 +13,8 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// localManagedDirectCredential is dormant custody only. Construction neither
-// offers a protocol nor attaches a command handler or starts a native worker.
+// localManagedDirectCredential composes target V1 custody. Construction neither
+// offers a protocol nor starts a native worker.
 type localManagedDirectCredential struct{ *localManagedEndpointPrepare }
 
 func newLocalManagedDirectCredential(d *Daemon) (*localManagedDirectCredential, error) {
@@ -43,7 +43,7 @@ func (e *localManagedDirectCredential) verifyCredentialPublication(ctx context.C
 		return nil, ErrManagedEndpointPrepareRetryable
 	}
 	server := managedPrepareServerOrigin(endpoint)
-	if _, err := issue.CanonicalBytes(); err != nil || issue.ChannelGeneration != 1 || !e.keys.credentialValid(issue) || issue.PoP.ACK.Reservation.InstallationID != e.keys.installation || server == "" || legacyTextServiceServer(endpoint) != server || server != managedPrepareServerOrigin(e.d.ServerURL) || server != issue.PoP.ACK.Reservation.ServerURL {
+	if _, err := issue.CanonicalBytes(); err != nil || issue.ChannelGeneration != 1 || !e.keys.credentialValid(issue) || issue.PoP.ACK.Reservation.InstallationID != e.keys.installation || server == "" || legacyTextServiceServer(endpoint) != server || server != managedPrepareServerOrigin(e.d.nativeServerURL()) || server != issue.PoP.ACK.Reservation.ServerURL {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	active := func() bool {
@@ -79,7 +79,7 @@ func (d *Daemon) managedDirectCredentialPublicationFence(token *nativeWorkerPubl
 		if d == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
-		if _, err := issue.CanonicalBytes(); err != nil || issue.ChannelGeneration != 1 || managedPrepareServerOrigin(d.ServerURL) != server {
+		if _, err := issue.CanonicalBytes(); err != nil || issue.ChannelGeneration != 1 || managedPrepareServerOrigin(d.nativeServerURL()) != server {
 			return nil, ErrManagedEndpointPrepareRejected
 		}
 		return d.credentialPublicationFence(token, captured, lane, nativeManagedSubjectFromEndpoint(issue.PoP.Prepare.Subject), managedPrepareSessionMatches(issue.PoP.Prepare.Subject, session), managedDirectCredentialProtocolV1, issue.IssuedAt, issue.InstallExpiresAt, issue.CredentialExpiresAt, issue.Budget.ExpiresAt)(conn, server, session)
@@ -120,13 +120,9 @@ func (e *localManagedDirectCredential) installCredential(ctx context.Context, so
 
 // executeCredential accepts only canonical target V1 issues. Public failures
 // contain the credential identity and fixed transport code, never local errors.
-// Runtime integration must guard ACK writes against current authority and bound
-// transient immediate ACK collisions with the server's guarded write using a
-// bounded retry policy before enabling a route; every retry must revalidate
-// authority and the original V1 installation deadline. It must stop on session
-// supersession or cancellation. This executor implements no ACK transport.
+// The dedicated connection lane publishes only guarded installed-success ACKs.
 func (e *localManagedDirectCredential) executeCredential(ctx context.Context, socket *websocket.Conn, native *NativeObservationConnection, session transport.HostSessionPayload, endpoint, kind string, raw []byte, lane *directManagedSourceCredentialPublicationLane) ([]byte, error) {
-	if kind != "host.managed_direct_credential" {
+	if kind != transport.MsgManagedDirectCredential {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	issue, err := transport.DecodeManagedDirectCredentialIssue(raw)
