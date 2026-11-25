@@ -11,13 +11,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/google/uuid"
 	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
 )
 
 const directMessageRecordLimit = 256
+
+// The physical file-content budget includes encoded ciphertext files, the
+// authentication key, and both old/new manifests during atomic replacement.
 const directMessageByteLimit = 16 << 20
+const directMessageMetadataReserve = 2*directMessageIndexLimit + 32
 const directMessageIndexLimit = 1 << 20
 
 // This namespace is independent of pending-channel Outbox and the V1 pair spool.
@@ -92,6 +99,9 @@ func (k *keyring) writeDirectMessageFile(path string, raw []byte) error {
 	if err = f.Close(); err != nil {
 		return err
 	}
+	if k.directMessageBeforeRename != nil {
+		k.directMessageBeforeRename()
+	}
 	if err = os.Rename(f.Name(), path); err != nil {
 		return err
 	}
@@ -118,6 +128,124 @@ func readDirectMessageFile(path string, max int) ([]byte, error) {
 	}
 	return raw, nil
 }
+
+// Stored []byte fields use padded base64 inside the authenticated JSON envelope.
+func directMessageStoredBytes(wireBytes int) int {
+	empty, _ := json.Marshal(directMessageFile{Wire: []byte{}, MAC: make([]byte, 32)})
+	return len(empty) + base64.StdEncoding.EncodedLen(wireBytes)
+}
+
+// Every caller holds the root journal flock. Streaming prevents an abandoned
+// directory from forcing an unbounded allocation. Only our exact temp grammar
+// and private owned regular files qualify for crash cleanup.
+func (k *keyring) recoverDirectMessageTemps() error {
+	dir := k.directMessageDir()
+	owner, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !owner.IsDir() || owner.Mode().Perm() != 0700 || !directMessagePrivateOwner(owner) {
+		return errDirect
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for {
+		entries, e := f.ReadDir(32)
+		if e != nil && !errors.Is(e, io.EOF) {
+			return e
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			info, err := os.Lstat(filepath.Join(dir, name))
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || !directMessagePrivateOwner(info) {
+				return errDirect
+			}
+			if strings.HasPrefix(name, ".direct-v2-") {
+				suffix := strings.TrimPrefix(name, ".direct-v2-")
+				if len(suffix) == 0 || len(suffix) > 10 || info.Size() > directMessageIndexLimit {
+					return errDirect
+				}
+				for _, c := range suffix {
+					if c < '0' || c > '9' {
+						return errDirect
+					}
+				}
+				if err = os.Remove(filepath.Join(dir, name)); err != nil {
+					return err
+				}
+				continue
+			}
+			if name == "auth.key" || name == "manifest.json" {
+				continue
+			}
+			id := strings.TrimSuffix(name, ".json")
+			parsed, err := uuid.Parse(id)
+			if err != nil || parsed.String() != id || name != id+".json" {
+				return errDirect
+			}
+		}
+		if errors.Is(e, io.EOF) {
+			break
+		}
+	}
+	return k.syncDirectMessages(dir)
+}
+
+// Unrecognized files are never deleted. They fail closed, as do files that are
+// absent from the authoritative reservation manifest, so they cannot consume
+// unaccounted capacity while this journal continues writing.
+func (k *keyring) validateDirectMessageStorage(records map[string]directMessageRecord) error {
+	f, err := os.Open(k.directMessageDir())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	total := 0
+	for {
+		entries, e := f.ReadDir(32)
+		if e != nil && !errors.Is(e, io.EOF) {
+			return e
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			info, err := os.Lstat(filepath.Join(k.directMessageDir(), name))
+			if err != nil {
+				return err
+			}
+			max := 0
+			switch name {
+			case "auth.key":
+				max = 32
+			case "manifest.json":
+				max = directMessageIndexLimit
+			default:
+				id := strings.TrimSuffix(name, ".json")
+				r, ok := records[id]
+				if !ok || r.Tombstone || name != id+".json" {
+					return errDirect
+				}
+				max = r.ReservedBytes
+			}
+			if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || !directMessagePrivateOwner(info) || info.Size() < 0 || info.Size() > int64(max) {
+				return errDirect
+			}
+			total += int(info.Size())
+			if total > directMessageByteLimit {
+				return errDirect
+			}
+		}
+		if errors.Is(e, io.EOF) {
+			return nil
+		}
+	}
+}
+
 func (k *keyring) initDirectMessages() error {
 	dir := k.directMessageDir()
 	err := os.Mkdir(dir, 0700)
@@ -129,8 +257,14 @@ func (k *keyring) initDirectMessages() error {
 		if !info.IsDir() || info.Mode().Perm() != 0700 {
 			return errDirect
 		}
-		_, _, e = k.readDirectMessages()
-		return e
+		if e = k.recoverDirectMessageTemps(); e != nil {
+			return e
+		}
+		records, _, e := k.readDirectMessages()
+		if e != nil {
+			return e
+		}
+		return k.validateDirectMessageStorage(records)
 	}
 	if err != nil {
 		return err
@@ -176,13 +310,13 @@ func (k *keyring) readDirectMessages() (map[string]directMessageRecord, []byte, 
 	if manifest.Records == nil || len(manifest.Records) > directMessageRecordLimit || !hmac.Equal(manifest.MAC, directMessageMAC(key, "manifest", payload)) {
 		return nil, nil, errDirect
 	}
-	total := 0
+	total := directMessageMetadataReserve
 	for id, r := range manifest.Records {
 		b := r.Binding
 		if _, err := b.Header.CanonicalBytes(); err != nil {
 			return nil, nil, errDirect
 		}
-		if id != b.Header.MessageID || b.Role != b.Header.SenderRole || b.Local.TenantID == "" || b.Local.PrincipalID == "" || b.Local.EndpointID == "" || b.Local.CredentialID == "" || b.PublicationHash == ([32]byte{}) || b.InputMAC == ([32]byte{}) || b.GrantID == "" || b.GrantGeneration == "" || b.ChannelGeneration == "" || b.IntentID == "" || b.NetworkID == "" || r.ReservedBytes <= 0 || r.ReservedBytes > transport.DirectChannelMessageMaxBytesV2 || r.WireBytes < 0 || r.WireBytes > r.ReservedBytes || (r.WireBytes == 0) != (r.WireDigest == ([32]byte{})) || r.Tombstone && (!r.Admitted || !r.DependencyDone || r.WireBytes == 0) {
+		if id != b.Header.MessageID || b.Role != b.Header.SenderRole || b.Local.TenantID == "" || b.Local.PrincipalID == "" || b.Local.EndpointID == "" || b.Local.CredentialID == "" || b.PublicationHash == ([32]byte{}) || b.InputMAC == ([32]byte{}) || b.GrantID == "" || b.GrantGeneration == "" || b.ChannelGeneration == "" || b.IntentID == "" || b.NetworkID == "" || r.ReservedBytes <= 0 || r.ReservedBytes > directMessageStoredBytes(transport.DirectChannelMessageMaxBytesV2) || r.WireBytes < 0 || r.WireBytes > transport.DirectChannelMessageMaxBytesV2 || r.WireBytes > 0 && directMessageStoredBytes(r.WireBytes) != r.ReservedBytes || (r.WireBytes == 0) != (r.WireDigest == ([32]byte{})) || r.Tombstone && (!r.Admitted || !r.DependencyDone || r.WireBytes == 0) {
 			return nil, nil, errDirect
 		}
 		if !r.Tombstone {
@@ -289,7 +423,8 @@ func (k *keyring) prepareDirectMessage(m *directMaterial, local directParty, h d
 		}
 		return &directPreparedMessage{b, wire}, nil
 	}
-	total := size
+	storedSize := directMessageStoredBytes(size)
+	total := directMessageMetadataReserve + storedSize
 	for _, r := range records {
 		if !r.Tombstone {
 			total += r.ReservedBytes
@@ -301,7 +436,7 @@ func (k *keyring) prepareDirectMessage(m *directMaterial, local directParty, h d
 	if _, err = os.Lstat(k.directMessagePath(h.MessageID)); !errors.Is(err, os.ErrNotExist) {
 		return nil, errDirect
 	}
-	record := directMessageRecord{Binding: b, ReservedBytes: size}
+	record := directMessageRecord{Binding: b, ReservedBytes: storedSize}
 	records[h.MessageID] = record
 	if err = k.writeDirectMessages(records, key); err != nil {
 		return nil, err
@@ -315,6 +450,9 @@ func (k *keyring) prepareDirectMessage(m *directMaterial, local directParty, h d
 		return nil, errDirect
 	}
 	raw, _ := json.Marshal(directMessageFile{wire, directMessageMAC(key, "wire", wire)})
+	if len(raw) != storedSize {
+		return nil, errDirect
+	}
 	if err = k.writeDirectMessageFile(k.directMessagePath(h.MessageID), raw); err != nil {
 		return nil, err
 	}

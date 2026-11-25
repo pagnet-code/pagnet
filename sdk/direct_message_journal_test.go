@@ -294,3 +294,57 @@ func TestDirectMessageProcessConcurrency(t *testing.T) {
 		t.Fatal("concurrent encryption diverged")
 	}
 }
+
+func TestDirectMessageEncodedStorageCapacity(t *testing.T) {
+	s, _, _, now := directMaterials(t)
+	k, _ := newKeyring(t.TempDir())
+	h, _ := s.prepareHeader("ASK", directTestAskID, directTestAskID, nil, now)
+	a, err := k.prepareDirectMessage(s, s.descriptor.S, h, nil, nil, []byte("hello"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := k.lockDirectMessages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, key, err := k.readDirectMessages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := records[h.MessageID]
+	info, err := os.Stat(k.directMessagePath(h.MessageID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ReservedBytes != int(info.Size()) || r.ReservedBytes <= len(a.wire) {
+		t.Fatal("encoded file was not fully charged")
+	}
+	// Pending reservations consume encoded storage before encryption. Exhaust
+	// physical capacity with fewer than 256 records to distinguish byte quota.
+	remaining := directMessageByteLimit - directMessageMetadataReserve - r.ReservedBytes - 100
+	for remaining > 0 {
+		pending := r
+		pending.WireBytes = 0
+		pending.WireDigest = [32]byte{}
+		pending.ReservedBytes = directMessageStoredBytes(transport.DirectChannelMessageMaxBytesV2)
+		if pending.ReservedBytes > remaining {
+			pending.ReservedBytes = remaining
+		}
+		id := uuid.NewString()
+		pending.Binding.Header.MessageID = id
+		pending.Binding.Header.RootID = id
+		records[id] = pending
+		remaining -= pending.ReservedBytes
+	}
+	if len(records) >= directMessageRecordLimit {
+		t.Fatal("fixture exhausted count first")
+	}
+	if err = k.writeDirectMessages(records, key); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	next, _ := s.prepareHeader("ASK", directTestSecondAskID, directTestSecondAskID, nil, now)
+	if _, err = k.prepareDirectMessage(s, s.descriptor.S, next, nil, nil, []byte("hello"), now); err == nil {
+		t.Fatal("encoded storage cap exceeded")
+	}
+}

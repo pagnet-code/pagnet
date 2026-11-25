@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -39,4 +40,9 @@ func (k *keyring) lockDirectMessages() (func(), error) {
 		return nil, err
 	}
 	return func() { _ = f.Close() }, nil
+}
+
+func directMessagePrivateOwner(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid())
 }
