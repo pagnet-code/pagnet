@@ -237,8 +237,7 @@ func (c *directManagedSourcePrepareConnectionV2) ack(payload []byte, session tra
 	}
 }
 
-// Only a future authenticated handshake integration may create this captured
-// negotiation. There is intentionally no wire, config or V1 conversion path.
+// The authenticated handshake captures this socket and session negotiation.
 type directManagedSourcePrepareNegotiationV2 struct {
 	socket  *websocket.Conn
 	native  *NativeObservationConnection

@@ -59,12 +59,13 @@ func directSourcePoPLaneFixtureV2(t *testing.T, feature bool) (*Daemon, *directM
 
 	keys, challenge, session, private := directSourcePoPFixtureV2(t)
 	clear(private)
-	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol, transport.DirectManagedSourcePrepareProtocolV2}
+	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol}
 	if feature {
-		session.ProtocolFeatures = append(session.ProtocolFeatures, transport.DirectManagedSourcePoPProtocolV2)
+		session.ProtocolFeatures = append(session.ProtocolFeatures, directManagedSourceProtocolsV2[:]...)
 	}
 	socket, peer := nativeBindingSocketPair(t)
 	native := NewNativeObservationConnection("https://example.test", session.HostID, session.BootID, nil)
+	native.offeredDirectManagedSourceV2 = directManagedSourceProtocolsV2
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}

@@ -71,6 +71,7 @@ func directSourceCredentialLaneFixtureV2(t *testing.T) (*Daemon, *directManagedS
 	}
 	socket, peer := nativeBindingSocketPair(t)
 	native := NewNativeObservationConnection("https://example.test", session.HostID, session.BootID, nil)
+	native.offeredDirectManagedSourceV2 = directManagedSourceProtocolsV2
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}

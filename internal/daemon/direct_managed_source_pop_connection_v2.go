@@ -255,8 +255,7 @@ func (c *directManagedSourcePoPConnectionV2) ack(payload []byte, session transpo
 	}
 }
 
-// Only future authenticated handshake integration may capture this negotiation.
-// There is deliberately no V1 conversion or startup/dispatch path.
+// The authenticated handshake captures this socket and session negotiation.
 type directManagedSourcePoPNegotiationV2 struct {
 	socket  *websocket.Conn
 	native  *NativeObservationConnection

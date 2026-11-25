@@ -62,6 +62,8 @@ type Config struct {
 	ManagedEndpointPrepareEnabled bool
 	// ManagedEndpointPoPEnabled opts into closed host custody proofs. Default OFF.
 	ManagedEndpointPoPEnabled bool
+	// DirectManagedSourceV2Enabled offers the complete V2 source suite. Default OFF.
+	DirectManagedSourceV2Enabled bool
 	// DirectManagedSourcePrepareEnabled opts into closed source key preparation. Default OFF.
 	DirectManagedSourcePrepareEnabled bool
 	// DirectManagedSourcePoPEnabled opts into closed source custody proofs. Default OFF.
@@ -1010,6 +1012,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.initManagedEndpointKeys()
 	d.initManagedEndpointPrepare()
 	d.initDirectManagedSourcePrepare()
+	d.initDirectManagedSourceV2()
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	defer bridgeCancel()
 	d.textServices = newTextServiceSupervisor(d)
@@ -1160,17 +1163,28 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 	if d.managedEndpointPoPReady() {
 		q.Set("managed_endpoint_pop", transport.ManagedEndpointPoPProtocol)
 	}
-	q.Del("direct_managed_source_prepare")
-	if d.directManagedSourcePrepareReady() {
-		q.Set("direct_managed_source_prepare", transport.DirectManagedSourcePrepareProtocol)
-	}
-	q.Del("direct_managed_source_pop")
-	if d.directManagedSourcePoPReady() {
-		q.Set("direct_managed_source_pop", transport.DirectManagedSourcePoPProtocol)
-	}
-	q.Del("direct_managed_source_credential")
-	if d.directManagedSourceCredentialReady() {
-		q.Set("direct_managed_source_credential", transport.DirectManagedSourceCredentialProtocol)
+	if d.DirectManagedSourceV2Enabled {
+		for _, key := range directManagedSourceQueryKeys {
+			q.Del(key)
+		}
+		if d.directManagedSourceV2Ready() {
+			for i, key := range directManagedSourceQueryKeys {
+				q.Set(key, directManagedSourceProtocolsV2[i])
+			}
+		}
+	} else {
+		q.Del("direct_managed_source_prepare")
+		if d.directManagedSourcePrepareReady() {
+			q.Set("direct_managed_source_prepare", transport.DirectManagedSourcePrepareProtocol)
+		}
+		q.Del("direct_managed_source_pop")
+		if d.directManagedSourcePoPReady() {
+			q.Set("direct_managed_source_pop", transport.DirectManagedSourcePoPProtocol)
+		}
+		q.Del("direct_managed_source_credential")
+		if d.directManagedSourceCredentialReady() {
+			q.Set("direct_managed_source_credential", transport.DirectManagedSourceCredentialProtocol)
+		}
 	}
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
@@ -1246,14 +1260,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn.offeredManagedEndpointPrepare = dialEndpoint.Query().Get("managed_endpoint_prepare") == transport.ManagedEndpointPrepareProtocol
 	popOffers := dialEndpoint.Query()["managed_endpoint_pop"]
 	nativeConn.offeredManagedEndpointPoP = len(popOffers) == 1 && popOffers[0] == transport.ManagedEndpointPoPProtocol
-	sourcePrepareOffers := dialEndpoint.Query()["direct_managed_source_prepare"]
-	nativeConn.offeredDirectManagedSourcePrepare = len(sourcePrepareOffers) == 1 && sourcePrepareOffers[0] == transport.DirectManagedSourcePrepareProtocol
-	sourcePoPOffers := dialEndpoint.Query()["direct_managed_source_pop"]
-	nativeConn.offeredDirectManagedSourcePoP = len(sourcePoPOffers) == 1 && sourcePoPOffers[0] == transport.DirectManagedSourcePoPProtocol
-	credentialOffers := dialEndpoint.Query()["direct_managed_source_credential"]
-	if len(credentialOffers) == 1 && credentialOffers[0] == transport.DirectManagedSourceCredentialProtocol {
-		nativeConn.offeredDirectManagedSourceCredential = credentialOffers[0]
-	}
+	nativeConn.captureDirectManagedSourceOffers(dialEndpoint.Query())
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
@@ -1279,6 +1286,8 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	defer directSourcePoP.close()
 	directSourceCredential := newDirectManagedSourceCredentialConnection(d, conn, nativeConn)
 	defer directSourceCredential.close()
+	directSourceDispatch := &directManagedSourceDispatch{v1: []func(transport.Envelope) bool{directSourcePrepare.handle, directSourcePoP.handle, directSourceCredential.handle}}
+	defer directSourceDispatch.close()
 	sourcePrepare := newNativeShareSourcePrepareConnection(d, conn, nativeConn)
 	defer sourcePrepare.close()
 	sourceProve := newNativeShareSourceProveConnection(d, conn, nativeConn, sourceProveOffered)
@@ -1497,6 +1506,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 			}
 			if env.Type == transport.MsgHostSession {
 				accountReadiness.admitted()
+				if directSourceDispatch.v2 == nil {
+					directSourceDispatch.v2, directSourceDispatch.closeV2 = d.directManagedSourceV2Handlers(conn, nativeConn)
+				}
 				if d.textServices != nil {
 					if session, err := nativeConn.AuthenticatedNativeHostSession(); err == nil {
 						d.textServices.admit(session)
@@ -1553,13 +1565,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		if sourceProve.handle(env) {
 			continue
 		}
-		if directSourceCredential.handle(env) {
-			continue
-		}
-		if directSourcePoP.handle(env) {
-			continue
-		}
-		if directSourcePrepare.handle(env) {
+		if directSourceDispatch.handle(env) {
 			continue
 		}
 		if managedPoP.handle(env) {

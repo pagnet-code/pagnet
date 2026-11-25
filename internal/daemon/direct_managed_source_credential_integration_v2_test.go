@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/domain"
+	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
+	sessioncore "github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -118,6 +120,7 @@ sleep 3600
 		return nil
 	})
 	defer native.Close()
+	native.offeredDirectManagedSourceV2 = directManagedSourceProtocolsV2
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}
@@ -189,16 +192,39 @@ sleep 3600
 	defer serveLock.Close()
 	link := &nativeWorkerLink{conn: socket, proxy: proxy, ownership: ownership}
 	d := &Daemon{state: state, nativeRegistry: registry, serveLockFile: serveLock, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: link}, curConn: socket, nativeConn: native, writeTimeout: time.Second}
-	executor, err := newLocalDirectManagedSourceCredentialV2(d)
-	if err != nil {
-		t.Fatal(err)
+	d.Config = Config{ServerURL: scope.ServerURL, DirectManagedSourceV2Enabled: true}
+	d.sessions = sessioncore.NewManager()
+	d.sessions.RegisterDriver(agentruntime.NewQwenPersistent(""))
+	d.initDirectManagedSourceV2()
+	executor, ok := d.directManagedSourceCredentialV2.(*localDirectManagedSourceCredentialV2)
+	if !ok {
+		t.Fatal("runtime did not compose full V2 suite")
 	}
-	// Build successful retained Prepare and PoP through the production lanes,
-	// including ownership_verify calls to the independently owned live session.
-	prepareRaw, err := executor.prepare(ctx, socket, native, session, scope.ServerURL, command)
-	if err != nil {
-		t.Fatal("prepare", err)
+	handlers, closeHandlers := d.directManagedSourceV2Handlers(socket, native)
+	dispatch := &directManagedSourceDispatch{v2: handlers, closeV2: closeHandlers}
+	defer dispatch.close()
+	exchange := func(typ string, payload any, id domain.ID) []byte {
+		t.Helper()
+		if !dispatch.handle(nativeBindingEnvelope(t, typ, payload)) {
+			t.Fatal("source command escaped dispatch")
+		}
+		peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var env transport.Envelope
+		if err := peer.ReadJSON(&env); err != nil {
+			t.Fatal("runtime ACK", err)
+		}
+		var outer struct {
+			CommandID domain.ID       `json:"commandId"`
+			Error     string          `json:"error"`
+			Result    json.RawMessage `json:"result"`
+		}
+		if env.Type != transport.MsgCommandAck || json.Unmarshal(env.Payload, &outer) != nil || outer.CommandID != id || outer.Error != "" {
+			t.Fatal("invalid runtime ACK", string(env.Payload))
+		}
+		return outer.Result
 	}
+	// Use the production dispatch and bounded queues for all three phases.
+	prepareRaw := exchange(transport.MsgDirectManagedSourcePrepareV2, command, command.CommandID)
 	prepare, err := transport.DecodeDirectManagedSourcePrepareACKV2(prepareRaw, command)
 	if err != nil {
 		t.Fatal(err)
@@ -217,10 +243,7 @@ sleep 3600
 	}
 	now := time.Now().UTC()
 	pop := transport.DirectManagedSourcePoPChallengeV2{ProtocolVersion: transport.DirectManagedSourcePoPProtocolV2, Suite: transport.DirectManagedSourcePoPSuiteV2, ChallengeID: domain.NewID(), Nonce: strings.Repeat("ab", 32), ServerEphemeralX25519: hex.EncodeToString(serverKey.PublicKey().Bytes()), IssuedAt: now, ExpiresAt: now.Add(time.Minute), Prepare: command, ACK: prepare, Receipt: receipt, SourceBindingDigest: digest}
-	popRaw, err := executor.confirmPoP(ctx, socket, native, session, scope.ServerURL, pop)
-	if err != nil {
-		t.Fatal("pop", err)
-	}
+	popRaw := exchange(transport.MsgDirectManagedSourcePoPV2, pop, pop.ChallengeID)
 	popProof, err := transport.DecodeDirectManagedSourcePoPProofV2(popRaw)
 	if err != nil {
 		t.Fatal(err)
@@ -234,10 +257,7 @@ sleep 3600
 		t.Fatal(err)
 	}
 	lane := newDirectManagedSourceCredentialPublicationLane()
-	ack, err := executor.installCredential(ctx, socket, native, session, scope.ServerURL, issue, lane)
-	if err != nil {
-		t.Fatal("production credential installation", err)
-	}
+	ack := exchange(transport.MsgDirectManagedSourceCredentialV2, issue, issue.CredentialID)
 	verify := func(retained transport.DirectManagedSourceCredentialIssueV2, server string, host transport.HostSessionPayload) error {
 		_, err := executor.verifyCredentialPublication(ctx, socket, native, host, server, retained)
 		return err

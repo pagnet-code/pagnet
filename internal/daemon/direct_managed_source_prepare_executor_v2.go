@@ -20,7 +20,7 @@ type localDirectManagedSourcePrepareV2 struct {
 	journal *DirectManagedSourcePrepareJournalV2
 }
 
-// newLocalDirectManagedSourcePrepareV2 is deliberately not wired to daemon startup.
+// newLocalDirectManagedSourcePrepareV2 composes isolated V2 custody.
 func newLocalDirectManagedSourcePrepareV2(d *Daemon) (*localDirectManagedSourcePrepareV2, error) {
 	if d == nil {
 		return nil, ErrManagedEndpointPrepareRetryable

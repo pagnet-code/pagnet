@@ -16,7 +16,7 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// This constructor composes isolated V2 custody without installing a live lane.
+// localDirectManagedSourceCredentialV2 composes isolated V2 custody.
 type localDirectManagedSourceCredentialV2 struct{ *localDirectManagedSourcePoPV2 }
 
 func newLocalDirectManagedSourceCredentialV2(d *Daemon) (*localDirectManagedSourceCredentialV2, error) {

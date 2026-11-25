@@ -12,7 +12,7 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-// This constructor only composes V2 custody; it does not install a live executor.
+// localDirectManagedSourcePoPV2 composes V2 custody.
 type localDirectManagedSourcePoPV2 struct {
 	*localDirectManagedSourcePrepareV2
 }

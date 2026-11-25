@@ -38,6 +38,7 @@ type NativeObservationConnection struct {
 	offeredSnapshotSigningPublicKey      string
 	offeredManagedEndpointPrepare        bool
 	offeredManagedEndpointPoP            bool
+	offeredDirectManagedSourceV2         [3]string
 	offeredDirectManagedSourcePrepare    bool
 	offeredDirectManagedSourcePoP        bool
 	offeredDirectManagedSourceCredential string
@@ -109,6 +110,9 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		if err != nil || id.String() != p.HostCredentialID {
 			return ErrNativeObservationConflict
 		}
+	}
+	if !c.validDirectManagedSourceSelection(p.ProtocolFeatures) {
+		return ErrNativeObservationConflict
 	}
 	managedPrepareFeatures := 0
 	for _, feature := range p.ProtocolFeatures {

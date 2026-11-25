@@ -207,8 +207,7 @@ func (c *directManagedSourceCredentialConnectionV2) ack(payload []byte, session 
 	}
 }
 
-// Only future authenticated handshake integration may capture this full suite.
-// No startup, dispatch or V1 fallback is installed by this constructor.
+// The authenticated handshake captures this complete suite negotiation.
 type directManagedSourceCredentialNegotiationV2 struct {
 	socket  *websocket.Conn
 	native  *NativeObservationConnection

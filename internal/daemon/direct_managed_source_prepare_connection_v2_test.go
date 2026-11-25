@@ -51,10 +51,11 @@ func directSourcePrepareLaneFixtureV2(t *testing.T, feature bool) (*Daemon, *dir
 	_, _, command, session := directSourceStoreFixtureV2(t)
 	session.ProtocolFeatures = []string{transport.NativeObservationReceiptProtocol}
 	if feature {
-		session.ProtocolFeatures = append(session.ProtocolFeatures, transport.DirectManagedSourcePrepareProtocolV2)
+		session.ProtocolFeatures = append(session.ProtocolFeatures, directManagedSourceProtocolsV2[:]...)
 	}
 	socket, peer := nativeBindingSocketPair(t)
 	native := NewNativeObservationConnection("https://example.test", session.HostID, session.BootID, nil)
+	native.offeredDirectManagedSourceV2 = directManagedSourceProtocolsV2
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}

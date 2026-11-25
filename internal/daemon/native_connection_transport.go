@@ -10,7 +10,11 @@ import (
 // nativeConnection binds all admission and source messages to one socket.
 // Ordinary daemon send may select a newer socket; native provenance cannot.
 func (d *Daemon) nativeConnection(conn *websocket.Conn) *NativeObservationConnection {
-	c := NewNativeObservationConnection(d.ServerURL, d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
+	serverURL := d.ServerURL
+	if d.DirectManagedSourceV2Enabled {
+		serverURL = directManagedSourceV2ServerOrigin(serverURL)
+	}
+	c := NewNativeObservationConnection(serverURL, d.HostID, d.bootID, func(ctx context.Context, typ string, payload any) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

@@ -45,6 +45,7 @@ func sourceCredentialAuthorityFixtureV2(t *testing.T) (*DirectManagedSourceKeySt
 		t.Fatal(err)
 	}
 	native := NewNativeObservationConnection(scope.ServerURL, scope.HostID, session.BootID, nil)
+	native.offeredDirectManagedSourceV2 = directManagedSourceProtocolsV2
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
 	}
