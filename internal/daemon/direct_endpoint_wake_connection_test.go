@@ -219,7 +219,7 @@ func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
 				}
 			}
 			assertRejected()
-			if err := lane.attach(handle, dormantWakeReconcile); err != nil {
+			if _, err := lane.attach(handle, dormantWakeReconcile); err != nil {
 				t.Fatal(err)
 			}
 			assertRejected()
@@ -237,7 +237,7 @@ func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
 			if entry.subscription.EndpointRole != wantRole {
 				t.Fatal("wrong wire role")
 			}
-			if err := lane.attach(handle, dormantWakeReconcile); err != ErrNativeObservationConflict || lane.byHandle[handle] != entry || len(lane.usedIDs) != 1 {
+			if _, err := lane.attach(handle, dormantWakeReconcile); err != ErrNativeObservationConflict || lane.byHandle[handle] != entry || len(lane.usedIDs) != 1 {
 				t.Fatal("duplicate replaced attachment or consumed ID", err)
 			}
 		})
@@ -314,7 +314,7 @@ func TestDirectEndpointWakeAttachRejectsInvalidBinding(t *testing.T) {
 			case "replaced-lane":
 				newDirectEndpointWakeConnection(d, lane.socket, lane.native).close()
 			}
-			if err := lane.attach(handle, callback); err != ErrNativeObservationConflict {
+			if _, err := lane.attach(handle, callback); err != ErrNativeObservationConflict {
 				t.Fatal("invalid attachment accepted", err)
 			}
 			if len(lane.byHandle) != 0 || len(lane.byID) != 0 || len(lane.usedIDs) != 0 {
@@ -342,7 +342,7 @@ func TestDirectEndpointWakeAttachLifecycle(t *testing.T) {
 	for _, reason := range []string{"revoke", "owner-close", "lane-close", "native-close"} {
 		t.Run(reason, func(t *testing.T) {
 			d, lane, handle := wakeAttachmentFixture(t, true)
-			if err := lane.attach(handle, dormantWakeReconcile); err != nil {
+			if _, err := lane.attach(handle, dormantWakeReconcile); err != nil {
 				t.Fatal(err)
 			}
 			entry := lane.byHandle[handle]
@@ -371,7 +371,7 @@ func TestDirectEndpointWakeAttachCapacity(t *testing.T) {
 				if i != 0 {
 					handle = d.directSubscriptions.add(first.binding)
 				}
-				err := lane.attach(handle, dormantWakeReconcile)
+				_, err := lane.attach(handle, dormantWakeReconcile)
 				if i == 64 {
 					if err != ErrNativeObservationCapacity {
 						t.Fatal("65th lifetime ID accepted", err)
@@ -398,7 +398,7 @@ func TestDirectEndpointWakeAttachCapacity(t *testing.T) {
 
 func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	d, old, stale := wakeAttachmentFixture(t, true)
-	if err := old.attach(stale, dormantWakeReconcile); err != nil {
+	if _, err := old.attach(stale, dormantWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	entry := old.byHandle[stale]
@@ -416,7 +416,7 @@ func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	d.curConn, d.nativeConn = socket, native
 	d.connMu.Unlock()
 	waitWakeAttachmentRemoved(t, old, entry)
-	if err := next.attach(stale, dormantWakeReconcile); err != ErrNativeObservationConflict {
+	if _, err := next.attach(stale, dormantWakeReconcile); err != ErrNativeObservationConflict {
 		t.Fatal("replacement inherited stale attachment", err)
 	}
 	binding := stale.binding
@@ -427,10 +427,10 @@ func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	}
 	binding.sessionIdentity = string(raw)
 	fresh := d.directSubscriptions.add(binding)
-	if err := old.attach(fresh, dormantWakeReconcile); err != ErrNativeObservationConflict {
+	if _, err := old.attach(fresh, dormantWakeReconcile); err != ErrNativeObservationConflict {
 		t.Fatal("old lane accepted replacement handle", err)
 	}
-	if err := next.attach(fresh, dormantWakeReconcile); err != nil {
+	if _, err := next.attach(fresh, dormantWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	nextEntry := next.byHandle[fresh]
@@ -454,7 +454,8 @@ func TestDirectEndpointWakeAttachRemoveReplaceRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			result <- lane.attach(handle, dormantWakeReconcile)
+			_, err := lane.attach(handle, dormantWakeReconcile)
+			result <- err
 		}()
 		go func() {
 			defer wg.Done()
@@ -496,11 +497,11 @@ func TestDirectEndpointWakeAttachRemoveReplaceRace(t *testing.T) {
 func TestDirectEndpointWakeAttachExactRemoval(t *testing.T) {
 	d, lane, old := wakeAttachmentFixture(t, true)
 	fresh := d.directSubscriptions.add(old.binding)
-	if err := lane.attach(old, dormantWakeReconcile); err != nil {
+	if _, err := lane.attach(old, dormantWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	oldEntry := lane.byHandle[old]
-	if err := lane.attach(fresh, dormantWakeReconcile); err != nil {
+	if _, err := lane.attach(fresh, dormantWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	freshEntry := lane.byHandle[fresh]

@@ -119,34 +119,52 @@ type directEndpointWakeAttachment struct {
 	latest, previous  *transport.DirectEndpointWakeOfferV1
 	subscribeStarted  bool
 	unsubscribeQueued bool
-	err               error
+	err               error // written once under c.mu, published by closing ctx.Done
+}
+
+// Done closes exactly once when this registration ends. It remains observable
+// after the connection removes the registration from its active maps.
+func (a *directEndpointWakeAttachment) Done() <-chan struct{} { return a.ctx.Done() }
+
+// TerminalError is meaningful after Done closes. Local cancellation reports
+// context.Canceled; server closure, writer and callback failures retain their raw
+// internal error. The controller must sanitize errors before displaying them.
+// Removal writes err once before closing Done, so this read needs no lock and
+// never calls an observer while holding the connection's mutex.
+func (a *directEndpointWakeAttachment) TerminalError() error {
+	select {
+	case <-a.Done():
+		return a.err
+	default:
+		return nil
+	}
 }
 
 // attach registers an exact admitted handle on its captured live socket. It
 // never restores an earlier attachment or selects a replacement connection.
-func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription, reconcile func(context.Context) error) error {
+func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription, reconcile func(context.Context) error) (*directEndpointWakeAttachment, error) {
 	if c == nil || c.daemon == nil || handle == nil || handle.owner != &c.daemon.directSubscriptions || reconcile == nil || !handle.Valid() {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	d := c.daemon
 	d.connMu.Lock()
 	defer d.connMu.Unlock()
 	if c.socket == nil || c.native == nil || d.curConn != c.socket || d.nativeConn != c.native || handle.binding.socket != c.socket || handle.binding.native != c.native {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	c.native.mu.Lock()
 	defer c.native.mu.Unlock()
 	if c.native.directWake != c || c.native.session == nil {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	select {
 	case <-c.native.closed:
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	default:
 	}
 	session, err := json.Marshal(c.native.session)
 	if err != nil || string(session) != handle.binding.sessionIdentity {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	metadata := handle.binding.metadata
 	role := ""
@@ -160,47 +178,47 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 	case "P":
 		role = transport.DirectEndpointWakeRoleTargetV1
 	default:
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	if metadata.ServerOrigin == "" || normalize(metadata.ServerOrigin) != metadata.ServerOrigin || normalize(c.native.serverURL) != metadata.ServerOrigin || normalize(d.nativeServerURL()) != metadata.ServerOrigin {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	features := make(map[string]int)
 	for _, feature := range c.native.session.ProtocolFeatures {
 		features[feature]++
 	}
 	if !c.native.offeredDirectEndpointWake || features[transport.DirectEndpointWakeFeatureV1] != 1 {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	for _, feature := range suite {
 		if features[feature] != 1 {
-			return ErrNativeObservationConflict
+			return nil, ErrNativeObservationConflict
 		}
 	}
 	installation, err := uuid.Parse(metadata.InstallationID.String())
 	if err != nil || installation == uuid.Nil || installation.String() != metadata.InstallationID.String() {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	select {
 	case <-c.done:
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	default:
 	}
 	if c.byHandle[handle] != nil {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	if len(c.usedIDs) >= 64 {
-		return ErrNativeObservationCapacity
+		return nil, ErrNativeObservationCapacity
 	}
 	id := domain.NewID().String()
 	if _, used := c.usedIDs[id]; used {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	subscription := transport.DirectEndpointWakeSubscribeV1{Protocol: transport.DirectEndpointWakeProtocolV1, SubscriptionID: id, DirectIntentID: metadata.IntentID.String(), EndpointRole: role, CredentialID: metadata.CredentialID.String()}
 	if _, err := subscription.CanonicalBytes(); err != nil {
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	entry := &directEndpointWakeAttachment{handle: handle, subscription: subscription, installationID: metadata.InstallationID, ctx: ctx, cancel: cancel, reconcile: reconcile, work: make(chan struct{}, 1)}
@@ -211,14 +229,14 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 	if _, current := handle.owner.entries[handle]; !current || !time.Now().Before(metadata.Deadline) {
 		handle.owner.mu.Unlock()
 		cancel()
-		return ErrNativeObservationConflict
+		return nil, ErrNativeObservationConflict
 	}
 	c.byHandle[handle], c.byID[id] = entry, entry
 	c.usedIDs[id] = entry
 	handle.owner.mu.Unlock()
 	if !c.enqueueLocked(entry, transport.MsgDirectEndpointWakeSubscribe, subscription, time.Now()) {
 		c.removeLocked(entry, false, ErrNativeObservationCapacity)
-		return ErrNativeObservationCapacity
+		return nil, ErrNativeObservationCapacity
 	}
 	go c.runReconcile(entry)
 	go func() {
@@ -230,7 +248,7 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 		defer c.mu.Unlock()
 		c.removeLocked(entry, true, context.Canceled)
 	}()
-	return nil
+	return entry, nil
 }
 
 // Removal is exact and nonblocking; lifetime IDs remain reserved after removal.

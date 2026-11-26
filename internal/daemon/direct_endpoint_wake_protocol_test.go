@@ -96,7 +96,7 @@ func TestDirectEndpointWakeImmediateOfferDuringSubscribe(t *testing.T) {
 		}
 		return nil
 	}
-	if err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
@@ -124,7 +124,7 @@ func TestDirectEndpointWakeACKIndependentAndCallbacksCoalesce(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	var calls, active, maximum atomic.Int32
-	if err := lane.attach(handle, func(ctx context.Context) error {
+	if _, err := lane.attach(handle, func(ctx context.Context) error {
 		n := active.Add(1)
 		defer active.Add(-1)
 		if n > maximum.Load() {
@@ -192,10 +192,10 @@ func TestDirectEndpointWakeCallbackFailureRemovesExactEntry(t *testing.T) {
 			writes := make(chan transport.Envelope, 16)
 			lane.write = wakeProtocolRecorder(writes)
 			other := d.directSubscriptions.add(handle.binding)
-			if err := lane.attach(other, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(other, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
-			if err := lane.attach(handle, func(context.Context) error {
+			if _, err := lane.attach(handle, func(context.Context) error {
 				if panics {
 					panic("test callback")
 				}
@@ -219,7 +219,7 @@ func TestDirectEndpointWakeCallbackFailureRemovesExactEntry(t *testing.T) {
 func TestDirectEndpointWakeRejectsInvalidOfferAndClosed(t *testing.T) {
 	_, lane, handle := wakeAttachmentFixture(t, true)
 	lane.write = func(time.Time, []byte) error { return nil }
-	if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	entry := wakeProtocolEntry(t, lane, handle)
@@ -299,7 +299,7 @@ func TestDirectEndpointWakeWriterContentionCutoff(t *testing.T) {
 			d.writeMu.Unlock()
 		}
 	}()
-	if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	entry := wakeProtocolEntry(t, lane, handle)
@@ -330,7 +330,7 @@ func TestDirectEndpointWakeQueueBackpressure(t *testing.T) {
 			d.writeMu.Unlock()
 		}
 	}()
-	if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	entry := wakeProtocolEntry(t, lane, handle)
@@ -361,7 +361,7 @@ func TestDirectEndpointWakeCloseUnsubscribeRaces(t *testing.T) {
 			_, lane, handle := wakeAttachmentFixture(t, true)
 			writes := make(chan transport.Envelope, 16)
 			lane.write = wakeProtocolRecorder(writes)
-			if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			entry := wakeProtocolEntry(t, lane, handle)
@@ -411,7 +411,7 @@ func TestDirectEndpointWakeWriteDeadlineBound(t *testing.T) {
 			deadlines := make(chan time.Time, 2)
 			lane.write = func(deadline time.Time, _ []byte) error { deadlines <- deadline; return nil }
 			before := time.Now()
-			if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			var deadline time.Time
@@ -511,7 +511,7 @@ func TestDirectEndpointWakeCapturedSocketProtocol(t *testing.T) {
 	t.Run("subscribe-offer-ack", func(t *testing.T) {
 		_, lane, handle, peer := wakeProtocolRealFixture(t)
 		callback := make(chan struct{}, 1)
-		if err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
+		if _, err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
 			t.Fatal(err)
 		}
 		entry := wakeProtocolEntry(t, lane, handle)
@@ -548,7 +548,7 @@ func TestDirectEndpointWakeCapturedSocketProtocol(t *testing.T) {
 
 func TestDirectEndpointWakeCapturedSocketReplacement(t *testing.T) {
 	d, lane, handle, peer := wakeProtocolRealFixture(t)
-	if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	entry := wakeProtocolEntry(t, lane, handle)
@@ -624,7 +624,7 @@ func TestDirectEndpointWakeWriteFailureAndIODeadline(t *testing.T) {
 				returned <- struct{}{}
 				return errors.New("socket write failed")
 			}
-			if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			entry := wakeProtocolEntry(t, lane, handle)
@@ -647,7 +647,7 @@ func TestDirectEndpointWakeWriteFailureAndIODeadline(t *testing.T) {
 			if !handle.Valid() {
 				t.Fatal("socket write failure revoked admitted handle")
 			}
-			if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 				t.Fatal("failed attachment prevented fresh explicit attachment", err)
 			}
 			replacement := wakeProtocolEntry(t, lane, handle)
@@ -672,7 +672,7 @@ func TestDirectEndpointWakeLifecycleContentionReleasesWriter(t *testing.T) {
 			d.writeTimeout = 40 * time.Millisecond
 			writes := make(chan transport.Envelope, 8)
 			lane.write = wakeProtocolRecorder(writes)
-			if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
@@ -720,7 +720,7 @@ func TestDirectEndpointWakeLocalRemovalToleratesRacedHints(t *testing.T) {
 			writes := make(chan transport.Envelope, 16)
 			lane.write = wakeProtocolRecorder(writes)
 			callbacks := make(chan struct{}, 4)
-			if err := lane.attach(handle, func(context.Context) error { callbacks <- struct{}{}; return nil }); err != nil {
+			if _, err := lane.attach(handle, func(context.Context) error { callbacks <- struct{}{}; return nil }); err != nil {
 				t.Fatal(err)
 			}
 			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
@@ -791,7 +791,7 @@ func TestDirectEndpointWakeRevocationBeforeDoneWatcher(t *testing.T) {
 	writes := make(chan transport.Envelope, 8)
 	lane.write = wakeProtocolRecorder(writes)
 	var callbacks atomic.Int32
-	if err := lane.attach(handle, func(context.Context) error { callbacks.Add(1); return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { callbacks.Add(1); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
@@ -841,7 +841,7 @@ func TestDirectEndpointWakeDefaultWriteFailureAvoidsLifecycleLock(t *testing.T) 
 		<-release
 		return errors.New("captured socket write failed")
 	}
-	if err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
+	if _, err := lane.attach(handle, func(context.Context) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	entry := wakeProtocolEntry(t, lane, handle)
