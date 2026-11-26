@@ -10,6 +10,7 @@ import (
 
 	agentruntime "github.com/pagnet-code/pagnet/internal/runtime"
 	"github.com/pagnet-code/pagnet/internal/session"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 func TestDirectManagedSourceV2RuntimeGate(t *testing.T) {
@@ -27,13 +28,15 @@ func TestDirectManagedSourceV2RuntimeGate(t *testing.T) {
 	if d.directManagedSourcePrepareV2 != nil || d.directManagedSourcePoPV2 != nil || d.directManagedSourceCredentialV2 != nil {
 		t.Fatal("default activated V2")
 	}
-	for _, reason := range []string{"exact", "inherited", "unrelated", "malformed", "worker-support", "custody", "off"} {
+	for _, reason := range []string{"exact", "inherited", "inherited-wake", "unrelated", "malformed", "worker-support", "custody", "off"} {
 		t.Run(reason, func(t *testing.T) {
 			d.DirectManagedSourceV2Enabled = true
 			d.ServerURL = "https://example.test"
 			switch reason {
 			case "inherited":
 				d.ServerURL += "?direct_managed_source_prepare=bad&direct_managed_source_prepare=bad&direct_managed_source_pop=bad&direct_managed_source_credential=bad"
+			case "inherited-wake":
+				d.ServerURL += "?direct_endpoint_wake=bad&direct_endpoint_wake=bad"
 			case "unrelated":
 				d.ServerURL += "?unrelated=value"
 			case "malformed":
@@ -57,7 +60,7 @@ func TestDirectManagedSourceV2RuntimeGate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := reason == "exact" || reason == "inherited"
+			want := reason == "exact" || reason == "inherited" || reason == "inherited-wake"
 			for i, key := range directManagedSourceQueryKeys {
 				values := endpoint.Query()[key]
 				if want {
@@ -67,6 +70,14 @@ func TestDirectManagedSourceV2RuntimeGate(t *testing.T) {
 				} else if len(values) != 0 {
 					t.Fatalf("unready suite offered %s: %v", key, values)
 				}
+			}
+			wake := endpoint.Query()[transport.DirectEndpointWakeQueryKey]
+			if want {
+				if len(wake) != 1 || wake[0] != transport.DirectEndpointWakeProtocolV1 {
+					t.Fatal("ready source missing exact wake offer", wake)
+				}
+			} else if len(wake) != 0 {
+				t.Fatal("unready source offered wake")
 			}
 			if want && d.nativeConnection(nil).serverURL != "https://example.test" {
 				t.Fatal("query became origin authority")

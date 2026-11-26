@@ -20,6 +20,7 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
+	directWake            *directEndpointWakeConnection
 	directInvalidations   directEndpointInvalidations
 	mu                    sync.Mutex
 	availabilityOnce      sync.Once
@@ -36,6 +37,7 @@ type NativeObservationConnection struct {
 	pendingObservations   map[string]chan transport.NativeObservationReceiptPayload
 
 	// Captured from this socket's dial offer before the read loop starts.
+	offeredDirectEndpointWake            bool
 	offeredSnapshotSigningPublicKey      string
 	offeredManagedEndpointPrepare        bool
 	offeredManagedEndpointPoP            bool
@@ -69,6 +71,7 @@ func (c *NativeObservationConnection) Close() {
 	case <-c.closed:
 		return
 	default:
+		c.directWake.close()
 		c.directInvalidations.revoke(func(b directEndpointBinding) bool { return b.native == c })
 		close(c.closed)
 	}
@@ -169,6 +172,9 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		}
 	}
 	if sourcePrepareFeatures > 1 || (sourcePrepareFeatures == 1 && !c.offeredDirectManagedSourcePrepare) || sourcePoPFeatures > 1 || (sourcePoPFeatures == 1 && (!c.offeredDirectManagedSourcePoP || sourcePrepareFeatures != 1)) {
+		return ErrNativeObservationConflict
+	}
+	if !c.validDirectEndpointWakeSelection(p.ProtocolFeatures) {
 		return ErrNativeObservationConflict
 	}
 	snapshotSigningKeyNegotiated := false

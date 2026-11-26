@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -39,7 +40,10 @@ type NativeWorkerRecord struct {
 type NativeWorkerRegistry struct {
 	db                  *sql.DB
 	root                string
+	custodyIdentity     nativeRegistryFileIdentity
 	mu                  sync.Mutex
+	closed              bool
+	closeErr            error
 	directInvalidations directEndpointInvalidations
 }
 
@@ -67,49 +71,41 @@ func privateNativeRegistryPath(path string, exact bool) error {
 }
 func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 	root := filepath.Join(stateDir, "native-workers")
-	if !filepath.IsAbs(stateDir) {
-		return nil, errors.New("native state path must be absolute")
-	}
-	// Reject symlinked ancestors before creating descendants.
-	if err := privateNativeRegistryPath(stateDir, false); err != nil {
-		return nil, err
-	}
-	if err := os.Mkdir(root, 0700); err != nil && !os.IsExist(err) {
-		return nil, err
-	}
-	parent, syncErr := os.Open(stateDir)
-	if syncErr != nil {
-		return nil, syncErr
-	}
-	syncErr = parent.Sync()
-	_ = parent.Close()
-	if syncErr != nil {
-		return nil, syncErr
-	}
-	if err := privateNativeRegistryDir(root); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(root, "registry.sqlite")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err == nil {
-		_ = f.Close()
-	} else if !os.IsExist(err) {
-		return nil, err
-	}
-	info, err := os.Lstat(path)
+	custodyRoot, custodyLock, identity, err := nativeRegistryOpenCustody(stateDir)
 	if err != nil {
 		return nil, err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != uint32(os.Getuid()) || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
-		return nil, errors.New("native registry file is not private")
-	}
+	defer custodyRoot.Close()
+	defer custodyLock.Close()
+	path := filepath.Join(root, "registry.sqlite")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{`PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=FULL`, `CREATE TABLE IF NOT EXISTS native_workers(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL,launch_state TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_gc(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_recoveries(recovery_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,original_generation TEXT NOT NULL,prepare_boot_identity TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('prepared','committed','collected')),UNIQUE(instance_id,original_generation))`} {
+	if _, err = db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	var journalMode string
+	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&journalMode); err != nil || journalMode != "wal" {
+		db.Close()
+		return nil, errNativeRegistryCustody
+	}
+	if _, err = db.Exec(`PRAGMA synchronous=FULL`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	var synchronous int
+	if err = db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil || synchronous != 2 {
+		db.Close()
+		return nil, errNativeRegistryCustody
+	}
+	if _, err = nativeRegistryInspectFiles(custodyRoot, identity, false); err != nil {
+		db.Close()
+		return nil, err
+	}
+	for _, q := range []string{`CREATE TABLE IF NOT EXISTS native_workers(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL,launch_state TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_gc(instance_id TEXT PRIMARY KEY,payload BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS native_worker_recoveries(recovery_id TEXT PRIMARY KEY,instance_id TEXT NOT NULL,original_generation TEXT NOT NULL,prepare_boot_identity TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('prepared','committed','collected')),UNIQUE(instance_id,original_generation))`} {
 		if _, err = db.Exec(q); err != nil {
 			_ = db.Close()
 			return nil, err
@@ -147,14 +143,56 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	registry := &NativeWorkerRegistry{db: db, root: root}
+	if _, err = nativeRegistryInspectFiles(custodyRoot, identity, false); err != nil {
+		db.Close()
+		return nil, err
+	}
+	registry := &NativeWorkerRegistry{db: db, root: root, custodyIdentity: identity}
 	if err := registry.initSourceHolderInstallation(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	if _, err = nativeRegistryInspectFiles(custodyRoot, identity, false); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return registry, nil
 }
-func (r *NativeWorkerRegistry) Close() error { return r.db.Close() }
+func (r *NativeWorkerRegistry) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return r.closeErr
+	}
+	root, err := nativeRegistryProtectedDirectory(r.root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err = nativeShareHolderPrivate(root, true); err != nil {
+		return err
+	}
+	custody, err := nativeRegistryCustodyLock(root)
+	if err != nil {
+		return err
+	}
+	defer custody.Close()
+	// Drain the sole connection before closing the pool: sql.DB.Close alone
+	// leaves checked-out connections alive until their readers release them.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	// SQLite's last close can unlink WAL and SHM files. Keep custody while it
+	// does so, rejecting new readers before releasing the driver connection.
+	err = r.db.Close()
+	err = errors.Join(err, conn.Close())
+	r.closed = true
+	r.closeErr = err
+	return err
+}
 func (r *NativeWorkerRegistry) Dir(scope sessionworker.Scope) string {
 	raw, _ := json.Marshal(scope)
 	sum := sha256.Sum256(raw)

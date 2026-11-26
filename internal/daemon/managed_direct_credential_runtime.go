@@ -28,6 +28,7 @@ func managedDirectCredentialServerOrigin(value string) string {
 	for _, key := range directManagedSourceQueryKeys {
 		query.Del(key)
 	}
+	query.Del("direct_endpoint_wake")
 	if len(query) != 0 {
 		return ""
 	}

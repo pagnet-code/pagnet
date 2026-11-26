@@ -968,7 +968,7 @@ func (d *Daemon) Close() error {
 		}
 		d.nativeWorkersMu.Unlock()
 		if d.nativeRegistry != nil {
-			_ = d.nativeRegistry.Close()
+			err = d.nativeRegistry.Close()
 		}
 		d.turnCancel()       // ctx watchers terminate active turn groups
 		d.terminal.stopAll() // stop PTY sessions (delegates to the supervisor)
@@ -976,7 +976,7 @@ func (d *Daemon) Close() error {
 			d.Log.Error("shutdown: process groups not reaped within deadline", "survivors", n)
 		}
 		d.stopBridgeSocket()
-		err = d.state.Close()
+		err = errors.Join(err, d.state.Close())
 	})
 	return err
 }
@@ -1199,6 +1199,10 @@ func (d *Daemon) wsURLWithSnapshotSigningKey(ctx context.Context, snapshotSignin
 			q.Set("direct_managed_source_credential", transport.DirectManagedSourceCredentialProtocol)
 		}
 	}
+	q.Del(transport.DirectEndpointWakeQueryKey)
+	if directEndpointWakeSuiteOffered(q) {
+		q.Set(transport.DirectEndpointWakeQueryKey, transport.DirectEndpointWakeProtocolV1)
+	}
 	q.Del("native_share_binding")
 	if d.nativeShareBindings != nil && d.nativeShareBindings.nativeShareBindingReady() {
 		q.Set("native_share_binding", transport.NativeShareBindingProtocol)
@@ -1276,6 +1280,9 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	credentialOffers := dialEndpoint.Query()["managed_direct_credential"]
 	nativeConn.offeredManagedDirectCredential = len(credentialOffers) == 1 && credentialOffers[0] == transport.ManagedDirectCredentialProtocol
 	nativeConn.captureDirectManagedSourceOffers(dialEndpoint.Query())
+	nativeConn.captureDirectEndpointWakeOffer(dialEndpoint.Query())
+	wake := newDirectEndpointWakeConnection(conn, nativeConn)
+	defer wake.close()
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
 	defer accountReadiness.close()
@@ -1584,6 +1591,12 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		}
 		if env.Type == transport.MsgAccountMessagingReadinessOffer || env.Type == transport.MsgAccountMessagingReadinessReset || env.Type == transport.MsgAccountMessagingReadinessSnapshotComplete || env.Type == transport.MsgAccountMessagingReadinessAccepted {
 			accountReadiness.offer(env)
+			continue
+		}
+		if handled, err := wake.handle(env); handled {
+			if err != nil {
+				return connectedAt, fmt.Errorf("direct endpoint wake protocol: %w", err)
+			}
 			continue
 		}
 		if sourceProve.handle(env) {

@@ -83,7 +83,11 @@ func p0FakeBinary(t *testing.T) string {
 // parent is group-writable. Production never relaxes its namespace policy.
 func privateDaemonStateDir(t *testing.T) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "state")
+	root := t.TempDir()
+	if err := os.Chmod(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "state")
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
 	}

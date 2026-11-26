@@ -27,7 +27,7 @@ func (d *Daemon) admitManagedTargetEndpoint(ctx context.Context, captured Manage
 	}
 	subject := nativeManagedSubjectFromEndpoint(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Authorization.ExpiresAt
-	metadata := DirectEndpointSubscriptionMetadata{InstallationID: e.keys.installation, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "P", ServerOrigin: issue.PoP.ACK.Reservation.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.Budget.ExpiresAt, subject.ExpiresAt)}
+	metadata := DirectEndpointSubscriptionMetadata{InstallationID: e.keys.installation, TenantID: issue.PoP.Prepare.Subject.TenantID, PrincipalID: issue.PoP.Prepare.Subject.PrincipalID, EndpointID: issue.PoP.Prepare.Subject.EndpointID, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "P", ServerOrigin: issue.PoP.ACK.Reservation.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.Budget.ExpiresAt, subject.ExpiresAt)}
 	scope := endpointMaterialScope{metadata.InstallationID, metadata.CredentialID, metadata.Role, endpointMaterialLiveUse}
 	return d.admitDirectEndpoint(ctx, captured, metadata, raw, subject, managedDirectCredentialProtocolV1, issue.IssuedAt, func(verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
 		return e.keys.withManagedTargetEndpointMaterial(issue, metadata.ServerOrigin, captured.Session, scope, func(transport.ManagedDirectCredentialIssue, string, transport.HostSessionPayload) error {
@@ -47,7 +47,7 @@ func (d *Daemon) admitDirectManagedSourceEndpointV2(ctx context.Context, capture
 	}
 	subject := nativeManagedSubjectFromSourceV2(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Prepare.Subject.AuthorizationExpiresAt
-	metadata := DirectEndpointSubscriptionMetadata{InstallationID: e.keys.installation, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "S", ServerOrigin: issue.PoP.ACK.Reservation.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.BudgetExpiresAt, subject.ExpiresAt)}
+	metadata := DirectEndpointSubscriptionMetadata{InstallationID: e.keys.installation, TenantID: issue.PoP.Prepare.Subject.TenantID, PrincipalID: issue.PoP.Prepare.Subject.PrincipalID, EndpointID: issue.PoP.Prepare.Subject.EndpointID, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "S", ServerOrigin: issue.PoP.ACK.Reservation.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.BudgetExpiresAt, subject.ExpiresAt)}
 	scope := endpointMaterialScope{metadata.InstallationID, metadata.CredentialID, metadata.Role, endpointMaterialLiveUse}
 	return d.admitDirectEndpoint(ctx, captured, metadata, raw, subject, directManagedSourceCredentialProtocolV2, issue.IssuedAt, func(verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
 		return e.keys.withDirectManagedSourceEndpointMaterialV2(issue, metadata.ServerOrigin, captured.Session, scope, func(transport.DirectManagedSourceCredentialIssueV2, string, transport.HostSessionPayload) error {
