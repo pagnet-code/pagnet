@@ -586,3 +586,25 @@ func TestDirectManagedSourceDeadlineEqualityV2(t *testing.T) {
 		t.Fatal("installation and credential equality rejected", err)
 	}
 }
+
+func TestDirectManagedSourcePoPReceiptV2CanonicalDomain(t *testing.T) {
+	issue, host, _, _ := directManagedSourceFixtureV2(t)
+	defer clear(host)
+	proof, err := ConfirmDirectManagedSourceHostCustodyV2(issue.PoP, host, issue.PoP.IssuedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := NewDirectManagedSourceCredentialPoPReceiptV2(proof)
+	if err != nil || receipt != issue.PoPReceipt {
+		t.Fatal("receipt changed existing V2 issue", err)
+	}
+	raw, _ := proof.CanonicalBytes()
+	plain := sha256.Sum256(raw)
+	if receipt.ProofDigest != sourceDigestV2("pagnet/direct-managed-source-host-custody-pop/proof/v2/", raw) || receipt.ProofDigest == hex.EncodeToString(plain[:]) {
+		t.Fatal("wrong proof digest domain")
+	}
+	proof.ProtocolVersion = DirectManagedSourcePoPProtocol
+	if _, err := NewDirectManagedSourceCredentialPoPReceiptV2(proof); err == nil {
+		t.Fatal("accepted V1 proof domain")
+	}
+}

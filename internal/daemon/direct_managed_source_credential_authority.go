@@ -38,21 +38,82 @@ func (lane *directManagedSourceCredentialPublicationLane) cancel() {
 	}
 }
 
+type directManagedSourceCredentialProtocolVariant uint8
+
+const (
+	directManagedSourceCredentialProtocolV1 directManagedSourceCredentialProtocolVariant = iota + 1
+	directManagedSourceCredentialProtocolV2
+	managedDirectCredentialProtocolV1
+)
+
 // directManagedSourceCredentialPublicationFence pins local authority only. The
 // caller obtains token through the full verifier, including worker IPC, before
 // entering store locks. The lane mutex is acquired last, after native.mu, and
 // released first after transaction completion. This does not authenticate remote
 // consent or budgets.
 func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane) DirectManagedSourceCredentialPublicationFence {
-	return func(registryConn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, session transport.HostSessionPayload) (release func(), err error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+	return func(conn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, session transport.HostSessionPayload) (func(), error) {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || conn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if _, err := issue.CanonicalBytes(); err != nil {
 			return nil, ErrManagedEndpointPrepareRejected
 		}
-		subject := nativeManagedSubjectFromSource(issue.PoP.Prepare.Subject)
-		if !reflect.DeepEqual(subject, token.subject) || !reflect.DeepEqual(session, captured.Session) || !directManagedSourceSessionMatches(issue.PoP.Prepare.Subject, session) || managedPrepareServerOrigin(server) == "" {
+		return d.credentialPublicationFence(token, captured, lane, nativeManagedSubjectFromSource(issue.PoP.Prepare.Subject), directManagedSourceSessionMatches(issue.PoP.Prepare.Subject, session), directManagedSourceCredentialProtocolV1, issue.IssuedAt, issue.InstallExpiresAt, issue.CredentialExpiresAt, issue.BudgetExpiresAt)(conn, server, session)
+	}
+}
+
+func (d *Daemon) directManagedSourceCredentialPublicationFenceV2(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane) DirectManagedSourceCredentialPublicationFenceV2 {
+	return func(conn *sql.Conn, issue transport.DirectManagedSourceCredentialIssueV2, server string, session transport.HostSessionPayload) (func(), error) {
+		if _, err := issue.CanonicalBytes(); err != nil {
+			return nil, ErrManagedEndpointPrepareRejected
+		}
+		return d.credentialPublicationFence(token, captured, lane, nativeManagedSubjectFromSourceV2(issue.PoP.Prepare.Subject), directManagedSourceSessionMatchesV2(issue.PoP.Prepare.Subject, session), directManagedSourceCredentialProtocolV2, issue.IssuedAt, issue.InstallExpiresAt, issue.CredentialExpiresAt, issue.BudgetExpiresAt)(conn, server, session)
+	}
+}
+
+func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane, subject nativeManagedSubject, matchesSession bool, variant directManagedSourceCredentialProtocolVariant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt time.Time) func(*sql.Conn, string, transport.HostSessionPayload) (func(), error) {
+	protocolValid := func(native *NativeObservationConnection, session transport.HostSessionPayload) bool {
+		var required []string
+		switch variant {
+		case directManagedSourceCredentialProtocolV1:
+			if !d.DirectManagedSourcePrepareEnabled || !d.DirectManagedSourcePoPEnabled || !d.DirectManagedSourceCredentialEnabled || !native.offeredDirectManagedSourcePrepare || !native.offeredDirectManagedSourcePoP || native.offeredDirectManagedSourceCredential != transport.DirectManagedSourceCredentialProtocol {
+				return false
+			}
+			required = []string{transport.DirectManagedSourcePrepareProtocol, transport.DirectManagedSourcePoPProtocol, transport.DirectManagedSourceCredentialProtocol}
+		case managedDirectCredentialProtocolV1:
+			// Dormant custody remains usable without attaching a transport. Runtime
+			// publication additionally requires the exact authenticated target suite.
+			required = []string{transport.NativeObservationReceiptProtocol, transport.NativeWorkerOwnershipProtocol}
+			if d.ManagedDirectCredentialEnabled || native.offeredManagedDirectCredential {
+				if !d.ManagedDirectCredentialEnabled || !d.ManagedEndpointPrepareEnabled || !d.ManagedEndpointPoPEnabled || !native.offeredManagedEndpointPrepare || !native.offeredManagedEndpointPoP || !native.offeredManagedDirectCredential {
+					return false
+				}
+				required = append(required, transport.ManagedEndpointPrepareProtocol, transport.ManagedEndpointPoPProtocol, transport.ManagedDirectCredentialProtocol)
+			}
+		case directManagedSourceCredentialProtocolV2:
+			required = []string{transport.DirectManagedSourcePrepareProtocolV2, transport.DirectManagedSourcePoPProtocolV2, transport.DirectManagedSourceCredentialProtocolV2}
+		default:
+			return false
+		}
+		for _, feature := range required {
+			count := 0
+			for _, got := range session.ProtocolFeatures {
+				if got == feature {
+					count++
+				}
+			}
+			if count != 1 {
+				return false
+			}
+		}
+		return true
+	}
+	return func(registryConn *sql.Conn, server string, session transport.HostSessionPayload) (release func(), err error) {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+			return nil, ErrManagedEndpointPrepareRetryable
+		}
+		if !reflect.DeepEqual(subject, token.subject) || !reflect.DeepEqual(session, captured.Session) || !matchesSession || managedPrepareServerOrigin(server) == "" {
 			return nil, ErrManagedEndpointPrepareRejected
 		}
 		ctx := context.Background()
@@ -155,19 +216,8 @@ func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWork
 		if d.nativeWorkers[token.instanceID] != token.link || token.link.proxy != p || token.link.conn != captured.Socket || p.connection != native || !sameManagedPrepareOwnership(token.link.ownership, ownership) || d.curConn != captured.Socket || d.nativeConn != native || native.session == nil || !reflect.DeepEqual(*native.session, session) || managedPrepareServerOrigin(native.serverURL) != managedPrepareServerOrigin(server) || native.hostID != session.HostID || native.bootID != session.BootID {
 			return release, ErrManagedEndpointPrepareRetryable
 		}
-		if !d.DirectManagedSourcePrepareEnabled || !d.DirectManagedSourcePoPEnabled || !d.DirectManagedSourceCredentialEnabled || !native.offeredDirectManagedSourcePrepare || !native.offeredDirectManagedSourcePoP || native.offeredDirectManagedSourceCredential != transport.DirectManagedSourceCredentialProtocol {
+		if !protocolValid(native, session) {
 			return release, ErrManagedEndpointPrepareRejected
-		}
-		for _, required := range []string{transport.DirectManagedSourcePrepareProtocol, transport.DirectManagedSourcePoPProtocol, transport.DirectManagedSourceCredentialProtocol} {
-			count := 0
-			for _, feature := range session.ProtocolFeatures {
-				if feature == required {
-					count++
-				}
-			}
-			if count != 1 {
-				return release, ErrManagedEndpointPrepareRejected
-			}
 		}
 		for _, done := range []<-chan struct{}{p.done, native.closed, lane.done} {
 			select {
@@ -177,7 +227,7 @@ func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWork
 			}
 		}
 		now := time.Now()
-		if now.Before(issue.IssuedAt) || !now.Before(issue.InstallExpiresAt) || !now.Before(issue.CredentialExpiresAt) || !now.Before(issue.BudgetExpiresAt) || !now.Before(subject.ExpiresAt) {
+		if now.Before(issuedAt) || !now.Before(installExpiresAt) || !now.Before(credentialExpiresAt) || !now.Before(budgetExpiresAt) || !now.Before(subject.ExpiresAt) {
 			return release, ErrManagedEndpointPrepareRejected
 		}
 		return release, nil

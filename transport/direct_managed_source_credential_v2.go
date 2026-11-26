@@ -29,6 +29,16 @@ type DirectManagedSourceCredentialPoPReceiptV2 struct {
 	ProofDigest    string    `json:"proofDigest"`
 }
 
+// NewDirectManagedSourceCredentialPoPReceiptV2 binds canonical V2 proof bytes
+// using the V2 proof domain. It does not authenticate or accept the proof.
+func NewDirectManagedSourceCredentialPoPReceiptV2(proof DirectManagedSourcePoPProofV2) (DirectManagedSourceCredentialPoPReceiptV2, error) {
+	raw, err := proof.CanonicalBytes()
+	if err != nil {
+		return DirectManagedSourceCredentialPoPReceiptV2{}, err
+	}
+	return DirectManagedSourceCredentialPoPReceiptV2{proof.ChallengeID, proof.TranscriptHash, managedEndpointDigest("pagnet/direct-managed-source-host-custody-pop/proof/v2/", raw)}, nil
+}
+
 // DirectManagedSourceCredentialIssueV2 carries public installation evidence only. The
 // caller authenticates the issuer and compares all retained authorization,
 // budget, channel and host state before using the derivation helpers. The issuer
@@ -105,14 +115,14 @@ func DecodeDirectManagedSourceCredentialIssueV2(raw []byte) (DirectManagedSource
 // from p; the protocol, suite, PoP and receipt are filled by this constructor.
 func NewDirectManagedSourceCredentialIssueV2(p DirectManagedSourceCredentialIssueV2, pop DirectManagedSourcePoPChallengeV2, proof DirectManagedSourcePoPProofV2) (DirectManagedSourceCredentialIssueV2, error) {
 	raw, err := pop.CanonicalBytes()
-	proofRaw, proofErr := proof.CanonicalBytes()
+	receipt, proofErr := NewDirectManagedSourceCredentialPoPReceiptV2(proof)
 	if err != nil || proofErr != nil || proof.ChallengeID != pop.ChallengeID || proof.TranscriptHash != managedEndpointDigest("pagnet/direct-managed-source-host-custody-pop/transcript/v2/", raw) {
 		return DirectManagedSourceCredentialIssueV2{}, errDirectManagedSourceBinding
 	}
 	p.ProtocolVersion = DirectManagedSourceCredentialProtocolV2
 	p.Suite = DirectManagedSourceCredentialSuiteV2
 	p.PoP = pop
-	p.PoPReceipt = DirectManagedSourceCredentialPoPReceiptV2{proof.ChallengeID, proof.TranscriptHash, managedEndpointDigest("pagnet/direct-managed-source-host-custody-pop/proof/v2/", proofRaw)}
+	p.PoPReceipt = receipt
 	canonical, err := p.CanonicalBytes()
 	if err != nil {
 		return DirectManagedSourceCredentialIssueV2{}, err

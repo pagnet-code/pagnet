@@ -61,6 +61,10 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 	if err != nil {
 		return err
 	}
+	serverURL := d.nativeServerURL()
+	if (d.DirectManagedSourceV2Enabled || d.ManagedDirectCredentialEnabled) && (serverURL == "" || serverURL != c.serverURL) {
+		return ErrNativeObservationConflict
+	}
 	expected, err := nativeRecoveryIdentity(p)
 	if err != nil {
 		return err
@@ -81,7 +85,7 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 		expected.FenceBoot = current
 		local, lookupErr := d.nativeRegistry.Lookup(p.InstanceID)
 		if lookupErr == nil {
-			if local.Scope.HostID != session.HostID || local.Scope.TenantID != session.TenantID || local.Scope.AccountID != session.AccountID || local.Scope.ServerURL != d.ServerURL {
+			if local.Scope.HostID != session.HostID || local.Scope.TenantID != session.TenantID || local.Scope.AccountID != session.AccountID || local.Scope.ServerURL != serverURL {
 				return ErrNativeObservationConflict
 			}
 			expected.LocalGeneration = local.Scope.Generation
@@ -114,7 +118,7 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 	}
 	priorLaunchEnabled := slices.Contains(session.ProtocolFeatures, transport.NativeWorkerPriorLaunchBootRecoveryProtocol)
 	if priorLaunchEnabled && record.Phase == "prepared" {
-		record, err = d.nativeRegistry.preparePriorLaunchBootProof(record, d.ServerURL, readBoot)
+		record, err = d.nativeRegistry.preparePriorLaunchBootProof(record, serverURL, readBoot)
 		if err != nil {
 			return err
 		}

@@ -38,6 +38,8 @@ type NativeObservationConnection struct {
 	offeredSnapshotSigningPublicKey      string
 	offeredManagedEndpointPrepare        bool
 	offeredManagedEndpointPoP            bool
+	offeredManagedDirectCredential       bool
+	offeredDirectManagedSourceV2         [3]string
 	offeredDirectManagedSourcePrepare    bool
 	offeredDirectManagedSourcePoP        bool
 	offeredDirectManagedSourceCredential string
@@ -110,6 +112,24 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 			return ErrNativeObservationConflict
 		}
 	}
+	if c.session != nil {
+		if len(c.session.ProtocolFeatures) != len(p.ProtocolFeatures) {
+			return ErrNativeObservationConflict
+		}
+		features := make(map[string]int, len(c.session.ProtocolFeatures))
+		for _, feature := range c.session.ProtocolFeatures {
+			features[feature]++
+		}
+		for _, feature := range p.ProtocolFeatures {
+			if features[feature] == 0 {
+				return ErrNativeObservationConflict
+			}
+			features[feature]--
+		}
+	}
+	if !c.validDirectManagedSourceSelection(p.ProtocolFeatures) {
+		return ErrNativeObservationConflict
+	}
 	managedPrepareFeatures := 0
 	for _, feature := range p.ProtocolFeatures {
 		if feature == transport.ManagedEndpointPrepareProtocol {
@@ -126,6 +146,15 @@ func (c *NativeObservationConnection) Admit(p transport.HostSessionPayload) erro
 		}
 	}
 	if managedPoPFeatures > 1 || (managedPoPFeatures == 1 && (!c.offeredManagedEndpointPoP || managedPrepareFeatures != 1)) {
+		return ErrNativeObservationConflict
+	}
+	managedCredentialFeatures := 0
+	for _, feature := range p.ProtocolFeatures {
+		if feature == transport.ManagedDirectCredentialProtocol {
+			managedCredentialFeatures++
+		}
+	}
+	if managedCredentialFeatures > 1 || (managedCredentialFeatures == 1 && (!c.offeredManagedDirectCredential || managedPrepareFeatures != 1 || managedPoPFeatures != 1)) {
 		return ErrNativeObservationConflict
 	}
 	sourcePrepareFeatures, sourcePoPFeatures := 0, 0
