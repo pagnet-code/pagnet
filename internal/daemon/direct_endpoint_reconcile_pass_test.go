@@ -33,23 +33,28 @@ type reconcilePassFixture struct {
 }
 type reconcilePassFakeClient struct {
 	*reconcileObservationReader
-	fixture           *reconcilePassFixture
-	accept            bool
-	publishErr        error
-	badResponse       bool
-	onPublish         func(context.Context)
-	publications      [][]byte
-	verifiers         []string
-	challenges        [][]byte
-	challengeErr      error
-	rejectChallenge   bool
-	challengeResponse func(transport.DirectChannelReadinessChallengeV2) transport.DirectChannelReadinessChallengeV2
-	onChallenge       func(context.Context)
-	proofs            [][]byte
-	proveErr          error
-	rejectProof       bool
-	proofResponse     func(transport.DirectChannelReadinessProofV2) transport.DirectChannelReadinessProofV2
-	onProve           func(context.Context)
+	fixture            *reconcilePassFixture
+	accept             bool
+	publishErr         error
+	badResponse        bool
+	onPublish          func(context.Context)
+	publications       [][]byte
+	verifiers          []string
+	challenges         [][]byte
+	challengeErr       error
+	rejectChallenge    bool
+	challengeResponse  func(transport.DirectChannelReadinessChallengeV2) transport.DirectChannelReadinessChallengeV2
+	onChallenge        func(context.Context)
+	proofs             [][]byte
+	proveErr           error
+	rejectProof        bool
+	proofResponse      func(transport.DirectChannelReadinessProofV2) transport.DirectChannelReadinessProofV2
+	onProve            func(context.Context)
+	activations        []directhttp.Activation
+	activationErr      error
+	rejectActivation   bool
+	activationResponse func(directhttp.Activation) directhttp.Activation
+	onActivate         func(context.Context)
 }
 
 func (c *reconcilePassFakeClient) Publish(ctx context.Context, credential, intent string, p transport.DirectChannelPublicationV2, verifier string) (transport.DirectChannelPublicationV2, error) {
@@ -660,4 +665,75 @@ func (c *reconcilePassFakeClient) Prove(ctx context.Context, credential, intent 
 		proof = c.proofResponse(proof)
 	}
 	return proof, nil
+}
+
+func (c *reconcilePassFakeClient) Activate(ctx context.Context, credential, intent string) (directhttp.Activation, error) {
+	if err := c.record("activate", credential, intent); err != nil {
+		return directhttp.Activation{}, err
+	}
+	row, err := readPassJournal(c.fixture.f.d.nativeRegistry)
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	defer clear(row.Root)
+	attempt := row.Attempts["activation"]
+	if !row.PublicationObserved || len(row.Proof) == 0 || row.ProofReceivedAt == "" || len(row.Activation) != 0 || attempt.Count != attempt.Recovered+1 {
+		c.t.Error("activation dispatched without committed proof receipt and authorization")
+	}
+	if c.enrollment.Proof == nil || row.ProofReceivedAt != c.enrollment.Proof.ReceivedAt.UTC().Format(time.RFC3339Nano) {
+		c.t.Error("activation did not use authenticated original proof receipt")
+	}
+	publication, err := transport.DecodeDirectChannelPublicationV2(row.Publication)
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	challenge, err := transport.DecodeDirectChannelReadinessChallengeV2(row.Challenge)
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	proof, err := transport.DecodeDirectChannelReadinessProofV2(row.Proof)
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	received, err := time.Parse(time.RFC3339Nano, row.ProofReceivedAt)
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	material := &directchannelcrypto.Material{Hash: c.fixture.binding.DescriptorHash}
+	copy(material.Key[:], row.Root)
+	readiness, err := material.ReadinessKey()
+	material.Clear()
+	if err != nil {
+		return directhttp.Activation{}, err
+	}
+	verifyErr := transport.VerifyDirectChannelReadinessProofV2(publication, challenge, proof, readiness, received)
+	clear(readiness)
+	if verifyErr != nil {
+		c.t.Error("activation used invalid historical proof")
+		return directhttp.Activation{}, verifyErr
+	}
+	if err := checkPassHTTPUnlocked(ctx, c.fixture.f); err != nil {
+		c.t.Error("activation held local locks")
+		return directhttp.Activation{}, err
+	}
+	expiry, _ := time.Parse(time.RFC3339Nano, c.fixture.binding.Descriptor.ExpiresAt)
+	if deadline, ok := ctx.Deadline(); !ok || deadline.After(expiry) {
+		c.t.Error("activation deadline exceeds descriptor authority")
+	}
+	value := directhttp.Activation{ChannelID: c.enrollment.Authority.ChannelID, ActivatedAt: time.Now().UTC(), ExpiresAt: expiry}
+	if c.activationResponse != nil {
+		value = c.activationResponse(value)
+	}
+	c.activations = append(c.activations, value)
+	if c.onActivate != nil {
+		c.onActivate(ctx)
+	}
+	if !c.rejectActivation {
+		c.enrollment.Activation = &directhttp.EnrollmentActivation{ActivatedAt: value.ActivatedAt, ExpiresAt: value.ExpiresAt}
+		c.enrollment.ObservedAt = time.Now().UTC()
+	}
+	if c.activationErr != nil {
+		return directhttp.Activation{}, c.activationErr
+	}
+	return value, nil
 }
