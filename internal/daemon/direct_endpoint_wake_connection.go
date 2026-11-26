@@ -258,6 +258,13 @@ func (c *directEndpointWakeConnection) removeLocked(entry *directEndpointWakeAtt
 	}
 	delete(c.byHandle, entry.handle)
 	delete(c.byID, entry.subscription.SubscriptionID)
+	// Local revocation may beat its Done watcher and a queued writer's final
+	// guard. Preserve that cancellation outcome regardless of scheduling.
+	select {
+	case <-entry.handle.Done():
+		err = context.Canceled
+	default:
+	}
 	entry.err = err
 	entry.cancel()
 	if unsubscribe && entry.subscribeStarted && !entry.unsubscribeQueued {
