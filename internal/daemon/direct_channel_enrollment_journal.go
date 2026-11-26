@@ -354,6 +354,7 @@ func (j *directEnrollmentJournal) lockedWithContext(ctx context.Context, bounded
 			return errDirectEnrollment
 		}
 		key := make([]byte, 32)
+		defer clear(key)
 		if _, e = rand.Read(key); e != nil {
 			return e
 		}
@@ -377,11 +378,11 @@ func (j *directEnrollmentJournal) lockedWithContext(ctx context.Context, bounded
 		return e
 	}
 	key, e := io.ReadAll(io.LimitReader(keyfile, 33))
+	defer clear(key)
 	keyfile.Close()
 	if e != nil || len(key) != 32 {
 		return errDirectEnrollment
 	}
-	defer clear(key)
 	if _, e = c.ExecContext(ctx, `INSERT OR IGNORE INTO native_registry_metadata(name,value) VALUES('direct_enrollment_mac_initialized','1')`); e != nil {
 		return e
 	}
@@ -423,6 +424,12 @@ func (j *directEnrollmentJournal) applyContext(ctx context.Context, s *DirectEnd
 }
 func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
 	var result directEnrollmentRecord
+	transferred := false
+	defer func() {
+		if !transferred {
+			clear(result.Root)
+		}
+	}()
 	if b.validate() != nil || s == nil {
 		return result, errDirectEnrollment
 	}
@@ -437,6 +444,7 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 		}
 		var raw, mac []byte
 		e := c.QueryRowContext(ctx, `SELECT CASE WHEN length(payload)<=65536 THEN payload ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1 WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&raw, &mac)
+		defer clear(raw)
 		exists := e == nil
 		if e != nil && !errors.Is(e, sql.ErrNoRows) {
 			return e
@@ -452,11 +460,13 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 			return errDirectEnrollment
 		}
 		var row directEnrollmentRecord
+		defer func() { clear(row.Root) }()
 		if exists {
 			if len(raw) > directEnrollmentMaxBytes || !hmac.Equal(mac, enrollmentMAC(key, b, raw)) || json.Unmarshal(raw, &row) != nil {
 				return errDirectEnrollment
 			}
 			canonical, _ := json.Marshal(row)
+			defer clear(canonical)
 			binding, _ := json.Marshal(row.Binding)
 			expected, _ := json.Marshal(b)
 			if !bytes.Equal(raw, canonical) || !bytes.Equal(binding, expected) || row.validate() != nil {
@@ -486,8 +496,9 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 		if row.validate() != nil {
 			return errDirectEnrollment
 		}
-		raw, e = json.Marshal(row)
-		if e != nil || len(raw) > directEnrollmentMaxBytes {
+		payload, e := json.Marshal(row)
+		defer clear(payload)
+		if e != nil || len(payload) > directEnrollmentMaxBytes {
 			return errDirectEnrollment
 		}
 		if !hasFence {
@@ -495,7 +506,7 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 				return e
 			}
 		}
-		if _, e = c.ExecContext(ctx, `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, raw, enrollmentMAC(key, b, raw)); e != nil {
+		if _, e = c.ExecContext(ctx, `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, payload, enrollmentMAC(key, b, payload)); e != nil {
 			return e
 		}
 		if bounded {
@@ -506,6 +517,7 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 			return errDirectEnrollment
 		}
 		result = row
+		result.Root = bytes.Clone(row.Root)
 		return nil
 	})
 	if err != nil {
@@ -517,6 +529,8 @@ func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded 
 		}
 		return directEnrollmentRecord{}, errDirectEnrollment
 	}
+	// Transfer the caller-owned root only after transaction and cleanup succeed.
+	transferred = true
 	return result, nil
 }
 func (j *directEnrollmentJournal) matches(s *DirectEndpointSubscription, b directEnrollmentBinding) bool {
