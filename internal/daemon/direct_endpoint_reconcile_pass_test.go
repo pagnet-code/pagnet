@@ -5,6 +5,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/directchannelcrypto"
 	"github.com/pagnet-code/pagnet/internal/directhttp"
 	"github.com/pagnet-code/pagnet/transport"
@@ -31,13 +33,18 @@ type reconcilePassFixture struct {
 }
 type reconcilePassFakeClient struct {
 	*reconcileObservationReader
-	fixture      *reconcilePassFixture
-	accept       bool
-	publishErr   error
-	badResponse  bool
-	onPublish    func(context.Context)
-	publications [][]byte
-	verifiers    []string
+	fixture           *reconcilePassFixture
+	accept            bool
+	publishErr        error
+	badResponse       bool
+	onPublish         func(context.Context)
+	publications      [][]byte
+	verifiers         []string
+	challenges        [][]byte
+	challengeErr      error
+	rejectChallenge   bool
+	challengeResponse func(transport.DirectChannelReadinessChallengeV2) transport.DirectChannelReadinessChallengeV2
+	onChallenge       func(context.Context)
 }
 
 func (c *reconcilePassFakeClient) Publish(ctx context.Context, credential, intent string, p transport.DirectChannelPublicationV2, verifier string) (transport.DirectChannelPublicationV2, error) {
@@ -106,7 +113,11 @@ func checkPassHTTPUnlocked(ctx context.Context, f *reconcileOperationFixture) er
 		return errDirectEndpointLocalBusy
 	}
 	registry.mu.Unlock()
-	for _, name := range []string{"registry.custody.lock", filepath.Join(nativeDirectManagedSourceKeyNamespaceV2, "holder.lock"), filepath.Join(directEnrollmentNamespace, "holder.lock")} {
+	namespace := nativeDirectManagedSourceKeyNamespaceV2
+	if f.role == "P" {
+		namespace = nativeManagedEndpointKeyNamespace
+	}
+	for _, name := range []string{"registry.custody.lock", filepath.Join(namespace, "holder.lock"), filepath.Join(directEnrollmentNamespace, "holder.lock")} {
 		file, err := os.OpenFile(filepath.Join(registry.root, name), os.O_RDWR, 0)
 		if err != nil {
 			return err
@@ -183,10 +194,10 @@ func TestDirectReconcilePassSourcePublicationAndRecovery(t *testing.T) {
 	}
 	f.client.calls = nil
 	state, err = f.run(t.Context())
-	if err != nil || state != directReconcilePublicationObserved {
+	if err != nil || state != directReconcileChallengeRequested {
 		t.Fatalf("source recovery: %s %v", state, err)
 	}
-	if !reflect.DeepEqual(f.client.calls, []string{"descriptor", "enrollment", "publication"}) || len(f.client.publications) != 1 {
+	if !reflect.DeepEqual(f.client.calls, []string{"descriptor", "enrollment", "publication", "challenge"}) || len(f.client.publications) != 1 {
 		t.Fatal("source recovery repeated PUT")
 	}
 	recovered, err := readPassJournal(f.f.d.nativeRegistry)
@@ -228,7 +239,7 @@ func TestDirectReconcilePassTarget(t *testing.T) {
 	}
 	f.client.enrollment = publishedEnrollment(f.client.enrollment, wire)
 	state, err = f.run(t.Context())
-	if err != nil || state != directReconcilePublicationObserved {
+	if err != nil || state != directReconcileChallengeRequested {
 		t.Fatalf("target accept: %s %v", state, err)
 	}
 	row, err := readPassJournal(f.f.d.nativeRegistry)
@@ -299,7 +310,7 @@ func TestDirectReconcilePassUnknownPublish(t *testing.T) {
 				t.Fatal(err)
 			}
 			if committed {
-				if state != directReconcilePublicationObserved || len(f.client.publications) != 1 {
+				if state != directReconcileChallengeRequested || len(f.client.publications) != 1 {
 					t.Fatal("accepted publication was retried")
 				}
 			} else {
@@ -523,4 +534,55 @@ func TestDirectReconcilePassExpiryDuringDispatchCommit(t *testing.T) {
 	if row.Attempts["publication"].Count != 1 || row.Attempts["publication"].Recovered != 0 || len(row.Root) != 32 || row.PublicationObserved {
 		t.Fatal("expiry did not retain exact durable dispatch attempt")
 	}
+}
+
+func passReadinessChallenge(b directEndpointReconcileBinding, publication []byte, role string, issued time.Time) transport.DirectChannelReadinessChallengeV2 {
+	local := b.Descriptor.S
+	if role == "P" {
+		local = b.Descriptor.P
+	}
+	channel, _ := transport.DirectChannelIDV2(b.Descriptor)
+	publicationHash := sha256.Sum256(publication)
+	expires := issued.Add(30 * time.Second)
+	descriptorExpiry, _ := time.Parse(time.RFC3339Nano, b.Descriptor.ExpiresAt)
+	if expires.After(descriptorExpiry) {
+		expires = descriptorExpiry
+	}
+	return transport.DirectChannelReadinessChallengeV2{Domain: transport.DirectChannelDomainV2 + "/proof", ChallengeID: string(domain.NewID()), Role: role, PrincipalID: local.PrincipalID, EndpointID: local.EndpointID, CredentialID: local.CredentialID, ChannelID: channel, ParentGrantID: b.Descriptor.ParentGrantID, GrantGeneration: b.Descriptor.GrantGeneration, ChannelGeneration: b.Descriptor.ChannelGeneration, DirectIntentID: b.Descriptor.DirectIntentID, DescriptorHash: base64.RawURLEncoding.EncodeToString(b.DescriptorHash[:]), PublicationHash: base64.RawURLEncoding.EncodeToString(publicationHash[:]), EpochID: b.Descriptor.EpochID, Nonce: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32)), IssuedAt: issued.UTC().Format(time.RFC3339Nano), ExpiresAt: expires.UTC().Format(time.RFC3339Nano)}
+}
+func (c *reconcilePassFakeClient) Challenge(ctx context.Context, credential, intent string) (transport.DirectChannelReadinessChallengeV2, error) {
+	if err := c.record("challenge", credential, intent); err != nil {
+		return transport.DirectChannelReadinessChallengeV2{}, err
+	}
+	row, err := readPassJournal(c.fixture.f.d.nativeRegistry)
+	if err != nil {
+		return transport.DirectChannelReadinessChallengeV2{}, err
+	}
+	defer clear(row.Root)
+	attempt := row.Attempts["challenge"]
+	if !row.PublicationObserved || attempt.Count != attempt.Recovered+1 || len(row.Challenge) != 0 || len(row.Proof) != 0 || row.ProofReceivedAt != "" {
+		c.t.Error("challenge dispatched without committed absence authorization")
+	}
+	if err := checkPassHTTPUnlocked(ctx, c.fixture.f); err != nil {
+		c.t.Error("challenge held local locks")
+		return transport.DirectChannelReadinessChallengeV2{}, err
+	}
+	challenge := passReadinessChallenge(c.fixture.binding, row.Publication, c.role, time.Now())
+	if c.challengeResponse != nil {
+		challenge = c.challengeResponse(challenge)
+	}
+	raw, _ := challenge.CanonicalBytes()
+	c.challenges = append(c.challenges, bytes.Clone(raw))
+	if c.onChallenge != nil {
+		c.onChallenge(ctx)
+	}
+	if !c.rejectChallenge {
+		hash := sha256.Sum256(raw)
+		c.enrollment.Challenge = &directhttp.EnrollmentChallenge{Challenge: challenge, TranscriptHash: base64.RawURLEncoding.EncodeToString(hash[:])}
+		c.enrollment.ObservedAt = time.Now()
+	}
+	if c.challengeErr != nil {
+		return transport.DirectChannelReadinessChallengeV2{}, c.challengeErr
+	}
+	return challenge, nil
 }

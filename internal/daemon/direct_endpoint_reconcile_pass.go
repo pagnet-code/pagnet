@@ -23,12 +23,15 @@ const (
 	directReconcileAwaitingPublication  directEndpointReconcilePassState = "awaiting_publication"
 	directReconcilePublicationObserved  directEndpointReconcilePassState = "publication_observed"
 	directReconcilePublicationPublished directEndpointReconcilePassState = "publication_published"
+	directReconcileChallengeRequested   directEndpointReconcilePassState = "challenge_requested"
+	directReconcileChallengeObserved    directEndpointReconcilePassState = "challenge_observed"
 )
 
 type directEndpointReconcilePass func(context.Context) (directEndpointReconcilePassState, error)
 type directEndpointReconcilePassClient interface {
 	directEndpointReconcileReader
 	Publish(context.Context, string, string, transport.DirectChannelPublicationV2, string) (transport.DirectChannelPublicationV2, error)
+	Challenge(context.Context, string, string) (transport.DirectChannelReadinessChallengeV2, error)
 }
 
 func newDirectSourceReconcilePass(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2) (directEndpointReconcilePass, error) {
@@ -103,7 +106,8 @@ func directReconcilePassClient(origin string, client directEndpointReconcilePass
 }
 
 // Each invocation starts with accepted authenticated GET evidence and performs
-// at most one PUT. There is no scheduler, activation hook or automatic retry.
+// at most one remote mutation (PUT or POST). There is no scheduler, activation
+// hook or automatic retry.
 func newDirectReconcilePass(s *DirectEndpointSubscription, registry *NativeWorkerRegistry, origin, credentialID, intent, role string, observe directEndpointReconcileObserver, operate directEndpointMaterialOperation, client directEndpointReconcilePassClient, now func() time.Time) directEndpointReconcilePass {
 	var active sync.Mutex
 	return func(ctx context.Context) (state directEndpointReconcilePassState, err error) {
@@ -151,6 +155,9 @@ func newDirectReconcilePass(s *DirectEndpointSubscription, registry *NativeWorke
 		if err := s.operationCurrentContextError(passctx); err != nil {
 			return "", err
 		}
+		if (observed.Enrollment.Challenge == nil && (observed.Enrollment.Proof != nil || observed.Enrollment.Activation != nil)) || (observed.Enrollment.PublicationHash == nil && observed.Enrollment.Challenge != nil) || (observed.Enrollment.Activation != nil && observed.Enrollment.Proof == nil) {
+			return "", errDirectEndpointReconcileBinding
+		}
 		if role == "P" && observed.Enrollment.PublicationHash == nil {
 			return directReconcileAwaitingPublication, nil
 		}
@@ -191,7 +198,8 @@ func newDirectReconcilePass(s *DirectEndpointSubscription, registry *NativeWorke
 			if err := s.operationCurrentContextError(workctx); err != nil {
 				return "", err
 			}
-			return directReconcilePublicationObserved, nil
+			material.Clear()
+			return reconcileDirectReadinessChallenge(workctx, s, registry, observed, wire, binding, row, credentialID, intent, role, client, now, operate)
 		}
 		readiness, err := material.ReadinessKey()
 		if err != nil {
@@ -264,7 +272,7 @@ func publishDirectReconcilePublication(ctx context.Context, s *DirectEndpointSub
 			invoked = true
 			response, err := client.Publish(opctx, credential, intent, publication, verifier)
 			if err != nil {
-				return sanitizeDirectReconcilePublishError(err)
+				return sanitizeDirectReconcileMutationError(err)
 			}
 			responseBytes, err := response.CanonicalBytes()
 			if err != nil || !bytes.Equal(responseBytes, wire) {
@@ -298,7 +306,7 @@ func publishDirectReconcilePublication(ctx context.Context, s *DirectEndpointSub
 	}
 	return directReconcilePublicationPublished, nil
 }
-func sanitizeDirectReconcilePublishError(err error) error {
+func sanitizeDirectReconcileMutationError(err error) error {
 	var wire *directhttp.Error
 	if errors.As(err, &wire) {
 		switch wire.Kind {
