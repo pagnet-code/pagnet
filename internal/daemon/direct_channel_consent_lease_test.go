@@ -288,3 +288,38 @@ func TestDirectConsentLeaseRegistrationCleanup(t *testing.T) {
 		})
 	}
 }
+
+func TestDirectConsentLeaseConcurrentRegistrationSessionCopy(t *testing.T) {
+	f := newConsentLeaseFixture(t)
+	if len(f.captured.Session.ProtocolFeatures) == 0 {
+		t.Fatal("fixture requires nonempty protocol features")
+	}
+	feature := f.captured.Session.ProtocolFeatures[0]
+	const workers = 16
+	start := make(chan struct{})
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			for j := 0; j < 16; j++ {
+				if err := f.register(t.Context(), f.sub, 1); err != nil && !errors.Is(err, errDirectEndpointLocalBusy) {
+					results <- err
+					return
+				}
+			}
+			results <- nil
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	if f.captured.Session.ProtocolFeatures[0] != feature {
+		t.Fatal("registration changed caller session")
+	}
+	if err := f.register(t.Context(), f.sub, 1); err != nil {
+		t.Fatal(err)
+	}
+}

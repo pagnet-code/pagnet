@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 type directChannelConsentLeaseKey struct {
@@ -41,9 +43,11 @@ func (d *Daemon) registerDirectChannelConsentLease(ctx context.Context, store *d
 	}
 	// Own caller-provided slices before retaining or validating any input.
 	raw, err := json.Marshal(captured.Session)
-	if err != nil || json.Unmarshal(raw, &captured.Session) != nil {
+	var session transport.HostSessionPayload
+	if err != nil || json.Unmarshal(raw, &session) != nil {
 		return errDirectChannelConsent
 	}
+	captured.Session = session
 	evidence.DescriptorBytes = append([]byte(nil), evidence.DescriptorBytes...)
 	leaseKey := directChannelConsentLeaseKey{store.installation, key}
 	registered := false
