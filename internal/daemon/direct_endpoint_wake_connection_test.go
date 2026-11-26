@@ -186,6 +186,7 @@ func wakeAttachmentFixture(t *testing.T, source bool) (*Daemon, *directEndpointW
 	socket := new(websocket.Conn)
 	d.curConn, d.nativeConn = socket, native
 	lane := newDirectEndpointWakeConnection(d, socket, native)
+	lane.write = func(time.Time, []byte) error { return nil }
 	raw, err := json.Marshal(session)
 	if err != nil {
 		t.Fatal(err)
@@ -205,7 +206,7 @@ func dormantWakeReconcile(context.Context) error {
 	panic("local wake attachment invoked reconciliation")
 }
 
-func TestDirectEndpointWakeAttachInert(t *testing.T) {
+func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
 	for _, source := range []bool{false, true} {
 		t.Run(map[bool]string{true: "source", false: "target"}[source], func(t *testing.T) {
 			_, lane, handle := wakeAttachmentFixture(t, source)
@@ -407,6 +408,7 @@ func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	}
 	socket := new(websocket.Conn)
 	next := newDirectEndpointWakeConnection(d, socket, native)
+	next.write = func(time.Time, []byte) error { return nil }
 	defer next.close()
 	defer native.Close()
 	d.connMu.Lock()
