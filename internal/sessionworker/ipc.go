@@ -23,8 +23,12 @@ import (
 const maxFrame = 1 << 20
 const handshakeTimeout = 5 * time.Second
 
-// ErrControllerCallNotStarted means cancellation prevented any RPC I/O.
+// ErrControllerCallNotStarted means cancellation, contention, or a preflight
+// failure prevented dispatch of any RPC I/O.
 var ErrControllerCallNotStarted = errors.New("controller call not started")
+
+// ErrControllerCallBusy means another call is using the controller connection.
+var ErrControllerCallBusy = errors.New("controller call busy")
 
 type handshake struct {
 	NativeGeneration string `json:"nativeGeneration,omitempty"`
@@ -456,6 +460,50 @@ func (c *Controller) Call(ctx context.Context, req Request) (Response, error) {
 	}
 	_ = c.conn.SetDeadline(deadline)
 	if err := writeFrame(c.conn, req); err != nil {
+		_ = c.conn.Close()
+		return Response{}, err
+	}
+	var response Response
+	err := readFrame(c.conn, &response)
+	if err != nil {
+		_ = c.conn.Close()
+	}
+	_ = c.conn.SetDeadline(time.Time{})
+	return response, err
+}
+
+// CallEndpoint rejects busy or invalid calls before dispatch so callers can
+// safely distinguish them from requests that may have reached the worker.
+func (c *Controller) CallEndpoint(ctx context.Context, req Request) (Response, error) {
+	if err := ctx.Err(); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	if !c.mu.TryLock() {
+		if err := ctx.Err(); err != nil {
+			return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+		}
+		return Response{}, errors.Join(ErrControllerCallNotStarted, ErrControllerCallBusy)
+	}
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	var frame bytes.Buffer
+	if err := writeFrame(&frame, req); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	deadline := time.Now().Add(handshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := c.conn.SetDeadline(deadline); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = c.conn.SetDeadline(time.Time{})
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	if _, err := io.Copy(c.conn, &frame); err != nil {
 		_ = c.conn.Close()
 		return Response{}, err
 	}

@@ -15,6 +15,29 @@ import (
 func (c *NativeObservationConnection) NativeWorkerAdmission(scope sessionworker.Scope, networkID, kind string) (sessionworker.Admission, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.nativeWorkerAdmissionLocked(scope, networkID, kind)
+}
+
+// nativeWorkerEndpointAdmission never queues behind connection lifecycle work.
+func (c *NativeObservationConnection) nativeWorkerEndpointAdmission(ctx context.Context, scope sessionworker.Scope, networkID, kind string) (sessionworker.Admission, error) {
+	if err := ctx.Err(); err != nil {
+		return sessionworker.Admission{}, err
+	}
+	if !c.mu.TryLock() {
+		return sessionworker.Admission{}, ErrNativeOriginAdmissionDeferred
+	}
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return sessionworker.Admission{}, err
+	}
+	admission, err := c.nativeWorkerAdmissionLocked(scope, networkID, kind)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return sessionworker.Admission{}, ctxErr
+	}
+	return admission, err
+}
+
+func (c *NativeObservationConnection) nativeWorkerAdmissionLocked(scope sessionworker.Scope, networkID, kind string) (sessionworker.Admission, error) {
 	select {
 	case <-c.closed:
 		return sessionworker.Admission{}, ErrNativeOriginAdmissionDeferred
