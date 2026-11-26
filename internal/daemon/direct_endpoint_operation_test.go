@@ -32,7 +32,9 @@ func newDirectEndpointOperationFixture(t *testing.T, deadline time.Duration) *di
 	t.Helper()
 	keys, issue, d, token, captured := sourceCredentialAuthorityFixtureV2(t)
 	d.ServerURL = "https://example.test"
-	issue.InstallExpiresAt = time.Now().Add(500 * time.Millisecond).UTC()
+	// Keep the setup deadline comfortably ahead under the race detector. Tests
+	// that need an expired installation use the injected key-store clock below.
+	issue.InstallExpiresAt = time.Now().Add(30 * time.Second).UTC()
 	if _, err := keys.InstallCredential(issue, d.ServerURL, captured.Session, directSourceCredentialScopeOKV2, directSourceCredentialFenceOKV2); err != nil {
 		t.Fatal(err)
 	}
