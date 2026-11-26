@@ -13,7 +13,7 @@ import (
 )
 
 func TestNativeSourceLaneDeletionWaitAndCancellation(t *testing.T) {
-	proxy := &NativeWorkerProxy{done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{done: make(chan struct{}), abortDone: make(chan struct{})}
 	entered, release := make(chan struct{}), make(chan struct{})
 	blocked := errors.New("ordinary drain finished")
 	proxy.ordinarySourceAdmission = func() error {
@@ -61,7 +61,7 @@ func TestNativeSourceLaneDurableDeletionFenceSurvivesReconnect(t *testing.T) {
 	}
 	for _, lease := range []string{"original", "reconnected"} {
 		t.Run(lease, func(t *testing.T) {
-			proxy := &NativeWorkerProxy{done: make(chan struct{}), ordinarySourceAdmission: func() error {
+			proxy := &NativeWorkerProxy{done: make(chan struct{}), abortDone: make(chan struct{}), ordinarySourceAdmission: func() error {
 				return registry.ordinarySourceDrainAdmission(scope.InstanceID)
 			}}
 			for range 2 {

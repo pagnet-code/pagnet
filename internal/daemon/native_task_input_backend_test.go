@@ -308,7 +308,7 @@ func proveOriginalTaskInputBridge(t *testing.T, binary, workerBinary string) {
 	if fixture.PrincipalID == "" {
 		t.Fatal("helper must expose authentic public principal")
 	}
-	proxy := &NativeWorkerProxy{connection: b.connection, controller: controllerB, scope: scope, done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{connection: b.connection, controller: controllerB, scope: scope, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{proxy: proxy, conn: b.socket}
 	row := &InstanceRow{InstanceID: fixture.InstanceID, AgentPrincipalID: fixture.PrincipalID, NetworkID: fixture.NetworkID, Kind: "worker", Runtime: fixture.Runtime}
 	control := dialControlSocket(t, filepath.Join(spec.Workspace, "bc-"+strings.ReplaceAll(fixture.InstanceID, "-", "")+".sock"))

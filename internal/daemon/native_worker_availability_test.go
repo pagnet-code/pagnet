@@ -135,7 +135,7 @@ func TestNativeWorkerAvailabilityCurrentProxyOnly(t *testing.T) {
 	c := NewNativeObservationConnection(scope.ServerURL, scope.HostID, "boot", nil)
 	conn := &websocket.Conn{}
 	now := time.Now()
-	old := &NativeWorkerProxy{connection: c, scope: scope, done: make(chan struct{}), snapshotAt: now}
+	old := &NativeWorkerProxy{connection: c, scope: scope, done: make(chan struct{}), abortDone: make(chan struct{}), snapshotAt: now}
 	d := &Daemon{nativeRegistry: r, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: {conn: conn, proxy: old}}}
 	check := func(want string, at time.Time) {
 		t.Helper()
@@ -148,7 +148,7 @@ func TestNativeWorkerAvailabilityCurrentProxyOnly(t *testing.T) {
 	check("unknown", now.Add(10*time.Second+time.Nanosecond))
 	close(old.done)
 	check("unavailable", now)
-	replacement := &NativeWorkerProxy{connection: c, scope: scope, done: make(chan struct{})}
+	replacement := &NativeWorkerProxy{connection: c, scope: scope, done: make(chan struct{}), abortDone: make(chan struct{})}
 	d.nativeWorkers[scope.InstanceID] = &nativeWorkerLink{conn: conn, proxy: replacement}
 	check("unknown", now)
 	// A late observation from the replaced proxy cannot refresh its successor.

@@ -26,6 +26,8 @@ type NativeWorkerProxy struct {
 	profile                             string
 	bootstrap                           sessionworker.Bootstrap
 	done                                chan struct{}
+	abortDone                           chan struct{}
+	abortOnce                           sync.Once
 	publicationMu                       sync.RWMutex
 	closeOnce                           sync.Once
 	reconcileOnce                       sync.Once
@@ -62,7 +64,7 @@ func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnec
 	if err != nil {
 		return nil, err
 	}
-	p := &NativeWorkerProxy{connection: connection, controller: c, scope: expected, profile: sessionworker.NativeProfileFingerprint(b.Native), bootstrap: b, done: make(chan struct{})}
+	p := &NativeWorkerProxy{connection: connection, controller: c, scope: expected, profile: sessionworker.NativeProfileFingerprint(b.Native), bootstrap: b, done: make(chan struct{}), abortDone: make(chan struct{})}
 	if _, err := p.Snapshot(ctx); err != nil {
 		_ = p.Close()
 		return nil, err
@@ -71,19 +73,42 @@ func AttachNativeWorker(ctx context.Context, connection *NativeObservationConnec
 		_ = p.Close()
 		return nil, err
 	}
-	go func() {
-		select {
-		case <-connection.closed:
-			_ = p.Close()
-		case <-p.done:
-		}
-	}()
+	go p.watchLifecycle()
 	return p, nil
+}
+
+// abort signals irreversible loss of the proxy without taking publication locks.
+// Ordered invalidation and controller cleanup remain owned by Close.
+func (p *NativeWorkerProxy) abort() {
+	p.abortOnce.Do(func() { close(p.abortDone) })
+}
+
+func (p *NativeWorkerProxy) aborted() bool {
+	select {
+	case <-p.abortDone:
+		return true
+	default:
+		return false
+	}
+}
+
+// AbortDone exposes the internal abort signal before ordered cleanup completes.
+func (p *NativeWorkerProxy) AbortDone() <-chan struct{} { return p.abortDone }
+
+func (p *NativeWorkerProxy) watchLifecycle() {
+	select {
+	case <-p.connection.closed:
+	case <-p.abortDone:
+	case <-p.done:
+		return
+	}
+	_ = p.Close()
 }
 
 // Close relinquishes the controller and fresh admission, leaving the worker
 // and its independently owned native session running.
 func (p *NativeWorkerProxy) Close() error {
+	p.abort()
 	var err error
 	p.closeOnce.Do(func() {
 		p.publicationMu.Lock()

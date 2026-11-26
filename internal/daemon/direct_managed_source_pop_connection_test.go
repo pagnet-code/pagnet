@@ -78,7 +78,7 @@ func directSourcePoPLaneFixture(t *testing.T, feature bool) (*Daemon, *directMan
 	}
 	executor := &directSourcePoPLaneExecutor{available: true, started: make(chan transport.DirectManagedSourcePoPChallenge, 16), result: proof}
 	d := &Daemon{Config: Config{DirectManagedSourcePrepareEnabled: true, DirectManagedSourcePoPEnabled: true}, directManagedSourcePrepare: &directSourcePrepareLaneExecutor{available: true}, directManagedSourcePoP: executor, curConn: socket, nativeConn: native, writeTimeout: time.Second}
-	proxy := &NativeWorkerProxy{connection: native, done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{connection: native, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{conn: socket, proxy: proxy}
 	d.nativeWorkers = map[string]*nativeWorkerLink{challenge.Prepare.Subject.InstanceID.String(): link}
 	executor.token = &nativeWorkerPublicationToken{instanceID: challenge.Prepare.Subject.InstanceID.String(), link: link, proxy: proxy}

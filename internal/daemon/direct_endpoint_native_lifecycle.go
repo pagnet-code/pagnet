@@ -69,7 +69,10 @@ func (p *NativeWorkerProxy) beginDirectEndpointTransition() {
 }
 
 func (p *NativeWorkerProxy) directEndpointAuthority(subject nativeManagedSubject) (uint64, bool) {
+	if p.aborted() {
+		return 0, false
+	}
 	p.publicationMu.RLock()
 	defer p.publicationMu.RUnlock()
-	return p.directEndpointEpoch, !p.directEndpointTransition && p.directEndpointObserved && p.directEndpointIdentity.matches(subject)
+	return p.directEndpointEpoch, !p.aborted() && !p.directEndpointTransition && p.directEndpointObserved && p.directEndpointIdentity.matches(subject)
 }

@@ -331,10 +331,18 @@ func waitWakeAttachmentRemoved(t *testing.T, lane *directEndpointWakeConnection,
 	case <-time.After(time.Second):
 		t.Fatal("attachment cancellation blocked")
 	}
-	lane.mu.Lock()
-	defer lane.mu.Unlock()
-	if lane.byHandle[entry.handle] != nil || lane.byID[entry.subscription.SubscriptionID] != nil {
-		t.Fatal("cancelled attachment retained")
+	deadline := time.Now().Add(time.Second)
+	for {
+		lane.mu.Lock()
+		removed := lane.byHandle[entry.handle] == nil && lane.byID[entry.subscription.SubscriptionID] == nil
+		lane.mu.Unlock()
+		if removed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled attachment retained")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

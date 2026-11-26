@@ -59,7 +59,7 @@ func newManagedPrepareVerifierFixtureForServer(t *testing.T, server string) *man
 		t.Fatal(err)
 	}
 	socket := &websocket.Conn{}
-	p := &NativeWorkerProxy{connection: c, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Native: spec}, done: make(chan struct{})}
+	p := &NativeWorkerProxy{connection: c, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Native: spec}, done: make(chan struct{}), abortDone: make(chan struct{})}
 	d := &Daemon{state: state, nativeRegistry: keys.registry, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: {conn: socket, proxy: p, ownership: ownership}}}
 	start, err := proc.StartIdentity(os.Getpid())
 	if err != nil {
@@ -150,7 +150,7 @@ func TestManagedPrepareVerifierFencesInFlightChanges(t *testing.T) {
 			case "proxy":
 				f.d.nativeWorkersMu.Lock()
 				old := f.d.nativeWorkers[id]
-				replacement := &NativeWorkerProxy{connection: old.proxy.connection, scope: old.proxy.scope, profile: old.proxy.profile, bootstrap: old.proxy.bootstrap, done: make(chan struct{})}
+				replacement := &NativeWorkerProxy{connection: old.proxy.connection, scope: old.proxy.scope, profile: old.proxy.profile, bootstrap: old.proxy.bootstrap, done: make(chan struct{}), abortDone: make(chan struct{})}
 				f.d.nativeWorkers[id] = &nativeWorkerLink{proxy: replacement, conn: old.conn, ownership: old.ownership}
 				f.d.nativeWorkersMu.Unlock()
 			case "local scope":

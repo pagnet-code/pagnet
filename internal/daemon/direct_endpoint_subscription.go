@@ -46,6 +46,20 @@ type DirectEndpointSubscription struct {
 }
 
 func (s *DirectEndpointSubscription) Done() <-chan struct{} { return s.done }
+
+// AbortDone signals proxy loss independently of ordered subscription cleanup.
+// Partial subscriptions without a proxy have no abort signal.
+func (s *DirectEndpointSubscription) AbortDone() <-chan struct{} {
+	if s == nil || s.binding.proxy == nil {
+		return nil
+	}
+	return s.binding.proxy.AbortDone()
+}
+
+func (s *DirectEndpointSubscription) aborted() bool {
+	return s != nil && s.binding.proxy != nil && s.binding.proxy.aborted()
+}
+
 func (s *DirectEndpointSubscription) Metadata() DirectEndpointSubscriptionMetadata {
 	return s.binding.metadata
 }
@@ -53,12 +67,12 @@ func (s *DirectEndpointSubscription) Metadata() DirectEndpointSubscriptionMetada
 // Valid checks local revocation and deadline only. It does not authorize HTTP
 // or replace fresh fenced current-authority verification before material use.
 func (s *DirectEndpointSubscription) Valid() bool {
-	if s == nil || s.owner == nil {
+	if s == nil || s.owner == nil || s.aborted() {
 		return false
 	}
 	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
-	if _, ok := s.owner.entries[s]; !ok {
+	if _, ok := s.owner.entries[s]; !ok || s.aborted() {
 		return false
 	}
 	if !time.Now().Before(s.binding.metadata.Deadline) {
@@ -87,9 +101,12 @@ type directEndpointSubscriptions struct {
 }
 
 func (o *directEndpointSubscriptions) add(binding directEndpointBinding) *DirectEndpointSubscription {
+	if binding.proxy != nil && binding.proxy.aborted() {
+		return nil
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.closed || !time.Now().Before(binding.metadata.Deadline) {
+	if o.closed || (binding.proxy != nil && binding.proxy.aborted()) || !time.Now().Before(binding.metadata.Deadline) {
 		return nil
 	}
 	if o.entries == nil {
@@ -102,9 +119,12 @@ func (o *directEndpointSubscriptions) add(binding directEndpointBinding) *Direct
 
 // activate runs only after custody transaction completion and its final checks.
 func (o *directEndpointSubscriptions) activate(s *DirectEndpointSubscription) bool {
+	if s.aborted() {
+		return false
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if _, ok := o.entries[s]; !ok {
+	if _, ok := o.entries[s]; !ok || s.aborted() {
 		return false
 	}
 	if !time.Now().Before(s.binding.metadata.Deadline) {

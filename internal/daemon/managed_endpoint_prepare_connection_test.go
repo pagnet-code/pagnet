@@ -122,7 +122,7 @@ func TestManagedEndpointPrepareLaneACKEnvelopeCompatibility(t *testing.T) {
 				errorCode = ""
 			}
 			if success {
-				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{}), abortDone: make(chan struct{})}
 				link := &nativeWorkerLink{conn: lane.socket, proxy: p}
 				lane.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
 				lane.executor.(*managedPrepareLaneExecutor).token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}

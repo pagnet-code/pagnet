@@ -79,13 +79,17 @@ func (s *DirectManagedSourceKeyStoreV2) credentialInput(p transport.DirectManage
 // validateCredentialEvidence reads successful Prepare and exact locally retained
 // PoP evidence in the same SQLite snapshot. It never takes their namespace locks.
 func (s *DirectManagedSourceKeyStoreV2) validateCredentialEvidence(conn *sql.Conn, p transport.DirectManagedSourceCredentialIssueV2, server string) error {
+	return s.validateCredentialEvidenceContext(context.Background(), conn, p, server)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) validateCredentialEvidenceContext(ctx context.Context, conn *sql.Conn, p transport.DirectManagedSourceCredentialIssueV2, server string) error {
 	// Installation has its own deadline. Validate immutable historical Prepare
 	// and PoP evidence without calling live ConfirmPoP or changing the clock.
 	if !s.credentialUseValid(p) {
 		return errDirectManagedSourceKeyV2
 	}
 	var currentInstallation string
-	if err := conn.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&currentInstallation); err != nil || currentInstallation != s.installation.String() {
+	if err := conn.QueryRowContext(ctx, `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&currentInstallation); err != nil || currentInstallation != s.installation.String() {
 		return errDirectManagedSourceKeyV2
 	}
 	request, _ := p.PoP.Prepare.CanonicalBytes()
@@ -93,7 +97,7 @@ func (s *DirectManagedSourceKeyStoreV2) validateCredentialEvidence(conn *sql.Con
 	var bindingID, installationID, origin, expiry, state string
 	var retainedRequest, retainedDigest, retainedACK []byte
 	var keyStarted int
-	err := conn.QueryRowContext(context.Background(), `SELECT binding_id,installation_id,server_url,request,request_digest,expires_at,state,ack,key_started FROM native_direct_managed_source_v2_prepare_commands WHERE command_id=?`, p.PoP.Prepare.CommandID).Scan(&bindingID, &installationID, &origin, &retainedRequest, &retainedDigest, &expiry, &state, &retainedACK, &keyStarted)
+	err := conn.QueryRowContext(ctx, `SELECT binding_id,installation_id,server_url,request,request_digest,expires_at,state,ack,key_started FROM native_direct_managed_source_v2_prepare_commands WHERE command_id=?`, p.PoP.Prepare.CommandID).Scan(&bindingID, &installationID, &origin, &retainedRequest, &retainedDigest, &expiry, &state, &retainedACK, &keyStarted)
 	ack, _ := p.PoP.ACK.CanonicalBytes()
 	if err != nil || bindingID != p.PoP.Prepare.Subject.ID.String() || installationID != s.installation.String() || origin != server || expiry != p.PoP.Prepare.Subject.EnrollmentExpiresAt.Format(time.RFC3339Nano) || state != "succeeded" || keyStarted != 1 || !bytes.Equal(request, retainedRequest) || !bytes.Equal(requestDigest[:], retainedDigest) || !bytes.Equal(ack, retainedACK) || !directManagedSourcePrepareSuccessForScopeV2(retainedACK, p.PoP.Prepare, server, s.installation) {
 		return errDirectManagedSourceKeyV2
@@ -101,7 +105,7 @@ func (s *DirectManagedSourceKeyStoreV2) validateCredentialEvidence(conn *sql.Con
 	var binding, direct, installation string
 	var popRequest, digest, proof []byte
 	var storedProofDigest string
-	if err := conn.QueryRowContext(context.Background(), `SELECT binding_id,direct_intent_id,installation_id,request,request_digest,proof,proof_digest FROM native_direct_managed_source_v2_pop_challenges WHERE challenge_id=?`, p.PoP.ChallengeID).Scan(&binding, &direct, &installation, &popRequest, &digest, &proof, &storedProofDigest); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT binding_id,direct_intent_id,installation_id,request,request_digest,proof,proof_digest FROM native_direct_managed_source_v2_pop_challenges WHERE challenge_id=?`, p.PoP.ChallengeID).Scan(&binding, &direct, &installation, &popRequest, &digest, &proof, &storedProofDigest); err != nil {
 		return errDirectManagedSourceKeyV2
 	}
 	canonical, _ := p.PoP.CanonicalBytes()
@@ -115,12 +119,16 @@ func (s *DirectManagedSourceKeyStoreV2) validateCredentialEvidence(conn *sql.Con
 }
 
 func (s *DirectManagedSourceKeyStoreV2) credentialRow(conn *sql.Conn, p transport.DirectManagedSourceCredentialIssueV2, raw []byte) (DirectManagedSourceCredentialEvidenceV2, bool, error) {
+	return s.credentialRowContext(context.Background(), conn, p, raw)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) credentialRowContext(ctx context.Context, conn *sql.Conn, p transport.DirectManagedSourceCredentialIssueV2, raw []byte) (DirectManagedSourceCredentialEvidenceV2, bool, error) {
 	var result DirectManagedSourceCredentialEvidenceV2
 	var binding, direct, installation string
 	var retained, digest []byte
 	sum := sha256.Sum256(raw)
 	var hash sql.NullString
-	err := conn.QueryRowContext(context.Background(), `SELECT binding_id,direct_intent_id,installation_id,issue,issue_digest,state,credential_hash,ack FROM native_direct_managed_source_v2_credentials WHERE credential_id=?`, p.CredentialID).Scan(&binding, &direct, &installation, &retained, &digest, &result.State, &hash, &result.ACK)
+	err := conn.QueryRowContext(ctx, `SELECT binding_id,direct_intent_id,installation_id,issue,issue_digest,state,credential_hash,ack FROM native_direct_managed_source_v2_credentials WHERE credential_id=?`, p.CredentialID).Scan(&binding, &direct, &installation, &retained, &digest, &result.State, &hash, &result.ACK)
 	if errors.Is(err, sql.ErrNoRows) {
 		return result, false, nil
 	}
@@ -345,20 +353,39 @@ func (s *DirectManagedSourceKeyStoreV2) CredentialEvidence(issue transport.Direc
 }
 
 func (s *DirectManagedSourceKeyStoreV2) withCredentialEvidence(issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) (DirectManagedSourceCredentialEvidenceV2, error) {
+	return s.withCredentialEvidenceContextMode(context.Background(), false, issue, configuredServer, session, verify, fence, use)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) withCredentialEvidenceContext(ctx context.Context, issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) (DirectManagedSourceCredentialEvidenceV2, error) {
+	return s.withCredentialEvidenceContextMode(ctx, true, issue, configuredServer, session, verify, fence, use)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) withCredentialEvidenceContextMode(ctx context.Context, bounded bool, issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) (DirectManagedSourceCredentialEvidenceV2, error) {
+	if bounded {
+		if err := ctx.Err(); err != nil {
+			return DirectManagedSourceCredentialEvidenceV2{}, err
+		}
+	}
 	p, server, raw, err := s.credentialInput(issue, configuredServer, session, verify)
 	if err != nil {
 		return DirectManagedSourceCredentialEvidenceV2{}, err
 	}
+	locked := func(fn func(*sql.Conn, *os.File, *func()) error) error { return s.withKeyLockedScoped(false, fn) }
+	if bounded {
+		locked = func(fn func(*sql.Conn, *os.File, *func()) error) error {
+			return withEndpointMaterialLockedContext(ctx, s.registry, nativeDirectManagedSourceKeyNamespaceV2, fn)
+		}
+	}
 	var result DirectManagedSourceCredentialEvidenceV2
-	err = s.withKeyLockedScoped(false, func(conn *sql.Conn, dir *os.File, release *func()) error {
-		if err := s.validateCredentialEvidence(conn, p, server); err != nil {
+	err = locked(func(conn *sql.Conn, dir *os.File, release *func()) error {
+		if err := s.validateCredentialEvidenceContext(ctx, conn, p, server); err != nil {
 			return err
 		}
-		row, exists, err := s.credentialRow(conn, p, raw)
+		row, exists, err := s.credentialRowContext(ctx, conn, p, raw)
 		if err != nil || !exists || row.State != "installed" {
 			return errDirectManagedSourceKeyV2
 		}
-		private, err := s.loadPoPKey(conn, dir, p.PoP.ACK.Reservation, p.PoP.Prepare)
+		private, err := s.loadPoPKeyContext(ctx, conn, dir, p.PoP.ACK.Reservation, p.PoP.Prepare)
 		defer clear(private)
 		if err != nil {
 			return err
@@ -398,13 +425,28 @@ func (s *DirectManagedSourceKeyStoreV2) withCredentialEvidence(issue transport.D
 		}
 
 		if use != nil {
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			var check func() error
 			*release, check, err = fence(conn)
 			if err != nil || *release == nil || check == nil || !s.credentialUseValid(p) {
 				return errDirectManagedSourceKeyV2
 			}
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if check() != nil {
 				return errDirectManagedSourceKeyV2
+			}
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			useErr := use(endpointMaterial{secret: retained.Secret, private: private})
 			checkErr := check()
@@ -437,6 +479,18 @@ func (s *DirectManagedSourceKeyStoreV2) withDirectManagedSourceEndpointMaterialV
 		return errDirectManagedSourceKeyV2
 	}
 	_, err := s.withCredentialEvidence(issue, configuredServer, session, verify, fence, use)
+	// Callback and filesystem errors must never carry private bytes to callers.
+	if err != nil {
+		return errDirectManagedSourceKeyV2
+	}
+	return nil
+}
+
+func (s *DirectManagedSourceKeyStoreV2) withDirectManagedSourceEndpointMaterialV2Context(ctx context.Context, issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, scope endpointMaterialScope, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+	if s == nil || scope.installation != s.installation || scope.credential != issue.CredentialID || scope.role != "S" || scope.use != endpointMaterialLiveUse || fence == nil || use == nil {
+		return errDirectManagedSourceKeyV2
+	}
+	_, err := s.withCredentialEvidenceContext(ctx, issue, configuredServer, session, verify, fence, use)
 	// Callback and filesystem errors must never carry private bytes to callers.
 	if err != nil {
 		return errDirectManagedSourceKeyV2

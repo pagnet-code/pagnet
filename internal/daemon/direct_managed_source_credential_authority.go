@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"reflect"
 	"strconv"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // directManagedSourceCredentialPublicationLane serializes cancellation with local
@@ -53,7 +56,7 @@ const (
 // consent or budgets.
 func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane) DirectManagedSourceCredentialPublicationFence {
 	return func(conn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, session transport.HostSessionPayload) (func(), error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || conn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || conn == nil || token == nil || token.link == nil || token.proxy == nil || token.proxy.aborted() || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if _, err := issue.CanonicalBytes(); err != nil {
@@ -73,6 +76,14 @@ func (d *Daemon) directManagedSourceCredentialPublicationFenceV2(token *nativeWo
 }
 
 func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane, subject nativeManagedSubject, matchesSession bool, variant directManagedSourceCredentialProtocolVariant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt time.Time) func(*sql.Conn, string, transport.HostSessionPayload) (func(), error) {
+	return d.credentialPublicationFenceContextMode(context.Background(), false, token, captured, lane, subject, matchesSession, variant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt)
+}
+
+func (d *Daemon) credentialPublicationFenceContext(ctx context.Context, token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane, subject nativeManagedSubject, matchesSession bool, variant directManagedSourceCredentialProtocolVariant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt time.Time) func(*sql.Conn, string, transport.HostSessionPayload) (func(), error) {
+	return d.credentialPublicationFenceContextMode(ctx, true, token, captured, lane, subject, matchesSession, variant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt)
+}
+
+func (d *Daemon) credentialPublicationFenceContextMode(ctx context.Context, bounded bool, token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane, subject nativeManagedSubject, matchesSession bool, variant directManagedSourceCredentialProtocolVariant, issuedAt, installExpiresAt, credentialExpiresAt, budgetExpiresAt time.Time) func(*sql.Conn, string, transport.HostSessionPayload) (func(), error) {
 	protocolValid := func(native *NativeObservationConnection, session transport.HostSessionPayload) bool {
 		var required []string
 		switch variant {
@@ -110,13 +121,12 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		return true
 	}
 	return func(registryConn *sql.Conn, server string, session transport.HostSessionPayload) (release func(), err error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || token.proxy.aborted() || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if !reflect.DeepEqual(subject, token.subject) || !reflect.DeepEqual(session, captured.Session) || !matchesSession || managedPrepareServerOrigin(server) == "" {
 			return nil, ErrManagedEndpointPrepareRejected
 		}
-		ctx := context.Background()
 		// The store already owns the registry writer reservation. Never call a
 		// registry API here: its single-connection pool is reserved by this caller.
 		var raw []byte
@@ -142,6 +152,10 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		if err != nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
+		if bounded && ctx.Err() != nil {
+			stateConn.Close()
+			return nil, ErrManagedEndpointPrepareRetryable
+		}
 		var unlocks []func()
 		stateReserved := false
 		busyChanged := false
@@ -149,6 +163,35 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		// On every failed acquisition, unwind before returning; on success the store
 		// owns this release until its own COMMIT/ROLLBACK, including panic unwinding.
 		release = func() {
+			if bounded {
+				// Keep publication authority pinned through independent synchronous
+				// SQL cleanup. An uncertain connection is closed before unlocking.
+				defer func() {
+					for i := len(unlocks) - 1; i >= 0; i-- {
+						unlocks[i]()
+					}
+					unlocks = nil
+				}()
+				cleanup, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+				defer cancel()
+				discard := func() { _ = stateConn.Raw(func(any) error { return driver.ErrBadConn }) }
+				if stateReserved {
+					stateReserved = false
+					if _, err := stateConn.ExecContext(cleanup, "ROLLBACK"); err != nil {
+						discard()
+						stateConn.Close()
+						return
+					}
+				}
+				if busyChanged {
+					busyChanged = false
+					if _, err := stateConn.ExecContext(cleanup, "PRAGMA busy_timeout="+strconv.Itoa(busy)); err != nil {
+						discard()
+					}
+				}
+				stateConn.Close()
+				return
+			}
 			for i := len(unlocks) - 1; i >= 0; i-- {
 				unlocks[i]()
 			}
@@ -175,11 +218,21 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		if err = stateConn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
 			return release, ErrManagedEndpointPrepareRetryable
 		}
+		if bounded {
+			busyChanged = true
+		}
 		if _, err = stateConn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
 			return release, ErrManagedEndpointPrepareRetryable
 		}
 		busyChanged = true
+		if bounded {
+			stateReserved = true
+		}
 		if _, err = stateConn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+			var sqliteErr *sqlite.Error
+			if bounded && errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY || sqliteErr.Code()&0xff == sqlite3.SQLITE_LOCKED) {
+				stateReserved = false
+			}
 			return release, ErrManagedEndpointPrepareRetryable
 		}
 		stateReserved = true
@@ -190,27 +243,45 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		if principal != subject.PrincipalID.String() || runtime != string(domain.RuntimeQwenCode) || profile != record.Profile {
 			return release, ErrManagedEndpointPrepareRejected
 		}
-		for _, lock := range []interface {
-			TryLock() bool
-			Unlock()
-		}{&d.nativeWorkersMu, &token.link.mu} {
-			if !lock.TryLock() {
+		for _, lock := range []*sync.Mutex{&d.nativeWorkersMu, &token.link.mu} {
+			if bounded {
+				unlock, err := directEndpointTryLock(ctx, lock)
+				if err != nil {
+					return release, ErrManagedEndpointPrepareRetryable
+				}
+				unlocks = append(unlocks, unlock)
+			} else {
+				if !lock.TryLock() {
+					return release, ErrManagedEndpointPrepareRetryable
+				}
+				unlocks = append(unlocks, lock.Unlock)
+			}
+		}
+		if bounded {
+			unlock, err := directEndpointTryRLock(ctx, &p.publicationMu)
+			if err != nil {
 				return release, ErrManagedEndpointPrepareRetryable
 			}
-			unlocks = append(unlocks, lock.Unlock)
-		}
-		if !p.publicationMu.TryRLock() {
-			return release, ErrManagedEndpointPrepareRetryable
-		}
-		unlocks = append(unlocks, p.publicationMu.RUnlock)
-		for _, lock := range []interface {
-			TryLock() bool
-			Unlock()
-		}{&d.connMu, &captured.Connection.mu, &lane.mu} {
-			if !lock.TryLock() {
+			unlocks = append(unlocks, unlock)
+		} else {
+			if !p.publicationMu.TryRLock() {
 				return release, ErrManagedEndpointPrepareRetryable
 			}
-			unlocks = append(unlocks, lock.Unlock)
+			unlocks = append(unlocks, p.publicationMu.RUnlock)
+		}
+		for _, lock := range []*sync.Mutex{&d.connMu, &captured.Connection.mu, &lane.mu} {
+			if bounded {
+				unlock, err := directEndpointTryLock(ctx, lock)
+				if err != nil {
+					return release, ErrManagedEndpointPrepareRetryable
+				}
+				unlocks = append(unlocks, unlock)
+			} else {
+				if !lock.TryLock() {
+					return release, ErrManagedEndpointPrepareRetryable
+				}
+				unlocks = append(unlocks, lock.Unlock)
+			}
 		}
 		native := captured.Connection
 		if d.nativeWorkers[token.instanceID] != token.link || token.link.proxy != p || token.link.conn != captured.Socket || p.connection != native || !sameManagedPrepareOwnership(token.link.ownership, ownership) || d.curConn != captured.Socket || d.nativeConn != native || native.session == nil || !reflect.DeepEqual(*native.session, session) || managedPrepareServerOrigin(native.serverURL) != managedPrepareServerOrigin(server) || native.hostID != session.HostID || native.bootID != session.BootID {
@@ -232,6 +303,9 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		now := time.Now()
 		if now.Before(issuedAt) || !now.Before(installExpiresAt) || !now.Before(credentialExpiresAt) || !now.Before(budgetExpiresAt) || !now.Before(subject.ExpiresAt) {
 			return release, ErrManagedEndpointPrepareRejected
+		}
+		if token.proxy.aborted() || (bounded && ctx.Err() != nil) {
+			return release, ErrManagedEndpointPrepareRetryable
 		}
 		return release, nil
 	}

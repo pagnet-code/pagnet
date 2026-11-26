@@ -81,13 +81,17 @@ func (s *ManagedEndpointKeyStore) credentialInput(p transport.ManagedDirectCrede
 // validateCredentialEvidence reads successful Prepare and exact locally retained
 // PoP evidence in the same SQLite snapshot. It never takes their namespace locks.
 func (s *ManagedEndpointKeyStore) validateCredentialEvidence(conn *sql.Conn, p transport.ManagedDirectCredentialIssue, server string) error {
+	return s.validateCredentialEvidenceContext(context.Background(), conn, p, server)
+}
+
+func (s *ManagedEndpointKeyStore) validateCredentialEvidenceContext(ctx context.Context, conn *sql.Conn, p transport.ManagedDirectCredentialIssue, server string) error {
 	// Installation has its own deadline. Validate immutable historical Prepare
 	// and PoP evidence without calling live ConfirmPoP or changing the clock.
 	if !s.credentialUseValid(p) {
 		return errManagedEndpointKey
 	}
 	var currentInstallation string
-	if err := conn.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&currentInstallation); err != nil || currentInstallation != s.installation.String() {
+	if err := conn.QueryRowContext(ctx, `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&currentInstallation); err != nil || currentInstallation != s.installation.String() {
 		return errManagedEndpointKey
 	}
 	request, _ := p.PoP.Prepare.CanonicalBytes()
@@ -95,14 +99,14 @@ func (s *ManagedEndpointKeyStore) validateCredentialEvidence(conn *sql.Conn, p t
 	var bindingID, installationID, origin, expiry, state string
 	var retainedRequest, retainedDigest, retainedACK []byte
 	var keyStarted int
-	err := conn.QueryRowContext(context.Background(), `SELECT enrollment_id,installation_id,server_url,request,request_digest,expires_at,state,ack,key_started FROM native_managed_endpoint_prepare_commands WHERE command_id=?`, p.PoP.Prepare.CommandID).Scan(&bindingID, &installationID, &origin, &retainedRequest, &retainedDigest, &expiry, &state, &retainedACK, &keyStarted)
+	err := conn.QueryRowContext(ctx, `SELECT enrollment_id,installation_id,server_url,request,request_digest,expires_at,state,ack,key_started FROM native_managed_endpoint_prepare_commands WHERE command_id=?`, p.PoP.Prepare.CommandID).Scan(&bindingID, &installationID, &origin, &retainedRequest, &retainedDigest, &expiry, &state, &retainedACK, &keyStarted)
 	ack, _ := p.PoP.ACK.CanonicalBytes()
 	if err != nil || bindingID != p.PoP.Prepare.Subject.ID.String() || installationID != s.installation.String() || origin != server || expiry != p.PoP.Prepare.Subject.ExpiresAt.Format(time.RFC3339Nano) || state != "succeeded" || keyStarted != 1 || !bytes.Equal(request, retainedRequest) || !bytes.Equal(requestDigest[:], retainedDigest) || !bytes.Equal(ack, retainedACK) || !managedEndpointPrepareSuccessForScope(retainedACK, p.PoP.Prepare, server, s.installation) {
 		return errManagedEndpointKey
 	}
 	var enrollment, direct, installation string
 	var popRequest, digest, proof []byte
-	if err := conn.QueryRowContext(context.Background(), `SELECT enrollment_id,direct_intent_id,installation_id,request,request_digest,proof FROM native_managed_endpoint_pop_challenges WHERE challenge_id=?`, p.PoP.ChallengeID).Scan(&enrollment, &direct, &installation, &popRequest, &digest, &proof); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT enrollment_id,direct_intent_id,installation_id,request,request_digest,proof FROM native_managed_endpoint_pop_challenges WHERE challenge_id=?`, p.PoP.ChallengeID).Scan(&enrollment, &direct, &installation, &popRequest, &digest, &proof); err != nil {
 		return errManagedEndpointKey
 	}
 	canonical, _ := p.PoP.CanonicalBytes()
@@ -116,12 +120,16 @@ func (s *ManagedEndpointKeyStore) validateCredentialEvidence(conn *sql.Conn, p t
 }
 
 func (s *ManagedEndpointKeyStore) credentialRow(conn *sql.Conn, p transport.ManagedDirectCredentialIssue, raw []byte) (ManagedDirectCredentialEvidence, bool, error) {
+	return s.credentialRowContext(context.Background(), conn, p, raw)
+}
+
+func (s *ManagedEndpointKeyStore) credentialRowContext(ctx context.Context, conn *sql.Conn, p transport.ManagedDirectCredentialIssue, raw []byte) (ManagedDirectCredentialEvidence, bool, error) {
 	var result ManagedDirectCredentialEvidence
 	var binding, direct, installation string
 	var retained, digest []byte
 	sum := sha256.Sum256(raw)
 	var hash sql.NullString
-	err := conn.QueryRowContext(context.Background(), `SELECT enrollment_id,direct_intent_id,installation_id,issue,issue_digest,state,credential_hash,ack FROM native_managed_direct_v1_credentials WHERE credential_id=?`, p.CredentialID).Scan(&binding, &direct, &installation, &retained, &digest, &result.State, &hash, &result.ACK)
+	err := conn.QueryRowContext(ctx, `SELECT enrollment_id,direct_intent_id,installation_id,issue,issue_digest,state,credential_hash,ack FROM native_managed_direct_v1_credentials WHERE credential_id=?`, p.CredentialID).Scan(&binding, &direct, &installation, &retained, &digest, &result.State, &hash, &result.ACK)
 	if errors.Is(err, sql.ErrNoRows) {
 		return result, false, nil
 	}
@@ -387,20 +395,39 @@ func (s *ManagedEndpointKeyStore) CredentialEvidence(issue transport.ManagedDire
 }
 
 func (s *ManagedEndpointKeyStore) withCredentialEvidence(issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) (ManagedDirectCredentialEvidence, error) {
+	return s.withCredentialEvidenceContextMode(context.Background(), false, issue, configuredServer, session, verify, fence, use)
+}
+
+func (s *ManagedEndpointKeyStore) withCredentialEvidenceContext(ctx context.Context, issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) (ManagedDirectCredentialEvidence, error) {
+	return s.withCredentialEvidenceContextMode(ctx, true, issue, configuredServer, session, verify, fence, use)
+}
+
+func (s *ManagedEndpointKeyStore) withCredentialEvidenceContextMode(ctx context.Context, bounded bool, issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) (ManagedDirectCredentialEvidence, error) {
+	if bounded {
+		if err := ctx.Err(); err != nil {
+			return ManagedDirectCredentialEvidence{}, err
+		}
+	}
 	p, server, raw, err := s.credentialInput(issue, configuredServer, session, verify)
 	if err != nil {
 		return ManagedDirectCredentialEvidence{}, err
 	}
+	locked := s.withCredentialLockedScoped
+	if bounded {
+		locked = func(fn func(*sql.Conn, *os.File, *func()) error) error {
+			return withEndpointMaterialLockedContext(ctx, s.registry, nativeManagedEndpointKeyNamespace, fn)
+		}
+	}
 	var result ManagedDirectCredentialEvidence
-	err = s.withCredentialLockedScoped(func(conn *sql.Conn, dir *os.File, release *func()) error {
-		if err := s.validateCredentialEvidence(conn, p, server); err != nil {
+	err = locked(func(conn *sql.Conn, dir *os.File, release *func()) error {
+		if err := s.validateCredentialEvidenceContext(ctx, conn, p, server); err != nil {
 			return err
 		}
-		row, exists, err := s.credentialRow(conn, p, raw)
+		row, exists, err := s.credentialRowContext(ctx, conn, p, raw)
 		if err != nil || !exists || row.State != "installed" {
 			return errManagedEndpointKey
 		}
-		private, err := s.loadPoPKey(conn, dir, p.PoP.ACK.Reservation)
+		private, err := s.loadPoPKeyContext(ctx, conn, dir, p.PoP.ACK.Reservation)
 		defer clear(private)
 		if err != nil {
 			return err
@@ -440,13 +467,28 @@ func (s *ManagedEndpointKeyStore) withCredentialEvidence(issue transport.Managed
 		}
 
 		if use != nil {
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			var check func() error
 			*release, check, err = fence(conn)
 			if err != nil || *release == nil || check == nil || !s.credentialUseValid(p) {
 				return errManagedEndpointKey
 			}
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if check() != nil {
 				return errManagedEndpointKey
+			}
+			if bounded {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			useErr := use(endpointMaterial{secret: retained.Secret, private: private})
 			checkErr := check()
@@ -479,6 +521,18 @@ func (s *ManagedEndpointKeyStore) withManagedTargetEndpointMaterial(issue transp
 		return errManagedEndpointKey
 	}
 	_, err := s.withCredentialEvidence(issue, configuredServer, session, verify, fence, use)
+	// Callback and filesystem errors must never carry private bytes to callers.
+	if err != nil {
+		return errManagedEndpointKey
+	}
+	return nil
+}
+
+func (s *ManagedEndpointKeyStore) withManagedTargetEndpointMaterialContext(ctx context.Context, issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, scope endpointMaterialScope, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+	if s == nil || scope.installation != s.installation || scope.credential != issue.CredentialID || scope.role != "P" || scope.use != endpointMaterialLiveUse || fence == nil || use == nil {
+		return errManagedEndpointKey
+	}
+	_, err := s.withCredentialEvidenceContext(ctx, issue, configuredServer, session, verify, fence, use)
 	// Callback and filesystem errors must never carry private bytes to callers.
 	if err != nil {
 		return errManagedEndpointKey

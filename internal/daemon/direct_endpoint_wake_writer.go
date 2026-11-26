@@ -159,6 +159,9 @@ func (c *directEndpointWakeConnection) writeCurrent(job *directEndpointWakeWrite
 		_, pending := c.pendingWrites[job]
 		return pending && time.Now().Before(job.deadline) && job.entry.unsubscribeQueued && job.entry.subscribeStarted && job.entry.ctx.Err() != nil, false
 	}
+	if job.entry.handle.aborted() {
+		return false, false
+	}
 	if !c.daemon.connMu.TryLock() {
 		return false, true
 	}
@@ -184,7 +187,7 @@ func (c *directEndpointWakeConnection) writeCurrent(job *directEndpointWakeWrite
 		return false, true
 	}
 	defer entry.handle.owner.mu.Unlock()
-	if _, valid := entry.handle.owner.entries[entry.handle]; !valid || !time.Now().Before(entry.handle.binding.metadata.Deadline) {
+	if _, valid := entry.handle.owner.entries[entry.handle]; !valid || !time.Now().Before(entry.handle.binding.metadata.Deadline) || entry.handle.aborted() {
 		return false, false
 	}
 	select {

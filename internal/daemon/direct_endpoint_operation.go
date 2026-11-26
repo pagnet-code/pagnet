@@ -84,6 +84,8 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 		select {
 		case <-s.Done():
 			cancel()
+		case <-s.AbortDone():
+			cancel()
 		case <-opctx.Done():
 		}
 	}()
@@ -143,9 +145,12 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 // operationCurrent linearizes dispatch acceptance and response acceptance with
 // generation removal. This leaf lock is never held across a callback.
 func (s *DirectEndpointSubscription) operationCurrent(ctx context.Context) bool {
+	if s.aborted() || ctx.Err() != nil {
+		return false
+	}
 	s.owner.mu.Lock()
 	defer s.owner.mu.Unlock()
-	if _, ok := s.owner.entries[s]; !ok || ctx.Err() != nil {
+	if _, ok := s.owner.entries[s]; !ok || ctx.Err() != nil || s.aborted() {
 		return false
 	}
 	if !time.Now().Before(s.binding.metadata.Deadline) {

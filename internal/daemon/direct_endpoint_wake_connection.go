@@ -119,7 +119,8 @@ type directEndpointWakeAttachment struct {
 	latest, previous  *transport.DirectEndpointWakeOfferV1
 	subscribeStarted  bool
 	unsubscribeQueued bool
-	err               error // written once under c.mu, published by closing ctx.Done
+	terminalOnce      sync.Once
+	err               error // written once by terminate, published by closing ctx.Done
 }
 
 // Done closes exactly once when this registration ends. It remains observable
@@ -129,7 +130,7 @@ func (a *directEndpointWakeAttachment) Done() <-chan struct{} { return a.ctx.Don
 // TerminalError is meaningful after Done closes. Local cancellation reports
 // context.Canceled; server closure, writer and callback failures retain their raw
 // internal error. The controller must sanitize errors before displaying them.
-// Removal writes err once before closing Done, so this read needs no lock and
+// Termination writes err once before closing Done, so this read needs no lock and
 // never calls an observer while holding the connection's mutex.
 func (a *directEndpointWakeAttachment) TerminalError() error {
 	select {
@@ -140,10 +141,26 @@ func (a *directEndpointWakeAttachment) TerminalError() error {
 	}
 }
 
+// terminate publishes cancellation independently of the registration maps.
+func (a *directEndpointWakeAttachment) terminate(err error) {
+	a.terminalOnce.Do(func() {
+		// Local revocation may beat its watcher or a queued writer's guard.
+		select {
+		case <-a.handle.Done():
+			err = context.Canceled
+		case <-a.handle.AbortDone():
+			err = context.Canceled
+		default:
+		}
+		a.err = err
+		a.cancel()
+	})
+}
+
 // attach registers an exact admitted handle on its captured live socket. It
 // never restores an earlier attachment or selects a replacement connection.
 func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription, reconcile func(context.Context) error) (*directEndpointWakeAttachment, error) {
-	if c == nil || c.daemon == nil || handle == nil || handle.owner != &c.daemon.directSubscriptions || reconcile == nil || !handle.Valid() {
+	if c == nil || c.daemon == nil || handle == nil || handle.owner != &c.daemon.directSubscriptions || reconcile == nil || handle.aborted() || !handle.Valid() {
 		return nil, ErrNativeObservationConflict
 	}
 	d := c.daemon
@@ -225,8 +242,12 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 	// Match the admission fence order: connMu -> native.mu -> lane.mu ->
 	// owner leaf lock. No lifecycle lock, I/O, callback or wait enters the
 	// owner lock. Map insertion linearizes attachment with exact revocation.
+	if handle.aborted() {
+		cancel()
+		return nil, ErrNativeObservationConflict
+	}
 	handle.owner.mu.Lock()
-	if _, current := handle.owner.entries[handle]; !current || !time.Now().Before(metadata.Deadline) {
+	if _, current := handle.owner.entries[handle]; !current || !time.Now().Before(metadata.Deadline) || handle.aborted() {
 		handle.owner.mu.Unlock()
 		cancel()
 		return nil, ErrNativeObservationConflict
@@ -242,8 +263,10 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 	go func() {
 		select {
 		case <-handle.Done():
+		case <-handle.AbortDone():
 		case <-ctx.Done():
 		}
+		entry.terminate(context.Canceled)
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.removeLocked(entry, true, context.Canceled)
@@ -258,15 +281,7 @@ func (c *directEndpointWakeConnection) removeLocked(entry *directEndpointWakeAtt
 	}
 	delete(c.byHandle, entry.handle)
 	delete(c.byID, entry.subscription.SubscriptionID)
-	// Local revocation may beat its Done watcher and a queued writer's final
-	// guard. Preserve that cancellation outcome regardless of scheduling.
-	select {
-	case <-entry.handle.Done():
-		err = context.Canceled
-	default:
-	}
-	entry.err = err
-	entry.cancel()
+	entry.terminate(err)
 	if unsubscribe && entry.subscribeStarted && !entry.unsubscribeQueued {
 		entry.unsubscribeQueued = true
 		c.enqueueLocked(entry, transport.MsgDirectEndpointWakeUnsubscribe, transport.DirectEndpointWakeUnsubscribeV1{Protocol: transport.DirectEndpointWakeProtocolV1, SubscriptionID: entry.subscription.SubscriptionID}, time.Now())
