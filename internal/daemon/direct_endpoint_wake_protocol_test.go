@@ -73,11 +73,48 @@ func wakeProtocolAccept(t *testing.T, lane *directEndpointWakeConnection, offer 
 	}
 }
 
+func TestDirectEndpointWakeInitialReconcileWithoutOffer(t *testing.T) {
+	for _, source := range []bool{false, true} {
+		t.Run(map[bool]string{false: "target", true: "source"}[source], func(t *testing.T) {
+			_, lane, handle := wakeAttachmentFixture(t, source)
+			writes := make(chan transport.Envelope, 4)
+			lane.write = wakeProtocolRecorder(writes)
+			calls := make(chan struct{}, 4)
+			entry, err := lane.attach(handle, func(context.Context) error { calls <- struct{}{}; return nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
+			select {
+			case <-calls:
+			case <-time.After(time.Second):
+				t.Fatal("initial reconciliation required an offer")
+			}
+			select {
+			case <-calls:
+				t.Fatal("initial reconciliation repeated without an offer")
+			case env := <-writes:
+				t.Fatalf("initial reconciliation fabricated protocol traffic: %s", env.Type)
+			case <-time.After(50 * time.Millisecond):
+			}
+			lane.mu.Lock()
+			pending, latest, previous := entry.pending, entry.latest, entry.previous
+			lane.mu.Unlock()
+			if pending || latest != nil || previous != nil || entry.TerminalError() != nil {
+				t.Fatal("initial reconciliation changed offer or terminal state")
+			}
+		})
+	}
+}
+
 func TestDirectEndpointWakeImmediateOfferDuringSubscribe(t *testing.T) {
 	_, lane, handle := wakeAttachmentFixture(t, true)
 	writes := make(chan transport.Envelope, 4)
 	handled := make(chan error, 1)
-	callback := make(chan struct{}, 1)
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	callback := make(chan struct{}, 2)
+	var calls atomic.Int32
 	lane.write = func(deadline time.Time, raw []byte) error {
 		var env transport.Envelope
 		if err := json.Unmarshal(raw, &env); err != nil {
@@ -85,6 +122,7 @@ func TestDirectEndpointWakeImmediateOfferDuringSubscribe(t *testing.T) {
 		}
 		writes <- env
 		if env.Type == transport.MsgDirectEndpointWakeSubscribe {
+			<-started
 			subscribe, err := transport.DecodeDirectEndpointWakeSubscribeV1(env.Payload)
 			if err != nil {
 				handled <- err
@@ -96,7 +134,18 @@ func TestDirectEndpointWakeImmediateOfferDuringSubscribe(t *testing.T) {
 		}
 		return nil
 	}
-	if _, err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
+	if _, err := lane.attach(handle, func(ctx context.Context) error {
+		if calls.Add(1) == 1 {
+			close(started)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		} else {
+			callback <- struct{}{}
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
@@ -109,6 +158,7 @@ func TestDirectEndpointWakeImmediateOfferDuringSubscribe(t *testing.T) {
 		t.Fatal("subscribe write deadlocked with immediate offer")
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeACK)
+	release <- struct{}{}
 	select {
 	case <-callback:
 	case <-time.After(time.Second):
@@ -140,14 +190,16 @@ func TestDirectEndpointWakeACKIndependentAndCallbacksCoalesce(t *testing.T) {
 		t.Fatal(err)
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
-	first := wakeProtocolOffer(wakeProtocolEntry(t, lane, handle))
-	wakeProtocolAccept(t, lane, first)
 	select {
-	case <-started:
+	case n := <-started:
+		if n != 1 {
+			t.Fatalf("initial callback count %d", n)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("callback did not start")
+		t.Fatal("initial callback did not start without an offer")
 	}
-	offers := []transport.DirectEndpointWakeOfferV1{first, first}
+	first := wakeProtocolOffer(wakeProtocolEntry(t, lane, handle))
+	offers := []transport.DirectEndpointWakeOfferV1{first, first, first}
 	second := first
 	second.OfferID = domain.NewID().String()
 	second.Revision = "2"
@@ -158,7 +210,7 @@ func TestDirectEndpointWakeACKIndependentAndCallbacksCoalesce(t *testing.T) {
 	for _, offer := range offers {
 		wakeProtocolAccept(t, lane, offer)
 	}
-	for _, offer := range append([]transport.DirectEndpointWakeOfferV1{first}, offers...) {
+	for _, offer := range offers {
 		env := wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeACK)
 		ack, err := transport.DecodeDirectEndpointWakeACKV1(env.Payload)
 		if err != nil || transport.ValidateDirectEndpointWakeACKV1(ack, offer) != nil {
@@ -195,19 +247,25 @@ func TestDirectEndpointWakeCallbackFailureRemovesExactEntry(t *testing.T) {
 			if _, err := lane.attach(other, func(context.Context) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := lane.attach(handle, func(context.Context) error {
+			release := make(chan struct{})
+			callbackErr := errors.New("callback failed")
+			entry, err := lane.attach(handle, func(context.Context) error {
+				<-release
 				if panics {
 					panic("test callback")
 				}
-				return errors.New("callback failed")
-			}); err != nil {
+				return callbackErr
+			})
+			if err != nil {
 				t.Fatal(err)
 			}
 			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
 			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
-			entry := wakeProtocolEntry(t, lane, handle)
-			wakeProtocolAccept(t, lane, wakeProtocolOffer(entry))
+			close(release)
 			waitWakeAttachmentRemoved(t, lane, entry)
+			if (!panics && entry.TerminalError() != callbackErr) || (panics && (entry.TerminalError() == nil || entry.TerminalError().Error() != "direct endpoint wake reconciliation panicked")) {
+				t.Fatalf("initial callback terminal error: %v", entry.TerminalError())
+			}
 			if !handle.Valid() {
 				t.Fatal("callback failure revoked admitted handle")
 			}
@@ -510,12 +568,13 @@ func TestDirectEndpointWakeCapturedSocketProtocol(t *testing.T) {
 	})
 	t.Run("subscribe-offer-ack", func(t *testing.T) {
 		_, lane, handle, peer := wakeProtocolRealFixture(t)
-		callback := make(chan struct{}, 1)
+		callback := make(chan struct{}, 2)
 		if _, err := lane.attach(handle, func(context.Context) error { callback <- struct{}{}; return nil }); err != nil {
 			t.Fatal(err)
 		}
 		entry := wakeProtocolEntry(t, lane, handle)
 		env := wakeProtocolReadSocket(t, peer, transport.MsgDirectEndpointWakeSubscribe)
+		waitWakeAbortSignal(t, callback)
 		subscribe, err := transport.DecodeDirectEndpointWakeSubscribeV1(env.Payload)
 		if err != nil {
 			t.Fatal(err)
@@ -725,6 +784,7 @@ func TestDirectEndpointWakeLocalRemovalToleratesRacedHints(t *testing.T) {
 			}
 			wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
 			entry := wakeProtocolEntry(t, lane, handle)
+			waitWakeAbortSignal(t, callbacks)
 			offer := wakeProtocolOffer(entry)
 			if previous {
 				wakeProtocolAccept(t, lane, offer)
@@ -791,11 +851,13 @@ func TestDirectEndpointWakeRevocationBeforeDoneWatcher(t *testing.T) {
 	writes := make(chan transport.Envelope, 8)
 	lane.write = wakeProtocolRecorder(writes)
 	var callbacks atomic.Int32
-	if _, err := lane.attach(handle, func(context.Context) error { callbacks.Add(1); return nil }); err != nil {
+	initial := make(chan struct{}, 1)
+	if _, err := lane.attach(handle, func(context.Context) error { callbacks.Add(1); initial <- struct{}{}; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	wakeProtocolReceive(t, writes, transport.MsgDirectEndpointWakeSubscribe)
 	entry := wakeProtocolEntry(t, lane, handle)
+	waitWakeAbortSignal(t, initial)
 	handle.owner.mu.Lock()
 	delete(handle.owner.entries, handle)
 	if handle.timer != nil {
@@ -818,7 +880,7 @@ func TestDirectEndpointWakeRevocationBeforeDoneWatcher(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("revoked writer did not drain")
 	}
-	if len(writes) != 0 || callbacks.Load() != 0 {
+	if len(writes) != 0 || callbacks.Load() != 1 {
 		t.Fatal("revoked hint produced ACK or callback")
 	}
 }

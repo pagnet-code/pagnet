@@ -34,11 +34,10 @@ func TestDirectEndpointWakeAbortCancelsBeforeCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	freshEntry, err := lane.attach(fresh, dormantWakeReconcile)
+	freshEntry, err := lane.attach(fresh, noopWakeReconcile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wakeProtocolAccept(t, lane, wakeProtocolOffer(entry))
 	waitWakeAbortSignal(t, started)
 	lane.mu.Lock()
 	handle.owner.mu.Lock()
@@ -79,7 +78,7 @@ func TestDirectEndpointWakeAbortedAttachRejectsBeforeOwnerLock(t *testing.T) {
 	proxy.abort()
 	result := make(chan error, 1)
 	go func() {
-		_, err := lane.attach(handle, dormantWakeReconcile)
+		_, err := lane.attach(handle, noopWakeReconcile)
 		result <- err
 	}()
 	select {
@@ -100,7 +99,7 @@ func TestDirectEndpointWakeAbortedWriteRejectsBeforeLocks(t *testing.T) {
 	d, lane, handle := wakeAttachmentFixture(t, true)
 	proxy := &NativeWorkerProxy{abortDone: make(chan struct{})}
 	handle.binding.proxy = proxy
-	entry, err := lane.attach(handle, dormantWakeReconcile)
+	entry, err := lane.attach(handle, noopWakeReconcile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +132,7 @@ func TestDirectEndpointWakeAbortDuringAttachmentInsertion(t *testing.T) {
 	t.Cleanup(unlock)
 	result := make(chan error, 1)
 	go func() {
-		_, err := lane.attach(handle, dormantWakeReconcile)
+		_, err := lane.attach(handle, noopWakeReconcile)
 		result <- err
 	}()
 	// Holding lane.mu stops insertion after the initial Valid check. Once

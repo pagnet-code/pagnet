@@ -15,7 +15,18 @@ func TestDirectEndpointWakeAttachmentTerminalResult(t *testing.T) {
 			d, lane, handle := wakeAttachmentFixture(t, true)
 			callbackErr := errors.New("private callback error")
 			writeErr := errors.New("private writer error")
-			callback := func(context.Context) error { return callbackErr }
+			release := make(chan struct{})
+			callback := func(ctx context.Context) error {
+				if reason != "callback" {
+					return nil
+				}
+				select {
+				case <-release:
+					return callbackErr
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			want := error(context.Canceled)
 			if reason == "writer-timeout" {
 				d.writeTimeout = 20 * time.Millisecond
@@ -50,7 +61,7 @@ func TestDirectEndpointWakeAttachmentTerminalResult(t *testing.T) {
 			}
 			switch reason {
 			case "callback":
-				wakeProtocolAccept(t, lane, wakeProtocolOffer(result))
+				close(release)
 			case "server-closed":
 				closed := transport.DirectEndpointWakeClosedV1{Protocol: transport.DirectEndpointWakeProtocolV1, SubscriptionID: result.subscription.SubscriptionID, Reason: transport.DirectEndpointWakeClosedRetryExhausted}
 				if handled, err := lane.handle(wakeProtocolEnvelope(transport.MsgDirectEndpointWakeClosed, closed)); !handled || err != nil {

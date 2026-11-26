@@ -45,6 +45,7 @@ type NativeWorkerRegistry struct {
 	closed              bool
 	closeErr            error
 	directInvalidations directEndpointInvalidations
+	directConsentLeases directChannelConsentLeases // guarded by mu
 }
 
 func privateNativeRegistryDir(path string) error { return privateNativeRegistryPath(path, true) }
@@ -190,6 +191,7 @@ func (r *NativeWorkerRegistry) Close() error {
 	err = r.db.Close()
 	err = errors.Join(err, conn.Close())
 	r.closed = true
+	r.directConsentLeases.revokeAll()
 	r.closeErr = err
 	return err
 }

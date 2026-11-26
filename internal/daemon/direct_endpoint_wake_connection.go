@@ -259,6 +259,7 @@ func (c *directEndpointWakeConnection) attach(handle *DirectEndpointSubscription
 		c.removeLocked(entry, false, ErrNativeObservationCapacity)
 		return nil, ErrNativeObservationCapacity
 	}
+	c.queueReconcileLocked(entry)
 	go c.runReconcile(entry)
 	go func() {
 		select {
@@ -285,6 +286,15 @@ func (c *directEndpointWakeConnection) removeLocked(entry *directEndpointWakeAtt
 	if unsubscribe && entry.subscribeStarted && !entry.unsubscribeQueued {
 		entry.unsubscribeQueued = true
 		c.enqueueLocked(entry, transport.MsgDirectEndpointWakeUnsubscribe, transport.DirectEndpointWakeUnsubscribeV1{Protocol: transport.DirectEndpointWakeProtocolV1, SubscriptionID: entry.subscription.SubscriptionID}, time.Now())
+	}
+}
+
+// queueReconcileLocked coalesces callback obligations onto the attachment's worker.
+func (c *directEndpointWakeConnection) queueReconcileLocked(entry *directEndpointWakeAttachment) {
+	entry.pending = true
+	select {
+	case entry.work <- struct{}{}:
+	default:
 	}
 }
 
@@ -413,11 +423,7 @@ func (c *directEndpointWakeConnection) handle(env transport.Envelope) (bool, err
 			entry.previous, entry.latest = entry.latest, &offer
 			// Accept the obligation before admitting the ACK. A single worker
 			// fulfills it independently of the captured-socket writer.
-			entry.pending = true
-			select {
-			case entry.work <- struct{}{}:
-			default:
-			}
+			c.queueReconcileLocked(entry)
 		}
 		if !c.enqueueLocked(entry, transport.MsgDirectEndpointWakeACK, transport.DirectEndpointWakeACKV1(offer), received) {
 			c.removeLocked(entry, true, ErrNativeObservationCapacity)
