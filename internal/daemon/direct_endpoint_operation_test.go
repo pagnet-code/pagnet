@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -68,7 +69,15 @@ func (f *directEndpointOperationFixture) verify(context.Context, ManagedEndpoint
 }
 
 func (f *directEndpointOperationFixture) operate(ctx context.Context, use func(context.Context, endpointMaterial) error) error {
-	return f.d.operateDirectEndpoint(ctx, f.captured, f.s, f.raw, f.subject, directManagedSourceCredentialProtocolV2, f.issue.IssuedAt, f.scope, f.custody, f.verify, use)
+	return f.d.operateDirectEndpoint(ctx, f.captured, f.s, f.raw, f.subject, directManagedSourceCredentialProtocolV2, f.issue.IssuedAt, f.scope, func(opctx context.Context, verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+		keys, err := newDirectManagedSourceKeyStoreV2Context(opctx, f.d.nativeRegistry)
+		if err != nil {
+			return err
+		}
+		return keys.withDirectManagedSourceEndpointMaterialV2Context(opctx, f.issue, f.d.ServerURL, f.captured.Session, f.scope, func(transport.DirectManagedSourceCredentialIssueV2, string, transport.HostSessionPayload) error {
+			return verify()
+		}, fence, use)
+	}, f.verify, use)
 }
 
 func TestDirectEndpointOperationLifecycleWhileCallbackHeld(t *testing.T) {
@@ -296,10 +305,26 @@ func TestDirectEndpointOperationTargetCustody(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(d.directSubscriptions.close)
+	// The production role wrapper must derive its context before opening custody.
+	d.nativeRegistry.mu.Lock()
+	started := time.Now()
+	rejected := d.operateManagedTargetEndpoint(context.Background(), captured, s, issue, func(context.Context, endpointMaterial) error { t.Error("contended target reached use"); return nil })
+	d.nativeRegistry.mu.Unlock()
+	if rejected != errDirectEndpointOperationRejected || time.Since(started) > time.Second {
+		t.Fatal("target role custody waited for registry")
+	}
 	keys.now = func() time.Time { return issue.InstallExpiresAt.Add(time.Nanosecond) }
 	time.Sleep(time.Until(issue.InstallExpiresAt) + 10*time.Millisecond)
 	var secret, private []byte
-	err = d.operateDirectEndpoint(context.Background(), captured, s, raw, s.binding.subject, managedDirectCredentialProtocolV1, issue.IssuedAt, scope, custody, verify, func(ctx context.Context, material endpointMaterial) error {
+	err = d.operateDirectEndpoint(context.Background(), captured, s, raw, s.binding.subject, managedDirectCredentialProtocolV1, issue.IssuedAt, scope, func(opctx context.Context, verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+		keys, err := newManagedEndpointKeyStoreContext(opctx, d.nativeRegistry)
+		if err != nil {
+			return err
+		}
+		return keys.withManagedTargetEndpointMaterialContext(opctx, issue, d.ServerURL, captured.Session, scope, func(transport.ManagedDirectCredentialIssue, string, transport.HostSessionPayload) error {
+			return verify()
+		}, fence, use)
+	}, verify, func(ctx context.Context, material endpointMaterial) error {
 		secret, private = material.secret, material.private
 		if len(secret) != 32 || len(private) != 32 {
 			t.Error("invalid target material length")
@@ -314,5 +339,72 @@ func TestDirectEndpointOperationTargetCustody(t *testing.T) {
 	}
 	if len(secret) == 0 || len(private) == 0 || !bytes.Equal(secret, make([]byte, len(secret))) || !bytes.Equal(private, make([]byte, len(private))) {
 		t.Fatal("target operation retained material")
+	}
+}
+
+func TestDirectEndpointOperationContextAcquisition(t *testing.T) {
+	for _, held := range []string{"registry", "key namespace", "publication", "connection", "owner"} {
+		t.Run(held, func(t *testing.T) {
+			f := newDirectEndpointOperationFixture(t, 0)
+			release := func() {}
+			switch held {
+			case "registry":
+				f.d.nativeRegistry.mu.Lock()
+				release = f.d.nativeRegistry.mu.Unlock
+			case "key namespace":
+				directEndpointHoldChildFlock(t, filepath.Join(f.d.nativeRegistry.root, nativeDirectManagedSourceKeyNamespaceV2, "holder.lock"))
+			case "publication":
+				f.token.proxy.publicationMu.Lock()
+				release = f.token.proxy.publicationMu.Unlock
+			case "connection":
+				f.d.connMu.Lock()
+				release = f.d.connMu.Unlock
+			case "owner":
+				f.s.owner.mu.Lock()
+				release = f.s.owner.mu.Unlock
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			called := false
+			start := time.Now()
+			use := func(context.Context, endpointMaterial) error { called = true; return nil }
+			var err error
+			if held == "registry" {
+				err = f.d.operateDirectManagedSourceEndpointV2(ctx, f.captured, f.s, f.issue, use)
+			} else {
+				err = f.operate(ctx, use)
+			}
+			release()
+			if err != errDirectEndpointOperationRejected || called {
+				t.Fatalf("held %s operation reached use: %v", held, err)
+			}
+			if time.Since(start) > time.Second {
+				t.Fatal("operation waited for held lock")
+			}
+		})
+	}
+}
+
+func TestDirectEndpointOperationContextResponseAcceptance(t *testing.T) {
+	for _, kind := range []string{"cancel", "owner held"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newDirectEndpointOperationFixture(t, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			release := func() {}
+			err := f.operate(ctx, func(context.Context, endpointMaterial) error {
+				if kind == "cancel" {
+					cancel()
+				} else {
+					f.s.owner.mu.Lock()
+					release = f.s.owner.mu.Unlock
+				}
+				return nil
+			})
+			release()
+			if err != errDirectEndpointOperationUnknown {
+				t.Fatalf("unaccepted callback succeeded: %v", err)
+			}
+		})
 	}
 }
