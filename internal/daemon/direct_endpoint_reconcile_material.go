@@ -7,12 +7,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"time"
 
 	"github.com/pagnet-code/pagnet/internal/directchannelcrypto"
 	"github.com/pagnet-code/pagnet/internal/directhttp"
 	"github.com/pagnet-code/pagnet/transport"
 )
+
+var errDirectEndpointReconcileSourceRootMissing = errors.New("direct endpoint reconcile source root missing")
 
 // directEndpointMaterialOperation must invoke use synchronously, at most once,
 // with custody owned by the operation. Success must include acceptance against
@@ -48,89 +51,100 @@ func acquireDirectEndpointReconcileMaterial(ctx context.Context, s *DirectEndpoi
 	if ctx == nil || s == nil || s.owner == nil || registry == nil || now == nil || operate == nil {
 		return nil, nil, errDirectEndpointOperationRejected
 	}
+	var stagedErr error
 	called := false
 	repeated := false
 	err = operate(ctx, func(opctx context.Context, custody endpointMaterial) error {
 		if called {
 			repeated = true
-			return errDirectEndpointOperationRejected
+			return nil
 		}
 		called = true
-		if err := s.operationCurrentContextError(opctx); err != nil {
-			return err
-		}
-		if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
-			return err
-		}
-		if role == "P" {
-			p, decodeErr := transport.DecodeDirectChannelPublicationV2(publication)
-			if decodeErr != nil || !b.publicationMatches(p) || !reconcilePublicationHash(e, publication) {
-				return errDirectEndpointReconcileBinding
+		// Keep local failures separate so the operation accepts the exact lease.
+		stagedErr = func() error {
+			if err := s.operationCurrentContextError(opctx); err != nil {
+				return err
 			}
-		}
-		binding, bindingErr := enrollmentBinding(s, b.Protocol, b.DescriptorBytes, b.LocalFingerprint, b.PeerFingerprint)
-		if bindingErr != nil {
-			return bindingErr
-		}
-		journal, journalErr := newDirectEnrollmentJournalContext(opctx, registry)
-		if journalErr != nil {
-			return journalErr
-		}
-		retained, reserveErr := journal.reserveContext(opctx, s, binding)
-		defer func() { clear(retained.Root) }()
-		if reserveErr != nil {
-			return reserveErr
-		}
-		// A source can only recover an already published root from local retention.
-		if role == "S" && e.PublicationHash != nil && retained.State != "material" {
-			return errDirectEnrollment
-		}
-		row, materialErr := journal.materialContext(opctx, s, binding, func() ([]byte, []byte, error) {
-			// This generator runs inside the journal transaction: local crypto only.
-			var candidate *directchannelcrypto.Material
-			var raw []byte
-			var cryptoErr error
-			if role == "S" {
-				candidate, raw, cryptoErr = directchannelcrypto.Prepare(b.DescriptorBytes, b.Descriptor, custody.private, now())
-			} else {
-				raw = publication
-				candidate, cryptoErr = directchannelcrypto.Accept(raw, b.Descriptor, custody.private, now())
+			if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
+				return err
 			}
-			if candidate != nil {
-				defer candidate.Clear()
+			if role == "P" {
+				p, decodeErr := transport.DecodeDirectChannelPublicationV2(publication)
+				if decodeErr != nil || !b.publicationMatches(p) || !reconcilePublicationHash(e, publication) {
+					return errDirectEndpointReconcileBinding
+				}
 			}
-			if cryptoErr != nil {
-				return nil, nil, cryptoErr
+			binding, bindingErr := enrollmentBinding(s, b.Protocol, b.DescriptorBytes, b.LocalFingerprint, b.PeerFingerprint)
+			if bindingErr != nil {
+				return bindingErr
 			}
-			return bytes.Clone(candidate.Key[:]), raw, nil
-		})
-		defer func() { clear(row.Root) }()
-		if materialErr != nil {
-			return materialErr
-		}
-		p, decodeErr := transport.DecodeDirectChannelPublicationV2(row.Publication)
-		if decodeErr != nil || len(row.Root) != 32 || !b.publicationMatches(p) || (e.PublicationHash != nil && !reconcilePublicationHash(e, row.Publication)) || (role == "P" && !bytes.Equal(publication, row.Publication)) {
-			return errDirectEnrollment
-		}
-		if err := s.operationCurrentContextError(opctx); err != nil {
-			return err
-		}
-		if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
-			return err
-		}
-		pending = &directchannelcrypto.Material{Descriptor: b.Descriptor, Hash: b.DescriptorHash, Role: role, PublicationHash: sha256.Sum256(row.Publication)}
-		copy(pending.Key[:], row.Root)
-		wire = bytes.Clone(row.Publication)
+			journal, journalErr := newDirectEnrollmentJournalContext(opctx, registry)
+			if journalErr != nil {
+				return journalErr
+			}
+			retained, reserveErr := journal.reserveContext(opctx, s, binding)
+			defer func() { clear(retained.Root) }()
+			if reserveErr != nil {
+				return reserveErr
+			}
+			// A source can only recover an already published root from local retention.
+			if role == "S" && e.PublicationHash != nil && retained.State != "material" {
+				return errDirectEndpointReconcileSourceRootMissing
+			}
+			row, materialErr := journal.materialContext(opctx, s, binding, func() ([]byte, []byte, error) {
+				// This generator runs inside the journal transaction: local crypto only.
+				var candidate *directchannelcrypto.Material
+				var raw []byte
+				var cryptoErr error
+				if role == "S" {
+					candidate, raw, cryptoErr = directchannelcrypto.Prepare(b.DescriptorBytes, b.Descriptor, custody.private, now())
+				} else {
+					raw = publication
+					candidate, cryptoErr = directchannelcrypto.Accept(raw, b.Descriptor, custody.private, now())
+				}
+				if candidate != nil {
+					defer candidate.Clear()
+				}
+				if cryptoErr != nil {
+					return nil, nil, cryptoErr
+				}
+				return bytes.Clone(candidate.Key[:]), raw, nil
+			})
+			defer func() { clear(row.Root) }()
+			if materialErr != nil {
+				return materialErr
+			}
+			p, decodeErr := transport.DecodeDirectChannelPublicationV2(row.Publication)
+			if decodeErr != nil || len(row.Root) != 32 || !b.publicationMatches(p) || (e.PublicationHash != nil && !reconcilePublicationHash(e, row.Publication)) || (role == "P" && !bytes.Equal(publication, row.Publication)) {
+				return errDirectEnrollment
+			}
+			if err := s.operationCurrentContextError(opctx); err != nil {
+				return err
+			}
+			if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
+				return err
+			}
+			pending = &directchannelcrypto.Material{Descriptor: b.Descriptor, Hash: b.DescriptorHash, Role: role, PublicationHash: sha256.Sum256(row.Publication)}
+			copy(pending.Key[:], row.Root)
+			wire = bytes.Clone(row.Publication)
+			return nil
+		}()
 		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
-	if !called || repeated || pending == nil {
-		return nil, nil, errDirectEndpointOperationRejected
-	}
 	if err := s.operationCurrentContextError(ctx); err != nil {
 		return nil, nil, err
+	}
+	if !called || repeated {
+		return nil, nil, errDirectEndpointOperationRejected
+	}
+	if stagedErr != nil {
+		return nil, nil, stagedErr
+	}
+	if pending == nil {
+		return nil, nil, errDirectEndpointOperationRejected
 	}
 	accepted = true
 	return pending, wire, nil
