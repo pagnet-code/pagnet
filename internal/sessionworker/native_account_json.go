@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/nativedirect"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -15,6 +16,22 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 	var collect func(any) error
 	collect = func(value any) error {
 		switch v := value.(type) {
+		case nativedirect.NativeDirectASKSource:
+			return collect(v.Ownership)
+		case DirectASKReservation:
+			return collect(v.Source)
+		case *DirectASKReservation:
+			if v != nil {
+				return collect(*v)
+			}
+		case *DirectASKRequest:
+			if v != nil {
+				return collect(v.Source)
+			}
+		case *DirectASKResult:
+			if v != nil {
+				return collect(v.Reservation)
+			}
 		case BridgeCall:
 			return collect(v.TurnSource)
 		case *BridgeCall:
@@ -181,7 +198,7 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 				return collect(*v)
 			}
 		case Request:
-			for _, part := range []any{v.OwnershipVerify, v.NativeDispatch, v.CancelProposal, v.CancelReceipt, v.Ownership, v.DeletionProof} {
+			for _, part := range []any{v.DirectASK, v.OwnershipVerify, v.NativeDispatch, v.CancelProposal, v.CancelReceipt, v.Ownership, v.DeletionProof} {
 				if err := collect(part); err != nil {
 					return err
 				}
@@ -198,7 +215,7 @@ func MarshalNativeJSON(value any) ([]byte, error) {
 				return collect(*v)
 			}
 		case Response:
-			for _, part := range []any{v.OwnershipVerify, v.Cancellation, v.ContentFragment, v.Snapshot, v.Bridge, v.InvocationSource, v.InvocationState, v.InvocationProjection, v.SourceDispositions} {
+			for _, part := range []any{v.DirectASK, v.OwnershipVerify, v.Cancellation, v.ContentFragment, v.Snapshot, v.Bridge, v.InvocationSource, v.InvocationState, v.InvocationProjection, v.SourceDispositions} {
 				if err := collect(part); err != nil {
 					return err
 				}

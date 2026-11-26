@@ -17,6 +17,7 @@ import (
 
 	"github.com/pagnet-code/pagnet/internal/agentbridge"
 	"github.com/pagnet-code/pagnet/internal/localpeer"
+	"github.com/pagnet-code/pagnet/internal/nativedirect"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
@@ -45,7 +46,42 @@ type handshake struct {
 	Proof            string `json:"proof,omitempty"`
 }
 
+type DirectASKRequest struct {
+	Source nativedirect.NativeDirectASKSource `json:"source"`
+	Wire   json.RawMessage                    `json:"wire"`
+}
+
+// DirectASKResult explicitly distinguishes a missing reservation from an absent RPC result.
+type DirectASKResult struct {
+	Found       bool                  `json:"found"`
+	Reservation *DirectASKReservation `json:"reservation,omitempty"`
+}
+
+// UnmarshalJSON requires explicit boolean absence evidence. Missing or null found
+// must never become an authoritative negative lookup result.
+func (r *DirectASKResult) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		Found       *bool                 `json:"found"`
+		Reservation *DirectASKReservation `json:"reservation,omitempty"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		return err
+	}
+	if wire.Found == nil {
+		return errors.New("direct ASK result lacks explicit found boolean")
+	}
+	var extra any
+	if decoder.Decode(&extra) != io.EOF {
+		return errors.New("direct ASK result has trailing data")
+	}
+	r.Found, r.Reservation = *wire.Found, wire.Reservation
+	return nil
+}
+
 type Request struct {
+	DirectASK           *DirectASKRequest                             `json:"directASK,omitempty"`
 	OwnershipVerify     *NativeOwnershipVerifyRequest                 `json:"ownershipVerify,omitempty"`
 	AccountReplyReceipt *transport.NativeAccountReplyReceiptPayload   `json:"accountReplyReceipt,omitempty"`
 	HostedPeer          *HostedPeerVerificationRequest                `json:"hostedPeer,omitempty"`
@@ -77,6 +113,7 @@ type Request struct {
 }
 
 type Response struct {
+	DirectASK              *DirectASKResult                 `json:"directASK,omitempty"`
 	OwnershipVerify        *NativeOwnershipVerifyResult     `json:"ownershipVerify,omitempty"`
 	HostedPeer             *HostedPeerVerificationResult    `json:"hostedPeer,omitempty"`
 	InvocationSource       *CloudInvocationSourceResult     `json:"invocationSource,omitempty"`
@@ -321,6 +358,8 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 		case <-done:
 		}
 	}()
+	// Mint only after the mutually authenticated controller acquired its durable lease.
+	controller := &directASKController{owner: owner, lease: auth.Lease}
 	for {
 		var req Request
 		if readFrame(c, &req) != nil {
@@ -380,7 +419,7 @@ func serveController(ctx context.Context, c *net.UnixConn, j *Journal, key []byt
 			} else if err := j.CurrentLease(ctx, auth.Lease); err != nil {
 				response.Error = err.Error()
 			} else {
-				response = owner.controllerRequest(ctx, auth.Lease, req)
+				response = owner.controllerRequestAuthenticated(ctx, auth.Lease, req, controller)
 			}
 		}
 		if writeFrame(c, response) != nil {
@@ -553,9 +592,28 @@ func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byt
 	}
 	return c, nil
 }
-func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) (response Response) {
+func (o *SessionOwner) controllerRequest(ctx context.Context, lease int64, req Request) Response {
+	return o.controllerRequestAuthenticated(ctx, lease, req, nil)
+}
+
+func (o *SessionOwner) controllerRequestAuthenticated(ctx context.Context, lease int64, req Request, controller *directASKController) (response Response) {
 	var err error
 	switch req.Type {
+	case "direct_ask_reserve_v1", "direct_ask_lookup_v1":
+		if req.DirectASK == nil || controller == nil || controller.lease != lease {
+			err = ErrFenced
+			break
+		}
+		var reservation *DirectASKReservation
+		if req.Type == "direct_ask_reserve_v1" {
+			reservation, err = o.ReserveDirectASK(ctx, controller, req.DirectASK.Source, req.DirectASK.Wire)
+		} else {
+			reservation, err = o.LookupDirectASK(ctx, controller, req.DirectASK.Source, req.DirectASK.Wire)
+		}
+		if err == nil {
+			response.DirectASK = &DirectASKResult{Found: reservation != nil, Reservation: reservation}
+		}
+		response.Retryable = errors.Is(err, ErrNativeBusy)
 	case "hosted_peer_verify":
 		if req.HostedPeer == nil {
 			err = ErrConflict
