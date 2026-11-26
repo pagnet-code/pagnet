@@ -4,8 +4,10 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,7 +183,7 @@ func TestDirectChannelConsentPreviewFingerprintTerms(t *testing.T) {
 			case "installation":
 				store.installation = "different"
 			}
-			changed, err := owned.fingerprint(b)
+			changed, err := owned.fingerprint(b, f.binding.DescriptorHash)
 			if err != nil || changed == first.Fingerprint {
 				t.Fatal("changed exact terms retained old fingerprint")
 			}
@@ -204,4 +206,78 @@ func TestDirectChannelConsentPreviewFingerprintTerms(t *testing.T) {
 		t.Fatal("changed authenticated terms retained old fingerprint")
 	}
 	assertConsentPreviewClean(t, p, f, admitted, 1, false)
+}
+
+func TestDirectChannelConsentPreviewDescriptorTerms(t *testing.T) {
+	for _, role := range []string{"S", "P"} {
+		for _, kind := range []string{"peer endpoint", "peer key", "key evidence", "limits"} {
+			t.Run(role+"/"+kind, func(t *testing.T) {
+				p, f, binding, admitted := consentPreviewFixture(t, role)
+				if _, err := p.store.Enable(t.Context(), binding, 0, "enable"); err != nil {
+					t.Fatal(err)
+				}
+				first, err := p.Preview(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				peer := &f.client.descriptor.P
+				if role == "P" {
+					peer = &f.client.descriptor.S
+				}
+				switch kind {
+				case "peer endpoint":
+					peer.EndpointID = string(domain.NewID())
+				case "peer key":
+					peer.PublicKey = base64.RawURLEncoding.EncodeToString(append([]byte{9}, make([]byte, 31)...))
+				case "key evidence":
+					peer.KeyEvidenceDigest = strings.Repeat("a", 64)
+					if peer.KeyEvidenceDigest == f.binding.Descriptor.S.KeyEvidenceDigest || peer.KeyEvidenceDigest == f.binding.Descriptor.P.KeyEvidenceDigest {
+						peer.KeyEvidenceDigest = strings.Repeat("b", 64)
+					}
+				case "limits":
+					f.client.descriptor.Limits.MaxInFlight = 3 - f.client.descriptor.Limits.MaxInFlight
+					f.client.descriptor.Budget.GrantLimits.MaxInFlight = 2
+				}
+				enrollment := reconcileEnrollment(t, f.client.descriptor, time.Now())
+				if f.client.enrollment.PublicationHash != nil {
+					f.client.publication.Descriptor = f.client.descriptor
+					wire, err := f.client.publication.CanonicalBytes()
+					if err != nil {
+						t.Fatal(err)
+					}
+					enrollment = publishedEnrollment(enrollment, wire)
+				}
+				f.client.enrollment = enrollment
+				// Derive the new binding independently to prove this regression
+				// changes only terms omitted from directChannelConsentBinding.
+				sub, err := p.admit(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sub.Remove()
+				observe, err := p.observe(sub)
+				if err != nil {
+					t.Fatal(err)
+				}
+				observed, err := observe(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				derived, err := deriveDirectChannelConsentBinding(sub, p.captured, p.store.installation, observed.Binding, time.Now())
+				sub.Remove()
+				if err != nil || derived != binding {
+					t.Fatal("descriptor-only terms changed consent binding")
+				}
+				changed, err := p.Preview(t.Context())
+				if err != nil || changed.Fingerprint == first.Fingerprint {
+					t.Fatal("descriptor-only terms retained old fingerprint")
+				}
+				changed.Fingerprint = first.Fingerprint
+				if changed != first || !changed.Enabled {
+					t.Fatal("persisted selector state changed with observed terms")
+				}
+				assertConsentPreviewClean(t, p, f, admitted, 1, true)
+			})
+		}
+	}
 }

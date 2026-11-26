@@ -24,6 +24,8 @@ type directChannelConsentPreview struct {
 	observe  func(*DirectEndpointSubscription) (directEndpointReconcileObserver, error)
 }
 
+// Revision and Enabled report persisted selector state. Eligibility for the
+// observed terms requires separate exact-binding validation.
 type directChannelConsentPreviewSummary struct {
 	Selector                               directChannelConsentKey
 	LocalPrincipal, PeerPrincipal, GrantID string
@@ -145,22 +147,23 @@ func (p *directChannelConsentPreview) Preview(ctx context.Context) (result direc
 		return result, errDirectChannelConsent
 	}
 	// A fixed, map-free JSON representation binds the complete exact terms to
-	// the owned authenticated scope, installation and retained issue. Revisions
-	// are informational and deliberately do not change a terms fingerprint.
-	fingerprint, err := p.fingerprint(binding)
+	// the authenticated descriptor, owned scope, installation and retained issue.
+	// Revisions are informational and do not change a terms fingerprint.
+	fingerprint, err := p.fingerprint(binding, observed.Binding.DescriptorHash)
 	if err != nil {
 		return result, err
 	}
 	return directChannelConsentPreviewSummary{Selector: binding.Key, LocalPrincipal: binding.Key.Principal, PeerPrincipal: binding.PeerPrincipal, GrantID: binding.GrantID, GrantGeneration: binding.GrantGeneration, AuthorizationDigest: binding.AuthorizationSnapshotDigest, ExpiresAt: binding.ExpiresAt, Revision: record.Revision, Enabled: record.Enabled, Fingerprint: fingerprint}, nil
 }
 
-func (p *directChannelConsentPreview) fingerprint(binding directChannelConsentBinding) (string, error) {
+func (p *directChannelConsentPreview) fingerprint(binding directChannelConsentBinding, descriptorHash [sha256.Size]byte) (string, error) {
 	raw, err := json.Marshal(struct {
-		Binding      directChannelConsentBinding
-		Session      transport.HostSessionPayload
-		Installation string
-		Issue        [sha256.Size]byte
-	}{binding, p.captured.Session, p.store.installation, p.issue})
+		Binding        directChannelConsentBinding
+		DescriptorHash [sha256.Size]byte
+		Session        transport.HostSessionPayload
+		Installation   string
+		Issue          [sha256.Size]byte
+	}{binding, descriptorHash, p.captured.Session, p.store.installation, p.issue})
 	if err != nil {
 		return "", errDirectChannelConsent
 	}
