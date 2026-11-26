@@ -1281,7 +1281,7 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 	nativeConn.offeredManagedDirectCredential = len(credentialOffers) == 1 && credentialOffers[0] == transport.ManagedDirectCredentialProtocol
 	nativeConn.captureDirectManagedSourceOffers(dialEndpoint.Query())
 	nativeConn.captureDirectEndpointWakeOffer(dialEndpoint.Query())
-	wake := newDirectEndpointWakeConnection(conn, nativeConn)
+	wake := newDirectEndpointWakeConnection(d, conn, nativeConn)
 	defer wake.close()
 	defer nativeConn.Close()
 	accountReadiness := newAccountMessagingReadinessSubscriptionConnection(d, conn, nativeConn)
