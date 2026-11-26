@@ -145,22 +145,22 @@ func TestEndpointMaterialContextLifetime(t *testing.T) {
 						cancel()
 					}
 					return func() {
-						released = true
-						var timeout int
-						if err := conn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {
-							t.Errorf("fence released before timeout restoration: %d %v", timeout, err)
-						}
-						if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
-							t.Errorf("fence released before transaction cleanup: %v", err)
-						} else {
-							_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-						}
-					}, func() error {
-						if kind == "cancel in check" {
-							cancel()
-						}
-						return nil
-					}, nil
+							released = true
+							var timeout int
+							if err := conn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {
+								t.Errorf("fence released before timeout restoration: %d %v", timeout, err)
+							}
+							if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+								t.Errorf("fence released before transaction cleanup: %v", err)
+							} else {
+								_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+							}
+						}, func() error {
+							if kind == "cancel in check" {
+								cancel()
+							}
+							return nil
+						}, nil
 				}
 				var recovered any
 				var err error
