@@ -202,8 +202,8 @@ func wakeAttachmentFixture(t *testing.T, source bool) (*Daemon, *directEndpointW
 	return d, lane, handle
 }
 
-func dormantWakeReconcile(context.Context) error {
-	panic("local wake attachment invoked reconciliation")
+func noopWakeReconcile(context.Context) error {
+	return nil
 }
 
 func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
@@ -219,7 +219,7 @@ func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
 				}
 			}
 			assertRejected()
-			if _, err := lane.attach(handle, dormantWakeReconcile); err != nil {
+			if _, err := lane.attach(handle, noopWakeReconcile); err != nil {
 				t.Fatal(err)
 			}
 			assertRejected()
@@ -237,7 +237,7 @@ func TestDirectEndpointWakeAttachExplicitSubscription(t *testing.T) {
 			if entry.subscription.EndpointRole != wantRole {
 				t.Fatal("wrong wire role")
 			}
-			if _, err := lane.attach(handle, dormantWakeReconcile); err != ErrNativeObservationConflict || lane.byHandle[handle] != entry || len(lane.usedIDs) != 1 {
+			if _, err := lane.attach(handle, noopWakeReconcile); err != ErrNativeObservationConflict || lane.byHandle[handle] != entry || len(lane.usedIDs) != 1 {
 				t.Fatal("duplicate replaced attachment or consumed ID", err)
 			}
 		})
@@ -248,7 +248,7 @@ func TestDirectEndpointWakeAttachRejectsInvalidBinding(t *testing.T) {
 	for _, reason := range []string{"nil", "foreign", "stale", "expired", "socket", "native", "session", "server", "native-server", "configured-server", "unnormalized-server", "role", "suite", "wake", "wake-not-selected", "installation", "installation-zero", "intent", "credential", "nil-callback", "not-current-socket", "not-current-native", "closed", "native-closed", "replaced-lane"} {
 		t.Run(reason, func(t *testing.T) {
 			d, lane, handle := wakeAttachmentFixture(t, true)
-			callback := dormantWakeReconcile
+			callback := noopWakeReconcile
 			switch reason {
 			case "nil":
 				handle = nil
@@ -350,7 +350,7 @@ func TestDirectEndpointWakeAttachLifecycle(t *testing.T) {
 	for _, reason := range []string{"revoke", "owner-close", "lane-close", "native-close"} {
 		t.Run(reason, func(t *testing.T) {
 			d, lane, handle := wakeAttachmentFixture(t, true)
-			if _, err := lane.attach(handle, dormantWakeReconcile); err != nil {
+			if _, err := lane.attach(handle, noopWakeReconcile); err != nil {
 				t.Fatal(err)
 			}
 			entry := lane.byHandle[handle]
@@ -379,7 +379,7 @@ func TestDirectEndpointWakeAttachCapacity(t *testing.T) {
 				if i != 0 {
 					handle = d.directSubscriptions.add(first.binding)
 				}
-				_, err := lane.attach(handle, dormantWakeReconcile)
+				_, err := lane.attach(handle, noopWakeReconcile)
 				if i == 64 {
 					if err != ErrNativeObservationCapacity {
 						t.Fatal("65th lifetime ID accepted", err)
@@ -406,10 +406,17 @@ func TestDirectEndpointWakeAttachCapacity(t *testing.T) {
 
 func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	d, old, stale := wakeAttachmentFixture(t, true)
-	if _, err := old.attach(stale, dormantWakeReconcile); err != nil {
+	started, canceled := make(chan struct{}), make(chan struct{})
+	if _, err := old.attach(stale, func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		return ctx.Err()
+	}); err != nil {
 		t.Fatal(err)
 	}
 	entry := old.byHandle[stale]
+	waitWakeAbortSignal(t, started)
 	native, session := wakeNative(t, wakeOffer(true))
 	if err := native.Admit(session); err != nil {
 		t.Fatal(err)
@@ -424,7 +431,11 @@ func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	d.curConn, d.nativeConn = socket, native
 	d.connMu.Unlock()
 	waitWakeAttachmentRemoved(t, old, entry)
-	if _, err := next.attach(stale, dormantWakeReconcile); err != ErrNativeObservationConflict {
+	waitWakeAbortSignal(t, canceled)
+	if entry.TerminalError() != context.Canceled {
+		t.Fatal("replacement lost old callback cancellation")
+	}
+	if _, err := next.attach(stale, noopWakeReconcile); err != ErrNativeObservationConflict {
 		t.Fatal("replacement inherited stale attachment", err)
 	}
 	binding := stale.binding
@@ -435,12 +446,14 @@ func TestDirectEndpointWakeAttachReplacementSocket(t *testing.T) {
 	}
 	binding.sessionIdentity = string(raw)
 	fresh := d.directSubscriptions.add(binding)
-	if _, err := old.attach(fresh, dormantWakeReconcile); err != ErrNativeObservationConflict {
+	if _, err := old.attach(fresh, noopWakeReconcile); err != ErrNativeObservationConflict {
 		t.Fatal("old lane accepted replacement handle", err)
 	}
-	if _, err := next.attach(fresh, dormantWakeReconcile); err != nil {
+	freshStarted := make(chan struct{})
+	if _, err := next.attach(fresh, func(context.Context) error { close(freshStarted); return nil }); err != nil {
 		t.Fatal(err)
 	}
+	waitWakeAbortSignal(t, freshStarted)
 	nextEntry := next.byHandle[fresh]
 	stale.Remove()
 	old.close()
@@ -462,7 +475,7 @@ func TestDirectEndpointWakeAttachRemoveReplaceRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := lane.attach(handle, dormantWakeReconcile)
+			_, err := lane.attach(handle, noopWakeReconcile)
 			result <- err
 		}()
 		go func() {
@@ -505,11 +518,11 @@ func TestDirectEndpointWakeAttachRemoveReplaceRace(t *testing.T) {
 func TestDirectEndpointWakeAttachExactRemoval(t *testing.T) {
 	d, lane, old := wakeAttachmentFixture(t, true)
 	fresh := d.directSubscriptions.add(old.binding)
-	if _, err := lane.attach(old, dormantWakeReconcile); err != nil {
+	if _, err := lane.attach(old, noopWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	oldEntry := lane.byHandle[old]
-	if _, err := lane.attach(fresh, dormantWakeReconcile); err != nil {
+	if _, err := lane.attach(fresh, noopWakeReconcile); err != nil {
 		t.Fatal(err)
 	}
 	freshEntry := lane.byHandle[fresh]
