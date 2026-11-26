@@ -75,7 +75,7 @@ func TestDirectReconcileProofSubmitAndReceipt(t *testing.T) {
 				t.Fatal("PUT response was treated as authenticated receipt")
 			}
 			state, err = f.run(t.Context())
-			if err != nil || state != directReconcileProofObserved || len(f.client.proofs) != 1 {
+			if err != nil || state != directReconcileActivationRequested || len(f.client.proofs) != 1 {
 				t.Fatalf("proof receipt: %s %v", state, err)
 			}
 			observed, err := readPassJournal(f.f.d.nativeRegistry)
@@ -110,7 +110,7 @@ func TestDirectReconcileProofUnknownHTTP(t *testing.T) {
 						t.Fatal(err)
 					}
 					if accepted {
-						if state != directReconcileProofObserved || len(f.client.proofs) != 1 {
+						if state != directReconcileActivationRequested || len(f.client.proofs) != 1 {
 							t.Fatal("accepted proof resent")
 						}
 					} else if state != directReconcileProofSubmitted || len(f.client.proofs) != 2 || !bytes.Equal(original, f.client.proofs[1]) {
@@ -178,7 +178,7 @@ func TestDirectReconcileProofExpiredChallengeReceipt(t *testing.T) {
 					f.client.enrollment.ObservedAt = time.Now().UTC()
 					state, err := f.run(t.Context())
 					if receipt {
-						if err != nil || state != directReconcileProofObserved {
+						if err != nil || state != directReconcileActivationRequested {
 							t.Fatalf("historical receipt rejected: %s %v", state, err)
 						}
 					} else if err != errDirectEndpointReconcileChallengeExpired || state != "" {
@@ -221,7 +221,7 @@ func TestDirectReconcileProofReceiptFailClosed(t *testing.T) {
 						if state, err := f.run(t.Context()); err != nil || state != directReconcileProofSubmitted {
 							t.Fatal("proof setup failed")
 						}
-						if state, err := f.run(t.Context()); err != nil || state != directReconcileProofObserved {
+						if state, err := f.run(t.Context()); err != nil || state != directReconcileActivationRequested {
 							t.Fatal("receipt setup failed")
 						}
 						switch kind {
@@ -565,11 +565,11 @@ func TestDirectReconcileProofReceiptUnknownCommit(t *testing.T) {
 					}
 					state, err := f.run(t.Context())
 					connector.exec = nil
-					if err == nil || state != "" || !injected || len(f.client.proofs) != 1 {
+					if err == nil || state != "" || !injected || len(f.client.proofs) != 1 || len(f.client.activations) != 0 {
 						t.Fatal("uncertain receipt COMMIT resent proof")
 					}
 					state, err = f.run(t.Context())
-					if err != nil || state != directReconcileProofObserved || len(f.client.proofs) != 1 {
+					if err != nil || state != directReconcileActivationRequested || len(f.client.proofs) != 1 {
 						t.Fatal("fresh GET failed receipt COMMIT recovery")
 					}
 				})

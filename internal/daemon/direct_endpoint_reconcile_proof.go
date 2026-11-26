@@ -47,7 +47,7 @@ func reconcileDirectReadinessProof(ctx context.Context, s *DirectEndpointSubscri
 		if err := s.operationCurrentContextError(ctx); err != nil {
 			return "", err
 		}
-		return directReconcileProofObserved, nil
+		return reconcileDirectActivation(ctx, s, registry, observed, publication, binding, row, credentialID, intent, role, client, now, operate)
 	}
 	if local.ProofReceivedAt != "" || len(local.Activation) != 0 {
 		return "", errDirectEnrollment
