@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"io"
@@ -30,9 +31,9 @@ type endpointMaterialScope struct {
 // not the short installation deadline. Both functions are mandatory on success.
 type endpointMaterialFence func(*sql.Conn) (release func(), check func() error, err error)
 
-// endpointMaterial exists only during a synchronous daemon callback. Both slices
-// are cleared when the callback returns, including panic unwinding. Never retain
-// or export either slice. Formatting deliberately reveals no bytes.
+// endpointMaterial belongs to a synchronous daemon use scope. Both slices are
+// cleared when that scope returns, including panic unwinding. Never retain or
+// export either slice. Formatting deliberately reveals no bytes.
 type endpointMaterial struct {
 	secret  []byte
 	private []byte
@@ -41,3 +42,23 @@ type endpointMaterial struct {
 func (endpointMaterial) Format(state fmt.State, verb rune) {
 	_, _ = io.WriteString(state, "endpointMaterial{closed}")
 }
+
+// loadEndpointMaterial copies validated installed custody while authority is
+// fenced. On return every store lock and reservation has been released. The
+// caller owns this copy and must clear it, including during panic unwinding.
+func loadEndpointMaterial(custody directEndpointCustodyUse, verify func() error, fence endpointMaterialFence) (material endpointMaterial, err error) {
+	complete := false
+	defer func() {
+		if !complete {
+			material.clear()
+		}
+	}()
+	err = custody(verify, fence, func(source endpointMaterial) error {
+		material = endpointMaterial{secret: bytes.Clone(source.secret), private: bytes.Clone(source.private)}
+		return nil
+	})
+	complete = err == nil
+	return material, err
+}
+
+func (m endpointMaterial) clear() { clear(m.secret); clear(m.private) }
