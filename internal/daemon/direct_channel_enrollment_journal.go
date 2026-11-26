@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const directEnrollmentNamespace = "direct-channel-enrollment-v1"
@@ -75,6 +77,16 @@ func newDirectEnrollmentJournal(r *NativeWorkerRegistry) (*directEnrollmentJourn
 	err := j.locked(func(c *sql.Conn, key []byte) error { return nil })
 	if err != nil {
 		return nil, errDirectEnrollment
+	}
+	return j, nil
+}
+func newDirectEnrollmentJournalContext(ctx context.Context, r *NativeWorkerRegistry) (*directEnrollmentJournal, error) {
+	if r == nil {
+		return nil, errDirectEnrollment
+	}
+	j := &directEnrollmentJournal{registry: r}
+	if err := j.lockedContext(ctx, func(*sql.Conn, []byte) error { return nil }); err != nil {
+		return nil, err
 	}
 	return j, nil
 }
@@ -199,12 +211,26 @@ func (r directEnrollmentRecord) validate() error {
 	return nil
 }
 func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error {
+	return j.lockedWithContext(context.Background(), false, fn)
+}
+func (j *directEnrollmentJournal) lockedContext(ctx context.Context, fn func(*sql.Conn, []byte) error) error {
+	return j.lockedWithContext(ctx, true, fn)
+}
+func (j *directEnrollmentJournal) lockedWithContext(ctx context.Context, bounded bool, fn func(*sql.Conn, []byte) error) (resultErr error) {
 	if j == nil || j.registry == nil {
 		return errDirectEnrollment
 	}
 	r := j.registry
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if bounded {
+		unlock, err := directEndpointTryLock(ctx, &r.mu)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	} else {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+	}
 	if j.poisoned {
 		return errDirectEnrollment
 	}
@@ -216,7 +242,12 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 	if e = nativeShareHolderPrivate(root, true); e != nil {
 		return e
 	}
-	custody, e := nativeRegistryCustodyLock(root)
+	var custody *os.File
+	if bounded {
+		custody, e = directEndpointTryNativeRegistryCustodyLock(ctx, root)
+	} else {
+		custody, e = nativeRegistryCustodyLock(root)
+	}
 	if e != nil {
 		return e
 	}
@@ -229,28 +260,74 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 		return e
 	}
 	defer dir.Close()
-	lock, e := nativeShareHolderLock(dir)
+	var lock *os.File
+	if bounded {
+		lock, e = directEndpointTryNativeShareHolderLockMode(ctx, dir, true)
+	} else {
+		lock, e = nativeShareHolderLock(dir)
+	}
 	if e != nil {
 		return e
 	}
 	defer lock.Close()
-	ctx := context.Background()
 	c, e := r.db.Conn(ctx)
 	if e != nil {
 		return e
 	}
 	defer c.Close()
+	committed := false
+	beginAttempted := false
+	if bounded {
+		var timeout int
+		if e = c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); e != nil {
+			return e
+		}
+		// This connection is borrowed exclusively. Cleanup outlives request
+		// cancellation and must finish before the connection returns to the pool.
+		defer func() {
+			cleanup, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			discard := func() { _ = c.Raw(func(any) error { return driver.ErrBadConn }) }
+			if beginAttempted && !committed {
+				if _, err := c.ExecContext(cleanup, "ROLLBACK"); err != nil {
+					discard()
+					if resultErr == nil {
+						resultErr = err
+					}
+					return
+				}
+			}
+			if _, err := c.ExecContext(cleanup, fmt.Sprintf("PRAGMA busy_timeout=%d", timeout)); err != nil {
+				discard()
+				if resultErr == nil {
+					resultErr = err
+				}
+			}
+		}()
+		if _, e = c.ExecContext(ctx, "PRAGMA busy_timeout=0"); e != nil {
+			return e
+		}
+	}
+	beginAttempted = true
 	if _, e = c.ExecContext(ctx, "BEGIN IMMEDIATE"); e != nil {
+		var sqliteErr *sqlite.Error
+		if bounded && errors.As(e, &sqliteErr) && (sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY || sqliteErr.Code()&0xff == sqlite3.SQLITE_LOCKED) {
+			// A refused reservation did not open a transaction. Restore the
+			// timeout without discarding the registry's configured connection.
+			beginAttempted = false
+			return errDirectEndpointLocalBusy
+		}
 		return e
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			if _, e := c.ExecContext(ctx, "ROLLBACK"); e != nil {
-				_ = c.Raw(func(any) error { return driver.ErrBadConn })
+	if !bounded {
+		defer func() {
+			if !committed {
+				if _, e := c.ExecContext(ctx, "ROLLBACK"); e != nil {
+					_ = c.Raw(func(any) error { return driver.ErrBadConn })
+				}
 			}
-		}
-	}()
+		}()
+	}
 	if _, e = nativeRegistryInspectFiles(root, r.custodyIdentity, false); e != nil {
 		return e
 	}
@@ -311,6 +388,11 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 	if e = fn(c, key); e != nil {
 		return e
 	}
+	if bounded {
+		if e = ctx.Err(); e != nil {
+			return e
+		}
+	}
 	_, e = c.ExecContext(ctx, "COMMIT")
 	committed = e == nil
 	if e != nil {
@@ -334,28 +416,34 @@ func enrollmentFenceMAC(key []byte, b directEnrollmentBinding, raw []byte) []byt
 	return enrollmentMAC(key, b, append([]byte("creation-fence/v1\x00"), raw...))
 }
 func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
+	return j.applyWithContext(context.Background(), false, s, b, change)
+}
+func (j *directEnrollmentJournal) applyContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, true, s, b, change)
+}
+func (j *directEnrollmentJournal) applyWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
 	var result directEnrollmentRecord
 	if b.validate() != nil || s == nil {
 		return result, errDirectEnrollment
 	}
-	err := j.locked(func(c *sql.Conn, key []byte) error {
+	err := j.lockedWithContext(ctx, bounded, func(c *sql.Conn, key []byte) error {
 		var installation string
-		if e := c.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&installation); e != nil || installation != b.Installation {
+		if e := c.QueryRowContext(ctx, `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&installation); e != nil || installation != b.Installation {
 			return errDirectEnrollment
 		}
 		var recordCount int
-		if e := c.QueryRowContext(context.Background(), `SELECT MAX((SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?),(SELECT COUNT(*) FROM native_direct_enrollment_v1_fences WHERE installation=?))`, b.Installation, b.Installation).Scan(&recordCount); e != nil || recordCount > directEnrollmentMaxRecords {
+		if e := c.QueryRowContext(ctx, `SELECT MAX((SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?),(SELECT COUNT(*) FROM native_direct_enrollment_v1_fences WHERE installation=?))`, b.Installation, b.Installation).Scan(&recordCount); e != nil || recordCount > directEnrollmentMaxRecords {
 			return errDirectEnrollment
 		}
 		var raw, mac []byte
-		e := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(payload)<=65536 THEN payload ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1 WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&raw, &mac)
+		e := c.QueryRowContext(ctx, `SELECT CASE WHEN length(payload)<=65536 THEN payload ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1 WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&raw, &mac)
 		exists := e == nil
 		if e != nil && !errors.Is(e, sql.ErrNoRows) {
 			return e
 		}
 		expectedBinding, _ := json.Marshal(b)
 		var fence, fenceMAC []byte
-		fenceErr := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(binding)<=65536 THEN binding ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1_fences WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&fence, &fenceMAC)
+		fenceErr := c.QueryRowContext(ctx, `SELECT CASE WHEN length(binding)<=65536 THEN binding ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1_fences WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&fence, &fenceMAC)
 		if fenceErr != nil && !errors.Is(fenceErr, sql.ErrNoRows) {
 			return fenceErr
 		}
@@ -380,8 +468,17 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 			}
 			row = directEnrollmentRecord{Version: 1, Binding: b, State: "reserved"}
 		}
-		if !j.matches(s, b) {
+		if bounded {
+			if e = j.matchesContext(ctx, s, b); e != nil {
+				return e
+			}
+		} else if !j.matches(s, b) {
 			return errDirectEnrollment
+		}
+		if bounded {
+			if e = ctx.Err(); e != nil {
+				return e
+			}
 		}
 		if e = change(&row, exists); e != nil {
 			return e
@@ -394,20 +491,30 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 			return errDirectEnrollment
 		}
 		if !hasFence {
-			if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?)`, b.Installation, b.Server, b.Channel, expectedBinding, enrollmentFenceMAC(key, b, expectedBinding)); e != nil {
+			if _, e = c.ExecContext(ctx, `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?)`, b.Installation, b.Server, b.Channel, expectedBinding, enrollmentFenceMAC(key, b, expectedBinding)); e != nil {
 				return e
 			}
 		}
-		if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, raw, enrollmentMAC(key, b, raw)); e != nil {
+		if _, e = c.ExecContext(ctx, `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, raw, enrollmentMAC(key, b, raw)); e != nil {
 			return e
 		}
-		if !j.matches(s, b) {
+		if bounded {
+			if e = j.matchesContext(ctx, s, b); e != nil {
+				return e
+			}
+		} else if !j.matches(s, b) {
 			return errDirectEnrollment
 		}
 		result = row
 		return nil
 	})
 	if err != nil {
+		if bounded && ctx.Err() != nil {
+			return directEnrollmentRecord{}, ctx.Err()
+		}
+		if bounded && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errDirectEndpointLocalBusy)) {
+			return directEnrollmentRecord{}, err
+		}
 		return directEnrollmentRecord{}, errDirectEnrollment
 	}
 	return result, nil
@@ -415,6 +522,29 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 func (j *directEnrollmentJournal) matches(s *DirectEndpointSubscription, b directEnrollmentBinding) bool {
 	m := s.binding.metadata
 	return s.Valid() && enrollmentSubscriptionParty(s, b) && string(m.InstallationID) == b.Installation && m.ServerOrigin == b.Server && string(m.CredentialID) == b.Credential && m.Role == b.Role && s.binding.issueDigest == b.IssueDigest && string(s.binding.subject.InstanceID) == b.Instance && s.binding.subject.OwnershipGeneration == b.Generation && s.binding.subject.NativeGeneration == b.NativeGeneration
+}
+
+func (j *directEnrollmentJournal) matchesContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding) error {
+	if s == nil || s.owner == nil {
+		return errDirectEnrollment
+	}
+	unlock, err := directEndpointTryLock(ctx, &s.owner.mu)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, ok := s.owner.entries[s]; !ok {
+		return errDirectEnrollment
+	}
+	if !time.Now().Before(s.binding.metadata.Deadline) {
+		s.owner.removeLocked(s)
+		return errDirectEnrollment
+	}
+	m := s.binding.metadata
+	if !enrollmentSubscriptionParty(s, b) || string(m.InstallationID) != b.Installation || m.ServerOrigin != b.Server || string(m.CredentialID) != b.Credential || m.Role != b.Role || s.binding.issueDigest != b.IssueDigest || string(s.binding.subject.InstanceID) != b.Instance || s.binding.subject.OwnershipGeneration != b.Generation || s.binding.subject.NativeGeneration != b.NativeGeneration {
+		return errDirectEnrollment
+	}
+	return nil
 }
 
 func enrollmentSubscriptionParty(s *DirectEndpointSubscription, b directEnrollmentBinding) bool {
@@ -431,7 +561,13 @@ func enrollmentSubscriptionParty(s *DirectEndpointSubscription, b directEnrollme
 }
 
 func (j *directEnrollmentJournal) reserve(s *DirectEndpointSubscription, b directEnrollmentBinding) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error { return nil })
+	return j.reserveWithContext(context.Background(), false, s, b)
+}
+func (j *directEnrollmentJournal) reserveContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding) (directEnrollmentRecord, error) {
+	return j.reserveWithContext(ctx, true, s, b)
+}
+func (j *directEnrollmentJournal) reserveWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error { return nil })
 }
 
 // material atomically installs one candidate before any dispatch is possible.
@@ -439,7 +575,13 @@ func (j *directEnrollmentJournal) reserve(s *DirectEndpointSubscription, b direc
 // HTTP, IPC, custody operations, or retain the candidate. A failed COMMIT poisons
 // this handle; callers must reopen and read the durable row before trying again.
 func (j *directEnrollmentJournal) material(s *DirectEndpointSubscription, b directEnrollmentBinding, generate func() ([]byte, []byte, error)) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.materialWithContext(context.Background(), false, s, b, generate)
+}
+func (j *directEnrollmentJournal) materialContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, generate func() ([]byte, []byte, error)) (directEnrollmentRecord, error) {
+	return j.materialWithContext(ctx, true, s, b, generate)
+}
+func (j *directEnrollmentJournal) materialWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, generate func() ([]byte, []byte, error)) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists {
 			return errDirectEnrollment
 		}
@@ -464,7 +606,13 @@ func (j *directEnrollmentJournal) material(s *DirectEndpointSubscription, b dire
 
 // bindProof retains one immutable server challenge and exact local proof. No cryptography or dispatch occurs here.
 func (j *directEnrollmentJournal) bindProof(s *DirectEndpointSubscription, b directEnrollmentBinding, challenge, proof []byte) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.bindProofWithContext(context.Background(), false, s, b, challenge, proof)
+}
+func (j *directEnrollmentJournal) bindProofContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, challenge, proof []byte) (directEnrollmentRecord, error) {
+	return j.bindProofWithContext(ctx, true, s, b, challenge, proof)
+}
+func (j *directEnrollmentJournal) bindProofWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, challenge, proof []byte) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || len(proof) == 0 {
 			return errDirectEnrollment
 		}
@@ -480,7 +628,13 @@ func (j *directEnrollmentJournal) bindProof(s *DirectEndpointSubscription, b dir
 // markDispatch persists each attempt before traffic. A previous unknown outcome
 // requires authoritative absence before exact immutable bytes may be replayed.
 func (j *directEnrollmentJournal) markDispatch(s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.markDispatchWithContext(context.Background(), false, s, b, kind)
+}
+func (j *directEnrollmentJournal) markDispatchContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.markDispatchWithContext(ctx, true, s, b, kind)
+}
+func (j *directEnrollmentJournal) markDispatchWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || !r.dispatchKind(kind) {
 			return errDirectEnrollment
 		}
@@ -521,7 +675,13 @@ func (r *directEnrollmentRecord) importLegacyAttempts() {
 // observeAbsent records only authoritative GET absence. It does not assert an
 // earlier request cannot still commit, so subsequent attempts reuse stored bytes.
 func (j *directEnrollmentJournal) observeAbsent(s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.observeAbsentWithContext(context.Background(), false, s, b, kind)
+}
+func (j *directEnrollmentJournal) observeAbsentContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.observeAbsentWithContext(ctx, true, s, b, kind)
+}
+func (j *directEnrollmentJournal) observeAbsentWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || !r.dispatchKind(kind) {
 			return errDirectEnrollment
 		}
@@ -533,7 +693,13 @@ func (j *directEnrollmentJournal) observeAbsent(s *DirectEndpointSubscription, b
 	})
 }
 func (j *directEnrollmentJournal) observePublication(s *DirectEndpointSubscription, b directEnrollmentBinding, hash [32]byte) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.observePublicationWithContext(context.Background(), false, s, b, hash)
+}
+func (j *directEnrollmentJournal) observePublicationContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, hash [32]byte) (directEnrollmentRecord, error) {
+	return j.observePublicationWithContext(ctx, true, s, b, hash)
+}
+func (j *directEnrollmentJournal) observePublicationWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, hash [32]byte) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || hash != r.PublicationHash {
 			return errDirectEnrollment
 		}
@@ -542,7 +708,13 @@ func (j *directEnrollmentJournal) observePublication(s *DirectEndpointSubscripti
 	})
 }
 func (j *directEnrollmentJournal) observeChallenge(s *DirectEndpointSubscription, b directEnrollmentBinding, challenge []byte) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.observeChallengeWithContext(context.Background(), false, s, b, challenge)
+}
+func (j *directEnrollmentJournal) observeChallengeContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, challenge []byte) (directEnrollmentRecord, error) {
+	return j.observeChallengeWithContext(ctx, true, s, b, challenge)
+}
+func (j *directEnrollmentJournal) observeChallengeWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, challenge []byte) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || len(challenge) == 0 || (len(r.Challenge) > 0 && !bytes.Equal(challenge, r.Challenge)) {
 			return errDirectEnrollment
 		}
@@ -557,7 +729,13 @@ func enrollmentObservedTime(value string, b directEnrollmentBinding) bool {
 	return err == nil && e == nil && ex == nil && !t.IsZero() && !t.After(expiry)
 }
 func (j *directEnrollmentJournal) observeProof(s *DirectEndpointSubscription, b directEnrollmentBinding, digest [32]byte, receivedAt string) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.observeProofWithContext(context.Background(), false, s, b, digest, receivedAt)
+}
+func (j *directEnrollmentJournal) observeProofContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, digest [32]byte, receivedAt string) (directEnrollmentRecord, error) {
+	return j.observeProofWithContext(ctx, true, s, b, digest, receivedAt)
+}
+func (j *directEnrollmentJournal) observeProofWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, digest [32]byte, receivedAt string) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || len(r.Proof) == 0 || digest != enrollmentHash(r.Proof) || !enrollmentObservedTime(receivedAt, b) || (r.ProofReceivedAt != "" && r.ProofReceivedAt != receivedAt) {
 			return errDirectEnrollment
 		}
@@ -569,7 +747,13 @@ func (j *directEnrollmentJournal) observeProof(s *DirectEndpointSubscription, b 
 type directEnrollmentActivation struct{ ChannelID, ActivatedAt, ExpiresAt string }
 
 func (j *directEnrollmentJournal) observeActivation(s *DirectEndpointSubscription, b directEnrollmentBinding, channelID, activatedAt, expiresAt string) (directEnrollmentRecord, error) {
-	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+	return j.observeActivationWithContext(context.Background(), false, s, b, channelID, activatedAt, expiresAt)
+}
+func (j *directEnrollmentJournal) observeActivationContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding, channelID, activatedAt, expiresAt string) (directEnrollmentRecord, error) {
+	return j.observeActivationWithContext(ctx, true, s, b, channelID, activatedAt, expiresAt)
+}
+func (j *directEnrollmentJournal) observeActivationWithContext(ctx context.Context, bounded bool, s *DirectEndpointSubscription, b directEnrollmentBinding, channelID, activatedAt, expiresAt string) (directEnrollmentRecord, error) {
+	return j.applyWithContext(ctx, bounded, s, b, func(r *directEnrollmentRecord, exists bool) error {
 		if !exists || r.State != "material" || len(r.Proof) == 0 || channelID != b.Channel || !enrollmentObservedTime(activatedAt, b) || !enrollmentObservedTime(expiresAt, b) {
 			return errDirectEnrollment
 		}
