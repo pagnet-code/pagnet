@@ -31,6 +31,8 @@ type directChannelConsentPreviewSummary struct {
 	LocalPrincipal, PeerPrincipal, GrantID string
 	GrantGeneration                        int64
 	AuthorizationDigest, ExpiresAt         string
+	Budget                                 transport.DirectChannelBudgetV2
+	Limits                                 transport.DirectChannelLimitsV2
 	Revision                               int64
 	Enabled                                bool
 	Fingerprint                            string
@@ -153,7 +155,7 @@ func (p *directChannelConsentPreview) Preview(ctx context.Context) (result direc
 	if err != nil {
 		return result, err
 	}
-	return directChannelConsentPreviewSummary{Selector: binding.Key, LocalPrincipal: binding.Key.Principal, PeerPrincipal: binding.PeerPrincipal, GrantID: binding.GrantID, GrantGeneration: binding.GrantGeneration, AuthorizationDigest: binding.AuthorizationSnapshotDigest, ExpiresAt: binding.ExpiresAt, Revision: record.Revision, Enabled: record.Enabled, Fingerprint: fingerprint}, nil
+	return directChannelConsentPreviewSummary{Selector: binding.Key, LocalPrincipal: binding.Key.Principal, PeerPrincipal: binding.PeerPrincipal, GrantID: binding.GrantID, GrantGeneration: binding.GrantGeneration, AuthorizationDigest: binding.AuthorizationSnapshotDigest, ExpiresAt: binding.ExpiresAt, Budget: observed.Binding.Descriptor.Budget, Limits: observed.Binding.Descriptor.Limits, Revision: record.Revision, Enabled: record.Enabled, Fingerprint: fingerprint}, nil
 }
 
 func (p *directChannelConsentPreview) fingerprint(binding directChannelConsentBinding, descriptorHash [sha256.Size]byte) (string, error) {

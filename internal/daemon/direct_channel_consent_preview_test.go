@@ -81,6 +81,9 @@ func TestDirectChannelConsentPreviewRoles(t *testing.T) {
 				if first.Selector != binding.Key || first.LocalPrincipal != binding.Key.Principal || first.PeerPrincipal != binding.PeerPrincipal || first.GrantID != binding.GrantID || first.GrantGeneration != binding.GrantGeneration || first.AuthorizationDigest != binding.AuthorizationSnapshotDigest || first.ExpiresAt != binding.ExpiresAt || first.Revision != revision || first.Enabled != enabled || len(first.Fingerprint) != 64 {
 					t.Fatal("incorrect public summary")
 				}
+				if first.Budget != f.binding.Descriptor.Budget || first.Limits != f.binding.Descriptor.Limits {
+					t.Fatal("summary omitted authenticated budget or effective limits")
+				}
 				if len(f.client.calls) < 2 || f.client.calls[0] != "descriptor" || f.client.calls[1] != "enrollment" {
 					t.Fatal("missing authenticated observation")
 				}
@@ -210,7 +213,7 @@ func TestDirectChannelConsentPreviewFingerprintTerms(t *testing.T) {
 
 func TestDirectChannelConsentPreviewDescriptorTerms(t *testing.T) {
 	for _, role := range []string{"S", "P"} {
-		for _, kind := range []string{"peer endpoint", "peer key", "key evidence", "limits"} {
+		for _, kind := range []string{"peer endpoint", "peer key", "key evidence", "limits", "budget limits"} {
 			t.Run(role+"/"+kind, func(t *testing.T) {
 				p, f, binding, admitted := consentPreviewFixture(t, role)
 				if _, err := p.store.Enable(t.Context(), binding, 0, "enable"); err != nil {
@@ -237,6 +240,9 @@ func TestDirectChannelConsentPreviewDescriptorTerms(t *testing.T) {
 				case "limits":
 					f.client.descriptor.Limits.MaxInFlight = 3 - f.client.descriptor.Limits.MaxInFlight
 					f.client.descriptor.Budget.GrantLimits.MaxInFlight = 2
+				case "budget limits":
+					f.client.descriptor.Budget.GrantLimits.MaxInFlight = 3 - f.client.descriptor.Budget.GrantLimits.MaxInFlight
+					f.client.descriptor.Limits.MaxInFlight = 1
 				}
 				enrollment := reconcileEnrollment(t, f.client.descriptor, time.Now())
 				if f.client.enrollment.PublicationHash != nil {
@@ -272,7 +278,11 @@ func TestDirectChannelConsentPreviewDescriptorTerms(t *testing.T) {
 				if err != nil || changed.Fingerprint == first.Fingerprint {
 					t.Fatal("descriptor-only terms retained old fingerprint")
 				}
+				if changed.Budget != f.client.descriptor.Budget || changed.Limits != f.client.descriptor.Limits || (kind == "limits" && changed.Limits == first.Limits) || (kind == "budget limits" && changed.Budget == first.Budget) {
+					t.Fatal("summary did not reflect changed authenticated budget or limits")
+				}
 				changed.Fingerprint = first.Fingerprint
+				changed.Budget, changed.Limits = first.Budget, first.Limits
 				if changed != first || !changed.Enabled {
 					t.Fatal("persisted selector state changed with observed terms")
 				}
