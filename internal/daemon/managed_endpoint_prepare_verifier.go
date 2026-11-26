@@ -76,7 +76,7 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 }
 
 // The injected verifier must provide its own bounded RPC and failure lifecycle.
-// The endpoint RPC entry point remains legacy until that prerequisite is complete.
+// Endpoint operations supply the bounded ownership RPC and its abort lifecycle.
 func (d *Daemon) verifyNativeManagedSubjectTokenContext(ctx context.Context, captured ManagedEndpointPrepareScope, configuredServer string, s nativeManagedSubject, verify func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error)) (*nativeWorkerPublicationToken, error) {
 	return d.verifyNativeManagedSubjectTokenContextMode(ctx, true, captured, configuredServer, s, verify)
 }

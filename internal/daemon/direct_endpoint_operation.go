@@ -21,11 +21,13 @@ var (
 	errDirectEndpointOperationUnknown  = errors.New("direct endpoint operation outcome unknown")
 )
 
+// Operation custody receives the derived lease context; admission custody stays unchanged.
+type directEndpointOperationCustodyUse func(context.Context, func() error, endpointMaterialFence, func(endpointMaterial) error) error
+
 // operateManagedTargetEndpoint and operateDirectManagedSourceEndpointV2 are
 // daemon-private prerequisites only: they install no transport or coordinator.
 func (d *Daemon) operateManagedTargetEndpoint(ctx context.Context, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.ManagedDirectCredentialIssue, use func(context.Context, endpointMaterial) error) error {
-	e, err := newLocalManagedDirectCredential(d)
-	if err != nil {
+	if d == nil || s == nil {
 		return errDirectEndpointOperationRejected
 	}
 	raw, err := issue.CanonicalBytes()
@@ -34,17 +36,20 @@ func (d *Daemon) operateManagedTargetEndpoint(ctx context.Context, captured Mana
 	}
 	subject := nativeManagedSubjectFromEndpoint(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Authorization.ExpiresAt
-	scope := endpointMaterialScope{e.keys.installation, issue.CredentialID, "P", endpointMaterialLiveUse}
-	return d.operateDirectEndpoint(ctx, captured, s, raw, subject, managedDirectCredentialProtocolV1, issue.IssuedAt, scope, func(verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
-		return e.keys.withManagedTargetEndpointMaterial(issue, issue.PoP.ACK.Reservation.ServerURL, captured.Session, scope, func(transport.ManagedDirectCredentialIssue, string, transport.HostSessionPayload) error {
+	scope := endpointMaterialScope{s.binding.metadata.InstallationID, s.binding.metadata.CredentialID, "P", endpointMaterialLiveUse}
+	return d.operateDirectEndpoint(ctx, captured, s, raw, subject, managedDirectCredentialProtocolV1, issue.IssuedAt, scope, func(opctx context.Context, verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+		keys, err := newManagedEndpointKeyStoreContext(opctx, d.nativeRegistry)
+		if err != nil || keys.installation != scope.installation {
+			return errDirectEndpointOperationRejected
+		}
+		return keys.withManagedTargetEndpointMaterialContext(opctx, issue, issue.PoP.ACK.Reservation.ServerURL, captured.Session, scope, func(transport.ManagedDirectCredentialIssue, string, transport.HostSessionPayload) error {
 			return verify()
 		}, fence, use)
 	}, d.verifyDirectEndpointToken, use)
 }
 
 func (d *Daemon) operateDirectManagedSourceEndpointV2(ctx context.Context, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2, use func(context.Context, endpointMaterial) error) error {
-	e, err := newLocalDirectManagedSourceCredentialV2(d)
-	if err != nil {
+	if d == nil || s == nil {
 		return errDirectEndpointOperationRejected
 	}
 	raw, err := issue.CanonicalBytes()
@@ -53,9 +58,13 @@ func (d *Daemon) operateDirectManagedSourceEndpointV2(ctx context.Context, captu
 	}
 	subject := nativeManagedSubjectFromSourceV2(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Prepare.Subject.AuthorizationExpiresAt
-	scope := endpointMaterialScope{e.keys.installation, issue.CredentialID, "S", endpointMaterialLiveUse}
-	return d.operateDirectEndpoint(ctx, captured, s, raw, subject, directManagedSourceCredentialProtocolV2, issue.IssuedAt, scope, func(verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
-		return e.keys.withDirectManagedSourceEndpointMaterialV2(issue, issue.PoP.ACK.Reservation.ServerURL, captured.Session, scope, func(transport.DirectManagedSourceCredentialIssueV2, string, transport.HostSessionPayload) error {
+	scope := endpointMaterialScope{s.binding.metadata.InstallationID, s.binding.metadata.CredentialID, "S", endpointMaterialLiveUse}
+	return d.operateDirectEndpoint(ctx, captured, s, raw, subject, directManagedSourceCredentialProtocolV2, issue.IssuedAt, scope, func(opctx context.Context, verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+		keys, err := newDirectManagedSourceKeyStoreV2Context(opctx, d.nativeRegistry)
+		if err != nil || keys.installation != scope.installation {
+			return errDirectEndpointOperationRejected
+		}
+		return keys.withDirectManagedSourceEndpointMaterialV2Context(opctx, issue, issue.PoP.ACK.Reservation.ServerURL, captured.Session, scope, func(transport.DirectManagedSourceCredentialIssueV2, string, transport.HostSessionPayload) error {
 			return verify()
 		}, fence, use)
 	}, d.verifyDirectEndpointToken, use)
@@ -66,8 +75,8 @@ func (d *Daemon) operateDirectManagedSourceEndpointV2(ctx context.Context, captu
 // revoke it without waiting for a callback. No registry, namespace, transaction,
 // or lifecycle lock is held during use. use is synchronous and must not retain
 // material; a nil return is trusted only while this exact lease remains live.
-func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, raw []byte, subject nativeManagedSubject, variant directManagedSourceCredentialProtocolVariant, issuedAt time.Time, scope endpointMaterialScope, custody directEndpointCustodyUse, verifyToken func(context.Context, ManagedEndpointPrepareScope, string, nativeManagedSubject) (*nativeWorkerPublicationToken, error), use func(context.Context, endpointMaterial) error) (err error) {
-	if d == nil || ctx == nil || s == nil || s.owner != &d.directSubscriptions || custody == nil || verifyToken == nil || use == nil || !s.Valid() {
+func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, raw []byte, subject nativeManagedSubject, variant directManagedSourceCredentialProtocolVariant, issuedAt time.Time, scope endpointMaterialScope, custody directEndpointOperationCustodyUse, verifyToken func(context.Context, ManagedEndpointPrepareScope, string, nativeManagedSubject) (*nativeWorkerPublicationToken, error), use func(context.Context, endpointMaterial) error) (err error) {
+	if d == nil || ctx == nil || s == nil || s.owner != &d.directSubscriptions || custody == nil || verifyToken == nil || use == nil || !s.operationCurrentContext(ctx) {
 		return errDirectEndpointOperationRejected
 	}
 	binding := s.binding
@@ -90,7 +99,7 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 		}
 	}()
 	defer func() { cancel(); <-watcherDone }()
-	live := func() bool { return s.operationCurrent(opctx) }
+	live := func() bool { return s.operationCurrentContext(opctx) }
 	lane := newDirectManagedSourceCredentialPublicationLane()
 	stop := context.AfterFunc(opctx, lane.cancel)
 	defer stop()
@@ -103,8 +112,8 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 		if verifyErr != nil || fresh == nil || fresh.link != binding.link || fresh.proxy != binding.proxy || !reflect.DeepEqual(fresh.subject, subject) {
 			return errDirectEndpointOperationRejected
 		}
-		epoch, current := fresh.proxy.directEndpointAuthority(subject)
-		if !current || fresh.endpointEpoch != epoch {
+		epoch, current, authorityErr := fresh.proxy.directEndpointAuthorityContext(opctx, subject)
+		if authorityErr != nil || !current || fresh.endpointEpoch != epoch {
 			return errDirectEndpointOperationRejected
 		}
 		fresh.endpointUse = true
@@ -115,7 +124,7 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 		if !live() {
 			return nil, nil, errDirectEndpointOperationRejected
 		}
-		release, fenceErr := d.credentialPublicationFence(token, captured, lane, subject, nativeManagedSessionMatches(subject, captured.Session), variant, issuedAt, binding.metadata.Deadline, binding.metadata.Deadline, binding.metadata.Deadline)(conn, binding.metadata.ServerOrigin, captured.Session)
+		release, fenceErr := d.credentialPublicationFenceContext(opctx, token, captured, lane, subject, nativeManagedSessionMatches(subject, captured.Session), variant, issuedAt, binding.metadata.Deadline, binding.metadata.Deadline, binding.metadata.Deadline)(conn, binding.metadata.ServerOrigin, captured.Session)
 		return release, func() error {
 			if !live() {
 				return errDirectEndpointOperationRejected
@@ -123,7 +132,9 @@ func (d *Daemon) operateDirectEndpoint(ctx context.Context, captured ManagedEndp
 			return nil
 		}, fenceErr
 	}
-	material, loadErr := loadEndpointMaterial(custody, verify, fence)
+	material, loadErr := loadEndpointMaterial(func(verify func() error, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+		return custody(opctx, verify, fence, use)
+	}, verify, fence)
 	defer material.clear()
 	if loadErr != nil || !live() {
 		return errDirectEndpointOperationRejected
@@ -158,4 +169,38 @@ func (s *DirectEndpointSubscription) operationCurrent(ctx context.Context) bool 
 		return false
 	}
 	return true
+}
+
+// operationCurrentContext bounds lease acceptance lock acquisition and checks
+// abort both before and after taking the subscription leaf lock.
+func (s *DirectEndpointSubscription) operationCurrentContext(ctx context.Context) bool {
+	return s.operationCurrentContextError(ctx) == nil
+}
+
+func (s *DirectEndpointSubscription) operationCurrentContextError(ctx context.Context) error {
+	if s == nil || s.owner == nil || ctx == nil {
+		return errDirectEndpointOperationRejected
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.aborted() {
+		return errDirectEndpointOperationRejected
+	}
+	unlock, err := directEndpointTryLock(ctx, &s.owner.mu)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := s.owner.entries[s]; !ok || s.aborted() {
+		return errDirectEndpointOperationRejected
+	}
+	if !time.Now().Before(s.binding.metadata.Deadline) {
+		s.owner.removeLocked(s)
+		return errDirectEndpointOperationRejected
+	}
+	return nil
 }

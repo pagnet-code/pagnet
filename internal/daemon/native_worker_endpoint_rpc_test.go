@@ -16,10 +16,8 @@ import (
 	"github.com/pagnet-code/pagnet/transport"
 )
 
-func endpointRPCFixture(t *testing.T, serve func(net.Conn, *NativeObservationConnection)) (*NativeWorkerProxy, *DirectEndpointSubscription) {
+func endpointRPCController(t *testing.T, scope sessionworker.Scope, native *NativeObservationConnection, serve func(net.Conn, *NativeObservationConnection)) *sessionworker.Controller {
 	t.Helper()
-	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: "tenant", AccountID: "account", HostID: "host", InstanceID: "instance", Generation: "generation"}
-	native := &NativeObservationConnection{serverURL: scope.ServerURL, hostID: scope.HostID, closed: make(chan struct{}), session: &transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID}}
 	dir := t.TempDir()
 	path, err := sessionworker.SocketPath(dir)
 	if err != nil {
@@ -32,7 +30,7 @@ func endpointRPCFixture(t *testing.T, serve func(net.Conn, *NativeObservationCon
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 	key := make([]byte, 32)
 	serverDone := make(chan struct{})
 	go func() {
@@ -67,6 +65,19 @@ func endpointRPCFixture(t *testing.T, serve func(net.Conn, *NativeObservationCon
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = controller.Close()
+		_ = listener.Close()
+		waitNativeProxySignal(t, serverDone)
+	})
+	return controller
+}
+
+func endpointRPCFixture(t *testing.T, serve func(net.Conn, *NativeObservationConnection)) (*NativeWorkerProxy, *DirectEndpointSubscription) {
+	t.Helper()
+	scope := sessionworker.Scope{ServerURL: "https://example.test", TenantID: "tenant", AccountID: "account", HostID: "host", InstanceID: "instance", Generation: "generation"}
+	native := &NativeObservationConnection{serverURL: scope.ServerURL, hostID: scope.HostID, closed: make(chan struct{}), session: &transport.HostSessionPayload{TenantID: scope.TenantID, AccountID: scope.AccountID}}
+	controller := endpointRPCController(t, scope, native, serve)
 	p := &NativeWorkerProxy{connection: native, controller: controller, scope: scope, bootstrap: sessionworker.Bootstrap{Native: sessionworker.NativeSpec{NetworkID: "network", Kind: "worker"}}, done: make(chan struct{}), abortDone: make(chan struct{})}
 	owner := &directEndpointSubscriptions{}
 	s := owner.add(directEndpointBinding{proxy: p, metadata: DirectEndpointSubscriptionMetadata{Deadline: time.Now().Add(time.Hour)}})
@@ -76,7 +87,6 @@ func endpointRPCFixture(t *testing.T, serve func(net.Conn, *NativeObservationCon
 	t.Cleanup(func() {
 		_ = p.Close()
 		waitNativeProxySignal(t, watcherDone)
-		waitNativeProxySignal(t, serverDone)
 	})
 	return p, s
 }
