@@ -341,12 +341,16 @@ func (s *DirectManagedSourceKeyStoreV2) publishCredential(dir *os.File, name str
 // CredentialEvidence verifies custody and completed installation through exact
 // replay, returning only public evidence. It never exposes secret material.
 func (s *DirectManagedSourceKeyStoreV2) CredentialEvidence(issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheckV2) (DirectManagedSourceCredentialEvidenceV2, error) {
+	return s.withCredentialEvidence(issue, configuredServer, session, verify, nil, nil)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) withCredentialEvidence(issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) (DirectManagedSourceCredentialEvidenceV2, error) {
 	p, server, raw, err := s.credentialInput(issue, configuredServer, session, verify)
 	if err != nil {
 		return DirectManagedSourceCredentialEvidenceV2{}, err
 	}
 	var result DirectManagedSourceCredentialEvidenceV2
-	err = s.withKeyLocked(false, func(conn *sql.Conn, dir *os.File) error {
+	err = s.withKeyLockedScoped(false, func(conn *sql.Conn, dir *os.File, release *func()) error {
 		if err := s.validateCredentialEvidence(conn, p, server); err != nil {
 			return err
 		}
@@ -355,7 +359,7 @@ func (s *DirectManagedSourceKeyStoreV2) CredentialEvidence(issue transport.Direc
 			return errDirectManagedSourceKeyV2
 		}
 		private, err := s.loadPoPKey(conn, dir, p.PoP.ACK.Reservation, p.PoP.Prepare)
-		clear(private)
+		defer clear(private)
 		if err != nil {
 			return err
 		}
@@ -383,6 +387,32 @@ func (s *DirectManagedSourceKeyStoreV2) CredentialEvidence(issue transport.Direc
 		if err := s.publishCredential(dir, name, canonical, true); err != nil {
 			return err
 		}
+		// Recompute immutable installation evidence only after validating both
+		// retained files. IssuedAt selects the original transcript; it grants no
+		// live authority and never repairs or publishes missing material.
+		derived, derivedACK, deriveErr := transport.DeriveDirectManagedSourceCredentialHostV2(p, private, p.IssuedAt)
+		defer clear(derived)
+		derivedCanonical, derivedACKErr := derivedACK.CanonicalBytes()
+		if deriveErr != nil || derivedACKErr != nil || !bytes.Equal(derived, retained.Secret) || !bytes.Equal(derivedCanonical, row.ACK) {
+			return errDirectManagedSourceKeyV2
+		}
+
+		if use != nil {
+			var check func() error
+			*release, check, err = fence(conn)
+			if err != nil || *release == nil || check == nil || !s.credentialUseValid(p) {
+				return errDirectManagedSourceKeyV2
+			}
+			if check() != nil {
+				return errDirectManagedSourceKeyV2
+			}
+			useErr := use(endpointMaterial{secret: retained.Secret, private: private})
+			checkErr := check()
+			if useErr != nil || checkErr != nil || !s.credentialUseValid(p) {
+				return errDirectManagedSourceKeyV2
+			}
+		}
+
 		result = row
 		return nil
 	})
@@ -396,4 +426,20 @@ func (s *DirectManagedSourceKeyStoreV2) CredentialEvidence(issue transport.Direc
 		return DirectManagedSourceCredentialEvidenceV2{}, errDirectManagedSourceKeyV2
 	}
 	return result, nil
+}
+
+// withDirectManagedSourceEndpointMaterialV2 grants temporary daemon-only use of installed material.
+// The future daemon coordinator must authenticate the exact session, worker and
+// ownership before calling, and pin that authority through fence. No callback
+// may retain material, perform worker IPC, or log it. This does not install keys.
+func (s *DirectManagedSourceKeyStoreV2) withDirectManagedSourceEndpointMaterialV2(issue transport.DirectManagedSourceCredentialIssueV2, configuredServer string, session transport.HostSessionPayload, scope endpointMaterialScope, verify DirectManagedSourceCredentialScopeCheckV2, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+	if s == nil || scope.installation != s.installation || scope.credential != issue.CredentialID || scope.role != "S" || scope.use != endpointMaterialLiveUse || fence == nil || use == nil {
+		return errDirectManagedSourceKeyV2
+	}
+	_, err := s.withCredentialEvidence(issue, configuredServer, session, verify, fence, use)
+	// Callback and filesystem errors must never carry private bytes to callers.
+	if err != nil {
+		return errDirectManagedSourceKeyV2
+	}
+	return nil
 }

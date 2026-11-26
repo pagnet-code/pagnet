@@ -383,12 +383,16 @@ func recoverManagedDirectCredentialLinks(dir *os.File, name string, raw []byte) 
 // CredentialEvidence verifies custody and completed installation through exact
 // replay, returning only public evidence. It never exposes secret material.
 func (s *ManagedEndpointKeyStore) CredentialEvidence(issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify ManagedDirectCredentialScopeCheck) (ManagedDirectCredentialEvidence, error) {
+	return s.withCredentialEvidence(issue, configuredServer, session, verify, nil, nil)
+}
+
+func (s *ManagedEndpointKeyStore) withCredentialEvidence(issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) (ManagedDirectCredentialEvidence, error) {
 	p, server, raw, err := s.credentialInput(issue, configuredServer, session, verify)
 	if err != nil {
 		return ManagedDirectCredentialEvidence{}, err
 	}
 	var result ManagedDirectCredentialEvidence
-	err = s.withPoPLocked(func(conn *sql.Conn, dir *os.File) error {
+	err = s.withCredentialLockedScoped(func(conn *sql.Conn, dir *os.File, release *func()) error {
 		if err := s.validateCredentialEvidence(conn, p, server); err != nil {
 			return err
 		}
@@ -397,7 +401,7 @@ func (s *ManagedEndpointKeyStore) CredentialEvidence(issue transport.ManagedDire
 			return errManagedEndpointKey
 		}
 		private, err := s.loadPoPKey(conn, dir, p.PoP.ACK.Reservation)
-		clear(private)
+		defer clear(private)
 		if err != nil {
 			return err
 		}
@@ -425,6 +429,32 @@ func (s *ManagedEndpointKeyStore) CredentialEvidence(issue transport.ManagedDire
 		if err := s.publishCredential(dir, name, canonical, true); err != nil {
 			return err
 		}
+		// Recompute immutable installation evidence only after validating both
+		// retained files. IssuedAt selects the original transcript; it grants no
+		// live authority and never repairs or publishes missing material.
+		derived, derivedACK, deriveErr := transport.DeriveManagedDirectCredentialHost(p, private, p.IssuedAt)
+		defer clear(derived)
+		derivedCanonical, derivedACKErr := derivedACK.CanonicalBytes()
+		if deriveErr != nil || derivedACKErr != nil || !bytes.Equal(derived, retained.Secret) || !bytes.Equal(derivedCanonical, row.ACK) {
+			return errManagedEndpointKey
+		}
+
+		if use != nil {
+			var check func() error
+			*release, check, err = fence(conn)
+			if err != nil || *release == nil || check == nil || !s.credentialUseValid(p) {
+				return errManagedEndpointKey
+			}
+			if check() != nil {
+				return errManagedEndpointKey
+			}
+			useErr := use(endpointMaterial{secret: retained.Secret, private: private})
+			checkErr := check()
+			if useErr != nil || checkErr != nil || !s.credentialUseValid(p) {
+				return errManagedEndpointKey
+			}
+		}
+
 		result = row
 		return nil
 	})
@@ -438,6 +468,22 @@ func (s *ManagedEndpointKeyStore) CredentialEvidence(issue transport.ManagedDire
 		return ManagedDirectCredentialEvidence{}, errManagedEndpointKey
 	}
 	return result, nil
+}
+
+// withManagedTargetEndpointMaterial grants temporary daemon-only use of installed material.
+// The future daemon coordinator must authenticate the exact session, worker and
+// ownership before calling, and pin that authority through fence. No callback
+// may retain material, perform worker IPC, or log it. This does not install keys.
+func (s *ManagedEndpointKeyStore) withManagedTargetEndpointMaterial(issue transport.ManagedDirectCredentialIssue, configuredServer string, session transport.HostSessionPayload, scope endpointMaterialScope, verify ManagedDirectCredentialScopeCheck, fence endpointMaterialFence, use func(endpointMaterial) error) error {
+	if s == nil || scope.installation != s.installation || scope.credential != issue.CredentialID || scope.role != "P" || scope.use != endpointMaterialLiveUse || fence == nil || use == nil {
+		return errManagedEndpointKey
+	}
+	_, err := s.withCredentialEvidence(issue, configuredServer, session, verify, fence, use)
+	// Callback and filesystem errors must never carry private bytes to callers.
+	if err != nil {
+		return errManagedEndpointKey
+	}
+	return nil
 }
 
 // The credential scope includes the enrollment and credential, because endpoint
