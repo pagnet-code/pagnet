@@ -119,6 +119,11 @@ func (d *Daemon) admitDirectEndpoint(ctx context.Context, captured ManagedEndpoi
 		if token != nil && (fresh.link != token.link || fresh.proxy != token.proxy || !sameManagedPrepareOwnership(fresh.ownership, token.ownership)) {
 			return ErrManagedEndpointPrepareRetryable
 		}
+		epoch, current := fresh.proxy.directEndpointAuthority(subject)
+		if !current || fresh.endpointEpoch != epoch {
+			return ErrManagedEndpointPrepareRetryable
+		}
+		fresh.endpointUse = true
 		token = fresh
 		return nil
 	}
@@ -140,8 +145,9 @@ func (d *Daemon) admitDirectEndpoint(ctx context.Context, captured ManagedEndpoi
 		if ctx.Err() != nil || token == nil {
 			return ErrManagedEndpointPrepareRetryable
 		}
-		// Both lifecycle objects remain fenced here. Each invalidation path only
+		// Registry, proxy and connection remain fenced here. Invalidation only
 		// acquires its index followed by the owner leaf mutex.
+		d.nativeRegistry.directInvalidations.register(&d.directSubscriptions)
 		token.proxy.directInvalidations.register(&d.directSubscriptions)
 		captured.Connection.directInvalidations.register(&d.directSubscriptions)
 		candidate = d.directSubscriptions.add(directEndpointBinding{metadata: metadata, issueDigest: sha256.Sum256(raw), sessionIdentity: string(sessionRaw), socket: captured.Socket, native: captured.Connection, link: token.link, proxy: token.proxy, subject: subject})

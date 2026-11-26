@@ -37,9 +37,10 @@ type NativeWorkerRecord struct {
 	LaunchBoot *transport.KernelBootEvidence `json:",omitempty"`
 }
 type NativeWorkerRegistry struct {
-	db   *sql.DB
-	root string
-	mu   sync.Mutex
+	db                  *sql.DB
+	root                string
+	mu                  sync.Mutex
+	directInvalidations directEndpointInvalidations
 }
 
 func privateNativeRegistryDir(path string) error { return privateNativeRegistryPath(path, true) }
@@ -545,6 +546,11 @@ func (r *NativeWorkerRegistry) PrepareRecovery(record NativeWorkerRecovery) (Nat
 	if !validNativeRecovery(record) || record.Phase != "prepared" || record.ServerCleaned {
 		return NativeWorkerRecovery{}, errors.New("invalid native worker recovery preparation")
 	}
+	// Keep invalidation inside the admission reservation on retries and failures.
+	defer r.directInvalidations.revokeMatching(func(binding directEndpointBinding) bool {
+		return binding.subject.InstanceID.String() == record.InstanceID &&
+			(record.OriginalGeneration == "" || binding.subject.OwnershipGeneration == record.OriginalGeneration || binding.subject.OwnershipGeneration == record.LocalGeneration)
+	})
 	existing, err := r.LookupRecovery(record.RecoveryID)
 	if err == nil {
 		identity := existing

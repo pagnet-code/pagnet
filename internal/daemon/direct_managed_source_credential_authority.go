@@ -129,7 +129,7 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 			return nil, ErrManagedEndpointPrepareRejected
 		}
 		var fenced int
-		if err := registryConn.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND original_generation=?)+(SELECT COUNT(*) FROM native_worker_gc WHERE instance_id=?)`, token.instanceID, record.Scope.Generation, token.instanceID).Scan(&fenced); err != nil {
+		if err := registryConn.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM native_worker_recoveries WHERE instance_id=? AND (original_generation=? OR original_generation=''))+(SELECT COUNT(*) FROM native_worker_gc WHERE instance_id=?)`, token.instanceID, record.Scope.Generation, token.instanceID).Scan(&fenced); err != nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		p, scope, ownership := token.proxy, record.Scope, token.ownership
@@ -214,6 +214,9 @@ func (d *Daemon) credentialPublicationFence(token *nativeWorkerPublicationToken,
 		}
 		native := captured.Connection
 		if d.nativeWorkers[token.instanceID] != token.link || token.link.proxy != p || token.link.conn != captured.Socket || p.connection != native || !sameManagedPrepareOwnership(token.link.ownership, ownership) || d.curConn != captured.Socket || d.nativeConn != native || native.session == nil || !reflect.DeepEqual(*native.session, session) || managedPrepareServerOrigin(native.serverURL) != managedPrepareServerOrigin(server) || native.hostID != session.HostID || native.bootID != session.BootID {
+			return release, ErrManagedEndpointPrepareRetryable
+		}
+		if token.endpointUse && (p.directEndpointTransition || p.directEndpointEpoch != token.endpointEpoch || !p.directEndpointIdentity.matches(subject)) {
 			return release, ErrManagedEndpointPrepareRetryable
 		}
 		if !protocolValid(native, session) {

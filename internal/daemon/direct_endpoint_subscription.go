@@ -46,6 +46,9 @@ func (s *DirectEndpointSubscription) Done() <-chan struct{} { return s.done }
 func (s *DirectEndpointSubscription) Metadata() DirectEndpointSubscriptionMetadata {
 	return s.binding.metadata
 }
+
+// Valid checks local revocation and deadline only. It does not authorize HTTP
+// or replace fresh fenced current-authority verification before material use.
 func (s *DirectEndpointSubscription) Valid() bool {
 	if s == nil || s.owner == nil {
 		return false
@@ -161,4 +164,14 @@ func (i *directEndpointInvalidations) revoke(matches func(directEndpointBinding)
 		o.revokeWhere(matches)
 	}
 	i.owners = nil
+}
+
+// revokeMatching keeps registrations for lifecycle objects that remain usable
+// after a generation fence (registry and native worker observations).
+func (i *directEndpointInvalidations) revokeMatching(matches func(directEndpointBinding) bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	for o := range i.owners {
+		o.revokeWhere(matches)
+	}
 }

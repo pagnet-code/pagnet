@@ -29,6 +29,7 @@ func subscriptionFixture(t *testing.T) (*Daemon, *nativeWorkerPublicationToken, 
 	subject := nativeManagedSubjectFromSourceV2(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Prepare.Subject.AuthorizationExpiresAt
 	token.subject = subject
+	token.endpointEpoch = token.proxy.observeDirectEndpointSnapshot(subscriptionNativeSnapshot(token), token.proxy.directEndpointObservationEpoch())
 	metadata := DirectEndpointSubscriptionMetadata{InstallationID: keys.installation, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "S", ServerOrigin: d.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.BudgetExpiresAt, subject.ExpiresAt)}
 	raw, err := issue.CanonicalBytes()
 	if err != nil {
@@ -305,6 +306,7 @@ func TestDirectEndpointSubscriptionTargetCustody(t *testing.T) {
 	subject := nativeManagedSubjectFromEndpoint(issue.PoP.Prepare.Subject)
 	subject.ExpiresAt = issue.PoP.Authorization.ExpiresAt
 	token.subject = subject
+	token.endpointEpoch = token.proxy.observeDirectEndpointSnapshot(subscriptionNativeSnapshot(token), token.proxy.directEndpointObservationEpoch())
 	metadata := DirectEndpointSubscriptionMetadata{InstallationID: keys.installation, OriginID: subject.OriginID, IntentID: issue.PoP.Prepare.Subject.DirectIntentID, CredentialID: issue.CredentialID, Role: "P", ServerOrigin: d.ServerURL, OwnershipGeneration: subject.OwnershipGeneration, Deadline: directEndpointDeadline(issue.CredentialExpiresAt, issue.Budget.ExpiresAt, subject.ExpiresAt)}
 	raw, err := issue.CanonicalBytes()
 	if err != nil {

@@ -139,6 +139,7 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 	if err != nil {
 		return nil, err
 	}
+	observationEpoch := p.directEndpointObservationEpoch()
 	result, err := verify(ctx, p, ownership)
 	if err != nil {
 		// Owner RPC errors arrive as public wire strings through proxy.call.
@@ -157,6 +158,7 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 	if identityErr != nil || actualStart != snapshot.NativeStartIdentity || snapshot.Scope != p.scope || snapshot.IdentityPending || snapshot.ActualRuntime != domain.RuntimeQwenCode || snapshot.ProfileFingerprint != p.profile || snapshot.PID <= 0 || snapshot.NativeStartIdentity == "" || snapshot.NativeGeneration != s.NativeGeneration || snapshot.NativeSessionID != s.NativeSessionID || json.Unmarshal(snapshot.Origin, &origin) != nil || origin.ID != s.OriginID.String() || origin.TenantID != s.TenantID.String() || origin.HostID != s.HostID.String() || origin.InstanceID != s.InstanceID.String() || origin.Runtime != string(domain.RuntimeQwenCode) || origin.NativeGeneration != s.NativeGeneration || (origin.NativeSessionID != "" && origin.NativeSessionID != s.NativeSessionID) {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
+	verifiedEndpointEpoch := p.observeDirectEndpointSnapshot(snapshot, observationEpoch)
 	// Origin admission may belong to an earlier socket while the native session
 	// survives reconnect. Only current host.session authority is pinned above.
 	after, proxy, fresh, err := selectLink()
@@ -175,7 +177,7 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 	if !time.Now().Before(s.ExpiresAt) {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
-	return &nativeWorkerPublicationToken{instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership, subject: s}, nil
+	return &nativeWorkerPublicationToken{endpointEpoch: verifiedEndpointEpoch, instanceID: s.InstanceID.String(), link: link, proxy: p, ownership: ownership, subject: s}, nil
 }
 
 func nativeManagedSubjectFromEndpoint(s transport.ManagedEndpointBindingIntent) nativeManagedSubject {

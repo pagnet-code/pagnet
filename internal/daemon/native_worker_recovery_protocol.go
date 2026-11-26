@@ -103,6 +103,7 @@ func (d *Daemon) handleNativeWorkerRecoveryState(conn *websocket.Conn, p transpo
 		if identity != expected {
 			return ErrNativeObservationConflict
 		}
+		record, err = d.nativeRegistry.PrepareRecovery(expected)
 	}
 	if err != nil {
 		return err

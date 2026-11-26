@@ -15,6 +15,10 @@ import (
 // never launches/adopts a PID or changes an execution profile. Production
 // command routing still requires durable intent mapping and source delivery.
 type NativeWorkerProxy struct {
+	directEndpointEpoch                 uint64
+	directEndpointObserved              bool
+	directEndpointTransition            bool
+	directEndpointIdentity              directEndpointNativeIdentity
 	directInvalidations                 directEndpointInvalidations
 	connection                          *NativeObservationConnection
 	controller                          *sessionworker.Controller
@@ -205,6 +209,7 @@ func (p *NativeWorkerProxy) RefreshAdmission(ctx context.Context) error {
 }
 
 func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeSnapshot, error) {
+	observationEpoch := p.directEndpointObservationEpoch()
 	response, err := p.call(ctx, sessionworker.Request{Type: "snapshot"})
 	if err != nil {
 		return sessionworker.NativeSnapshot{}, err
@@ -213,6 +218,7 @@ func (p *NativeWorkerProxy) Snapshot(ctx context.Context) (sessionworker.NativeS
 		_ = p.Close()
 		return sessionworker.NativeSnapshot{}, ErrNativeObservationConflict
 	}
+	p.observeDirectEndpointSnapshot(*response.Snapshot, observationEpoch)
 	p.snapshotMu.Lock()
 	p.snapshotAt = time.Now()
 	p.snapshotMu.Unlock()
@@ -257,6 +263,7 @@ func (p *NativeWorkerProxy) Reconcile(ctx context.Context) error {
 		return err
 	}
 	if response.Activation != nil {
+		p.beginDirectEndpointTransition()
 		request := *response.Activation
 		if request.ActualRuntime != p.bootstrap.Native.Runtime || request.NetworkID != p.bootstrap.Native.NetworkID || request.NetworkTenantID != p.bootstrap.Native.NetworkTenantID {
 			return ErrNativeObservationConflict

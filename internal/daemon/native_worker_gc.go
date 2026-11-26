@@ -35,6 +35,13 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 	if !reflect.DeepEqual(a, b) {
 		return nativeWorkerGC{}, ErrNativeObservationConflict
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Admission holds the same reservation through owner registration. Every
+	// validated attempt invalidates before releasing it, even on persistence failure.
+	defer r.directInvalidations.revokeMatching(func(binding directEndpointBinding) bool {
+		return binding.subject.InstanceID.String() == record.Scope.InstanceID && binding.subject.OwnershipGeneration == record.Scope.Generation
+	})
 	existing, lookupErr := r.lookupGC(p.InstanceID)
 	if lookupErr == nil {
 		if existing.CommandID != p.CommandID || existing.DeleteRequestID != p.DeleteRequestID || existing.Ownership.ID != p.NativeOwnership.ID || existing.Ownership.OwnershipGeneration != record.Scope.Generation {
