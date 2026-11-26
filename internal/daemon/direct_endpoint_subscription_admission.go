@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"time"
 
@@ -67,12 +68,15 @@ func directEndpointDeadline(values ...time.Time) time.Time {
 }
 
 func (d *Daemon) verifyDirectEndpointToken(ctx context.Context, captured ManagedEndpointPrepareScope, server string, subject nativeManagedSubject) (*nativeWorkerPublicationToken, error) {
-	if ctx.Err() != nil || managedPrepareServerOrigin(d.nativeServerURL()) != server {
+	if ctx == nil || managedPrepareServerOrigin(d.nativeServerURL()) != server {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
-	return d.verifyNativeManagedSubjectToken(ctx, captured, server, subject, func(ctx context.Context, p *NativeWorkerProxy, ownership transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
-		response, err := p.call(ctx, sessionworker.Request{Type: "ownership_verify", OwnershipVerify: &sessionworker.NativeOwnershipVerifyRequest{Ownership: ownership}})
-		return response.OwnershipVerify, err
+	return d.verifyNativeManagedSubjectTokenContext(ctx, captured, server, subject, func(ctx context.Context, p *NativeWorkerProxy, ownership transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
+		result, err := p.verifyEndpointOwnership(ctx, ownership)
+		if errors.Is(err, ErrNativeObservationConflict) {
+			return nil, ErrManagedEndpointPrepareRejected
+		}
+		return result, err
 	})
 }
 
