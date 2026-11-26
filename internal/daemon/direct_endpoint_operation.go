@@ -174,20 +174,33 @@ func (s *DirectEndpointSubscription) operationCurrent(ctx context.Context) bool 
 // operationCurrentContext bounds lease acceptance lock acquisition and checks
 // abort both before and after taking the subscription leaf lock.
 func (s *DirectEndpointSubscription) operationCurrentContext(ctx context.Context) bool {
-	if s == nil || s.owner == nil || ctx == nil || s.aborted() || ctx.Err() != nil {
-		return false
+	return s.operationCurrentContextError(ctx) == nil
+}
+
+func (s *DirectEndpointSubscription) operationCurrentContextError(ctx context.Context) error {
+	if s == nil || s.owner == nil || ctx == nil {
+		return errDirectEndpointOperationRejected
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.aborted() {
+		return errDirectEndpointOperationRejected
 	}
 	unlock, err := directEndpointTryLock(ctx, &s.owner.mu)
 	if err != nil {
-		return false
+		return err
 	}
 	defer unlock()
-	if _, ok := s.owner.entries[s]; !ok || ctx.Err() != nil || s.aborted() {
-		return false
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := s.owner.entries[s]; !ok || s.aborted() {
+		return errDirectEndpointOperationRejected
 	}
 	if !time.Now().Before(s.binding.metadata.Deadline) {
 		s.owner.removeLocked(s)
-		return false
+		return errDirectEndpointOperationRejected
 	}
-	return true
+	return nil
 }

@@ -3,10 +3,12 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -112,6 +114,48 @@ func TestDirectEndpointReconcileBinding(t *testing.T) {
 					return validateDirectSourceReconcileBindingV2(s, captured, source, desc, e, at)
 				}
 				return validateDirectTargetReconcileBinding(s, captured, target, desc, e, at)
+			}
+			validateContext := func(ctx context.Context) (directEndpointReconcileBinding, error) {
+				if role == "S" {
+					return validateDirectSourceReconcileBindingV2Context(ctx, s, captured, source, d, reconcileEnrollment(t, d, now), now)
+				}
+				return validateDirectTargetReconcileBindingContext(ctx, s, captured, target, d, reconcileEnrollment(t, d, now), now)
+			}
+			for _, kind := range []string{"busy", "cancelled", "nil context", "aborted"} {
+				t.Run("context "+kind, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+					defer cancel()
+					var want error = errDirectEndpointLocalBusy
+					if kind == "cancelled" {
+						cancel()
+						want = context.Canceled
+					}
+					var checkctx context.Context = ctx
+					if kind == "nil context" {
+						checkctx = nil
+						want = errDirectEndpointReconcileBinding
+					}
+					if kind == "aborted" {
+						done := make(chan struct{})
+						close(done)
+						s.binding.proxy = &NativeWorkerProxy{abortDone: done}
+						defer func() { s.binding.proxy = nil }()
+						want = errDirectEndpointReconcileBinding
+					}
+					s.owner.mu.Lock()
+					start := time.Now()
+					_, contextErr := validateContext(checkctx)
+					s.owner.mu.Unlock()
+					if !errors.Is(contextErr, want) {
+						t.Fatalf("context validation: %v want %v", contextErr, want)
+					}
+					if time.Since(start) > time.Second {
+						t.Fatal("binding validation waited for owner")
+					}
+				})
+			}
+			if _, err := validateContext(context.Background()); err != nil {
+				t.Fatalf("context checks changed binding: %v", err)
 			}
 			e := reconcileEnrollment(t, d, now)
 			out, err := validate(d, e, now)

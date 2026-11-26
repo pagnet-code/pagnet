@@ -56,8 +56,11 @@ func acquireDirectEndpointReconcileMaterial(ctx context.Context, s *DirectEndpoi
 			return errDirectEndpointOperationRejected
 		}
 		called = true
-		if opctx == nil || !s.operationCurrent(opctx) || validateDirectReconcileMaterialEvidence(s, b, e, now(), role) != nil {
-			return errDirectEndpointReconcileBinding
+		if err := s.operationCurrentContextError(opctx); err != nil {
+			return err
+		}
+		if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
+			return err
 		}
 		if role == "P" {
 			p, decodeErr := transport.DecodeDirectChannelPublicationV2(publication)
@@ -109,8 +112,11 @@ func acquireDirectEndpointReconcileMaterial(ctx context.Context, s *DirectEndpoi
 		if decodeErr != nil || len(row.Root) != 32 || !b.publicationMatches(p) || (e.PublicationHash != nil && !reconcilePublicationHash(e, row.Publication)) || (role == "P" && !bytes.Equal(publication, row.Publication)) {
 			return errDirectEnrollment
 		}
-		if !s.operationCurrent(opctx) || validateDirectReconcileMaterialEvidence(s, b, e, now(), role) != nil {
-			return errDirectEndpointOperationRejected
+		if err := s.operationCurrentContextError(opctx); err != nil {
+			return err
+		}
+		if err := validateDirectReconcileMaterialEvidenceContext(opctx, s, b, e, now(), role); err != nil {
+			return err
 		}
 		pending = &directchannelcrypto.Material{Descriptor: b.Descriptor, Hash: b.DescriptorHash, Role: role, PublicationHash: sha256.Sum256(row.Publication)}
 		copy(pending.Key[:], row.Root)
@@ -120,8 +126,11 @@ func acquireDirectEndpointReconcileMaterial(ctx context.Context, s *DirectEndpoi
 	if err != nil {
 		return nil, nil, err
 	}
-	if !called || repeated || pending == nil || !s.operationCurrent(ctx) {
+	if !called || repeated || pending == nil {
 		return nil, nil, errDirectEndpointOperationRejected
+	}
+	if err := s.operationCurrentContextError(ctx); err != nil {
+		return nil, nil, err
 	}
 	accepted = true
 	return pending, wire, nil
@@ -135,6 +144,14 @@ func reconcilePublicationHash(e directhttp.Enrollment, raw []byte) bool {
 // Recheck public binding evidence inside the accepted material-use operation.
 // Authentication of GET responses and the original issue binding are prerequisites.
 func validateDirectReconcileMaterialEvidence(s *DirectEndpointSubscription, b directEndpointReconcileBinding, e directhttp.Enrollment, now time.Time, role string) error {
+	return validateDirectReconcileMaterialEvidenceContext(context.Background(), s, b, e, now, role)
+}
+
+func validateDirectReconcileMaterialEvidenceContext(ctx context.Context, s *DirectEndpointSubscription, b directEndpointReconcileBinding, e directhttp.Enrollment, now time.Time, role string) error {
+	if err := directReconcileBindingCurrentContext(ctx, s); err != nil {
+		return err
+	}
+
 	raw, err := b.Descriptor.CanonicalBytes()
 	hash := sha256.Sum256(raw)
 	d := b.Descriptor
@@ -155,5 +172,5 @@ func validateDirectReconcileMaterialEvidence(s *DirectEndpointSubscription, b di
 	if _, err := enrollmentBinding(s, b.Protocol, raw, b.LocalFingerprint, b.PeerFingerprint); err != nil {
 		return err
 	}
-	return nil
+	return directReconcileBindingCurrentContext(ctx, s)
 }

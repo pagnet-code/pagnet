@@ -162,14 +162,17 @@ func TestDirectReconcileMaterialConcurrentSource(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if first == nil {
-		t.Fatal("no acquisition completed")
-	}
 	restored, replay, err := f.acquire(f.enrollment, nil, f.operation)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restored.Clear()
+	// Every concurrent attempt may fail fast. A fresh attempt must still recover
+	// the one durable candidate, or install it after confirmed rollbacks.
+	if first == nil {
+		first = replay
+		root = restored.Key
+	}
 	if restored.Key != root || !bytes.Equal(replay, first) {
 		t.Fatal("concurrent candidate not retained")
 	}
@@ -338,6 +341,104 @@ func TestDirectReconcileMaterialRetainedConflict(t *testing.T) {
 			defer m.Clear()
 			if !bytes.Equal(m.Key[:], f.vector.EpochKey) || !bytes.Equal(got, f.vector.Publication) {
 				t.Fatal("retained material changed")
+			}
+		})
+	}
+}
+
+func TestDirectReconcileMaterialContextOwner(t *testing.T) {
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			for _, kind := range []string{"busy", "cancelled", "aborted"} {
+				t.Run(kind, func(t *testing.T) {
+					f := newReconcileMaterialFixture(t, role)
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					var want error = errDirectEndpointLocalBusy
+					if kind == "cancelled" {
+						cancel()
+						want = context.Canceled
+					}
+					if kind == "aborted" {
+						done := make(chan struct{})
+						close(done)
+						f.subscription.binding.proxy = &NativeWorkerProxy{abortDone: done}
+						want = errDirectEndpointReconcileBinding
+					}
+					f.subscription.owner.mu.Lock()
+					start := time.Now()
+					err := validateDirectReconcileMaterialEvidenceContext(ctx, f.subscription, f.binding, f.enrollment, f.now, role)
+					f.subscription.owner.mu.Unlock()
+					if !errors.Is(err, want) {
+						t.Fatalf("material evidence: %v want %v", err, want)
+					}
+					if time.Since(start) > time.Second {
+						t.Fatal("material evidence waited for owner")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestDirectReconcileMaterialContextAcceptance(t *testing.T) {
+	for _, stage := range []string{"callback entry", "callback return", "cancelled", "aborted"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newReconcileMaterialFixture(t, "S")
+			locked := false
+			operation := func(ctx context.Context, use func(context.Context, endpointMaterial) error) error {
+				if stage == "cancelled" {
+					cancelled, cancel := context.WithCancel(ctx)
+					cancel()
+					ctx = cancelled
+				}
+				if stage == "aborted" {
+					done := make(chan struct{})
+					close(done)
+					f.subscription.binding.proxy = &NativeWorkerProxy{abortDone: done}
+				}
+				if stage == "callback entry" {
+					f.subscription.owner.mu.Lock()
+					locked = true
+				}
+				err := f.operation(ctx, use)
+				if stage == "callback return" {
+					f.subscription.owner.mu.Lock()
+					locked = true
+				}
+				return err
+			}
+			start := time.Now()
+			material, wire, err := f.acquire(f.enrollment, nil, operation)
+			if locked {
+				f.subscription.owner.mu.Unlock()
+			}
+			var want error = errDirectEndpointLocalBusy
+			if stage == "cancelled" {
+				want = context.Canceled
+			}
+			if stage == "aborted" {
+				want = errDirectEndpointOperationRejected
+			}
+			if !errors.Is(err, want) || material != nil || wire != nil {
+				if material != nil {
+					material.Clear()
+				}
+				t.Fatal("owner contention exposed material")
+			}
+			if time.Since(start) > time.Second {
+				t.Fatal("material acquisition waited for owner")
+			}
+			var rows int
+			if err := f.journal.registry.db.QueryRow(`SELECT COUNT(*) FROM native_direct_enrollment_v1`).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			wantRows := 0
+			if stage == "callback return" {
+				wantRows = 1
+			}
+			if rows != wantRows {
+				t.Fatalf("journal rows %d want %d", rows, wantRows)
 			}
 		})
 	}
