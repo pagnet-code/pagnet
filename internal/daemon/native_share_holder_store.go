@@ -401,7 +401,7 @@ func nativeShareHolderLock(directory *os.File) (*os.File, error) {
 	return nativeShareHolderLockMode(directory, true)
 }
 
-func nativeShareHolderLockMode(directory *os.File, create bool) (*os.File, error) {
+func nativeShareHolderOpenLock(directory *os.File, create bool) (*os.File, error) {
 	flags := unix.O_RDWR | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK
 	if create {
 		flags |= unix.O_CREAT
@@ -411,12 +411,22 @@ func nativeShareHolderLockMode(directory *os.File, create bool) (*os.File, error
 		return nil, err
 	}
 	lock := os.NewFile(uintptr(fd), "holder.lock")
-	if err = nativeShareHolderPrivate(lock, false); err == nil {
-		for {
-			err = unix.Flock(fd, unix.LOCK_EX)
-			if err != unix.EINTR {
-				break
-			}
+	if err = nativeShareHolderPrivate(lock, false); err != nil {
+		lock.Close()
+		return nil, err
+	}
+	return lock, nil
+}
+
+func nativeShareHolderLockMode(directory *os.File, create bool) (*os.File, error) {
+	lock, err := nativeShareHolderOpenLock(directory, create)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err = unix.Flock(int(lock.Fd()), unix.LOCK_EX)
+		if err != unix.EINTR {
+			break
 		}
 	}
 	if err == nil && create {

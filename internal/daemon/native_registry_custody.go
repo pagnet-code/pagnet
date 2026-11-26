@@ -63,18 +63,27 @@ func nativeRegistryProtectedDirectory(path string) (*os.File, error) {
 	}
 	return current, nil
 }
-func nativeRegistryCustodyLock(root *os.File) (*os.File, error) {
+func nativeRegistryCustodyOpenLock(root *os.File) (*os.File, error) {
 	fd, e := unix.Openat(int(root.Fd()), "registry.custody.lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0600)
 	if e != nil {
 		return nil, e
 	}
 	f := os.NewFile(uintptr(fd), "registry.custody.lock")
-	if e = nativeShareHolderPrivate(f, false); e == nil {
-		for {
-			e = unix.Flock(fd, unix.LOCK_EX)
-			if e != unix.EINTR {
-				break
-			}
+	if e = nativeShareHolderPrivate(f, false); e != nil {
+		f.Close()
+		return nil, e
+	}
+	return f, nil
+}
+func nativeRegistryCustodyLock(root *os.File) (*os.File, error) {
+	f, e := nativeRegistryCustodyOpenLock(root)
+	if e != nil {
+		return nil, e
+	}
+	for {
+		e = unix.Flock(int(f.Fd()), unix.LOCK_EX)
+		if e != unix.EINTR {
+			break
 		}
 	}
 	if e == nil {
