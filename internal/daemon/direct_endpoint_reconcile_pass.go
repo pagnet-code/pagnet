@@ -27,6 +27,8 @@ const (
 	directReconcileChallengeObserved    directEndpointReconcilePassState = "challenge_observed"
 	directReconcileProofSubmitted       directEndpointReconcilePassState = "proof_submitted"
 	directReconcileProofObserved        directEndpointReconcilePassState = "proof_observed"
+	directReconcileActivationRequested  directEndpointReconcilePassState = "activation_requested"
+	directReconcileActivationObserved   directEndpointReconcilePassState = "activation_observed"
 )
 
 type directEndpointReconcilePass func(context.Context) (directEndpointReconcilePassState, error)
@@ -35,6 +37,7 @@ type directEndpointReconcilePassClient interface {
 	Publish(context.Context, string, string, transport.DirectChannelPublicationV2, string) (transport.DirectChannelPublicationV2, error)
 	Challenge(context.Context, string, string) (transport.DirectChannelReadinessChallengeV2, error)
 	Prove(context.Context, string, string, transport.DirectChannelReadinessProofV2) (transport.DirectChannelReadinessProofV2, error)
+	Activate(context.Context, string, string) (directhttp.Activation, error)
 }
 
 func newDirectSourceReconcilePass(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2) (directEndpointReconcilePass, error) {
