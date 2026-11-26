@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pagnet-code/pagnet/internal/directchannelcrypto"
 	"github.com/pagnet-code/pagnet/internal/directhttp"
 	"github.com/pagnet-code/pagnet/transport"
 )
@@ -55,7 +56,7 @@ func validateDirectReconcileChallengeBinding(b directEndpointReconcileBinding, p
 	return raw, expires, nil
 }
 
-func reconcileDirectReadinessChallenge(ctx context.Context, s *DirectEndpointSubscription, registry *NativeWorkerRegistry, observed directEndpointReconcileObservation, publication []byte, binding directEnrollmentBinding, local directEnrollmentRecord, credentialID, intent, role string, client directEndpointReconcilePassClient, now func() time.Time, operate directEndpointMaterialOperation) (directEndpointReconcilePassState, error) {
+func reconcileDirectReadinessChallenge(ctx context.Context, s *DirectEndpointSubscription, registry *NativeWorkerRegistry, observed directEndpointReconcileObservation, publication []byte, binding directEnrollmentBinding, local directEnrollmentRecord, material *directchannelcrypto.Material, credentialID, intent, role string, client directEndpointReconcilePassClient, now func() time.Time, operate directEndpointMaterialOperation) (directEndpointReconcilePassState, error) {
 	if err := validateDirectReconcileMaterialEvidenceContext(ctx, s, observed.Binding, observed.Enrollment, now(), role); err != nil {
 		return "", err
 	}
@@ -65,6 +66,9 @@ func reconcileDirectReadinessChallenge(ctx context.Context, s *DirectEndpointSub
 		transcript := sha256.Sum256(raw)
 		if err != nil || e.Challenge.TranscriptHash != base64.RawURLEncoding.EncodeToString(transcript[:]) {
 			return "", errDirectEndpointReconcileBinding
+		}
+		if e.Proof != nil && (len(local.Challenge) == 0 || len(local.Proof) == 0) {
+			return "", errDirectEndpointReconcileProofMissing
 		}
 		journal, err := newDirectEnrollmentJournalContext(ctx, registry)
 		if err != nil {
@@ -78,10 +82,7 @@ func reconcileDirectReadinessChallenge(ctx context.Context, s *DirectEndpointSub
 		if err := s.operationCurrentContextError(ctx); err != nil {
 			return "", err
 		}
-		if !now().Before(expires) {
-			return "", errDirectEndpointReconcileChallengeExpired
-		}
-		return directReconcileChallengeObserved, nil
+		return reconcileDirectReadinessProof(ctx, s, registry, observed, publication, raw, expires, binding, row, material, credentialID, intent, role, client, now, operate)
 	}
 	if e.Proof != nil || e.Activation != nil {
 		return "", errDirectEndpointReconcileBinding
@@ -89,6 +90,7 @@ func reconcileDirectReadinessChallenge(ctx context.Context, s *DirectEndpointSub
 	if len(local.Challenge) != 0 || len(local.Proof) != 0 || local.ProofReceivedAt != "" || len(local.Activation) != 0 || local.ProofStarted {
 		return "", errDirectEnrollment
 	}
+	material.Clear()
 	return requestDirectReconcileChallenge(ctx, s, registry, observed, publication, binding, credentialID, intent, role, client, now, operate)
 }
 

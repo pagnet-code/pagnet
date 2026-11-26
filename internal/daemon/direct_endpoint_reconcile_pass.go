@@ -25,6 +25,8 @@ const (
 	directReconcilePublicationPublished directEndpointReconcilePassState = "publication_published"
 	directReconcileChallengeRequested   directEndpointReconcilePassState = "challenge_requested"
 	directReconcileChallengeObserved    directEndpointReconcilePassState = "challenge_observed"
+	directReconcileProofSubmitted       directEndpointReconcilePassState = "proof_submitted"
+	directReconcileProofObserved        directEndpointReconcilePassState = "proof_observed"
 )
 
 type directEndpointReconcilePass func(context.Context) (directEndpointReconcilePassState, error)
@@ -32,6 +34,7 @@ type directEndpointReconcilePassClient interface {
 	directEndpointReconcileReader
 	Publish(context.Context, string, string, transport.DirectChannelPublicationV2, string) (transport.DirectChannelPublicationV2, error)
 	Challenge(context.Context, string, string) (transport.DirectChannelReadinessChallengeV2, error)
+	Prove(context.Context, string, string, transport.DirectChannelReadinessProofV2) (transport.DirectChannelReadinessProofV2, error)
 }
 
 func newDirectSourceReconcilePass(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2) (directEndpointReconcilePass, error) {
@@ -158,6 +161,9 @@ func newDirectReconcilePass(s *DirectEndpointSubscription, registry *NativeWorke
 		if (observed.Enrollment.Challenge == nil && (observed.Enrollment.Proof != nil || observed.Enrollment.Activation != nil)) || (observed.Enrollment.PublicationHash == nil && observed.Enrollment.Challenge != nil) || (observed.Enrollment.Activation != nil && observed.Enrollment.Proof == nil) {
 			return "", errDirectEndpointReconcileBinding
 		}
+		if _, _, err := validateDirectReconcileEnrollmentReadiness(observed.Binding, observed.Publication, role, observed.Enrollment, now()); err != nil {
+			return "", err
+		}
 		if role == "P" && observed.Enrollment.PublicationHash == nil {
 			return directReconcileAwaitingPublication, nil
 		}
@@ -198,8 +204,7 @@ func newDirectReconcilePass(s *DirectEndpointSubscription, registry *NativeWorke
 			if err := s.operationCurrentContextError(workctx); err != nil {
 				return "", err
 			}
-			material.Clear()
-			return reconcileDirectReadinessChallenge(workctx, s, registry, observed, wire, binding, row, credentialID, intent, role, client, now, operate)
+			return reconcileDirectReadinessChallenge(workctx, s, registry, observed, wire, binding, row, material, credentialID, intent, role, client, now, operate)
 		}
 		readiness, err := material.ReadinessKey()
 		if err != nil {

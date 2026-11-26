@@ -123,7 +123,7 @@ func setReadinessGET(t *testing.T, f *reconcilePassFixture, challenge transport.
 	}
 	hash := sha256.Sum256(raw)
 	f.client.enrollment.Challenge = &directhttp.EnrollmentChallenge{Challenge: challenge, TranscriptHash: base64.RawURLEncoding.EncodeToString(hash[:])}
-	f.client.enrollment.ObservedAt = time.Now()
+	f.client.enrollment.ObservedAt = time.Now().UTC()
 }
 func TestDirectReconcileChallengeRequestAndObserve(t *testing.T) {
 	for _, role := range []string{"S", "P"} {
@@ -143,7 +143,7 @@ func TestDirectReconcileChallengeRequestAndObserve(t *testing.T) {
 				t.Fatal("POST response was ingested or proof advanced")
 			}
 			state, err = f.run(t.Context())
-			if err != nil || state != directReconcileChallengeObserved || len(f.client.challenges) != 1 {
+			if err != nil || state != directReconcileProofSubmitted || len(f.client.challenges) != 1 {
 				t.Fatalf("challenge observation: %s %v", state, err)
 			}
 			row, err = readPassJournal(f.f.d.nativeRegistry)
@@ -151,8 +151,8 @@ func TestDirectReconcileChallengeRequestAndObserve(t *testing.T) {
 				t.Fatal(err)
 			}
 			clear(row.Root)
-			if !bytes.Equal(row.Challenge, f.client.challenges[0]) || len(row.Proof) != 0 || len(row.Activation) != 0 {
-				t.Fatal("challenge observation changed bytes or advanced proof")
+			if !bytes.Equal(row.Challenge, f.client.challenges[0]) || len(row.Proof) == 0 || len(row.Activation) != 0 {
+				t.Fatal("challenge/proof progression changed immutable bytes or activated")
 			}
 		})
 	}
@@ -213,7 +213,7 @@ func TestDirectReconcileChallengeImmutableAndExpired(t *testing.T) {
 						if err != errDirectEndpointReconcileChallengeExpired || state != "" {
 							t.Fatal("expired GET challenge was accepted")
 						}
-					} else if err != nil || state != directReconcileChallengeObserved {
+					} else if err != nil || state != directReconcileProofSubmitted {
 						t.Fatal("challenge setup not observed")
 					}
 					if kind == "changed" {
@@ -259,7 +259,7 @@ func TestDirectReconcileChallengeUnknownHTTP(t *testing.T) {
 						t.Fatal(err)
 					}
 					if accepted {
-						if state != directReconcileChallengeObserved || len(f.client.challenges) != 1 {
+						if state != directReconcileProofSubmitted || len(f.client.challenges) != 1 {
 							t.Fatal("existing challenge renewed after lost response")
 						}
 					} else if state != directReconcileChallengeRequested || len(f.client.challenges) != 2 {
