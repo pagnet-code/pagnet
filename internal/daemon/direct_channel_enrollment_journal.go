@@ -29,7 +29,7 @@ const directEnrollmentMaxRecords = 1024
 var errDirectEnrollment = errors.New("direct channel enrollment journal unavailable, unsafe or conflicting")
 
 // This journal is storage only. Records never authorize traffic or restore a lease.
-// Lock order: registry.mu, namespace flock, BEGIN IMMEDIATE, subscription leaf.
+// Lock order: registry.mu, custody flock, namespace flock, BEGIN IMMEDIATE, subscription leaf.
 type directEnrollmentJournal struct {
 	registry *NativeWorkerRegistry
 	poisoned bool
@@ -178,11 +178,22 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 	if j.poisoned {
 		return errDirectEnrollment
 	}
-	root, e := nativeShareHolderDirectory(r.root)
+	root, e := nativeRegistryProtectedDirectory(r.root)
 	if e != nil {
 		return e
 	}
 	defer root.Close()
+	if e = nativeShareHolderPrivate(root, true); e != nil {
+		return e
+	}
+	custody, e := nativeRegistryCustodyLock(root)
+	if e != nil {
+		return e
+	}
+	defer custody.Close()
+	if _, e = nativeRegistryInspectFiles(root, r.custodyIdentity, false); e != nil {
+		return e
+	}
 	dir, e := nativeShareHolderChild(root, directEnrollmentNamespace)
 	if e != nil {
 		return e
@@ -210,8 +221,20 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 			}
 		}
 	}()
+	if _, e = nativeRegistryInspectFiles(root, r.custodyIdentity, false); e != nil {
+		return e
+	}
 	if _, e = c.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS native_direct_enrollment_v1(installation TEXT NOT NULL,server TEXT NOT NULL,channel TEXT NOT NULL,payload BLOB NOT NULL,mac BLOB NOT NULL,PRIMARY KEY(installation,server,channel))`); e != nil {
 		return e
+	}
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS native_direct_enrollment_v1_fences(installation TEXT NOT NULL,server TEXT NOT NULL,channel TEXT NOT NULL,role TEXT NOT NULL,binding BLOB NOT NULL,mac BLOB NOT NULL,PRIMARY KEY(installation,server,channel,role))`,
+		`CREATE TRIGGER IF NOT EXISTS native_direct_enrollment_v1_fences_no_update BEFORE UPDATE ON native_direct_enrollment_v1_fences BEGIN SELECT RAISE(ABORT,'immutable enrollment fence'); END`,
+		`CREATE TRIGGER IF NOT EXISTS native_direct_enrollment_v1_fences_no_delete BEFORE DELETE ON native_direct_enrollment_v1_fences BEGIN SELECT RAISE(ABORT,'immutable enrollment fence'); END`,
+	} {
+		if _, e = c.ExecContext(ctx, q); e != nil {
+			return e
+		}
 	}
 	var initialized int
 	if e = c.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_registry_metadata WHERE name='direct_enrollment_mac_initialized'`).Scan(&initialized); e != nil {
@@ -220,7 +243,7 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 	keyfile, e := nativeShareHolderOpen(dir, "journal.mac", false)
 	if errors.Is(e, os.ErrNotExist) {
 		var count int
-		if e = c.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_direct_enrollment_v1`).Scan(&count); e != nil || count != 0 || initialized != 0 {
+		if e = c.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM native_direct_enrollment_v1)+(SELECT COUNT(*) FROM native_direct_enrollment_v1_fences)`).Scan(&count); e != nil || count != 0 || initialized != 0 {
 			return errDirectEnrollment
 		}
 		key := make([]byte, 32)
@@ -273,6 +296,12 @@ func enrollmentMAC(key []byte, b directEnrollmentBinding, raw []byte) []byte {
 	h.Write(raw)
 	return h.Sum(nil)
 }
+
+// Separate immutable fences detect deletion of an individual mutable journal row.
+// They do not detect rollback or replacement of an entire database snapshot.
+func enrollmentFenceMAC(key []byte, b directEnrollmentBinding, raw []byte) []byte {
+	return enrollmentMAC(key, b, append([]byte("creation-fence/v1\x00"), raw...))
+}
 func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
 	var result directEnrollmentRecord
 	if b.validate() != nil || s == nil {
@@ -284,7 +313,7 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 			return errDirectEnrollment
 		}
 		var recordCount int
-		if e := c.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?`, b.Installation).Scan(&recordCount); e != nil || recordCount > directEnrollmentMaxRecords {
+		if e := c.QueryRowContext(context.Background(), `SELECT MAX((SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?),(SELECT COUNT(*) FROM native_direct_enrollment_v1_fences WHERE installation=?))`, b.Installation, b.Installation).Scan(&recordCount); e != nil || recordCount > directEnrollmentMaxRecords {
 			return errDirectEnrollment
 		}
 		var raw, mac []byte
@@ -293,7 +322,17 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 		if e != nil && !errors.Is(e, sql.ErrNoRows) {
 			return e
 		}
-		row := directEnrollmentRecord{Version: 1, Binding: b, State: "reserved"}
+		expectedBinding, _ := json.Marshal(b)
+		var fence, fenceMAC []byte
+		fenceErr := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(binding)<=65536 THEN binding ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1_fences WHERE installation=? AND server=? AND channel=? AND role=?`, b.Installation, b.Server, b.Channel, b.Role).Scan(&fence, &fenceMAC)
+		if fenceErr != nil && !errors.Is(fenceErr, sql.ErrNoRows) {
+			return fenceErr
+		}
+		hasFence := fenceErr == nil
+		if hasFence != exists || (hasFence && (!bytes.Equal(fence, expectedBinding) || !hmac.Equal(fenceMAC, enrollmentFenceMAC(key, b, fence)))) {
+			return errDirectEnrollment
+		}
+		var row directEnrollmentRecord
 		if exists {
 			if len(raw) > directEnrollmentMaxBytes || !hmac.Equal(mac, enrollmentMAC(key, b, raw)) || json.Unmarshal(raw, &row) != nil {
 				return errDirectEnrollment
@@ -305,10 +344,10 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 				return errDirectEnrollment
 			}
 		} else {
-			var count int
-			if e = c.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?`, b.Installation).Scan(&count); e != nil || count >= directEnrollmentMaxRecords {
+			if recordCount >= directEnrollmentMaxRecords {
 				return errDirectEnrollment
 			}
+			row = directEnrollmentRecord{Version: 1, Binding: b, State: "reserved"}
 		}
 		if !j.matches(s, b) {
 			return errDirectEnrollment
@@ -322,6 +361,11 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 		raw, e = json.Marshal(row)
 		if e != nil || len(raw) > directEnrollmentMaxBytes {
 			return errDirectEnrollment
+		}
+		if !hasFence {
+			if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?,?)`, b.Installation, b.Server, b.Channel, b.Role, expectedBinding, enrollmentFenceMAC(key, b, expectedBinding)); e != nil {
+				return e
+			}
 		}
 		if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, raw, enrollmentMAC(key, b, raw)); e != nil {
 			return e

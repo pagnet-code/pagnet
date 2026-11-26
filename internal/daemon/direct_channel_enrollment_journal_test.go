@@ -266,6 +266,9 @@ func TestDirectEnrollmentCapacityNoEviction(t *testing.T) {
 			if _, e := c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?)`, b.Installation, b.Server, fmt.Sprint(i), []byte("occupied"), []byte("occupied")); e != nil {
 				return e
 			}
+			if _, e := c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?,?)`, b.Installation, b.Server, fmt.Sprint(i), b.Role, []byte("occupied"), []byte("occupied")); e != nil {
+				return e
+			}
 		}
 		return nil
 	}); e != nil {
@@ -318,6 +321,47 @@ func TestDirectEnrollmentSubscriptionPartyBinding(t *testing.T) {
 			}
 			if _, e := enrollmentBinding(s, b.Protocol, b.Descriptor, b.LocalFingerprint, b.PeerFingerprint); e == nil {
 				t.Fatal("wrong party constructed binding")
+			}
+		})
+	}
+}
+
+func TestDirectEnrollmentDeletedRecordCannotRecreate(t *testing.T) {
+	for _, phase := range []string{"started", "material"} {
+		t.Run(phase, func(t *testing.T) {
+			j, s, b, v := enrollmentFixture(t)
+			if _, e := j.reserve(s, b); e != nil {
+				t.Fatal(e)
+			}
+			g, e := j.start(s, b)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if phase == "material" {
+				if _, e = g.material(s, v.EpochKey, v.Publication); e != nil {
+					t.Fatal(e)
+				}
+			}
+			if _, e = j.registry.db.Exec(`DELETE FROM native_direct_enrollment_v1`); e != nil {
+				t.Fatal(e)
+			}
+			r, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer r.Close()
+			other, e := newDirectEnrollmentJournal(r)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if _, e = other.reserve(s, b); e == nil {
+				t.Fatal("deleted row recreated")
+			}
+			if _, e = other.start(s, b); e == nil {
+				t.Fatal("second creation grant")
+			}
+			if _, e = r.db.Exec(`DELETE FROM native_direct_enrollment_v1_fences`); e == nil {
+				t.Fatal("immutable fence deleted")
 			}
 		})
 	}
