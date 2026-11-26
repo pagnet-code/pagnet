@@ -70,18 +70,16 @@ func TestDirectEnrollmentSingleGrantAndReplay(t *testing.T) {
 	if _, e := j.reserve(s, b); e != nil {
 		t.Fatal(e)
 	}
-	otherRegistry, err := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
-	if err != nil {
-		t.Fatal(err)
+	registry, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+	if e != nil {
+		t.Fatal(e)
 	}
-	defer otherRegistry.Close()
-	otherJournal, err := newDirectEnrollmentJournal(otherRegistry)
-	if err != nil {
-		t.Fatal(err)
+	defer registry.Close()
+	other, e := newDirectEnrollmentJournal(registry)
+	if e != nil {
+		t.Fatal(e)
 	}
-	var wins atomic.Int32
-	var grant *directEnrollmentGrant
-	var mu sync.Mutex
+	var generated atomic.Int32
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
@@ -89,56 +87,52 @@ func TestDirectEnrollmentSingleGrantAndReplay(t *testing.T) {
 			defer wg.Done()
 			active := j
 			if i%2 == 0 {
-				active = otherJournal
+				active = other
 			}
-			g, e := active.start(s, b)
-			if e == nil {
-				wins.Add(1)
-				mu.Lock()
-				grant = g
-				mu.Unlock()
+			row, e := active.material(s, b, func() ([]byte, []byte, error) { generated.Add(1); return bytes.Clone(v.EpochKey), v.Publication, nil })
+			if e != nil {
+				t.Error(e)
+				return
+			}
+			if !bytes.Equal(row.Root, v.EpochKey) || !bytes.Equal(row.Publication, v.Publication) {
+				t.Error("material changed")
 			}
 		}(i)
 	}
 	wg.Wait()
-	if wins.Load() != 1 {
-		t.Fatalf("grants %d", wins.Load())
+	if generated.Load() != 1 {
+		t.Fatalf("candidates %d", generated.Load())
 	}
-	if _, e := j.reserve(s, b); e == nil {
-		t.Fatal("started replay accepted")
-	}
-	if _, e := grant.material(s, v.EpochKey, v.Publication); e != nil {
+	if _, e := j.bindProof(s, b, v.Challenges[0], v.Proofs[0]); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := grant.material(s, v.EpochKey, v.Publication); e == nil {
-		t.Fatal("grant reused")
-	}
-	r, e := j.bindProof(s, b, v.Challenges[0], v.Proofs[0])
-	if e != nil {
-		t.Fatal(e)
-	}
-	for _, kind := range []string{"publication", "challenge", "proof"} {
-		if _, e = j.markDispatch(s, b, kind); e != nil {
+	for _, kind := range []string{"publication", "challenge", "proof", "activation"} {
+		// A retained challenge is already authoritative and cannot be dispatched again.
+		if kind == "challenge" {
+			continue
+		}
+		if _, e := j.markDispatch(s, b, kind); e != nil {
 			t.Fatal(e)
 		}
-		if _, e = j.markDispatch(s, b, kind); e == nil {
-			t.Fatal("dispatch reused")
+		if _, e := j.markDispatch(s, b, kind); e == nil {
+			t.Fatal("unknown outcome replayed")
+		}
+		if _, e := j.observeAbsent(s, b, kind); e != nil {
+			t.Fatal(e)
+		}
+		row, e := j.markDispatch(s, b, kind)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if row.Attempts[kind].Count != 2 || row.Attempts[kind].Recovered != 1 {
+			t.Fatal("nonmonotonic attempts")
 		}
 	}
-	reopened, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+	replay, e := other.material(s, b, func() ([]byte, []byte, error) { t.Fatal("regenerated root"); return nil, nil, nil })
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer reopened.Close()
-	other, e := newDirectEnrollmentJournal(reopened)
-	if e != nil {
-		t.Fatal(e)
-	}
-	replay, e := other.reserve(s, b)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if !bytes.Equal(replay.Publication, v.Publication) || !bytes.Equal(replay.Root, v.EpochKey) || !bytes.Equal(replay.Proof, r.Proof) {
+	if !bytes.Equal(replay.Root, v.EpochKey) || !bytes.Equal(replay.Proof, v.Proofs[0]) {
 		t.Fatal("replay changed bytes")
 	}
 }
@@ -149,36 +143,59 @@ func TestDirectEnrollmentCrashPhases(t *testing.T) {
 			if _, e := j.reserve(s, b); e != nil {
 				t.Fatal(e)
 			}
-			if phase != "reserved" {
-				g, e := j.start(s, b)
-				if e != nil {
+			if phase == "started" {
+				if _, e := j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error { r.State = "started"; return nil }); e != nil {
 					t.Fatal(e)
 				}
-				if phase == "material" {
-					if _, e = g.material(s, v.EpochKey, v.Publication); e != nil {
-						t.Fatal(e)
-					}
+			}
+			if phase == "material" {
+				if _, e := j.material(s, b, func() ([]byte, []byte, error) { return bytes.Clone(v.EpochKey), v.Publication, nil }); e != nil {
+					t.Fatal(e)
 				}
 			}
-			r, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+			registry, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
 			if e != nil {
 				t.Fatal(e)
 			}
-			defer r.Close()
-			other, e := newDirectEnrollmentJournal(r)
+			defer registry.Close()
+			reopened, e := newDirectEnrollmentJournal(registry)
 			if e != nil {
 				t.Fatal(e)
 			}
-			row, e := other.reserve(s, b)
-			if phase == "started" {
-				if e == nil {
-					t.Fatal("crashed start recovered")
-				}
-			} else if e != nil || row.State != phase {
-				t.Fatalf("state %s error %v", row.State, e)
+			calls := 0
+			row, e := reopened.material(s, b, func() ([]byte, []byte, error) { calls++; return bytes.Clone(v.EpochKey), v.Publication, nil })
+			if e != nil {
+				t.Fatal(e)
+			}
+			expected := 1
+			if phase == "material" {
+				expected = 0
+			}
+			if calls != expected || !bytes.Equal(row.Root, v.EpochKey) {
+				t.Fatal("incorrect crash recovery")
 			}
 		})
 	}
+}
+
+// Legacy start rows are constructed only as authenticated migration fixtures.
+type enrollmentLegacyGrant struct {
+	j *directEnrollmentJournal
+	b directEnrollmentBinding
+}
+
+func enrollmentLegacyStart(j *directEnrollmentJournal, s *DirectEndpointSubscription, b directEnrollmentBinding) (*enrollmentLegacyGrant, error) {
+	_, e := j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "reserved" {
+			return errDirectEnrollment
+		}
+		r.State = "started"
+		return nil
+	})
+	return &enrollmentLegacyGrant{j, b}, e
+}
+func (g *enrollmentLegacyGrant) material(s *DirectEndpointSubscription, root, publication []byte) (directEnrollmentRecord, error) {
+	return g.j.material(s, g.b, func() ([]byte, []byte, error) { return bytes.Clone(root), publication, nil })
 }
 func TestDirectEnrollmentTampering(t *testing.T) {
 	for _, kind := range []string{"mac", "noncanonical", "oversize", "identity", "descriptor", "key-missing", "key-mode", "key-hardlink"} {
@@ -333,7 +350,7 @@ func TestDirectEnrollmentDeletedRecordCannotRecreate(t *testing.T) {
 			if _, e := j.reserve(s, b); e != nil {
 				t.Fatal(e)
 			}
-			g, e := j.start(s, b)
+			g, e := enrollmentLegacyStart(j, s, b)
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -357,7 +374,7 @@ func TestDirectEnrollmentDeletedRecordCannotRecreate(t *testing.T) {
 			if _, e = other.reserve(s, b); e == nil {
 				t.Fatal("deleted row recreated")
 			}
-			if _, e = other.start(s, b); e == nil {
+			if _, e = enrollmentLegacyStart(other, s, b); e == nil {
 				t.Fatal("second creation grant")
 			}
 			if _, e = r.db.Exec(`DELETE FROM native_direct_enrollment_v1_fences`); e == nil {
@@ -403,7 +420,7 @@ func TestDirectEnrollmentDeletedRecordRejectsOppositeRole(t *testing.T) {
 				if _, e = j.reserve(first, firstBinding); e != nil {
 					t.Fatal(e)
 				}
-				grant, e := j.start(first, firstBinding)
+				grant, e := enrollmentLegacyStart(j, first, firstBinding)
 				if e != nil {
 					t.Fatal(e)
 				}
@@ -427,7 +444,7 @@ func TestDirectEnrollmentDeletedRecordRejectsOppositeRole(t *testing.T) {
 				if _, e = reopened.reserve(next, nextBinding); e == nil {
 					t.Fatal("opposite role recreated deleted journal row")
 				}
-				if _, e = reopened.start(next, nextBinding); e == nil {
+				if _, e = enrollmentLegacyStart(reopened, next, nextBinding); e == nil {
 					t.Fatal("opposite role minted second creation grant")
 				}
 				var rows, fences int
@@ -442,5 +459,160 @@ func TestDirectEnrollmentDeletedRecordRejectsOppositeRole(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestDirectEnrollmentCommitOutcomeRecovery(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		t.Run(fmt.Sprint(committed), func(t *testing.T) {
+			j, s, b, v := enrollmentFixture(t)
+			if _, e := j.reserve(s, b); e != nil {
+				t.Fatal(e)
+			}
+			// Inject a lost COMMIT acknowledgement after writing the same authenticated
+			// material that apply writes; alternatively confirm rollback before error.
+			e := j.locked(func(c *sql.Conn, key []byte) error {
+				row := directEnrollmentRecord{Version: 1, Binding: b, State: "material", Root: bytes.Clone(v.EpochKey), Publication: bytes.Clone(v.Publication), PublicationHash: enrollmentHash(v.Publication)}
+				raw, err := json.Marshal(row)
+				if err != nil {
+					return err
+				}
+				if _, err = c.ExecContext(context.Background(), `UPDATE native_direct_enrollment_v1 SET payload=?,mac=?`, raw, enrollmentMAC(key, b, raw)); err != nil {
+					return err
+				}
+				operation := "ROLLBACK"
+				if committed {
+					operation = "COMMIT"
+				}
+				_, err = c.ExecContext(context.Background(), operation)
+				return err
+			})
+			if e == nil {
+				t.Fatal("uncertain commit accepted")
+			}
+			if _, e = j.reserve(s, b); e == nil {
+				t.Fatal("poisoned handle usable")
+			}
+			reopened, e := newDirectEnrollmentJournal(j.registry)
+			if e != nil {
+				t.Fatal(e)
+			}
+			generated := 0
+			row, e := reopened.material(s, b, func() ([]byte, []byte, error) { generated++; return bytes.Clone(v.EpochKey), v.Publication, nil })
+			if e != nil {
+				t.Fatal(e)
+			}
+			want := 1
+			if committed {
+				want = 0
+			}
+			if generated != want || !bytes.Equal(row.Root, v.EpochKey) {
+				t.Fatal("commit recovery replaced material")
+			}
+		})
+	}
+}
+func TestDirectEnrollmentObservations(t *testing.T) {
+	j, s, b, v := enrollmentFixture(t)
+	if _, e := j.reserve(s, b); e != nil {
+		t.Fatal(e)
+	}
+	row, e := j.material(s, b, func() ([]byte, []byte, error) { return bytes.Clone(v.EpochKey), v.Publication, nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observePublication(s, b, enrollmentHash([]byte("wrong"))); e == nil {
+		t.Fatal("wrong publication accepted")
+	}
+	if _, e = j.observePublication(s, b, row.PublicationHash); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.markDispatch(s, b, "publication"); e == nil {
+		t.Fatal("observed publication replayed")
+	}
+	if _, e = j.markDispatch(s, b, "challenge"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observeAbsent(s, b, "challenge"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.markDispatch(s, b, "challenge"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observeChallenge(s, b, v.Challenges[0]); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.bindProof(s, b, v.Challenges[0], v.Proofs[0]); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observeChallenge(s, b, []byte("changed")); e == nil {
+		t.Fatal("changed challenge accepted")
+	}
+	c, e := transport.DecodeDirectChannelReadinessChallengeV2(v.Challenges[0])
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observeProof(s, b, enrollmentHash([]byte("wrong")), c.ExpiresAt); e == nil {
+		t.Fatal("wrong proof accepted")
+	}
+	if _, e = j.observeProof(s, b, enrollmentHash(v.Proofs[0]), c.ExpiresAt); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.markDispatch(s, b, "activation"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.markDispatch(s, b, "activation"); e == nil {
+		t.Fatal("activation unknown outcome replayed")
+	}
+	if _, e = j.observeAbsent(s, b, "activation"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.markDispatch(s, b, "activation"); e != nil {
+		t.Fatal(e)
+	}
+	d, e := transport.DecodeDirectChannelDescriptorV2(v.Descriptor)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.observeActivation(s, b, "wrong", c.ExpiresAt, d.ExpiresAt); e == nil {
+		t.Fatal("wrong activation accepted")
+	}
+	activated, e := j.observeActivation(s, b, b.Channel, c.ExpiresAt, d.ExpiresAt)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if len(activated.Activation) == 0 || !bytes.Equal(activated.ActivationHash, enrollmentDigest(activated.Activation)) {
+		t.Fatal("activation not retained")
+	}
+	if _, e = j.observeActivation(s, b, b.Channel, "2999-01-01T00:00:00Z", d.ExpiresAt); e == nil {
+		t.Fatal("activation outside descriptor accepted")
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		if got := fmt.Sprintf(verb, activated); got != "directEnrollmentRecord{private}" {
+			t.Fatal("record formatting exposed private fields")
+		}
+	}
+}
+
+func TestDirectEnrollmentConfirmedRollback(t *testing.T) {
+	j, s, b, v := enrollmentFixture(t)
+	if _, e := j.material(s, b, func() ([]byte, []byte, error) { t.Fatal("missing row generated candidate"); return nil, nil, nil }); e == nil {
+		t.Fatal("missing reservation accepted")
+	}
+	if _, e := j.reserve(s, b); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := j.material(s, b, func() ([]byte, []byte, error) { return bytes.Clone(v.EpochKey), []byte("invalid publication"), nil }); e == nil {
+		t.Fatal("invalid candidate accepted")
+	}
+	row, e := j.reserve(s, b)
+	if e != nil || row.State != "reserved" {
+		t.Fatal("confirmed rollback changed reservation")
+	}
+	if _, e = j.material(s, b, func() ([]byte, []byte, error) { return bytes.Clone(v.EpochKey), v.Publication, nil }); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = j.material(s, b, func() ([]byte, []byte, error) { t.Fatal("committed root regenerated"); return nil, nil, nil }); e != nil {
+		t.Fatal(e)
 	}
 }

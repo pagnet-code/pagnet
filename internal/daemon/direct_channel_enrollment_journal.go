@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/pagnet-code/pagnet/transport"
@@ -49,18 +48,23 @@ type directEnrollmentRecord struct {
 	Publication                                        []byte
 	PublicationHash                                    [32]byte
 	Challenge, Proof                                   []byte
-	PublicationStarted, ChallengeStarted, ProofStarted bool
+	PublicationStarted, ChallengeStarted, ProofStarted bool                               // Legacy authenticated dispatch fences.
+	Attempts                                           map[string]directEnrollmentAttempt `json:",omitempty"`
+	PublicationObserved                                bool                               `json:",omitempty"`
+	ProofReceivedAt                                    string                             `json:",omitempty"`
+	Activation                                         []byte                             `json:",omitempty"`
+	ActivationHash                                     []byte                             `json:",omitempty"`
 }
 
 func (directEnrollmentRecord) Format(s fmt.State, verb rune) {
 	_, _ = io.WriteString(s, "directEnrollmentRecord{private}")
 }
 
-type directEnrollmentGrant struct {
-	mu      sync.Mutex
-	journal *directEnrollmentJournal
-	binding directEnrollmentBinding
-	used    bool
+// Attempts count durable dispatch authorizations. Recovered records which attempts
+// have been reconciled by an authoritative absence; absence never permits new bytes.
+type directEnrollmentAttempt struct {
+	Count     uint64
+	Recovered uint64
 }
 
 func newDirectEnrollmentJournal(r *NativeWorkerRegistry) (*directEnrollmentJournal, error) {
@@ -75,6 +79,7 @@ func newDirectEnrollmentJournal(r *NativeWorkerRegistry) (*directEnrollmentJourn
 	return j, nil
 }
 func enrollmentHash(b []byte) [32]byte { return sha256.Sum256(b) }
+func enrollmentDigest(b []byte) []byte { h := enrollmentHash(b); return h[:] }
 func enrollmentBinding(s *DirectEndpointSubscription, protocol directManagedSourceCredentialProtocolVariant, descriptor []byte, local, peer [32]byte) (directEnrollmentBinding, error) {
 	if s == nil {
 		return directEnrollmentBinding{}, errDirectEnrollment
@@ -115,8 +120,33 @@ func (r directEnrollmentRecord) validate() error {
 	if r.Version != 1 || r.Binding.validate() != nil {
 		return errDirectEnrollment
 	}
+	for kind, a := range r.Attempts {
+		if (kind != "publication" && kind != "challenge" && kind != "proof" && kind != "activation") || a.Recovered > a.Count {
+			return errDirectEnrollment
+		}
+	}
+	if (r.Attempts["proof"].Count > 0 || r.Attempts["activation"].Count > 0) && len(r.Proof) == 0 {
+		return errDirectEnrollment
+	}
+	if r.ProofReceivedAt != "" && (len(r.Proof) == 0 || !enrollmentObservedTime(r.ProofReceivedAt, r.Binding)) {
+		return errDirectEnrollment
+	}
+	if len(r.Activation) > 0 {
+		var activation directEnrollmentActivation
+		if json.Unmarshal(r.Activation, &activation) != nil || activation.ChannelID != r.Binding.Channel || !enrollmentObservedTime(activation.ActivatedAt, r.Binding) || !enrollmentObservedTime(activation.ExpiresAt, r.Binding) || !bytes.Equal(r.ActivationHash, enrollmentDigest(r.Activation)) || len(r.Proof) == 0 {
+			return errDirectEnrollment
+		}
+		raw, _ := json.Marshal(activation)
+		start, _ := time.Parse(time.RFC3339Nano, activation.ActivatedAt)
+		end, _ := time.Parse(time.RFC3339Nano, activation.ExpiresAt)
+		if !bytes.Equal(raw, r.Activation) || !start.Before(end) {
+			return errDirectEnrollment
+		}
+	} else if len(r.ActivationHash) != 0 {
+		return errDirectEnrollment
+	}
 	if r.State == "reserved" || r.State == "started" {
-		if len(r.Root) != 0 || len(r.Publication) != 0 || r.PublicationHash != ([32]byte{}) || len(r.Challenge) != 0 || len(r.Proof) != 0 || r.PublicationStarted || r.ChallengeStarted || r.ProofStarted {
+		if len(r.Attempts) > 0 || r.PublicationObserved || r.ProofReceivedAt != "" || len(r.Activation) > 0 || len(r.Root) != 0 || len(r.Publication) != 0 || r.PublicationHash != ([32]byte{}) || len(r.Challenge) != 0 || len(r.Proof) != 0 || r.PublicationStarted || r.ChallengeStarted || r.ProofStarted {
 			return errDirectEnrollment
 		}
 		return nil
@@ -401,38 +431,27 @@ func enrollmentSubscriptionParty(s *DirectEndpointSubscription, b directEnrollme
 }
 
 func (j *directEnrollmentJournal) reserve(s *DirectEndpointSubscription, b directEnrollmentBinding) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error { return nil })
+}
+
+// material atomically installs one candidate before any dispatch is possible.
+// generate is private synchronous local cryptography only: it must never perform
+// HTTP, IPC, custody operations, or retain the candidate. A failed COMMIT poisons
+// this handle; callers must reopen and read the durable row before trying again.
+func (j *directEnrollmentJournal) material(s *DirectEndpointSubscription, b directEnrollmentBinding, generate func() ([]byte, []byte, error)) (directEnrollmentRecord, error) {
 	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
-		if r.State == "started" {
+		if !exists {
 			return errDirectEnrollment
 		}
-		return nil
-	})
-}
-func (j *directEnrollmentJournal) start(s *DirectEndpointSubscription, b directEnrollmentBinding) (*directEnrollmentGrant, error) {
-	_, e := j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
-		if !exists || r.State != "reserved" {
+		if r.State == "material" {
+			return nil
+		}
+		if (r.State != "reserved" && r.State != "started") || generate == nil {
 			return errDirectEnrollment
 		}
-		r.State = "started"
-		return nil
-	})
-	if e != nil {
-		return nil, e
-	}
-	return &directEnrollmentGrant{journal: j, binding: b}, nil
-}
-func (g *directEnrollmentGrant) material(s *DirectEndpointSubscription, root, publication []byte) (directEnrollmentRecord, error) {
-	if g == nil {
-		return directEnrollmentRecord{}, errDirectEnrollment
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.used {
-		return directEnrollmentRecord{}, errDirectEnrollment
-	}
-	g.used = true
-	return g.journal.apply(s, g.binding, func(r *directEnrollmentRecord, exists bool) error {
-		if !exists || r.State != "started" {
+		root, publication, err := generate()
+		defer clear(root)
+		if err != nil {
 			return errDirectEnrollment
 		}
 		r.State = "material"
@@ -449,7 +468,7 @@ func (j *directEnrollmentJournal) bindProof(s *DirectEndpointSubscription, b dir
 		if !exists || r.State != "material" || len(proof) == 0 {
 			return errDirectEnrollment
 		}
-		if len(r.Challenge) > 0 && (!bytes.Equal(challenge, r.Challenge) || !bytes.Equal(proof, r.Proof)) {
+		if (len(r.Challenge) > 0 && !bytes.Equal(challenge, r.Challenge)) || (len(r.Proof) > 0 && !bytes.Equal(proof, r.Proof)) {
 			return errDirectEnrollment
 		}
 		r.Challenge = bytes.Clone(challenge)
@@ -458,31 +477,113 @@ func (j *directEnrollmentJournal) bindProof(s *DirectEndpointSubscription, b dir
 	})
 }
 
-// markDispatch commits a start fence before the caller may attempt traffic. A
-// repeated marker is rejected: unknown remote outcomes require explicit recovery.
+// markDispatch persists each attempt before traffic. A previous unknown outcome
+// requires authoritative absence before exact immutable bytes may be replayed.
 func (j *directEnrollmentJournal) markDispatch(s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
 	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
-		if !exists || r.State != "material" {
+		if !exists || r.State != "material" || !r.dispatchKind(kind) {
 			return errDirectEnrollment
 		}
-		var marker *bool
-		switch kind {
-		case "publication":
-			marker = &r.PublicationStarted
-		case "challenge":
-			marker = &r.ChallengeStarted
-		case "proof":
-			if len(r.Proof) == 0 {
-				return errDirectEnrollment
-			}
-			marker = &r.ProofStarted
-		default:
+		r.importLegacyAttempts()
+		a := r.Attempts[kind]
+		if a.Count != a.Recovered || a.Count == ^uint64(0) {
 			return errDirectEnrollment
 		}
-		if *marker {
+		a.Count++
+		r.Attempts[kind] = a
+		return nil
+	})
+}
+func (r directEnrollmentRecord) dispatchKind(kind string) bool {
+	switch kind {
+	case "publication":
+		return !r.PublicationObserved
+	case "challenge":
+		return len(r.Challenge) == 0
+	case "proof":
+		return len(r.Proof) > 0 && r.ProofReceivedAt == ""
+	case "activation":
+		return len(r.Proof) > 0 && len(r.Activation) == 0
+	}
+	return false
+}
+func (r *directEnrollmentRecord) importLegacyAttempts() {
+	if r.Attempts == nil {
+		r.Attempts = make(map[string]directEnrollmentAttempt)
+	}
+	for kind, started := range map[string]bool{"publication": r.PublicationStarted, "challenge": r.ChallengeStarted, "proof": r.ProofStarted} {
+		if started && r.Attempts[kind].Count == 0 {
+			r.Attempts[kind] = directEnrollmentAttempt{Count: 1}
+		}
+	}
+}
+
+// observeAbsent records only authoritative GET absence. It does not assert an
+// earlier request cannot still commit, so subsequent attempts reuse stored bytes.
+func (j *directEnrollmentJournal) observeAbsent(s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || !r.dispatchKind(kind) {
 			return errDirectEnrollment
 		}
-		*marker = true
+		r.importLegacyAttempts()
+		a := r.Attempts[kind]
+		a.Recovered = a.Count
+		r.Attempts[kind] = a
+		return nil
+	})
+}
+func (j *directEnrollmentJournal) observePublication(s *DirectEndpointSubscription, b directEnrollmentBinding, hash [32]byte) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || hash != r.PublicationHash {
+			return errDirectEnrollment
+		}
+		r.PublicationObserved = true
+		return nil
+	})
+}
+func (j *directEnrollmentJournal) observeChallenge(s *DirectEndpointSubscription, b directEnrollmentBinding, challenge []byte) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || len(challenge) == 0 || (len(r.Challenge) > 0 && !bytes.Equal(challenge, r.Challenge)) {
+			return errDirectEnrollment
+		}
+		r.Challenge = bytes.Clone(challenge)
+		return nil
+	})
+}
+func enrollmentObservedTime(value string, b directEnrollmentBinding) bool {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	d, e := transport.DecodeDirectChannelDescriptorV2(b.Descriptor)
+	expiry, ex := time.Parse(time.RFC3339Nano, d.ExpiresAt)
+	return err == nil && e == nil && ex == nil && !t.IsZero() && !t.After(expiry)
+}
+func (j *directEnrollmentJournal) observeProof(s *DirectEndpointSubscription, b directEnrollmentBinding, digest [32]byte, receivedAt string) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || len(r.Proof) == 0 || digest != enrollmentHash(r.Proof) || !enrollmentObservedTime(receivedAt, b) || (r.ProofReceivedAt != "" && r.ProofReceivedAt != receivedAt) {
+			return errDirectEnrollment
+		}
+		r.ProofReceivedAt = receivedAt
+		return nil
+	})
+}
+
+type directEnrollmentActivation struct{ ChannelID, ActivatedAt, ExpiresAt string }
+
+func (j *directEnrollmentJournal) observeActivation(s *DirectEndpointSubscription, b directEnrollmentBinding, channelID, activatedAt, expiresAt string) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || len(r.Proof) == 0 || channelID != b.Channel || !enrollmentObservedTime(activatedAt, b) || !enrollmentObservedTime(expiresAt, b) {
+			return errDirectEnrollment
+		}
+		start, _ := time.Parse(time.RFC3339Nano, activatedAt)
+		end, _ := time.Parse(time.RFC3339Nano, expiresAt)
+		if !start.Before(end) {
+			return errDirectEnrollment
+		}
+		raw, _ := json.Marshal(directEnrollmentActivation{channelID, activatedAt, expiresAt})
+		if len(r.Activation) > 0 && !bytes.Equal(raw, r.Activation) {
+			return errDirectEnrollment
+		}
+		r.Activation = raw
+		r.ActivationHash = enrollmentDigest(raw)
 		return nil
 	})
 }
