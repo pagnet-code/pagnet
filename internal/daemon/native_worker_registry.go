@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/pagnet-code/pagnet/internal/sessionworker"
 	"github.com/pagnet-code/pagnet/transport"
@@ -41,6 +42,8 @@ type NativeWorkerRegistry struct {
 	root                string
 	custodyIdentity     nativeRegistryFileIdentity
 	mu                  sync.Mutex
+	closed              bool
+	closeErr            error
 	directInvalidations directEndpointInvalidations
 }
 
@@ -158,6 +161,9 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 func (r *NativeWorkerRegistry) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return r.closeErr
+	}
 	root, err := nativeRegistryProtectedDirectory(r.root)
 	if err != nil {
 		return err
@@ -171,9 +177,21 @@ func (r *NativeWorkerRegistry) Close() error {
 		return err
 	}
 	defer custody.Close()
+	// Drain the sole connection before closing the pool: sql.DB.Close alone
+	// leaves checked-out connections alive until their readers release them.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
 	// SQLite's last close can unlink WAL and SHM files. Keep custody while it
-	// does so, just as opens and enrollment writes hold custody to inspect them.
-	return r.db.Close()
+	// does so, rejecting new readers before releasing the driver connection.
+	err = r.db.Close()
+	err = errors.Join(err, conn.Close())
+	r.closed = true
+	r.closeErr = err
+	return err
 }
 func (r *NativeWorkerRegistry) Dir(scope sessionworker.Scope) string {
 	raw, _ := json.Marshal(scope)

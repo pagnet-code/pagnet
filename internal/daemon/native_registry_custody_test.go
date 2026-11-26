@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -232,6 +233,116 @@ func TestNativeRegistryCloseFailureReportedByDaemon(t *testing.T) {
 	}
 	if d.turnCtx.Err() == nil {
 		t.Fatal("registry failure interrupted daemon shutdown")
+	}
+}
+
+func TestNativeRegistryCloseDrainsReaders(t *testing.T) {
+	for _, outstanding := range []string{"connection", "rows"} {
+		t.Run(outstanding, func(t *testing.T) {
+			state := registryCustodyState(t)
+			r, err := OpenNativeWorkerRegistry(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = r.Close() })
+			var release func() error
+			if outstanding == "connection" {
+				conn, err := r.db.Conn(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = conn.Close
+			} else {
+				rows, err := r.db.Query(`SELECT 1`)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = rows.Close
+			}
+			defer release()
+			waits := r.db.Stats().WaitCount
+			closed := make(chan error, 1)
+			go func() { closed <- r.Close() }()
+			deadline := time.Now().Add(5 * time.Second)
+			for r.db.Stats().WaitCount == waits {
+				select {
+				case err := <-closed:
+					t.Fatalf("Close returned before reader release: %v", err)
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("Close did not wait for the checked-out connection")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case err := <-closed:
+				t.Fatalf("Close returned while reader was active: %v", err)
+			default:
+			}
+			var readers sync.WaitGroup
+			for i := 0; i < 8; i++ {
+				readers.Add(1)
+				go func() {
+					defer readers.Done()
+					for n := 0; n < 32; n++ {
+						if _, err := r.List(); err != nil {
+							return
+						}
+					}
+				}()
+			}
+			if err := release(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-closed:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close did not finish after reader release")
+			}
+			readers.Wait()
+			if got := r.db.Stats().OpenConnections; got != 0 {
+				t.Fatalf("Close left %d driver connections alive", got)
+			}
+			if err := r.Close(); err != nil {
+				t.Fatalf("repeated Close: %v", err)
+			}
+			reopened, err := OpenNativeWorkerRegistry(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestNativeRegistryCloseDrainTimeoutIsRetryable(t *testing.T) {
+	r, err := OpenNativeWorkerRegistry(registryCustodyState(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	conn, err := r.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := r.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close did not time out waiting for the connection: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.db.Ping(); err != nil {
+		t.Fatalf("drain timeout closed the database: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close retry failed: %v", err)
 	}
 }
 
