@@ -261,6 +261,9 @@ func openAuthorityJournal(dir string, authority AuthorityScope, existing bool) (
 	if err = j.initializeGatewayAdmissions(); err != nil {
 		return fail(err)
 	}
+	if err = j.initializeDirectAdmissions(); err != nil {
+		return fail(err)
+	}
 	if err = j.validateHistory(); err != nil {
 		return fail(err)
 	}
