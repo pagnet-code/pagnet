@@ -13,6 +13,9 @@ import (
 // does not install a transport or restore a subscription after reconnect.
 type DirectEndpointSubscriptionMetadata struct {
 	InstallationID      domain.ID
+	TenantID            domain.ID
+	PrincipalID         domain.ID
+	EndpointID          domain.ID
 	OriginID            domain.ID
 	IntentID            domain.ID
 	CredentialID        domain.ID

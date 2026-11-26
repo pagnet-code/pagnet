@@ -1,0 +1,443 @@
+//go:build linux || darwin
+
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/pagnet-code/pagnet/transport"
+)
+
+const directEnrollmentNamespace = "direct-channel-enrollment-v1"
+const directEnrollmentMaxBytes = 65536
+const directEnrollmentMaxRecords = 1024
+
+var errDirectEnrollment = errors.New("direct channel enrollment journal unavailable, unsafe or conflicting")
+
+// This journal is storage only. Records never authorize traffic or restore a lease.
+// Lock order: registry.mu, namespace flock, BEGIN IMMEDIATE, subscription leaf.
+type directEnrollmentJournal struct {
+	registry *NativeWorkerRegistry
+	poisoned bool
+}
+type directEnrollmentBinding struct {
+	Installation, Server, Channel, Role                            string
+	Protocol                                                       directManagedSourceCredentialProtocolVariant
+	Credential, Instance, Generation, NativeGeneration             string
+	IssueDigest, DescriptorHash, LocalFingerprint, PeerFingerprint [32]byte
+	Descriptor                                                     []byte
+}
+type directEnrollmentRecord struct {
+	Version                                            int
+	Binding                                            directEnrollmentBinding
+	State                                              string
+	Root                                               []byte
+	Publication                                        []byte
+	PublicationHash                                    [32]byte
+	Challenge, Proof                                   []byte
+	PublicationStarted, ChallengeStarted, ProofStarted bool
+}
+
+func (directEnrollmentRecord) Format(s fmt.State, verb rune) {
+	_, _ = io.WriteString(s, "directEnrollmentRecord{private}")
+}
+
+type directEnrollmentGrant struct {
+	mu      sync.Mutex
+	journal *directEnrollmentJournal
+	binding directEnrollmentBinding
+	used    bool
+}
+
+func newDirectEnrollmentJournal(r *NativeWorkerRegistry) (*directEnrollmentJournal, error) {
+	if r == nil {
+		return nil, errDirectEnrollment
+	}
+	j := &directEnrollmentJournal{registry: r}
+	err := j.locked(func(c *sql.Conn, key []byte) error { return nil })
+	if err != nil {
+		return nil, errDirectEnrollment
+	}
+	return j, nil
+}
+func enrollmentHash(b []byte) [32]byte { return sha256.Sum256(b) }
+func enrollmentBinding(s *DirectEndpointSubscription, protocol directManagedSourceCredentialProtocolVariant, descriptor []byte, local, peer [32]byte) (directEnrollmentBinding, error) {
+	if s == nil {
+		return directEnrollmentBinding{}, errDirectEnrollment
+	}
+	d, err := transport.DecodeDirectChannelDescriptorV2(descriptor)
+	if err != nil {
+		return directEnrollmentBinding{}, errDirectEnrollment
+	}
+	channel, _ := transport.DirectChannelIDV2(d)
+	b := s.binding
+	out := directEnrollmentBinding{Installation: string(b.metadata.InstallationID), Server: b.metadata.ServerOrigin, Channel: channel, Role: b.metadata.Role, Protocol: protocol, Credential: string(b.metadata.CredentialID), Instance: string(b.subject.InstanceID), Generation: b.subject.OwnershipGeneration, NativeGeneration: b.subject.NativeGeneration, IssueDigest: b.issueDigest, DescriptorHash: enrollmentHash(descriptor), LocalFingerprint: local, PeerFingerprint: peer, Descriptor: bytes.Clone(descriptor)}
+	if out.validate() != nil || !enrollmentSubscriptionParty(s, out) {
+		return directEnrollmentBinding{}, errDirectEnrollment
+	}
+	return out, nil
+}
+func (b directEnrollmentBinding) validate() error {
+	d, e := transport.DecodeDirectChannelDescriptorV2(b.Descriptor)
+	if e != nil || len(b.Descriptor) > transport.DirectChannelDescriptorMaxBytesV2 || b.Installation == "" || b.Instance == "" || b.Generation == "" || b.NativeGeneration == "" || b.Server == "" || len(b.Server) > 2048 || managedPrepareServerOrigin(b.Server) != b.Server || b.DescriptorHash != enrollmentHash(b.Descriptor) || b.IssueDigest == ([32]byte{}) || b.LocalFingerprint == ([32]byte{}) || b.PeerFingerprint == ([32]byte{}) {
+		return errDirectEnrollment
+	}
+	party := d.S
+	if b.Role == "P" {
+		party = d.P
+		if b.Protocol != managedDirectCredentialProtocolV1 {
+			return errDirectEnrollment
+		}
+	} else if b.Role != "S" || b.Protocol != directManagedSourceCredentialProtocolV2 {
+		return errDirectEnrollment
+	}
+	channel, _ := transport.DirectChannelIDV2(d)
+	if b.Channel != channel || b.Credential != party.CredentialID {
+		return errDirectEnrollment
+	}
+	return nil
+}
+func (r directEnrollmentRecord) validate() error {
+	if r.Version != 1 || r.Binding.validate() != nil {
+		return errDirectEnrollment
+	}
+	if r.State == "reserved" || r.State == "started" {
+		if len(r.Root) != 0 || len(r.Publication) != 0 || r.PublicationHash != ([32]byte{}) || len(r.Challenge) != 0 || len(r.Proof) != 0 || r.PublicationStarted || r.ChallengeStarted || r.ProofStarted {
+			return errDirectEnrollment
+		}
+		return nil
+	}
+	if r.State != "material" || len(r.Root) != 32 || enrollmentHash(r.Publication) != r.PublicationHash {
+		return errDirectEnrollment
+	}
+	p, err := transport.DecodeDirectChannelPublicationV2(r.Publication)
+	if err != nil {
+		return errDirectEnrollment
+	}
+	descriptor, _ := p.Descriptor.CanonicalBytes()
+	if !bytes.Equal(descriptor, r.Binding.Descriptor) {
+		return errDirectEnrollment
+	}
+	if len(r.Challenge) == 0 {
+		if len(r.Proof) != 0 || r.ProofStarted {
+			return errDirectEnrollment
+		}
+		return nil
+	}
+	c, err := transport.DecodeDirectChannelReadinessChallengeV2(r.Challenge)
+	if err != nil {
+		return errDirectEnrollment
+	}
+	d := p.Descriptor
+	party := d.S
+	if r.Binding.Role == "P" {
+		party = d.P
+	}
+	dh, _ := transport.DescriptorHashV2(d)
+	ph, _ := transport.PublicationHashV2(p)
+	if c.Role != r.Binding.Role || c.PrincipalID != party.PrincipalID || c.EndpointID != party.EndpointID || c.CredentialID != party.CredentialID || c.ChannelID != r.Binding.Channel || c.DescriptorHash != dh || c.PublicationHash != ph || c.ParentGrantID != d.ParentGrantID || c.GrantGeneration != d.GrantGeneration || c.ChannelGeneration != d.ChannelGeneration || c.DirectIntentID != d.DirectIntentID || c.EpochID != d.EpochID {
+		return errDirectEnrollment
+	}
+	expiry, _ := time.Parse(time.RFC3339Nano, c.ExpiresAt)
+	dexp, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
+	if expiry.After(dexp) {
+		return errDirectEnrollment
+	}
+	if len(r.Proof) > 0 {
+		proof, e := transport.DecodeDirectChannelReadinessProofV2(r.Proof)
+		hash := enrollmentHash(r.Challenge)
+		if e != nil || proof.ChallengeID != c.ChallengeID || proof.TranscriptHash != base64.RawURLEncoding.EncodeToString(hash[:]) {
+			return errDirectEnrollment
+		}
+	} else if r.ProofStarted {
+		return errDirectEnrollment
+	}
+	return nil
+}
+func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error {
+	if j == nil || j.registry == nil {
+		return errDirectEnrollment
+	}
+	r := j.registry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if j.poisoned {
+		return errDirectEnrollment
+	}
+	root, e := nativeShareHolderDirectory(r.root)
+	if e != nil {
+		return e
+	}
+	defer root.Close()
+	dir, e := nativeShareHolderChild(root, directEnrollmentNamespace)
+	if e != nil {
+		return e
+	}
+	defer dir.Close()
+	lock, e := nativeShareHolderLock(dir)
+	if e != nil {
+		return e
+	}
+	defer lock.Close()
+	ctx := context.Background()
+	c, e := r.db.Conn(ctx)
+	if e != nil {
+		return e
+	}
+	defer c.Close()
+	if _, e = c.ExecContext(ctx, "BEGIN IMMEDIATE"); e != nil {
+		return e
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, e := c.ExecContext(ctx, "ROLLBACK"); e != nil {
+				_ = c.Raw(func(any) error { return driver.ErrBadConn })
+			}
+		}
+	}()
+	if _, e = c.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS native_direct_enrollment_v1(installation TEXT NOT NULL,server TEXT NOT NULL,channel TEXT NOT NULL,payload BLOB NOT NULL,mac BLOB NOT NULL,PRIMARY KEY(installation,server,channel))`); e != nil {
+		return e
+	}
+	var initialized int
+	if e = c.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_registry_metadata WHERE name='direct_enrollment_mac_initialized'`).Scan(&initialized); e != nil {
+		return e
+	}
+	keyfile, e := nativeShareHolderOpen(dir, "journal.mac", false)
+	if errors.Is(e, os.ErrNotExist) {
+		var count int
+		if e = c.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_direct_enrollment_v1`).Scan(&count); e != nil || count != 0 || initialized != 0 {
+			return errDirectEnrollment
+		}
+		key := make([]byte, 32)
+		if _, e = rand.Read(key); e != nil {
+			return e
+		}
+		keyfile, e = nativeShareHolderOpen(dir, "journal.mac", true)
+		if e != nil {
+			return e
+		}
+		if _, e = keyfile.Write(key); e == nil {
+			e = keyfile.Sync()
+		}
+		keyfile.Close()
+		if e != nil {
+			return e
+		}
+		if e = dir.Sync(); e != nil {
+			return e
+		}
+		keyfile, e = nativeShareHolderOpen(dir, "journal.mac", false)
+	}
+	if e != nil {
+		return e
+	}
+	key, e := io.ReadAll(io.LimitReader(keyfile, 33))
+	keyfile.Close()
+	if e != nil || len(key) != 32 {
+		return errDirectEnrollment
+	}
+	defer clear(key)
+	if _, e = c.ExecContext(ctx, `INSERT OR IGNORE INTO native_registry_metadata(name,value) VALUES('direct_enrollment_mac_initialized','1')`); e != nil {
+		return e
+	}
+	if e = fn(c, key); e != nil {
+		return e
+	}
+	_, e = c.ExecContext(ctx, "COMMIT")
+	committed = e == nil
+	if e != nil {
+		j.poisoned = true
+	}
+	return e
+}
+func enrollmentMAC(key []byte, b directEnrollmentBinding, raw []byte) []byte {
+	h := hmac.New(sha256.New, key)
+	identity, _ := json.Marshal([]string{"pagnet/direct-enrollment/storage/v1", b.Installation, b.Server, b.Channel})
+	h.Write(identity)
+	h.Write([]byte{0})
+	h.Write(raw)
+	return h.Sum(nil)
+}
+func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directEnrollmentBinding, change func(*directEnrollmentRecord, bool) error) (directEnrollmentRecord, error) {
+	var result directEnrollmentRecord
+	if b.validate() != nil || s == nil {
+		return result, errDirectEnrollment
+	}
+	err := j.locked(func(c *sql.Conn, key []byte) error {
+		var installation string
+		if e := c.QueryRowContext(context.Background(), `SELECT value FROM native_registry_metadata WHERE name='installation_id'`).Scan(&installation); e != nil || installation != b.Installation {
+			return errDirectEnrollment
+		}
+		var recordCount int
+		if e := c.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?`, b.Installation).Scan(&recordCount); e != nil || recordCount > directEnrollmentMaxRecords {
+			return errDirectEnrollment
+		}
+		var raw, mac []byte
+		e := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(payload)<=65536 THEN payload ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1 WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&raw, &mac)
+		exists := e == nil
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return e
+		}
+		row := directEnrollmentRecord{Version: 1, Binding: b, State: "reserved"}
+		if exists {
+			if len(raw) > directEnrollmentMaxBytes || !hmac.Equal(mac, enrollmentMAC(key, b, raw)) || json.Unmarshal(raw, &row) != nil {
+				return errDirectEnrollment
+			}
+			canonical, _ := json.Marshal(row)
+			binding, _ := json.Marshal(row.Binding)
+			expected, _ := json.Marshal(b)
+			if !bytes.Equal(raw, canonical) || !bytes.Equal(binding, expected) || row.validate() != nil {
+				return errDirectEnrollment
+			}
+		} else {
+			var count int
+			if e = c.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM native_direct_enrollment_v1 WHERE installation=?`, b.Installation).Scan(&count); e != nil || count >= directEnrollmentMaxRecords {
+				return errDirectEnrollment
+			}
+		}
+		if !j.matches(s, b) {
+			return errDirectEnrollment
+		}
+		if e = change(&row, exists); e != nil {
+			return e
+		}
+		if row.validate() != nil {
+			return errDirectEnrollment
+		}
+		raw, e = json.Marshal(row)
+		if e != nil || len(raw) > directEnrollmentMaxBytes {
+			return errDirectEnrollment
+		}
+		if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?) ON CONFLICT(installation,server,channel) DO UPDATE SET payload=excluded.payload,mac=excluded.mac`, b.Installation, b.Server, b.Channel, raw, enrollmentMAC(key, b, raw)); e != nil {
+			return e
+		}
+		if !j.matches(s, b) {
+			return errDirectEnrollment
+		}
+		result = row
+		return nil
+	})
+	if err != nil {
+		return directEnrollmentRecord{}, errDirectEnrollment
+	}
+	return result, nil
+}
+func (j *directEnrollmentJournal) matches(s *DirectEndpointSubscription, b directEnrollmentBinding) bool {
+	m := s.binding.metadata
+	return s.Valid() && enrollmentSubscriptionParty(s, b) && string(m.InstallationID) == b.Installation && m.ServerOrigin == b.Server && string(m.CredentialID) == b.Credential && m.Role == b.Role && s.binding.issueDigest == b.IssueDigest && string(s.binding.subject.InstanceID) == b.Instance && s.binding.subject.OwnershipGeneration == b.Generation && s.binding.subject.NativeGeneration == b.NativeGeneration
+}
+
+func enrollmentSubscriptionParty(s *DirectEndpointSubscription, b directEnrollmentBinding) bool {
+	d, e := transport.DecodeDirectChannelDescriptorV2(b.Descriptor)
+	if e != nil {
+		return false
+	}
+	party := d.S
+	if b.Role == "P" {
+		party = d.P
+	}
+	m := s.binding.metadata
+	return string(m.TenantID) == party.TenantID && string(m.PrincipalID) == party.PrincipalID && string(m.EndpointID) == party.EndpointID && string(m.IntentID) == d.DirectIntentID
+}
+
+func (j *directEnrollmentJournal) reserve(s *DirectEndpointSubscription, b directEnrollmentBinding) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if r.State == "started" {
+			return errDirectEnrollment
+		}
+		return nil
+	})
+}
+func (j *directEnrollmentJournal) start(s *DirectEndpointSubscription, b directEnrollmentBinding) (*directEnrollmentGrant, error) {
+	_, e := j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "reserved" {
+			return errDirectEnrollment
+		}
+		r.State = "started"
+		return nil
+	})
+	if e != nil {
+		return nil, e
+	}
+	return &directEnrollmentGrant{journal: j, binding: b}, nil
+}
+func (g *directEnrollmentGrant) material(s *DirectEndpointSubscription, root, publication []byte) (directEnrollmentRecord, error) {
+	if g == nil {
+		return directEnrollmentRecord{}, errDirectEnrollment
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.used {
+		return directEnrollmentRecord{}, errDirectEnrollment
+	}
+	g.used = true
+	return g.journal.apply(s, g.binding, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "started" {
+			return errDirectEnrollment
+		}
+		r.State = "material"
+		r.Root = bytes.Clone(root)
+		r.Publication = bytes.Clone(publication)
+		r.PublicationHash = enrollmentHash(publication)
+		return nil
+	})
+}
+
+// bindProof retains one immutable server challenge and exact local proof. No cryptography or dispatch occurs here.
+func (j *directEnrollmentJournal) bindProof(s *DirectEndpointSubscription, b directEnrollmentBinding, challenge, proof []byte) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" || len(proof) == 0 {
+			return errDirectEnrollment
+		}
+		if len(r.Challenge) > 0 && (!bytes.Equal(challenge, r.Challenge) || !bytes.Equal(proof, r.Proof)) {
+			return errDirectEnrollment
+		}
+		r.Challenge = bytes.Clone(challenge)
+		r.Proof = bytes.Clone(proof)
+		return nil
+	})
+}
+
+// markDispatch commits a start fence before the caller may attempt traffic. A
+// repeated marker is rejected: unknown remote outcomes require explicit recovery.
+func (j *directEnrollmentJournal) markDispatch(s *DirectEndpointSubscription, b directEnrollmentBinding, kind string) (directEnrollmentRecord, error) {
+	return j.apply(s, b, func(r *directEnrollmentRecord, exists bool) error {
+		if !exists || r.State != "material" {
+			return errDirectEnrollment
+		}
+		var marker *bool
+		switch kind {
+		case "publication":
+			marker = &r.PublicationStarted
+		case "challenge":
+			marker = &r.ChallengeStarted
+		case "proof":
+			if len(r.Proof) == 0 {
+				return errDirectEnrollment
+			}
+			marker = &r.ProofStarted
+		default:
+			return errDirectEnrollment
+		}
+		if *marker {
+			return errDirectEnrollment
+		}
+		*marker = true
+		return nil
+	})
+}
