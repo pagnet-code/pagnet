@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"github.com/pagnet-code/pagnet/internal/proc"
+	"os"
 	"testing"
 
 	"github.com/pagnet-code/pagnet/domain"
@@ -197,5 +199,61 @@ func TestDirectEndpointNativeOldObservationCannotBorrowNewEpoch(t *testing.T) {
 	}
 	if s, err := admit(context.Background(), nil); err == nil || s != nil {
 		t.Fatal("stale verified endpoint readmitted")
+	}
+}
+
+func TestDirectEndpointVerifierCurrentSnapshotRevokesStaleSubject(t *testing.T) {
+	for _, kind := range []string{"generation", "session", "origin", "inactive", "pending"} {
+		t.Run(kind, func(t *testing.T) {
+			d, token, captured, admit := subscriptionFixture(t)
+			snapshot := subscriptionNativeSnapshot(token)
+			snapshot.PID = os.Getpid()
+			start, err := proc.StartIdentity(snapshot.PID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.NativeStartIdentity = start
+			token.endpointEpoch = token.proxy.observeDirectEndpointSnapshot(snapshot, token.proxy.directEndpointObservationEpoch())
+			admitted, err := admit(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var origin transport.NativeObservationOrigin
+			if err := json.Unmarshal(snapshot.Origin, &origin); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "generation":
+				snapshot.NativeGeneration = "current-generation"
+				origin.NativeGeneration = snapshot.NativeGeneration
+			case "session":
+				snapshot.NativeSessionID = "current-session"
+				origin.NativeSessionID = snapshot.NativeSessionID
+			case "origin":
+				origin.ID = domain.NewID().String()
+			case "inactive":
+				snapshot.PID = 0
+			case "pending":
+				snapshot.IdentityPending = true
+			}
+			snapshot.Origin, err = json.Marshal(origin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			verified, err := d.verifyNativeManagedSubjectToken(context.Background(), captured, d.ServerURL, token.subject, func(context.Context, *NativeWorkerProxy, transport.NativeWorkerOwnership) (*sessionworker.NativeOwnershipVerifyResult, error) {
+				return &sessionworker.NativeOwnershipVerifyResult{Snapshot: snapshot}, nil
+			})
+			if err == nil || verified != nil {
+				t.Fatal("stale requested subject accepted current snapshot")
+			}
+			select {
+			case <-admitted.Done():
+			default:
+				t.Fatal("mismatched ownership verification left prior admission live")
+			}
+			if admitted.Valid() {
+				t.Fatal("stale subject remains locally valid")
+			}
+		})
 	}
 }

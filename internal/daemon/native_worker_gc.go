@@ -38,9 +38,10 @@ func (r *NativeWorkerRegistry) beginGC(record NativeWorkerRecord, p transport.Fo
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Admission holds the same reservation through owner registration. Every
-	// validated attempt invalidates before releasing it, even on persistence failure.
+	// validated attempt invalidates the whole instance, matching the persisted GC
+	// fence, before releasing it, even on persistence failure.
 	defer r.directInvalidations.revokeMatching(func(binding directEndpointBinding) bool {
-		return binding.subject.InstanceID.String() == record.Scope.InstanceID && binding.subject.OwnershipGeneration == record.Scope.Generation
+		return binding.subject.InstanceID.String() == record.Scope.InstanceID
 	})
 	existing, lookupErr := r.lookupGC(p.InstanceID)
 	if lookupErr == nil {

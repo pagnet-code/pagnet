@@ -153,12 +153,21 @@ func (d *Daemon) verifyNativeManagedSubjectToken(ctx context.Context, captured M
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	snapshot := result.Snapshot
-	actualStart, identityErr := proc.StartIdentity(snapshot.PID)
-	var origin transport.NativeObservationOrigin
-	if identityErr != nil || actualStart != snapshot.NativeStartIdentity || snapshot.Scope != p.scope || snapshot.IdentityPending || snapshot.ActualRuntime != domain.RuntimeQwenCode || snapshot.ProfileFingerprint != p.profile || snapshot.PID <= 0 || snapshot.NativeStartIdentity == "" || snapshot.NativeGeneration != s.NativeGeneration || snapshot.NativeSessionID != s.NativeSessionID || json.Unmarshal(snapshot.Origin, &origin) != nil || origin.ID != s.OriginID.String() || origin.TenantID != s.TenantID.String() || origin.HostID != s.HostID.String() || origin.InstanceID != s.InstanceID.String() || origin.Runtime != string(domain.RuntimeQwenCode) || origin.NativeGeneration != s.NativeGeneration || (origin.NativeSessionID != "" && origin.NativeSessionID != s.NativeSessionID) {
+	// The authenticated worker's current snapshot is an independent lifecycle
+	// observation. A stale requested subject must not suppress its revocation.
+	if snapshot.Scope != p.scope || snapshot.ActualRuntime != domain.RuntimeQwenCode || snapshot.ProfileFingerprint != p.profile {
 		return nil, ErrManagedEndpointPrepareRejected
 	}
 	verifiedEndpointEpoch := p.observeDirectEndpointSnapshot(snapshot, observationEpoch)
+	actualStart, identityErr := proc.StartIdentity(snapshot.PID)
+	if identityErr != nil || actualStart != snapshot.NativeStartIdentity {
+		p.beginDirectEndpointTransition()
+		return nil, ErrManagedEndpointPrepareRejected
+	}
+	var origin transport.NativeObservationOrigin
+	if snapshot.IdentityPending || snapshot.PID <= 0 || snapshot.NativeStartIdentity == "" || snapshot.NativeGeneration != s.NativeGeneration || snapshot.NativeSessionID != s.NativeSessionID || json.Unmarshal(snapshot.Origin, &origin) != nil || origin.ID != s.OriginID.String() || origin.TenantID != s.TenantID.String() || origin.HostID != s.HostID.String() || origin.InstanceID != s.InstanceID.String() || origin.Runtime != string(domain.RuntimeQwenCode) || origin.NativeGeneration != s.NativeGeneration || (origin.NativeSessionID != "" && origin.NativeSessionID != s.NativeSessionID) {
+		return nil, ErrManagedEndpointPrepareRejected
+	}
 	// Origin admission may belong to an earlier socket while the native session
 	// survives reconnect. Only current host.session authority is pinned above.
 	after, proxy, fresh, err := selectLink()

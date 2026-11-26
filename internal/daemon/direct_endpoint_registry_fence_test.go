@@ -196,15 +196,28 @@ func TestDirectEndpointRegistryFenceRetryAndFailureRevoke(t *testing.T) {
 				if unmatched == nil {
 					t.Fatal("unmatched subscription missing")
 				}
+				unrelatedBinding := other
+				unrelatedBinding.subject.InstanceID = domain.NewID()
+				unrelated := d.directSubscriptions.add(unrelatedBinding)
+				if unrelated == nil {
+					t.Fatal("unrelated instance subscription missing")
+				}
 				err = fence(attempt == "conflict")
 				if (attempt == "retry") != (err == nil) {
 					t.Fatalf("unexpected fence result: %v", err)
 				}
+				if !unrelated.Valid() {
+					t.Fatal("registry fence revoked another instance")
+				}
 				if subscription.Valid() {
 					t.Fatal("retry or failure left matching subscription active")
 				}
-				if !unmatched.Valid() {
-					t.Fatal("selective fence revoked another generation")
+				if kind == "gc" {
+					if unmatched.Valid() {
+						t.Fatal("instance-wide GC fence left replacement generation active")
+					}
+				} else if !unmatched.Valid() {
+					t.Fatal("generation-specific recovery revoked another generation")
 				}
 			})
 		}
