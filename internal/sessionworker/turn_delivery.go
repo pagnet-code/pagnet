@@ -21,7 +21,7 @@ func ValidNativeInputKind(kind string) bool {
 // NativeSourceType decides eligibility before allocating a durable sequence.
 // A human turn or an unsupported old capture cannot create a stream gap.
 func NativeSourceType(o NativeObservation) string {
-	if (o.TurnSource != nil && o.TurnSource.SourceAccountMessage != nil) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
+	if (o.TurnSource != nil && (o.TurnSource.SourceAccountMessage != nil || o.TurnSource.SourceDirectASK != nil)) || (o.OutputContent != nil && o.OutputContent.Purpose == "browser_account_reply") {
 		return ""
 	}
 	if typ := LifecycleSourceType(o.Event.Type); typ != "" {

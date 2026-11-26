@@ -30,7 +30,10 @@ type DirectASKReservation struct {
 }
 
 func (j *Journal) initializeDirectAdmissions() error {
-	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS worker_direct_admissions(admission_id TEXT PRIMARY KEY,delivery_key TEXT NOT NULL UNIQUE,digest TEXT NOT NULL,record BLOB NOT NULL CHECK(length(record)<=98304),state TEXT NOT NULL CHECK(state IN ('reserved','unknown')))`); err != nil {
+	if err := j.migrateDirectAdmissions(); err != nil {
+		return err
+	}
+	if _, err := j.db.Exec(`CREATE TABLE IF NOT EXISTS worker_direct_turn_sources(admission_id TEXT PRIMARY KEY,native_generation TEXT NOT NULL,logical_turn TEXT NOT NULL,native_session TEXT NOT NULL,source TEXT NOT NULL,UNIQUE(native_generation,logical_turn))`); err != nil {
 		return err
 	}
 	rows, err := j.db.Query(`SELECT admission_id,delivery_key,digest,record,state FROM worker_direct_admissions`)
@@ -60,7 +63,7 @@ func (j *Journal) initializeDirectAdmissions() error {
 		sum, e := r.Source.Digest()
 		delivery, ke := r.Source.DeliveryKey()
 		count++
-		if e != nil || ke != nil || r.Source.ValidateWire(r.Wire) != nil || r.Source.Scope != j.scope || j.isLocal() || id != r.Source.AdmissionID || key != hex.EncodeToString(delivery[:]) || digest != hex.EncodeToString(sum[:]) || r.State != "" || (state != "reserved" && state != "unknown") || count > maxCommands || len(raw) > 98304 {
+		if e != nil || ke != nil || r.Source.ValidateWire(r.Wire) != nil || r.Source.Scope != j.scope || j.isLocal() || id != r.Source.AdmissionID || key != hex.EncodeToString(delivery[:]) || digest != hex.EncodeToString(sum[:]) || r.State != "" || (state != "reserved" && state != "submitted" && state != "unknown") || count > maxCommands || len(raw) > 98304 {
 			err = errors.New("invalid direct ASK reservation history")
 			break
 		}
@@ -72,7 +75,10 @@ func (j *Journal) initializeDirectAdmissions() error {
 	if err != nil {
 		return err
 	}
-	_, err = j.db.Exec(`UPDATE worker_direct_admissions SET state='unknown' WHERE state='reserved'`)
+	if err = j.validateDirectExecution(); err != nil {
+		return err
+	}
+	_, err = j.db.Exec(`UPDATE worker_direct_admissions SET state='unknown' WHERE state IN ('reserved','submitted')`)
 	return err
 }
 
