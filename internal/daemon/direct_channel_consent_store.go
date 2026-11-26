@@ -125,7 +125,12 @@ func (s *directChannelConsentStore) schema(ctx context.Context, c *sql.Conn) err
 	}
 	return nil
 }
-func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Conn) error) (resultErr error) {
+func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Conn) error) error {
+	return s.lockedCompletion(ctx, fn, nil)
+}
+
+// completion runs after transaction cleanup, before releasing registry.mu.
+func (s *directChannelConsentStore) lockedCompletion(ctx context.Context, fn func(*sql.Conn) error, completion func(error)) (resultErr error) {
 	if s == nil || s.registry == nil {
 		return errDirectChannelConsent
 	}
@@ -135,6 +140,15 @@ func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Con
 		return e
 	}
 	defer unlock()
+	if completion != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				completion(errDirectChannelConsent)
+				panic(recovered)
+			}
+			completion(resultErr)
+		}()
+	}
 	if s.poisoned || r.closed {
 		return errDirectChannelConsent
 	}
@@ -173,6 +187,7 @@ func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Con
 		if beginAttempted && !committed {
 			if _, err := c.ExecContext(cleanup, "ROLLBACK"); err != nil {
 				discard()
+				r.directConsentLeases.revokeAll()
 				if resultErr == nil {
 					resultErr = err
 				}
@@ -181,6 +196,7 @@ func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Con
 		}
 		if _, err := c.ExecContext(cleanup, fmt.Sprintf("PRAGMA busy_timeout=%d", timeout)); err != nil {
 			discard()
+			r.directConsentLeases.revokeAll()
 			if resultErr == nil {
 				resultErr = err
 			}
@@ -214,6 +230,7 @@ func (s *directChannelConsentStore) locked(ctx context.Context, fn func(*sql.Con
 	committed = e == nil
 	if e != nil {
 		s.poisoned = true
+		r.directConsentLeases.revokeAll()
 	}
 	return e
 }
@@ -339,6 +356,9 @@ func (s *directChannelConsentStore) mutate(ctx context.Context, k directChannelC
 		if e != nil {
 			return e
 		}
+		// Revoke before releasing the registry fence, including a failed or
+		// uncertain completion after the write. Exact retries never reach here.
+		s.registry.directConsentLeases.revoke(directChannelConsentLeaseKey{s.installation, k})
 		if b != nil {
 			expiry, _ := time.Parse(time.RFC3339Nano, b.ExpiresAt)
 			if !time.Now().Before(expiry) {
