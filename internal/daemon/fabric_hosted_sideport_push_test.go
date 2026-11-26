@@ -369,7 +369,7 @@ func newSideportMiniFixture(t *testing.T, accepts bool) *sideportMiniFixture {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	proxy := &NativeWorkerProxy{connection: ownerConn, controller: ctrl, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Protocol: sessionworker.Protocol, Scope: scope, Native: spec}, done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{connection: ownerConn, controller: ctrl, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Protocol: sessionworker.Protocol, Scope: scope, Native: spec}, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{proxy: proxy, conn: client, ownership: ownership}
 	d.nativeWorkersMu.Lock()
 	if d.nativeWorkers == nil {

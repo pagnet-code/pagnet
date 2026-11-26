@@ -77,7 +77,7 @@ func managedPoPLaneFixture(t *testing.T, feature bool) (*Daemon, *managedEndpoin
 	}
 	executor := &managedPoPLaneExecutor{available: true, started: make(chan transport.ManagedEndpointPoPChallenge, 16), result: proof}
 	d := &Daemon{Config: Config{ManagedEndpointPrepareEnabled: true, ManagedEndpointPoPEnabled: true}, managedEndpointPrepare: &managedPrepareLaneExecutor{available: true}, managedEndpointPoP: executor, curConn: socket, nativeConn: native, writeTimeout: time.Second}
-	proxy := &NativeWorkerProxy{connection: native, done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{connection: native, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{conn: socket, proxy: proxy}
 	d.nativeWorkers = map[string]*nativeWorkerLink{challenge.Prepare.Subject.InstanceID.String(): link}
 	executor.token = &nativeWorkerPublicationToken{instanceID: challenge.Prepare.Subject.InstanceID.String(), link: link, proxy: proxy}

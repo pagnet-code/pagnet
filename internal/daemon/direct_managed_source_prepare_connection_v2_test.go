@@ -128,7 +128,7 @@ func TestDirectManagedSourcePrepareLaneACKEnvelopeCompatibilityV2(t *testing.T) 
 				errorCode = ""
 			}
 			if success {
-				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+				p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{}), abortDone: make(chan struct{})}
 				link := &nativeWorkerLink{conn: lane.socket, proxy: p}
 				lane.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
 				lane.executor.(*directSourcePrepareLaneExecutorV2).token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}
@@ -359,7 +359,7 @@ func TestDirectManagedSourcePrepareLaneSendFailureRetainsACKV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+	p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{conn: lane.socket, proxy: p}
 	lane.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
 	executor.token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}
@@ -375,7 +375,7 @@ func TestDirectManagedSourcePrepareLaneSendFailureRetainsACKV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p = &NativeWorkerProxy{connection: next.native, done: make(chan struct{})}
+	p = &NativeWorkerProxy{connection: next.native, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link = &nativeWorkerLink{conn: next.socket, proxy: p}
 	next.d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
 	nextExecutor.token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}
@@ -394,7 +394,7 @@ func TestDirectManagedSourcePrepareLaneBlockedWriterSupersessionV2(t *testing.T)
 	}
 	keys, journal, command, keySession := directSourceStoreFixtureV2(t)
 	ack := directSourcePrepareACKBytesV2(t, keys, journal, command, keySession)
-	p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{})}
+	p := &NativeWorkerProxy{connection: lane.native, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{conn: lane.socket, proxy: p}
 	d.nativeWorkers = map[string]*nativeWorkerLink{command.Subject.InstanceID.String(): link}
 	executor.token = &nativeWorkerPublicationToken{instanceID: command.Subject.InstanceID.String(), link: link, proxy: p}

@@ -93,6 +93,9 @@ waitForSocket:
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Close() })
+	if a.AbortDone() == nil || a.aborted() {
+		t.Fatal("attached proxy missing open abort signal")
+	}
 	if a.availability(time.Now()) != "connected" {
 		t.Fatal("authenticated initial snapshot did not establish availability")
 	}

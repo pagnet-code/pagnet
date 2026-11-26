@@ -51,7 +51,7 @@ func sourceCredentialAuthorityFixture(t *testing.T) (*DirectManagedSourceKeyStor
 		t.Fatal(err)
 	}
 	socket := &websocket.Conn{}
-	proxy := &NativeWorkerProxy{connection: native, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Native: spec}, done: make(chan struct{})}
+	proxy := &NativeWorkerProxy{connection: native, scope: scope, profile: record.ProfileFingerprint, bootstrap: sessionworker.Bootstrap{Native: spec}, done: make(chan struct{}), abortDone: make(chan struct{})}
 	link := &nativeWorkerLink{conn: socket, proxy: proxy, ownership: ownership}
 	d := &Daemon{Config: Config{DirectManagedSourcePrepareEnabled: true, DirectManagedSourcePoPEnabled: true, DirectManagedSourceCredentialEnabled: true}, state: state, nativeRegistry: keys.registry, nativeWorkers: map[string]*nativeWorkerLink{scope.InstanceID: link}, curConn: socket, nativeConn: native}
 	token := &nativeWorkerPublicationToken{instanceID: scope.InstanceID, link: link, proxy: proxy, ownership: ownership, subject: nativeManagedSubjectFromSource(s)}

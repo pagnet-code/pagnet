@@ -241,7 +241,7 @@ func TestNativeWorkerPumpReceiptProgress(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			proxy := &NativeWorkerProxy{connection: c, controller: controller, scope: w.scope, profile: profile, bootstrap: sessionworker.Bootstrap{Scope: w.scope, Native: spec}, done: make(chan struct{})}
+			proxy := &NativeWorkerProxy{connection: c, controller: controller, scope: w.scope, profile: profile, bootstrap: sessionworker.Bootstrap{Scope: w.scope, Native: spec}, done: make(chan struct{}), abortDone: make(chan struct{})}
 			ctx, cancel := context.WithCancel(context.Background())
 			d := &Daemon{turnCtx: ctx}
 			done := make(chan struct{})
