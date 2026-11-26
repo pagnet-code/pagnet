@@ -116,10 +116,10 @@ func runtimeBridgeFixture(t *testing.T) (*directRuntimeBridge, *runtimeBridgeFak
 	}
 	point := func(n byte) string { b := make([]byte, 32); b[0] = n; return base64.RawURLEncoding.EncodeToString(b) }
 	endpoint := func(n byte) transport.DirectChannelEndpointV2 {
-		return transport.DirectChannelEndpointV2{id(n), id(n + 1), id(n + 2), point(n), id(n + 3), strings.Repeat("ab", 32)}
+		return transport.DirectChannelEndpointV2{TenantID: id(n), PrincipalID: id(n + 1), EndpointID: id(n + 2), PublicKey: point(n), CredentialID: id(n + 3), KeyEvidenceDigest: strings.Repeat("ab", 32)}
 	}
-	limits := transport.DirectChannelLimitsV2{4096, 5, 100, 1048576, 2, 8}
-	d := transport.DirectChannelDescriptorV2{Domain: transport.DirectChannelDomainV2, Suite: transport.DirectChannelSuiteV2, ParentGrantID: id(1), GrantGeneration: "1", ChannelGeneration: "2", DirectIntentID: id(2), NetworkID: id(3), AuthorizationDigest: strings.Repeat("cd", 32), S: endpoint(9), P: endpoint(10), EpochID: "01900000-0000-7000-8000-000000000001", ExpiresAt: "2030-01-01T01:00:00Z", Budget: transport.DirectChannelBudgetV2{id(4), "3", strings.Repeat("ef", 32), "2030-01-01T02:00:00Z", transport.DirectChannelCountingVersionV2, limits}, Limits: limits}
+	limits := transport.DirectChannelLimitsV2{MaxMessageWireBytes: 4096, MaxMessagesPerMinute: 5, MaxMessagesPerDay: 100, MaxWireBytesPerDay: 1048576, MaxInFlight: 2, MaxTurnsPerThread: 8}
+	d := transport.DirectChannelDescriptorV2{Domain: transport.DirectChannelDomainV2, Suite: transport.DirectChannelSuiteV2, ParentGrantID: id(1), GrantGeneration: "1", ChannelGeneration: "2", DirectIntentID: id(2), NetworkID: id(3), AuthorizationDigest: strings.Repeat("cd", 32), S: endpoint(9), P: endpoint(10), EpochID: "01900000-0000-7000-8000-000000000001", ExpiresAt: "2030-01-01T01:00:00Z", Budget: transport.DirectChannelBudgetV2{AgreementID: id(4), AcceptedRevision: "3", TermsDigest: strings.Repeat("ef", 32), ExpiresAt: "2030-01-01T02:00:00Z", CountingVersion: transport.DirectChannelCountingVersionV2, GrantLimits: limits}, Limits: limits}
 	p := transport.DirectChannelPublicationV2{Descriptor: d, Enc: point(11), Ciphertext: binary(7, 48)}
 	channel, _ := transport.DirectChannelIDV2(d)
 	dh, _ := transport.DescriptorHashV2(d)
