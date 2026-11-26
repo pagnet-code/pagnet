@@ -15,6 +15,7 @@ import (
 // never launches/adopts a PID or changes an execution profile. Production
 // command routing still requires durable intent mapping and source delivery.
 type NativeWorkerProxy struct {
+	directInvalidations                 directEndpointInvalidations
 	connection                          *NativeObservationConnection
 	controller                          *sessionworker.Controller
 	scope                               sessionworker.Scope
@@ -82,6 +83,7 @@ func (p *NativeWorkerProxy) Close() error {
 	var err error
 	p.closeOnce.Do(func() {
 		p.publicationMu.Lock()
+		p.directInvalidations.revoke(func(b directEndpointBinding) bool { return b.proxy == p })
 		close(p.done)
 		p.publicationMu.Unlock()
 		if p.controller != nil {
