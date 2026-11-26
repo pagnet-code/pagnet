@@ -163,7 +163,10 @@ sleep 3600
 		if err != nil {
 			t.Fatal(err)
 		}
-		if outcome.Outcome != nil && outcome.Outcome.State != "admitted" {
+		// Attach may complete after the snapshot above, or before the
+		// supervisor and driver expose matching ownership identity. Keep
+		// polling for the live snapshot after a successful attach.
+		if outcome.Outcome != nil && outcome.Outcome.State != "admitted" && outcome.Outcome.State != "completed" {
 			t.Fatalf("Qwen fixture activation ended: %+v", *outcome.Outcome)
 		}
 
