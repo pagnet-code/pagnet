@@ -40,10 +40,14 @@ type directEndpointReconcilePassClient interface {
 	Activate(context.Context, string, string) (directhttp.Activation, error)
 }
 
+// These primitive pass constructors do not enforce local consent.
 func newDirectSourceReconcilePass(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2) (directEndpointReconcilePass, error) {
 	return newDirectSourceReconcilePassWithClient(d, captured, s, issue, nil, time.Now)
 }
 func newDirectSourceReconcilePassWithClient(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2, client directEndpointReconcilePassClient, now func() time.Time) (directEndpointReconcilePass, error) {
+	return newDirectSourceReconcilePassWithObserver(d, captured, s, issue, client, now, nil)
+}
+func newDirectSourceReconcilePassWithObserver(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.DirectManagedSourceCredentialIssueV2, client directEndpointReconcilePassClient, now func() time.Time, wrap func(directEndpointReconcileObserver) directEndpointReconcileObserver) (directEndpointReconcilePass, error) {
 	raw, err := issue.CanonicalBytes()
 	if err != nil {
 		return nil, errDirectEndpointOperationRejected
@@ -64,6 +68,9 @@ func newDirectSourceReconcilePassWithClient(d *Daemon, captured ManagedEndpointP
 	if err != nil {
 		return nil, err
 	}
+	if wrap != nil {
+		observe = wrap(observe)
+	}
 	operate, err := newDirectSourceReconcileOperation(d, captured, s, owned)
 	if err != nil {
 		return nil, err
@@ -74,6 +81,9 @@ func newDirectTargetReconcilePass(d *Daemon, captured ManagedEndpointPrepareScop
 	return newDirectTargetReconcilePassWithClient(d, captured, s, issue, nil, time.Now)
 }
 func newDirectTargetReconcilePassWithClient(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.ManagedDirectCredentialIssue, client directEndpointReconcilePassClient, now func() time.Time) (directEndpointReconcilePass, error) {
+	return newDirectTargetReconcilePassWithObserver(d, captured, s, issue, client, now, nil)
+}
+func newDirectTargetReconcilePassWithObserver(d *Daemon, captured ManagedEndpointPrepareScope, s *DirectEndpointSubscription, issue transport.ManagedDirectCredentialIssue, client directEndpointReconcilePassClient, now func() time.Time, wrap func(directEndpointReconcileObserver) directEndpointReconcileObserver) (directEndpointReconcilePass, error) {
 	raw, err := issue.CanonicalBytes()
 	if err != nil {
 		return nil, errDirectEndpointOperationRejected
@@ -93,6 +103,9 @@ func newDirectTargetReconcilePassWithClient(d *Daemon, captured ManagedEndpointP
 	observe, err := newDirectTargetReconcileObserverWithReader(d, captured, s, owned, client, now)
 	if err != nil {
 		return nil, err
+	}
+	if wrap != nil {
+		observe = wrap(observe)
 	}
 	operate, err := newDirectTargetReconcileOperation(d, captured, s, owned)
 	if err != nil {
