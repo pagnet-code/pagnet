@@ -46,7 +46,7 @@ func attachmentControllerFixtureWithRoleAdmission(t *testing.T, role string, rea
 	}
 	s := f.f.s
 	subject := s.binding.subject
-	s.binding.metadata.TenantID, s.binding.metadata.PrincipalID, s.binding.metadata.EndpointID = subject.TenantID, subject.PrincipalID, s.binding.metadata.EndpointID
+	s.binding.metadata.TenantID, s.binding.metadata.PrincipalID = subject.TenantID, subject.PrincipalID
 	local := f.binding.Descriptor.S
 	if role == "P" {
 		local = f.binding.Descriptor.P
