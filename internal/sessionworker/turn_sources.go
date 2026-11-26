@@ -10,11 +10,13 @@ import (
 	"strings"
 
 	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/nativedirect"
 	"github.com/pagnet-code/pagnet/internal/session"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
 type NativeTurnSource struct {
+	SourceDirectASK      *nativedirect.NativeDirectASKSource   `json:"sourceDirectASK,omitempty"`
 	SourceAccountMessage *transport.NativeAccountMessageSource `json:"sourceAccountMessage,omitempty"`
 	SourceInvocation     *transport.NativeInvocationSource     `json:"sourceInvocation,omitempty"`
 	SourceTask           *transport.NativeTaskSource           `json:"sourceTask,omitempty"`
@@ -111,6 +113,9 @@ func (j *Journal) initializeTurnSources() error {
 // receives the request. Proven-unaccepted endpoint retry binds a new native
 // generation, never rewrites a prior generation's source.
 func (j *Journal) BindNativeTurn(ctx context.Context, source NativeTurnSource) error {
+	if source.SourceDirectASK != nil || source.InputKind == "direct_ask" {
+		return ErrFenced
+	}
 	if source.SourceAccountMessage != nil || source.InputKind == "account_message" {
 		if source.SourceAccountMessage == nil || source.InputKind != "account_message" || j.db == nil {
 			return ErrFenced
@@ -205,8 +210,8 @@ func readNativeTurn(ctx context.Context, tx *sql.Tx, generation, turn string) (N
 
 func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	var source NativeTurnSource
-	var task, invocation, account string
-	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation, &account)
+	var task, invocation, account, direct string
+	err := row.Scan(&source.Sequence, &source.LogicalTurnID, &source.NativeGeneration, &source.NativeSessionID, &source.SourceCommandID, &source.SourceAdmissionID, &source.InputKind, &task, &invocation, &account, &direct)
 	if err == nil && task != "" {
 		err = json.Unmarshal([]byte(task), &source.SourceTask)
 	}
@@ -215,6 +220,12 @@ func scanNativeTurn(row *sql.Row) (NativeTurnSource, error) {
 	}
 	if err == nil && account != "" {
 		err = json.Unmarshal([]byte(account), &source.SourceAccountMessage)
+	}
+	if err == nil && direct != "" {
+		err = json.Unmarshal([]byte(direct), &source.SourceDirectASK)
+	}
+	if err == nil && source.SourceDirectASK != nil && !validDirectTurn(source) {
+		err = ErrConflict
 	}
 	if err == nil && ((source.InputKind == "account_message") != (source.SourceAccountMessage != nil) || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage)) {
 		err = ErrConflict
@@ -253,7 +264,7 @@ func (j *Journal) NativeEventSource(ctx context.Context, generation string, even
 
 func nativeEventSourceResult(source NativeTurnSource, err error, turn, sessionID string) (*NativeTurnSource, bool, error) {
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, strings.HasPrefix(turn, "pagnet-worker-turn-"), nil
+		return nil, strings.HasPrefix(turn, "pagnet-worker-turn-") || strings.HasPrefix(turn, "pagnet-direct-turn-"), nil
 	}
 	if err != nil {
 		return nil, false, err
@@ -464,7 +475,7 @@ func invocationSourceJSON(source *transport.NativeInvocationSource) string {
 // The source kind and full accepted descriptor remain part of a key pin. A
 // completed task cannot become an invocation merely by changing input labels.
 func sourceContentDescriptor(source *NativeTurnSource) string {
-	if source == nil || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage) {
+	if source == nil || source.SourceDirectASK != nil || !transport.ValidNativeSourceUnion(source.SourceTask, source.SourceInvocation, source.SourceAccountMessage) {
 		return ""
 	}
 	if source.SourceAccountMessage != nil && source.InputKind == "account_message" {

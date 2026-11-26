@@ -21,8 +21,11 @@ func (j *Journal) initializeTerminalReservations() error {
 	if err != nil {
 		return err
 	}
+	if _, err = j.db.Exec(`CREATE TABLE IF NOT EXISTS worker_direct_terminal_reservations(admission_id TEXT PRIMARY KEY,rows_left INTEGER NOT NULL,capture_left INTEGER NOT NULL,content_left INTEGER NOT NULL)`); err != nil {
+		return err
+	}
 	var count, invalid, reservedRows, captures, content int
-	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN sequence<1 OR rows_left<0 OR rows_left>384 OR capture_left<0 OR capture_left>44040192 OR content_left<0 OR content_left>67108864 THEN 1 ELSE 0 END),0),COALESCE(SUM(rows_left),0),COALESCE(SUM(capture_left),0),COALESCE(SUM(content_left),0) FROM worker_terminal_reservations`).Scan(&count, &invalid, &reservedRows, &captures, &content); err != nil {
+	if err = j.db.QueryRow(`SELECT COUNT(*),COALESCE(SUM(CASE WHEN sequence<1 OR rows_left<0 OR rows_left>384 OR capture_left<0 OR capture_left>44040192 OR content_left<0 OR content_left>67108864 THEN 1 ELSE 0 END),0),COALESCE(SUM(rows_left),0),COALESCE(SUM(capture_left),0),COALESCE(SUM(content_left),0) FROM (SELECT sequence,rows_left,capture_left,content_left FROM worker_terminal_reservations UNION ALL SELECT 1,rows_left,capture_left,content_left FROM worker_direct_terminal_reservations)`).Scan(&count, &invalid, &reservedRows, &captures, &content); err != nil {
 		return err
 	}
 	var usedRows, usedCapture, usedContent int
@@ -35,10 +38,13 @@ func (j *Journal) initializeTerminalReservations() error {
 	return nil
 }
 func terminalReservationsTx(ctx context.Context, tx *sql.Tx) (rows, captures, content int, err error) {
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(rows_left),0),COALESCE(SUM(capture_left),0),COALESCE(SUM(content_left),0) FROM worker_terminal_reservations`).Scan(&rows, &captures, &content)
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(rows_left),0),COALESCE(SUM(capture_left),0),COALESCE(SUM(content_left),0) FROM (SELECT rows_left,capture_left,content_left FROM worker_terminal_reservations UNION ALL SELECT rows_left,capture_left,content_left FROM worker_direct_terminal_reservations)`).Scan(&rows, &captures, &content)
 	return
 }
 func (j *Journal) reserveTerminalTx(ctx context.Context, tx *sql.Tx, sequence int64, kind string) error {
+	return j.reserveTerminalIdentityTx(ctx, tx, sequence, kind, "")
+}
+func (j *Journal) reserveTerminalIdentityTx(ctx context.Context, tx *sql.Tx, sequence int64, kind, direct string) error {
 	if kind != "prompt" {
 		return nil
 	}
@@ -54,6 +60,10 @@ func (j *Journal) reserveTerminalTx(ctx context.Context, tx *sql.Tx, sequence in
 	stops := j.sourceStopReservationsLocked()
 	if count+stops+rows+terminalSourceReserveRows > maxPendingObservations || total+unmarked*sourceDispositionReserveBytes+stops*sourceStopReserveBytes+captures+terminalCaptureReserveBytes > maxPendingObservationBytes || fragments+content+terminalContentReserveBytes > maxWorkerContentBytes {
 		return ErrFull
+	}
+	if direct != "" {
+		_, err = tx.ExecContext(ctx, `INSERT INTO worker_direct_terminal_reservations(admission_id,rows_left,capture_left,content_left) VALUES(?,?,?,?)`, direct, terminalSourceReserveRows, terminalCaptureReserveBytes, terminalContentReserveBytes)
+		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO worker_terminal_reservations(sequence,rows_left,capture_left,content_left) VALUES(?,?,?,?)`, sequence, terminalSourceReserveRows, terminalCaptureReserveBytes, terminalContentReserveBytes)
 	return err
