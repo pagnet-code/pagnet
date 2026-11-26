@@ -20,6 +20,7 @@ var ErrNativeOriginAdmissionRejected = errors.New("native activation admission r
 // Its writer must never select a replacement connection behind this object's
 // back: registration and replies are fenced to the same runner admission.
 type NativeObservationConnection struct {
+	directInvalidations   directEndpointInvalidations
 	mu                    sync.Mutex
 	availabilityOnce      sync.Once
 	availabilitySequence  int64
@@ -68,6 +69,7 @@ func (c *NativeObservationConnection) Close() {
 	case <-c.closed:
 		return
 	default:
+		c.directInvalidations.revoke(func(b directEndpointBinding) bool { return b.native == c })
 		close(c.closed)
 	}
 	c.session = nil

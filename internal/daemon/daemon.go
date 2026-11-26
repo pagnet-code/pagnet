@@ -206,6 +206,7 @@ type Config struct {
 
 // Daemon is a running host-daemon instance.
 type Daemon struct {
+	directSubscriptions directEndpointSubscriptions
 	Config
 	Log *slog.Logger
 
@@ -949,6 +950,7 @@ func (d *Daemon) finishQueue(instanceID string) {
 func (d *Daemon) Close() error {
 	var err error
 	d.closeOnce.Do(func() {
+		d.directSubscriptions.close()
 		d.accountSealMu.Lock()
 		d.accountSealClosed = true
 		if d.accountSealJournal != nil {
@@ -1342,11 +1344,13 @@ func (d *Daemon) connectAndRun(ctx context.Context) (connectedAt time.Time, err 
 		defer d.browserAssignments.disconnect()
 	}
 	d.connMu.Lock()
+	d.directSubscriptions.revokeWhere(func(b directEndpointBinding) bool { return b.socket != conn || b.native != nativeConn })
 	d.curConn = conn
 	d.nativeConn = nativeConn
 	d.connMu.Unlock()
 	defer func() {
 		d.connMu.Lock()
+		d.directSubscriptions.revokeWhere(func(b directEndpointBinding) bool { return b.socket == conn })
 		d.curConn = nil
 		d.nativeConn = nil
 		d.connMu.Unlock()
@@ -1767,6 +1771,7 @@ func (d *Daemon) pingConn(conn *websocket.Conn) {
 // a different object and is unaffected).
 func (d *Daemon) invalidateCurrentConnection(failed *websocket.Conn) {
 	d.connMu.Lock()
+	d.directSubscriptions.revokeWhere(func(b directEndpointBinding) bool { return b.socket == failed })
 	isCurrent := d.curConn == failed
 	if isCurrent {
 		d.curConn = nil

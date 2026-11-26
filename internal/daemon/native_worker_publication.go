@@ -33,11 +33,13 @@ func sameManagedPrepareOwnership(a, b transport.NativeWorkerOwnership) bool {
 // nativeWorkerPublicationToken pins the immutable binding verified outside the
 // publication locks. Dispatch counters may advance without revoking the token.
 type nativeWorkerPublicationToken struct {
-	instanceID string
-	link       *nativeWorkerLink
-	proxy      *NativeWorkerProxy
-	ownership  transport.NativeWorkerOwnership
-	subject    nativeManagedSubject
+	endpointUse   bool
+	endpointEpoch uint64
+	instanceID    string
+	link          *nativeWorkerLink
+	proxy         *NativeWorkerProxy
+	ownership     transport.NativeWorkerOwnership
+	subject       nativeManagedSubject
 }
 
 // publishNativeWorker holds the current worker and connection authority through

@@ -24,6 +24,9 @@ func (p *NativeWorkerProxy) AcceptDispatch(ctx context.Context, o transport.Nati
 	if proof.OwnershipID != o.ID || proof.OwnershipGeneration != p.scope.Generation || proof.SourceCommandID == "" {
 		return sessionworker.Outcome{}, ErrNativeObservationConflict
 	}
+	if kind == "stop" || kind == "restart" || kind == "replace" {
+		p.beginDirectEndpointTransition()
+	}
 	if err := p.BindOwnership(ctx, o); err != nil {
 		return sessionworker.Outcome{}, err
 	}

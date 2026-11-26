@@ -318,13 +318,7 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 		}
 	}
 	link := &nativeWorkerLink{proxy: proxy, conn: conn, ownership: *ownership}
-	d.nativeWorkersMu.Lock()
-	if d.nativeWorkers == nil {
-		d.nativeWorkers = map[string]*nativeWorkerLink{}
-	}
-	old := d.nativeWorkers[record.Scope.InstanceID]
-	d.nativeWorkers[record.Scope.InstanceID] = link
-	d.nativeWorkersMu.Unlock()
+	old := d.replaceNativeWorkerLink(record.Scope.InstanceID, link)
 	if old != nil {
 		_ = old.proxy.Close()
 	}
@@ -345,6 +339,22 @@ func (d *Daemon) connectNativeWorker(conn *websocket.Conn, connection *NativeObs
 	}
 	go d.pumpNativeWorker(link)
 	return nil
+}
+
+// replaceNativeWorkerLink revokes the outgoing exact binding before publishing
+// its replacement. Closing the old proxy remains outside the worker map lock.
+func (d *Daemon) replaceNativeWorkerLink(instanceID string, link *nativeWorkerLink) *nativeWorkerLink {
+	d.nativeWorkersMu.Lock()
+	if d.nativeWorkers == nil {
+		d.nativeWorkers = map[string]*nativeWorkerLink{}
+	}
+	old := d.nativeWorkers[instanceID]
+	if old != nil {
+		d.directSubscriptions.revokeWhere(func(b directEndpointBinding) bool { return b.link == old })
+	}
+	d.nativeWorkers[instanceID] = link
+	d.nativeWorkersMu.Unlock()
+	return old
 }
 
 func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
@@ -380,6 +390,9 @@ func (d *Daemon) pumpNativeWorker(link *nativeWorkerLink) {
 		}
 		if updated, err := link.proxy.SettleDispatches(ctx, ownership); err == nil && updated != nil {
 			link.mu.Lock()
+			if !sameManagedPrepareOwnership(link.ownership, *updated) {
+				d.directSubscriptions.revokeWhere(func(b directEndpointBinding) bool { return b.link == link })
+			}
 			link.ownership = *updated
 			link.mu.Unlock()
 		}

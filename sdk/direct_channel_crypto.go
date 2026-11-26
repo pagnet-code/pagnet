@@ -5,21 +5,20 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"time"
 
-	"github.com/pagnet-code/pagnet/e2ee"
+	"github.com/pagnet-code/pagnet/internal/directchannelcrypto"
 	"github.com/pagnet-code/pagnet/transport"
 )
 
 const directDomain = transport.DirectChannelDomainV2
 
-var errDirect = errors.New("sdk: invalid direct channel context or wire")
+var errDirect = directchannelcrypto.ErrInvalid
 
 // Use the transport contract without exposing a public SDK direct-channel API.
 type directParty = transport.DirectChannelEndpointV2
@@ -78,103 +77,43 @@ func directMaterialFor(d directDescriptor, raw, key []byte, role string) (*direc
 	copy(m.key[:], key)
 	return m, nil
 }
+func directMaterialFromCrypto(m *directchannelcrypto.Material) *directMaterial {
+	defer m.Clear()
+	return &directMaterial{descriptor: m.Descriptor, hash: m.Hash, key: m.Key, role: m.Role, publicationHash: m.PublicationHash}
+}
+func (m *directMaterial) cryptoMaterial() directchannelcrypto.Material {
+	return directchannelcrypto.Material{Descriptor: m.descriptor, Hash: m.hash, Key: m.key, Role: m.role, PublicationHash: m.publicationHash}
+}
 func directPrepare(raw []byte, expected directDescriptor, private []byte, now time.Time) (*directMaterial, []byte, error) {
-	d, err := directValidate(raw, expected, now)
+	m, wire, err := directchannelcrypto.Prepare(raw, expected, private, now)
 	if err != nil {
 		return nil, nil, err
 	}
-	pub, _ := directBinary(d.S.PublicKey, 32)
-	recipient, _ := directBinary(d.P.PublicKey, 32)
-	if !pairPrivateMatches(private, pub) {
-		return nil, nil, errDirect
-	}
-	key := make([]byte, 32)
-	defer clear(key)
-	if _, err = rand.Read(key); err != nil {
-		return nil, nil, err
-	}
-	hash := sha256.Sum256(raw)
-	enc, ct, err := e2ee.HPKEWrapAuth(recipient, private, []byte(directDomain+"/epoch-wrap"), hash[:], key)
-	if err != nil {
-		return nil, nil, err
-	}
-	wire, err := (directPackage{Descriptor: d, Enc: directB64(enc), Ciphertext: directB64(ct)}).CanonicalBytes()
-	if err != nil {
-		return nil, nil, err
-	}
-	m, err := directMaterialFor(d, raw, key, "S")
-	if err != nil {
-		return nil, nil, err
-	}
-	m.publicationHash = sha256.Sum256(wire)
-	return m, wire, nil
+	return directMaterialFromCrypto(m), wire, nil
 }
 func directAccept(wire []byte, expected directDescriptor, private []byte, now time.Time) (*directMaterial, error) {
-	p, err := transport.DecodeDirectChannelPublicationV2(wire)
-	if err != nil {
-		return nil, errDirect
-	}
-	raw, err := p.Descriptor.CanonicalBytes()
-	if err != nil {
-		return nil, errDirect
-	}
-	d, err := directValidate(raw, expected, now)
+	m, err := directchannelcrypto.Accept(wire, expected, private, now)
 	if err != nil {
 		return nil, err
 	}
-	pub, _ := directBinary(d.P.PublicKey, 32)
-	sender, _ := directBinary(d.S.PublicKey, 32)
-	enc, eerr := directBinary(p.Enc, 32)
-	ct, cerr := directBinary(p.Ciphertext, 48)
-	if !pairPrivateMatches(private, pub) || eerr != nil || cerr != nil {
-		return nil, errDirect
-	}
-	hash := sha256.Sum256(raw)
-	key, err := e2ee.HPKEUnwrapAuth(private, sender, enc, []byte(directDomain+"/epoch-wrap"), hash[:], ct)
-	defer clear(key)
-	if err != nil {
-		return nil, err
-	}
-	m, err := directMaterialFor(d, raw, key, "P")
-	if err != nil {
-		return nil, err
-	}
-	m.publicationHash = sha256.Sum256(wire)
-	return m, nil
+	return directMaterialFromCrypto(m), nil
 }
 func (m *directMaterial) derive(purpose string) ([]byte, error) {
 	return hkdf.Key(sha256.New, m.key[:], m.hash[:], directDomain+"/"+purpose, 32)
 }
-func (m *directMaterial) readinessKey() ([]byte, error) { return m.derive("readiness") }
-
-// CredentialID comes from authenticated local credential metadata. This helper
-// only proves possession; challenge issuance and replay consumption are external.
+func (m *directMaterial) readinessKey() ([]byte, error) {
+	material := m.cryptoMaterial()
+	defer material.Clear()
+	return material.ReadinessKey()
+}
 func (m *directMaterial) readinessProof(raw []byte, credentialID string, now time.Time) ([]byte, error) {
-	challenge, err := transport.DecodeDirectChannelReadinessChallengeV2(raw)
-	if err != nil || m.publicationHash == ([32]byte{}) || challenge.Role != m.role {
-		return nil, errDirect
-	}
-	d := m.descriptor
-	party := d.S
-	if m.role == "P" {
-		party = d.P
-	}
-	issued, _ := time.Parse(time.RFC3339Nano, challenge.IssuedAt)
-	expiry, _ := time.Parse(time.RFC3339Nano, challenge.ExpiresAt)
-	descriptorExpiry, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
-	if transport.ValidateDirectChannelDescriptorV2(d, now) != nil || now.Before(issued) || !expiry.After(now) || expiry.After(descriptorExpiry) || credentialID != party.CredentialID || challenge.CredentialID != credentialID || challenge.PrincipalID != party.PrincipalID || challenge.EndpointID != party.EndpointID || challenge.ChannelID != directChannelID(d) || challenge.ParentGrantID != d.ParentGrantID || challenge.GrantGeneration != d.GrantGeneration || challenge.ChannelGeneration != d.ChannelGeneration || challenge.DirectIntentID != d.DirectIntentID || challenge.DescriptorHash != directB64(m.hash[:]) || challenge.PublicationHash != directB64(m.publicationHash[:]) || challenge.EpochID != d.EpochID {
-		return nil, errDirect
-	}
-	key, err := m.readinessKey()
-	defer clear(key)
-	if err != nil {
-		return nil, err
-	}
-	mac := hmac.New(sha256.New, key)
-	mac.Write(raw)
-	transcriptHash := sha256.Sum256(raw)
-	proof := transport.DirectChannelReadinessProofV2{ProtocolVersion: transport.DirectChannelReadinessProtocolV2, ChallengeID: challenge.ChallengeID, TranscriptHash: directB64(transcriptHash[:]), Confirmation: directB64(mac.Sum(nil))}
-	return proof.CanonicalBytes()
+	material := m.cryptoMaterial()
+	defer material.Clear()
+	return material.ReadinessProof(raw, credentialID, now)
+}
+func (m *directMaterial) clear() { clear(m.key[:]) }
+func (m directMaterial) Format(s fmt.State, verb rune) {
+	_, _ = s.Write([]byte("sdk.directMaterial{REDACTED}"))
 }
 
 type directHeader = transport.DirectChannelMessageHeaderV2
