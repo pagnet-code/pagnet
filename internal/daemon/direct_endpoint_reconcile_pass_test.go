@@ -45,6 +45,11 @@ type reconcilePassFakeClient struct {
 	rejectChallenge   bool
 	challengeResponse func(transport.DirectChannelReadinessChallengeV2) transport.DirectChannelReadinessChallengeV2
 	onChallenge       func(context.Context)
+	proofs            [][]byte
+	proveErr          error
+	rejectProof       bool
+	proofResponse     func(transport.DirectChannelReadinessProofV2) transport.DirectChannelReadinessProofV2
+	onProve           func(context.Context)
 }
 
 func (c *reconcilePassFakeClient) Publish(ctx context.Context, credential, intent string, p transport.DirectChannelPublicationV2, verifier string) (transport.DirectChannelPublicationV2, error) {
@@ -154,6 +159,7 @@ func newReconcilePassFixture(t *testing.T, role string) *reconcilePassFixture {
 	} else {
 		f, b, e = newReconcileObservationTargetFixture(t)
 	}
+	e.ObservedAt = e.ObservedAt.UTC()
 	out := &reconcilePassFixture{f: f, binding: b}
 	out.client = &reconcilePassFakeClient{reconcileObservationReader: observationReader(t, f.s, b, e), fixture: out, accept: true}
 	var err error
@@ -579,10 +585,79 @@ func (c *reconcilePassFakeClient) Challenge(ctx context.Context, credential, int
 	if !c.rejectChallenge {
 		hash := sha256.Sum256(raw)
 		c.enrollment.Challenge = &directhttp.EnrollmentChallenge{Challenge: challenge, TranscriptHash: base64.RawURLEncoding.EncodeToString(hash[:])}
-		c.enrollment.ObservedAt = time.Now()
+		c.enrollment.ObservedAt = time.Now().UTC()
 	}
 	if c.challengeErr != nil {
 		return transport.DirectChannelReadinessChallengeV2{}, c.challengeErr
 	}
 	return challenge, nil
+}
+
+func (c *reconcilePassFakeClient) Prove(ctx context.Context, credential, intent string, proof transport.DirectChannelReadinessProofV2) (transport.DirectChannelReadinessProofV2, error) {
+	if err := c.record("prove", credential, intent); err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	raw, err := proof.CanonicalBytes()
+	if err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	c.proofs = append(c.proofs, bytes.Clone(raw))
+	row, err := readPassJournal(c.fixture.f.d.nativeRegistry)
+	if err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	defer clear(row.Root)
+	attempt := row.Attempts["proof"]
+	if !row.PublicationObserved || len(row.Challenge) == 0 || !bytes.Equal(row.Proof, raw) || row.ProofReceivedAt != "" || attempt.Count != attempt.Recovered+1 {
+		c.t.Error("proof dispatched without committed exact authorization")
+	}
+	publication, err := transport.DecodeDirectChannelPublicationV2(row.Publication)
+	if err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	challenge, err := transport.DecodeDirectChannelReadinessChallengeV2(row.Challenge)
+	if err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	material := &directchannelcrypto.Material{Hash: c.fixture.binding.DescriptorHash}
+	copy(material.Key[:], row.Root)
+	readiness, err := material.ReadinessKey()
+	material.Clear()
+	if err != nil {
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	verifyErr := transport.VerifyDirectChannelReadinessProofV2(publication, challenge, proof, readiness, time.Now())
+	clear(readiness)
+	if verifyErr != nil {
+		c.t.Error("proof did not match retained readiness key")
+		return transport.DirectChannelReadinessProofV2{}, verifyErr
+	}
+	if err := checkPassHTTPUnlocked(ctx, c.fixture.f); err != nil {
+		c.t.Error("proof held local locks")
+		return transport.DirectChannelReadinessProofV2{}, err
+	}
+	if deadline, ok := ctx.Deadline(); !ok {
+		c.t.Error("proof missing challenge deadline")
+	} else {
+		expiry, _ := time.Parse(time.RFC3339Nano, challenge.ExpiresAt)
+		if deadline.After(expiry) {
+			c.t.Error("proof deadline exceeds challenge expiry")
+		}
+	}
+	if c.onProve != nil {
+		c.onProve(ctx)
+	}
+	if !c.rejectProof {
+		digest := sha256.Sum256(raw)
+		received := time.Now().UTC()
+		c.enrollment.Proof = &directhttp.EnrollmentProof{Digest: base64.RawURLEncoding.EncodeToString(digest[:]), ReceivedAt: received}
+		c.enrollment.ObservedAt = received
+	}
+	if c.proveErr != nil {
+		return transport.DirectChannelReadinessProofV2{}, c.proveErr
+	}
+	if c.proofResponse != nil {
+		proof = c.proofResponse(proof)
+	}
+	return proof, nil
 }
