@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,4 +187,143 @@ func TestControllerEndpointDispatchFailureClosesConnection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestControllerEndpointExplicitCancellation(t *testing.T) {
+	for _, mode := range []string{"write", "read"} {
+		t.Run(mode, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer server.Close()
+			started := make(chan struct{})
+			conn := &endpointCancelConn{Conn: client, started: started, signalWrite: mode == "write"}
+			controller := &Controller{conn: conn}
+			if mode == "read" {
+				go func() {
+					var req Request
+					_ = readFrame(server, &req)
+				}()
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			finished := make(chan error, 1)
+			go func() { _, err := controller.CallEndpoint(ctx, Request{Type: "snapshot"}); finished <- err }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("call did not start I/O")
+			}
+			cancel()
+			select {
+			case err := <-finished:
+				if !errors.Is(err, context.Canceled) || errors.Is(err, ErrControllerCallNotStarted) {
+					t.Fatalf("dispatched cancellation = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("explicit cancellation waited for the 5s socket deadline")
+			}
+			if _, err := server.Write([]byte{0}); err == nil {
+				t.Fatal("canceled RPC left transport open")
+			}
+		})
+	}
+}
+
+type endpointCancelConn struct {
+	net.Conn
+	started     chan struct{}
+	signalWrite bool
+	once        sync.Once
+}
+
+func (c *endpointCancelConn) Write(b []byte) (int, error) {
+	if c.signalWrite {
+		c.once.Do(func() { close(c.started) })
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *endpointCancelConn) Read(b []byte) (int, error) {
+	if !c.signalWrite {
+		c.once.Do(func() { close(c.started) })
+	}
+	return c.Conn.Read(b)
+}
+
+func TestControllerEndpointCancellationJoinsBeforeUnlock(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	started, callbackEntered, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	base := &endpointCancelConn{Conn: client, started: started}
+	conn := &endpointTestConn{Conn: base}
+	conn.setDeadline = func(deadline time.Time) error {
+		if !deadline.IsZero() && time.Until(deadline) <= 0 {
+			close(callbackEntered)
+			<-release
+		}
+		return nil
+	}
+	controller := &Controller{conn: conn}
+	written := make(chan error, 1)
+	writeReply := make(chan struct{})
+	var replyOnce sync.Once
+	defer replyOnce.Do(func() { close(writeReply) })
+	go func() {
+		var req Request
+		if err := readFrame(server, &req); err != nil {
+			written <- err
+			return
+		}
+		<-writeReply
+		written <- writeFrame(server, Response{})
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() { _, err := controller.CallEndpoint(ctx, Request{Type: "snapshot"}); finished <- err }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("call did not reach its read")
+	}
+	cancel()
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation callback did not start")
+	}
+	replyOnce.Do(func() { close(writeReply) })
+	if err := <-written; err != nil {
+		t.Fatal("late reply failed before cancellation deadline advanced", err)
+	}
+	// The reply is complete, but cleanup must retain mu until the callback joins.
+	if _, err := controller.CallEndpoint(t.Context(), Request{Type: "next"}); !errors.Is(err, ErrControllerCallBusy) {
+		t.Fatalf("later call entered before cancellation callback joined: %v", err)
+	}
+	select {
+	case err := <-finished:
+		t.Fatalf("call returned before cancellation callback joined: %v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrControllerCallNotStarted) {
+			t.Fatalf("late reply accepted after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("call did not finish after cancellation callback")
+	}
+	if !conn.closed || !conn.deadlines[len(conn.deadlines)-1].IsZero() {
+		t.Fatal("canceled call did not close transport and reset deadline")
+	}
+	// A fresh serialized connection cannot be touched by the old callback.
+	nextClient, nextServer := net.Pipe()
+	defer nextClient.Close()
+	defer nextServer.Close()
+	controller.mu.Lock()
+	controller.conn = nextClient
+	controller.mu.Unlock()
+	endpointTestExchange(t, controller, nextServer)
 }

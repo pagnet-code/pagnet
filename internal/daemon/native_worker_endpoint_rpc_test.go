@@ -102,7 +102,7 @@ func endpointRPCSuccess(t *testing.T, server net.Conn) {
 }
 
 func TestNativeWorkerEndpointRPCFailureBeforeOrderedCleanup(t *testing.T) {
-	for _, failure := range []string{"EOF", "timeout", "unknown-response"} {
+	for _, failure := range []string{"EOF", "timeout", "explicit-cancel", "unknown-response"} {
 		t.Run(failure, func(t *testing.T) {
 			dispatched := make(chan struct{})
 			p, s := endpointRPCFixture(t, func(server net.Conn, _ *NativeObservationConnection) {
@@ -111,7 +111,7 @@ func TestNativeWorkerEndpointRPCFailureBeforeOrderedCleanup(t *testing.T) {
 				}
 				close(dispatched)
 				switch failure {
-				case "timeout":
+				case "timeout", "explicit-cancel":
 					var b [1]byte
 					_, _ = server.Read(b[:]) // controller closes after its deadline
 				case "unknown-response":
@@ -124,10 +124,17 @@ func TestNativeWorkerEndpointRPCFailureBeforeOrderedCleanup(t *testing.T) {
 			unlock := func() { release.Do(func() { s.owner.mu.Unlock(); p.publicationMu.Unlock() }) }
 			defer unlock()
 			ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+			if failure == "explicit-cancel" {
+				cancel()
+				ctx, cancel = context.WithCancel(t.Context())
+			}
 			defer cancel()
 			finished := make(chan error, 1)
 			go func() { _, err := p.verifyEndpointOwnership(ctx, transport.NativeWorkerOwnership{}); finished <- err }()
 			waitNativeProxySignal(t, dispatched)
+			if failure == "explicit-cancel" {
+				cancel()
+			}
 			select {
 			case err := <-finished:
 				if err != errDirectEndpointRPCUnknown {

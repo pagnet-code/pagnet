@@ -503,17 +503,43 @@ func (c *Controller) CallEndpoint(ctx context.Context, req Request) (Response, e
 		_ = c.conn.SetDeadline(time.Time{})
 		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
 	}
-	if _, err := io.Copy(c.conn, &frame); err != nil {
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(canceled)
+		_ = c.conn.SetDeadline(time.Now())
+	})
+	joined := false
+	join := func() {
+		if !joined {
+			joined = true
+			if !stop() {
+				<-canceled
+			}
+		}
+	}
+	defer func() {
+		// A cancellation callback must finish while this call still owns mu.
+		// Otherwise its deadline could interrupt a later serialized call.
+		join()
+		_ = c.conn.SetDeadline(time.Time{})
+	}()
+	if err := ctx.Err(); err != nil {
+		return Response{}, errors.Join(ErrControllerCallNotStarted, err)
+	}
+	_, err := io.Copy(c.conn, &frame)
+	var response Response
+	if err == nil {
+		err = readFrame(c.conn, &response)
+	}
+	join()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
+	if err != nil {
 		_ = c.conn.Close()
 		return Response{}, err
 	}
-	var response Response
-	err := readFrame(c.conn, &response)
-	if err != nil {
-		_ = c.conn.Close()
-	}
-	_ = c.conn.SetDeadline(time.Time{})
-	return response, err
+	return response, nil
 }
 
 func DialOwnerController(ctx context.Context, dir string, scope Scope, key []byte, id string) (*Controller, error) {
