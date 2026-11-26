@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pagnet-code/pagnet/domain"
 )
@@ -26,6 +27,7 @@ type DirectEndpointSubscriptionMetadata struct {
 }
 
 type directEndpointBinding struct {
+	leaseID         string // minted at live admission; durable evidence never restores this lease
 	metadata        DirectEndpointSubscriptionMetadata
 	issueDigest     [sha256.Size]byte
 	sessionIdentity string
@@ -112,6 +114,7 @@ func (o *directEndpointSubscriptions) add(binding directEndpointBinding) *Direct
 	if o.entries == nil {
 		o.entries = make(map[*DirectEndpointSubscription]struct{})
 	}
+	binding.leaseID = uuid.NewString()
 	s := &DirectEndpointSubscription{owner: o, binding: binding, done: make(chan struct{})}
 	o.entries[s] = struct{}{}
 	return s
