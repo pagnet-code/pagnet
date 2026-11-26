@@ -172,12 +172,16 @@ func (s *ManagedEndpointKeyStore) withPoPLocked(fn func(*sql.Conn, *os.File) err
 
 // Private bytes stay within this operation and are cleared by its caller.
 func (s *ManagedEndpointKeyStore) loadPoPKey(conn *sql.Conn, dir *os.File, reservation transport.ManagedEndpointKeyReservation) ([]byte, error) {
+	return s.loadPoPKeyContext(context.Background(), conn, dir, reservation)
+}
+
+func (s *ManagedEndpointKeyStore) loadPoPKeyContext(ctx context.Context, conn *sql.Conn, dir *os.File, reservation transport.ManagedEndpointKeyReservation) ([]byte, error) {
 	p := reservation.Subject
 	name := managedEndpointKeyScope(s.installation, reservation.ServerURL, p)
 	identity := managedEndpointSlotIdentity(s.installation, reservation.ServerURL, p)
 	var scope, installation string
 	var request, retained []byte
-	if err := conn.QueryRowContext(context.Background(), `SELECT scope,installation_id,request,reservation FROM native_managed_endpoint_keys WHERE enrollment_id=?`, p.ID).Scan(&scope, &installation, &request, &retained); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT scope,installation_id,request,reservation FROM native_managed_endpoint_keys WHERE enrollment_id=?`, p.ID).Scan(&scope, &installation, &request, &retained); err != nil {
 		return nil, errManagedEndpointKey
 	}
 	subject, server, err := validateManagedEndpointRequest(request)
@@ -188,7 +192,7 @@ func (s *ManagedEndpointKeyStore) loadPoPKey(conn *sql.Conn, dir *os.File, reser
 	var slotInstallation, public, anchor string
 	var slotIdentity []byte
 	var generation, format int
-	if err = conn.QueryRowContext(context.Background(), `SELECT installation_id,identity,key_generation,file_format,legacy_enrollment_id,x25519 FROM native_managed_endpoint_key_slots WHERE scope=?`, name).Scan(&slotInstallation, &slotIdentity, &generation, &format, &anchor, &public); err != nil || slotInstallation != installation || !bytes.Equal(identity, slotIdentity) || generation != 1 || public != reservation.X25519 {
+	if err = conn.QueryRowContext(ctx, `SELECT installation_id,identity,key_generation,file_format,legacy_enrollment_id,x25519 FROM native_managed_endpoint_key_slots WHERE scope=?`, name).Scan(&slotInstallation, &slotIdentity, &generation, &format, &anchor, &public); err != nil || slotInstallation != installation || !bytes.Equal(identity, slotIdentity) || generation != 1 || public != reservation.X25519 {
 		return nil, errManagedEndpointKey
 	}
 	var stat unix.Stat_t
@@ -213,7 +217,7 @@ func (s *ManagedEndpointKeyStore) loadPoPKey(conn *sql.Conn, dir *os.File, reser
 	}
 	var anchorScope, anchorInstallation string
 	var anchorRequest, anchorReserved []byte
-	if err = conn.QueryRowContext(context.Background(), `SELECT scope,installation_id,request,reservation FROM native_managed_endpoint_keys WHERE enrollment_id=?`, anchor).Scan(&anchorScope, &anchorInstallation, &anchorRequest, &anchorReserved); err != nil {
+	if err = conn.QueryRowContext(ctx, `SELECT scope,installation_id,request,reservation FROM native_managed_endpoint_keys WHERE enrollment_id=?`, anchor).Scan(&anchorScope, &anchorInstallation, &anchorRequest, &anchorReserved); err != nil {
 		return nil, errManagedEndpointKey
 	}
 	anchorSubject, anchorServer, err := validateManagedEndpointRequest(anchorRequest)

@@ -170,11 +170,15 @@ func (s *DirectManagedSourceKeyStoreV2) withPoPLocked(fn func(*sql.Conn, *os.Fil
 
 // Private bytes stay within this operation and are cleared by its caller.
 func (s *DirectManagedSourceKeyStoreV2) loadPoPKey(conn *sql.Conn, dir *os.File, reservation transport.DirectManagedSourceKeyReservationV2, expected transport.DirectManagedSourcePrepareCommandV2) ([]byte, error) {
+	return s.loadPoPKeyContext(context.Background(), conn, dir, reservation, expected)
+}
+
+func (s *DirectManagedSourceKeyStoreV2) loadPoPKeyContext(ctx context.Context, conn *sql.Conn, dir *os.File, reservation transport.DirectManagedSourceKeyReservationV2, expected transport.DirectManagedSourcePrepareCommandV2) ([]byte, error) {
 	p := reservation.Subject
 	name := directManagedSourceKeyScopeV2(s.installation, reservation.ServerURL, p)
 	var scope, installation string
 	var request, retained, requestDigest []byte
-	if err := conn.QueryRowContext(context.Background(), `SELECT scope,installation_id,request,reservation,request_digest FROM native_direct_managed_source_v2_keys WHERE binding_id=?`, p.ID).Scan(&scope, &installation, &request, &retained, &requestDigest); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT scope,installation_id,request,reservation,request_digest FROM native_direct_managed_source_v2_keys WHERE binding_id=?`, p.ID).Scan(&scope, &installation, &request, &retained, &requestDigest); err != nil {
 		return nil, errDirectManagedSourceKeyV2
 	}
 	command, err := transport.DecodeDirectManagedSourcePrepareCommandV2(request)
