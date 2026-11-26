@@ -41,6 +41,9 @@ func (d *Daemon) recordNativeWorkerReadinessFailure(c *NativeObservationConnecti
 }
 
 func (p *NativeWorkerProxy) availability(now time.Time) string {
+	if p.aborted() {
+		return "unavailable"
+	}
 	select {
 	case <-p.done:
 		return "unavailable"
@@ -49,6 +52,9 @@ func (p *NativeWorkerProxy) availability(now time.Time) string {
 	p.snapshotMu.Lock()
 	at := p.snapshotAt
 	p.snapshotMu.Unlock()
+	if p.aborted() {
+		return "unavailable"
+	}
 	if at.IsZero() || now.Before(at) || now.Sub(at) > nativeWorkerSnapshotFreshness {
 		return "unknown"
 	}

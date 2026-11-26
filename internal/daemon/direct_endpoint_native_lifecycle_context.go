@@ -123,10 +123,13 @@ func (p *NativeWorkerProxy) beginDirectEndpointTransitionContext(ctx context.Con
 }
 
 func (p *NativeWorkerProxy) directEndpointAuthorityContext(ctx context.Context, subject nativeManagedSubject) (uint64, bool, error) {
+	if p.aborted() {
+		return 0, false, nil
+	}
 	unlock, err := directEndpointTryRLock(ctx, &p.publicationMu)
 	if err != nil {
 		return 0, false, err
 	}
 	defer unlock()
-	return p.directEndpointEpoch, !p.directEndpointTransition && p.directEndpointObserved && p.directEndpointIdentity.matches(subject), nil
+	return p.directEndpointEpoch, !p.aborted() && !p.directEndpointTransition && p.directEndpointObserved && p.directEndpointIdentity.matches(subject), nil
 }

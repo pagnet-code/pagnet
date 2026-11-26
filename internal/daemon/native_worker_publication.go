@@ -47,7 +47,7 @@ type nativeWorkerPublicationToken struct {
 // RLock → connMu → native.mu. The caller holds writeMu. The callback sets the deadline
 // and writes the frame; IPC, disk access and connection cleanup happen outside.
 func (d *Daemon) publishNativeWorker(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, laneDone <-chan struct{}, expires time.Time, write func(time.Time) error) error {
-	if token == nil || token.link == nil || token.proxy == nil || captured.Connection == nil {
+	if token == nil || token.link == nil || token.proxy == nil || token.proxy.aborted() || captured.Connection == nil {
 		return ErrManagedEndpointPrepareRetryable
 	}
 	d.nativeWorkersMu.Lock()
@@ -77,6 +77,9 @@ func (d *Daemon) publishNativeWorker(token *nativeWorkerPublicationToken, captur
 	deadline := now.Add(d.writeTimeout)
 	if expires.Before(deadline) {
 		deadline = expires
+	}
+	if token.proxy.aborted() {
+		return ErrManagedEndpointPrepareRetryable
 	}
 	return write(deadline)
 }

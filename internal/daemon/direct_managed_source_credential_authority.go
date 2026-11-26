@@ -56,7 +56,7 @@ const (
 // consent or budgets.
 func (d *Daemon) directManagedSourceCredentialPublicationFence(token *nativeWorkerPublicationToken, captured ManagedEndpointPrepareScope, lane *directManagedSourceCredentialPublicationLane) DirectManagedSourceCredentialPublicationFence {
 	return func(conn *sql.Conn, issue transport.DirectManagedSourceCredentialIssue, server string, session transport.HostSessionPayload) (func(), error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || conn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || conn == nil || token == nil || token.link == nil || token.proxy == nil || token.proxy.aborted() || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if _, err := issue.CanonicalBytes(); err != nil {
@@ -121,7 +121,7 @@ func (d *Daemon) credentialPublicationFenceContextMode(ctx context.Context, boun
 		return true
 	}
 	return func(registryConn *sql.Conn, server string, session transport.HostSessionPayload) (release func(), err error) {
-		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
+		if d == nil || d.nativeRegistry == nil || d.state == nil || registryConn == nil || token == nil || token.link == nil || token.proxy == nil || token.proxy.aborted() || captured.Socket == nil || captured.Connection == nil || lane == nil || lane.done == nil {
 			return nil, ErrManagedEndpointPrepareRetryable
 		}
 		if !reflect.DeepEqual(subject, token.subject) || !reflect.DeepEqual(session, captured.Session) || !matchesSession || managedPrepareServerOrigin(server) == "" {
@@ -304,7 +304,7 @@ func (d *Daemon) credentialPublicationFenceContextMode(ctx context.Context, boun
 		if now.Before(issuedAt) || !now.Before(installExpiresAt) || !now.Before(credentialExpiresAt) || !now.Before(budgetExpiresAt) || !now.Before(subject.ExpiresAt) {
 			return release, ErrManagedEndpointPrepareRejected
 		}
-		if bounded && ctx.Err() != nil {
+		if token.proxy.aborted() || (bounded && ctx.Err() != nil) {
 			return release, ErrManagedEndpointPrepareRetryable
 		}
 		return release, nil
