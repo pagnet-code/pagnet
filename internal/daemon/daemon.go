@@ -968,7 +968,7 @@ func (d *Daemon) Close() error {
 		}
 		d.nativeWorkersMu.Unlock()
 		if d.nativeRegistry != nil {
-			_ = d.nativeRegistry.Close()
+			err = d.nativeRegistry.Close()
 		}
 		d.turnCancel()       // ctx watchers terminate active turn groups
 		d.terminal.stopAll() // stop PTY sessions (delegates to the supervisor)
@@ -976,7 +976,7 @@ func (d *Daemon) Close() error {
 			d.Log.Error("shutdown: process groups not reaped within deadline", "survivors", n)
 		}
 		d.stopBridgeSocket()
-		err = d.state.Close()
+		err = errors.Join(err, d.state.Close())
 	})
 	return err
 }

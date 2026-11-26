@@ -4,10 +4,12 @@ package daemon
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -126,6 +128,113 @@ func TestNativeRegistryCustodyRejectsOrphansAndAncestors(t *testing.T) {
 		}
 	})
 }
+func TestNativeRegistryCloseWaitsForCustody(t *testing.T) {
+	r, err := OpenNativeWorkerRegistry(registryCustodyState(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	root, err := nativeRegistryProtectedDirectory(r.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	custody, err := nativeRegistryCustodyLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer custody.Close()
+	closed := make(chan error, 1)
+	go func() { closed <- r.Close() }()
+	// Wait until Close has entered its critical section before checking that
+	// custody blocks it, so an unscheduled goroutine cannot satisfy the test.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.mu.TryLock() {
+		r.mu.Unlock()
+		select {
+		case err := <-closed:
+			t.Fatalf("Close returned while custody was held: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not enter its critical section")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while custody was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := r.db.Ping(); err != nil {
+		t.Fatalf("database closed while custody was held: %v", err)
+	}
+	if err := custody.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not finish after custody release")
+	}
+}
+
+func TestNativeRegistryCloseCustodyFailureIsRetryable(t *testing.T) {
+	for _, name := range []string{".", "registry.custody.lock"} {
+		t.Run(name, func(t *testing.T) {
+			r, err := OpenNativeWorkerRegistry(registryCustodyState(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(r.root, name)
+			mode := os.FileMode(0600)
+			if name == "." {
+				mode = 0700
+			}
+			t.Cleanup(func() {
+				_ = os.Chmod(path, mode)
+				_ = r.Close()
+			})
+			if err := os.Chmod(path, mode|0044); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Close(); err == nil {
+				t.Fatal("Close accepted unsafe custody")
+			}
+			if err := r.db.Ping(); err != nil {
+				t.Fatalf("custody failure closed the database: %v", err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Close(); err != nil {
+				t.Fatalf("Close retry failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestNativeRegistryCloseFailureReportedByDaemon(t *testing.T) {
+	d := newTestDaemon(t)
+	r := d.nativeRegistry
+	t.Cleanup(func() {
+		_ = os.Chmod(r.root, 0700)
+		_ = r.Close()
+	})
+	if err := os.Chmod(r.root, 0744); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); !errors.Is(err, errNativeShareHolder) {
+		t.Fatalf("Close did not report registry custody failure: %v", err)
+	}
+	if d.turnCtx.Err() == nil {
+		t.Fatal("registry failure interrupted daemon shutdown")
+	}
+}
+
 func TestNativeRegistryCustodyConcurrentSafeOpens(t *testing.T) {
 	state := registryCustodyState(t)
 	var wg sync.WaitGroup

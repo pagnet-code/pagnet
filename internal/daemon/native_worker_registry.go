@@ -155,7 +155,26 @@ func OpenNativeWorkerRegistry(stateDir string) (*NativeWorkerRegistry, error) {
 	}
 	return registry, nil
 }
-func (r *NativeWorkerRegistry) Close() error { return r.db.Close() }
+func (r *NativeWorkerRegistry) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	root, err := nativeRegistryProtectedDirectory(r.root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err = nativeShareHolderPrivate(root, true); err != nil {
+		return err
+	}
+	custody, err := nativeRegistryCustodyLock(root)
+	if err != nil {
+		return err
+	}
+	defer custody.Close()
+	// SQLite's last close can unlink WAL and SHM files. Keep custody while it
+	// does so, just as opens and enrollment writes hold custody to inspect them.
+	return r.db.Close()
+}
 func (r *NativeWorkerRegistry) Dir(scope sessionworker.Scope) string {
 	raw, _ := json.Marshal(scope)
 	sum := sha256.Sum256(raw)
