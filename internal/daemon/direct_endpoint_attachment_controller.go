@@ -146,6 +146,9 @@ func (c *directEndpointAttachmentController) attach(ctx context.Context, expecte
 	if err != nil || sub == nil {
 		return nil, errDirectChannelConsent
 	}
+	if err := c.validateLocalConsent(record, sub, time.Now()); err != nil {
+		return nil, err
+	}
 	observe, err := c.observe(sub)
 	if err != nil {
 		return nil, err
@@ -199,4 +202,22 @@ func (c *directEndpointAttachmentController) status() error {
 	default:
 		return nil
 	}
+}
+
+// validateLocalConsent rejects stale local opt-in metadata before authenticated
+// HTTP. Remote descriptor fields still require the full post-observation check.
+func (c *directEndpointAttachmentController) validateLocalConsent(record directChannelConsentRecord, sub *DirectEndpointSubscription, now time.Time) error {
+	if sub == nil || record.Binding == nil {
+		return errDirectChannelConsent
+	}
+	admitted, binding := sub.binding, record.Binding
+	subject, metadata := admitted.subject, admitted.metadata
+	session, err := json.Marshal(c.captured.Session)
+	expiry, expiryErr := time.Parse(time.RFC3339Nano, binding.ExpiresAt)
+	if err != nil || expiryErr != nil || !now.Before(expiry) || record.Key != c.key || binding.Key != c.key ||
+		binding.Instance != string(subject.InstanceID) || binding.Origin != string(subject.OriginID) || binding.OwnershipGeneration != subject.OwnershipGeneration || binding.NativeGeneration != subject.NativeGeneration ||
+		c.store.installation != string(metadata.InstallationID) || string(session) != admitted.sessionIdentity || c.captured.Socket != admitted.socket || c.captured.Connection != admitted.native || !nativeManagedSessionMatches(subject, c.captured.Session) {
+		return errDirectChannelConsent
+	}
+	return nil
 }

@@ -17,6 +17,11 @@ import (
 
 func attachmentControllerFixture(t *testing.T, role string) (*directEndpointAttachmentController, *reconcilePassFixture, directChannelConsentBinding) {
 	t.Helper()
+	return attachmentControllerFixtureWithRoleAdmission(t, role, false)
+}
+
+func attachmentControllerFixtureWithRoleAdmission(t *testing.T, role string, realAdmission bool) (*directEndpointAttachmentController, *reconcilePassFixture, directChannelConsentBinding) {
+	t.Helper()
 	f := newReconcilePassFixture(t, role)
 	if role == "P" {
 		raw, err := os.ReadFile("../directchannelcrypto/testdata/sdk-v2.json")
@@ -94,7 +99,9 @@ func attachmentControllerFixture(t *testing.T, role string) (*directEndpointAtta
 		t.Fatal(err)
 	}
 	// The fixture already admitted through the real custody and authority fence.
-	c.admit = func(context.Context) (*DirectEndpointSubscription, error) { return s, nil }
+	if !realAdmission {
+		c.admit = func(context.Context) (*DirectEndpointSubscription, error) { return s, nil }
+	}
 	return c, f, binding
 }
 
@@ -230,6 +237,84 @@ func TestDirectAttachmentControllerDisableBeforeDispatch(t *testing.T) {
 			if c.status() != errDirectChannelConsent {
 				t.Fatal("terminal status not sanitized")
 			}
+		})
+	}
+}
+
+func TestDirectAttachmentControllerStaleLocalConsent(t *testing.T) {
+	for _, role := range []string{"S", "P"} {
+		for _, kind := range []string{"instance", "origin", "ownership generation", "native generation", "expired", "installation", "session"} {
+			t.Run(role+"/"+kind, func(t *testing.T) {
+				c, f, binding := attachmentControllerFixture(t, role)
+				switch kind {
+				case "instance":
+					binding.Instance = "foreign"
+				case "origin":
+					binding.Origin = "foreign"
+				case "ownership generation":
+					binding.OwnershipGeneration = "foreign"
+				case "native generation":
+					binding.NativeGeneration = "foreign"
+				case "expired":
+					binding.ExpiresAt = time.Now().Add(100 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+				case "installation":
+					f.f.s.binding.metadata.InstallationID = domain.NewID()
+				case "session":
+					c.captured.Session.BootID = "foreign"
+				}
+				if _, err := c.store.Enable(t.Context(), binding, 0, "enable"); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "expired" {
+					expiry, err := time.Parse(time.RFC3339Nano, binding.ExpiresAt)
+					if err != nil {
+						t.Fatal(err)
+					}
+					time.Sleep(time.Until(expiry) + time.Millisecond)
+				}
+				if a, err := c.attach(t.Context(), 1); a != nil || err != errDirectChannelConsent {
+					t.Fatal("stale local consent accepted")
+				}
+				if len(f.client.calls) != 0 {
+					t.Fatal("stale local consent reached HTTP")
+				}
+				assertAttachmentNoMutation(t, f)
+				if f.f.s.Valid() {
+					t.Fatal("stale local consent admission remained live")
+				}
+			})
+		}
+	}
+}
+
+func TestDirectAttachmentControllerRoleAdmission(t *testing.T) {
+	for _, role := range []string{"S", "P"} {
+		t.Run(role, func(t *testing.T) {
+			c, f, binding := attachmentControllerFixtureWithRoleAdmission(t, role, true)
+			if _, err := c.store.Enable(t.Context(), binding, 0, "enable"); err != nil {
+				t.Fatal(err)
+			}
+			entered, finished := make(chan struct{}), make(chan struct{})
+			original := c.pass
+			c.pass = func(s *DirectEndpointSubscription, record directChannelConsentRecord, revision int64) (directEndpointReconcilePass, error) {
+				pass, err := original(s, record, revision)
+				return func(ctx context.Context) (directEndpointReconcilePassState, error) {
+					defer close(finished)
+					close(entered)
+					<-ctx.Done()
+					return pass(ctx)
+				}, err
+			}
+			a, err := c.attach(t.Context(), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a.handle == f.f.s || a.handle.owner != &c.d.directSubscriptions || a.handle.binding.metadata.Role != role {
+				t.Fatal("constructor did not admit a fresh exact-role handle")
+			}
+			<-entered
+			c.wake.close()
+			<-finished
 		})
 	}
 }
