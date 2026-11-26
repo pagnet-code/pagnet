@@ -34,6 +34,7 @@ import (
 	"github.com/pagnet-code/pagnet/domain"
 	"github.com/pagnet-code/pagnet/fabric"
 	"github.com/pagnet-code/pagnet/internal/agentbridge"
+	"github.com/pagnet-code/pagnet/transport"
 )
 
 // sideportFakeBinary builds (when stale/missing) the pagnet-fake-runtime
@@ -124,7 +125,7 @@ type sideportOwnerFixture struct {
 
 const sideportNetworkID = "network-1"
 
-func newSideportOwnerFixture(t *testing.T) *sideportOwnerFixture {
+func newSideportOwnerFixture(t *testing.T, beforeActivation ...func(*sideportOwnerFixture)) *sideportOwnerFixture {
 	t.Helper()
 	ctx := t.Context()
 	scope := testScope()
@@ -199,18 +200,38 @@ func newSideportOwnerFixture(t *testing.T) *sideportOwnerFixture {
 	}
 	t.Cleanup(func() { _ = f.controller.Close() })
 
+	for _, prepare := range beforeActivation {
+		prepare(f)
+	}
+
 	admission := Admission{NativeAdmissionID: uuid.NewString(), Scope: scope, TenantID: scope.TenantID, NetworkID: sideportNetworkID, Kind: "worker", RunnerID: uuid.NewString(), RunnerEpoch: time.Now().UTC(), BootID: uuid.NewString()}
 	if r := f.call(t, Request{Type: "admission", Admission: &admission}); r.Error != "" {
 		t.Fatalf("admission: %s", r.Error)
 	}
-	opRaw, _ := json.Marshal(Operation{SourceCommandID: "activate-one"})
-	if r := f.call(t, Request{Type: "intent", Sequence: 1, CommandID: "activate-one", Kind: "activate", Payload: opRaw}); r.Error != "" {
+	command := "activate-one"
+	requestType := "intent"
+	var proof *transport.NativeDispatchProof
+	if len(beforeActivation) > 0 {
+		var raw string
+		if err := j.db.QueryRow(`SELECT ownership FROM worker_dispatch_meta WHERE singleton=1`).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var ownership transport.NativeWorkerOwnership
+		if err := json.Unmarshal([]byte(raw), &ownership); err != nil {
+			t.Fatal(err)
+		}
+		p := dispatchProof(ownership, 1)
+		proof = &p
+		command, requestType = p.SourceCommandID, "dispatch"
+	}
+	opRaw, _ := json.Marshal(Operation{SourceCommandID: command})
+	if r := f.call(t, Request{Type: requestType, Sequence: 1, CommandID: command, Kind: "activate", Payload: opRaw, NativeDispatch: proof}); r.Error != "" {
 		t.Fatalf("activate intent: %s", r.Error)
 	}
 	activation := f.pollActivation(t)
-	origin := json.RawMessage(fmt.Sprintf(`{"id":%q,"commandId":"activate-one","tenantId":%q,"hostId":%q,"instanceId":%q,"runtime":"fake-persistent","nativeGeneration":%q,"nativeAdmissionId":%q,"runnerId":%q,"runnerEpoch":%q,"bootId":%q,"createdAt":%q}`,
-		uuid.NewString(), spec.NetworkTenantID, scope.HostID, scope.InstanceID, activation.NativeGeneration,
-		admission.NativeAdmissionID, admission.RunnerID, admission.RunnerEpoch.Format(time.RFC3339Nano), admission.BootID, time.Now().UTC().Format(time.RFC3339Nano)))
+	origin := json.RawMessage(fmt.Sprintf(`{"id":%q,"commandId":%q,"tenantId":%q,"hostId":%q,"instanceId":%q,"runtime":"fake-persistent","nativeGeneration":%q,"nativeAdmissionId":%q,"runnerId":%q,"runnerEpoch":%q,"bootId":%q,"createdAt":%q}`,
+		uuid.NewString(), command, spec.NetworkTenantID, scope.HostID, scope.InstanceID, activation.NativeGeneration,
+		activation.Admission.NativeAdmissionID, activation.Admission.RunnerID, activation.Admission.RunnerEpoch.Format(time.RFC3339Nano), activation.Admission.BootID, time.Now().UTC().Format(time.RFC3339Nano)))
 	if r := f.call(t, Request{Type: "activation_origin", ActivationOrigin: &ActivationOrigin{ID: activation.ID, NativeGeneration: activation.NativeGeneration, Origin: origin}}); r.Error != "" {
 		t.Fatalf("activation origin: %s", r.Error)
 	}

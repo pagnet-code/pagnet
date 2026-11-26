@@ -14,8 +14,8 @@ import (
 )
 
 // directASKController is a package-private authenticated-controller capability.
-// This dormant phase has no production issuer. Future IPC composition must mint
-// it only from the authenticated connection's durable lease, never request data.
+// It is minted only from an authenticated controller connection's durable lease,
+// never from request data.
 type directASKController struct {
 	owner *SessionOwner
 	lease int64
