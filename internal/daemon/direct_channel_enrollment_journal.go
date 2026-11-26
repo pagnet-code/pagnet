@@ -525,7 +525,7 @@ func (j *directEnrollmentJournal) matches(s *DirectEndpointSubscription, b direc
 }
 
 func (j *directEnrollmentJournal) matchesContext(ctx context.Context, s *DirectEndpointSubscription, b directEnrollmentBinding) error {
-	if s == nil || s.owner == nil {
+	if s == nil || s.owner == nil || s.aborted() {
 		return errDirectEnrollment
 	}
 	unlock, err := directEndpointTryLock(ctx, &s.owner.mu)
@@ -533,7 +533,7 @@ func (j *directEnrollmentJournal) matchesContext(ctx context.Context, s *DirectE
 		return err
 	}
 	defer unlock()
-	if _, ok := s.owner.entries[s]; !ok {
+	if _, ok := s.owner.entries[s]; !ok || s.aborted() {
 		return errDirectEnrollment
 	}
 	if !time.Now().Before(s.binding.metadata.Deadline) {
