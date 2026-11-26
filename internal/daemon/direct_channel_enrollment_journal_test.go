@@ -266,7 +266,7 @@ func TestDirectEnrollmentCapacityNoEviction(t *testing.T) {
 			if _, e := c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1 VALUES(?,?,?,?,?)`, b.Installation, b.Server, fmt.Sprint(i), []byte("occupied"), []byte("occupied")); e != nil {
 				return e
 			}
-			if _, e := c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?,?)`, b.Installation, b.Server, fmt.Sprint(i), b.Role, []byte("occupied"), []byte("occupied")); e != nil {
+			if _, e := c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?)`, b.Installation, b.Server, fmt.Sprint(i), []byte("occupied"), []byte("occupied")); e != nil {
 				return e
 			}
 		}
@@ -364,5 +364,83 @@ func TestDirectEnrollmentDeletedRecordCannotRecreate(t *testing.T) {
 				t.Fatal("immutable fence deleted")
 			}
 		})
+	}
+}
+
+func TestDirectEnrollmentDeletedRecordRejectsOppositeRole(t *testing.T) {
+	for _, firstRole := range []string{"S", "P"} {
+		for _, phase := range []string{"started", "material"} {
+			t.Run(firstRole+"/"+phase, func(t *testing.T) {
+				j, source, sourceBinding, v := enrollmentFixture(t)
+				descriptor, e := transport.DecodeDirectChannelDescriptorV2(v.Descriptor)
+				if e != nil {
+					t.Fatal(e)
+				}
+				targetBinding := source.binding
+				targetBinding.metadata.TenantID = domain.ID(descriptor.P.TenantID)
+				targetBinding.metadata.PrincipalID = domain.ID(descriptor.P.PrincipalID)
+				targetBinding.metadata.EndpointID = domain.ID(descriptor.P.EndpointID)
+				targetBinding.metadata.CredentialID = domain.ID(descriptor.P.CredentialID)
+				targetBinding.metadata.Role = "P"
+				targetBinding.issueDigest = enrollmentHash([]byte("target issue"))
+				target := source.owner.add(targetBinding)
+				if target == nil {
+					t.Fatal("target subscription unavailable")
+				}
+				peerBinding, e := enrollmentBinding(target, managedDirectCredentialProtocolV1, v.Descriptor, sourceBinding.PeerFingerprint, sourceBinding.LocalFingerprint)
+				if e != nil {
+					t.Fatal(e)
+				}
+				first, next := source, target
+				firstBinding, nextBinding := sourceBinding, peerBinding
+				if firstRole == "P" {
+					first, next = target, source
+					firstBinding, nextBinding = peerBinding, sourceBinding
+				}
+				if firstBinding.Channel != nextBinding.Channel || firstBinding.Installation != nextBinding.Installation {
+					t.Fatal("fixture changed journal identity")
+				}
+				if _, e = j.reserve(first, firstBinding); e != nil {
+					t.Fatal(e)
+				}
+				grant, e := j.start(first, firstBinding)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if phase == "material" {
+					if _, e = grant.material(first, v.EpochKey, v.Publication); e != nil {
+						t.Fatal(e)
+					}
+				}
+				if _, e = j.registry.db.Exec(`DELETE FROM native_direct_enrollment_v1`); e != nil {
+					t.Fatal(e)
+				}
+				r, e := OpenNativeWorkerRegistry(filepath.Dir(j.registry.root))
+				if e != nil {
+					t.Fatal(e)
+				}
+				defer r.Close()
+				reopened, e := newDirectEnrollmentJournal(r)
+				if e != nil {
+					t.Fatal(e)
+				}
+				if _, e = reopened.reserve(next, nextBinding); e == nil {
+					t.Fatal("opposite role recreated deleted journal row")
+				}
+				if _, e = reopened.start(next, nextBinding); e == nil {
+					t.Fatal("opposite role minted second creation grant")
+				}
+				var rows, fences int
+				if e = r.db.QueryRow(`SELECT COUNT(*) FROM native_direct_enrollment_v1`).Scan(&rows); e != nil {
+					t.Fatal(e)
+				}
+				if e = r.db.QueryRow(`SELECT COUNT(*) FROM native_direct_enrollment_v1_fences`).Scan(&fences); e != nil {
+					t.Fatal(e)
+				}
+				if rows != 0 || fences != 1 {
+					t.Fatalf("rows %d fences %d", rows, fences)
+				}
+			})
+		}
 	}
 }

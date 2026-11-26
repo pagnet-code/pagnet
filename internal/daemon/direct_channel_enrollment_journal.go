@@ -228,7 +228,7 @@ func (j *directEnrollmentJournal) locked(fn func(*sql.Conn, []byte) error) error
 		return e
 	}
 	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS native_direct_enrollment_v1_fences(installation TEXT NOT NULL,server TEXT NOT NULL,channel TEXT NOT NULL,role TEXT NOT NULL,binding BLOB NOT NULL,mac BLOB NOT NULL,PRIMARY KEY(installation,server,channel,role))`,
+		`CREATE TABLE IF NOT EXISTS native_direct_enrollment_v1_fences(installation TEXT NOT NULL,server TEXT NOT NULL,channel TEXT NOT NULL,binding BLOB NOT NULL,mac BLOB NOT NULL,PRIMARY KEY(installation,server,channel))`,
 		`CREATE TRIGGER IF NOT EXISTS native_direct_enrollment_v1_fences_no_update BEFORE UPDATE ON native_direct_enrollment_v1_fences BEGIN SELECT RAISE(ABORT,'immutable enrollment fence'); END`,
 		`CREATE TRIGGER IF NOT EXISTS native_direct_enrollment_v1_fences_no_delete BEFORE DELETE ON native_direct_enrollment_v1_fences BEGIN SELECT RAISE(ABORT,'immutable enrollment fence'); END`,
 	} {
@@ -297,7 +297,8 @@ func enrollmentMAC(key []byte, b directEnrollmentBinding, raw []byte) []byte {
 	return h.Sum(nil)
 }
 
-// Separate immutable fences detect deletion of an individual mutable journal row.
+// Immutable fences use exactly the mutable row identity; role remains bound by
+// the authenticated binding. They detect deletion of an individual journal row.
 // They do not detect rollback or replacement of an entire database snapshot.
 func enrollmentFenceMAC(key []byte, b directEnrollmentBinding, raw []byte) []byte {
 	return enrollmentMAC(key, b, append([]byte("creation-fence/v1\x00"), raw...))
@@ -324,7 +325,7 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 		}
 		expectedBinding, _ := json.Marshal(b)
 		var fence, fenceMAC []byte
-		fenceErr := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(binding)<=65536 THEN binding ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1_fences WHERE installation=? AND server=? AND channel=? AND role=?`, b.Installation, b.Server, b.Channel, b.Role).Scan(&fence, &fenceMAC)
+		fenceErr := c.QueryRowContext(context.Background(), `SELECT CASE WHEN length(binding)<=65536 THEN binding ELSE NULL END,CASE WHEN length(mac)=32 THEN mac ELSE NULL END FROM native_direct_enrollment_v1_fences WHERE installation=? AND server=? AND channel=?`, b.Installation, b.Server, b.Channel).Scan(&fence, &fenceMAC)
 		if fenceErr != nil && !errors.Is(fenceErr, sql.ErrNoRows) {
 			return fenceErr
 		}
@@ -363,7 +364,7 @@ func (j *directEnrollmentJournal) apply(s *DirectEndpointSubscription, b directE
 			return errDirectEnrollment
 		}
 		if !hasFence {
-			if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?,?)`, b.Installation, b.Server, b.Channel, b.Role, expectedBinding, enrollmentFenceMAC(key, b, expectedBinding)); e != nil {
+			if _, e = c.ExecContext(context.Background(), `INSERT INTO native_direct_enrollment_v1_fences VALUES(?,?,?,?,?)`, b.Installation, b.Server, b.Channel, expectedBinding, enrollmentFenceMAC(key, b, expectedBinding)); e != nil {
 				return e
 			}
 		}
